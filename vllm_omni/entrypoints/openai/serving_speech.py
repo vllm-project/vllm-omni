@@ -537,17 +537,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         voice = request.voice
         voice_lookup = request.voice.lower() if request.voice is not None else None
         task_type = request.task_type
-        pre_resolved_upload_audio = bool(getattr(request, "_auto_resolved_upload_audio", False))
-        pre_resolved_upload_embedding = bool(getattr(request, "_auto_resolved_upload_embedding", False))
-        explicit_ref_audio = request.ref_audio is not None and not pre_resolved_upload_audio
-        explicit_speaker_embedding = request.speaker_embedding is not None and not pre_resolved_upload_embedding
+        explicit_ref_audio = request.ref_audio is not None
+        explicit_speaker_embedding = request.speaker_embedding is not None
         ref_audio = request.ref_audio
         ref_text = request.ref_text.strip() if request.ref_text and request.ref_text.strip() else None
         speaker_embedding = request.speaker_embedding
         x_vector_only_mode = request.x_vector_only_mode
         uploaded_speaker_info = self.uploaded_speakers.get(voice_lookup) if voice_lookup is not None else None
-        resolved_upload_audio = pre_resolved_upload_audio
-        resolved_upload_embedding = pre_resolved_upload_embedding
+        resolved_upload_audio = False
+        resolved_upload_embedding = False
 
         if uploaded_speaker_info is not None and not explicit_ref_audio and not explicit_speaker_embedding:
             if ref_text is None:
@@ -592,15 +590,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _apply_normalized_speech_request(
         request: OpenAICreateSpeechRequest,
         normalized: SpeechRequestNormalized,
+        *,
+        apply_clone_inputs: bool = True,
     ) -> None:
         """Mutate request so downstream code sees canonicalized fields."""
         request.task_type = normalized.task_type
-        request.ref_audio = normalized.ref_audio
         request.ref_text = normalized.ref_text
-        request.speaker_embedding = normalized.speaker_embedding
         request.x_vector_only_mode = normalized.x_vector_only_mode
-        object.__setattr__(request, "_auto_resolved_upload_audio", normalized.resolved_upload_audio)
-        object.__setattr__(request, "_auto_resolved_upload_embedding", normalized.resolved_upload_embedding)
+        if apply_clone_inputs:
+            request.ref_audio = normalized.ref_audio
+            request.speaker_embedding = normalized.speaker_embedding
 
     async def upload_voice(
         self,
@@ -873,17 +872,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Check if the current model is a supported TTS model."""
         return any(stage.engine_args.model_stage in _TTS_MODEL_STAGES for stage in self.engine_client.stage_configs)
 
-    def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+    def _validate_tts_request(
+        self,
+        request: OpenAICreateSpeechRequest,
+        normalized: SpeechRequestNormalized | None = None,
+    ) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
         if self._tts_model_type == "voxtral_tts":
-            return self._validate_voxtral_tts_request(request)
+            return self._validate_voxtral_tts_request(request, normalized)
         if self._tts_model_type == "fish_tts":
-            return self._validate_fish_tts_request(request)
+            return self._validate_fish_tts_request(request, normalized)
         if self._tts_model_type == "cosyvoice3":
-            return self._validate_cosyvoice3_request(request)
+            return self._validate_cosyvoice3_request(request, normalized)
         if self._tts_model_type == "voxcpm2":
             return None  # VoxCPM2 accepts any text input
-        return self._validate_qwen_tts_request(request)
+        return self._validate_qwen_tts_request(request, normalized)
 
     def _validate_ref_audio_format(self, ref_audio: str) -> str | None:
         """Validate ref_audio is a supported URI format. Returns error or None."""
@@ -895,20 +898,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
         return None
 
-    def _validate_voxtral_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+    def _validate_voxtral_tts_request(
+        self,
+        request: OpenAICreateSpeechRequest,
+        normalized: SpeechRequestNormalized | None = None,
+    ) -> str | None:
         """Validate Voxtral TTS request parameters. Returns error message or None."""
-        normalized = self._normalize_speech_request(request)
-        self._apply_normalized_speech_request(request, normalized)
+        if normalized is None:
+            normalized = self._normalize_speech_request(request)
+            self._apply_normalized_speech_request(request, normalized, apply_clone_inputs=False)
 
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
 
         # Voxtral TTS requires either a preset voice or ref_audio for voice cloning.
-        if request.voice is None and request.ref_audio is None:
+        if request.voice is None and normalized.ref_audio is None:
             return "Either 'voice' (preset speaker) or 'ref_audio' (voice cloning) must be provided"
 
-        if request.ref_audio is not None:
-            fmt_err = self._validate_ref_audio_format(request.ref_audio)
+        if normalized.ref_audio is not None:
+            fmt_err = self._validate_ref_audio_format(normalized.ref_audio)
             if fmt_err:
                 return fmt_err
 
@@ -924,11 +932,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
-    def _validate_qwen_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+    def _validate_qwen_tts_request(
+        self,
+        request: OpenAICreateSpeechRequest,
+        normalized: SpeechRequestNormalized | None = None,
+    ) -> str | None:
         """Validate Qwen TTS request parameters. Returns error message or None."""
-        normalized = self._normalize_speech_request(request)
-        self._apply_normalized_speech_request(request, normalized)
-        task_type = request.task_type or "CustomVoice"
+        if normalized is None:
+            normalized = self._normalize_speech_request(request)
+            self._apply_normalized_speech_request(request, normalized, apply_clone_inputs=False)
+        task_type = normalized.task_type or "CustomVoice"
 
         # Validate input is not empty
         if not request.input or not request.input.strip():
@@ -950,15 +963,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return f"Invalid voice '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
 
         # Validate speaker_embedding constraints
-        if request.speaker_embedding is not None:
+        if normalized.speaker_embedding is not None:
             if task_type != "Base":
                 return "'speaker_embedding' is only valid for Base task"
-            if not request.speaker_embedding:
+            if not normalized.speaker_embedding:
                 return "'speaker_embedding' must be a non-empty list of floats"
             # speaker_embedding implies x_vector_only_mode — set it before
             # Base task validation so callers don't need to pass it explicitly.
             request.x_vector_only_mode = True
-            emb_len = len(request.speaker_embedding)
+            emb_len = len(normalized.speaker_embedding)
             # ECAPA-TDNN produces 1024-dim (0.6B) or 2048-dim (1.7B)
             expected_dims = {1024, 2048}
             if emb_len not in expected_dims:
@@ -972,16 +985,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if task_type == "Base":
             if request.voice is None:
                 # 1. Ensure a voice source is provided
-                if request.ref_audio is None and getattr(request, "speaker_embedding", None) is None:
+                if normalized.ref_audio is None and normalized.speaker_embedding is None:
                     return "Base task requires 'ref_audio' or 'speaker_embedding' for voice cloning"
                 # 2. Validate ref_audio format if it exists (using the helper from main)
-                if request.ref_audio is not None:
-                    fmt_err = self._validate_ref_audio_format(request.ref_audio)
+                if normalized.ref_audio is not None:
+                    fmt_err = self._validate_ref_audio_format(normalized.ref_audio)
                     if fmt_err:
                         return fmt_err
                 # 3. Validate text requirements based on the mode
-                if not getattr(request, "x_vector_only_mode", False):
-                    if not request.ref_text or not request.ref_text.strip():
+                if not normalized.x_vector_only_mode:
+                    if not normalized.ref_text:
                         return (
                             "Base task requires non-empty 'ref_text' (transcript of "
                             "the reference audio) unless 'x_vector_only_mode' is enabled"
@@ -1005,16 +1018,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                             return f"Speaker embedding for '{request.voice}' is not yet ready (cache_status='{status}')"
                 else:
                     # need ref_audio for built-in speaker
-                    if request.ref_audio is None:
+                    if normalized.ref_audio is None:
                         return (
                             f"Base task with built-in speaker '{request.voice}' requires 'ref_audio' for voice cloning"
                         )
-                    fmt_err = self._validate_ref_audio_format(request.ref_audio)
+                    fmt_err = self._validate_ref_audio_format(normalized.ref_audio)
                     if fmt_err:
                         return fmt_err
-                    if not getattr(request, "x_vector_only_mode", False) and (
-                        not request.ref_text or not request.ref_text.strip()
-                    ):
+                    if not normalized.x_vector_only_mode and not normalized.ref_text:
                         return (
                             "Base task requires non-empty 'ref_text' (transcript of "
                             "the reference audio) unless 'x_vector_only_mode' is enabled"
@@ -1022,9 +1033,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Validate cross-parameter dependencies
         if task_type != "Base":
-            if request.ref_text is not None:
+            if normalized.ref_text is not None:
                 return "'ref_text' is only valid for Base task"
-            if request.x_vector_only_mode is not None:
+            if normalized.x_vector_only_mode is not None:
                 return "'x_vector_only_mode' is only valid for Base task"
 
         # Validate VoiceDesign task requirements
@@ -1044,26 +1055,30 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
-    def _validate_fish_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
-        """Validate Fish Speech request parameters. Returns error message or None.
-
-        Side effect: if request.voice references an uploaded speaker, resolves
-        it to request.ref_audio and request.ref_text for voice cloning.
-        """
-        normalized = self._normalize_speech_request(request)
-        self._apply_normalized_speech_request(request, normalized)
+    def _validate_fish_tts_request(
+        self,
+        request: OpenAICreateSpeechRequest,
+        normalized: SpeechRequestNormalized | None = None,
+    ) -> str | None:
+        """Validate Fish Speech request parameters. Returns error message or None."""
+        if normalized is None:
+            normalized = self._normalize_speech_request(request)
+            self._apply_normalized_speech_request(request, normalized, apply_clone_inputs=False)
 
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
 
-        if normalized.uploaded_speaker_info is not None and request.ref_audio is None and normalized.ref_audio is None:
+        if normalized.uploaded_speaker_info is not None and normalized.ref_audio is None:
+            file_path = normalized.uploaded_speaker_info.get("file_path")
+            if file_path and not Path(file_path).exists():
+                return f"Audio file for uploaded voice '{request.voice}' not found on disk"
             return f"Could not load audio for uploaded voice '{request.voice}'"
 
-        if request.ref_audio is not None:
-            fmt_err = self._validate_ref_audio_format(request.ref_audio)
+        if normalized.ref_audio is not None:
+            fmt_err = self._validate_ref_audio_format(normalized.ref_audio)
             if fmt_err:
                 return fmt_err
-            if not request.ref_text or not request.ref_text.strip():
+            if not normalized.ref_text:
                 return "Voice cloning requires 'ref_text' (transcript of the reference audio)"
 
         if request.max_new_tokens is not None:
@@ -1074,23 +1089,28 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return None
 
-    def _validate_cosyvoice3_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+    def _validate_cosyvoice3_request(
+        self,
+        request: OpenAICreateSpeechRequest,
+        normalized: SpeechRequestNormalized | None = None,
+    ) -> str | None:
         """Validate CosyVoice3 request parameters. Returns error message or None."""
-        normalized = self._normalize_speech_request(request)
-        self._apply_normalized_speech_request(request, normalized)
+        if normalized is None:
+            normalized = self._normalize_speech_request(request)
+            self._apply_normalized_speech_request(request, normalized, apply_clone_inputs=False)
 
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
 
         # CosyVoice3 requires reference audio for voice cloning
-        if request.ref_audio is None:
+        if normalized.ref_audio is None:
             return "CosyVoice3 requires 'ref_audio' (reference audio for voice cloning)"
 
-        fmt_err = self._validate_ref_audio_format(request.ref_audio)
+        fmt_err = self._validate_ref_audio_format(normalized.ref_audio)
         if fmt_err:
             return fmt_err
 
-        if not request.ref_text or not request.ref_text.strip():
+        if not normalized.ref_text:
             return "CosyVoice3 requires 'ref_text' (transcript of the reference audio)"
 
         if request.max_new_tokens is not None:
@@ -1241,13 +1261,30 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         key = "audio" if "audio" in mm else ("model_outputs" if "model_outputs" in mm else None)
         return mm, key
 
-    def _build_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+    def _build_tts_params(
+        self,
+        request: OpenAICreateSpeechRequest,
+        normalized: SpeechRequestNormalized | None = None,
+    ) -> dict[str, Any]:
         """Build TTS parameters from request.
 
         Processes each parameter if present, skips if not.
         Values are wrapped in lists as required by the model.
         """
-        normalized = self._normalize_speech_request(request)
+        if self._tts_model_type == "voxcpm":
+            params: dict[str, Any] = {
+                "text": [request.input],
+                "cfg_value": [2.0],
+                "inference_timesteps": [10],
+                "min_len": [2],
+                "max_new_tokens": [request.max_new_tokens or 4096],
+            }
+            if request.ref_text is not None:
+                params["ref_text"] = [request.ref_text]
+            return params
+
+        if normalized is None:
+            normalized = self._normalize_speech_request(request)
         params: dict[str, Any] = {}
 
         # Text content (always required)
@@ -1267,9 +1304,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Speaker (voice)
         if normalized.voice is not None:
-            speaker_value = (
-                normalized.voice_lookup if normalized.uploaded_speaker_info is not None else normalized.voice
-            )
+            speaker_value = normalized.voice_lookup if normalized.voice_lookup is not None else normalized.voice
             params["speaker"] = [speaker_value]
 
             # Uploaded voices use task_type="Base" (CustomVoice requires built-in spk_id).
@@ -1479,7 +1514,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._apply_normalized_speech_request(request, normalized)
 
         if self._is_fish_speech:
-            validation_error = self._validate_fish_tts_request(request)
+            validation_error = self._validate_fish_tts_request(request, normalized)
             if validation_error:
                 raise ValueError(validation_error)
             ref_audio_data = None
@@ -1518,7 +1553,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if additional:
                 prompt["additional_information"] = additional
         elif self._is_tts:
-            validation_error = self._validate_tts_request(request)
+            validation_error = self._validate_tts_request(request, normalized)
             if validation_error:
                 raise ValueError(validation_error)
 
@@ -1529,7 +1564,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt = await self._build_cosyvoice3_prompt(request)
                 tts_params = {}
             else:
-                tts_params = self._build_tts_params(request)
+                tts_params = self._build_tts_params(request, normalized)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
                 # to [[wav_list, sr]] so the model doesn't re-decode base64.
                 ref_audio_source = request.ref_audio

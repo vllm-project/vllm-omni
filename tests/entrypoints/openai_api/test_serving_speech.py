@@ -954,7 +954,7 @@ class TestTTSMethods:
         params = speech_server._build_tts_params(req)
 
         assert params["text"] == ["Hello"]
-        assert params["speaker"] == ["Ryan"]
+        assert params["speaker"] == ["ryan"]
         assert params["language"] == ["English"]
         assert params["task_type"] == ["CustomVoice"]
 
@@ -2026,6 +2026,24 @@ class TestFishSpeechServing:
         assert fish_speech_server._tts_model_type == "fish_tts"
         assert fish_speech_server._validate_tts_request(OpenAICreateSpeechRequest(input="hello fish")) is None
 
+    def test_validate_tts_request_reports_missing_uploaded_fish_audio_file(self, fish_speech_server, mocker):
+        fish_speech_server.uploaded_speakers = {
+            "missing_voice": {
+                "name": "missing_voice",
+                "file_path": "/tmp/voice_samples/missing_voice.wav",
+                "mime_type": "audio/wav",
+                "embedding_source": "audio",
+                "ref_text": "reference text",
+            }
+        }
+        mocker.patch("pathlib.Path.exists", return_value=False)
+
+        error = fish_speech_server._validate_tts_request(
+            OpenAICreateSpeechRequest(input="hello fish", voice="missing_voice")
+        )
+
+        assert error == "Audio file for uploaded voice 'missing_voice' not found on disk"
+
     def test_prepare_speech_generation_rejects_invalid_fish_max_new_tokens(self, fish_speech_server):
         with pytest.raises(ValueError, match="max_new_tokens cannot exceed"):
             asyncio.run(
@@ -2354,7 +2372,7 @@ class TestTTSAsyncOffloading:
             }
         }
         mocker.patch("pathlib.Path.exists", return_value=True)
-        mocker.patch.object(
+        mock_get_audio = mocker.patch.object(
             qwen3_tts_server,
             "_get_uploaded_audio_data",
             return_value="data:audio/wav;base64,ZmFrZQ==",
@@ -2369,6 +2387,7 @@ class TestTTSAsyncOffloading:
         assert tts_params["x_vector_only_mode"] == [True]
         assert tts_params["voice_created_at"] == [1711234567.89]
         assert tts_params["ref_audio"] == [[[0.1, 0.2, 0.3], 24000]]
+        mock_get_audio.assert_called_once_with("custom_voice")
 
     def test_shutdown_is_idempotent(self, mocker: MockerFixture):
         """Calling shutdown() twice should not raise."""
