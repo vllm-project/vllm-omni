@@ -382,6 +382,21 @@ class DiffusionWorker:
             profiler.step()
         return output
 
+    def execute_micro_step(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Execute one temporal-PP micro-step by delegating to the model runner."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        if self.lora_manager is not None:
+            self.lora_manager.set_active_adapter(None)
+        if any(new_req.req.sampling_params.lora_request is not None for new_req in scheduler_output.scheduled_new_reqs):
+            raise ValueError("Stream-batch mode does not support LoRA yet.")
+        profiler = self._get_profiler()
+        ctx = profiler.annotate_context_manager("diffusion_micro_step") if profiler else nullcontext()
+        with ctx:
+            output = self.model_runner.execute_micro_step(scheduler_output)
+        if profiler:
+            profiler.step()
+        return output
+
     def load_weights(self, weights) -> set[str]:
         """Load weights by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
@@ -950,6 +965,10 @@ class WorkerWrapperBase:
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""
         return self.worker.execute_stepwise(scheduler_output)
+
+    def execute_micro_step(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Execute one temporal-PP micro-step."""
+        return self.worker.execute_micro_step(scheduler_output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """

@@ -162,7 +162,12 @@ class DiffusionEngine:
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
-        self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
+        if self.stream_batch:
+            self.execute_fn = self.executor.execute_micro_step
+        elif self.step_execution:
+            self.execute_fn = self.executor.execute_step
+        else:
+            self.execute_fn = self.executor.execute_request
 
         try:
             self._dummy_run()

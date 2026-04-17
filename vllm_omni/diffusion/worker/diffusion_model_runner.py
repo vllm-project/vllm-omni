@@ -32,9 +32,10 @@ from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
-from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput, ChunkState
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -486,3 +487,134 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 self._update_states_after(states, input_batch, pipeline_interrupted)
 
                 return BatchRunnerOutput.from_list(runner_output_list)
+    # ------------------------------------------------------------------
+    # Temporal-PP micro-step execution
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _merge_chunk_outputs(chunks: list[DiffusionOutput]) -> DiffusionOutput:
+        """Merge K completed chunk outputs into a single ``DiffusionOutput``.
+
+        Concatenates video tensors ``[B, C, T, H, W]`` along the temporal
+        dimension (dim 2).
+        """
+        if len(chunks) == 1:
+            return chunks[0]
+        try:
+            merged = torch.cat([c.output for c in chunks], dim=2)
+        except Exception as e:
+            return DiffusionOutput(error=f"Failed to merge {len(chunks)} chunk outputs: {e}")
+        return DiffusionOutput(output=merged)
+
+    @staticmethod
+    def _get_or_create_chunk(state: DiffusionRequestState, chunk_idx: int) -> tuple[ChunkState, bool]:
+        chunks: dict[int, ChunkState] = state.extra.setdefault("chunks", {})
+        chunk = chunks.get(chunk_idx)
+        if chunk is not None:
+            return chunk, False
+        chunk = ChunkState(idx=chunk_idx)
+        chunks[chunk_idx] = chunk
+        return chunk, True
+
+    def execute_micro_step(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Execute one temporal-PP micro-step.
+
+        Each rank reads its own slot from ``scheduler_output.per_rank_assignment``
+        and performs at most one local compute + send + recv via the existing
+        ``denoise_step`` / ``step_scheduler`` pipeline methods (with chunk-scoped
+        ``state.latents`` and ``state.step_index`` swapped in via
+        ``state.use_chunk``). Only the last PP rank emits ``chunk_events``.
+        """
+        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        if not self.supports_step_mode():
+            raise ValueError("Current pipeline does not support step execution.")
+        if self.od_config.cache_backend not in (None, "none"):
+            raise ValueError("Stream-batch mode does not support cache_backend yet.")
+
+        assignment = scheduler_output.per_rank_assignment
+        if assignment is None:
+            raise ValueError("execute_micro_step requires per_rank_assignment in scheduler_output.")
+
+        use_hsdp = self.od_config.parallel_config.use_hsdp
+        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+
+        with grad_context:
+            state, is_new_request = self._update_states(scheduler_output)
+
+            # prepare_encode must run on ALL ranks when the request is first
+            # seen — even if this rank is idle this micro-step — so that shared
+            # state (prompt embeds, timesteps, scheduler) is available when the
+            # rank later receives its first chunk assignment.
+            if is_new_request:
+                if state.sampling.generator is None and state.sampling.seed is not None:
+                    gen_device = state.sampling.generator_device or (
+                        "cpu" if self.device.type == "cpu" else self.device
+                    )
+                    state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
+                with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+                    self.pipeline.prepare_encode(state)
+
+            pp_group = get_pp_group()
+            pp_rank = pp_group.rank_in_group
+            task = assignment[pp_rank]
+
+            # Idle rank (warmup / cooldown / no active request). Still drain prior sends.
+            if task is None:
+                if hasattr(self.pipeline, "sync_pp_send"):
+                    self.pipeline.sync_pp_send()
+                return RunnerOutput(req_id=state.req_id)
+
+            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+
+                chunk, is_new_chunk = self._get_or_create_chunk(state, task.chunk_idx)
+                if is_new_chunk:
+                    # First chunk reuses the noise sampled by prepare_encode;
+                    # subsequent chunks draw fresh noise of the same shape from
+                    # the request's generator (deterministic, advances state).
+                    # Each chunk gets its own scheduler deepcopy so multi-step
+                    # ODE solver state doesn't leak between chunks.
+                    chunk.latents = (
+                        state.latents
+                        if task.chunk_idx == 0
+                        else torch.randn_like(state.latents, generator=state.sampling.generator)
+                    )
+                    chunk.scheduler = copy.deepcopy(state.scheduler)
+
+                # Sanity guard: scheduler's per-rank assignment must match what this
+                # rank currently believes about the chunk's progress.
+                assert chunk.step_index == task.step_index, (
+                    f"Stale chunk state on rank {pp_rank}: chunk_idx={task.chunk_idx} "
+                    f"local step_index={chunk.step_index}, scheduler said {task.step_index}"
+                )
+
+                with state.use_chunk(chunk):
+                    noise_pred = self.pipeline.denoise_step(state)
+                    if noise_pred is None and getattr(self.pipeline, "interrupt", False):
+                        return RunnerOutput(
+                            req_id=task.sched_req_id,
+                            result=DiffusionOutput(error="micro-step denoise interrupted"),
+                        )
+                    self.pipeline.step_scheduler(state, noise_pred)
+                    chunk_done = state.denoise_completed
+
+                output = RunnerOutput(
+                    req_id=task.sched_req_id,
+                    step_index=chunk.step_index,
+                    chunk_idx=task.chunk_idx,
+                )
+
+                # Only rank N-1 runs post_decode and tracks chunk completion.
+                if pp_group.is_last_rank and chunk_done:
+                    output.chunk_completed = True
+                    with state.use_chunk(chunk):
+                        chunk_output = self.pipeline.post_decode(state)
+                    state.extra["chunks"].pop(task.chunk_idx, None)
+
+                    completed = state.extra.setdefault("completed_chunk_outputs", [])
+                    completed.append(chunk_output)
+                    if len(completed) >= state.sampling.num_chunks:
+                        output.finished = True
+                        output.result = self._merge_chunk_outputs(completed)
+                        self._update_states_after(state, finished=True)
+
+                return output

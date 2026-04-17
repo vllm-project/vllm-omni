@@ -85,6 +85,11 @@ class DiffusionExecutor(ABC):
         pass
 
     @abstractmethod
+    def execute_micro_step(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Execute one temporal-PP micro-step from a scheduler output."""
+        pass
+
+    @abstractmethod
     def collective_rpc(
         self,
         method: str,

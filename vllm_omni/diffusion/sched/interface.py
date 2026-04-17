@@ -108,16 +108,14 @@ class CachedRequestData:
 
 @dataclass
 class RankTask:
-    """One ``(request, chunk, denoising_step)`` triple assigned to a single PP rank for one micro-step.
+    """One ``(request, chunk, step_index)`` triple assigned to a single PP rank for one micro-step.
 
-    Used by temporal-PP schedulers (e.g. ``StreamBatchScheduler``) to tell each rank
-    which work to perform in the current micro-step. Spatial-PP schedulers leave
-    ``DiffusionSchedulerOutput.per_rank_assignment`` as ``None``.
+    Used by ``StreamBatchScheduler`` to tell each rank which work to perform in the current micro-step.
     """
 
     sched_req_id: str
     chunk_idx: int
-    denoising_step: int
+    step_index: int
 
 
 @dataclass

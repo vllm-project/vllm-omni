@@ -344,6 +344,32 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         else:
             raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
 
+    def execute_micro_step(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Forward a temporal-PP micro-step to worker ``execute_micro_step`` RPC.
+
+        The reply is collected from the last PP rank, which owns rank N-1's ODE
+        results and any chunk-finished decodes (carried in
+        ``RunnerOutput.chunk_events``). Other ranks' replies are discarded.
+
+        Assumes worker rank == PP rank (true for PP-only layouts; revisit when
+        introducing TP/DP combinations).
+        """
+        from vllm_omni.diffusion.worker.utils import RunnerOutput
+
+        self._ensure_open()
+        last_pp_rank = self.od_config.parallel_config.pipeline_parallel_size - 1
+        result = self.collective_rpc(
+            "execute_micro_step",
+            args=(scheduler_output,),
+            unique_reply_rank=last_pp_rank,
+            exec_all_ranks=True,
+        )
+        if not isinstance(result, RunnerOutput):
+            raise RuntimeError(
+                f"Unexpected response type for execute_micro_step: {type(result)!r}"
+            )
+        return result
+
     def collective_rpc(
         self,
         method: str,

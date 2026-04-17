@@ -589,6 +589,10 @@ class OmniDiffusionConfig:
 
     # sleep mode
     enable_sleep_mode: bool = False
+    # Temporal pipeline parallelism (StreamBatchScheduler-driven streaming chunks).
+    # When True, the engine uses ``StreamBatchScheduler`` and routes execution
+    # through ``executor.execute_micro_step``.
+    stream_batch: bool = False
 
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
