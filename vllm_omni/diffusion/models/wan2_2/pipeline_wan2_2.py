@@ -938,25 +938,6 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
 # ---------------------------------------------------------------------------
 
 
-def _load_model_index(model: str, local_files_only: bool) -> dict:
-    """Load model_index.json from local path or HF Hub."""
-    if local_files_only:
-        model_index_path = os.path.join(model, "model_index.json")
-        if os.path.exists(model_index_path):
-            with open(model_index_path) as f:
-                return json.load(f)
-    else:
-        try:
-            from huggingface_hub import hf_hub_download
-
-            model_index_path = hf_hub_download(model, "model_index.json")
-            with open(model_index_path) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-
 class WanT2VDMD2Pipeline(DMD2PipelineMixin, Wan22Pipeline):
     """Wan 2.1 T2V pipeline for FastGen DMD2-distilled 4-step models."""
 

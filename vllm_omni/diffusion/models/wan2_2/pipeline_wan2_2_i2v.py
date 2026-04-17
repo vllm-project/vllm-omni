@@ -25,8 +25,8 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
+from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
-    _load_model_index,
     build_wan_scheduler,
     create_transformer_from_config,
     load_transformer_config,
@@ -174,7 +174,10 @@ class Wan22I2VPipeline(
         ]
 
         # Load model_index.json to detect available components
-        model_index = _load_model_index(model, local_files_only)
+        try:
+            model_index = _load_json(model, "model_index.json", local_files_only)
+        except Exception:
+            model_index = {}
 
         # Check if this is a two-stage model (MoE with transformer_2)
         self.has_transformer_2 = "transformer_2" in model_index

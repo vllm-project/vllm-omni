@@ -8,6 +8,7 @@ import os
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.models.schedulers import DMD2EulerScheduler
+from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = logging.getLogger(__name__)
@@ -18,11 +19,11 @@ class DMD2PipelineMixin:
 
     def __init_dmd2__(self) -> None:
         """Call after super().__init__() to apply DMD2 scheduler and read model_index."""
-        # Deferred import: avoids cycle with wan2_2.pipeline_wan2_2 (which imports this mixin).
-        from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import _load_model_index
-
         local_files_only = os.path.exists(self.od_config.model)
-        model_index = _load_model_index(self.od_config.model, local_files_only)
+        try:
+            model_index = _load_json(self.od_config.model, "model_index.json", local_files_only)
+        except Exception:
+            model_index = {}
 
         dmd2_timesteps = model_index.get("dmd2_denoising_timesteps", [999, 937, 833, 624])
         self.num_inference_steps = model_index.get("dmd2_num_inference_steps", 4)
