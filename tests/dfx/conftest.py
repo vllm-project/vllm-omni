@@ -40,15 +40,41 @@ def modify_stage(default_path, updates, deletes):
     return path
 
 
+def _build_serve_args(serve_args: Any) -> list[str]:
+    """Convert server_params.serve_args to a flat CLI args list."""
+    if serve_args is None:
+        return []
+    if isinstance(serve_args, list):
+        return [str(item) for item in serve_args]
+    if not isinstance(serve_args, dict):
+        raise TypeError(f"serve_args must be dict/list/None, got {type(serve_args).__name__}")
+
+    args: list[str] = []
+    for key, value in serve_args.items():
+        flag = f"--{str(key).replace('_', '-')}"
+        if isinstance(value, bool):
+            if value:
+                args.append(flag)
+            continue
+        if value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            args.extend([flag, json.dumps(value, ensure_ascii=False, separators=(",", ":"))])
+            continue
+        args.extend([flag, str(value)])
+    return args
+
+
 def create_unique_server_params(
     configs: list[dict[str, Any]],
     stage_configs_dir: Path,
-) -> list[tuple[str, str, str | None]]:
+) -> list[tuple[str, str, str | None, list[str]]]:
     unique_params = []
-    seen = set()
+    seen: set[tuple[str, str, str | None, tuple[str, ...]]] = set()
     for config in configs:
         test_name = config["test_name"]
         model = config["server_params"]["model"]
+        serve_args = _build_serve_args(config["server_params"].get("serve_args"))
         stage_config_name = config["server_params"].get("stage_config_name")
         if stage_config_name:
             stage_config_path = str(stage_configs_dir / stage_config_name)
@@ -58,10 +84,10 @@ def create_unique_server_params(
         else:
             stage_config_path = None
 
-        server_param = (test_name, model, stage_config_path)
-        if server_param not in seen:
-            seen.add(server_param)
-            unique_params.append(server_param)
+        server_param_key = (test_name, model, stage_config_path, tuple(serve_args))
+        if server_param_key not in seen:
+            seen.add(server_param_key)
+            unique_params.append((test_name, model, stage_config_path, serve_args))
 
     return unique_params
 
