@@ -526,10 +526,10 @@ class FluxTransformer2DModel(nn.Module):
 
     def __init__(
         self,
-        od_config: OmniDiffusionConfig = None,
+        od_config: OmniDiffusionConfig | None = None,
         patch_size: int = 1,
         in_channels: int = 64,
-        out_channels: int = None,
+        out_channels: int | None = None,
         num_layers: int = 19,
         num_single_layers: int = 38,
         attention_head_dim: int = 128,
