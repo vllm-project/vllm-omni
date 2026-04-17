@@ -23,10 +23,11 @@ import torch.nn.functional as F
 import torchaudio.compliance.kaldi as kaldi
 from torch import Tensor
 
+from vllm_omni.model_executor.models.whisper_utils import Conv1d, ConvTranspose1d
 from vllm_omni.utils.audio import mel_filter_bank, peak_normalize
 
 from .core_vq import DistributedGroupResidualVectorQuantization
-from .whisper_encoder import Conv1d, ConvTranspose1d, WhisperEncoder
+from .whisper_encoder import WhisperEncoder
 
 
 def dynamic_range_compression_torch(x, c=1, clip_val=1e-5):

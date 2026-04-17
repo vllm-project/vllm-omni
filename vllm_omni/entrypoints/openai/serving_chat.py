@@ -733,6 +733,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return params
 
+    @staticmethod
+    def _set_if_supported(obj: Any, **kwargs: Any) -> None:
+        for key, value in kwargs.items():
+            if value is not None and hasattr(obj, key):
+                setattr(obj, key, value)
+
     def _build_sampling_params_list_from_request(
         self,
         request: ChatCompletionRequest,
@@ -1579,6 +1585,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     role,
                     reasoning_parser,
                 )
+                final_res = omni_outputs.request_output
             elif omni_outputs.final_output_type == "audio":
                 choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
             elif omni_outputs.final_output_type == "image":
@@ -2057,6 +2064,254 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return choices
 
     # ==================== Diffusion Mode Methods ====================
+    def _build_multistage_generation_inputs(
+        self,
+        *,
+        engine: AsyncOmni,
+        prompt: str,
+        extra_body: dict[str, Any],
+        reference_images: list[Image.Image],
+        gen_params: OmniDiffusionSamplingParams,
+    ) -> tuple[OmniTextPrompt, list[Any]]:
+        """Build the shared multistage generation prompt and stage params."""
+        stage_configs = getattr(engine, "stage_configs", None) or []
+        default_params_list = list(getattr(engine, "default_sampling_params_list", []) or [])
+
+        height = gen_params.height
+        width = gen_params.width
+        seed = gen_params.seed
+        generator_device = gen_params.generator_device
+        num_outputs_per_prompt = gen_params.num_outputs_per_prompt
+        num_inference_steps = extra_body.get("num_inference_steps")
+        guidance_scale = extra_body.get("guidance_scale")
+        true_cfg_scale = extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale")
+        negative_prompt = extra_body.get("negative_prompt")
+        num_frames = extra_body.get("num_frames")
+        guidance_scale_2 = extra_body.get("guidance_scale_2")
+        lora_body = extra_body.get("lora")
+        layers = extra_body.get("layers")
+        resolution = extra_body.get("resolution")
+
+        engine_prompt_data: dict[str, Any] | None = None
+        modalities = ["image"]
+        if reference_images:
+            if len(reference_images) == 1:
+                engine_prompt_data = {"img2img": reference_images[0]}
+                modalities = ["img2img"]
+            else:
+                engine_prompt_data = {"image": reference_images}
+
+        engine_prompt: OmniTextPrompt = {"prompt": prompt}
+        engine_prompt["modalities"] = modalities
+        if negative_prompt is not None:
+            engine_prompt["negative_prompt"] = negative_prompt
+
+        mm_processor_kwargs: dict[str, Any] = {}
+        if height is not None:
+            mm_processor_kwargs["target_h"] = height
+        if width is not None:
+            mm_processor_kwargs["target_w"] = width
+        if mm_processor_kwargs:
+            engine_prompt["mm_processor_kwargs"] = mm_processor_kwargs
+        if engine_prompt_data is not None:
+            engine_prompt["multi_modal_data"] = engine_prompt_data
+
+        comprehension_idx = None
+        for idx, stage in enumerate(stage_configs):
+            if getattr(stage, "is_comprehension", False):
+                comprehension_idx = idx
+                break
+
+        sampling_params_list: list[Any] = []
+        for idx, stage_cfg in enumerate(stage_configs):
+            stage_type = get_stage_type(stage_cfg)
+            if idx < len(default_params_list):
+                default_stage_params = default_params_list[idx]
+                if hasattr(default_stage_params, "clone"):
+                    try:
+                        default_stage_params = default_stage_params.clone()
+                    except Exception:
+                        pass
+            elif stage_type == "diffusion":
+                default_stage_params = gen_params.clone()
+            else:
+                default_stage_params = SamplingParams()
+
+            if (
+                comprehension_idx is not None
+                and idx == comprehension_idx
+                and seed is not None
+                and hasattr(default_stage_params, "seed")
+            ):
+                default_stage_params.seed = seed
+
+            if stage_type == "diffusion":
+                self._set_if_supported(
+                    default_stage_params,
+                    height=height,
+                    width=width,
+                    seed=seed,
+                    generator_device=generator_device,
+                    num_outputs_per_prompt=num_outputs_per_prompt,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    true_cfg_scale=true_cfg_scale,
+                    num_frames=num_frames,
+                    guidance_scale_2=guidance_scale_2,
+                    layers=layers,
+                    resolution=resolution,
+                )
+                if lora_body and isinstance(lora_body, dict):
+                    try:
+                        lora_req, lora_scale = parse_lora_request(lora_body)
+                        if lora_req is not None:
+                            default_stage_params.lora_request = lora_req
+                            if lora_scale is not None:
+                                default_stage_params.lora_scale = lora_scale
+                    except Exception as e:  # pragma: no cover - safeguard
+                        logger.warning("Failed to parse LoRA request: %s", e)
+
+            sampling_params_list.append(default_stage_params)
+
+        return engine_prompt, sampling_params_list
+
+    async def generate_diffusion_images(
+        self,
+        *,
+        prompt: str,
+        extra_body: dict[str, Any] | None = None,
+        reference_images: list[str] | None = None,
+        request_id: str | None = None,
+    ) -> tuple[list[Image.Image], dict[str, Any], float] | ErrorResponse:
+        """Generate diffusion images and return raw images plus generation stats."""
+        if request_id is None:
+            request_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
+        if extra_body is None:
+            extra_body = {}
+        if reference_images is None:
+            reference_images = []
+
+        engine = self._diffusion_engine if self._diffusion_engine is not None else self.engine_client
+
+        height = extra_body.get("height")
+        width = extra_body.get("width")
+        if "size" in extra_body:
+            try:
+                size_str = extra_body["size"]
+                if isinstance(size_str, str) and "x" in size_str.lower():
+                    w, h = size_str.lower().split("x")
+                    width, height = int(w), int(h)
+            except ValueError:
+                logger.warning("Invalid size format: %s", extra_body.get("size"))
+
+        seed = extra_body.get("seed")
+        generator_device = extra_body.get("generator_device")
+        negative_prompt = extra_body.get("negative_prompt")
+        num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
+        lora_body = extra_body.get("lora")
+
+        pil_images: list[Image.Image] = []
+        for img_b64 in reference_images:
+            try:
+                img_bytes = base64.b64decode(img_b64)
+                pil_images.append(Image.open(BytesIO(img_bytes)))
+            except Exception as e:
+                logger.warning("Failed to decode reference image: %s", e)
+
+        gen_params = OmniDiffusionSamplingParams(
+            height=height,
+            width=width,
+            num_outputs_per_prompt=num_outputs_per_prompt,
+            seed=seed,
+        )
+        self._set_if_supported(
+            gen_params,
+            generator_device=generator_device,
+            num_inference_steps=extra_body.get("num_inference_steps"),
+            guidance_scale=extra_body.get("guidance_scale"),
+            true_cfg_scale=extra_body.get("true_cfg_scale") or extra_body.get("cfg_scale"),
+            num_frames=extra_body.get("num_frames"),
+            guidance_scale_2=extra_body.get("guidance_scale_2"),
+            layers=extra_body.get("layers"),
+            resolution=extra_body.get("resolution"),
+        )
+
+        if lora_body and isinstance(lora_body, dict):
+            try:
+                lora_req, lora_scale = parse_lora_request(lora_body)
+                if lora_req is not None:
+                    gen_params.lora_request = lora_req
+                    if lora_scale is not None:
+                        gen_params.lora_scale = lora_scale
+            except Exception as e:  # pragma: no cover - safeguard
+                logger.warning("Failed to parse LoRA request: %s", e)
+
+        gen_prompt: OmniTextPrompt = {
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
+        }
+        if pil_images:
+            if len(pil_images) == 1:
+                gen_prompt["multi_modal_data"] = {"image": pil_images[0]}
+            else:
+                od_config = getattr(engine, "od_config", None)
+                supports_multimodal_inputs = getattr(od_config, "supports_multimodal_inputs", False)
+                if od_config is None:
+                    supports_multimodal_inputs = True
+                if supports_multimodal_inputs:
+                    gen_prompt["multi_modal_data"] = {"image": pil_images}
+                else:
+                    return self._create_error_response(
+                        "Multiple input images are not supported by the current diffusion model. "
+                        "For multi-image editing, start the server with Qwen-Image-Edit-2509 "
+                        "and send multiple images in the user message content.",
+                        status_code=400,
+                    )
+
+        if isinstance(engine, AsyncOmni):
+            diffusion_engine = cast(AsyncOmni, engine)
+            stage_configs = getattr(diffusion_engine, "stage_configs", None) or []
+            if len(stage_configs) > 1:
+                engine_prompt, sampling_params_list = self._build_multistage_generation_inputs(
+                    engine=diffusion_engine,
+                    prompt=prompt,
+                    extra_body=extra_body,
+                    reference_images=pil_images,
+                    gen_params=gen_params,
+                )
+            else:
+                engine_prompt = gen_prompt
+                sampling_params_list = [gen_params]
+
+            result = None
+            async for output in diffusion_engine.generate(
+                prompt=engine_prompt,
+                sampling_params_list=sampling_params_list,
+                request_id=request_id,
+            ):
+                result = output
+            if result is None:
+                return self._create_error_response("No output generated from AsyncOmni", status_code=500)
+        else:
+            result = await engine.generate(
+                prompt=gen_prompt,
+                sampling_params=gen_params,
+                request_id=request_id,
+            )
+
+        images = getattr(result.request_output, "images", [])
+        stage_durations = result.stage_durations
+        peak_memory_mb = result.peak_memory_mb
+
+        flat_images: list[Image.Image] = []
+        for item in images:
+            if isinstance(item, list):
+                flat_images.extend(item)
+            else:
+                flat_images.append(item)
+
+        return flat_images, stage_durations, peak_memory_mb
+
     async def _create_diffusion_chat_completion(
         self,
         request: ChatCompletionRequest,
@@ -2234,8 +2489,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if hasattr(default_stage_params, "clone"):
                     try:
                         default_stage_params = default_stage_params.clone()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("Failed to clone default params for stage %d: %s", idx, e)
                 sampling_params_list.append(default_stage_params)
 
             if not sampling_params_list:

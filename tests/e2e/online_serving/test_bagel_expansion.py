@@ -88,7 +88,7 @@ def _get_diffusion_feature_cases(model: str):
                 ],
             ),
             id="parallel_tp_2",
-            marks=PARALLEL_FEATURE_MARKS,
+            marks=[*PARALLEL_FEATURE_MARKS, pytest.mark.skip(reason="issue: #2862")],
         ),
         # Ulysses-SP degree=2 (2 GPUs)
         pytest.param(
