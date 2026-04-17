@@ -69,9 +69,9 @@ DIFFUSION_VIDEO_PARAMS = [param for param in WAN_PARAMS if supports_video_genera
     current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
     reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
 )
-@pytest.mark.parametrize("omni_server", DIFFUSION_VIDEO_PARAMS, indirect=True)
-def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server, openai_client) -> None:
-    stage_config_path = getattr(omni_server, "stage_config_path", None)
+@pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
+def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server_function, openai_client_function) -> None:
+    stage_config_path = getattr(omni_server_function, "stage_config_path", None)
     device_spec = resolve_oom_device_spec(OOM_INJECTION_CONFIG, stage_config_path)
     handle = inject_gpu_oom(
         device=device_spec,
@@ -98,7 +98,7 @@ def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server, open
             "stream": False,
         }
         try:
-            openai_client.send_video_diffusion_request(request_config, request_num=1)
+            openai_client_function.send_video_diffusion_request(request_config, request_num=1)
         except Exception as exc:
             assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
         else:
@@ -123,8 +123,11 @@ def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server, open
     ],
     indirect=True,
 )
-@pytest.mark.parametrize("omni_server", DIFFUSION_VIDEO_PARAMS, indirect=True)
-def test_reliability_fault_process_kill_video_request_failure(omni_server_after_fault, openai_client) -> None:
+@pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
+def test_reliability_fault_process_kill_video_request_failure(
+    omni_server_after_fault_function,
+    openai_client_function,
+) -> None:
     image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
     request_config = {
         "form_data": {
@@ -142,7 +145,7 @@ def test_reliability_fault_process_kill_video_request_failure(omni_server_after_
         "stream": False,
     }
     try:
-        openai_client.send_video_diffusion_request(request_config, request_num=1)
+        openai_client_function.send_video_diffusion_request(request_config, request_num=1)
     except Exception as exc:
         assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
     else:

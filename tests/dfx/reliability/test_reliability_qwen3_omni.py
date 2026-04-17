@@ -114,9 +114,12 @@ QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, MODEL
     current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
     reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
 )
-@pytest.mark.parametrize("omni_server", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server, openai_client) -> None:
-    device_spec = resolve_oom_device_spec(OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server))
+@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_function, openai_client_function) -> None:
+    device_spec = resolve_oom_device_spec(
+        OOM_INJECTION_CONFIG,
+        _stage_config_path_from_omni_server(omni_server_function),
+    )
     handle = inject_gpu_oom(
         device=device_spec,
         target_mem_ratio=OOM_INJECTION_CONFIG["target_mem_ratio"],
@@ -136,13 +139,13 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server, opena
             content_text=f"{_get_mix_prompt()} " * 200,
         )
         request_config = {
-            "model": omni_server.model,
+            "model": omni_server_function.model,
             "messages": messages,
             "stream": True,
             "key_words": {"audio": ["test"]},
         }
         try:
-            openai_client.send_omni_request(request_config, request_num=1)
+            openai_client_function.send_omni_request(request_config, request_num=1)
         except Exception as exc:
             assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
         else:
@@ -156,9 +159,12 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server, opena
     current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
     reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
 )
-@pytest.mark.parametrize("omni_server", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server, openai_client) -> None:
-    device_spec = resolve_oom_device_spec(OOM_INJECTION_CONFIG, _stage_config_path_from_omni_server(omni_server))
+@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_function, openai_client_function) -> None:
+    device_spec = resolve_oom_device_spec(
+        OOM_INJECTION_CONFIG,
+        _stage_config_path_from_omni_server(omni_server_function),
+    )
     handle = inject_gpu_oom(
         device=device_spec,
         target_mem_ratio=OOM_INJECTION_CONFIG["target_mem_ratio"],
@@ -172,14 +178,14 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server, open
             content_text="What is the capital of China? Answer in 20 words.",
         )
         request_config = {
-            "model": omni_server.model,
+            "model": omni_server_function.model,
             "messages": messages,
             "stream": False,
             "modalities": ["text"],
             "key_words": {"text": ["beijing"]},
         }
         try:
-            openai_client.send_omni_request(request_config, request_num=4)
+            openai_client_function.send_omni_request(request_config, request_num=4)
         except Exception as exc:
             assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
         else:
@@ -204,21 +210,21 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server, open
     ],
     indirect=True,
 )
-@pytest.mark.parametrize("omni_server", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_process_kill_request_failure(omni_server_after_fault, openai_client) -> None:
+@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+def test_reliability_fault_process_kill_request_failure(omni_server_after_fault_function, openai_client_function) -> None:
     messages = dummy_messages_from_mix_data(
         system_prompt=_get_system_prompt(),
         content_text="What is the capital of China? Answer in 20 words.",
     )
     request_config = {
-        "model": omni_server_after_fault.model,
+        "model": omni_server_after_fault_function.model,
         "messages": messages,
         "stream": False,
         "modalities": ["text"],
         "key_words": {"text": ["beijing"]},
     }
     try:
-        openai_client.send_omni_request(request_config, request_num=1)
+        openai_client_function.send_omni_request(request_config, request_num=1)
     except Exception as exc:
         assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
     else:
