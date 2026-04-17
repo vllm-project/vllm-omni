@@ -114,7 +114,7 @@ steps:
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_omni.json
             EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json" || true
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
         agents:
           queue: "mithril-h100-pool"
@@ -185,7 +185,7 @@ steps:
             set +e
             pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_tts.json
             EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/*.json" || true
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
         agents:
           queue: "mithril-h100-pool"
@@ -465,8 +465,8 @@ steps:
             EXIT3=$$?
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_layered_vllm_omni.json
             EXIT4=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json" || true
-            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log" || true
+            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
+            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             exit $$((EXIT1 | EXIT2 | EXIT3 | EXIT4))
         agents:
           queue: "mithril-h100-pool"
