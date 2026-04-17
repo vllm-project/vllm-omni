@@ -210,7 +210,15 @@ def run_non_streaming(inputs, sampling_params_list, model_name, args, output_dir
     output_audio_dur = 0.0
 
     for batch_idx, o in enumerate(outputs):
-        audio_tensor = torch.cat(o.multimodal_output["audio"])
+        audio_out = o.multimodal_output["audio"]
+
+        if isinstance(audio_out, torch.Tensor):
+            audio_tensor = audio_out
+        elif isinstance(audio_out, (list, tuple)):
+            audio_tensor = torch.cat(audio_out)
+        else:
+            raise TypeError(f"Unexpected audio output type: {type(audio_out)}")
+
         audio_array = audio_tensor.tolist()
         output_audio_dur += float(len(audio_array)) / 24000
         if args.write_audio:
