@@ -91,13 +91,8 @@ stage_args:
 # Top-level runtime config (concise): default windows and stage edges
 runtime:
   enabled: true
-  defaults:
-    window_size: -1             # Simplified: trigger downstream only after full upstream completion
-    max_inflight: 1             # Simplified: process serially within each stage
   edges:
     - from: 0                   # thinker → talker: trigger only after receiving full input (-1)
       to: 1
-      window_size: -1
     - from: 1                   # talker → code2wav: trigger only after receiving full input (-1)
       to: 2
-      window_size: -1
