@@ -113,6 +113,10 @@ class OmniOpenAIServingVideo:
         if vp.fps is not None:
             gen_params.fps = vp.fps
             gen_params.frame_rate = float(vp.fps)
+        gen_params.enable_frame_interpolation = request.enable_frame_interpolation
+        gen_params.frame_interpolation_exp = request.frame_interpolation_exp
+        gen_params.frame_interpolation_scale = request.frame_interpolation_scale
+        gen_params.frame_interpolation_model_path = request.frame_interpolation_model_path
 
         if request.num_inference_steps is not None:
             gen_params.num_inference_steps = request.num_inference_steps
@@ -160,7 +164,7 @@ class OmniOpenAIServingVideo:
         videos = self._extract_video_outputs(result)
         audios = self._extract_audio_outputs(result, expected_count=len(videos))
         audio_sample_rate = self._resolve_audio_sample_rate(result)
-        output_fps = vp.fps or self._resolve_fps(result) or 24
+        output_fps = (vp.fps or self._resolve_fps(result) or 24) * self._resolve_video_fps_multiplier(result)
         return VideoGenerationArtifacts(
             videos=videos,
             audios=audios,
@@ -242,6 +246,22 @@ class OmniOpenAIServingVideo:
         _t_encode_ms = (time.perf_counter() - _t_encode_start) * 1000
         logger.info("Video response encoding (MP4 bytes): %.2f ms", _t_encode_ms)
         return video_bytes, artifacts.stage_durations, artifacts.peak_memory_mb
+
+    @staticmethod
+    def _resolve_video_fps_multiplier(result: Any) -> int:
+        custom_output = getattr(result, "custom_output", None)
+        if isinstance(custom_output, dict):
+            multiplier = custom_output.get("video_fps_multiplier")
+            if multiplier is not None:
+                return int(multiplier)
+        request_output = getattr(result, "request_output", None)
+        if request_output is not None:
+            custom_output = getattr(request_output, "custom_output", None)
+            if isinstance(custom_output, dict):
+                multiplier = custom_output.get("video_fps_multiplier")
+                if multiplier is not None:
+                    return int(multiplier)
+        return 1
 
     @staticmethod
     def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:

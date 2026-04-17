@@ -307,32 +307,39 @@ class MiniCPM4PagedForVoxCPM2(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
+    def precompute_fused_qkv(self) -> None:
+        """Materialize fused QKV weights before CUDA Graph capture."""
+        for layer in self.layers:
+            attn = layer.self_attn
+            if attn._fused_qkv_weight is None:
+                attn._fused_qkv_weight = torch.cat(
+                    [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight],
+                    dim=0,
+                ).detach()
+
     def compile_selective(self) -> list[str]:
-        """Compile MLP + o_proj; keep RMSNorm/RoPE eager for precision."""
-        compiled: list[str] = []
-        for i, layer in enumerate(self.layers):
-            if i in self._compiled_layers:
-                continue
-            try:
-                layer.mlp = torch.compile(
-                    layer.mlp,
-                    mode="default",
-                    fullgraph=True,
-                )
-                layer.self_attn.o_proj = torch.compile(
-                    layer.self_attn.o_proj,
-                    mode="default",
-                    fullgraph=True,
-                )
-                layer.self_attn._fused_qkv_weight = None
-                self._compiled_layers.add(i)
-                if i == 0:
-                    compiled.append(f"layers.*.mlp (×{len(self.layers)})")
-                    compiled.append(f"layers.*.self_attn.o_proj (×{len(self.layers)})")
-            except Exception as e:
-                logger.warning("compile_selective: layer %d failed: %s", i, e)
-                break
-        return compiled
+        """Compile the full model forward as one graph.
+
+        Earlier versions compiled ``layer.mlp`` + ``layer.self_attn.o_proj``
+        (PR #2690) and then the whole ``layer`` (perf/voxcpm2-streaming-vae).
+        Both still paid one Dynamo dispatch per layer per decode step.
+        V3 profiling showed 1,332 per-layer dispatches (~28 layers × ~47
+        decode steps) costing ~726 ms of CPU self-time for a long prompt.
+
+        Compiling ``forward`` at the model level lets Dynamo unroll the
+        28-layer Python loop inside the graph. Graph breaks at
+        PagedAttention produce sub-graphs but Dynamo memoises the whole
+        trace once, so the per-step dispatch drops from 28 to just a few.
+        """
+        if self._compiled_layers:
+            return []
+        # Null the fused-qkv caches so the compile sees the real weight layout.
+        for layer in self.layers:
+            layer.self_attn._fused_qkv_weight = None
+        self.forward = torch.compile(self.forward, mode="default", fullgraph=False)
+        # Mark every layer as compiled so idempotent callers don't double-wrap.
+        self._compiled_layers.update(range(len(self.layers)))
+        return ["forward (whole model)"]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights from native checkpoint (base_lm. prefix pre-stripped)."""
@@ -414,23 +421,25 @@ class MiniCPM4PagedResidualLM(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
+    def precompute_fused_qkv(self) -> None:
+        """Materialize fused QKV weights before CUDA Graph capture."""
+        for layer in self.layers:
+            attn = layer.self_attn
+            if attn._fused_qkv_weight is None:
+                attn._fused_qkv_weight = torch.cat(
+                    [attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight],
+                    dim=0,
+                ).detach()
+
     def compile_selective(self) -> list[str]:
-        """Compile MLP + o_proj (same as base_lm)."""
-        compiled: list[str] = []
-        for i, layer in enumerate(self.layers):
-            if i in self._compiled_layers:
-                continue
-            try:
-                layer.mlp = torch.compile(layer.mlp, mode="default", fullgraph=True)
-                layer.self_attn.o_proj = torch.compile(layer.self_attn.o_proj, mode="default", fullgraph=True)
-                layer.self_attn._fused_qkv_weight = None
-                self._compiled_layers.add(i)
-                if i == 0:
-                    compiled.append(f"layers.*.mlp (×{len(self.layers)})")
-                    compiled.append(f"layers.*.self_attn.o_proj (×{len(self.layers)})")
-            except Exception as e:
-                logger.warning("compile_selective: residual layer %d failed: %s", i, e)
-        return compiled
+        """Compile the full residual model forward as one graph (same strategy as base_lm)."""
+        if self._compiled_layers:
+            return []
+        for layer in self.layers:
+            layer.self_attn._fused_qkv_weight = None
+        self.forward = torch.compile(self.forward, mode="default", fullgraph=False)
+        self._compiled_layers.update(range(len(self.layers)))
+        return ["forward (whole residual)"]
 
     def load_weights_from_native(self, native_residual_lm: nn.Module) -> int:
         """Load weights from native residual_lm. Returns param count."""

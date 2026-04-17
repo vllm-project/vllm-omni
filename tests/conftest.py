@@ -1,3 +1,4 @@
+import atexit
 import base64
 import datetime
 import io
@@ -1362,9 +1363,10 @@ def modify_stage_config(
                             continue
 
                         # Delete specified paths in this stage
-                        for path in delete_paths:
-                            if path:  # Skip empty paths
-                                delete_by_path(target_stage, path)
+                        # Avoid shadowing the original YAML Path used for the output filename below.
+                        for delete_path in delete_paths:
+                            if delete_path:  # Skip empty paths
+                                delete_by_path(target_stage, delete_path)
             elif "." in key:
                 # Delete using dot-separated path
                 delete_by_path(config, key)
@@ -1394,15 +1396,15 @@ def modify_stage_config(
                             raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
 
                         # Apply updates to this stage
-                        for path, val in stage_updates.items():
+                        for update_path, val in stage_updates.items():
                             # Check if this is a simple key (not dot-separated)
                             # Example: 'engine_input_source' vs 'engine_args.max_model_len'
-                            if "." not in path:
+                            if "." not in update_path:
                                 # Direct key assignment (e.g., updating a list value)
-                                target_stage[path] = val
+                                target_stage[update_path] = val
                             else:
                                 # Dot-separated path (e.g., nested dict access)
-                                apply_update(target_stage, path, val)
+                                apply_update(target_stage, update_path, val)
             elif "." in key:
                 # Apply using dot-separated path
                 apply_update(config, key, value)
@@ -1414,13 +1416,14 @@ def modify_stage_config(
     # within the same second (e.g. test_qwen3_omni_expansion imports both
     # get_chunk_config and get_batch_token_config). int(time.time()) would collide
     # and the later write would overwrite the earlier YAML on disk.
-    base_name = yaml_path.rsplit(".", 1)[0] if "." in yaml_path else yaml_path
-    output_path = f"{base_name}_{time.time_ns()}.yaml"
+    # Keep generated configs outside the repo and delete them when pytest exits.
+    output_fd, output_path = tempfile.mkstemp(prefix=f"{path.stem}_", suffix=".yaml")
+    atexit.register(Path(output_path).unlink, missing_ok=True)
 
-    with open(output_path, "w", encoding="utf-8") as f:
+    with os.fdopen(output_fd, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=None, sort_keys=False, allow_unicode=True, indent=2)
 
-    return output_path
+    return str(output_path)
 
 
 class OmniServer:
@@ -1847,6 +1850,7 @@ class OmniResponse:
     e2e_latency: float | None = None
     success: bool = False
     error_message: str | None = None
+    cached_tokens: int | None = None
 
 
 @dataclass
@@ -2342,6 +2346,11 @@ class OpenAIClientHandler:
                 if hasattr(choice.message, "content") and choice.message.content is not None:
                     text_content = choice.message.content
 
+            # Extract cached_tokens for prefix caching tests
+            usage = getattr(chat_completion, "usage", None)
+            if usage and (details := getattr(usage, "prompt_tokens_details", None)):
+                result.cached_tokens = details.cached_tokens
+
             # Calculate end-to-end latency
             result.e2e_latency = time.perf_counter() - start_time
 
@@ -2394,7 +2403,7 @@ class OpenAIClientHandler:
                                 image_url = item.get("image_url", {}).get("url")
                             else:
                                 image_url_obj = getattr(item, "image_url", None)
-                                image_url = hasattr(image_url_obj, "url", None) if image_url_obj else None
+                                image_url = getattr(image_url_obj, "url", None) if image_url_obj else None
                             if image_url and image_url.startswith("data:image"):
                                 b64_data = image_url.split(",", 1)[1]
                                 img = decode_b64_image(b64_data)
@@ -2700,7 +2709,7 @@ class OpenAIClientHandler:
 
         return responses
 
-    def send_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+    def send_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[DiffusionResponse]:
         """
         Send OpenAI requests for diffusion models.
 
@@ -2708,9 +2717,9 @@ class OpenAIClientHandler:
             request_config: Request configuration dictionary containing parameters like model, messages
             request_num: Number of requests to send concurrently, defaults to 1 (single request)
         Returns:
-            List[OmniResponse]: List of response objects
+            List[DiffusionResponse]: List of response objects
         """
-        responses = []
+        responses: list[DiffusionResponse] = []
         stream = request_config.get("stream", False)
         modalities = request_config.get("modalities", omit)  # Most diffusion models don't require modalities param
         extra_body = request_config.get("extra_body", None)

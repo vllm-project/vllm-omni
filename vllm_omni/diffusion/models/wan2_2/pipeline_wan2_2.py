@@ -26,14 +26,19 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_z
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
+from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.prompt_utils import (
+    validate_prompt_sequence_lengths,
+)
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 DEBUG_PERF = False
 WAN_SAMPLE_SOLVER_CHOICES = {"unipc", "euler"}
+WAN22_MAX_SEQUENCE_LENGTH = 512
 
 
 def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
@@ -162,10 +167,23 @@ def get_wan22_post_process_func(
     def post_process_func(
         video: torch.Tensor,
         output_type: str = "np",
+        sampling_params=None,
     ):
         if output_type == "latent":
             return video
-        return video_processor.postprocess_video(video, output_type=output_type)
+        custom_output = {}
+        if sampling_params is not None and getattr(sampling_params, "enable_frame_interpolation", False):
+            video, multiplier = interpolate_video_tensor(
+                video,
+                exp=sampling_params.frame_interpolation_exp,
+                scale=sampling_params.frame_interpolation_scale,
+                model_path=sampling_params.frame_interpolation_model_path,
+            )
+            custom_output["video_fps_multiplier"] = multiplier
+        return {
+            "video": video_processor.postprocess_video(video, output_type=output_type),
+            "custom_output": custom_output,
+        }
 
     return post_process_func
 
@@ -275,6 +293,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
                 pass
 
         self.boundary_ratio = od_config.boundary_ratio
+        self.tokenizer_max_length = WAN22_MAX_SEQUENCE_LENGTH
 
         # Determine which transformers to load based on boundary_ratio
         # boundary_ratio=1.0: only load transformer_2 (low-noise stage only)
@@ -450,6 +469,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
             negative_prompt_embeds=negative_prompt_embeds,
             guidance_scale_2=guidance_high if boundary_ratio is not None else None,
             boundary_ratio=boundary_ratio,
+            max_sequence_length=req.sampling_params.max_sequence_length or self.tokenizer_max_length,
         )
 
         if num_frames % self.vae_scale_factor_temporal != 1:
@@ -483,7 +503,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
                 negative_prompt=negative_prompt,
                 do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
                 num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
-                max_sequence_length=req.sampling_params.max_sequence_length or 512,
+                max_sequence_length=req.sampling_params.max_sequence_length or self.tokenizer_max_length,
                 device=device,
                 dtype=dtype,
             )
@@ -787,6 +807,20 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         prompt = [prompt] if isinstance(prompt, str) else prompt
         prompt_clean = [self._prompt_clean(p) for p in prompt]
         batch_size = len(prompt_clean)
+        text_inputs_untruncated = self.tokenizer(
+            prompt_clean,
+            padding=True,
+            truncation=False,
+            add_special_tokens=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        validate_prompt_sequence_lengths(
+            text_inputs_untruncated.attention_mask,
+            max_sequence_length=max_sequence_length,
+            supported_max_sequence_length=self.tokenizer_max_length,
+            error_context="for Wan2.2 text encoding",
+        )
 
         text_inputs = self.tokenizer(
             prompt_clean,
@@ -815,8 +849,24 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         if do_classifier_free_guidance:
             negative_prompt = negative_prompt or ""
             negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+            negative_prompt_clean = [self._prompt_clean(p) for p in negative_prompt]
+            neg_text_inputs_untruncated = self.tokenizer(
+                negative_prompt_clean,
+                padding=True,
+                truncation=False,
+                add_special_tokens=True,
+                return_attention_mask=True,
+                return_tensors="pt",
+            )
+            validate_prompt_sequence_lengths(
+                neg_text_inputs_untruncated.attention_mask,
+                max_sequence_length=max_sequence_length,
+                supported_max_sequence_length=self.tokenizer_max_length,
+                prompt_name="negative_prompt",
+                error_context="for Wan2.2 text encoding",
+            )
             neg_text_inputs = self.tokenizer(
-                [self._prompt_clean(p) for p in negative_prompt],
+                negative_prompt_clean,
                 padding="max_length",
                 max_length=max_sequence_length,
                 truncation=True,
@@ -888,6 +938,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         negative_prompt_embeds=None,
         guidance_scale_2=None,
         boundary_ratio=None,
+        max_sequence_length=None,
     ):
         if height % 16 != 0 or width % 16 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 16 but are {height} and {width}.")
@@ -913,6 +964,11 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
             not isinstance(negative_prompt, str) and not isinstance(negative_prompt, list)
         ):
             raise ValueError(f"`negative_prompt` has to be of type `str` or `list` but is {type(negative_prompt)}")
+
+        if max_sequence_length is not None and max_sequence_length > self.tokenizer_max_length:
+            raise ValueError(
+                f"`max_sequence_length` cannot be greater than {self.tokenizer_max_length} but is {max_sequence_length}"
+            )
 
         if boundary_ratio is None and guidance_scale_2 is not None:
             raise ValueError("`guidance_scale_2` is only supported when `boundary_ratio` is set.")

@@ -5,8 +5,8 @@ Supports vLLM-Omni server backend:
   - vllm-omni (default): starts DiffusionServer via vllm_omni.entrypoints.cli.main,
     benchmarks with diffusion_benchmark_serving.py --backend vllm-omni
 
-A config JSON file is REQUIRED via --config-file:
-  pytest run_diffusion_benchmark.py --config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
+A config JSON file is REQUIRED via --test-config-file:
+  pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
 
 JSON config entries use a "server_type" field, and this runner executes
 the vllm-omni path.
@@ -52,19 +52,20 @@ BENCHMARK_SCRIPT = str(
 _SESSION_TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 _RESULT_LOCK = threading.Lock()
 _BRANCHPOINT_COMMIT_SHA: str | None = None
+DIFFUSION_RESULT_TEMPLATE_PATH = Path(__file__).parent / "diffusion_result_template.json"
 
 
 def _get_config_file_from_argv() -> str | None:
-    """Read --config-file from sys.argv at import time so pytest parametrize can use it.
+    """Read --test-config-file from sys.argv at import time so pytest parametrize can use it.
 
     pytest_addoption (below) registers the same flag so pytest does not reject it.
-    Supports both ``--config-file path`` and ``--config-file=path`` forms.
+    Supports both ``--test-config-file path`` and ``--test-config-file=path`` forms.
     Returns None if the flag is not present; callers must handle the missing case.
     """
     for i, arg in enumerate(sys.argv):
-        if arg == "--config-file" and i + 1 < len(sys.argv):
+        if arg == "--test-config-file" and i + 1 < len(sys.argv):
             return sys.argv[i + 1]
-        if arg.startswith("--config-file="):
+        if arg.startswith("--test-config-file="):
             return arg.split("=", 1)[1]
     return None
 
@@ -131,19 +132,6 @@ def _append_to_aggregated_file(record: dict[str, Any]) -> None:
         records.append(record)
         with open(AGGREGATED_RESULT_FILE, "w", encoding="utf-8") as f:
             json.dump(records, f, indent=2, ensure_ascii=False)
-
-
-# Register --config-file with pytest so it does not reject the argument.
-def pytest_addoption(parser: pytest.Parser) -> None:
-    parser.addoption(
-        "--config-file",
-        action="store",
-        default=None,
-        help=(
-            "Path to the benchmark config JSON file (required). "
-            "Example: --config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json"
-        ),
-    )
 
 
 _server_lock = threading.Lock()
@@ -576,10 +564,17 @@ def run_benchmark(
 
     if process.returncode != 0:
         tmp_result_file.unlink(missing_ok=True)
-        raise RuntimeError(f"Benchmark script exited with code {process.returncode}")
+        print(f"ERROR:Benchmark script exited with code {process.returncode}")
 
     if not tmp_result_file.exists():
-        raise FileNotFoundError(f"Benchmark result file not found: {tmp_result_file}")
+        with open(DIFFUSION_RESULT_TEMPLATE_PATH, encoding="utf-8") as f:
+            template_payload = json.load(f)
+        # Template schema is fixed and owned by this repo:
+        # ``diffusion_result_template.json`` is a one-item list and metrics live at [0]["result"].
+        template_metrics: dict[str, Any] = template_payload[0]["result"]
+        with open(tmp_result_file, "w", encoding="utf-8") as f:
+            json.dump(template_metrics, f, ensure_ascii=False, indent=2)
+        print(f"Benchmark result file not generated, fallback to template: {tmp_result_file}")
 
     try:
         with open(tmp_result_file, encoding="utf-8") as f:

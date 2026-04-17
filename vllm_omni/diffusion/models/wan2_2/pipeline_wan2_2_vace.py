@@ -187,6 +187,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         video=None,
         mask=None,
         reference_images=None,
+        max_sequence_length=None,
     ):
         super().check_inputs(
             prompt=prompt,
@@ -195,6 +196,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             width=width,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
+            max_sequence_length=max_sequence_length,
         )
 
         # VACE-specific: validate video/mask/reference_images consistency
@@ -491,6 +493,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
             video=source_video,
             mask=source_mask,
             reference_images=reference_images,
+            max_sequence_length=req.sampling_params.max_sequence_length or self.tokenizer_max_length,
         )
 
         device = self.device
@@ -509,7 +512,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
                 negative_prompt=negative_prompt,
                 do_classifier_free_guidance=guidance_scale > 1.0,
                 num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
-                max_sequence_length=req.sampling_params.max_sequence_length or 512,
+                max_sequence_length=req.sampling_params.max_sequence_length or self.tokenizer_max_length,
                 device=device,
                 dtype=dtype,
             )

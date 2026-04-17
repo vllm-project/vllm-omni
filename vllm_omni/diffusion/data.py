@@ -666,6 +666,49 @@ class OmniDiffusionConfig:
     def update_multimodal_support(self) -> None:
         self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
 
+    def enrich_config(self) -> None:
+        """Load model metadata from HuggingFace and populate config fields.
+
+        Diffusers-style models expose ``model_index.json`` with ``_class_name``.
+        Non-diffusers models (e.g. Bagel, NextStep) only have ``config.json``,
+        so we fall back to reading that and mapping model_type manually.
+        """
+        from vllm.transformers_utils.config import get_hf_file_to_dict
+
+        try:
+            config_dict = get_hf_file_to_dict("model_index.json", self.model)
+            if config_dict is not None:
+                if self.model_class_name is None:
+                    self.model_class_name = config_dict.get("_class_name", None)
+                self.update_multimodal_support()
+
+                tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model)
+                self.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+            else:
+                raise FileNotFoundError("model_index.json not found")
+        except (AttributeError, OSError, ValueError, FileNotFoundError):
+            cfg = get_hf_file_to_dict("config.json", self.model)
+            if cfg is None:
+                raise ValueError(f"Could not find config.json or model_index.json for model {self.model}")
+
+            self.tf_model_config = TransformerConfig.from_dict(cfg)
+            model_type = cfg.get("model_type")
+            architectures = cfg.get("architectures") or []
+
+            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                self.model_class_name = "BagelPipeline"
+                self.tf_model_config = TransformerConfig()
+                self.update_multimodal_support()
+            elif model_type == "nextstep":
+                if self.model_class_name is None:
+                    self.model_class_name = "NextStep11Pipeline"
+                self.tf_model_config = TransformerConfig()
+                self.update_multimodal_support()
+            elif architectures and len(architectures) == 1:
+                self.model_class_name = architectures[0]
+            else:
+                raise
+
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
         # Backwards-compatibility: older callers may use a diffusion-specific

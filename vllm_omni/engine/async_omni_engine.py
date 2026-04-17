@@ -61,6 +61,7 @@ from vllm_omni.engine.stage_engine_startup import (
 )
 from vllm_omni.engine.stage_init_utils import (
     StartedLlmStage,
+    _inject_inferred_kv_tp_topology,
     acquire_device_locks,
     build_diffusion_config,
     build_engine_args_dict,
@@ -78,7 +79,10 @@ from vllm_omni.engine.stage_init_utils import (
     setup_stage_devices,
     terminate_alive_proc,
 )
-from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
+from vllm_omni.entrypoints.utils import (
+    inject_omni_kv_config,
+    load_and_resolve_stage_configs,
+)
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.platforms import current_omni_platform
 
@@ -378,6 +382,12 @@ class AsyncOmniEngine:
                             omni_kv["omni_to_stage"] = omni_to
                             omni_kv.setdefault("stage_id", metadata.stage_id)
                             engine_args_dict["omni_kv_config"] = omni_kv
+                        if self.stage_configs:
+                            _inject_inferred_kv_tp_topology(
+                                engine_args_dict.get("omni_kv_config"),
+                                metadata.stage_id,
+                                self.stage_configs,
+                            )
                         vllm_config, executor_class = build_vllm_config(
                             stage_cfg,
                             self.model,
@@ -752,10 +762,8 @@ class AsyncOmniEngine:
                                 setup_stage_devices(configured_stage_id, metadata.runtime_cfg)
                                 omni_conn_cfg, omni_from, omni_to = omni_kv_connector
                                 if omni_conn_cfg:
-                                    from vllm_omni.entrypoints.utils import inject_omni_kv_config
-
                                     inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                                inject_kv_stage_info(stage_cfg, configured_stage_id)
+                                inject_kv_stage_info(stage_cfg, configured_stage_id, self.stage_configs)
                                 if self.single_stage_mode:
                                     assert self._omni_master_server is not None
                                     stage_clients[stage_idx] = self._launch_diffusion_stage(
@@ -764,12 +772,14 @@ class AsyncOmniEngine:
                                         self._omni_master_server,
                                     )
                                 else:
+                                    use_inline = True if self.num_stages == 1 else False
                                     stage_clients[stage_idx] = initialize_diffusion_stage(
                                         self.model,
                                         stage_cfg,
                                         metadata,
                                         stage_init_timeout=stage_init_timeout,
                                         batch_size=self.diffusion_batch_size,
+                                        use_inline=use_inline,
                                     )
                                 logger.info(
                                     "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
@@ -1073,7 +1083,6 @@ class AsyncOmniEngine:
                 params=companion_params,
                 supported_tasks=self.supported_tasks,
             )
-            request = _upgrade_to_omni_request(request, companion_prompt)
             request.external_req_id = cid
 
             self.output_processors[0].add_request(
@@ -1139,6 +1148,16 @@ class AsyncOmniEngine:
         # We temporally create a default config for diffusion stage.
         # In the future, we should merge the default config with the user-provided config.
         normalized_kwargs = dict(kwargs)
+        default_sampling_params = normalized_kwargs.get("default_sampling_params")
+        if isinstance(default_sampling_params, str):
+            try:
+                default_sampling_params = json.loads(default_sampling_params)
+            except json.JSONDecodeError:
+                logger.warning("Invalid default_sampling_params JSON, ignoring stage defaults.")
+                default_sampling_params = None
+        if not isinstance(default_sampling_params, dict):
+            default_sampling_params = None
+        stage_default_sampling_params = default_sampling_params.get("0", {}) if default_sampling_params else {}
 
         # TODO: hack, convert dtype to string to avoid non-premitive omegaconf create error.
         if "dtype" in normalized_kwargs and not isinstance(normalized_kwargs["dtype"], str):
@@ -1235,6 +1254,7 @@ class AsyncOmniEngine:
                     "devices": devices,
                 },
                 "engine_args": stage_engine_args,
+                "default_sampling_params": stage_default_sampling_params,
                 "final_output": True,
                 "final_output_type": "image",
             }
