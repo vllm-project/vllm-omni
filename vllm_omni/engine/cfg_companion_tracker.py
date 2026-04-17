@@ -70,9 +70,13 @@ class CfgCompanionTracker:
         parent_id = self._companion_to_parent.get(companion_id)
         if parent_id is None:
             return None
-        if companion_id in self._done.get(parent_id, set()):
+        done_set = self._done.get(parent_id)
+        assert done_set is not None, (
+            f"Companion {companion_id} completed before parent {parent_id} was registered"
+        )
+        if companion_id in done_set:
             return None
-        self._done[parent_id].add(companion_id)
+        done_set.add(companion_id)
         logger.debug("CFG companion %s completed (parent=%s)", companion_id, parent_id)
         if parent_id in self._pending_parents and self.all_companions_done(parent_id):
             return parent_id
@@ -80,6 +84,9 @@ class CfgCompanionTracker:
 
     def defer_parent(self, parent_id: str, engine_outputs: Any, stage_id: int) -> None:
         """Hold parent result while waiting for companions to finish."""
+        # TODO: Add timeout/error recovery when the orchestrator grows a
+        # companion-failure path. Today deferred parents are released only when
+        # companions finish or the external layer aborts the request.
         self._pending_parents[parent_id] = {
             "engine_outputs": engine_outputs,
             "stage_id": stage_id,
@@ -104,6 +111,9 @@ class CfgCompanionTracker:
         parents_to_cleanup: set[str] = set()
 
         for req_id in request_ids:
+            # The orchestrator calls this with parent request IDs. If a raw
+            # companion ID is passed here, keep it as a direct abort target and
+            # avoid tearing down parent tracking state implicitly.
             if req_id not in self._companion_ids:
                 parents_to_cleanup.add(req_id)
 

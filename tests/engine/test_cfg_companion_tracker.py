@@ -71,3 +71,12 @@ def test_companion_completion_flushes_deferred_parent():
     assert popped is not None
     assert popped["engine_outputs"] == {"out": 123}
     assert popped["stage_id"] == 0
+
+
+def test_companion_completion_without_registered_parent_asserts():
+    tracker = CfgCompanionTracker()
+    tracker._companion_ids.add("req1__cfg_text")
+    tracker._companion_to_parent["req1__cfg_text"] = "req1"
+
+    with pytest.raises(AssertionError, match="completed before parent req1 was registered"):
+        tracker.on_companion_completed("req1__cfg_text")
