@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-from .helpers import (
+from tests.dfx.stability.helpers import (
     finalize_resource_monitor,
     report_latest_gpu_samples,
     start_resource_monitor,
