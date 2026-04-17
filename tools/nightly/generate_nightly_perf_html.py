@@ -17,7 +17,7 @@ from typing import Any
 LOGGER = logging.getLogger(__name__)
 
 _RESULT_JSON_PREFIX = "result_test_"
-_DIFFUSION_JSON_PREFIX = "diffusion_perf_"
+_DIFFUSION_JSON_PREFIXES = ("diffusion_perf_", "diffusion_result_")
 DEFAULT_INPUT_DIR = os.getenv("DEFAULT_INPUT_DIR") or "tests"
 DEFAULT_OUTPUT_DIR = os.getenv("DEFAULT_OUTPUT_DIR") or "tests"
 DEFAULT_DIFFUSION_INPUT_DIR = os.getenv("DIFFUSION_BENCHMARK_DIR")
@@ -51,7 +51,7 @@ def _default_diffusion_input_dir(input_dir: str) -> str:
     return DEFAULT_DIFFUSION_INPUT_DIR if DEFAULT_DIFFUSION_INPUT_DIR else input_dir
 
 
-def _load_json_file(path: str) -> dict[str, Any] | None:
+def _load_json_file(path: str) -> dict[str, Any] | list[Any] | None:
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
@@ -59,8 +59,8 @@ def _load_json_file(path: str) -> dict[str, Any] | None:
         LOGGER.warning("failed to load json '%s': %s", path, exc)
         return None
 
-    if not isinstance(data, dict):
-        LOGGER.warning("json root in '%s' is not an object, skip", path)
+    if not isinstance(data, (dict, list)):
+        LOGGER.warning("json root in '%s' is not an object or list, skip", path)
         return None
 
     return data
@@ -170,9 +170,10 @@ def _iter_omni_json_records(input_dir: str) -> Iterable[dict[str, Any]]:
 
 def _parse_diffusion_from_filename(filename: str) -> dict[str, Any]:
     name, ext = os.path.splitext(filename)
-    if ext != ".json" or not name.startswith(_DIFFUSION_JSON_PREFIX):
+    if ext != ".json" or not any(name.startswith(prefix) for prefix in _DIFFUSION_JSON_PREFIXES):
         return {}
-    core = name[len(_DIFFUSION_JSON_PREFIX) :]
+    matched_prefix = next(prefix for prefix in _DIFFUSION_JSON_PREFIXES if name.startswith(prefix))
+    core = name[len(matched_prefix) :]
     parts = core.split("_")
     if len(parts) < 2:
         return {}
@@ -195,7 +196,7 @@ def _iter_diffusion_json_records(input_dir: str) -> Iterable[dict[str, Any]]:
         return
 
     for entry in sorted(os.listdir(input_dir)):
-        if not entry.endswith(".json") or not entry.startswith(_DIFFUSION_JSON_PREFIX):
+        if not entry.endswith(".json") or not any(entry.startswith(prefix) for prefix in _DIFFUSION_JSON_PREFIXES):
             continue
         full_path = os.path.join(input_dir, entry)
         if not os.path.isfile(full_path):
@@ -204,17 +205,32 @@ def _iter_diffusion_json_records(input_dir: str) -> Iterable[dict[str, Any]]:
         if data is None:
             continue
 
-        record: dict[str, Any] = dict(data)
         filename_meta = _parse_diffusion_from_filename(os.path.basename(full_path))
-        if "date" not in record or not record.get("date"):
-            record["date"] = filename_meta.get("date") or datetime.now(
-                timezone.utc,
-            ).strftime("%Y%m%d-%H%M%S")
-        if "test_name" not in record or not record.get("test_name"):
-            if "test_name" in filename_meta:
-                record["test_name"] = filename_meta["test_name"]
-        record["source_file"] = os.path.basename(full_path)
-        yield record
+        if isinstance(data, dict):
+            records = [data]
+        elif isinstance(data, list):
+            records = [r for r in data if isinstance(r, dict)]
+        else:
+            records = []
+
+        if not records:
+            LOGGER.warning("diffusion json '%s' has no valid records, skip", full_path)
+            continue
+
+        for record in records:
+            flat: dict[str, Any] = dict(record)
+            result = flat.pop("result", None)
+            if isinstance(result, dict):
+                flat.update(result)
+            if "date" not in flat or not flat.get("date"):
+                flat["date"] = filename_meta.get("date") or datetime.now(
+                    timezone.utc,
+                ).strftime("%Y%m%d-%H%M%S")
+            if "test_name" not in flat or not flat.get("test_name"):
+                if "test_name" in filename_meta:
+                    flat["test_name"] = filename_meta["test_name"]
+            flat["source_file"] = os.path.basename(full_path)
+            yield flat
 
 
 def _collect_omni_records(input_dir: str) -> list[dict[str, Any]]:
