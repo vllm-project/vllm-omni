@@ -31,7 +31,12 @@ from vllm_omni.diffusion.registry import (
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
+from vllm_omni.diffusion.sched import (
+    RequestScheduler,
+    SchedulerInterface,
+    StepScheduler,
+    StreamBatchScheduler,
+)
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -138,9 +143,18 @@ class DiffusionEngine:
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
         self.step_execution = bool(getattr(od_config, "step_execution", False))
-        self.scheduler: SchedulerInterface = scheduler or (
-            StepScheduler() if self.step_execution else RequestScheduler()
-        )
+        self.stream_batch = bool(getattr(od_config, "stream_batch", False))
+        if self.stream_batch and not self.step_execution:
+            raise ValueError("stream_batch=True requires step_execution=True.")
+
+        if scheduler is not None:
+            self.scheduler: SchedulerInterface = scheduler
+        elif self.stream_batch:
+            self.scheduler = StreamBatchScheduler()
+        elif self.step_execution:
+            self.scheduler = StepScheduler()
+        else:
+            self.scheduler = RequestScheduler()
         self.scheduler.initialize(od_config)
         if self.scheduler.max_num_running_reqs > 1 and not self.step_execution:
             max_num_seqs = self.scheduler.max_num_running_reqs
