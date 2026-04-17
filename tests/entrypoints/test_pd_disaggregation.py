@@ -14,8 +14,8 @@ without spinning up a real engine.
 import uuid
 import warnings
 from queue import Empty, Queue
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 from vllm import SamplingParams
@@ -30,6 +30,11 @@ warnings.filterwarnings(
     message=r"builtin type SwigPy.*has no __module__ attribute",
     category=DeprecationWarning,
 )
+
+
+def _ns(**kwargs):
+    """Create a lightweight attribute object for tests."""
+    return SimpleNamespace(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -119,11 +124,12 @@ class _FakeStage:
     def init_stage_worker(
         self, model: str, *, is_async=False, shm_threshold_bytes=65536, ctx=None, batch_timeout=10, **kwargs
     ):
-        self._proc = MagicMock()
-        self._proc.start = MagicMock()
-        self._proc.join = MagicMock()
-        self._proc.is_alive = MagicMock(return_value=False)
-        self._proc.terminate = MagicMock()
+        self._proc = _ns(
+            start=lambda: None,
+            join=lambda timeout=None: None,
+            is_alive=lambda: False,
+            terminate=lambda: None,
+        )
         if self._out_q is not None:
             try:
                 self._out_q.put_nowait({"type": "stage_ready", "stage_id": self.stage_id})
@@ -162,17 +168,17 @@ class _FakeStage:
 
 
 def _setup_engine_mocks(monkeypatch):
-    fake_engine = MagicMock()
-    fake_engine.tokenizer = MagicMock()
+    fake_engine = _ns()
+    fake_engine.tokenizer = _ns()
     fake_engine.log_stats = False
-    fake_engine.vllm_config = MagicMock()
-    fake_engine.vllm_config.model_config = MagicMock()
+    fake_engine.vllm_config = _ns()
+    fake_engine.vllm_config.model_config = _ns()
     fake_engine.vllm_config.model_config.io_processor_plugin = None
-    fake_engine.get_supported_tasks = MagicMock(return_value=[])
-    fake_engine.model_config = MagicMock()
+    fake_engine.get_supported_tasks = lambda: []
+    fake_engine.model_config = _ns()
     fake_engine.model_config.io_processor_plugin = None
-    fake_registry = MagicMock()
-    fake_registry.resolve_model_cls = MagicMock(return_value=(MagicMock(), "test_arch"))
+    fake_registry = _ns()
+    fake_registry.resolve_model_cls = lambda *args, **kwargs: (_ns(), "test_arch")
     fake_engine.model_config.registry = fake_registry
     fake_engine.vllm_config.model_config.registry = fake_registry
 
@@ -215,15 +221,17 @@ def _setup_engine_mocks(monkeypatch):
 def _setup_multiprocessing_mocks(monkeypatch):
     import multiprocessing as mp
 
-    fake_process_class = MagicMock()
-    fake_process_instance = MagicMock()
-    fake_process_instance.start = MagicMock()
-    fake_process_instance.join = MagicMock()
-    fake_process_instance.is_alive = MagicMock(return_value=False)
-    fake_process_instance.terminate = MagicMock()
-    fake_process_class.return_value = fake_process_instance
+    fake_process_instance = _ns(
+        start=lambda: None,
+        join=lambda timeout=None: None,
+        is_alive=lambda: False,
+        terminate=lambda: None,
+    )
 
-    fake_ctx = MagicMock()
+    def fake_process_class(*args, **kwargs):
+        return fake_process_instance
+
+    fake_ctx = _ns()
     fake_ctx.Queue = lambda maxsize=0: _FakeQueue(maxsize=maxsize)
     fake_ctx.Process = fake_process_class
 
@@ -299,9 +307,9 @@ def mock_get_config(monkeypatch):
     """Auto-mock get_config and related model loading functions."""
     import sys
 
-    fake_tokenizer = MagicMock()
-    fake_tokenizer.encode = MagicMock(return_value=[1, 2, 3])
-    fake_tokenizer.decode = MagicMock(return_value="test")
+    fake_tokenizer = _ns()
+    fake_tokenizer.encode = lambda *args, **kwargs: [1, 2, 3]
+    fake_tokenizer.decode = lambda *args, **kwargs: "test"
 
     def _mock_init_tokenizer_from_configs(model_config=None, **kwargs):
         return fake_tokenizer
@@ -345,7 +353,7 @@ def mock_get_config(monkeypatch):
     if async_omni_path in sys.modules:
         setattr(sys.modules[async_omni_path], "init_tokenizer_from_configs", _mock_init_tokenizer_from_configs)
 
-    fake_hf_config = MagicMock()
+    fake_hf_config = _ns()
     fake_hf_config.model_type = "qwen2_5_omni"
 
     monkeypatch.setattr(
@@ -746,7 +754,7 @@ class TestSamplingParamsAutoDuplication:
             omni.stage_list[i]._out_q.put_nowait(
                 {
                     "request_id": expected_rid,
-                    "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1, 2])])],
+                    "engine_outputs": [_ns(request_id=expected_rid, outputs=[_ns(token_ids=[1, 2])])],
                     "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
                 }
             )
@@ -892,14 +900,14 @@ class TestPDRouting:
         omni.stage_list[0]._out_q.put_nowait(
             {
                 "request_id": expected_rid,
-                "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1])])],
+                "engine_outputs": [_ns(request_id=expected_rid, outputs=[_ns(token_ids=[1])])],
                 "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
             }
         )
         omni.stage_list[1]._out_q.put_nowait(
             {
                 "request_id": expected_rid,
-                "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1, 2, 3])])],
+                "engine_outputs": [_ns(request_id=expected_rid, outputs=[_ns(token_ids=[1, 2, 3])])],
                 "metrics": {"num_tokens_out": 3, "stage_gen_time_ms": 50.0},
             }
         )
@@ -939,14 +947,14 @@ class TestPDRouting:
         omni.stage_list[0]._out_q.put_nowait(
             {
                 "request_id": expected_rid,
-                "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1])])],
+                "engine_outputs": [_ns(request_id=expected_rid, outputs=[_ns(token_ids=[1])])],
                 "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
             }
         )
         omni.stage_list[1]._out_q.put_nowait(
             {
                 "request_id": expected_rid,
-                "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1, 2, 3])])],
+                "engine_outputs": [_ns(request_id=expected_rid, outputs=[_ns(token_ids=[1, 2, 3])])],
                 "metrics": {"num_tokens_out": 3, "stage_gen_time_ms": 50.0},
             }
         )
@@ -987,14 +995,14 @@ class TestPDRouting:
         omni.stage_list[0]._out_q.put_nowait(
             {
                 "request_id": expected_rid,
-                "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1])])],
+                "engine_outputs": [_ns(request_id=expected_rid, outputs=[_ns(token_ids=[1])])],
                 "metrics": {"num_tokens_out": 1, "stage_gen_time_ms": 10.0},
             }
         )
         omni.stage_list[1]._out_q.put_nowait(
             {
                 "request_id": expected_rid,
-                "engine_outputs": [MagicMock(request_id=expected_rid, outputs=[MagicMock(token_ids=[1, 2, 3])])],
+                "engine_outputs": [_ns(request_id=expected_rid, outputs=[_ns(token_ids=[1, 2, 3])])],
                 "metrics": {"num_tokens_out": 3, "stage_gen_time_ms": 50.0},
             }
         )
