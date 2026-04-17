@@ -120,11 +120,7 @@ class VoiceCacheManager:
         self._speaker_locks: dict[str, asyncio.Lock] = {}
 
     def _get_speaker_lock(self, speaker_key: str) -> asyncio.Lock:
-        lock = self._speaker_locks.get(speaker_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._speaker_locks[speaker_key] = lock
-        return lock
+        return self._speaker_locks.setdefault(speaker_key, asyncio.Lock())
 
     @staticmethod
     def cache_file_path_for_speaker(speaker_info: dict[str, Any]) -> Path | None:
@@ -136,8 +132,16 @@ class VoiceCacheManager:
             return Path(file_path).with_suffix(".safetensors")
         return None
 
-    def invalidate_speaker_prompt_cache(self, speaker_key: str) -> None:
+    def invalidate_speaker_prompt_cache(self, speaker_key: str, *, remove_lock: bool = False) -> None:
+        """Clear memoized prompt data, optionally removing the per-speaker lock.
+
+        Locks are kept during rebuild invalidation so concurrent cache requests
+        continue to serialize on the same lock. Deletion paths may remove the
+        lock after the speaker is no longer addressable.
+        """
         self._speaker_prompt_cache.pop(speaker_key, None)
+        if remove_lock:
+            self._speaker_locks.pop(speaker_key, None)
 
     def load_cached_speaker_prompt(self, speaker_name: str, speaker_info: dict[str, Any]) -> dict[str, Any] | None:
         speaker_key = speaker_name.lower()
@@ -186,6 +190,12 @@ class VoiceCacheManager:
         audio_file_path: Path,
         payload: dict[str, Any],
     ) -> bool:
+        """Persist a speaker prompt cache and update in-memory state.
+
+        The caller must hold the per-speaker async lock. After the cache file
+        is atomically replaced, this method mutates ``speaker_info`` in place
+        and warms ``_speaker_prompt_cache`` for subsequent requests.
+        """
         try:
             import torch
             from safetensors.torch import save_file

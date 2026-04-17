@@ -1187,7 +1187,7 @@ async def create_voice_cache(
             status_code=HTTPStatus.BAD_REQUEST.value,
         )
     except Exception as e:
-        logger.exception(f"Failed to create voice cache for '{name}': {e}")
+        logger.exception("Failed to create voice cache for '%s': %s", name, e)
         return JSONResponse(
             content={"success": False, "error": f"Internal error: {str(e)}"},
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,

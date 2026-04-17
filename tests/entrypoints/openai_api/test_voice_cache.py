@@ -399,9 +399,11 @@ class TestAudioPromptCache:
         server.uploaded_speakers = {"v": info}
         server.supported_speakers = {"v"}
         server._speaker_cache_manager._speaker_prompt_cache["v"] = _cached_prompt_payload()
+        server._speaker_cache_manager._speaker_locks["v"] = asyncio.Lock()
 
         assert asyncio.run(server.delete_voice("v")) is True
         assert "v" not in server._speaker_cache_manager._speaker_prompt_cache
+        assert "v" not in server._speaker_cache_manager._speaker_locks
 
 
 # ── RPC payload extraction tests ──

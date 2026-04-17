@@ -1330,6 +1330,15 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 return raw[0]
             return None
 
+        def _normalize_ref_code_payload(raw: object) -> object:
+            if isinstance(raw, list) and len(raw) == 1 and isinstance(raw[0], (torch.Tensor, np.ndarray)):
+                # Preserve compatibility with older internal payloads that
+                # wrapped tensor/ndarray ref_code in a singleton list. Do not
+                # unwrap Python list payloads: a one-frame ref_code is also a
+                # valid list with len == 1.
+                return raw[0]
+            return raw
+
         if task_type == "Base":
             # Base supports voice clone prompt with in-context mode.
             xvec_only = bool((info_dict.get("x_vector_only_mode") or [False])[0])
@@ -1365,7 +1374,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 # Keep the full ref_code payload. For cached prompts this may be
                 # a 2D Python list (frames x quantizers), and unwrapping it as a
                 # singleton would silently drop all but the first frame.
-                ref_code = voice_clone_prompt.get("ref_code")
+                ref_code = _normalize_ref_code_payload(voice_clone_prompt.get("ref_code"))
             ref_code_t = None
             if isinstance(ref_code, torch.Tensor):
                 ref_code_t = ref_code

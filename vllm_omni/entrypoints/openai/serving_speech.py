@@ -207,6 +207,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "Re-upload voices after each restart if needed."
         )
         self._tts_tokenizer = None
+        # Direct-embedding voices cache only the x-vector loaded from their
+        # safetensors file. Audio-uploaded prompt caches include ref_code/ICL
+        # metadata and are managed separately by VoiceCacheManager.
         self._speaker_embedding_cache: dict[str, list[float]] = {}
         self._speaker_cache_manager = VoiceCacheManager(self.uploaded_speakers_dir)
 
@@ -726,7 +729,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         speaker_info = self.uploaded_speakers.pop(voice_name_lower)
         self.supported_speakers.discard(voice_name_lower)
         self._speaker_embedding_cache.pop(voice_name_lower, None)
-        self._speaker_cache_manager.invalidate_speaker_prompt_cache(voice_name_lower)
+        self._speaker_cache_manager.invalidate_speaker_prompt_cache(voice_name_lower, remove_lock=True)
 
         # Clean up associated files on disk
         file_paths = {
@@ -781,7 +784,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         tts_stage_id = self._tts_stage.stage_id
         ref_text = speaker_info.get("ref_text")
         # msgspec IPC requires plain Python types; numpy arrays do not
-        # survive this RPC boundary, so the waveform must be converted.
+        # survive this RPC boundary, so the waveform must be converted. This
+        # can be expensive for long reference audio; a bytes-based payload can
+        # be considered if the RPC layer supports it in the future.
         results = await self.engine_client.collective_rpc(
             method="create_voice_clone_prompt",
             args=(wav_np.tolist(), int(sr), ref_text),
