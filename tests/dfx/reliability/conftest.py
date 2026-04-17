@@ -13,6 +13,7 @@ import http.client
 import json
 import logging
 import os
+import psutil
 import select
 import shlex
 import signal
@@ -651,6 +652,7 @@ def inject_process_kill(
     signal_name: str = "SIGTERM",
     limit: int | None = None,
     allow_zero_match: bool = False,
+    execute_kill: bool = True,
 ) -> list[int]:
     """Kill processes matching pattern with selected signal."""
     if os.name == "nt":
@@ -675,9 +677,53 @@ def inject_process_kill(
     if not pids and not allow_zero_match:
         raise RuntimeError(f"No process matched pattern: {grep_pattern}")
 
-    for pid in pids:
-        os.kill(pid, sig)
+    if execute_kill:
+        for pid in pids:
+            os.kill(pid, sig)
     return pids
+
+
+def _safe_proc_info(pid: int) -> tuple[str, str]:
+    """Best-effort process name/cmdline lookup for debug logging."""
+    try:
+        proc = psutil.Process(pid)
+        name = proc.name()
+        cmdline = " ".join(proc.cmdline()) or "<empty-cmdline>"
+        return name, cmdline
+    except Exception:  # noqa: BLE001
+        return "<unknown>", "<unavailable>"
+
+
+def _list_server_process_tree(server: Any) -> list[int]:
+    """Return [root, descendants...] PIDs for the current test server instance."""
+    root_proc = getattr(server, "proc", None)
+    if root_proc is None or getattr(root_proc, "pid", None) is None:
+        return []
+
+    root_pid = int(root_proc.pid)
+    try:
+        root = psutil.Process(root_pid)
+    except Exception:  # noqa: BLE001
+        return [root_pid]
+
+    descendants = [child.pid for child in root.children(recursive=True)]
+    return [root_pid, *descendants]
+
+
+def _log_server_process_tree(server: Any) -> None:
+    """Print server process tree for debugging fault injection targets."""
+    pids = _list_server_process_tree(server)
+    if not pids:
+        logger.warning("[reliability][process-kill] current server has no visible process tree")
+        return
+    for pid in pids:
+        name, cmdline = _safe_proc_info(pid)
+        logger.info(
+            "[reliability][process-kill] current_server_proc pid=%s name=%s cmdline=%s",
+            pid,
+            name,
+            cmdline,
+        )
 
 
 FaultInjector = Callable[[Any], None]
@@ -703,7 +749,13 @@ def make_process_kill_fault_injector(
     """
     patterns: tuple[str, ...] = (grep_patterns,) if isinstance(grep_patterns, str) else tuple(grep_patterns)
 
-    def _inject(_server: Any) -> None:
+    def _inject(server: Any) -> None:
+        _log_server_process_tree(server)
+        server_tree = set(_list_server_process_tree(server))
+        if not server_tree:
+            logger.warning(
+                "[reliability][process-kill] no server process tree found; fallback to global pgrep matching"
+            )
         for pattern in patterns:
             logger.info(
                 "[reliability][process-kill] trying pattern=%s signal=%s limit=%s",
@@ -716,13 +768,35 @@ def make_process_kill_fault_injector(
                 signal_name=signal_name,
                 limit=limit,
                 allow_zero_match=True,
+                execute_kill=False,
             )
-            if pids:
+            filtered = [pid for pid in pids if not server_tree or pid in server_tree]
+            if pids and not filtered:
+                logger.warning(
+                    "[reliability][process-kill] pattern=%s matched non-server pids=%s, skip them",
+                    pattern,
+                    pids,
+                )
+                continue
+            if filtered:
+                sig = getattr(signal, signal_name, None)
+                if sig is None:
+                    raise ValueError(f"Unsupported signal_name: {signal_name}")
+                for pid in filtered:
+                    name, cmdline = _safe_proc_info(pid)
+                    logger.info(
+                        "[reliability][process-kill] killing pid=%s name=%s signal=%s cmdline=%s",
+                        pid,
+                        name,
+                        signal_name,
+                        cmdline,
+                    )
+                    os.kill(pid, sig)
                 logger.info(
                     "[reliability][process-kill] matched pattern=%s killed_pids=%s killed_count=%d",
                     pattern,
-                    pids,
-                    len(pids),
+                    filtered,
+                    len(filtered),
                 )
                 return
         logger.warning(
