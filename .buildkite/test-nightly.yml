@@ -415,7 +415,9 @@ steps:
             EXIT2=$$?
             pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_edit_2509_vllm_omni.json
             EXIT3=$$?
-            if [ $$EXIT1 -eq 0 ] || [ $$EXIT2 -eq 0 ] || [ $$EXIT3 -eq 0 ]; then
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_layered_vllm_omni.json
+            EXIT4=$$?
+            if [ $$EXIT1 -eq 0 ] || [ $$EXIT2 -eq 0 ] || [ $$EXIT3 -eq 0 ] || [ $$EXIT4 -eq 0 ]; then
               buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
               buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             fi

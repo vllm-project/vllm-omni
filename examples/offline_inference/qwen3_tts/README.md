@@ -15,11 +15,11 @@ Please refer to the [stage configuration documentation](https://docs.vllm.ai/pro
 
 ### ROCm Dependencies
 
-You will need to install these two dependencies `onnxruntime-rocm` and `sox`.
+You will need to install the dependency `onnxruntime-rocm`.
 
 ```
 pip uninstall onnxruntime # should be removed before we can install onnxruntime-rocm
-pip install onnxruntime-rocm sox
+pip install onnxruntime-rocm
 ```
 
 ## Quick Start
