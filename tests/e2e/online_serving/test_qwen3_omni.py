@@ -26,9 +26,15 @@ models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 QWEN3_OMNI_CONFIG_PATH = str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
 QWEN3_OMNI_XPU_CONFIG_PATH = str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")
 
+_STAGE_CONFIGS_DIR = Path(__file__).parent.parent / "stage_configs"
+_PD_SEP_CONFIG = str(_STAGE_CONFIGS_DIR / "qwen3_omni_moe_pd_ci.yaml")
 
-def get_chunk_config(config_path: str):
-    path = modify_stage_config(
+
+def get_chunk_config(config_path: str | None = None):
+    """Load qwen3_omni_ci.yaml with async_chunk modifications for streaming mode."""
+    if config_path is None:
+        config_path = str(_STAGE_CONFIGS_DIR / "qwen3_omni_ci.yaml")
+    return modify_stage_config(
         config_path,
         updates={
             "async_chunk": True,
@@ -43,7 +49,6 @@ def get_chunk_config(config_path: str):
         },
         deletes={"stage_args": {2: ["custom_process_input_func"]}},
     )
-    return path
 
 
 def get_prefix_caching_config(config_path: str):
@@ -59,11 +64,20 @@ def get_prefix_caching_config(config_path: str):
     return path
 
 
-if current_omni_platform.is_xpu():
-    stage_configs = [QWEN3_OMNI_XPU_CONFIG_PATH]
-    prefix_caching_stage_configs = [get_prefix_caching_config(QWEN3_OMNI_XPU_CONFIG_PATH)]
-else:  # MI325 GPU should share the same config as H100
-    stage_configs = [get_chunk_config(QWEN3_OMNI_CONFIG_PATH)]
+# Set VLLM_TEST_PD_MODE=1 to test PD disaggregation, default tests async_chunk mode.
+_USE_PD = os.environ.get("VLLM_TEST_PD_MODE", "0") == "1"
+
+# Stage configs for H100/CUDA, ROCm MI325, and XPU platforms
+if current_omni_platform.is_rocm():
+    rocm_config = str(_STAGE_CONFIGS_DIR / "rocm" / "qwen3_omni_ci.yaml")
+    stage_configs = [rocm_config]
+    prefix_caching_stage_configs = [get_prefix_caching_config(rocm_config)]
+elif current_omni_platform.is_xpu():
+    xpu_config = str(_STAGE_CONFIGS_DIR / "xpu" / "qwen3_omni_ci.yaml")
+    stage_configs = [xpu_config]
+    prefix_caching_stage_configs = [get_prefix_caching_config(xpu_config)]
+else:
+    stage_configs = [_PD_SEP_CONFIG if _USE_PD else get_chunk_config(QWEN3_OMNI_CONFIG_PATH)]
     prefix_caching_stage_configs = [get_prefix_caching_config(QWEN3_OMNI_CONFIG_PATH)]
 
 # Create parameter combinations for model and stage config
@@ -116,7 +130,8 @@ def get_max_batch_size(size_type="few"):
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.skipif(_USE_PD, reason="Temporarily skip PD mode in this test module.")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3 if _USE_PD else 2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     """
@@ -155,7 +170,8 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.skipif(_USE_PD, reason="Temporarily skip PD mode in this test module.")
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3 if _USE_PD else 2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, openai_client) -> None:
     """

@@ -41,6 +41,45 @@ logger = init_logger(__name__)
 _ENABLE_PROFILING = os.environ.get("VOXCPM2_PROFILE", "0") == "1"
 
 
+def is_cjk_char(c: str) -> bool:
+    """Check if a character is a CJK ideograph."""
+    cp = ord(c)
+    return (
+        0x4E00 <= cp <= 0x9FFF  # CJK Unified Ideographs
+        or 0x3400 <= cp <= 0x4DBF  # Extension A
+        or 0xF900 <= cp <= 0xFAFF  # Compatibility Ideographs
+        or 0x20000 <= cp <= 0x2A6DF  # Extension B
+        or 0x2A700 <= cp <= 0x2B73F  # Extension C
+        or 0x2B740 <= cp <= 0x2B81F  # Extension D
+        or 0x2F800 <= cp <= 0x2FA1F  # Compatibility Supplement
+    )
+
+
+def build_cjk_split_map(tokenizer: Any) -> dict[int, list[int]]:
+    """Build {multichar_cjk_token_id: [single_char_ids]} from tokenizer vocab."""
+    vocab = tokenizer.get_vocab()
+    split_map: dict[int, list[int]] = {}
+    for token, token_id in vocab.items():
+        clean = token.replace("\u2581", "")
+        if len(clean) >= 2 and all(is_cjk_char(c) for c in clean):
+            char_ids = tokenizer.convert_tokens_to_ids(list(clean))
+            if all(cid != tokenizer.unk_token_id for cid in char_ids):
+                split_map[token_id] = char_ids
+    return split_map
+
+
+def split_multichar_chinese(token_ids: list[int], split_map: dict[int, list[int]]) -> list[int]:
+    """Replace multichar Chinese token IDs with single-char IDs (idempotent)."""
+    result: list[int] = []
+    for tid in token_ids:
+        expansion = split_map.get(tid)
+        if expansion is not None:
+            result.extend(expansion)
+        else:
+            result.append(tid)
+    return result
+
+
 def _encode_raw_audio(
     tts: nn.Module,
     samples: list[float] | torch.Tensor,
@@ -353,6 +392,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._cuda_graph_pool: tuple | None = None
         self._cuda_graph_warmup_steps = 0
         self._cuda_graph_warmup_threshold = 3
+
+        self._multichar_zh_split: dict[int, list[int]] | None = None
 
         self._active_states: dict[str, _RequestState] = {}
         self._current_request_id: str | None = None
@@ -985,6 +1026,17 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs=mm)
 
+    # -------------------- Chinese token splitting --------------------
+
+    def _get_multichar_zh_split(self) -> dict[int, list[int]]:
+        """Lazy-build {multichar_chinese_token_id: [char_id, ...]} map."""
+        if self._multichar_zh_split is not None:
+            return self._multichar_zh_split
+        base_tokenizer = self.tts.text_tokenizer.tokenizer
+        self._multichar_zh_split = build_cjk_split_map(base_tokenizer)
+        logger.info("VoxCPM2: built multichar Chinese split map (%d entries)", len(self._multichar_zh_split))
+        return self._multichar_zh_split
+
     # -------------------- preprocess / postprocess --------------------
 
     def preprocess(
@@ -1011,8 +1063,17 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             for rid in [r for r, s in self._active_states.items() if r not in pending_ids and s.prefill_completed]:
                 self._cleanup_request(rid)
 
-            # VoxCPM2Tokenizer does char-level Chinese splitting, so use input_ids directly
             token_ids = input_ids.tolist()
+            # Fail-fast: unsplit multichar Chinese IDs in input_ids means the
+            # serving layer didn't pre-split.  Silent fixup here would cause
+            # input_ids/embeds length mismatch (scheduler slot count is fixed).
+            split_map = self._get_multichar_zh_split()
+            if split_map and any(tid in split_map for tid in token_ids):
+                raise ValueError(
+                    "VoxCPM2 preprocess received unsplit multichar Chinese "
+                    "token IDs. The serving layer must send prompt_token_ids "
+                    "with single-char CJK IDs (see _voxcpm2_encode)."
+                )
             if token_ids and token_ids[0] == self.config.bos_token_id:
                 token_ids = token_ids[1:]
 

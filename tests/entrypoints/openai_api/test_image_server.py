@@ -106,10 +106,13 @@ def test_encode_image_base64():
 
 
 class MockGenerationResult:
-    """Mock result object from AsyncOmni.generate()"""
+    """Mock result object compatible with current diffusion output shape."""
 
     def __init__(self, images):
         self.images = images
+        self.request_output = SimpleNamespace(images=images)
+        self.stage_durations = {}
+        self.peak_memory_mb = 0.0
 
 
 class FakeAsyncOmni:
@@ -117,19 +120,25 @@ class FakeAsyncOmni:
 
     def __init__(self, images=None):
         self.stage_configs = [
-            SimpleNamespace(stage_type="llm"),
-            SimpleNamespace(stage_type="diffusion"),
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
         ]
         self.default_sampling_params_list = [SamplingParams(temperature=0.1), OmniDiffusionSamplingParams()]
         self.captured_sampling_params_list = None
         self.captured_prompt = None
         self._images = images or [Image.new("RGB", (64, 64), color="green")]
 
-    async def generate(self, prompt, request_id, sampling_params_list):
-        self.captured_sampling_params_list = sampling_params_list
+    async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        if sampling_params_list is not None:
+            self.captured_sampling_params_list = sampling_params_list
+        else:
+            self.captured_sampling_params_list = [sampling_params]
         self.captured_prompt = prompt
         images = [img.copy() for img in self._images]
         yield MockGenerationResult(images)
+
+    def __class_getitem__(cls, item):
+        return cls
 
 
 @pytest.fixture
@@ -177,7 +186,7 @@ def test_client(mock_async_diffusion):
         [BaseModelPath(name="Qwen/Qwen-Image", model_path="Qwen/Qwen-Image")]
     )
     app.state.args = Namespace(
-        default_sampling_params='{"0": {"num_inference_steps":4, "guidance_scale":7.5}}',
+        default_sampling_params='{"0": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
         max_generated_image_size=1024 * 1792,
     )
 
@@ -189,18 +198,55 @@ def async_omni_test_client():
     """Create test client with mocked AsyncOmni engine."""
     from fastapi import FastAPI
 
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
     from vllm_omni.entrypoints.openai.api_server import router
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    class FakeAsyncOmniClass(AsyncOmni):
+        def __init__(self):
+            self.stage_configs = [
+                SimpleNamespace(stage_type="llm", is_comprehension=True),
+                SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+            ]
+            self.default_sampling_params_list = [
+                SamplingParams(temperature=0.1),
+                OmniDiffusionSamplingParams(),
+            ]
+            self.captured_sampling_params_list = None
+            self.captured_prompt = None
+            self._images = [Image.new("RGB", (64, 64), color="green")]
+            self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
+
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+            if sampling_params_list is not None:
+                self.captured_sampling_params_list = sampling_params_list
+            else:
+                self.captured_sampling_params_list = [sampling_params]
+            self.captured_prompt = prompt
+            images = [img.copy() for img in self._images]
+            yield MockGenerationResult(images)
+
+        def __class_getitem__(cls, item):
+            return cls
+
+        def get_diffusion_od_config(self):
+            return self.od_config
 
     app = FastAPI()
     app.include_router(router)
 
-    app.state.engine_client = FakeAsyncOmni()
+    engine = FakeAsyncOmniClass()
+    chat_handler = object.__new__(OmniOpenAIServingChat)
+    chat_handler.engine_client = engine
+    chat_handler._diffusion_engine = None
+    app.state.openai_serving_chat = chat_handler
+    app.state.engine_client = engine
     app.state.stage_configs = [
         SimpleNamespace(stage_type="llm"),
         SimpleNamespace(stage_type="diffusion"),
     ]
     app.state.args = Namespace(
-        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5}}',
+        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
         max_generated_image_size=1048576,  # 1024*1024 to support resolution tests
     )
     return TestClient(app)
@@ -211,18 +257,55 @@ def async_omni_rgba_test_client():
     """Create test client with mocked AsyncOmni engine returning RGBA output."""
     from fastapi import FastAPI
 
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
     from vllm_omni.entrypoints.openai.api_server import router
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    class FakeAsyncOmniClass(AsyncOmni):
+        def __init__(self):
+            self.stage_configs = [
+                SimpleNamespace(stage_type="llm", is_comprehension=True),
+                SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+            ]
+            self.default_sampling_params_list = [
+                SamplingParams(temperature=0.1),
+                OmniDiffusionSamplingParams(),
+            ]
+            self.captured_sampling_params_list = None
+            self.captured_prompt = None
+            self._images = [Image.new("RGBA", (64, 64), color=(0, 255, 0, 128))]
+            self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
+
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+            if sampling_params_list is not None:
+                self.captured_sampling_params_list = sampling_params_list
+            else:
+                self.captured_sampling_params_list = [sampling_params]
+            self.captured_prompt = prompt
+            images = [img.copy() for img in self._images]
+            yield MockGenerationResult(images)
+
+        def __class_getitem__(cls, item):
+            return cls
+
+        def get_diffusion_od_config(self):
+            return self.od_config
 
     app = FastAPI()
     app.include_router(router)
 
-    app.state.engine_client = FakeAsyncOmni(images=[Image.new("RGBA", (64, 64), color=(0, 255, 0, 128))])
+    engine = FakeAsyncOmniClass()
+    chat_handler = object.__new__(OmniOpenAIServingChat)
+    chat_handler.engine_client = engine
+    chat_handler._diffusion_engine = None
+    app.state.openai_serving_chat = chat_handler
+    app.state.engine_client = engine
     app.state.stage_configs = [
         SimpleNamespace(stage_type="llm"),
         SimpleNamespace(stage_type="diffusion"),
     ]
     app.state.args = Namespace(
-        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5}}',
+        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
         max_generated_image_size=1048576,
     )
     return TestClient(app)
@@ -233,18 +316,52 @@ def async_omni_stage_configs_only_client():
     """Create test client with refactored AsyncOmni compatibility surface only."""
     from fastapi import FastAPI
 
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
     from vllm_omni.entrypoints.openai.api_server import router
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    class FakeAsyncOmniClass(AsyncOmni):
+        def __init__(self):
+            self.stage_configs = [
+                SimpleNamespace(stage_type="llm", is_comprehension=True),
+                SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+            ]
+            self.default_sampling_params_list = [
+                SamplingParams(temperature=0.1),
+                OmniDiffusionSamplingParams(),
+            ]
+            self.captured_sampling_params_list = None
+            self.captured_prompt = None
+            self._images = [Image.new("RGB", (64, 64), color="green")]
+            self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
+
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+            if sampling_params_list is not None:
+                self.captured_sampling_params_list = sampling_params_list
+            else:
+                self.captured_sampling_params_list = [sampling_params]
+            self.captured_prompt = prompt
+            images = [img.copy() for img in self._images]
+            yield MockGenerationResult(images)
+
+        def __class_getitem__(cls, item):
+            return cls
+
+        def get_diffusion_od_config(self):
+            return self.od_config
 
     app = FastAPI()
     app.include_router(router)
 
-    engine = FakeAsyncOmni()
+    engine = FakeAsyncOmniClass()
     assert not hasattr(engine, "stage_list")
     app.state.engine_client = engine
-    # Intentionally do not populate app.state.stage_configs. Refactored
-    # AsyncOmni exposes stage_configs on the engine instance.
+    chat_handler = object.__new__(OmniOpenAIServingChat)
+    chat_handler.engine_client = engine
+    chat_handler._diffusion_engine = None
+    app.state.openai_serving_chat = chat_handler
     app.state.args = Namespace(
-        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5}}',
+        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
         max_generated_image_size=1024 * 1792,
     )
     return TestClient(app)
@@ -306,6 +423,9 @@ def test_models_endpoint_no_engine():
 
 def test_generate_single_image(test_client):
     """Test generating a single image"""
+    # Single-stage path should not require openai_serving_chat.
+    assert not hasattr(test_client.app.state, "openai_serving_chat")
+
     response = test_client.post(
         "/v1/images/generations",
         json={
@@ -372,6 +492,43 @@ def test_generate_images_async_omni_stage_configs_only(async_omni_stage_configs_
     assert captured is not None
     assert len(captured) == 2
     assert captured[1].seed == 11
+
+
+def test_multistage_images_async_omni_construction(async_omni_test_client):
+    """Regression: multistage image generation builds the expected chat-style payload."""
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "n": 2,
+            "size": "128x256",
+            "seed": 7,
+            "num_inference_steps": 12,
+            "guidance_scale": 6.5,
+        },
+    )
+    assert response.status_code == 200
+
+    engine = async_omni_test_client.app.state.engine_client
+    captured_prompt = engine.captured_prompt
+    assert captured_prompt["prompt"] == "a cat"
+    assert captured_prompt["modalities"] == ["image"]
+    assert captured_prompt["mm_processor_kwargs"] == {
+        "target_h": 256,
+        "target_w": 128,
+    }
+
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert len(captured) == 2
+    assert captured[0].temperature == 0.1
+    assert captured[0].seed == 7
+    assert captured[1].num_outputs_per_prompt == 2
+    assert captured[1].width == 128
+    assert captured[1].height == 256
+    assert captured[1].seed == 7
+    assert captured[1].num_inference_steps == 12
+    assert captured[1].guidance_scale == 6.5
 
 
 def test_image_edits_async_omni_stage_configs_only(async_omni_stage_configs_only_client):
@@ -782,6 +939,63 @@ def test_image_edit_rejects_multiple_images_when_model_does_not_support_them(asy
     assert engine.captured_prompt is None
 
 
+def test_image_edit_rejects_too_many_images_for_qwen_image_edit_2511(async_omni_test_client):
+    engine = async_omni_test_client.app.state.engine_client
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=4,
+    )
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[
+            ("image", make_test_image_bytes((16, 16))),
+            ("image", make_test_image_bytes((16, 16))),
+            ("image", make_test_image_bytes((16, 16))),
+            ("image", make_test_image_bytes((16, 16))),
+            ("image", make_test_image_bytes((16, 16))),
+        ],
+        data={"prompt": "hello world."},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Received 5 input images. At most 4 images are supported by this model."
+    assert engine.captured_prompt is None
+
+
+def test_image_edit_rejects_too_many_images_for_qwen_image_edit_2511_before_loading(
+    async_omni_test_client, monkeypatch: pytest.MonkeyPatch
+):
+    import vllm_omni.entrypoints.openai.api_server as api_server_module
+
+    engine = async_omni_test_client.app.state.engine_client
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=4,
+    )
+
+    def _fail_load(*args, **kwargs):
+        raise AssertionError("_load_input_images should not run for over-limit requests")
+
+    monkeypatch.setattr(api_server_module, "_load_input_images", _fail_load)
+
+    response = async_omni_test_client.post(
+        "/v1/images/edits",
+        files=[
+            ("image", make_test_image_bytes((16, 16))),
+            ("image", make_test_image_bytes((16, 16))),
+            ("image", make_test_image_bytes((16, 16))),
+            ("image", make_test_image_bytes((16, 16))),
+            ("image", make_test_image_bytes((16, 16))),
+        ],
+        data={"prompt": "hello world."},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Received 5 input images. At most 4 images are supported by this model."
+    assert engine.captured_prompt is None
+
+
 def test_image_edit_parameter_pass(async_omni_test_client):
     img_bytes_1 = make_test_image_bytes((16, 16))
 
@@ -960,6 +1174,7 @@ def test_image_edit_parameter_default(async_omni_test_client):
     assert captured_sampling_params.num_outputs_per_prompt == 1
     assert captured_sampling_params.num_inference_steps == 4
     assert captured_sampling_params.guidance_scale == 7.5
+    assert captured_sampling_params.generator_device == "cpu"
 
     # Test that a size exceeding max_generated_image_size returns 400
     response = async_omni_test_client.post(
@@ -993,6 +1208,7 @@ def test_image_edit_parameter_default_single_stage(test_client):
     assert captured_sampling_params.num_outputs_per_prompt == 1
     assert captured_sampling_params.num_inference_steps == 4
     assert captured_sampling_params.guidance_scale == 7.5
+    assert captured_sampling_params.generator_device == "cpu"
 
     # Size exceeding max_generated_image_size (1024*1792) returns 400
     response = test_client.post(
