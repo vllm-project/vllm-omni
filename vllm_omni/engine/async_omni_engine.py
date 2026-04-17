@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 import janus
 import torch
 from omegaconf import OmegaConf
+from vllm import envs as vllm_envs
 from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
@@ -79,6 +80,7 @@ from vllm_omni.engine.stage_init_utils import (
     setup_stage_devices,
     terminate_alive_proc,
 )
+from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import (
     inject_omni_kv_config,
     load_and_resolve_stage_configs,
@@ -902,6 +904,7 @@ class AsyncOmniEngine:
             self._initialize_janus_queues()
 
             self._initialize_stages(stage_init_timeout)
+            pd_config = self._detect_pd_config()
             orchestrator = Orchestrator(
                 request_async_queue=self.request_queue.async_q,
                 output_async_queue=self.output_queue.async_q,
@@ -910,6 +913,7 @@ class AsyncOmniEngine:
                 stage_clients=self.stage_clients,
                 output_processors=self.output_processors,
                 stage_vllm_configs=self.stage_vllm_configs,
+                pd_config=pd_config,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
@@ -1130,6 +1134,48 @@ class AsyncOmniEngine:
         if cache_config is None and cache_backend not in (None, "", "none"):
             cache_config = AsyncOmniEngine._get_default_cache_config(cache_backend)
         return cache_config
+
+    def _detect_pd_config(self) -> dict[str, Any] | None:
+        """Detect PD (Prefill-Decode) disaggregation config from stage_configs.
+        Returns a dict with 'pd_pair' and 'bootstrap_addr', or None.
+        """
+        pd_pair = PDDisaggregationMixin.detect_pd_separation_from_stage_configs(self.stage_configs)
+        if pd_pair is None:
+            return None
+        prefill_idx, decode_idx = pd_pair
+
+        # Extract bootstrap address from prefill stage engine_args
+        bootstrap_addr: str | None = None
+        try:
+            prefill_cfg = self.stage_configs[prefill_idx]
+            ea = getattr(prefill_cfg, "engine_args", None)
+            kv_cfg = getattr(ea, "kv_transfer_config", None) if ea is not None else None
+            if kv_cfg is not None:
+                port = vllm_envs.VLLM_MOONCAKE_BOOTSTRAP_PORT
+                kv_ip = getattr(kv_cfg, "kv_ip", None) or "127.0.0.1"
+                bootstrap_addr = f"http://{kv_ip}:{port}"
+        except Exception as exc:
+            logger.warning("[AsyncOmniEngine] Could not extract PD bootstrap address: %s", exc)
+
+        logger.info(
+            "[AsyncOmniEngine] PD disaggregation detected: prefill=stage-%d, decode=stage-%d, bootstrap=%s",
+            prefill_idx,
+            decode_idx,
+            bootstrap_addr,
+        )
+        prefill_engine_id: str | None = None
+        try:
+            prefill_client = self.stage_clients[prefill_idx]
+            kv_cfg = getattr(getattr(prefill_client, "vllm_config", None), "kv_transfer_config", None)
+            prefill_engine_id = getattr(kv_cfg, "engine_id", None)
+        except Exception as exc:
+            logger.warning("[AsyncOmniEngine] Could not extract prefill engine_id: %s", exc)
+
+        return {
+            "pd_pair": (prefill_idx, decode_idx),
+            "bootstrap_addr": bootstrap_addr,
+            "prefill_engine_id": prefill_engine_id,
+        }
 
     @staticmethod
     def _create_default_diffusion_stage_cfg(kwargs: dict[str, Any]) -> list:
