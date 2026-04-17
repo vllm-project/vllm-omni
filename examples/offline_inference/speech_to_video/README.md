@@ -14,7 +14,7 @@ pip install librosa decord
 
 ## Local CLI Usage
 
-### Singing Example (720p)
+### Singing Example (480p)
 
 ```bash
 wget -O "Five Hundred Miles.png" "https://raw.githubusercontent.com/Wan-Video/Wan2.2/main/examples/Five%20Hundred%20Miles.png"
@@ -24,34 +24,9 @@ python speech_to_video.py \
   --image "Five Hundred Miles.png" \
   --audio "Five Hundred Miles.MP3" \
   --prompt "A person singing" \
-  --output s2v_singing.mp4
-```
-
-### Quick Run (480p, 3.5x faster)
-
-```bash
-python speech_to_video.py \
-  --model Wan-AI/Wan2.2-S2V-14B \
-  --image "Five Hundred Miles.png" \
-  --audio "Five Hundred Miles.MP3" \
-  --prompt "A person singing" \
   --height 448 --width 832 \
   --num-inference-steps 5 \
   --output s2v_singing_480p.mp4
-```
-
-### With First-Frame Initialization
-
-Use `--init-first-frame` to use the reference image as the first frame of the video, which can improve temporal coherence:
-
-```bash
-python speech_to_video.py \
-  --model /path/to/Wan2.2-S2V-14B \
-  --image reference.jpg \
-  --audio speech.wav \
-  --prompt "A person speaking naturally" \
-  --init-first-frame \
-  --output s2v_output.mp4
 ```
 
 ## Key Arguments
