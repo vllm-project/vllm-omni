@@ -12,6 +12,12 @@ Architecture:
   processing
 """
 
+# We import version early, because it will warn if vLLM / vLLM Omni
+# are not using the same major + minor version (if vLLM is installed).
+# We should do this before applying patch, because vLLM imports might
+# throw in patch if the versions differ.
+from .version import __version__, __version_tuple__  # isort:skip # noqa: F401
+
 try:
     from . import patch  # noqa: F401
 except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
@@ -24,8 +30,6 @@ except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency
 from vllm_omni.transformers_utils import configs as _configs  # noqa: F401, E402
 
 from .config import OmniModelConfig
-
-from .version import __version__, __version_tuple__  # isort:skip
 
 
 def __getattr__(name: str):

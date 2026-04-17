@@ -412,9 +412,12 @@ class FrameInterpolator:
             return restore_layout(video), 1
 
         video, restore_range = _normalize_video_tensor_range(video)
-        # Prefer the decoded video's current device so CPU-offloaded requests do
-        # not move the tensor back to GPU just for interpolation.
-        model = self._ensure_model_loaded(preferred_device=video.device)
+        # A CPU tensor may be transport/offload state rather than an execution
+        # choice, so only trust it when it is already on an accelerator.
+        preferred_device = video.device
+        if preferred_device.type == "cpu":
+            preferred_device = _select_torch_device()
+        model = self._ensure_model_loaded(preferred_device=preferred_device)
         video = video.to(model.device())
         intermediates_per_pair = 2**exp // 2
 

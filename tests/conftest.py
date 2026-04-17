@@ -3026,6 +3026,10 @@ class OmniRunner:
             video_padding_token = "<|video_pad|>"
             image_padding_token = "<|image_pad|>"
             audio_padding_token = "<|audio_pad|>"
+        elif "Ming-flash-omni" in self.model_name:
+            video_padding_token = "<VIDEO>"
+            image_padding_token = "<IMAGE>"
+            audio_padding_token = "<AUDIO>"
 
         if isinstance(prompts, str):
             prompts = [prompts]

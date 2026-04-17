@@ -281,6 +281,7 @@ def enable_cache_for_longcat_image(pipeline: Any, cache_config: Any) -> Callable
                 ],
                 forward_pattern=[ForwardPattern.Pattern_1, ForwardPattern.Pattern_1],
                 params_modifiers=[modifier],
+                has_separate_cfg=True,
             )
         ),
         cache_config=db_cache_config,
@@ -632,6 +633,7 @@ def enable_cache_for_ltx2(pipeline: Any, cache_config: Any) -> Callable[[int], N
             forward_pattern=ForwardPattern.Pattern_0,
             # Treat audio_hidden_states as encoder_hidden_states in Pattern_0
             check_forward_pattern=False,
+            has_separate_cfg=True,
         ),
         cache_config=db_cache_config,
         calibrator_config=calibrator_config,

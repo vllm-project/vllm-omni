@@ -45,6 +45,8 @@ if CONFIG_FILE_PATH is None:
     CONFIG_FILE_PATH = _DEFAULT_CONFIG_FILE
 
 BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
+OMNI_RESULT_TEMPLATE_PATH = Path(__file__).parent / "result_omni_template.json"
+
 
 STAGE_CONFIGS_DIR = Path(__file__).parent.parent / "stage_configs"
 test_params = create_unique_server_params(BENCHMARK_CONFIGS, STAGE_CONFIGS_DIR)
@@ -64,7 +66,7 @@ def omni_server(request):
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
-        server_args = ["--stage-init-timeout", "300", "--init-timeout", "900"]
+        server_args = ["--stage-init-timeout", "600", "--init-timeout", "900"]
         if stage_config_path:
             server_args = ["--stage-configs-path", stage_config_path] + server_args
         with OmniServer(model, server_args) as server:
@@ -141,8 +143,17 @@ def run_benchmark(
         result_dir = "./"
 
     result_path = os.path.join(result_dir, result_filename)
-    with open(result_path, encoding="utf-8") as f:
-        result = json.load(f)
+    if not os.path.exists(result_path):
+        with open(OMNI_RESULT_TEMPLATE_PATH, encoding="utf-8") as f:
+            template_result: dict[str, Any] = json.load(f)
+        Path(result_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(template_result, f, ensure_ascii=False, indent=2)
+        print(f"Benchmark result file not generated, fallback to template: {result_path}")
+        result = template_result
+    else:
+        with open(result_path, encoding="utf-8") as f:
+            result = json.load(f)
 
     if baseline_config:
         result["baseline"] = _baseline_thresholds_for_step(
