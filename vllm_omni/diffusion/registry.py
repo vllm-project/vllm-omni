@@ -93,6 +93,11 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2_i2v",
         "Wan22I2VPipeline",
     ),
+    "WanS2VPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_s2v",
+        "Wan22S2VPipeline",
+    ),
     "LongCatImagePipeline": (
         "longcat_image",
         "pipeline_longcat_image",
@@ -359,6 +364,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2ImageToVideoTwoStagesPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
+    "WanS2VPipeline": "get_wan22_s2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
@@ -390,6 +396,7 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanPipeline": "get_wan22_pre_process_func",
     "WanVACEPipeline": "get_wan22_vace_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
+    "WanS2VPipeline": "get_wan22_s2v_pre_process_func",
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
     "HeliosPipeline": "get_helios_pre_process_func",
     "HeliosPyramidPipeline": "get_helios_pre_process_func",
