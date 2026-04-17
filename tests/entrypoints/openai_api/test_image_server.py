@@ -204,14 +204,19 @@ def async_omni_test_client():
 
     class FakeAsyncOmniClass(AsyncOmni):
         def __init__(self):
-            self.stage_configs = [
+            stage_configs = [
                 SimpleNamespace(stage_type="llm", is_comprehension=True),
                 SimpleNamespace(stage_type="diffusion", is_comprehension=False),
             ]
-            self.default_sampling_params_list = [
+            default_sampling_params_list = [
                 SamplingParams(temperature=0.1),
                 OmniDiffusionSamplingParams(),
             ]
+            self.engine = SimpleNamespace(
+                stage_configs=stage_configs,
+                default_sampling_params_list=default_sampling_params_list,
+            )
+            self.default_sampling_params_list = default_sampling_params_list
             self.captured_sampling_params_list = None
             self.captured_prompt = None
             self._images = [Image.new("RGB", (64, 64), color="green")]
@@ -263,14 +268,19 @@ def async_omni_rgba_test_client():
 
     class FakeAsyncOmniClass(AsyncOmni):
         def __init__(self):
-            self.stage_configs = [
+            stage_configs = [
                 SimpleNamespace(stage_type="llm", is_comprehension=True),
                 SimpleNamespace(stage_type="diffusion", is_comprehension=False),
             ]
-            self.default_sampling_params_list = [
+            default_sampling_params_list = [
                 SamplingParams(temperature=0.1),
                 OmniDiffusionSamplingParams(),
             ]
+            self.engine = SimpleNamespace(
+                stage_configs=stage_configs,
+                default_sampling_params_list=default_sampling_params_list,
+            )
+            self.default_sampling_params_list = default_sampling_params_list
             self.captured_sampling_params_list = None
             self.captured_prompt = None
             self._images = [Image.new("RGBA", (64, 64), color=(0, 255, 0, 128))]
@@ -322,14 +332,19 @@ def async_omni_stage_configs_only_client():
 
     class FakeAsyncOmniClass(AsyncOmni):
         def __init__(self):
-            self.stage_configs = [
+            stage_configs = [
                 SimpleNamespace(stage_type="llm", is_comprehension=True),
                 SimpleNamespace(stage_type="diffusion", is_comprehension=False),
             ]
-            self.default_sampling_params_list = [
+            default_sampling_params_list = [
                 SamplingParams(temperature=0.1),
                 OmniDiffusionSamplingParams(),
             ]
+            self.engine = SimpleNamespace(
+                stage_configs=stage_configs,
+                default_sampling_params_list=default_sampling_params_list,
+            )
+            self.default_sampling_params_list = default_sampling_params_list
             self.captured_sampling_params_list = None
             self.captured_prompt = None
             self._images = [Image.new("RGB", (64, 64), color="green")]
