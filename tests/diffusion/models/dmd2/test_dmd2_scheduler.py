@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline, LTX2T2VDMD2Pipeline
+from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_image2video import LTX2I2VDMD2Pipeline, LTX2ImageToVideoPipeline
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, WanT2VDMD2Pipeline
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import Wan22I2VPipeline, WanI2VDMD2Pipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest, OmniDiffusionSamplingParams
@@ -13,19 +15,21 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _DMD2_TIMESTEPS = [999, 937, 833, 624]
 
-# Wan base pipeline whose __init__ loads model weights — mocked in tests.
-_WAN_BASE = {
+# DMD2 subclass → immediate base pipeline whose __init__ loads model weights (mocked in tests).
+_DMD2_BASE = {
     WanT2VDMD2Pipeline: Wan22Pipeline,
     WanI2VDMD2Pipeline: Wan22I2VPipeline,
+    LTX2T2VDMD2Pipeline: LTX2Pipeline,
+    LTX2I2VDMD2Pipeline: LTX2ImageToVideoPipeline,
 }
 
 
 def _make_pipeline(cls):
-    """Run the DMD2 __init__ (including __init_dmd2__) with the Wan base mocked."""
+    """Run the DMD2 __init__ (including __init_dmd2__) with the base pipeline mocked."""
 
-    base = _WAN_BASE[cls]
+    base = _DMD2_BASE[cls]
     od_config = MagicMock()
-    od_config.model = "/nonexistent"  # _load_model_index returns {} → uses inline defaults
+    od_config.model = "/nonexistent"
 
     def _mock_base_init(self, *a, **kw):
         self.od_config = od_config  # __init_dmd2__ needs this
@@ -42,7 +46,10 @@ def _make_request(**sp_kwargs) -> OmniDiffusionRequest:
     return OmniDiffusionRequest(prompts=[{"prompt": "a cat"}], sampling_params=sp)
 
 
-@pytest.fixture(params=[WanT2VDMD2Pipeline, WanI2VDMD2Pipeline], ids=["t2v", "i2v"])
+@pytest.fixture(
+    params=list(_DMD2_BASE.keys()),
+    ids=["wan_t2v", "wan_i2v", "ltx2_t2v", "ltx2_i2v"],
+)
 def pipeline(request):
     return _make_pipeline(request.param)
 
@@ -60,7 +67,7 @@ def _fake_parent_forward(self, req, *args, num_inference_steps=40, **kwargs):
 
 def test_forward_timesteps_match_dmd2_schedule(pipeline):
     """After forward() runs, scheduler.timesteps must equal the DMD2 training schedule."""
-    parent = _WAN_BASE[type(pipeline)]
+    parent = _DMD2_BASE[type(pipeline)]
 
     # Baseline: calling set_timesteps(40) without the DMD2 override gives a different schedule
     pipeline.scheduler.set_timesteps(40, device="cpu")
@@ -75,14 +82,12 @@ def test_forward_timesteps_match_dmd2_schedule(pipeline):
     assert pipeline.scheduler.timesteps.long().tolist() == _DMD2_TIMESTEPS
 
 
-def test_forward_timesteps_fixed_across_num_steps(pipeline):
-    """scheduler.timesteps is always the DMD2 schedule regardless of num_steps passed."""
-    parent = _WAN_BASE[type(pipeline)]
+def test_forward_timesteps_idempotent_across_calls(pipeline):
+    """Successive forward() calls must not cause scheduler state to drift."""
+    parent = _DMD2_BASE[type(pipeline)]
 
-    for num_steps in [1, 4, 10, 40, 100]:
-        with patch.object(parent, "forward", _fake_parent_forward):
-            pipeline.forward(_make_request())
+    with patch.object(parent, "forward", _fake_parent_forward):
+        pipeline.forward(_make_request())
+        pipeline.forward(_make_request())
 
-        assert pipeline.scheduler.timesteps.long().tolist() == _DMD2_TIMESTEPS, (
-            f"num_steps={num_steps}: got {pipeline.scheduler.timesteps.tolist()}"
-        )
+    assert pipeline.scheduler.timesteps.long().tolist() == _DMD2_TIMESTEPS

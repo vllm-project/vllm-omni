@@ -939,7 +939,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
 
 
 class WanT2VDMD2Pipeline(DMD2PipelineMixin, Wan22Pipeline):
-    """Wan 2.1 T2V pipeline for FastGen DMD2-distilled 4-step models."""
+    """Wan 2.x T2V pipeline for FastGen DMD2-distilled models."""
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
