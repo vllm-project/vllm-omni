@@ -324,6 +324,24 @@ class OmniGenerationScheduler(VLLMScheduler):
 
         return scheduler_output
 
+    def finish_requests(self, request_ids, finished_status: RequestStatus) -> list[tuple[str, int]]:
+        """Handles the finish signal from outside the scheduler.
+
+        For example, the API server can abort a request when the client
+        disconnects.
+
+        If request_ids is None, all requests will be finished.
+
+        Returns:
+            Tuple of (req_id, client_index) for requests that were aborted. Will not
+            include any that were already finished.
+        """
+
+        if self.chunk_transfer_adapter:
+            self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
+
+        return super().finish_requests(request_ids, finished_status)
+
     """
     Scheduler for the diffusion model.
     This scheduler is modified to stop the request immediately for the diffusion model.
