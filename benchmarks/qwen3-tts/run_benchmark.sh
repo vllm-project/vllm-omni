@@ -23,6 +23,9 @@
 #   # Use 1.7B model:
 #   MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice bash run_benchmark.sh --async-only
 #
+#   # Use Voice Clone model
+#   MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base TASK_TYPE=Base bash run_benchmark.sh --async-only
+#
 #   # Use batch_size=4 config:
 #   STAGE_CONFIG=vllm_omni/configs/qwen3_tts_bs4.yaml bash run_benchmark.sh --async-only
 #
@@ -35,6 +38,7 @@
 #   GPU_MEM_TALKER   - gpu_memory_utilization for talker stage (default: 0.3)
 #   GPU_MEM_CODE2WAV - gpu_memory_utilization for code2wav stage (default: 0.2)
 #   STAGE_CONFIG     - Path to stage config YAML (default: configs/qwen3_tts_bs1.yaml)
+#   TASK_TYPE        - Task type: CustomVoice, VoiceDesign, Base (default: CustomVoice)
 
 set -euo pipefail
 
@@ -53,6 +57,7 @@ NUM_WARMUPS="${NUM_WARMUPS:-3}"
 STAGE_CONFIG="${STAGE_CONFIG:-vllm_omni/configs/qwen3_tts_bs1.yaml}"
 RESULT_DIR="${SCRIPT_DIR}/results"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+TASK_TYPE="${TASK_TYPE:-CustomVoice}"
 
 # Parse args
 RUN_ASYNC=true
@@ -77,6 +82,7 @@ echo " Concurrency:  ${CONCURRENCY}"
 echo " Port:         ${PORT}"
 echo " Stage config: ${STAGE_CONFIG}"
 echo " Results:      ${RESULT_DIR}"
+echo " Task type:    ${TASK_TYPE}"
 echo "============================================================"
 
 # Prepare stage config with correct GPU device and memory settings
@@ -195,7 +201,8 @@ run_bench() {
         --max-concurrency ${conc_args} \
         --num-warmups "${NUM_WARMUPS}" \
         --config-name "${config_name}" \
-        --result-dir "${RESULT_DIR}"
+        --result-dir "${RESULT_DIR}" \
+        --task-type "${TASK_TYPE}"
 
     stop_server
 
@@ -222,7 +229,8 @@ if [ "${RUN_HF}" = true ]; then
         --num-warmups "${NUM_WARMUPS}" \
         --gpu-device "${GPU_DEVICE}" \
         --config-name "hf_transformers" \
-        --result-dir "${RESULT_DIR}"
+        --result-dir "${RESULT_DIR}" \
+        --task-type "${TASK_TYPE}"
 
     # Allow GPU memory to settle
     sleep 5

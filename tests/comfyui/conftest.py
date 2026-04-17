@@ -9,8 +9,8 @@ This module sets up the test environment by:
 
 import os
 import sys
+from types import ModuleType, SimpleNamespace
 from typing import BinaryIO, TypedDict
-from unittest.mock import MagicMock
 
 
 def pytest_configure(config):
@@ -58,15 +58,15 @@ def _setup_comfyui_test_environment():
             else:
                 file.write(self._data)
 
-    mock_comfy_api = MagicMock()
-    mock_comfy_api_input = MagicMock()
+    mock_comfy_api = ModuleType("comfy_api")
+    mock_comfy_api_input = ModuleType("comfy_api.input")
     mock_comfy_api_input.AudioInput = AudioInput
     mock_comfy_api_input.VideoInput = VideoInput
     mock_comfy_api.input = mock_comfy_api_input
-    mock_comfy_api_latest = MagicMock()
-    mock_comfy_api_latest.Types.VideoComponents = MagicMock(side_effect=lambda **kwargs: kwargs)
-    mock_comfy_api_latest.InputImpl.VideoFromComponents = MagicMock(
-        side_effect=lambda _: VideoInput(b"mock_video_from_components")
+    mock_comfy_api_latest = ModuleType("comfy_api.latest")
+    mock_comfy_api_latest.Types = SimpleNamespace(VideoComponents=lambda **kwargs: kwargs)
+    mock_comfy_api_latest.InputImpl = SimpleNamespace(
+        VideoFromComponents=lambda _: VideoInput(b"mock_video_from_components")
     )
     mock_comfy_api.latest = mock_comfy_api_latest
 
@@ -76,8 +76,8 @@ def _setup_comfyui_test_environment():
         sample_rate = 24000
         return waveform, sample_rate
 
-    mock_comfy_extras = MagicMock()
-    mock_nodes_audio = MagicMock()
+    mock_comfy_extras = ModuleType("comfy_extras")
+    mock_nodes_audio = ModuleType("comfy_extras.nodes_audio")
     mock_nodes_audio.load = mock_load
     mock_comfy_extras.nodes_audio = mock_nodes_audio
 

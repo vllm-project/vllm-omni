@@ -108,8 +108,8 @@ class DistributedAutoencoderKLQwenImage(AutoencoderKLQwenImage, DistributedVaeMi
         if not self.is_distributed_enabled():
             return super().tiled_decode(z, return_dict=return_dict)
 
-        logger.info("Decode run with distributed executor")
-        result = self.distributed_decoder.execute(
+        logger.debug("Decode running with distributed executor")
+        result = self.distributed_executor.execute(
             z,
             DistributedOperator(split=self.tile_split, exec=self.tile_exec, merge=self.tile_merge),
             broadcast_result=True,

@@ -22,9 +22,9 @@ import pytest
 from PIL import Image
 from vllm.assets.image import ImageAsset
 
-from tests.conftest import modify_stage_config
+from tests.conftest import OmniRunner, modify_stage_config
 from tests.utils import hardware_test
-from vllm_omni.entrypoints.omni import Omni
+from vllm_omni import Omni
 from vllm_omni.platforms import current_omni_platform
 
 # Reference pixel data extracted from the known-good output image
@@ -79,19 +79,17 @@ def _find_free_port() -> int:
     return port
 
 
-def _configure_sampling_params(omni: Omni, max_tokens: int = 1, num_inference_steps: int = 15) -> list:
+def _configure_sampling_params(omni: Omni, num_inference_steps: int = 15) -> list:
     """Configure sampling parameters for Bagel img2img generation.
 
     Args:
         omni: The Omni instance to get default params from.
-        max_tokens: Maximum tokens for the first stage.
         num_inference_steps: Number of inference steps for the diffusion stage.
 
     Returns:
         Configured sampling params list.
     """
     params_list = omni.default_sampling_params_list
-    params_list[0].max_tokens = max_tokens  # type: ignore
     if len(params_list) > 1:
         params_list[1].num_inference_steps = num_inference_steps  # type: ignore
         params_list[1].extra_args = {  # type: ignore
@@ -212,11 +210,10 @@ def test_bagel_img2img_shared_memory_connector(run_level):
     input_image = _load_input_image()
     config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
     config_path = _resolve_stage_config(config_path, run_level)
-    omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=config_path, stage_init_timeout=300)
-
-    try:
-        generated_image = _generate_bagel_img2img(omni, input_image)
+    with OmniRunner(
+        "ByteDance-Seed/BAGEL-7B-MoT",
+        stage_configs_path=config_path,
+    ) as runner:
+        generated_image = _generate_bagel_img2img(runner.omni, input_image)
         if run_level == "advanced_model":
             _validate_pixels(generated_image)
-    finally:
-        omni.close()

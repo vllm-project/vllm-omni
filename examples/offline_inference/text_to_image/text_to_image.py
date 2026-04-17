@@ -242,6 +242,31 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable logging of diffusion pipeline stats.",
     )
+    parser.add_argument(
+        "--init-timeout",
+        type=int,
+        default=600,
+        help="Timeout for initializing a single stage in seconds (default: 600s)",
+    )
+    parser.add_argument(
+        "--stage-init-timeout",
+        type=int,
+        default=600,
+        help="Timeout for initializing a single stage in seconds (default: 600s)",
+    )
+    parser.add_argument(
+        "--use-system-prompt",
+        type=str,
+        default=None,
+        choices=["None", "dynamic", "en_vanilla", "en_recaption", "en_think_recaption", "en_unified", "custom"],
+        help="System prompt preset for generation. Recommended: en_unified.",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help=("Custom system prompt. Used when --use-system-prompt is custom. "),
+    )
     return parser.parse_args()
 
 
@@ -333,6 +358,8 @@ def main():
         "mode": "text-to-image",
         "log_stats": args.log_stats,
         "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
+        "init_timeout": args.init_timeout,
+        "stage_init_timeout": args.stage_init_timeout,
         **lora_args,
         **quant_kwargs,
     }
@@ -363,7 +390,7 @@ def main():
         f"vae_patch_parallel_size={args.vae_patch_parallel_size}, "
         f"enable_expert_parallel={args.enable_expert_parallel}."
     )
-    print(f"  CPU offload: {args.enable_cpu_offload}")
+    print(f"  CPU offload: {args.enable_cpu_offload}; CPU Layerwise Offload: {args.enable_layerwise_offload}")
     print(f"  Image size: {args.width}x{args.height}")
     if args.lora_path:
         print(f"  LoRA: scale={args.lora_scale}")
@@ -382,13 +409,13 @@ def main():
         )
 
     generation_start = time.perf_counter()
-
     extra_args = {
         "timesteps_shift": args.timesteps_shift,
         "cfg_schedule": args.cfg_schedule,
         "use_norm": args.use_norm,
+        "use_system_prompt": args.use_system_prompt,
+        "system_prompt": args.system_prompt,
     }
-
     if lora_request:
         extra_args["lora_request"] = lora_request
         extra_args["lora_scale"] = args.lora_scale

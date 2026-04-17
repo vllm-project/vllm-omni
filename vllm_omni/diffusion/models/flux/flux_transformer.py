@@ -12,7 +12,6 @@ from diffusers.models.embeddings import (
     get_1d_rotary_pos_embed,
 )
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
 from diffusers.utils import is_torch_npu_available
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
@@ -32,6 +31,11 @@ if TYPE_CHECKING:
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.layers.adalayernorm import (
+    AdaLayerNormContinuous,
+    AdaLayerNormZero,
+    AdaLayerNormZeroSingle,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 logger = init_logger(__name__)
@@ -46,6 +50,7 @@ class ColumnParallelApproxGELU(nn.Module):
         approximate: str,
         bias: bool = True,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.proj = ColumnParallelLinear(
@@ -55,6 +60,7 @@ class ColumnParallelApproxGELU(nn.Module):
             gather_output=False,
             return_bias=False,
             quant_config=quant_config,
+            prefix=f"{prefix}.proj",
         )
         self.approximate = approximate
 
@@ -73,6 +79,7 @@ class FeedForward(nn.Module):
         inner_dim: int | None = None,
         bias: bool = True,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -82,7 +89,9 @@ class FeedForward(nn.Module):
         dim_out = dim_out or dim
 
         layers: list[nn.Module] = [
-            ColumnParallelApproxGELU(dim, inner_dim, approximate="tanh", bias=bias, quant_config=quant_config),
+            ColumnParallelApproxGELU(
+                dim, inner_dim, approximate="tanh", bias=bias, quant_config=quant_config, prefix=f"{prefix}.net.0"
+            ),
             nn.Identity(),  # placeholder for weight loading
             RowParallelLinear(
                 inner_dim,
@@ -90,6 +99,7 @@ class FeedForward(nn.Module):
                 input_is_parallel=True,
                 return_bias=False,
                 quant_config=quant_config,
+                prefix=f"{prefix}.net.2",
             ),
         ]
 
@@ -117,6 +127,7 @@ class FluxAttention(torch.nn.Module):
         context_pre_only: bool | None = None,
         pre_only: bool = False,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -141,6 +152,7 @@ class FluxAttention(torch.nn.Module):
             total_num_heads=self.heads,
             bias=bias,
             quant_config=quant_config,
+            prefix=f"{prefix}.to_qkv",
         )
 
         if not self.pre_only:
@@ -153,6 +165,7 @@ class FluxAttention(torch.nn.Module):
                         input_is_parallel=True,
                         return_bias=False,
                         quant_config=quant_config,
+                        prefix=f"{prefix}.to_out.0",
                     ),
                     nn.Dropout(dropout),
                 ]
@@ -168,8 +181,8 @@ class FluxAttention(torch.nn.Module):
                 total_num_heads=self.heads,
                 bias=added_proj_bias,
                 quant_config=quant_config,
+                prefix=f"{prefix}.add_kv_proj",
             )
-
             self.to_add_out = RowParallelLinear(
                 self.inner_dim,
                 query_dim,
@@ -177,6 +190,7 @@ class FluxAttention(torch.nn.Module):
                 input_is_parallel=True,
                 return_bias=False,
                 quant_config=quant_config,
+                prefix=f"{prefix}.to_add_out",
             )
 
         self.rope = RotaryEmbedding(is_neox_style=False)
@@ -272,11 +286,11 @@ class FluxTransformerBlock(nn.Module):
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
-
-        self.norm1 = AdaLayerNormZero(dim)
-        self.norm1_context = AdaLayerNormZero(dim)
+        self.norm1 = AdaLayerNormZero(dim, quant_config=quant_config, prefix=f"{prefix}.norm1")
+        self.norm1_context = AdaLayerNormZero(dim, quant_config=quant_config, prefix=f"{prefix}.norm1_context")
 
         self.attn = FluxAttention(
             query_dim=dim,
@@ -288,13 +302,14 @@ class FluxTransformerBlock(nn.Module):
             bias=True,
             eps=eps,
             quant_config=quant_config,
+            prefix=f"{prefix}.attn",
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config)
+        self.ff = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix=f"{prefix}.ff")
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff_context = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config)
+        self.ff_context = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix=f"{prefix}.ff_context")
 
     def forward(
         self,
@@ -361,17 +376,30 @@ class FluxSingleTransformerBlock(nn.Module):
         attention_head_dim: int,
         mlp_ratio: float = 4.0,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
-        self.norm = AdaLayerNormZeroSingle(dim)
+        # Modulation linear kept full precision; shift/scale/gate outputs
+        # are multiplied into the residual stream every block (see #2728).
+        self.norm = AdaLayerNormZeroSingle(dim, quant_config=None, prefix=f"{prefix}.norm")
         self.proj_mlp = ReplicatedLinear(
-            dim, self.mlp_hidden_dim, bias=True, return_bias=False, quant_config=quant_config
+            dim,
+            self.mlp_hidden_dim,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj_mlp",
         )
         self.act_mlp = nn.GELU(approximate="tanh")
         self.proj_out = ReplicatedLinear(
-            dim + self.mlp_hidden_dim, dim, bias=True, return_bias=False, quant_config=quant_config
+            dim + self.mlp_hidden_dim,
+            dim,
+            bias=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj_out",
         )
 
         self.attn = FluxAttention(
@@ -383,6 +411,7 @@ class FluxSingleTransformerBlock(nn.Module):
             eps=1e-6,
             pre_only=True,
             quant_config=quant_config,
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -483,6 +512,7 @@ class FluxTransformer2DModel(nn.Module):
     # -- typically a transformer layer
     # used for torch compile optimizations
     _repeated_blocks = ["FluxTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
@@ -496,10 +526,10 @@ class FluxTransformer2DModel(nn.Module):
 
     def __init__(
         self,
-        od_config: OmniDiffusionConfig = None,
+        od_config: OmniDiffusionConfig | None = None,
         patch_size: int = 1,
         in_channels: int = 64,
-        out_channels: int = None,
+        out_channels: int | None = None,
         num_layers: int = 19,
         num_single_layers: int = 38,
         attention_head_dim: int = 128,
@@ -535,15 +565,19 @@ class FluxTransformer2DModel(nn.Module):
         self.context_embedder = nn.Linear(joint_attention_dim, self.inner_dim)
         self.x_embedder = nn.Linear(in_channels, self.inner_dim)
 
+        # Dual-stream blocks kept full precision — FP8 on their joint
+        # attention path causes noise on FLUX (#2728). Single-stream
+        # blocks (38 vs 19) still get FP8 for memory savings.
         self.transformer_blocks = nn.ModuleList(
             [
                 FluxTransformerBlock(
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
-                    quant_config=quant_config,
+                    quant_config=None,
+                    prefix=f"transformer_blocks.{i}",
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
 
@@ -554,12 +588,21 @@ class FluxTransformer2DModel(nn.Module):
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     quant_config=quant_config,
+                    prefix=f"single_transformer_blocks.{i}",
                 )
-                for _ in range(num_single_layers)
+                for i in range(num_single_layers)
             ]
         )
 
-        self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
+        # Final modulation feeds proj_out; keep full precision (see #2728).
+        self.norm_out = AdaLayerNormContinuous(
+            self.inner_dim,
+            self.inner_dim,
+            elementwise_affine=False,
+            eps=1e-6,
+            quant_config=None,
+            prefix="norm_out",
+        )
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
 
     def forward(

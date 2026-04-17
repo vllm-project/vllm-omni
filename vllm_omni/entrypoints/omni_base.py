@@ -14,6 +14,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
+from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import get_final_stage_id_for_e2e
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -65,7 +66,7 @@ def omni_snapshot_download(model_id: str) -> str:
 OutputMessageHandleResult = tuple[Literal[True], None, None, None] | tuple[Literal[False], str, int, ClientRequestState]
 
 
-class OmniBase:
+class OmniBase(PDDisaggregationMixin):
     """Shared runtime foundation for AsyncOmni and Omni."""
 
     def __init__(
@@ -84,6 +85,7 @@ class OmniBase:
         if "log_requests" in kwargs:
             raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
         model = omni_snapshot_download(model)
+        self._name = self.__class__.__name__
         self.model = model
         self.log_stats = log_stats
         self.async_chunk = async_chunk
@@ -125,9 +127,17 @@ class OmniBase:
             model,
         )
 
+        # PD disaggregation state (detects if a prefill/decode stage pair is configured)
+        self._init_pd_state()
+
     @property
     def num_stages(self) -> int:
         return self.engine.num_stages
+
+    @property
+    def stage_configs(self) -> list:
+        """Expose engine stage configs for PD disaggregation detection and validation."""
+        return self.engine.stage_configs
 
     @property
     def is_running(self) -> bool:
@@ -282,6 +292,11 @@ class OmniBase:
             final_output_type=stage_meta["final_output_type"],
             request_output=engine_outputs,
             images=images,
+            trajectory_latents=getattr(engine_outputs, "trajectory_latents", None),
+            trajectory_timesteps=getattr(engine_outputs, "trajectory_timesteps", None),
+            trajectory_log_probs=getattr(engine_outputs, "trajectory_log_probs", None),
+            trajectory_decoded=getattr(engine_outputs, "trajectory_decoded", None),
+            _custom_output=getattr(engine_outputs, "_custom_output", {}),
             stage_durations=stage_durations,
             peak_memory_mb=peak_memory_mb,
         )

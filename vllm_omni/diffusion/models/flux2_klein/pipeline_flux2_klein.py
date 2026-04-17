@@ -234,7 +234,15 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
         self.transformer = Flux2Transformer2DModel(quant_config=od_config.quantization_config, **transformer_kwargs)
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
+        self.latent_channels = self.vae.config.latent_channels if hasattr(self.vae, "config") else 16
         self.image_processor = Flux2ImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
+        self.mask_processor = VaeImageProcessor(
+            vae_scale_factor=self.vae_scale_factor * 2,
+            vae_latent_channels=self.latent_channels,
+            do_normalize=False,
+            do_binarize=True,
+            do_convert_grayscale=True,
+        )
         self.tokenizer_max_length = 512
         self.default_sample_size = 128
 
@@ -246,6 +254,14 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
+
+    def get_timesteps(self, num_inference_steps, strength, device):
+        init_timestep = min(num_inference_steps * strength, num_inference_steps)
+        t_start = int(max(num_inference_steps - init_timestep, 0))
+        timesteps = self.scheduler.timesteps[t_start * self.scheduler.order :]
+        if hasattr(self.scheduler, "set_begin_index"):
+            self.scheduler.set_begin_index(t_start * self.scheduler.order)
+        return timesteps, num_inference_steps - t_start
 
     @staticmethod
     def _get_qwen3_prompt_embeds(
@@ -582,6 +598,54 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
 
         return image_latents, image_latent_ids
 
+    def prepare_mask_latents(
+        self,
+        mask,
+        masked_image,
+        batch_size,
+        num_channels_latents,
+        num_images_per_prompt,
+        height,
+        width,
+        dtype,
+        device,
+        generator,
+    ):
+        height = 2 * (int(height) // (self.vae_scale_factor * 2))
+        width = 2 * (int(width) // (self.vae_scale_factor * 2))
+        mask = torch.nn.functional.interpolate(mask, size=(height, width))
+        mask = mask.to(device=device, dtype=dtype)
+
+        batch_size = batch_size * num_images_per_prompt
+
+        if masked_image is not None:
+            masked_image = masked_image.to(device=device, dtype=dtype)
+            if masked_image.shape[1] != num_channels_latents:
+                masked_image_latents = self._encode_vae_image(image=masked_image, generator=generator)
+            else:
+                masked_image_latents = masked_image
+        else:
+            masked_image_latents = None
+
+        if mask.shape[0] < batch_size:
+            if not batch_size % mask.shape[0] == 0:
+                raise ValueError("The passed mask and the required batch size don't match.")
+            mask = mask.repeat(batch_size // mask.shape[0], 1, 1, 1)
+        if masked_image_latents is not None and masked_image_latents.shape[0] < batch_size:
+            if not batch_size % masked_image_latents.shape[0] == 0:
+                raise ValueError("The passed mask and the required batch size don't match.")
+            masked_image_latents = masked_image_latents.repeat(batch_size // masked_image_latents.shape[0], 1, 1, 1)
+
+        if masked_image_latents is not None:
+            masked_image_latents = masked_image_latents.to(device=device, dtype=dtype)
+            masked_image_latents = self._pack_latents(masked_image_latents)
+
+        mask = mask.repeat(1, self.latent_channels, 1, 1)
+        mask = self._patchify_latents(mask)
+        mask = self._pack_latents(mask)
+
+        return mask, masked_image_latents
+
     def check_inputs(
         self,
         prompt,
@@ -590,7 +654,15 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
         prompt_embeds=None,
         callback_on_step_end_tensor_inputs=None,
         guidance_scale=None,
+        strength=None,
+        num_inference_steps=None,
     ):
+        if strength is not None:
+            if strength < 0 or strength > 1:
+                raise ValueError(f"strength must be between 0 and 1, got {strength}")
+        if num_inference_steps is not None and num_inference_steps <= 0:
+            raise ValueError(f"num_inference_steps must be positive, got {num_inference_steps}")
+
         if (
             height is not None
             and height % (self.vae_scale_factor * 2) != 0
@@ -622,7 +694,7 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
         elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
             raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
 
-        if guidance_scale > 1.0 and self.is_distilled:
+        if guidance_scale is not None and guidance_scale > 1.0 and self.is_distilled:
             logger.warning(f"Guidance scale {guidance_scale} is ignored for step-wise distilled models.")
 
     @property
@@ -653,11 +725,14 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
         self,
         req: OmniDiffusionRequest,
         image: PIL.Image.Image | list[PIL.Image.Image] | None = None,
+        reference_image: PIL.Image.Image | list[PIL.Image.Image] | None = None,
+        mask_image: PIL.Image.Image | list[PIL.Image.Image] | None = None,
         prompt: str | list[str] | None = None,
         height: int | None = None,
         width: int | None = None,
         num_inference_steps: int = 50,
         sigmas: list[float] | None = None,
+        strength: float = 1.0,
         guidance_scale: float | None = 4.0,
         num_images_per_prompt: int = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
@@ -671,6 +746,7 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         max_sequence_length: int = 512,
         text_encoder_out_layers: tuple[int, ...] = (9, 18, 27),
+        padding_mask_crop: int | None = None,
     ) -> DiffusionOutput:
         r"""
         Function invoked when calling the pipeline for generation.
@@ -804,6 +880,8 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
             prompt_embeds=prompt_embeds,
             callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
             guidance_scale=guidance_scale,
+            strength=strength,
+            num_inference_steps=num_inference_steps,
         )
 
         self._guidance_scale = guidance_scale
@@ -848,6 +926,9 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
         if image is not None and not isinstance(image, list):
             image = [image]
 
+        multiple_of = self.vae_scale_factor * 2
+        crops_coords = None
+        resize_mode = "crop"
         condition_images = None
         if image is not None:
             for img in image:
@@ -860,16 +941,30 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
                     img = self.image_processor._resize_to_target_area(img, 1024 * 1024)
                     image_width, image_height = img.size
 
-                multiple_of = self.vae_scale_factor * 2
                 image_width = (image_width // multiple_of) * multiple_of
                 image_height = (image_height // multiple_of) * multiple_of
-                img = self.image_processor.preprocess(img, height=image_height, width=image_width, resize_mode="crop")
+                if padding_mask_crop is not None:
+                    crops_coords = self.mask_processor.get_crop_region(mask_image, width, height, pad=padding_mask_crop)
+                    resize_mode = "fill"
+                img = self.image_processor.preprocess(
+                    img, height=image_height, width=image_width, crops_coords=crops_coords, resize_mode=resize_mode
+                )
                 condition_images.append(img)
                 height = height or image_height
                 width = width or image_width
 
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
+
+        # Get mask_image and reference_image
+        multi_modal_data = req.prompts[0].get("multi_modal_data", {}) if req.prompts else {}
+        mask_image = multi_modal_data.get("mask_image")
+        reference_image = multi_modal_data.get("reference_image")
+
+        if mask_image is not None and (image is None or (isinstance(image, list) and len(image) == 0)):
+            raise ValueError("image must be provided when using mask_image for inpainting")
+
+        init_image = condition_images[0] if condition_images else None
 
         # 5. prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4
@@ -884,6 +979,8 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
             latents=latents,
         )
 
+        original_latent_ids = latent_ids
+
         image_latents = None
         image_latent_ids = None
         if condition_images is not None:
@@ -895,6 +992,71 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
                 dtype=self.vae.dtype,
             )
 
+        # Preprocess reference_image
+        if reference_image is not None and not (
+            isinstance(reference_image, torch.Tensor) and reference_image.size(1) == self.latent_channels
+        ):
+            if (
+                isinstance(reference_image, list)
+                and isinstance(reference_image[0], torch.Tensor)
+                and reference_image[0].ndim == 4
+            ):
+                reference_image = torch.cat(reference_image, dim=0)
+            img_reference = reference_image[0] if isinstance(reference_image, list) else reference_image
+            reference_image_height, reference_image_width = self.image_processor.get_default_height_width(img_reference)
+
+            reference_image_width = reference_image_width // multiple_of * multiple_of
+            reference_image_height = reference_image_height // multiple_of * multiple_of
+            reference_image = self.image_processor.resize(
+                reference_image, reference_image_height, reference_image_width
+            )
+            reference_image = self.image_processor.preprocess(
+                reference_image,
+                reference_image_height,
+                reference_image_width,
+                crops_coords=crops_coords,
+                resize_mode=resize_mode,
+            )
+        else:
+            pass
+
+        reference_image_latents = None
+        reference_image_latent_ids = None
+        if reference_image is not None:
+            reference_image_latents, reference_image_latent_ids = self.prepare_image_latents(
+                images=[reference_image],
+                batch_size=batch_size * num_images_per_prompt,
+                generator=generator,
+                device=device,
+                dtype=self.vae.dtype,
+            )
+
+        if reference_image_latent_ids is not None:
+            latent_ids = torch.cat([latent_ids, reference_image_latent_ids], dim=1)
+        elif image_latent_ids is not None:
+            latent_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
+
+        mask = None
+        if mask_image is not None:
+            mask_condition = self.mask_processor.preprocess(
+                mask_image, height=height, width=width, resize_mode=resize_mode, crops_coords=crops_coords
+            )
+            if init_image is not None:
+                masked_image = init_image * (mask_condition < 0.5).to(init_image.dtype)
+            else:
+                masked_image = None
+            mask, _ = self.prepare_mask_latents(
+                mask_condition,
+                masked_image,
+                batch_size,
+                self.latent_channels,
+                num_images_per_prompt,
+                height,
+                width,
+                prompt_embeds.dtype,
+                device,
+                generator,
+            )
         # 6. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
         if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
@@ -908,6 +1070,13 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
             sigmas=sigmas,
             mu=mu,
         )
+        if reference_image is not None or mask_image is not None:
+            timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
+            if num_inference_steps < 1:
+                raise ValueError(
+                    f"After adjusting the num_inference_steps by strength parameter: {strength}, the number of pipeline"
+                    f"steps is {num_inference_steps} which is < 1 and not appropriate for this pipeline."
+                )
         self._num_timesteps = len(timesteps)
 
         # 7. Denoising loop
@@ -924,7 +1093,10 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
             latent_model_input = latents.to(self.transformer.dtype)
             latent_image_ids = latent_ids
 
-            if image_latents is not None:
+            if reference_image_latents is not None:
+                latent_model_input = torch.cat([latents, reference_image_latents], dim=1)
+                latent_image_ids = latent_ids
+            elif image_latents is not None:
                 latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
                 latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
@@ -953,7 +1125,9 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
                 negative_kwargs = None
 
             # For editing pipelines, we need to slice the output to remove condition latents
-            output_slice = latents.size(1) if image_latents is not None else None
+            output_slice = (
+                latents.size(1) if (image_latents is not None or reference_image_latents is not None) else None
+            )
 
             noise_pred = self.predict_noise_maybe_with_cfg(
                 do_true_cfg=self.do_classifier_free_guidance,
@@ -964,8 +1138,21 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
                 output_slice=output_slice,
             )
 
+            latents_dtype = latents.dtype
             # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, self.do_classifier_free_guidance)
+
+            if mask is not None and image_latents is not None:
+                init_latents_proper = image_latents
+                if i < len(timesteps) - 1:
+                    noise_timestep = timesteps[i + 1]
+                    init_latents_proper = self.scheduler.scale_noise(
+                        init_latents_proper, torch.tensor([noise_timestep], device=device), latents
+                    )
+                latents = (1 - mask) * init_latents_proper + mask * latents
+
+            if latents.dtype != latents_dtype and torch.backends.mps.is_available():
+                latents = latents.to(latents_dtype)
 
             if callback_on_step_end is not None:
                 callback_kwargs = {}
@@ -978,7 +1165,7 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
 
         self._current_timestep = None
 
-        latents = self._unpack_latents_with_ids(latents, latent_ids)
+        latents = self._unpack_latents_with_ids(latents, original_latent_ids)
 
         latents_bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
         latents_bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(

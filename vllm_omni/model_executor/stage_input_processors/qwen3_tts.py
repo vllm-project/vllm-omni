@@ -212,7 +212,7 @@ def talker2code2wav_async_chunk(
             }
         return None
 
-    in_initial_phase = initial_chunk_size > 0 and initial_chunk_size < chunk_size and length < chunk_size
+    in_initial_phase = initial_chunk_size > 0 and initial_chunk_size < chunk_size and length <= chunk_size
 
     if in_initial_phase:
         # IC phase: emit every initial_chunk_size frames with growing left context.
@@ -225,7 +225,7 @@ def talker2code2wav_async_chunk(
         # Normal phase: offset so the first normal emit picks up after IC phase.
         # IC is stateless (may change with load); any mismatch is absorbed by left_context.
         initial_coverage = (
-            ((chunk_size - 1) // initial_chunk_size) * initial_chunk_size if 0 < initial_chunk_size < chunk_size else 0
+            (chunk_size // initial_chunk_size) * initial_chunk_size if 0 < initial_chunk_size < chunk_size else 0
         )
         adjusted = length - initial_coverage
         if not finished and adjusted % chunk_size != 0:

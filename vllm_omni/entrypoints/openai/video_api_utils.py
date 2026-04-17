@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import os
-import tempfile
 from io import BytesIO
 from typing import Any
 
@@ -160,7 +158,7 @@ def _normalize_frames(frames: list[Any]) -> list[np.ndarray]:
 
 
 def _coerce_video_to_frames(video: Any) -> list[np.ndarray]:
-    """Convert a video payload into a list of frames for export_to_video."""
+    """Convert a video payload into a list of normalized float32 frames."""
     if isinstance(video, torch.Tensor):
         video_array = _normalize_video_tensor(video)
         return list(video_array)
@@ -186,84 +184,72 @@ def _coerce_video_to_frames(video: Any) -> list[np.ndarray]:
     raise ValueError(f"Unsupported video payload type: {type(video)}")
 
 
-def _coerce_audio_to_waveform(audio: Any) -> torch.Tensor:
-    """Convert an audio payload into a 2-channel CPU float tensor for LTX2 export."""
+def _coerce_audio_to_numpy(audio: Any) -> np.ndarray:
+    """Convert an audio payload into a float32 numpy array for muxing."""
     if isinstance(audio, torch.Tensor):
-        waveform = audio.detach().cpu()
+        arr = audio.detach().cpu().float().numpy()
     elif isinstance(audio, np.ndarray):
-        waveform = torch.from_numpy(audio)
+        arr = audio
     elif isinstance(audio, list):
-        waveform = torch.tensor(audio)
+        arr = np.array(audio)
     else:
         raise ValueError(f"Unsupported audio payload type: {type(audio)}")
 
-    waveform = waveform.squeeze()
-
-    if waveform.ndim == 0:
+    arr = np.squeeze(arr)
+    if arr.ndim == 0:
         raise ValueError("Audio payload must contain at least one sample.")
 
-    if waveform.ndim == 1:
-        waveform = waveform.unsqueeze(0)
-    elif waveform.ndim == 2:
-        if waveform.shape[0] in (1, 2):
-            pass
-        elif waveform.shape[1] in (1, 2):
-            waveform = waveform.transpose(0, 1)
-        else:
-            raise ValueError(f"Unsupported audio payload shape: {tuple(waveform.shape)}")
-    else:
-        raise ValueError(f"Unsupported audio payload rank: {waveform.ndim}")
-
-    if waveform.shape[0] == 1:
-        waveform = waveform.repeat(2, 1)
-    elif waveform.shape[0] != 2:
-        raise ValueError(f"Expected mono or stereo audio, got shape {tuple(waveform.shape)}")
-
-    return waveform.float().contiguous()
+    return arr.astype(np.float32)
 
 
-def _encode_video_bytes(video: Any, fps: int, audio: Any | None = None, audio_sample_rate: int | None = None) -> bytes:
+def _encode_video_bytes(
+    video: Any,
+    fps: int,
+    audio: Any | None = None,
+    audio_sample_rate: int | None = None,
+    video_codec_options: dict[str, str] | None = None,
+) -> bytes:
     """Encode a video payload into MP4 bytes, optionally muxing audio."""
-    try:
-        from diffusers.utils import export_to_video
-    except ImportError as exc:  # pragma: no cover - optional dependency
-        raise ImportError("diffusers is required for export_to_video.") from exc
+    from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 
     frames = _coerce_video_to_frames(video)
     if not frames:
         raise ValueError("No frames found to encode.")
 
-    tmp_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    tmp_file.close()
-    try:
-        if audio is not None:
-            from diffusers.pipelines.ltx2.export_utils import encode_video as encode_ltx2_video
+    frames_np = np.stack(frames, axis=0)
+    if frames_np.ndim == 4 and frames_np.shape[-1] == 4:
+        frames_np = frames_np[..., :3]
 
-            frames_np = np.stack(frames, axis=0)
-            if frames_np.ndim == 4 and frames_np.shape[-1] == 4:
-                frames_np = frames_np[..., :3]
-            frames_np = np.clip(frames_np, 0.0, 1.0)
-            frames_u8 = (frames_np * 255).round().clip(0, 255).astype("uint8")
-            video_tensor = torch.from_numpy(frames_u8)
-            encode_ltx2_video(
-                video_tensor,
-                fps=fps,
-                audio=_coerce_audio_to_waveform(audio),
-                audio_sample_rate=audio_sample_rate,
-                output_path=tmp_file.name,
-            )
-        else:
-            export_to_video(frames, tmp_file.name, fps=fps)
-        with open(tmp_file.name, "rb") as f:
-            return f.read()
-    finally:
-        try:
-            os.remove(tmp_file.name)
-        except OSError:
-            pass
+    if frames_np.dtype == np.uint8:
+        frames_u8 = frames_np
+    else:
+        frames_np = np.clip(frames_np, 0.0, 1.0)
+        frames_np *= 255.0
+        frames_u8 = np.round(frames_np).astype(np.uint8)
+
+    # Ensure contiguous memory layout for faster PyAV muxing
+    frames_u8 = np.ascontiguousarray(frames_u8)
+
+    audio_np = _coerce_audio_to_numpy(audio) if audio is not None else None
+
+    return mux_video_audio_bytes(
+        frames_u8,
+        audio_np,
+        fps=float(fps),
+        audio_sample_rate=audio_sample_rate or 24000,
+        video_codec_options=video_codec_options,
+    )
 
 
-def encode_video_base64(video: Any, fps: int, audio: Any | None = None, audio_sample_rate: int | None = None) -> str:
+def encode_video_base64(
+    video: Any,
+    fps: int,
+    audio: Any | None = None,
+    audio_sample_rate: int | None = None,
+    video_codec_options: dict[str, str] | None = None,
+) -> str:
     """Encode a video (frames/array/tensor) to base64 MP4."""
-    video_bytes = _encode_video_bytes(video, fps=fps, audio=audio, audio_sample_rate=audio_sample_rate)
+    video_bytes = _encode_video_bytes(
+        video, fps=fps, audio=audio, audio_sample_rate=audio_sample_rate, video_codec_options=video_codec_options
+    )
     return base64.b64encode(video_bytes).decode("utf-8")

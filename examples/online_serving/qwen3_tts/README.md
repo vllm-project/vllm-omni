@@ -192,14 +192,6 @@ with open("output.wav", "wb") as f:
     f.write(response.content)
 ```
 
-### FAQ
-
-If you encounter error about backend of librosa, try to install ffmpeg with command below.
-```
-sudo apt update
-sudo apt install ffmpeg
-```
-
 ## API Reference
 
 ### Voices Endpoint
@@ -233,6 +225,7 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 - `consent` (required): Consent recording ID
 - `name` (required): Name for the new voice
 - `ref_text` (optional): Transcript of the audio. Enables in-context voice cloning (higher quality).
+- `speaker_description` (optional): Free-form description of the voice (e.g. "warm narrator", "energetic presenter").
 
 **Response Example:**
 ```json
@@ -243,10 +236,14 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
     "consent": "user_consent_id",
     "created_at": 1738660000,
     "mime_type": "audio/wav",
-    "file_size": 1024000
+    "file_size": 1024000,
+    "ref_text": "The exact transcript of the audio sample.",
+    "speaker_description": "warm narrator"
   }
 }
 ```
+
+Fields `ref_text` and `speaker_description` are omitted when not provided at upload time.
 
 **Usage Example:**
 ```bash
@@ -254,7 +251,8 @@ curl -X POST http://localhost:8000/v1/audio/voices \
   -F "audio_sample=@/path/to/voice_sample.wav" \
   -F "consent=user_consent_id" \
   -F "name=custom_voice_1" \
-  -F "ref_text=The exact transcript of the audio sample."
+  -F "ref_text=The exact transcript of the audio sample." \
+  -F "speaker_description=warm narrator"
 ```
 
 ### Endpoint
@@ -378,6 +376,54 @@ Server -> Client:
 // binary PCM frame(s)
 {"type": "audio.done", "sentence_index": 0, "total_bytes": 96000, "error": false}
 {"type": "session.done", "total_sentences": 1}
+```
+
+## Choosing an Execution Backend: Uniproc vs Multiprocessing
+
+Qwen3-TTS stage configs support two execution backends controlled by the
+`distributed_executor_backend` engine arg. The performance tradeoff between
+them is **both hardware- and task-dependent**, so there is no single best
+default (see [#2603](https://github.com/vllm-project/vllm-omni/issues/2603),
+[#2604](https://github.com/vllm-project/vllm-omni/pull/2604) for the full
+investigation).
+
+| Backend | Stage config setting | Behaviour |
+| ------- | -------------------- | --------- |
+| **Uniproc** (default, world_size=1) | `distributed_executor_backend` omitted | Both stages run inside the orchestrator process. Avoids IPC serialisation, D2H copies, and msgpack overhead between stages. |
+| **Multiprocessing** | `distributed_executor_backend: "mp"` | Each stage runs in its own subprocess. The Talker can continue decoding while Code2Wav runs the vocoder in parallel, improving pipeline utilisation under concurrency. |
+
+> **Note:** When `distributed_executor_backend` is omitted and `world_size=1`,
+> vLLM [automatically uses the uniproc executor](https://github.com/vllm-project/vllm/blob/main/vllm/config/parallel.py#L825).
+> When `world_size > 1`, it defaults to `mp`.
+
+### When uniproc wins
+
+The uniproc path eliminates inter-process data transfer (D2H copies,
+msgpack serialisation/deserialisation, tensor detaching). This matters most
+when per-request processing is heavy relative to autoregressive decode.
+
+The Base cloning task involves reference-audio encoding on every request, making IPC
+overhead a larger fraction of total cost. Qwen3-Omni shows a similar pattern.
+
+### When multiprocessing (`mp`) wins
+
+For lighter per-request workloads, process-level parallelism between the
+Talker and Code2Wav stages dominates.
+
+CustomVoice is lighter per-request (no reference audio encoding), so the
+process-level parallelism of `mp` outweighs its serialisation cost at
+concurrency ≥ 4.
+
+### How to switch
+
+To use the uniproc executor on a single-GPU setup, pass the
+`qwen3_tts_uniproc.yaml` stage config:
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --omni \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts_uniproc.yaml \
+    --port 8091
 ```
 
 ## Limitations

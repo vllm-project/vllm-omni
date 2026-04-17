@@ -73,7 +73,6 @@ vllm_omni/                                    tests/
 │   └── arg_utils.py                            │   └── test_arg_utils.py               ⬜
 │
 ├── entrypoints/                        →     ├── entrypoints/
-│   ├── async_omni_diffusion.py                 │   ├── test_async_omni_diffusion_config.py  ✅
 │   ├── stage_utils.py                          │   ├── test_stage_utils.py            ✅
 │   ├── cli/                                     │   ├── cli/                           (benchmarks/test_serve_cli.py covers CLI serve)
 │   │   └── ...                                  │   │   └── test_*.py                  ⬜
@@ -148,7 +147,7 @@ vllm_omni/                                    tests/
                                                    ├── test_zimage_tensor_parallel.py
                                                    ├── test_cache_dit.py
                                                    ├── test_teacache.py
-                                                   ├── test_stable_audio_model.py
+                                                   ├── test_stable_audio_expansion.py
                                                    ├── test_diffusion_cpu_offload.py
                                                    ├── test_diffusion_layerwise_offload.py
                                                    ├── test_diffusion_lora.py

@@ -14,7 +14,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
-import mistune
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -62,6 +61,8 @@ class ReadmeSnippet(NamedTuple):
         readme_path: Path,
         skipif: ReadmeSnippetExtractionSkipPredicate | None = None,
     ) -> list["ReadmeSnippet"]:
+        import mistune
+
         markdown = mistune.create_markdown(renderer="ast")
         tokens = markdown(readme_path.read_text(encoding="utf-8"))
         tokens = cast(list[dict[str, Any]], tokens)  # mistune's AST renderer always produces a list, not a str

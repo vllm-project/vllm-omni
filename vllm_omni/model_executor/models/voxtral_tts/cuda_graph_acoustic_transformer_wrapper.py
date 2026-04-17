@@ -11,6 +11,7 @@ eliminating kernel launch overhead on every decode step.
 import torch
 from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation import (
     AudioSpecialTokens,
@@ -48,7 +49,7 @@ class CUDAGraphAcousticTransformerWrapper:
         self.acoustic_embeddings_levels = self.acoustic_transformer.acoustic_embeddings_levels
 
         self.cfg_alpha = 1.2
-        self.n_steps = 8
+        self.n_steps = self.acoustic_transformer.acoustic_transformer_args.n_decoding_steps
 
         # Graph storage
         self.graphs: dict[int, CUDAGraph] = {}
@@ -72,7 +73,7 @@ class CUDAGraphAcousticTransformerWrapper:
         )
 
         # Pre-create persistent buffers
-        self.timesteps = torch.linspace(0, 1, self.n_steps, device=device, dtype=dtype)
+        self.timesteps = torch.linspace(0, 1, self.n_steps + 1, device=device, dtype=dtype)
         self.fake_eos_one = torch.tensor(1.0, dtype=dtype, device=device)
         self.fake_eos_zero = torch.tensor(0.0, dtype=dtype, device=device)
 
@@ -196,7 +197,7 @@ class CUDAGraphAcousticTransformerWrapper:
 
         graph = CUDAGraph()
         with torch.no_grad():
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                 static_fake_eos, static_audio_codes = self._forward_cudagraph_compatible(
                     static_input, noise=static_noise
                 )

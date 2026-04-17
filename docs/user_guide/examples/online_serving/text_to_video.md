@@ -3,17 +3,28 @@
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_video>.
 
 
-This example demonstrates how to deploy the Wan2.2 text-to-video model for online video generation using vLLM-Omni.
+This example demonstrates how to deploy text-to-video models for online video generation using vLLM-Omni.
 
-## Start Server
+## Supported Models
 
-### Basic Start
+| Model | Model ID |
+|-------|----------|
+| Wan2.1 T2V (1.3B) | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` |
+| Wan2.1 T2V (14B) | `Wan-AI/Wan2.1-T2V-14B-Diffusers` |
+| Wan2.2 T2V | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
+| LTX-2 | `Lightricks/LTX-2` |
+
+## Wan2.2 T2V
+
+### Start Server
+
+#### Basic Start
 
 ```bash
 vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --port 8091
 ```
 
-### Start with Parameters
+#### Start with Parameters
 
 Or use the startup script:
 
@@ -37,11 +48,42 @@ artifact, poll the job status and then download the completed file from the
 content endpoint.
 
 The main endpoints are:
-- `POST /v1/videos`: create a video generation job
+- `POST /v1/videos`: create a video generation job (async)
+- `POST /v1/videos/sync`: generate a video and return raw bytes (sync, for benchmarks)
 - `GET /v1/videos/{video_id}`: retrieve the current job status and metadata
 - `GET /v1/videos`: list stored video jobs
 - `GET /v1/videos/{video_id}/content`: download the generated video file
 - `DELETE /v1/videos/{video_id}`: delete the job and any stored output
+
+## Sync API (Benchmark / Testing)
+
+`POST /v1/videos/sync` is a synchronous alternative that blocks until generation
+completes and returns the raw video bytes (`video/mp4`) directly in the response
+body. It is designed for benchmark and testing scenarios where one-shot
+request/response latency measurement is needed.
+
+The sync endpoint accepts the same form parameters as `POST /v1/videos`. It does
+not create any stored job record — the response is purely the generated video
+file. Metadata is returned via response headers:
+
+- `X-Request-Id`: unique identifier for this generation request
+- `X-Model`: model name used for generation
+- `X-Inference-Time-S`: wall-clock inference time in seconds
+
+```bash
+curl -X POST http://localhost:8091/v1/videos/sync \
+  -F "prompt=Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage." \
+  -F "size=832x480" \
+  -F "num_frames=33" \
+  -F "fps=16" \
+  -F "num_inference_steps=40" \
+  -F "guidance_scale=4.0" \
+  -F "guidance_scale_2=4.0" \
+  -F "boundary_ratio=0.875" \
+  -F "flow_shift=5.0" \
+  -F "seed=42" \
+  -o sync_t2v_output.mp4
+```
 
 ## Storage
 
@@ -123,6 +165,9 @@ curl -X POST http://localhost:8091/v1/videos \
   -F "guidance_scale_2=4.0" \
   -F "boundary_ratio=0.875" \
   -F "flow_shift=5.0" \
+  -F "enable_frame_interpolation=true" \
+  -F "frame_interpolation_exp=1" \
+  -F "frame_interpolation_scale=1.0" \
   -F "seed=42"
 ```
 
@@ -145,6 +190,35 @@ curl -X POST http://localhost:8091/v1/videos \
 | `flow_shift`          | float  | None    | Scheduler flow shift (Wan2.2)                    |
 | `seed`                | int    | None    | Random seed (reproducible)                       |
 | `lora`                | object | None    | LoRA configuration                               |
+| `enable_frame_interpolation` | bool | false | Enable RIFE frame interpolation before MP4 encoding |
+| `frame_interpolation_exp` | int | 1 | Interpolation exponent; 1=2x temporal resolution, 2=4x |
+| `frame_interpolation_scale` | float | 1.0 | RIFE inference scale; use 0.5 for high-resolution inputs |
+| `frame_interpolation_model_path` | str | None | Local directory or Hugging Face repo ID with `flownet.pkl`; defaults to `elfgum/RIFE-4.22.lite` |
+
+## Frame Interpolation
+
+Frame interpolation is an optional post-processing step for `/v1/videos` and
+`/v1/videos/sync`. It synthesizes intermediate frames between generated frames
+without rerunning the diffusion model. If the generated video has `N` frames,
+the interpolated output frame count is `(N - 1) * 2**exp + 1`. The encoder FPS
+is multiplied by `2**exp` so the output duration remains close to the original.
+
+Frame interpolation runs in the diffusion worker post-processing path instead of
+the API server encoding path, so it can reuse the worker's current accelerator
+device without blocking the FastAPI event loop.
+
+Example: generate 5 frames and interpolate to 9 frames:
+
+```bash
+curl -X POST http://localhost:8091/v1/videos/sync \
+  -F "prompt=A dog running through a park" \
+  -F "num_frames=5" \
+  -F "fps=8" \
+  -F "enable_frame_interpolation=true" \
+  -F "frame_interpolation_exp=1" \
+  -F "frame_interpolation_scale=1.0" \
+  -o sync_t2v_interpolated.mp4
+```
 
 ## Create Response Format
 
@@ -203,8 +277,94 @@ while true; do
 done
 ```
 
+## LTX-2
+
+### Start Server
+
+#### Basic Start
+
+```bash
+vllm serve Lightricks/LTX-2 --omni --port 8098 \
+    --enforce-eager --flow-shift 1.0 --boundary-ratio 1.0
+```
+
+#### Start with Optimization Presets
+
+Use the LTX-2 startup script with built-in optimization presets:
+
+```bash
+# Baseline (1 GPU, eager)
+bash run_server_ltx2.sh baseline
+
+# 4-GPU Ulysses sequence parallelism (lossless)
+bash run_server_ltx2.sh ulysses4
+
+# Cache-DiT lossy acceleration (1 GPU, ~1.4× speedup)
+bash run_server_ltx2.sh cache-dit
+
+# Best combo: 4-GPU Ulysses SP + Cache-DiT (~2.2× speedup)
+bash run_server_ltx2.sh best-combo
+```
+
+#### Optimization Benchmarks
+
+Benchmarked on H800, online serving (480×768, 41 frames, 20 steps, `seed=42`).
+"Inference" is the server-reported inference time; excludes HTTP/poll overhead.
+
+| Preset | Server Command | Inference (s) | Speedup | Type |
+|--------|---------------|---------------|---------|------|
+| `baseline` | `--enforce-eager` | 10.3 | 1.00× | — |
+| `compile` | *(default, no --enforce-eager)* | ~10.3 (warm) | ~1.00× | Lossless |
+| `ulysses4` | `--enforce-eager --usp 4` | ~10.3 | ~1.00× | Lossless |
+| `cache-dit` | `--enforce-eager --cache-backend cache_dit` | 7.4 avg | ~1.4× | Lossy |
+| `best-combo` | `--enforce-eager --usp 4 --cache-backend cache_dit` | 4.7 avg | **~2.2×** | Lossless + Lossy |
+
+**Observations**:
+- **torch.compile**: On H800, warm-request inference time matches the eager baseline (~10.3s).
+  The first request pays ~6s compilation overhead. Benefit depends on model architecture and GPU.
+- **Ulysses SP (4 GPU)**: No measurable speedup alone for 41-frame generation at this resolution.
+  Communication overhead outweighs gains at this sequence length.
+- **Cache-DiT**: Inference varies per request (6–10s) due to dynamic caching decisions.
+  Average is ~7.4s (~1.4× speedup) with slight quality tradeoff.
+- **Best combo**: 4-GPU Ulysses SP + Cache-DiT synergize well — Cache-DiT reduces per-step
+  computation, making the communication overhead of Ulysses SP worthwhile. Average ~4.7s
+  (~2.2× speedup).
+- **FP8 quantization**: Reduces VRAM but does not speed up LTX-2 on H800 (compute-bound).
+
+**Deployment Recommendations**:
+- For **production with quality priority**: use `baseline` with `--enforce-eager`
+- For **maximum throughput** (4 GPUs, quality tradeoff): use `best-combo` (~2.2× speedup)
+- For **single-GPU throughput**: use `cache-dit` (~1.4× speedup)
+- `--enforce-eager` is recommended to avoid torch.compile warmup latency on first request
+
+### Send Requests (curl)
+
+```bash
+# Using the provided script
+bash run_curl_ltx2.sh
+
+# Or directly
+curl -sS -X POST http://localhost:8098/v1/videos \
+  -H "Accept: application/json" \
+  -F "prompt=A serene lakeside sunrise with mist over the water." \
+  -F "width=768" \
+  -F "height=480" \
+  -F "num_frames=41" \
+  -F "fps=24" \
+  -F "num_inference_steps=20" \
+  -F "guidance_scale=3.0" \
+  -F "seed=42"
+```
+
 ## Example materials
 
+??? abstract "response.json"
+    ``````json
+    --8<-- "examples/online_serving/text_to_video/response.json"
+    ``````
+??? abstract "run_curl_ltx2.sh"
+    ``````sh
+    --8<-- "examples/online_serving/text_to_video/run_curl_ltx2.sh"
 ??? abstract "run_curl_hunyuan_video_15.sh"
     ``````sh
     --8<-- "examples/online_serving/text_to_video/run_curl_hunyuan_video_15.sh"
@@ -217,6 +377,9 @@ done
     ``````sh
     --8<-- "examples/online_serving/text_to_video/run_server.sh"
     ``````
+??? abstract "run_server_ltx2.sh"
+    ``````sh
+    --8<-- "examples/online_serving/text_to_video/run_server_ltx2.sh"
 ??? abstract "run_server_hunyuan_video_15.sh"
     ``````sh
     --8<-- "examples/online_serving/text_to_video/run_server_hunyuan_video_15.sh"

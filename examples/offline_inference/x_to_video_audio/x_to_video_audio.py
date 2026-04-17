@@ -5,10 +5,12 @@ import argparse
 import re
 import time
 
-import librosa
+import numpy as np
 from PIL import Image
+from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -36,8 +38,8 @@ def parse_args() -> argparse.Namespace:
         "--cfg-parallel-size",
         type=int,
         default=1,
-        choices=[1, 2],
-        help="Number of GPUs used for classifier free guidance parallel size.",
+        choices=[1, 2, 3, 4],
+        help="Number of GPUs used for classifier free guidance parallel size (max 4 branches).",
     )
     parser.add_argument(
         "--video-negative-prompt",
@@ -69,7 +71,7 @@ def load_image_and_audio(image_paths, audio_paths):
             image.append(img)
 
     for path in audio_paths:
-        audio_array, sr = librosa.load(path, sr=16000)
+        audio_array, sr = load_audio(path, sr=16000)
         audio_array = audio_array[int(sr * 1) : int(sr * 3)]
         audio.append(audio_array)
     return image, audio
@@ -131,15 +133,35 @@ def main() -> None:
 
     if not outputs:
         raise RuntimeError("No output returned from DreamID-Omni.")
-    output = outputs[0].request_output
-    generated_video = output[0].images[0][0]
-    generated_audio = output[0].images[0][1]
-    try:
-        from dreamid_omni.utils.io_utils import save_video
-    except Exception as e:
-        raise RuntimeError(f"Failed to extract video and audio from DreamID-Omni output. Error: {e}")
+    result = outputs[0]
+    if not result.images:
+        raise RuntimeError("No video frames found in DreamID-Omni output.")
+    generated_video = result.images[0]
+    mm = result.multimodal_output or {}
+    generated_audio = mm.get("audio")
+    fps = int(mm.get("fps", 24))
+    sample_rate = int(mm.get("audio_sample_rate", 16000))
+
+    # DreamID-Omni returns video as (C, F, H, W) float32 in [-1, 1].
+    # mux_video_audio_bytes expects (F, H, W, C) uint8.
+    if not isinstance(generated_video, np.ndarray) or generated_video.ndim != 4:
+        raise RuntimeError(f"Unexpected video shape: {getattr(generated_video, 'shape', None)}")
+    frames = generated_video.transpose(1, 2, 3, 0)
+    frames = (np.clip((frames + 1.0) / 2.0, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+
+    audio_np = None
+    if generated_audio is not None:
+        audio_np = np.squeeze(np.asarray(generated_audio)).astype(np.float32)
+
     output_path = args.output
-    save_video(output_path, generated_video, generated_audio, fps=24, sample_rate=16000)
+    video_bytes = mux_video_audio_bytes(
+        frames,
+        audio_np,
+        fps=float(fps),
+        audio_sample_rate=sample_rate,
+    )
+    with open(output_path, "wb") as f:
+        f.write(video_bytes)
     print(f"Saved generated video to {output_path}")
     print(f"Total time: {elapsed:.2f}s")
 

@@ -97,21 +97,50 @@ def test_flush_on_finish():
 
 
 _CASES = [
+    # ── IC boundary rule ──────────────────────────────────────────────
+    # IC phase: length <= chunk_size  (uses <=, consistent with fish_speech)
+    # IC emits fill the entire first chunk_size worth of frames, so the
+    # normal phase always starts at a clean chunk boundary.
+    # initial_coverage = (chunk_size // initial_chunk_size) * initial_chunk_size
+    #
     # Dynamic IC=16, cs=25, initial_coverage=16
-    ((25, 25, 0), 24, False, None),  # IC phase: 24%16!=0 -> hold
-    ((25, 25, 0), 25, False, None),  # transition: adjusted=9, hold (no replay)
-    ((25, 25, 0), 41, False, (16, 41)),  # first normal emit, lc=16
+    # IC does NOT evenly divide cs, so initial_coverage < cs.
+    # IC emits at 16; frames 17-25 remain in IC phase but 25%16!=0 -> hold.
+    # Normal phase: adjusted = length - 16, emit when adjusted % 25 == 0.
+    ((25, 25, 0), 24, False, None),  # IC: 24<=25, 24%16!=0 -> hold
+    ((25, 25, 0), 25, False, None),  # IC: 25<=25, 25%16!=0 -> hold
+    ((25, 25, 0), 41, False, (16, 41)),  # normal: adjusted=25, 25%25==0 -> emit, lc=16
+    #
     # Per-request IC=10, cs=25, initial_coverage=20
-    ((25, 25, 10), 9, False, None),  # IC: hold
-    ((25, 25, 10), 10, False, (0, 10)),  # IC: emit at boundary
-    ((25, 25, 10), 25, False, None),  # transition: hold (no replay)
-    ((25, 25, 10), 45, False, (20, 45)),  # first normal emit, lc=20
+    # IC does NOT evenly divide cs; IC emits at 10, 20.
+    # Frames 21-25 are still IC phase but 21..25 % 10 != 0 -> hold.
+    ((25, 25, 10), 9, False, None),  # IC: 9%10!=0 -> hold
+    ((25, 25, 10), 10, False, (0, 10)),  # IC: 10%10==0 -> emit, lc=0
+    ((25, 25, 10), 25, False, None),  # IC: 25<=25, 25%10!=0 -> hold
+    ((25, 25, 10), 45, False, (20, 45)),  # normal: adjusted=25, 25%25==0 -> emit, lc=20
     ((25, 25, 10), 5, True, (0, 5)),  # finished flushes IC tail
     ((25, 25, 10), 33, True, (20, 33)),  # finished flushes normal tail
-    # IC=8, cs=16: IC divides chunk_size evenly (edge case)
-    ((16, 25, 8), 8, False, (0, 8)),  # IC: emit
-    ((16, 25, 8), 16, False, None),  # transition: hold (no replay)
-    ((16, 25, 8), 24, False, (8, 24)),  # first normal emit, lc=8
+    #
+    # IC=8, cs=16: IC evenly divides chunk_size (edge case)
+    # initial_coverage = (16//8)*8 = 16 == chunk_size.
+    # IC fills the entire first chunk: emits at 8 and 16.
+    # Normal phase starts at frame 17; first normal emit at 16+16=32.
+    ((16, 25, 8), 8, False, (0, 8)),  # IC: 8%8==0 -> emit, lc=0
+    ((16, 25, 8), 16, False, (8, 16)),  # IC: 16<=16, 16%8==0 -> emit, lc=8
+    ((16, 25, 8), 24, False, None),  # normal: adjusted=8, 8%16!=0 -> hold
+    ((16, 25, 8), 32, False, (16, 32)),  # normal: adjusted=16, 16%16==0 -> first emit, lc=16
+    #
+    # IC=5, cs=25: IC evenly divides chunk_size
+    # initial_coverage = (25//5)*5 = 25 == chunk_size.
+    # IC fills the entire first chunk: emits at 5, 10, 15, 20, 25.
+    # Normal phase starts at frame 26; first normal emit at 25+25=50.
+    # Emit intervals: 5,5,5,5,5,25,25,... — smooth transition, no gap.
+    ((25, 25, 5), 5, False, (0, 5)),  # IC: 5%5==0 -> emit, lc=0
+    ((25, 25, 5), 12, False, None),  # IC: 12%5!=0 -> hold
+    ((25, 25, 5), 25, False, (20, 25)),  # IC: 25<=25, 25%5==0 -> emit, lc=20
+    ((25, 25, 5), 30, False, None),  # normal: adjusted=5, 5%25!=0 -> hold
+    ((25, 25, 5), 50, False, (25, 50)),  # normal: adjusted=25, 25%25==0 -> first emit, lc=25
+    #
     # Per-request override: IC=15 at n_frames=10 -> 10%15!=0 -> hold
     ((25, 25, 15), 10, False, None),
 ]
