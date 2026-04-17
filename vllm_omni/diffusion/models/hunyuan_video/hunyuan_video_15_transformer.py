@@ -775,6 +775,10 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
             )
             hidden_states_mask[:, ctx.sp_original_seq_len :] = False
 
+            # if mask is all true, set it to None
+            if hidden_states_mask.all():
+                hidden_states_mask = None
+
         for block in self.transformer_blocks:
             hidden_states, encoder_hidden_states = block(
                 hidden_states,
