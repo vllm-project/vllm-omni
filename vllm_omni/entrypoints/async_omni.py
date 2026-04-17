@@ -309,7 +309,6 @@ class AsyncOmni(EngineClient, OmniBase):
         if not stage0_params.skip_clone:
             stage0_params = stage0_params.clone()
             stage0_params.skip_clone = True
-        stage0_params.output_kind = RequestOutputKind.DELTA
 
         has_submitted_first_chunk = False
 

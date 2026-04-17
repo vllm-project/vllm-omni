@@ -53,7 +53,6 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.orca_metrics import metrics_header
-from vllm.entrypoints.openai.realtime.connection import RealtimeConnection
 from vllm.entrypoints.openai.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
 from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
@@ -108,6 +107,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoListResponse,
     VideoResponse,
 )
+from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
@@ -1204,6 +1204,22 @@ async def streaming_speech(websocket: WebSocket):
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
+    engine_client = getattr(websocket.app.state, "engine_client", None)
+    if engine_client is not None and getattr(engine_client, "async_chunk", False):
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "type": "error",
+                "error": (
+                    "The /v1/realtime API is not supported when async_chunk is enabled on the server. "
+                    "Use a stage configuration with async_chunk disabled and restart the server before using "
+                    "this endpoint."
+                ),
+                "code": "unsupported",
+            }
+        )
+        await websocket.close()
+        return
     serving = getattr(websocket.app.state, "openai_serving_realtime", None)
     if serving is None:
         await websocket.accept()
