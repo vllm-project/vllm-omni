@@ -66,17 +66,17 @@ def rope_precompute(x, grid_sizes, freqs, start=None):
     """Precompute complex-valued RoPE embeddings for S2V multi-grid positions."""
     b, s, n, c = x.size(0), x.size(1), x.size(2), x.size(3) // 2
 
-    if type(freqs) is list:
+    if isinstance(freqs, list):
         trainable_freqs = freqs[1]
         freqs = freqs[0]
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
     output = torch.view_as_complex(x.detach().reshape(b, s, n, -1, 2).to(torch.float64))
     seq_bucket = [0]
-    if type(grid_sizes) is not list:
+    if not isinstance(grid_sizes, list):
         grid_sizes = [grid_sizes]
     for g in grid_sizes:
-        if type(g) is not list:
+        if not isinstance(g, list):
             g = [torch.zeros_like(g), g]
         batch_size = g[0].shape[0]
         for i in range(batch_size):
@@ -123,17 +123,17 @@ def rope_apply(x, grid_sizes, freqs, start=None):
     n, c = x.size(2), x.size(3) // 2
     input_dtype = x.dtype
 
-    if type(freqs) is list:
+    if isinstance(freqs, list):
         trainable_freqs = freqs[1]
         freqs = freqs[0]
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
     output = x.clone()
     seq_bucket = [0]
-    if type(grid_sizes) is not list:
+    if not isinstance(grid_sizes, list):
         grid_sizes = [grid_sizes]
     for g in grid_sizes:
-        if type(g) is not list:
+        if not isinstance(g, list):
             g = [torch.zeros_like(g), g]
         batch_size = g[0].shape[0]
         for i in range(batch_size):
@@ -484,7 +484,7 @@ class CausalConv1d(nn.Module):
 
 
 class MotionEncoder_tc(nn.Module):
-    def __init__(self, in_dim, hidden_dim, num_heads=int, need_global=True, dtype=None, device=None):
+    def __init__(self, in_dim, hidden_dim, num_heads=4, need_global=True, dtype=None, device=None):
         factory_kwargs = {"dtype": dtype, "device": device}
         super().__init__()
         self.num_heads = num_heads
@@ -1052,7 +1052,7 @@ class FramePackMotioner(nn.Module):
                 pad_lat[:, -overlap_frame:] = m[:, -overlap_frame:]
 
             if add_last_motion < 2 and self.drop_mode != "drop":
-                zero_end_frame = self.zip_frame_buckets[: self.zip_frame_buckets.__len__() - add_last_motion - 1].sum()
+                zero_end_frame = self.zip_frame_buckets[: len(self.zip_frame_buckets) - add_last_motion - 1].sum()
                 pad_lat[:, -zero_end_frame:] = 0
 
             pad_lat = pad_lat.unsqueeze(0)
@@ -1352,7 +1352,7 @@ class WanS2VTransformer3DModel(nn.Module):
             self.trainable_cond_mask = zero_module(self.trainable_cond_mask)
             if hasattr(self, "cond_encoder"):
                 self.cond_encoder = zero_module(self.cond_encoder)
-            for i in range(self.audio_injector.injector.__len__()):
+            for i in range(len(self.audio_injector.injector)):
                 self.audio_injector.injector[i].o = zero_module(self.audio_injector.injector[i].o)
                 if self.enable_adain:
                     self.audio_injector.injector_adain_layers[i].linear = zero_module(
@@ -1560,6 +1560,26 @@ class WanS2VTransformer3DModel(nn.Module):
         *extra_args,
         **extra_kwargs,
     ):
+        """Forward pass for S2V transformer.
+
+        Args:
+            x: Noisy latents [B, C, T, H, W]
+            t: Timesteps [B]
+            context: Text embeddings [B, seq_len, dim]
+            seq_len: Sequence length
+            ref_latents: Reference image latents [B, C, 1, H, W]
+            motion_latents: Motion context latents [B, C, T_motion, H, W]
+            cond_states: Pose condition latents [B, C, T, H, W] — typically zero tensor
+                        for no pose control. Iterates over batch dimension (dim 0).
+            audio_input: Raw audio features (optional if audio_emb provided)
+            motion_frames: [num_frames, num_latent_frames] for audio alignment
+            add_last_motion: Number of last motion frames to repeat
+            drop_motion_frames: Whether to drop first motion frame
+            audio_emb: Precomputed audio embeddings from encode_audio()
+
+        Returns:
+            Predicted noise [B, C, T, H, W]
+        """
         add_last_motion = self.add_last_motion * add_last_motion
 
         # Audio encoding — use precomputed embeddings if available
@@ -1581,6 +1601,8 @@ class WanS2VTransformer3DModel(nn.Module):
             self.merged_audio_emb = audio_emb_local[:, motion_frames[1] :, :]
 
         # Patch embedding + condition
+        # NOTE: x and cond_states are 5D tensors [B, C, T, H, W]. Iterating over them
+        # yields 4D tensors [C, T, H, W], which we unsqueeze(0) to restore batch dim.
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         cond = [self.cond_encoder(c.unsqueeze(0)) for c in cond_states]
         x = [x_ + pose for x_, pose in zip(x, cond)]

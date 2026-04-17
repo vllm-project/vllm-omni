@@ -15,6 +15,7 @@ import os
 from collections.abc import Iterable
 from typing import Any
 
+import librosa
 import numpy as np
 import PIL.Image
 import torch
@@ -209,8 +210,8 @@ def _get_size_less_than_area(
     for i in range(100):
         scale = max_scale - (max_scale - min_scale) * i / 100
         new_height, new_width = int(height * scale), int(width * scale)
-        pad_height = (64 - new_height % 64) % 64
-        pad_width = (64 - new_width % 64) % 64
+        pad_height = (divisor - new_height % divisor) % divisor
+        pad_width = (divisor - new_width % divisor) % divisor
         padded_height, padded_width = new_height + pad_height, new_width + pad_width
         if padded_height * padded_width <= max_upper_area:
             return padded_height, padded_width
@@ -431,7 +432,7 @@ def _load_wan_t5_as_umt5(
 ) -> UMT5EncoderModel:
     """Load a Wan2.2 T5 ``.pth`` checkpoint as a ``UMT5EncoderModel``."""
     logger.info("Loading Wan T5 checkpoint: %s", checkpoint_path)
-    wan_sd = torch.load(checkpoint_path, map_location="cpu")
+    wan_sd = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     hf_sd = _convert_wan_t5_state_dict(wan_sd)
 
     model.load_state_dict(hf_sd, assign=True)
@@ -499,6 +500,12 @@ class Wan22S2VPipeline(
         # -- VAE scale factors --
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if hasattr(self.vae, "config") else 4
         self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if hasattr(self.vae, "config") else 8
+
+        # -- Resolution divisor for padding (VAE spatial scale × transformer patch size) --
+        # S2V uses patch_size=2 in patch_embedding (3D conv with stride 2 in spatial dims)
+        # Total divisor = vae_scale_factor_spatial × patch_size_spatial = 8 × 8 = 64
+        # (patch_size_spatial = 2 × 2 × 2 for three conv layers)
+        self.resolution_divisor = self.vae_scale_factor_spatial * 8  # 8 = 2^3 for patch embedding
 
         # -- S2V specific config --
         # These mirror Wan2.2/wan/configs/wan_s2v_14B.py
@@ -772,8 +779,6 @@ class Wan22S2VPipeline(
             audio_input = audio_path.astype(np.float32)
             sample_rate = 16000
         else:
-            import librosa
-
             audio_input, sample_rate = librosa.load(audio_path, sr=16000)
         input_values = self.audio_processor(audio_input, sampling_rate=sample_rate, return_tensors="pt").input_values
         # Match dtype of audio model weights (may be bfloat16 in bundled checkpoints)
@@ -898,8 +903,10 @@ class Wan22S2VPipeline(
             raise ValueError("Reference image is required for S2V generation.")
         if audio_path is None:
             raise ValueError("Audio path is required for S2V generation.")
-        if height % 64 != 0 or width % 64 != 0:
-            raise ValueError(f"`height` and `width` must be divisible by 64, got {height} and {width}.")
+        if height % self.resolution_divisor != 0 or width % self.resolution_divisor != 0:
+            raise ValueError(
+                f"`height` and `width` must be divisible by {self.resolution_divisor}, got {height} and {width}."
+            )
 
     # ------------------------------------------------------------------
     # Noise prediction
@@ -1040,8 +1047,6 @@ class Wan22S2VPipeline(
             num_repeat = audio_num_repeat
 
         # Load raw audio waveform for muxing into output video
-        import librosa
-
         if isinstance(audio_path, np.ndarray):
             raw_audio_waveform = audio_path.astype(np.float32)
             raw_audio_sr = 16000
@@ -1112,6 +1117,7 @@ class Wan22S2VPipeline(
 
             # -- Pose condition for this clip --
             # Default: zero condition (no pose driving)
+            # Shape: [B=1, C=16, T, H, W] — passed to transformer which iterates over batch dim
             lat_h = height // self.vae_scale_factor_spatial
             lat_w = width // self.vae_scale_factor_spatial
             lat_target_frames = (infer_frames + 3 + motion_frames) // 4 - lat_motion_frames
