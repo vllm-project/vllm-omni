@@ -220,6 +220,9 @@ class OmniDiffusionSamplingParams:
     width_latents: list[int] | int | None = None
     num_frames: int = 1  # Default for image models
     num_frames_round_down: bool = False  # Whether to round down num_frames if it's not divisible by num_gpus
+    # Number of output chunks the request produces. Read by ``StreamBatchScheduler``
+    # (temporal PP) to know how many chunks to admit through the pipeline.
+    num_chunks: int = 1
 
     # Original dimensions (before VAE scaling)
     height: int | None = None
