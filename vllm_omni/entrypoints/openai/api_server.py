@@ -121,6 +121,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParam
 logger = init_logger(__name__)
 router = APIRouter()
 
+MAX_UINT32_SEED = 2**32 - 1
 profiler_router = APIRouter()
 
 
@@ -1312,6 +1313,57 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         )
 
     try:
+        # Unify request construction for any multi-stage pipeline to avoid
+        # divergence between /v1/images and /v1/chat/completions.
+        if len(stage_configs) > 1:
+            chat_handler = getattr(raw_request.app.state, "openai_serving_chat", None)
+            if chat_handler is None:
+                logger.warning("openai_serving_chat is not initialized for multi-stage /v1/images/generations")
+                raise HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                    detail="openai_serving_chat is not initialized for multi-stage image generation.",
+                )
+
+            effective_seed = request.seed if request.seed is not None else random.randint(0, MAX_UINT32_SEED)
+            extra_body: dict[str, Any] = {
+                "seed": effective_seed,
+                "num_outputs_per_prompt": request.n,
+            }
+            if request.size is not None:
+                parse_size(request.size)
+                width, height = parse_size(request.size)
+                app_state_args = getattr(raw_request.app.state, "args", None)
+                _check_max_generated_image_size(app_state_args, width, height)
+                extra_body["size"] = request.size
+            if request.negative_prompt is not None:
+                extra_body["negative_prompt"] = request.negative_prompt
+            if request.num_inference_steps is not None:
+                extra_body["num_inference_steps"] = request.num_inference_steps
+            if request.guidance_scale is not None:
+                extra_body["guidance_scale"] = request.guidance_scale
+            if request.true_cfg_scale is not None:
+                extra_body["true_cfg_scale"] = request.true_cfg_scale
+            if request.generator_device is not None:
+                extra_body["generator_device"] = request.generator_device
+            if request.lora is not None:
+                # Keep /images validation semantics: invalid LoRA should fail with 400.
+                _parse_lora_request(request.lora)
+                extra_body["lora"] = request.lora
+
+            generation_result = await chat_handler.generate_diffusion_images(
+                prompt=request.prompt,
+                extra_body=extra_body,
+                request_id=f"img_gen-{random_uuid()}",
+            )
+            if isinstance(generation_result, ErrorResponse):
+                return JSONResponse(
+                    status_code=generation_result.error.code if generation_result.error else 400,
+                    content=generation_result.model_dump(),
+                )
+            flat_images, _, _ = generation_result
+            image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in flat_images]
+            return ImageGenerationResponse(created=int(time.time()), data=image_data)
+
         # Build params - pass through user values directly
         prompt: OmniTextPrompt = {"prompt": request.prompt}
         if request.negative_prompt is not None:
@@ -1352,7 +1404,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         # This fixes issues where using the default global generator
         # might produce blurry images in some environments.
         _update_if_not_none(
-            gen_params, "seed", request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
+            gen_params, "seed", request.seed if request.seed is not None else random.randint(0, MAX_UINT32_SEED)
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
         _update_if_not_none(gen_params, "layers", request.layers)
@@ -1573,7 +1625,7 @@ async def edit_images(
         # a proper generator is initialized in the backend.
         # This fixes issues where using the default global generator
         # might produce blurry images in some environments.
-        _update_if_not_none(gen_params, "seed", seed if seed is not None else random.randint(0, 2**32 - 1))
+        _update_if_not_none(gen_params, "seed", seed if seed is not None else random.randint(0, MAX_UINT32_SEED))
         _update_if_not_none(gen_params, "generator_device", generator_device)
         _update_if_not_none(gen_params, "layers", layers)
         _update_if_not_none(gen_params, "resolution", resolution)
