@@ -29,16 +29,6 @@ logger = init_logger(__name__)
 class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
     def load_model(self, *args, **kwargs) -> None:
         NPUModelRunner.load_model(self, *args, **kwargs)
-        capture_sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
-        capture_len = 0 if not capture_sizes else len(capture_sizes)
-        logger.debug(
-            "logId: 2 npu load graph-config: mode=%s, capture_sizes_len=%s, "
-            "max_capture_size=%s, enforce_eager=%s",
-            getattr(self.compilation_config, "cudagraph_mode", None),
-            capture_len,
-            getattr(self.compilation_config, "max_cudagraph_capture_size", None),
-            getattr(self.model_config, "enforce_eager", None),
-        )
         # Initialize enable_sp cache to avoid get_current_vllm_config() error
         # in _pad_for_sequence_parallelism during execute_model.
         # This is a workaround for vllm-ascend not passing vllm_config to enable_sp().

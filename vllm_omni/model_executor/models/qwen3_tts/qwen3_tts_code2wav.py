@@ -157,7 +157,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         if seq_token_counts is not None and len(seq_token_counts) >= 1:
             boundaries = [0]
             for count in seq_token_counts:
-                boundaries.append(boundaries[-1] + max(int(count), 0))
+                boundaries.append(boundaries[-1] + int(count))
             n = ids.numel()
             return [ids[boundaries[i] : min(boundaries[i + 1], n)] for i in range(len(seq_token_counts))]
         if is_forward_context_available():
