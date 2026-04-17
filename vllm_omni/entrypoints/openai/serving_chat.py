@@ -1585,6 +1585,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     role,
                     reasoning_parser,
                 )
+                final_res = omni_outputs.request_output
             elif omni_outputs.final_output_type == "audio":
                 choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
             elif omni_outputs.final_output_type == "image":
