@@ -733,6 +733,7 @@ def make_process_kill_fault_injector(
     grep_patterns: str | Sequence[str],
     signal_name: str = "SIGKILL",
     limit: int = 1,
+    post_kill_wait_seconds: float = 0.0,
 ) -> FaultInjector:
     """Build a post-ready injector that kills processes matched by ``pgrep -f``.
 
@@ -744,6 +745,7 @@ def make_process_kill_fault_injector(
         grep_patterns: One pattern or an ordered list of patterns.
         signal_name: Passed to :func:`inject_process_kill` (e.g. ``SIGKILL``).
         limit: Maximum PIDs to kill per pattern (default ``1``).
+        post_kill_wait_seconds: Optional wait time after kill before test request starts.
     """
     patterns: tuple[str, ...] = (grep_patterns,) if isinstance(grep_patterns, str) else tuple(grep_patterns)
 
@@ -789,6 +791,12 @@ def make_process_kill_fault_injector(
                     f"[reliability][process-kill] matched pattern={pattern} killed_pids={filtered} killed_count={len(filtered)}",
                     flush=True,
                 )
+                if post_kill_wait_seconds > 0:
+                    print(
+                        f"[reliability][process-kill] waiting {post_kill_wait_seconds:.2f}s after kill",
+                        flush=True,
+                    )
+                    time.sleep(post_kill_wait_seconds)
                 return
         logger.warning(
             "[reliability][process-kill] no process matched patterns=%s signal=%s limit=%s",

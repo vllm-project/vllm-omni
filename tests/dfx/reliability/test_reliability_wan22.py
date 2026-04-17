@@ -117,6 +117,7 @@ def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server_funct
                 grep_patterns="vllm_omni.entrypoints.cli.main",
                 signal_name="SIGKILL",
                 limit=1,
+                post_kill_wait_seconds=2.0,
             ),
             id="runtime_process_chain",
         ),

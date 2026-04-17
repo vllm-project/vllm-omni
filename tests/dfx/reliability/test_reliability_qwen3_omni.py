@@ -204,6 +204,7 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_funct
                 grep_patterns="VLLM::Worker",
                 signal_name="SIGKILL",
                 limit=1,
+                post_kill_wait_seconds=2.0,
             ),
             id="runtime_process_chain",
         ),
