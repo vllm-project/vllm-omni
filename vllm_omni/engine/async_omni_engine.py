@@ -1138,6 +1138,16 @@ class AsyncOmniEngine:
         # We temporally create a default config for diffusion stage.
         # In the future, we should merge the default config with the user-provided config.
         normalized_kwargs = dict(kwargs)
+        default_sampling_params = normalized_kwargs.get("default_sampling_params")
+        if isinstance(default_sampling_params, str):
+            try:
+                default_sampling_params = json.loads(default_sampling_params)
+            except json.JSONDecodeError:
+                logger.warning("Invalid default_sampling_params JSON, ignoring stage defaults.")
+                default_sampling_params = None
+        if not isinstance(default_sampling_params, dict):
+            default_sampling_params = None
+        stage_default_sampling_params = default_sampling_params.get("0", {}) if default_sampling_params else {}
 
         # TODO: hack, convert dtype to string to avoid non-premitive omegaconf create error.
         if "dtype" in normalized_kwargs and not isinstance(normalized_kwargs["dtype"], str):
@@ -1234,6 +1244,7 @@ class AsyncOmniEngine:
                     "devices": devices,
                 },
                 "engine_args": stage_engine_args,
+                "default_sampling_params": stage_default_sampling_params,
                 "final_output": True,
                 "final_output_type": "image",
             }
