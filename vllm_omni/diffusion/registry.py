@@ -119,8 +119,8 @@ _DIFFUSION_MODELS = {
         "FluxKontextPipeline",
     ),
     "HunyuanImage3ForCausalMM": (
-        "hunyuan_image_3",
-        "pipeline_hunyuan_image_3",
+        "hunyuan_image3",
+        "pipeline_hunyuan_image3",
         "HunyuanImage3Pipeline",
     ),
     "Flux2KleinPipeline": (
@@ -375,6 +375,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
+    "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {

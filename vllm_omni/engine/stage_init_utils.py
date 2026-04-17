@@ -13,7 +13,7 @@ import importlib
 import multiprocessing as mp
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -101,8 +101,110 @@ def resolve_worker_cls(engine_args: dict[str, Any]) -> None:
         raise ValueError(f"Unknown worker_type: {worker_type}")
 
 
-def inject_kv_stage_info(stage_cfg: Any, stage_id: int) -> None:
-    """Inject stage metadata into omni_kv_config when present."""
+def _get_attr_or_item(obj: Any, key: str, default: Any = None) -> Any:
+    """Read *key* from *obj* regardless of whether it's a dict or object."""
+    if hasattr(obj, "get"):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _tp_size_for_stage(stage_configs: Sequence[Any], stage_id: Any) -> int | None:
+    """Resolve tensor_parallel_size for *stage_id* from the loaded stage configs."""
+    id_strs = {str(stage_id)}
+    try:
+        id_strs.add(str(int(stage_id)))
+    except (TypeError, ValueError):
+        pass
+
+    for stage_cfg in stage_configs:
+        if str(getattr(stage_cfg, "stage_id", None)) not in id_strs:
+            continue
+        engine_args = getattr(stage_cfg, "engine_args", None)
+        if engine_args is None:
+            return 1
+        parallel_config = _get_attr_or_item(engine_args, "parallel_config")
+        if parallel_config is not None:
+            tp = _get_attr_or_item(parallel_config, "tensor_parallel_size", 1)
+        else:
+            tp = _get_attr_or_item(engine_args, "tensor_parallel_size", 1)
+        try:
+            return max(1, int(tp))
+        except (TypeError, ValueError):
+            return 1
+    return None
+
+
+def _inject_inferred_kv_tp_topology(
+    omni_kv: Any,
+    stage_id: int,
+    stage_configs: Sequence[Any],
+    engine_input_source: Sequence[int] | None = None,
+) -> None:
+    """Infer adjacent-stage TP topology and inject it into omni_kv_config.
+
+    This keeps heterogeneous TP working without requiring user-authored
+    rank_mapping blocks in config files.
+    """
+    if omni_kv is None:
+        return
+
+    if hasattr(omni_kv, "get"):
+        need_send = bool(omni_kv.get("need_send_cache", False))
+        need_recv = bool(omni_kv.get("need_recv_cache", False))
+        omni_from_stage = omni_kv.get("omni_from_stage")
+        omni_to_stage = omni_kv.get("omni_to_stage")
+        rank_mapping = omni_kv.get("rank_mapping")
+    else:
+        need_send = bool(getattr(omni_kv, "need_send_cache", False))
+        need_recv = bool(getattr(omni_kv, "need_recv_cache", False))
+        omni_from_stage = getattr(omni_kv, "omni_from_stage", None)
+        omni_to_stage = getattr(omni_kv, "omni_to_stage", None)
+        rank_mapping = getattr(omni_kv, "rank_mapping", None)
+
+    if not need_send and not need_recv:
+        return
+
+    current_tp = _tp_size_for_stage(stage_configs, stage_id)
+    if current_tp is None:
+        return
+
+    peer_stage_id = None
+    from_tp = None
+    to_tp = None
+    if str(omni_from_stage) == str(stage_id):
+        peer_stage_id = omni_to_stage
+        from_tp = current_tp
+        to_tp = _tp_size_for_stage(stage_configs, peer_stage_id)
+    elif str(omni_to_stage) == str(stage_id):
+        peer_stage_id = omni_from_stage
+        from_tp = _tp_size_for_stage(stage_configs, peer_stage_id)
+        to_tp = current_tp
+    elif need_recv and engine_input_source:
+        peer_stage_id = engine_input_source[0]
+        from_tp = _tp_size_for_stage(stage_configs, peer_stage_id)
+        to_tp = current_tp
+
+    if from_tp is None or to_tp is None:
+        return
+
+    if not isinstance(rank_mapping, dict):
+        rank_mapping = {}
+    rank_mapping.setdefault("from_tp", int(from_tp))
+    rank_mapping.setdefault("to_tp", int(to_tp))
+
+    if hasattr(omni_kv, "__setitem__"):
+        omni_kv["rank_mapping"] = rank_mapping
+    else:
+        setattr(omni_kv, "rank_mapping", rank_mapping)
+
+
+def inject_kv_stage_info(stage_cfg: Any, stage_id: int, stage_configs: Sequence[Any] | None = None) -> None:
+    """Inject stage_id, engine_input_source, and inferred TP topology into omni_kv_config.
+
+    When *stage_configs* is provided, also infers from_tp/to_tp for
+    heterogeneous TP topologies so the KV transfer manager can compute
+    rank mappings automatically.
+    """
     try:
         engine_args = stage_cfg.engine_args
         if hasattr(engine_args, "get"):
@@ -125,6 +227,14 @@ def inject_kv_stage_info(stage_cfg: Any, stage_id: int) -> None:
                 omni_kv.setdefault("engine_input_source", list(engine_input_source))
             elif hasattr(omni_kv, "__setitem__") and "engine_input_source" not in omni_kv:
                 omni_kv["engine_input_source"] = list(engine_input_source)
+
+        if stage_configs:
+            _inject_inferred_kv_tp_topology(
+                omni_kv,
+                stage_id=stage_id,
+                stage_configs=stage_configs,
+                engine_input_source=engine_input_source,
+            )
     except Exception as e:
         logger.debug("Failed to inject stage info into omni_kv_config: %s", e)
 
@@ -192,8 +302,9 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     default_sampling_params: OmniSamplingParams = SPClass(**default_sp)
 
     custom_process_input_func: Callable | None = None
-    if hasattr(stage_config, "custom_process_input_func"):
-        mod_path, fn_name = stage_config.custom_process_input_func.rsplit(".", 1)
+    _cpif_path = getattr(stage_config, "custom_process_input_func", None)
+    if _cpif_path:
+        mod_path, fn_name = _cpif_path.rsplit(".", 1)
         custom_process_input_func = getattr(importlib.import_module(mod_path), fn_name)
 
     prompt_expand_func: Callable | None = None
@@ -530,6 +641,7 @@ def initialize_diffusion_stage(
     metadata: StageMetadata,
     stage_init_timeout: int,
     batch_size: int = 1,
+    use_inline: bool = False,
 ) -> Any:
     """Build a diffusion stage client.
 
@@ -541,13 +653,12 @@ def initialize_diffusion_stage(
         batch_size: Maximum number of requests to batch together in the
             diffusion engine.  Passed through to ``StageDiffusionClient``
             and ultimately to ``AsyncOmni``.
+        use_inline: If True, uses the inline diffusion client instead of subprocess.
     """
-    from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+    from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
-    return StageDiffusionClient(
-        model, od_config, metadata, stage_init_timeout=stage_init_timeout, batch_size=batch_size
-    )
+    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
 
 
 def _shutdown_or_close_resource(resource: Any, resource_name: str, stage_id: int) -> None:

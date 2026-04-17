@@ -246,6 +246,23 @@ class Orchestrator:
                         idle = False
                         req_state = self.request_states.get(output.request_id)
                         if req_state is not None:
+                            if getattr(output, "error", None) is not None:
+                                parent_id = self._companion_to_parent.get(output.request_id, output.request_id)
+                                await self.output_async_queue.put(
+                                    {
+                                        "type": "error",
+                                        "request_id": parent_id,
+                                        "stage_id": stage_id,
+                                        "error": output.error,
+                                    }
+                                )
+                                role_map = self._companion_map.get(parent_id, {})
+                                for cid in role_map.values():
+                                    self.request_states.pop(cid, None)
+                                self._cleanup_companion_state(parent_id)
+                                self.request_states.pop(parent_id, None)
+                                continue
+
                             stage_metrics = self._build_stage_metrics(stage_id, output.request_id, [output], req_state)
                             await self._route_output(stage_id, output, req_state, stage_metrics)
                     continue

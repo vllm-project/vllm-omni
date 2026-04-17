@@ -5,8 +5,8 @@ Supports vLLM-Omni server backend:
   - vllm-omni (default): starts DiffusionServer via vllm_omni.entrypoints.cli.main,
     benchmarks with diffusion_benchmark_serving.py --backend vllm-omni
 
-A config JSON file is REQUIRED via --config-file:
-  pytest run_diffusion_benchmark.py --config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
+A config JSON file is REQUIRED via --test-config-file:
+  pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
 
 JSON config entries use a "server_type" field, and this runner executes
 the vllm-omni path.
@@ -27,13 +27,14 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import psutil
 import pytest
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
+os.environ.setdefault("DIFFUSION_ATTENTION_BACKEND", "FLASH_ATTN")
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -50,19 +51,20 @@ BENCHMARK_SCRIPT = str(
 # Populated lazily after CONFIG_FILE_PATH is resolved.
 _SESSION_TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 _RESULT_LOCK = threading.Lock()
+_BRANCHPOINT_COMMIT_SHA: str | None = None
 
 
 def _get_config_file_from_argv() -> str | None:
-    """Read --config-file from sys.argv at import time so pytest parametrize can use it.
+    """Read --test-config-file from sys.argv at import time so pytest parametrize can use it.
 
     pytest_addoption (below) registers the same flag so pytest does not reject it.
-    Supports both ``--config-file path`` and ``--config-file=path`` forms.
+    Supports both ``--test-config-file path`` and ``--test-config-file=path`` forms.
     Returns None if the flag is not present; callers must handle the missing case.
     """
     for i, arg in enumerate(sys.argv):
-        if arg == "--config-file" and i + 1 < len(sys.argv):
+        if arg == "--test-config-file" and i + 1 < len(sys.argv):
             return sys.argv[i + 1]
-        if arg.startswith("--config-file="):
+        if arg.startswith("--test-config-file="):
             return arg.split("=", 1)[1]
     return None
 
@@ -110,7 +112,7 @@ def load_configs(config_path: str) -> list[dict[str, Any]]:
 BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
 
 _config_stem = Path(CONFIG_FILE_PATH).stem  # e.g. "test_qwen_image_vllm_omni"
-AGGREGATED_RESULT_FILE = BENCHMARK_RESULT_DIR / f"benchmark_results_{_config_stem}_{_SESSION_TIMESTAMP}.json"
+AGGREGATED_RESULT_FILE = BENCHMARK_RESULT_DIR / f"diffusion_result_{_config_stem}_{_SESSION_TIMESTAMP}.json"
 
 
 def _append_to_aggregated_file(record: dict[str, Any]) -> None:
@@ -129,19 +131,6 @@ def _append_to_aggregated_file(record: dict[str, Any]) -> None:
         records.append(record)
         with open(AGGREGATED_RESULT_FILE, "w", encoding="utf-8") as f:
             json.dump(records, f, indent=2, ensure_ascii=False)
-
-
-# Register --config-file with pytest so it does not reject the argument.
-def pytest_addoption(parser: pytest.Parser) -> None:
-    parser.addoption(
-        "--config-file",
-        action="store",
-        default=None,
-        help=(
-            "Path to the benchmark config JSON file (required). "
-            "Example: --config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json"
-        ),
-    )
 
 
 _server_lock = threading.Lock()
@@ -232,13 +221,13 @@ class DiffusionServer:
 
     def __init__(
         self,
-        model: str,
-        serve_args: list[str],
+        server_cfg: dict[str, Any],
         *,
         port: int | None = None,
     ) -> None:
-        self.model = model
-        self.serve_args = serve_args
+        self.server_cfg: dict[str, Any] = server_cfg
+        self.model = server_cfg["model"]
+        self.serve_args = server_cfg["serve_args"]
         self.host = "127.0.0.1"
         self.port = port if port is not None else _get_open_port()
         self.proc: subprocess.Popen | None = None
@@ -299,6 +288,95 @@ def _build_serve_args(serve_args_dict: dict[str, Any]) -> list[str]:
     return args
 
 
+def _get_branchpoint_commit_sha() -> str:
+    """Return the branch-point commit SHA against main.
+
+    Uses git command: ``git merge-base HEAD origin/main``.
+    """
+    global _BRANCHPOINT_COMMIT_SHA
+    if _BRANCHPOINT_COMMIT_SHA is not None:
+        return _BRANCHPOINT_COMMIT_SHA
+
+    repo_root = Path(__file__).parent.parent.parent.parent
+    try:
+        sha = (
+            subprocess.check_output(
+                ["git", "merge-base", "HEAD", "origin/main"],
+                cwd=str(repo_root),
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            .strip()
+            .splitlines()[0]
+        )
+        _BRANCHPOINT_COMMIT_SHA = sha
+    except Exception as e:
+        print(f"Warning: failed to get branch-point commit SHA: {e}")
+        _BRANCHPOINT_COMMIT_SHA = ""
+    return _BRANCHPOINT_COMMIT_SHA
+
+
+def _to_resolution_string(params: dict[str, Any]) -> str:
+    width = params.get("width", "unknown width")
+    height = params.get("height", "unknown height")
+    return f"{width}x{height}"
+
+
+def _to_parallelism_string(framework: str, serve_args_dict: dict[str, Any]) -> str:
+    parts: list[str] = []
+    if framework == "vllm-omni":
+        keys = [
+            "num-gpus",
+            "usp",
+            "ulysses-degree",
+            "ring",
+            "ring-degree",
+            "cfg-parallel-size",
+            "vae-patch-parallel-size",
+            "vae-use-tiling",
+            "tensor-parallel-size",
+        ]
+        for key in keys:
+            if key in serve_args_dict:
+                parts.append(f"{key}={serve_args_dict[key]}")
+    return ",".join(parts) if parts else "none"
+
+
+def _to_cache_string(framework: str, serve_args_dict: dict[str, Any]) -> str:
+    if framework == "vllm-omni":
+        if "cache-backend" in serve_args_dict:
+            return str(serve_args_dict["cache-backend"])
+    return "disabled"
+
+
+def _to_offload_string(framework: str, serve_args_dict: dict[str, Any]) -> str:
+    selected: list[str] = []
+    if framework == "vllm-omni":
+        offload_keys = [
+            "enable-cpu-offload",
+            "enable-layerwise-offload",
+        ]
+        for key in offload_keys:
+            if key in serve_args_dict:
+                selected.append(key)
+    return f"enabled({';'.join(selected)})" if selected else "disabled"
+
+
+def _to_compile_value(framework: str, serve_args_dict: dict[str, Any]) -> str:
+    if framework == "vllm-omni":
+        if "enforce-eager" in serve_args_dict:
+            return "disabled"
+        return "enabled"
+    return "disabled"
+
+
+def _to_quantization_value(framework: str, serve_args_dict: dict[str, Any]) -> str:
+    if framework == "vllm-omni":
+        quant = serve_args_dict.get("quantization")
+        return str(quant) if quant else "disabled"
+    return "disabled"
+
+
 def _unique_server_params(configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return one server-config dict per unique test_name."""
     seen: set[str] = set()
@@ -310,12 +388,14 @@ def _unique_server_params(configs: list[dict[str, Any]]) -> list[dict[str, Any]]
         seen.add(test_name)
         if cfg.get("server_type", "vllm-omni") != "vllm-omni":
             raise ValueError(f"Unsupported server_type in config: {cfg.get('server_type')}")
+        serve_args_dict = cfg["server_params"].get("serve_args", {})
         result.append(
             {
                 "test_name": test_name,
                 "server_type": "vllm-omni",
                 "model": cfg["server_params"]["model"],
-                "serve_args": _build_serve_args(cfg["server_params"].get("serve_args", {})),
+                "serve_args_dict": serve_args_dict,
+                "serve_args": _build_serve_args(serve_args_dict),
                 "benchmark_backend": "vllm-omni",
                 "server_params": cfg["server_params"],
             }
@@ -334,9 +414,7 @@ def _test_param_mapping(configs: list[dict[str, Any]]) -> dict[str, list[dict]]:
 
 def _make_server(server_cfg: dict[str, Any]) -> DiffusionServer:
     """Factory: return a vLLM-Omni diffusion server instance for the config."""
-    model = server_cfg["model"]
-    serve_args = server_cfg["serve_args"]
-    return DiffusionServer(model=model, serve_args=serve_args)
+    return DiffusionServer(server_cfg=server_cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +442,6 @@ def diffusion_server(request):
         print(f"\nStarting {server_type} server for test: {test_name}")
         with _make_server(server_cfg) as server:
             server.test_name = test_name
-            server.server_params = server_cfg["server_params"]
             print(f"{server_type} server started successfully")
             yield server
             print(f"{server_type} server stopping…")
@@ -402,16 +479,18 @@ def run_benchmark(
     params: dict[str, Any],
     test_name: str,
     backend: str = "vllm-omni",
-    server_params: dict[str, Any] | None = None,
+    server_cfg: dict[str, Any] | None = None,
+    source_file: str = "",
 ) -> dict[str, Any]:
     """Run diffusion_benchmark_serving.py as a subprocess and return parsed metrics.
 
     The raw metrics are written to a temporary file by the subprocess.  After
     the run completes the metrics are merged with full metadata (test_name,
-    backend, benchmark_params, timestamp) and appended to the session-wide
-    aggregated JSON file (AGGREGATED_RESULT_FILE).  The temporary file is
-    removed afterwards.  Subprocess stdout/stderr are tee'd to a .log file
-    under BENCHMARK_RESULT_DIR/logs/; its path is stored in the record.
+    backend, benchmark_params, timestamp, flat reporting fields) and appended
+    to the session-wide aggregated JSON file (AGGREGATED_RESULT_FILE).  The
+    temporary file is removed afterwards.  Subprocess stdout/stderr are tee'd
+    to a .log file under BENCHMARK_RESULT_DIR/logs/; its path is stored in
+    the record.
     """
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -495,14 +574,55 @@ def run_benchmark(
     finally:
         tmp_result_file.unlink(missing_ok=True)
 
+    server_cfg = server_cfg or {}
+    serve_args_dict = server_cfg.get("serve_args_dict", {})
+    if not isinstance(serve_args_dict, dict):
+        serve_args_dict = {}
+
+    completed = metrics.get("completed_requests", metrics.get("completed", 0))
+    failed = metrics.get("failed_requests", metrics.get("failed", 0))
+
     record: dict[str, Any] = {
         "test_name": test_name,
         "backend": backend,
         "timestamp": timestamp,
-        "server_params": server_params,
+        "server_params": server_cfg.get("server_params"),
         "benchmark_params": params,
         "result": metrics,
         "log_file": str(log_file),
+        "Model": model,
+        "Framework": backend,
+        "Hardware": "",
+        "Deployment": "",
+        "Task": params.get("task", "t2i"),
+        "Dataset": params.get("dataset", "random"),
+        "resolution": _to_resolution_string(params),
+        "Parallelism": _to_parallelism_string(backend, serve_args_dict),
+        "max_concurrency": params.get("max-concurrency", ""),
+        "Cache": _to_cache_string(backend, serve_args_dict),
+        "Quantization": _to_quantization_value(backend, serve_args_dict),
+        "offload": _to_offload_string(backend, serve_args_dict),
+        "compile": _to_compile_value(backend, serve_args_dict),
+        "Attn_backend": os.environ.get("DIFFUSION_ATTENTION_BACKEND", ""),
+        "num_inference_steps": params.get("num-inference-steps", ""),
+        "completed": completed,
+        "failed": failed,
+        "throughput_qps": metrics.get("throughput_qps"),
+        "latency_mean": metrics.get("latency_mean"),
+        "latency_median": metrics.get("latency_median"),
+        "latency_p99": metrics.get("latency_p99"),
+        "latency_p95": metrics.get("latency_p95"),
+        "latency_p50": metrics.get("latency_p50"),
+        "peak_memory_mb_max": metrics.get("peak_memory_mb_max"),
+        "peak_memory_mb_mean": metrics.get("peak_memory_mb_mean"),
+        "peak_memory_mb_median": metrics.get("peak_memory_mb_median"),
+        "stage_durations_mean": metrics.get("stage_durations_mean"),
+        "stage_durations_p50": metrics.get("stage_durations_p50"),
+        "stage_durations_p99": metrics.get("stage_durations_p99"),
+        "commit_sha": _get_branchpoint_commit_sha(),
+        "build_id": os.environ.get("BUILDKITE_BUILD_ID", ""),
+        "build_url": os.environ.get("BUILDKITE_BUILD_URL", ""),
+        "source_file": source_file,
     }
     _append_to_aggregated_file(record)
     print(f"\n  Result appended to: {AGGREGATED_RESULT_FILE}")
@@ -565,7 +685,8 @@ def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
         params=params,
         test_name=test_name,
         backend=backend,
-        server_params=diffusion_server.server_params,
+        server_cfg=getattr(diffusion_server, "server_cfg", {}),
+        source_file=cast(str, CONFIG_FILE_PATH),
     )
 
     print(f"\n{'=' * 60}")
