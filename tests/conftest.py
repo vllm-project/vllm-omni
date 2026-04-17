@@ -2859,7 +2859,11 @@ class OpenAIClientHandler:
                 return
 
             if current_status == "failed":
-                error_msg = status_data.get("last_error", "Unknown error")
+                error_msg = status_data.get("last_error")
+                if not error_msg:
+                    # Keep a failure hint aligned with reliability fault keywords,
+                    # and surface raw status payload for easier diagnosis.
+                    error_msg = f"internal job failure (missing last_error), status={status_data!r}"
                 raise RuntimeError(f"Job failed: {error_msg}")
 
             time.sleep(poll_interval_seconds)
