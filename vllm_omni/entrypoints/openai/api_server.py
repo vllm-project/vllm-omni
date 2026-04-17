@@ -1305,11 +1305,14 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
     # Get engine client (AsyncOmni) from app state
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
 
-    # Validate model field (warn if mismatch, don't error)
+    # Validate model field — reject mismatched model with HTTP 400
     if request.model is not None and request.model != model_name:
-        logger.warning(
-            f"Model mismatch: request specifies '{request.model}' but "
-            f"server is running '{model_name}'. Using server model."
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=(
+                f"Model mismatch: request specifies '{request.model}' but "
+                f"server is running '{model_name}'."
+            ),
         )
 
     try:
@@ -1501,8 +1504,9 @@ async def edit_images(
     # 1. get engine and model
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
     if model is not None and model != model_name:
-        logger.warning(
-            f"Model mismatch: request specifies '{model}' but server is running '{model_name}'. Using server model."
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=f"Model mismatch: request specifies '{model}' but server is running '{model_name}'.",
         )
     # 2. get output format & compression
     output_format = _choose_output_format(output_format, background)
@@ -2218,10 +2222,12 @@ async def _parse_video_form(
         app_model_name, app_stage_configs = _resolve_video_runtime_context(raw_request)
         effective_model_name = handler.model_name or app_model_name or request.model or "unknown"
         if request.model is not None and effective_model_name is not None and request.model != effective_model_name:
-            logger.warning(
-                "Model mismatch: request specifies '%s' but server is running '%s'. Using server model.",
-                request.model,
-                effective_model_name,
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=(
+                    f"Model mismatch: request specifies '{request.model}' "
+                    f"but server is running '{effective_model_name}'."
+                ),
             )
         handler.set_stage_configs_if_missing(app_stage_configs)
     except HTTPException:

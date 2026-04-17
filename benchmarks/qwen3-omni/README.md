@@ -2,6 +2,19 @@
 
 This README explains how to (1) prepare benchmark datasets and (2) run the provided Qwen3-Omni benchmarks.
 
+## 0) Prerequisites
+
+Install the extra dependencies required by the Transformers benchmark script:
+
+```bash
+pip install qwen-omni-utils
+```
+
+This provides the `qwen_omni_utils` module (e.g. `process_mm_info`) used by
+`benchmarks/qwen3-omni/transformers/qwen3_omni_moe_transformers.py`.
+It is intentionally omitted from `requirements/common.txt` because it is only
+needed for this offline reference benchmark, not for the core vLLM-Omni server.
+
 ## 1) Prepare the dataset (SeedTTS top100)
 
 ```bash

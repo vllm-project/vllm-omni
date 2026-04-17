@@ -279,7 +279,7 @@ def main(args):
         query_result = query_func(image_path=image_path)
     elif args.query_type == "use_audio":
         query_result = query_func(audio_path=audio_path, sampling_rate=getattr(args, "sampling_rate", 16000))
-    elif args.query_type == "mixed_modalities":
+    elif args.query_type == "use_mixed_modalities":
         query_result = query_func(
             video_path=video_path,
             image_path=image_path,
