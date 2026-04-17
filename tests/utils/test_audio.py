@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Unit tests for vllm_omni.utils.audio.mel_filter_bank."""
+"""Unit tests for vllm_omni.utils.audio."""
 
+import numpy as np
 import pytest
 import torch
 
-from vllm_omni.utils.audio import mel_filter_bank
+from vllm_omni.utils.audio import mel_filter_bank, peak_normalize
 
 # Parameter combinations used across the codebase.
 _PARAM_SETS = [
@@ -59,3 +60,20 @@ class TestMelFilterBank:
         last_nonzero_low = (fb_low.sum(dim=0) > 0).nonzero()[-1].item()
         last_nonzero_high = (fb_high.sum(dim=0) > 0).nonzero()[-1].item()
         assert last_nonzero_high > last_nonzero_low
+
+
+class TestPeakNormalize:
+    def test_silence_unchanged(self):
+        """All-zero input should remain all-zero."""
+        audio = np.zeros(1600, dtype=np.float32)
+        result = peak_normalize(audio, db_level=-6.0)
+        np.testing.assert_array_equal(result, audio)
+
+    def test_peak_reaches_target(self):
+        """After normalization, peak amplitude should be at target dB."""
+        rng = np.random.default_rng(7)
+        audio = rng.uniform(-0.4, 0.4, size=16000).astype(np.float32)
+
+        result = peak_normalize(audio, db_level=-6.0)
+        peak_db = 20 * np.log10(np.abs(result).max())
+        np.testing.assert_allclose(peak_db, -6.0, atol=1e-4)
