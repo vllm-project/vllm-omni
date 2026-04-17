@@ -71,7 +71,8 @@ DIFFUSION_VIDEO_PARAMS = [param for param in WAN_PARAMS if supports_video_genera
 )
 @pytest.mark.parametrize("omni_server", DIFFUSION_VIDEO_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server, openai_client) -> None:
-    device_spec = resolve_oom_device_spec(OOM_INJECTION_CONFIG, omni_server.stage_config_path)
+    stage_config_path = getattr(omni_server, "stage_config_path", None)
+    device_spec = resolve_oom_device_spec(OOM_INJECTION_CONFIG, stage_config_path)
     handle = inject_gpu_oom(
         device=device_spec,
         target_mem_ratio=OOM_INJECTION_CONFIG["target_mem_ratio"],
