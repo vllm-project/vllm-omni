@@ -71,9 +71,7 @@ class CfgCompanionTracker:
         if parent_id is None:
             return None
         done_set = self._done.get(parent_id)
-        assert done_set is not None, (
-            f"Companion {companion_id} completed before parent {parent_id} was registered"
-        )
+        assert done_set is not None, f"Companion {companion_id} completed before parent {parent_id} was registered"
         if companion_id in done_set:
             return None
         done_set.add(companion_id)
