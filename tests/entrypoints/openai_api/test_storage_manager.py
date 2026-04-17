@@ -60,23 +60,17 @@ def test_local_storage_ttl_sweeper_removes_expired_file(tmp_path):
         sweep_interval_seconds=60,
     )
 
-    async def run_test() -> None:
+    async def setup_file() -> tuple[str, str]:
         save_context = await storage.save(b"video-bytes", "video-expired")
         file_path = storage.get_full_file_path(save_context.key)
-        expired_mtime = time.time() - 10
-        os.utime(file_path, (expired_mtime, expired_mtime))
+        return save_context.key, file_path
 
-        storage.start()
-        try:
-            deadline = time.time() + 1.0
-            while time.time() < deadline:
-                if not os.path.exists(file_path):
-                    break
-                await asyncio.sleep(0.01)
-        finally:
-            await storage.stop()
+    storage_key, file_path = asyncio.run(setup_file())
+    expired_mtime = time.time() - 10
+    os.utime(file_path, (expired_mtime, expired_mtime))
 
-        assert not os.path.exists(file_path)
-        assert await storage.open(save_context.key) is None
+    deleted = asyncio.run(storage._sweep_once(time.time() - 1))
 
-    asyncio.run(run_test())
+    assert deleted == 1
+    assert not os.path.exists(file_path)
+    assert asyncio.run(storage.open(storage_key)) is None

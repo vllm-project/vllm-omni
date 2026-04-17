@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import os
+import stat
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -14,9 +15,6 @@ from vllm_omni.entrypoints.openai.config import CONFIG, STORAGE_BACKENDS, FileBa
 logger = init_logger(__name__)
 
 
-K = TypeVar("K", bound=str, covariant=True)
-
-
 @dataclass
 class SaveContext:
     key: str
@@ -24,18 +22,21 @@ class SaveContext:
     expires_at: int | None = None
 
 
-@dataclass
-class BaseStorageHandle(Generic[K]):
-    kind: K
+@dataclass(frozen=True)
+class BaseStorageHandle:
+    kind: str
 
 
-@dataclass
-class FileStorageHandle(BaseStorageHandle[Literal["path"]]):
+@dataclass(frozen=True)
+class FileStorageHandle(BaseStorageHandle):
     path: str
     kind: Literal["path"] = field(default="path", init=False)
 
 
-class StorageBaseManager(ABC):
+K = TypeVar("K", bound=BaseStorageHandle, covariant=True)
+
+
+class StorageBaseManager(Generic[K], ABC):
     @abstractmethod
     async def save(self, *args, **kwargs) -> SaveContext:
         pass
@@ -47,14 +48,17 @@ class StorageBaseManager(ABC):
     def start(self, *args, **kwargs):
         pass
 
+    def stop(self, *args, **kwargs):
+        pass
+
     @abstractmethod
-    async def open(self, storage_key: str) -> BaseStorageHandle | None:
+    async def open(self, storage_key: str) -> K | None:
         pass
 
 
-class LocalStorageManager(StorageBaseManager):
+class LocalStorageManager(StorageBaseManager[FileStorageHandle]):
     def __init__(self, storage_path: str, max_concurrency: int = 4):
-        self.storage_path = storage_path
+        self.storage_path = os.path.realpath(storage_path)
         os.makedirs(self.storage_path, exist_ok=True)
 
         self._io_semaphore = asyncio.Semaphore(max(1, max_concurrency))
@@ -69,7 +73,6 @@ class LocalStorageManager(StorageBaseManager):
         filename = self.get_full_file_path(file_name)
         tmp_name: str | None = None
 
-        response = SaveContext(key=file_name, created_at=int(time.time()))
         try:
             with NamedTemporaryFile("wb", dir=self.storage_path, delete=False) as f:
                 tmp_name = f.name
@@ -77,6 +80,7 @@ class LocalStorageManager(StorageBaseManager):
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_name, filename)
+            response = SaveContext(key=file_name, created_at=int(time.time()))
             return response
         except Exception:
             if tmp_name is not None:
@@ -105,7 +109,12 @@ class LocalStorageManager(StorageBaseManager):
         return os.path.exists(self.get_full_file_path(file_name))
 
     def get_full_file_path(self, file_name: str) -> str:
-        return os.path.join(self.storage_path, file_name)
+        full = os.path.realpath(os.path.join(self.storage_path, file_name))
+
+        if os.path.commonpath([self.storage_path, full]) != self.storage_path:
+            raise ValueError(f"Illegal storage key: {file_name!r}")
+
+        return full
 
 
 class LocalStorageTTLManager(LocalStorageManager):
@@ -126,27 +135,42 @@ class LocalStorageTTLManager(LocalStorageManager):
         result.expires_at = result.created_at + self._ttl_seconds
         return result
 
-    async def _sweep_loop(self) -> None:
-        def _sweep_once(cutoff: float) -> int:
-            deleted = 0
-            for entry in os.scandir(self.storage_path):
+    async def _sweep_once(self, cutoff: float) -> int:
+        expired: list[str] = []
+        for entry in os.scandir(self.storage_path):
+            try:
                 if not entry.is_file(follow_symlinks=False):
                     continue
-                try:
-                    if entry.stat(follow_symlinks=False).st_mtime < cutoff:
-                        os.remove(entry.path)
-                        deleted += 1
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    logger.warning("TTL sweep failed to delete expired file %s", entry.path, exc_info=True)
-            return deleted
+                if entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                    expired.append(entry.path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning("TTL sweep failed to inspect %s", entry.path, exc_info=True)
 
+        deleted = 0
+        for path in expired:
+            try:
+                async with self._io_semaphore:
+                    st = await asyncio.to_thread(os.stat, path, follow_symlinks=False)
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    if st.st_mtime >= cutoff:
+                        continue
+                    await asyncio.to_thread(os.remove, path)
+                    deleted += 1
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning("TTL sweep failed to delete expired file %s", path, exc_info=True)
+
+        return deleted
+
+    async def _sweep_loop(self) -> None:
         while True:
             try:
                 cutoff = time.time() - self._ttl_seconds
-                async with self._io_semaphore:
-                    await asyncio.to_thread(_sweep_once, cutoff)
+                await self._sweep_once(cutoff)
             except Exception:
                 logger.exception("TTL sweep failed for storage path %s", self.storage_path)
             await asyncio.sleep(self._sweep_interval_seconds)
@@ -164,7 +188,7 @@ class LocalStorageTTLManager(LocalStorageManager):
         self._sweeper_task = None
 
 
-def get_storage_manager(storage_config: STORAGE_BACKENDS) -> StorageBaseManager:
+def get_storage_manager(storage_config: STORAGE_BACKENDS) -> StorageBaseManager[FileStorageHandle]:
     if isinstance(storage_config, FileBackend):
         if storage_config.file_ttl is not None and storage_config.ttl_sweep_interval is not None:
             manager = LocalStorageTTLManager(

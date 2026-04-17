@@ -108,7 +108,7 @@ export VLLM_OMNI_SERVER_STORAGE__FILE_TTL=86400
 export VLLM_OMNI_SERVER_STORAGE__TTL_SWEEP_INTERVAL=300
 ```
 
-See also: [Configuration Options](../../../configuration/README.md#openai-video-storage)
+See also: [Configuration Options](../../../configuration/README.md)
 
 ## API Calls
 

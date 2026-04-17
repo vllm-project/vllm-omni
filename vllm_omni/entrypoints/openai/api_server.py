@@ -2076,7 +2076,7 @@ def video_response_from_request(model_name: str, req: VideoGenerationRequest) ->
 async def _cleanup_video(video_id: str):
     try:
         await STORAGE_MANAGER.delete(video_id)
-    except OSError:
+    except Exception:
         logger.warning("Failed to cleanup partial video file '%s'", video_id)
 
 
@@ -2466,7 +2466,7 @@ async def download_video(video_id: str) -> Response:
         response = FileResponse(path=file_handle.path, media_type=job.media_type, filename=file_name)
     else:
         raise HTTPException(
-            status_code=500, detail=f"Server generated an unsupported file storage handl for file id {video_id}"
+            status_code=500, detail=f"Server generated an unsupported file storage handle for file id {video_id}"
         )
 
     return response
