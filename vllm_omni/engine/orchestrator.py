@@ -682,13 +682,10 @@ class Orchestrator:
 
         # Build and submit requests for each input
         for next_input in next_inputs:
+            # Only AR thinker stages consume encoder mm_features; downstream
+            # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
             _ms = getattr(next_client, "model_stage", None)
-            _ms_lower = str(_ms).lower() if _ms is not None else ""
-            _eot = getattr(next_client, "engine_output_type", None)
-            # Strip mm_features for downstream synthesis stages (talker/code2wav),
-            # including model-specific names like "cosyvoice3_code2wav".
-            _strip_mm = ("code2wav" in _ms_lower) or ("talker" in _ms_lower) or _eot == "audio"
-            _mm_features = None if _strip_mm else req_state.mm_features
+            _mm_features = req_state.mm_features if _ms == "thinker" else None
             request = build_engine_core_request_from_tokens(
                 request_id=req_id,
                 prompt=next_input,
