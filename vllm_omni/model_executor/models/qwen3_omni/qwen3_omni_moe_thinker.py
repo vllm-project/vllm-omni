@@ -119,7 +119,10 @@ from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
 )
-from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+from vllm_omni.quantization.component_config import (
+    PRE_QUANTIZED_METHODS,
+    ComponentQuantizationConfig,
+)
 
 try:
     import flash_attn
@@ -1114,21 +1117,24 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.multimodal_config = multimodal_config
         self.quant_config = quant_config
 
-        # Pre-quantized checkpoints (modelopt NVFP4/FP8/MXFP8) quantize the
-        # entire thinker — audio tower, visual encoder, and language model
-        # all share the same quant method.  Dynamic quantization methods
-        # (e.g. --quantization fp8) should only target the language model.
-        _PRE_QUANTIZED_METHODS = {"modelopt", "modelopt_fp4", "modelopt_mxfp8"}
+        # Pre-quantized checkpoints (modelopt NVFP4/FP8/MXFP8) only quantize
+        # the Thinker LM (language model). Vision and audio encoder weights
+        # remain in BF16 and have no corresponding scale tensors in the
+        # checkpoint. Dynamic quantization methods (e.g. --quantization fp8)
+        # should also only target the language model.
 
         if isinstance(quant_config, ComponentQuantizationConfig):
             audio_quant_config = quant_config.resolve("audio_tower")
             visual_quant_config = quant_config.resolve("visual")
             language_quant_config = quant_config.resolve("language_model")
         elif quant_config is not None:
-            if quant_config.get_name() in _PRE_QUANTIZED_METHODS:
-                # Pre-quantized: pass quant_config to all subcomponents.
-                audio_quant_config = quant_config
-                visual_quant_config = quant_config
+            if quant_config.get_name() in PRE_QUANTIZED_METHODS:
+                # Pre-quantized: only the Thinker LM is quantized.
+                # Vision/audio encoder weights are BF16 with no FP8 scales;
+                # passing quant_config to them causes FP8 kernels to run on
+                # BF16 weights (producing garbage embeddings). Keep None.
+                audio_quant_config = None
+                visual_quant_config = None
                 language_quant_config = quant_config
             else:
                 # Dynamic quantization: scope to language_model only.

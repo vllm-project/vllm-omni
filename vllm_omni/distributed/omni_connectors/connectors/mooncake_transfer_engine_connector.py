@@ -230,16 +230,19 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
           sender immediately cleans up the buffer (``cleanup()``), so only the
           first receiver to pull a given key will succeed.  Broadcast / multicast
           (1 sender → N receivers sharing the same data) is not yet supported.
-        - **1 receiver → 1 sender**: ``update_sender_info()`` stores a single
-          ``(sender_host, sender_zmq_port)`` pair, so a receiver can only query
-          metadata from one sender at a time.
+        - **1 receiver → N senders**: Supported via partial metadata.  The
+          manager constructs metadata with the target sender's
+          ``source_host`` / ``source_port`` (computed from ``from_rank``)
+          and passes it to ``get(metadata=...)``.  The connector detects
+          that ``data_size`` is missing, queries the specified sender at
+          the given address to fill it in, then performs the RDMA pull.
+          This enables heterogeneous TP (sender TP > receiver TP) where a
+          single receiver must pull KV shards from multiple sender ranks.
 
     Future work:
         - Support 1 sender → N receivers (e.g. reference-counted buffers, or
           explicit ``retain()`` / ``release()`` semantics so the buffer survives
           multiple pulls).
-        - Support 1 receiver → N senders (e.g. a sender registry mapping
-          ``get_key`` prefixes to different sender endpoints).
     """
 
     # RDMA connector copies raw bytes/tensor directly to the memory pool
@@ -267,6 +270,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._req_local = threading.local()
         self._worker_local = threading.local()
         self._last_ttl_check: float = _time_mod.monotonic()
+        self._sender_endpoints: dict[int, tuple[str, int]] = {}
 
         self._metrics = {
             "puts": 0,
@@ -408,16 +412,38 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             "can_put": self.can_put,
         }
 
-    def update_sender_info(self, sender_host: str, sender_zmq_port: int) -> None:
+    def update_sender_info(
+        self,
+        sender_host: str,
+        sender_zmq_port: int,
+        sender_rank: int | None = None,
+    ) -> None:
+        """Inject a sender's ZMQ endpoint into the receiver connector.
+
+        When ``sender_rank`` is ``None`` (default), sets the single default
+        sender used by ``get()`` when no rank is specified — this preserves
+        backward-compatible 1:1 semantics.
+
+        When ``sender_rank`` is an integer, the endpoint is stored in a
+        per-rank registry for internal use (e.g. by
+        ``_query_metadata_from_sender(sender_rank=R)``).
         """
-        Inject the sender's ZMQ endpoint into the receiver connector.
-        Used for NO METADATA GET calls.(E.g: KV-cache transfer path)
-        Must be called before using get() without metadata!
-        Otherwise, get() will raise an error.
-        """
-        self.sender_host = sender_host
-        self.sender_zmq_port = sender_zmq_port
-        logger.info(f"Sender info updated: host={sender_host!r}, zmq_port={sender_zmq_port}")
+        if sender_rank is not None:
+            self._sender_endpoints[sender_rank] = (sender_host, sender_zmq_port)
+            logger.info(
+                "Sender info updated for rank %s: host=%r, zmq_port=%s",
+                sender_rank,
+                sender_host,
+                sender_zmq_port,
+            )
+        else:
+            self.sender_host = sender_host
+            self.sender_zmq_port = sender_zmq_port
+            logger.info(
+                "Sender info updated (default): host=%r, zmq_port=%s",
+                sender_host,
+                sender_zmq_port,
+            )
 
     def _get_local_ip(self) -> str:
         """
@@ -657,55 +683,74 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             logger.error(f"RDMA Put failed for {put_key}: {e}", exc_info=True)
             return False, 0, None
 
-    def _query_metadata_from_sender(self, get_key: str) -> dict[str, Any] | None:
-        """Query metadata from sender via ZMQ (fallback when ``metadata=None``).
+    def _resolve_sender_endpoint(self, sender_rank: int | None = None) -> tuple[str, int] | None:
+        """Return ``(host, zmq_port)`` for *sender_rank*.
 
-        ``get()`` supports two metadata resolution paths::
-
-            get(metadata=?)
-            ├── metadata provided (adapter path)
-            │     → use metadata directly (source_host/port/data_size)
-            │     → RDMA pull
-            └── metadata=None (KV-transfer polling path)
-                  → _query_metadata_from_sender(get_key)   ← this method
-                  │
-                  ├── sender_host resolved (via update_sender_info)
-                  │     → ZMQ query → get data_size/is_fast_path
-                  │     → construct metadata → RDMA pull
-                  └── sender_host unresolved ("auto" / None)
-                        → return None → caller retries or times out
-
-        For the second path, the caller must call
-        :meth:`update_sender_info` before ``get()`` to resolve the sender's ZMQ endpoint.
-        Support the two paths in case that the orchestrator pushes the request info
-        to different stages at the same time knowing metadata or not.
+        Resolution order:
+        1. Per-rank registry (``_sender_endpoints[sender_rank]``)
+        2. Default sender (``sender_host`` / ``sender_zmq_port``)
+        3. ``None`` if nothing is configured.
         """
-        zmq_addr = f"tcp://{self.sender_host}:{self.sender_zmq_port}"
+        if sender_rank is not None and sender_rank in self._sender_endpoints:
+            return self._sender_endpoints[sender_rank]
+        host = getattr(self, "sender_host", None)
+        port = getattr(self, "sender_zmq_port", None)
+        if host and port and str(host).lower() != "auto":
+            return (host, int(port))
+        return None
+
+    def _query_metadata_at(self, get_key: str, host: str, port: int) -> dict[str, Any] | None:
+        """Query metadata from a sender endpoint via ZMQ.
+
+        Returns ``{source_host, source_port, data_size, is_fast_path}``
+        or ``None`` when the key is not found / the query fails.
+        """
+        zmq_addr = f"tcp://{host}:{port}"
         req_socket = self._get_req_socket(zmq_addr, timeout_ms=5000)
-
         try:
-            # Send query request
-            query = QueryRequest(request_id=get_key)
-            req_socket.send(QUERY_INFO + msgspec.msgpack.encode(query))
+            req_socket.send(QUERY_INFO + msgspec.msgpack.encode(QueryRequest(request_id=get_key)))
             resp = req_socket.recv()
-
             if resp == INFO_NOT_FOUND:
                 return None
-
-            # Parse response
             query_resp = msgspec.msgpack.decode(resp, type=QueryResponse)
             return {
-                # source_host/source_port are used for verification
-                "source_host": self.sender_host,
-                "source_port": self.sender_zmq_port,
+                "source_host": host,
+                "source_port": port,
                 "data_size": query_resp.data_size,
                 "is_fast_path": query_resp.is_fast_path,
             }
         except Exception as e:
-            # Socket may be stuck in bad state after timeout; discard it
             self._invalidate_req_socket(zmq_addr)
-            logger.debug(f"Failed to query metadata for {get_key}: {e}")
+            logger.debug("Failed to query metadata at %s for %s: %s", zmq_addr, get_key, e)
             return None
+
+    def _query_metadata_from_sender(self, get_key: str, sender_rank: int | None = None) -> dict[str, Any] | None:
+        """Query metadata from sender via ZMQ (fallback when ``metadata=None``).
+
+        ``get()`` supports three metadata resolution paths::
+
+            get(metadata=?)
+            ├── Path 1: metadata has data_size (adapter path)
+            │     → use metadata directly → RDMA pull
+            ├── Path 2: metadata has source_host/port but no data_size
+            │     → _query_metadata_at(host, port) → get data_size → RDMA pull
+            └── Path 3: metadata=None (KV-transfer polling path)
+                  → _query_metadata_from_sender(get_key)   ← this method
+                  │
+                  ├── sender endpoint resolved (via update_sender_info)
+                  │     → ZMQ query → get data_size/is_fast_path
+                  │     → construct metadata → RDMA pull
+                  └── sender endpoint unresolved
+                        → return None → caller retries or times out
+
+        When *sender_rank* is provided, the query is routed to that
+        rank's endpoint (registered via ``update_sender_info(rank=...)``).
+        Otherwise the default sender is used.
+        """
+        endpoint = self._resolve_sender_endpoint(sender_rank)
+        if endpoint is None:
+            return None
+        return self._query_metadata_at(get_key, *endpoint)
 
     def get(
         self,
@@ -714,12 +759,18 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         get_key: str,
         metadata: dict[str, Any] | None = None,
     ) -> tuple[Any, int] | None:
-        """
-        Consumer Side.
-        Allocates from local pool and pulls data via RDMA.
+        """Consumer Side.  Allocates from local pool and pulls data via RDMA.
 
-        If metadata is not provided, will attempt to query it from sender
-        using configured sender_host/sender_zmq_port.
+        Metadata resolution:
+
+        1. ``metadata`` provided **with** ``data_size`` → use directly (RDMA pull).
+        2. ``metadata`` provided with ``source_host``/``source_port`` but
+           **without** ``data_size`` → query that specific sender for
+           ``data_size`` / ``is_fast_path``, then RDMA pull.  This is the
+           heterogeneous-TP path where the manager knows the target sender
+           endpoint but not the payload size.
+        3. ``metadata=None`` → query the default sender (set via
+           ``update_sender_info()``) for the full metadata.
 
         Returns:
             ``(data, size)`` on success, ``None`` on failure.
@@ -727,9 +778,6 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             - **is_fast_path=True** (tensor *or* bytes payload):
                 Returns ``(ManagedBuffer, size)``.
                 **CALLER MUST call ``ManagedBuffer.release()`` after consuming.**
-                Note: even if the producer ``put()`` raw ``bytes``, the consumer
-                receives a ``ManagedBuffer`` — use ``buf.to_bytes()`` to obtain
-                a ``bytes`` copy, or ``buf.tensor`` for zero-copy access.
             - **is_fast_path=False** (serialized Python object):
                 Returns ``(DeserializedObject, size)``.
                 Buffer is auto-released internally after deserialization.
@@ -741,9 +789,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
         _t0 = _time_mod.perf_counter()
 
-        # If no metadata provided, try to query from sender
         if not metadata:
-            # Must insert sender info before using get() without metadata.
+            # Path 3: no metadata at all — query default sender
             if not self.sender_host or not self.sender_zmq_port or str(self.sender_host).lower() == "auto":
                 raise RuntimeError(
                     f"get(metadata=None) requires sender info to be resolved, "
@@ -753,6 +800,21 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             metadata = self._query_metadata_from_sender(get_key)
             if not metadata:
                 return None
+        elif "data_size" not in metadata:
+            # Path 2: partial metadata (host/port only) — query that sender
+            partial_host = metadata.get("source_host")
+            partial_port = metadata.get("source_port")
+            if not partial_host or not partial_port:
+                logger.warning(
+                    "get(%s): partial metadata missing source_host/source_port, cannot resolve data_size. metadata=%s",
+                    get_key,
+                    metadata,
+                )
+                return None
+            queried = self._query_metadata_at(get_key, str(partial_host), int(partial_port))
+            if not queried:
+                return None
+            metadata = queried
 
         _t1 = _time_mod.perf_counter()
         _query_ms = (_t1 - _t0) * 1000

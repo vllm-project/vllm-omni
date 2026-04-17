@@ -36,13 +36,20 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
+    WAN22_MAX_SEQUENCE_LENGTH,
+    build_wan_scheduler,
     create_transformer_from_config,
     load_transformer_config,
+    resolve_wan_flow_shift,
+    resolve_wan_sample_solver,
     retrieve_latents,
 )
+from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.prompt_utils import (
+    validate_prompt_sequence_lengths,
+)
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -59,10 +66,23 @@ def get_wan22_ti2v_post_process_func(
     def post_process_func(
         video: torch.Tensor,
         output_type: str = "np",
+        sampling_params=None,
     ):
         if output_type == "latent":
             return video
-        return video_processor.postprocess_video(video, output_type=output_type)
+        custom_output = {}
+        if sampling_params is not None and getattr(sampling_params, "enable_frame_interpolation", False):
+            video, multiplier = interpolate_video_tensor(
+                video,
+                exp=sampling_params.frame_interpolation_exp,
+                scale=sampling_params.frame_interpolation_scale,
+                model_path=sampling_params.frame_interpolation_model_path,
+            )
+            custom_output["video_fps_multiplier"] = multiplier
+        return {
+            "video": video_processor.postprocess_video(video, output_type=output_type),
+            "custom_output": custom_output,
+        }
 
     return post_process_func
 
@@ -169,6 +189,7 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
 
         # Text encoder
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        self.tokenizer_max_length = WAN22_MAX_SEQUENCE_LENGTH
         self.text_encoder = UMT5EncoderModel.from_pretrained(
             model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
@@ -183,13 +204,9 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
         self.transformer = create_transformer_from_config(transformer_config)
 
-        # Initialize UniPC scheduler
-        flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0  # default for 720p
-        self.scheduler = FlowUniPCMultistepScheduler(
-            num_train_timesteps=1000,
-            shift=flow_shift,
-            prediction_type="flow_prediction",
-        )
+        self._sample_solver = "unipc"
+        self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
+        self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
 
         # VAE scale factors
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if hasattr(self.vae, "config") else 4
@@ -289,6 +306,7 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
             width=width,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
+            max_sequence_length=req.sampling_params.max_sequence_length or self.tokenizer_max_length,
         )
 
         # Adjust num_frames to be compatible with VAE temporal scaling
@@ -312,7 +330,7 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
                 negative_prompt=negative_prompt,
                 do_classifier_free_guidance=guidance_scale > 1.0,
                 num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
-                max_sequence_length=req.sampling_params.max_sequence_length or 512,
+                max_sequence_length=req.sampling_params.max_sequence_length or self.tokenizer_max_length,
                 device=device,
                 dtype=dtype,
             )
@@ -322,6 +340,13 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
                 negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dtype)
 
         batch_size = prompt_embeds.shape[0]
+
+        sample_solver = resolve_wan_sample_solver(req, default=self._sample_solver)
+        flow_shift = resolve_wan_flow_shift(req, self.od_config)
+        if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
+            self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
+            self._sample_solver = sample_solver
+            self._flow_shift = flow_shift
 
         # Timesteps
         self.scheduler.set_timesteps(num_steps, device=device)
@@ -499,6 +524,20 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         prompt = [prompt] if isinstance(prompt, str) else prompt
         prompt_clean = [self._prompt_clean(p) for p in prompt]
         batch_size = len(prompt_clean)
+        text_inputs_untruncated = self.tokenizer(
+            prompt_clean,
+            padding=True,
+            truncation=False,
+            add_special_tokens=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        validate_prompt_sequence_lengths(
+            text_inputs_untruncated.attention_mask,
+            max_sequence_length=max_sequence_length,
+            supported_max_sequence_length=self.tokenizer_max_length,
+            error_context="for Wan2.2 text encoding",
+        )
 
         text_inputs = self.tokenizer(
             prompt_clean,
@@ -527,8 +566,24 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         if do_classifier_free_guidance:
             negative_prompt = negative_prompt or ""
             negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+            negative_prompt_clean = [self._prompt_clean(p) for p in negative_prompt]
+            neg_text_inputs_untruncated = self.tokenizer(
+                negative_prompt_clean,
+                padding=True,
+                truncation=False,
+                add_special_tokens=True,
+                return_attention_mask=True,
+                return_tensors="pt",
+            )
+            validate_prompt_sequence_lengths(
+                neg_text_inputs_untruncated.attention_mask,
+                max_sequence_length=max_sequence_length,
+                supported_max_sequence_length=self.tokenizer_max_length,
+                prompt_name="negative_prompt",
+                error_context="for Wan2.2 text encoding",
+            )
             neg_text_inputs = self.tokenizer(
-                [self._prompt_clean(p) for p in negative_prompt],
+                negative_prompt_clean,
                 padding="max_length",
                 max_length=max_sequence_length,
                 truncation=True,
@@ -653,6 +708,7 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         width,
         prompt_embeds=None,
         negative_prompt_embeds=None,
+        max_sequence_length=None,
     ):
         if height % 16 != 0 or width % 16 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 16 but are {height} and {width}.")
@@ -667,6 +723,11 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
 
         if prompt is None and prompt_embeds is None:
             raise ValueError("Provide either `prompt` or `prompt_embeds`.")
+
+        if max_sequence_length is not None and max_sequence_length > self.tokenizer_max_length:
+            raise ValueError(
+                f"`max_sequence_length` cannot be greater than {self.tokenizer_max_length} but is {max_sequence_length}"
+            )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""

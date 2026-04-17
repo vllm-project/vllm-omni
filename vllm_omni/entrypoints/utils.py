@@ -299,11 +299,19 @@ def load_stage_configs_from_model(model: str, base_engine_args: dict | None = No
     stage_config_path = resolve_model_config_path(model)
     if stage_config_path is None:
         return []
-    stage_configs = load_stage_configs_from_yaml(config_path=stage_config_path, base_engine_args=base_engine_args)
+    stage_configs = load_stage_configs_from_yaml(
+        config_path=stage_config_path,
+        base_engine_args=base_engine_args,
+        prefer_stage_engine_args=True,
+    )
     return stage_configs
 
 
-def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None = None) -> list:
+def load_stage_configs_from_yaml(
+    config_path: str,
+    base_engine_args: dict | None = None,
+    prefer_stage_engine_args: bool = True,
+) -> list:
     """Load stage configurations from a YAML file.
 
     .. deprecated::
@@ -311,6 +319,9 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
 
     Args:
         config_path: Path to the YAML configuration file
+        base_engine_args: Engine args supplied by the caller.
+        prefer_stage_engine_args: When True, YAML stage args override caller
+            engine args. When False, caller engine args override YAML defaults.
 
     Returns:
         List of stage configuration dictionaries from the file's stage_args
@@ -327,7 +338,11 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
         base_engine_args_tmp = base_engine_args.copy()
         # Update base_engine_args with stage-specific engine_args if they exist
         if hasattr(stage_arg, "engine_args") and stage_arg.engine_args is not None:
-            base_engine_args_tmp = create_config(merge_configs(base_engine_args_tmp, stage_arg.engine_args))
+            if prefer_stage_engine_args:
+                merged_engine_args = merge_configs(base_engine_args_tmp, stage_arg.engine_args)
+            else:
+                merged_engine_args = merge_configs(stage_arg.engine_args, base_engine_args_tmp)
+            base_engine_args_tmp = create_config(merged_engine_args)
         stage_type = getattr(stage_arg, "stage_type", "llm")
         if hasattr(stage_arg, "runtime") and stage_arg.runtime is not None and stage_type != "diffusion":
             base_engine_args_tmp.async_chunk = global_async_chunk

@@ -1,7 +1,6 @@
 # Common dependencies for all platforms
 av>=14.0.0
 omegaconf>=2.3.0
-librosa>=0.11.0
 resampy>=0.4.3
 diffusers>=0.36.0
 accelerate==1.12.0
@@ -11,7 +10,6 @@ tqdm>=4.66.0
 torchsde>=0.2.6
 openai-whisper>=20250625
 imageio[ffmpeg]>=2.37.2
-sox>=1.5.0
 x-transformers>=2.12.2
 einops>=0.8.1
 prettytable>=3.8.0

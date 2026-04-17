@@ -10,10 +10,8 @@ stage_args:
     engine_args:
       model_stage: dit
       model_class_name: "OmniVoicePipeline"
-      gpu_memory_utilization: 0.5
       enforce_eager: true
       trust_remote_code: true
-      engine_output_type: audio
       distributed_executor_backend: "mp"
       dtype: "float32"
     final_output: true

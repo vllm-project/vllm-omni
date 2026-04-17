@@ -9,6 +9,33 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm_omni.inputs.data import OmniPromptType
 
 
+@dataclass
+class OmniConnectorOutput:
+    """Communication results from Model Runner to Scheduler.
+
+    Carries transfer readiness signals so the Scheduler can make scheduling
+    decisions without ever calling connector.put()/get() directly.
+
+    Attributes:
+        chunk_ready_req_ids: Request IDs with newly arrived chunks this cycle.
+        chunk_finished_req_ids: Request IDs whose final chunk has arrived.
+        request_metadata: Lightweight scheduling metadata keyed by request ID
+            (e.g. next_stage_prompt_len, code_predictor_codes, left_context_size).
+            Full payloads are owned by the Model Runner's local cache.
+        kv_sent_req_ids: Request IDs whose KV cache was successfully sent.
+        stage_recv_req_ids: Request IDs that received batch stage inputs.
+        has_pending_kv_work: True if the mixin has pending, active, or
+            completed KV transfers that the scheduler should account for.
+    """
+
+    chunk_ready_req_ids: set[str] = field(default_factory=set)
+    chunk_finished_req_ids: set[str] = field(default_factory=set)
+    request_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
+    kv_sent_req_ids: list[str] = field(default_factory=list)
+    stage_recv_req_ids: set[str] = field(default_factory=set)
+    has_pending_kv_work: bool = False
+
+
 class OmniModelRunnerOutput(ModelRunnerOutput):
     """Model runner output for omni models.
 
@@ -24,6 +51,7 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
+    omni_connector_output: OmniConnectorOutput | None = None
 
 
 @dataclass
@@ -71,6 +99,9 @@ class OmniRequestOutput:
 
     # memory usage info
     peak_memory_mb: float = 0.0
+
+    # error handling
+    error: str | None = None
 
     @classmethod
     def from_pipeline(
@@ -123,8 +154,12 @@ class OmniRequestOutput:
             prompt: The prompt used
             metrics: Generation metrics
             latents: Optional latent tensors
+            trajectory_latents: Optional stacked trajectory latent tensors
+            trajectory_timesteps: Optional stacked trajectory timestep tensors
+            trajectory_log_probs: Optional stacked trajectory log-probability tensors
+            trajectory_decoded: Optional list of decoded trajectory images
             multimodal_output: Optional multimodal output dict
-            custom_output: Optional custom output dict (e.g. latent trajectories, prompt embeds)
+            custom_output: Optional custom output dict (e.g. prompt embeds)
             stage_durations: Optional stage durations (execution time of each stage) dict
             peak_memory_mb: Peak memory usage in MB
 

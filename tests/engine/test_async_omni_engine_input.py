@@ -1,6 +1,5 @@
-from unittest.mock import Mock
-
 import pytest
+from pytest_mock import MockerFixture
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 
@@ -24,18 +23,18 @@ def _make_engine_core_request() -> EngineCoreRequest:
     )
 
 
-def test_build_add_request_message_preserves_additional_information():
+def test_build_add_request_message_preserves_additional_information(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
     engine.default_sampling_params_list = [params]
     engine.stage_metadata = [{"stage_type": "llm"}]
     engine.supported_tasks = ("speech",)
 
-    input_processor = Mock()
+    input_processor = mocker.Mock()
     input_processor.process_inputs.return_value = _make_engine_core_request()
     engine.input_processor = input_processor
 
-    output_processor = Mock()
+    output_processor = mocker.Mock()
     engine.output_processors = [output_processor]
 
     prompt = {
@@ -63,18 +62,18 @@ def test_build_add_request_message_preserves_additional_information():
     output_processor.add_request.assert_called_once()
 
 
-def test_build_add_request_message_with_resumable_streaming():
+def test_build_add_request_message_with_resumable_streaming(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
     engine.default_sampling_params_list = [params]
     engine.stage_metadata = [{"stage_type": "llm"}]
     engine.supported_tasks = ("generate",)
 
-    input_processor = Mock()
+    input_processor = mocker.Mock()
     input_processor.process_inputs.return_value = _make_engine_core_request()
     engine.input_processor = input_processor
 
-    output_processor = Mock()
+    output_processor = mocker.Mock()
     engine.output_processors = [output_processor]
 
     msg = engine._build_add_request_message(

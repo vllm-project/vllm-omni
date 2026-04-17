@@ -112,14 +112,6 @@ python end2end_async_chunk.py \
 > async_chunk example when you need the stage-level concurrency semantics
 > described in PR #962 / #1151.
 
-### FAQ
-
-If you encounter error about backend of librosa, try to install ffmpeg with command below.
-```
-sudo apt update
-sudo apt install ffmpeg
-```
-
 ## Example materials
 
 ??? abstract "end2end.py"

@@ -48,6 +48,15 @@ class VoxtralTTSConfigParser(MistralConfigParser):
         audio_tokenizer_args = config_dict["multimodal"].pop("audio_tokenizer_args", None)
         audio_config = {}
         if encoder_args is not None:
+            # Default n_decoding_steps if not provided
+            acoustic_args = encoder_args.get("acoustic_transformer_args", {})
+            if acoustic_args.get("n_decoding_steps") is None:
+                logger.warning(
+                    "n_decoding_steps not provided in acoustic_transformer_args, defaulting to 7. "
+                    "Please add 'n_decoding_steps' to params.json under acoustic_transformer_args."
+                )
+                acoustic_args["n_decoding_steps"] = 7
+
             audio_config = {
                 "sampling_rate": encoder_args["audio_encoding_args"]["sampling_rate"],
                 "codec_args": audio_tokenizer_args,
