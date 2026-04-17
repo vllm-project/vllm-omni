@@ -207,13 +207,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "Re-upload voices after each restart if needed."
         )
         self._tts_tokenizer = None
+        self._voxcpm2_tokenizer = None
+        self._voxcpm2_split_map: dict[int, list[int]] = {}
+
+        logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
+
         # Direct-embedding voices cache only the x-vector loaded from their
         # safetensors file. Audio-uploaded prompt caches include ref_code/ICL
         # metadata and are managed separately by VoiceCacheManager.
         self._speaker_embedding_cache: dict[str, list[float]] = {}
         self._speaker_cache_manager = VoiceCacheManager(self.uploaded_speakers_dir)
-
-        logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
 
         # Batch configuration
         self._batch_max_items: int = getattr(self.engine_client, "tts_batch_max_items", 32)
