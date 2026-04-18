@@ -25,8 +25,8 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput
-from vllm_omni.diffusion.models.qwen_image.autoencoder_kl_qwenimage import (
-    AutoencoderKLQwenImage,
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import (
+    DistributedAutoencoderKLQwenImage,
 )
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
     QwenImageCFGParallelMixin,
@@ -224,9 +224,9 @@ class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParalle
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
         ).to(self.device)
-        self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
-        )
+        self.vae = DistributedAutoencoderKLQwenImage.from_pretrained(
+            model, subfolder="vae", local_files_only=local_files_only
+        ).to(self.device)
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
         self.processor = Qwen2VLProcessor.from_pretrained(
             model, subfolder="processor", local_files_only=local_files_only
@@ -723,6 +723,11 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         self._current_timestep = None
         self._interrupt = False
 
+        # Ensure text_encoder is on GPU for prompt encoding
+        # (it may have been offloaded to CPU after a previous forward call)
+        if next(self.text_encoder.parameters()).device.type == "cpu":
+            self.text_encoder.to(self.device)
+
         # 3. encode prompot & negative prompt
         if prompt is None or prompt == "" or prompt == " ":
             prompt = self.get_image_caption(prompt_image, use_en_prompt=use_en_prompt, device=self.device)
@@ -768,6 +773,12 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
                 max_sequence_length=max_sequence_length,
                 prompt_name="negative_prompt",
             )
+
+        # Offload text_encoder to CPU to free GPU memory for denoising + VAE decode.
+        # The text_encoder is no longer needed after prompt encoding and typically
+        # dominates GPU memory (>>30 GiB for the Qwen2.5-VL encoder).
+        self.text_encoder.to("cpu")
+        torch.cuda.empty_cache()
 
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.in_channels // 4
