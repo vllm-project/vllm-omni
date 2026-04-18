@@ -1,0 +1,18 @@
+{
+  "model": "HunyuanImage-3.0",
+  "tensor_parallel_size": 4,
+  "expert_parallel_size": 1,
+  "num_inference_steps": 50,
+  "guidance_scale": 5.0,
+  "seed": 1234,
+  "timestamp": "2026-03-23T00:00:00Z",
+  "description": "Initial baseline for HunYuanImage CI benchmark. Replace with actual benchmark results from the first CI run on A100 GPU.",
+  "statistics": {
+    "total_prompts": 5,
+    "total_latency_seconds": 0.0,
+    "average_latency_seconds": 0.0,
+    "min_latency_seconds": 0.0,
+    "max_latency_seconds": 0.0
+  },
+  "prompts": []
+}

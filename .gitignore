@@ -237,8 +237,12 @@ Thumbs.db
 data/
 datasets/
 *.csv
+!baseline.json
 *.json
+!benchmarks/diffusion/performance_dashboard/baseline.json
+!baseline.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
+!baseline.json
 *.jsonl
 *.parquet
 
@@ -263,3 +267,6 @@ tmp_test
 vllm_omni/_version.py
 # output files
 *.wav
+
+# Allow baseline.json for CI benchmarks
+!benchmarks/diffusion/performance_dashboard/baseline.json
