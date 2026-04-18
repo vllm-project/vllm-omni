@@ -979,6 +979,8 @@ def test_image_edit_rejects_model_mismatch(test_client):
     )
     assert response.status_code == 400
     assert "model mismatch" in response.json()["detail"].lower()
+
+
 def test_image_edit_rejects_too_many_images_for_qwen_image_edit_2511(async_omni_test_client):
     engine = async_omni_test_client.app.state.engine_client
     engine.get_diffusion_od_config = lambda: SimpleNamespace(
