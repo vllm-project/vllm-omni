@@ -33,6 +33,3 @@ stage_args:
 # Runtime defaults
 runtime:
   enabled: true
-  defaults:
-    window_size: -1
-    max_inflight: 1

@@ -302,11 +302,21 @@ class StageEngineCoreClientBase:
         self,
         stage_list: list[Any],
         prompt: OmniTokensPrompt | list[OmniTokensPrompt] | None = None,
+        streaming_context: Any | None = None,
     ) -> list[OmniTokensPrompt]:
         """Process inputs from upstream stages."""
         from vllm_omni.inputs.data import OmniTokensPrompt
 
         if self.custom_process_input_func is not None:
+            # Keep legacy arg call for non-streaming processors.
+            if bool(getattr(streaming_context, "enabled", False)):
+                return self.custom_process_input_func(
+                    stage_list,
+                    self.engine_input_source,
+                    prompt,
+                    self.requires_multimodal_data,
+                    streaming_context,
+                )
             return self.custom_process_input_func(
                 stage_list,
                 self.engine_input_source,

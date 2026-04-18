@@ -145,19 +145,13 @@ Compared with the default Qwen3-Omni config:
 ```yaml
 runtime:
   enabled: true
-  defaults:
-    window_size: -1
-    max_inflight: 1
   edges:
     - from: 0
       to: 1
-      window_size: -1
     - from: 1
       to: 2
-      window_size: -1
     - from: 2
       to: 3
-      window_size: -1
 ```
 
 ## 4. Launch with your custom config

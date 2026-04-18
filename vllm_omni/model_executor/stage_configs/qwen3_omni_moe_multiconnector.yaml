@@ -111,10 +111,6 @@ stage_args:
 # Top-level runtime config: default windows and stage edges
 runtime:
   enabled: true
-  defaults:
-    window_size: -1
-    max_inflight: 1
-
   # Distributed connectors configuration
   connectors:
     # Mooncake connector for cross-node/intra-node communication
@@ -137,7 +133,5 @@ runtime:
   edges:
     - from: 0
       to: 1
-      window_size: -1
     - from: 1
       to: 2
-      window_size: -1

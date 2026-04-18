@@ -70,14 +70,9 @@ stage_args:
 # Top-level runtime config with MultiConnector support
 runtime:
   enabled: true
-  defaults:
-    window_size: -1 # Trigger downstream only after full upstream completion
-    max_inflight: 1 # Process serially within each stage
-
   edges:
     - from: 0 # AR → Diffusion
       to: 1
-      window_size: -1
 
 # OmniConnector configuration for efficient inter-stage tensor transfer
 connectors:

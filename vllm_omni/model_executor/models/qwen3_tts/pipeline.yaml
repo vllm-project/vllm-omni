@@ -90,4 +90,3 @@ connectors:
 edges:
   - from: 0
     to: 1
-    window_size: -1
