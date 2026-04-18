@@ -287,6 +287,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             tracing_enabled=tracing_enabled,
         )
         self.engine_core_output_type = engine_core_output_type
+        # Keep a reference so process_outputs() can detokenize for text stages.
+        self._tokenizer = tokenizer
 
     def add_request(
         self,
@@ -342,6 +344,19 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             req_state = self.request_states.get(eco.request_id)
             if req_state is None or not isinstance(req_state, OmniRequestState):
                 continue
+            # For text-output stages (plain LLM as Stage 0 in text→TTS pipeline),
+            # surface incremental decoded text in pooling_output so the async_chunk
+            # hook can read pooling_output["text"]. Gated on engine_core_output_type
+            # == "text" so existing latent pipelines are unaffected.
+            if (
+                eco.pooling_output is None
+                and eco.new_token_ids
+                and self.engine_core_output_type == "text"
+                and self._tokenizer is not None
+            ):
+                decoded = self._tokenizer.decode(eco.new_token_ids, skip_special_tokens=True)
+                eco.pooling_output = {"text": decoded}
+
             if eco.pooling_output is not None and req_state.detokenizer is not None:
                 mm_type = (getattr(eco, "output_type", self.engine_core_output_type) or "").lower()
                 req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
