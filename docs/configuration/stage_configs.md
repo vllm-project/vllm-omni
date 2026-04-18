@@ -1,9 +1,116 @@
 # Stage configs for vLLM-Omni
 
-In vLLM-Omni, the target model is separated into multiple stages, which are processed by different LLMEngines, DiffusionEngines or other types of engines. Depending on different types of stages, such as Autoregressive (AR) stage or Diffusion transformer (DiT) stage, each can choose corresponding schedulers, model workers to load with the Engines in a plug-in fashion.
+Stage configs are the control plane for the stage-based CLI in vLLM-Omni. They tell
+`vllm serve ... --omni` how to split a model into stages, what each stage runs, which
+devices each stage sees, and how data flows between stages.
+
+In vLLM-Omni, the target model can be separated into multiple stages, which are
+processed by different LLM engines, diffusion engines, or other specialized engines.
+Depending on the stage type, such as an autoregressive (AR) stage or a diffusion
+transformer (DiT) stage, each stage can choose its own scheduler, worker, runtime,
+and sampling defaults.
 
 !!! note
     Default stage config YAMLs (for example, `vllm_omni/model_executor/stage_configs/qwen2_5_omni.yaml` and `vllm_omni/model_executor/stage_configs/qwen3_omni_moe.yaml`) are bundled and loaded automatically when `stage_configs_path` is not provided. They have been verified to work on 1xH100 for Qwen2.5-Omni and 2xH100 for Qwen3-Omni.
+
+!!! note
+    Diffusion models follow the same CLI entrypoint, but if no stage config YAML is
+    found, vLLM-Omni will synthesize a default single-stage diffusion config from the
+    CLI arguments.
+
+## When to use stage configs
+
+Use a stage config when you need to:
+
+- run a multi-stage omni model with the correct bundled defaults
+- override device placement or memory allocation per stage
+- customize connectors, runtimes, or inter-stage topology
+- tune per-stage sampling defaults or stage-specific engine arguments
+- keep a reproducible deployment layout in version-controlled YAML
+
+## Stage-Based CLI Quick Start
+
+### 1. Start with bundled defaults
+
+For supported omni models, the simplest path is to let vLLM-Omni resolve the bundled
+stage config automatically:
+
+```bash
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
+```
+
+The equivalent Python path is:
+
+```python
+from vllm_omni import AsyncOmni
+
+omni = AsyncOmni(model="Qwen/Qwen2.5-Omni-7B")
+```
+
+### 2. Point to a custom YAML
+
+If you want to modify stage placement or stage-specific engine arguments, start from a
+bundled YAML in `vllm_omni/model_executor/stage_configs/`, copy it, edit it, then pass
+it through `--stage-configs-path` or `stage_configs_path`.
+
+For offline (assuming the necessary dependencies have been imported):
+
+```python
+model_name = "Qwen/Qwen2.5-Omni-7B"
+omni = Omni(model=model_name, stage_configs_path="/path/to/custom_stage_configs.yaml")
+```
+
+For online serving:
+
+```bash
+vllm serve Qwen/Qwen2.5-Omni-7B \
+  --omni \
+  --port 8091 \
+  --stage-configs-path /path/to/custom_stage_configs.yaml
+```
+
+### 3. Use Ray for distributed execution
+
+For current multi-node or distributed stage deployments, prefer the Ray backend
+instead of the legacy stage-per-process flow:
+
+```bash
+vllm serve Qwen/Qwen2.5-Omni-7B \
+  --omni \
+  --port 8091 \
+  --worker-backend ray \
+  --ray-address auto
+```
+
+See [Ray-based execution notes](../design/feature/ray_based_execution.md) for cluster
+setup details.
+
+### 4. Understand the legacy `--stage-id` flow
+
+`--stage-id` belongs to the legacy stage-per-process flow. Do not treat it as the
+recommended way to select or launch stages in the current AsyncOmniEngine-based
+`vllm serve` runtime.
+
+Older setups paired `--stage-id` with both `--omni-master-address` and
+`--omni-master-port`.
+
+!!! warning
+    `--headless` is deprecated and not supported in the current AsyncOmniEngine-based
+    `vllm serve` runtime. Older documents or examples that use
+    `--stage-id ... --headless` should be treated as legacy reference, not as the
+    recommended deployment path for new setups.
+
+## Key CLI Flags
+
+| Flag | Purpose |
+|------|---------|
+| `--omni` | Enable the vLLM-Omni entrypoint for multi-stage or diffusion models. |
+| `--stage-configs-path` | Load a custom stage config YAML instead of auto-resolving one from the model. |
+| `--stage-id` | Legacy stage-per-process parameter retained for historical compatibility notes; not part of the recommended current runtime workflow. |
+| `--worker-backend` | Choose the stage worker backend, such as `multi_process` or `ray`. |
+| `--ray-address` | Connect to an existing Ray cluster when `--worker-backend ray` is used. |
+| `--omni-master-address` / `--omni-master-port` | Legacy orchestrator endpoint required when `--stage-id` is used. |
+| `--default-sampling-params` | Override default per-stage sampling parameters from the CLI. |
 
 Therefore, as a core part of vLLM-Omni, the stage configs for a model have several main functions:
 
@@ -13,18 +120,6 @@ Therefore, as a core part of vLLM-Omni, the stage configs for a model have sever
 - Input and output dependencies for each stage.
 - Default input parameters.
 
-If users want to modify some part of it. The custom stage_configs file can be input as input argument in both online and offline. Just like examples below:
-
-For offline (Assume necessary dependencies have ben imported):
-```python
-model_name = "Qwen/Qwen2.5-Omni-7B"
-omni = Omni(model=model_name, stage_configs_path="/path/to/custom_stage_configs.yaml")
-```
-
-For online serving:
-```bash
-vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
-```
 !!! important
     We are actively iterating on the definition of stage configs, and we welcome all feedbacks from both community users and developers to help us shape the development!
 

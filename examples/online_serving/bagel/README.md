@@ -97,6 +97,13 @@ Replace `<ORCHESTRATOR_IP>` below with the actual IP address of your orchestrato
 
 > [!WARNING]
 > **Before launching**, edit [`bagel_multiconnector.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml) and replace the `metadata_server` and `master` addresses with your Mooncake master node's actual IP. Mismatched addresses will cause silent connection failures.
+>
+> The stage-per-process flow below relies on `--stage-id` together with `--headless`.
+> `--headless` is deprecated and currently not supported by the AsyncOmniEngine-based
+> `vllm serve` runtime, so treat the commands below as legacy reference only.
+> For new deployments, prefer the standard orchestrator flow or the Ray backend. See
+> the [stage config guide](../../../docs/configuration/stage_configs.md) and
+> [Ray-based execution notes](../../../docs/design/feature/ray_based_execution.md).
 
 **1. Start Mooncake Master** (on the orchestrator node):
 
@@ -145,13 +152,13 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
 
 | Argument | Description |
 | :------- | :---------- |
-| `--stage-id` | Which stage this process runs (0 = Thinker, 1 = DiT) |
-| `--headless` | Run without the API server (worker-only mode) |
+| `--stage-id` | Legacy flow only: which stage this process runs (0 = Thinker, 1 = DiT) |
+| `--headless` | Legacy worker-only mode. Deprecated and not supported in the current runtime. |
 | `-oma` | Orchestrator master address |
 | `-omp` | Orchestrator master port for Stage 1 to connect to Stage 0 for task coordination |
 
 > [!IMPORTANT]
-> **Startup Order**: Stage 0 (orchestrator) must be launched **before** Stage 1 (headless).
+> **Legacy Startup Order**: Stage 0 (orchestrator) must be launched **before** Stage 1 (headless).
 > Stage 0 will appear to hang on startup until Stage 1 (worker) connects — this is expected behavior.
 
 **Network Requirements**
