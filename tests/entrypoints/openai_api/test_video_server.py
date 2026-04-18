@@ -28,7 +28,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 )
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager
-from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
+from vllm_omni.entrypoints.openai.stores import InMemoryVideoMetadataStore, TaskRegistry
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -94,7 +94,7 @@ class BlockingVideoHandler:
 @pytest.fixture(autouse=True)
 def isolated_video_backends(tmp_path, monkeypatch):
     """Use isolated in-memory metadata and local storage for each test."""
-    store: AsyncDictStore[VideoResponse] = AsyncDictStore()
+    store = InMemoryVideoMetadataStore()
     tasks = TaskRegistry()
     storage = LocalStorageManager(storage_path=str(tmp_path / "storage"))
     monkeypatch.setattr(api_server, "VIDEO_STORE", store)

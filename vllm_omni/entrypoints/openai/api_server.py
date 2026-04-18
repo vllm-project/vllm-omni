@@ -113,7 +113,7 @@ from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
-from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
+from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS, init_video_store
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
@@ -359,6 +359,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
         if serving_speech is not None:
             serving_speech.shutdown()
+        VIDEO_STORE.close()
         sock.close()
 
 
@@ -837,6 +838,20 @@ async def omni_init_app_state(
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
+
+    # init video metadata save backend
+    video_metadata_backend = getattr(args, "video_metadata_store", "memory")
+    init_video_store(
+        backend=video_metadata_backend,
+        directory=getattr(
+            args,
+            "video_metadata_store_dir",
+            os.path.join(os.getenv("VLLM_OMNI_STORAGE_PATH", "/tmp/storage"), "metadata"),
+        ),
+    )
+    # When restart after update video job status
+    if video_metadata_backend == "diskcache":
+        await _reconcile_video_store_on_startup()
 
 
 def Omnivideo(request: Request) -> OmniOpenAIServingVideo | None:
@@ -2094,6 +2109,35 @@ def _cleanup_video(video_id: str, output_path: str | None):
         logger.warning("Failed to cleanup partial video file '%s' for id=%s", output_path, video_id)
 
 
+async def _reconcile_video_store_on_startup() -> None:
+    """Mark orphaned QUEUED/IN_PROGRESS records as FAILED on startup.
+
+    Because VIDEO_TASKS is in-memory, any job that was running or queued when
+    the process last exited has no corresponding task after a restart.
+    """
+
+    orphaned_statuses = (VideoGenerationStatus.QUEUED, VideoGenerationStatus.IN_PROGRESS)
+    jobs = await VIDEO_STORE.list_values()
+    for job in jobs:
+        if job.status in orphaned_statuses:
+            await VIDEO_STORE.update_fields(
+                job.id,
+                {
+                    "status": VideoGenerationStatus.FAILED,
+                    "completed_at": int(time.time()),
+                    "error": VideoError(
+                        code="ProcessRestart",
+                        message="Job was interrupted by a server restart and cannot be resumed.",
+                    ),
+                },
+            )
+            logger.warning(
+                "Reconciled orphaned video job %s (was %s) → FAILED on startup.",
+                job.id,
+                job.status,
+            )
+
+
 async def _run_video_generation_job(
     handler: OmniOpenAIServingVideo,
     request: VideoGenerationRequest,
@@ -2427,9 +2471,17 @@ async def delete_video(video_id: str) -> VideoDeleteResponse:
                 raise HTTPException(status_code=409, detail="Cancellation in progress. Please try again later.")
             except asyncio.CancelledError:
                 pass
+        else:
+            # No task found: this record was orphaned by a previous process restart.
+            # There is nothing to cancel; fall through to remove it from the store.
+            logger.warning(
+                "Video job %s has status %s but no associated task (likely orphaned by restart); removing.",
+                video_id,
+                job.status,
+            )
 
-            await VIDEO_STORE.pop(video_id)
-            return VideoDeleteResponse(id=job.id, deleted=True)
+        await VIDEO_STORE.pop(video_id)
+        return VideoDeleteResponse(id=job.id, deleted=True)
     elif job.status is VideoGenerationStatus.FAILED:
         if job.file_name is not None:
             try:

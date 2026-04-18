@@ -406,6 +406,23 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable diffusion pipeline profiler to display stage durations.",
         )
+
+        # Video metadata store
+        omni_config_group.add_argument(
+            "--video-metadata-store",
+            type=str,
+            default="memory",
+            choices=["memory", "diskcache"],
+            help="Backend for storing video generation job metadata. "
+            "'memory' (default) keeps records in-process; "
+            "'diskcache' persists them to disk and survives process restarts.",
+        )
+        omni_config_group.add_argument(
+            "--video-metadata-store-dir",
+            type=str,
+            default="/tmp/storage/metadata",
+            help="Directory used by the 'diskcache' backend (default: /tmp/storage/metadata).",
+        )
         return serve_parser
 
 
