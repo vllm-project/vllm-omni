@@ -3,8 +3,8 @@
 # Copyright 2025 The Qwen team.
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
-from dataclasses import dataclass, field
 import logging
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -444,9 +444,7 @@ def thinker2talker(
         info = {
             "thinker_prefill_embeddings": thinker_emb,
             "thinker_hidden_states": thinker_hid,
-            "thinker_sequences": (
-                thinker_sequences,
-            ),  # the thinker_sequences is the whole ids
+            "thinker_sequences": thinker_sequences,  # the thinker_sequences is the whole ids
             "thinker_input_ids": thinker_input_ids,
             # Provide thinker-side TTS token embeddings for talker projection
             "tts_bos_embed": _resolve_tts_token_embedding(
