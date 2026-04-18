@@ -76,6 +76,11 @@ Alternatively, use the convenience script:
 ./run_server.sh CustomVoice      # CustomVoice model
 ./run_server.sh VoiceDesign      # VoiceDesign model
 ./run_server.sh Base             # Base (voice clone) model
+./run_server.sh Base 0.6B                                               # 0.6B Base (voice clone)
+./run_server.sh /path/to/local/model                                    # Local model directory
+SERVED_MODEL_NAME=my-tts ./run_server.sh                                # Custom served model name
+STAGE_CONFIGS_PATH=./my_qwen_stage_config.yaml ./run_server.sh          # Custom stage config
+
 ```
 
 ### Send TTS Request
@@ -190,6 +195,14 @@ response = httpx.post(
 
 with open("output.wav", "wb") as f:
     f.write(response.content)
+```
+
+### FAQ
+
+If you encounter error about backend of librosa, try to install ffmpeg with command below.
+```
+sudo apt update
+sudo apt install ffmpeg
 ```
 
 ## API Reference
