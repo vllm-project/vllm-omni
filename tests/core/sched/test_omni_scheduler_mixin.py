@@ -12,12 +12,16 @@ from dataclasses import replace
 
 import pytest
 
-import vllm_omni  # noqa: F401 - apply vLLM-Omni patches before binding Request/StreamingUpdate
+# Imports must run in this order: vllm_omni applies patches to vllm.v1.request before
+# Request / StreamingUpdate are bound in this module. Ruff isort would reorder them.
+# isort: off
+import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
-
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+
+# isort: on
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
