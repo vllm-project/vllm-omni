@@ -491,6 +491,20 @@ async def omni_init_app_state(
     state.log_stats = not args.disable_log_stats
     state.args = args
 
+    # Safety checker
+    if getattr(args, "safety_checker", False):
+        from vllm_omni.entrypoints.openai.safety_checker import SafetyChecker
+
+        try:
+            checker = SafetyChecker()
+            checker._ensure_loaded()
+            state.safety_checker = checker
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize safety checker: {e}") from e
+        logger.info("NSFW safety checker enabled")
+    else:
+        state.safety_checker = None
+
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
 
@@ -1449,6 +1463,8 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
         logger.info(f"Successfully generated {len(images)} image(s)")
 
+        await _check_safety(images, raw_request)
+
         # Encode images to base64
         image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in images]
 
@@ -1661,6 +1677,8 @@ async def edit_images(
         images = _extract_images_from_result(result)
         logger.info(f"Successfully generated {len(images)} image(s)")
 
+        await _check_safety(images, raw_request)
+
         # Encode images to base64
         image_data = [
             ImageData(
@@ -1866,6 +1884,32 @@ def _update_if_not_none(object: Any, key: str, val: Any) -> None:
         setattr(object, key, val)
 
 
+async def _check_safety(images: list[Any], raw_request: Request) -> None:
+    """Raise HTTPException if any image is flagged as unsafe."""
+    checker = getattr(raw_request.app.state, "safety_checker", None)
+    if checker is None:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(None, checker.check_images, images)
+    except Exception as e:
+        logger.error("Safety checker inference failed: %s", e)
+        raise HTTPException(
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+            detail=f"Safety checker unavailable: {e}",
+        )
+    unsafe_indices = [i for i, (is_safe, _) in enumerate(results) if not is_safe]
+    if unsafe_indices:
+        logger.warning(
+            "NSFW content detected: %d of %d images flagged (indices: %s)",
+            len(unsafe_indices),
+            len(images),
+            unsafe_indices,
+        )
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail="Generated content was flagged as potentially unsafe.",
+        )
 def _normalize_image(image: Any) -> Any:
     """Normalize a single image output to a PIL-compatible format."""
     if isinstance(image, Image.Image):

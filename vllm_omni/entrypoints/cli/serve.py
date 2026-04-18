@@ -406,6 +406,14 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable diffusion pipeline profiler to display stage durations.",
         )
+
+        # Safety checker
+        omni_config_group.add_argument(
+            "--safety-checker",
+            action="store_true",
+            help="Enable NSFW safety checker for image generation endpoints. "
+            "Uses Falconsai/nsfw_image_detection on CPU.",
+        )
         return serve_parser
 
 
