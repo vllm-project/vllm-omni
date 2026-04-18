@@ -194,7 +194,7 @@ def async_omni_test_client():
         SimpleNamespace(stage_type="diffusion"),
     ]
     app.state.args = Namespace(
-        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5}}',
+        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5, "generative-device":"cuda"}}',
         max_generated_image_size=1048576,  # 1024*1024 to support resolution tests
     )
     return TestClient(app)
@@ -345,6 +345,36 @@ def test_generate_images_async_omni_sampling_params(async_omni_test_client):
     assert captured[1].height == 256
     assert captured[1].width == 256
     assert captured[1].seed == 7
+
+
+def test_generate_images_async_omni_default_generator_device(async_omni_test_client):
+    """Test --default-sampling-params can set generator_device for generation endpoint."""
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "n": 1,
+            "size": "256x256",
+        },
+    )
+    assert response.status_code == 200
+    engine = async_omni_test_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert captured[1].generator_device == "cuda"
+
+
+def test_apply_stage_default_sampling_params_accepts_generator_device_alias():
+    """Test hyphenated alias keys map to generator_device."""
+    from vllm_omni.entrypoints.openai.api_server import apply_stage_default_sampling_params
+
+    params = OmniDiffusionSamplingParams()
+    apply_stage_default_sampling_params(
+        '{"1": {"generator-device": "cuda"}}',
+        params,
+        "1",
+    )
+    assert params.generator_device == "cuda"
 
 
 def test_generate_images_async_omni_stage_configs_only(async_omni_stage_configs_only_client):
