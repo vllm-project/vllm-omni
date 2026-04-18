@@ -526,6 +526,50 @@ class TestDiffusionEngine:
         with pytest.raises(RuntimeError, match="Dummy run failed: boom"):
             engine._dummy_run()
 
+    def test_step_multi_request_reuses_multimodal_slice_logic(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = SimpleNamespace(
+            model_class_name="mock_model",
+            enable_cpu_offload=False,
+        )
+        engine.pre_process_func = None
+        engine.post_process_func = None
+        engine.add_req_and_wait_for_response = Mock(
+            return_value=DiffusionOutput(
+                output={
+                    "video": ["frame-0", "frame-1"],
+                    "audio": ["audio-0", "audio-1"],
+                    "actions": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+                }
+            )
+        )
+
+        request = OmniDiffusionRequest(
+            prompts=["prompt-0", "prompt-1"],
+            sampling_params=OmniDiffusionSamplingParams(
+                num_inference_steps=1,
+                num_outputs_per_prompt=1,
+            ),
+            request_ids=["req-0", "req-1"],
+        )
+
+        with patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False):
+            outputs = engine.step(request)
+
+        assert len(outputs) == 2
+        assert outputs[0].images == ["frame-0"]
+        assert outputs[1].images == ["frame-1"]
+        assert outputs[0].multimodal_output["audio"] == "audio-0"
+        assert outputs[1].multimodal_output["audio"] == "audio-1"
+        torch.testing.assert_close(
+            outputs[0].multimodal_output["actions"],
+            torch.tensor([1.0, 2.0]),
+        )
+        torch.testing.assert_close(
+            outputs[1].multimodal_output["actions"],
+            torch.tensor([3.0, 4.0]),
+        )
+
 
 class TestStepScheduler:
     def setup_method(self) -> None:

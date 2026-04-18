@@ -14,6 +14,7 @@ from vllm.transformers_utils.repo_utils import file_or_path_exists
 
 from vllm_omni.config.stage_config import StageConfigFactory
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
+from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -358,6 +359,9 @@ def resolve_model_config_path(model: str) -> str:
                 )
 
     default_config_path = current_omni_platform.get_default_stage_config_path()
+    if model_type == "vla" and _looks_like_dreamzero(model):
+        model_type = "dreamzero"
+
     if model_type in _DIFFUSERS_CLASS_TO_CONFIG:
         normalized_model_type = _DIFFUSERS_CLASS_TO_CONFIG[model_type]
     else:
