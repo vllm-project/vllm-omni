@@ -295,12 +295,13 @@ def _run_timing(
 # =========================================================================
 
 
+@pytest.mark.parametrize("bias", [True, False])
 @pytest.mark.parametrize(
     "image_num, K, N, dtype",
     [(num, 3584, 4608, "w16a16_bf16") for num in _IMAGE_NUM],
     ids=lambda val: "",
 )
-def test_mot_qkv_parallel(image_num: int, K: int, N: int, dtype: str):
+def test_mot_qkv_parallel(image_num: int, K: int, N: int, dtype: str, bias: bool):
     dcfg = _parse_dtype(dtype)
     torch.manual_seed(42)
 
@@ -310,7 +311,7 @@ def test_mot_qkv_parallel(image_num: int, K: int, N: int, dtype: str):
             head_size=_BAGEL_HEAD_SIZE,
             total_num_heads=_BAGEL_TOTAL_NUM_HEADS,
             total_num_kv_heads=_BAGEL_TOTAL_NUM_KV_HEADS,
-            bias=True,
+            bias=bias,
             params_dtype=dcfg.torch_dtype,
             disable_tp=True,
         ).cuda()
@@ -319,7 +320,7 @@ def test_mot_qkv_parallel(image_num: int, K: int, N: int, dtype: str):
             head_size=_BAGEL_HEAD_SIZE,
             total_num_heads=_BAGEL_TOTAL_NUM_HEADS,
             total_num_kv_heads=_BAGEL_TOTAL_NUM_KV_HEADS,
-            bias=True,
+            bias=bias,
             params_dtype=dcfg.torch_dtype,
             disable_tp=True,
         ).cuda()
@@ -328,8 +329,8 @@ def test_mot_qkv_parallel(image_num: int, K: int, N: int, dtype: str):
             head_size=_BAGEL_HEAD_SIZE,
             total_num_heads=_BAGEL_TOTAL_NUM_HEADS,
             total_num_kv_heads=_BAGEL_TOTAL_NUM_KV_HEADS,
-            bias=True,
-            vae_bias=True,
+            bias=bias,
+            vae_bias=bias,
             params_dtype=dcfg.torch_dtype,
             disable_tp=True,
         ).cuda()
@@ -379,6 +380,7 @@ def test_mot_qkv_parallel(image_num: int, K: int, N: int, dtype: str):
 # =========================================================================
 
 
+@pytest.mark.parametrize("bias", [True, False])
 @pytest.mark.parametrize(
     "image_num, K, N, dtype",
     [(num, 3584, 3584, "w16a16_bf16") for num in _IMAGE_NUM],
@@ -389,6 +391,7 @@ def test_mot_o_proj(
     K: int,
     N: int,
     dtype: str,
+    bias: bool,
 ):
     dcfg = _parse_dtype(dtype)
     torch.manual_seed(42)
@@ -397,7 +400,7 @@ def test_mot_o_proj(
         text_linear = RowParallelLinear(
             K,
             N,
-            bias=False,
+            bias=bias,
             input_is_parallel=True,
             params_dtype=dcfg.torch_dtype,
             disable_tp=True,
@@ -405,7 +408,7 @@ def test_mot_o_proj(
         vae_linear = RowParallelLinear(
             K,
             N,
-            bias=False,
+            bias=bias,
             input_is_parallel=True,
             params_dtype=dcfg.torch_dtype,
             disable_tp=True,
@@ -413,7 +416,8 @@ def test_mot_o_proj(
         mot_linear = MoTRowParallelLinear(
             K,
             N,
-            bias=False,
+            bias=bias,
+            vae_bias=bias,
             input_is_parallel=True,
             params_dtype=dcfg.torch_dtype,
             disable_tp=True,

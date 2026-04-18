@@ -381,60 +381,45 @@ class PackedAttentionMoT(nn.Module):
     ) -> tuple[torch.Tensor, NaiveCache | None]:
         """SP-aware attention for gen mode denoising.
 
-        Converts packed format to batched (1, S, H, D) and uses the diffusion
-        Attention layer (Ulysses / Ring) with joint mechanism:
+        Uses MoT unified layers for projection/norm (fused text/vae routing),
+        then splits into text/vae for the DiffusionAttention (Ulysses / Ring)
+        with joint mechanism:
           - Main Q/K/V: VAE tokens (split across SP ranks)
           - Joint Q: text marker Q (replicated)
           - Joint K/V: KV cache K/V + text marker K/V (replicated)
         """
+        text_indices = packed_text_indexes
+        vae_indices = packed_vae_token_indexes
+
         packed_query_sequence = packed_query_sequence.to(torch.bfloat16)
 
-        packed_text_query_sequence = packed_query_sequence[packed_text_indexes]
-        packed_vae_query_sequence = packed_query_sequence[packed_vae_token_indexes]
+        # MoT QKV projection — fused kernel routes text/vae to correct weights
+        qkv, _ = self.qkv_proj(packed_query_sequence, text_indices, vae_indices)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
 
-        # Project text tokens through base qkv
-        text_qkv, _ = self.qkv_proj(packed_text_query_sequence)
-        text_q, text_k, text_v = text_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # MoT QK norms — routes text/vae to weight/gen_weight internally
+        q = self.q_norm(q.to(torch.float32), text_indices, vae_indices)
+        k = self.k_norm(k.to(torch.float32), text_indices, vae_indices)
 
-        # Project vae tokens through moe_gen qkv
-        vae_qkv, _ = self.qkv_proj_moe_gen(packed_vae_query_sequence)
-        vae_q, vae_k, vae_v = vae_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # RoPE on full packed tensor
+        cos, sin = [x[..., : self.head_dim // 2] for x in packed_query_position_embeddings]
+        q = self.rotary_op(q.to(cos.dtype).unsqueeze(0), cos, sin).squeeze(0)
+        k = self.rotary_op(k.to(cos.dtype).unsqueeze(0), cos, sin).squeeze(0)
 
-        # Reshape to (tokens, heads, head_dim)
-        text_q = text_q.view(-1, self.num_heads, self.head_dim)
-        text_k = text_k.view(-1, self.num_kv_heads, self.head_dim)
-        text_v = text_v.view(-1, self.num_kv_heads, self.head_dim)
-        vae_q = vae_q.view(-1, self.num_heads, self.head_dim)
-        vae_k = vae_k.view(-1, self.num_kv_heads, self.head_dim)
-        vae_v = vae_v.view(-1, self.num_kv_heads, self.head_dim)
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
 
-        # Apply QK norms
-        text_q = self.q_norm(text_q.to(torch.float32))
-        text_k = self.k_norm(text_k.to(torch.float32))
-        vae_q = self.q_norm_moe_gen(vae_q.to(torch.float32))
-        vae_k = self.k_norm_moe_gen(vae_k.to(torch.float32))
-
-        # Apply RoPE - need to build per-token cos/sin for text and vae separately
-        # packed_query_position_embeddings are ordered as the packed sequence
-        cos_full, sin_full = [x[..., : self.head_dim // 2] for x in packed_query_position_embeddings]
-
-        # Extract cos/sin for text and vae positions
-        text_cos = cos_full[packed_text_indexes]
-        text_sin = sin_full[packed_text_indexes]
-        vae_cos = cos_full[packed_vae_token_indexes]
-        vae_sin = sin_full[packed_vae_token_indexes]
-
-        text_q = self.rotary_op(text_q.to(text_cos.dtype).unsqueeze(0), text_cos, text_sin).squeeze(0)
-        text_k = self.rotary_op(text_k.to(text_cos.dtype).unsqueeze(0), text_cos, text_sin).squeeze(0)
-        vae_q = self.rotary_op(vae_q.to(vae_cos.dtype).unsqueeze(0), vae_cos, vae_sin).squeeze(0)
-        vae_k = self.rotary_op(vae_k.to(vae_cos.dtype).unsqueeze(0), vae_cos, vae_sin).squeeze(0)
-
-        text_q = text_q.to(torch.bfloat16)
-        text_k = text_k.to(torch.bfloat16)
-        text_v = text_v.to(torch.bfloat16)
-        vae_q = vae_q.to(torch.bfloat16)
-        vae_k = vae_k.to(torch.bfloat16)
-        vae_v = vae_v.to(torch.bfloat16)
+        # Split into text / vae for SP attention
+        text_q = q[text_indices]
+        text_k = k[text_indices]
+        text_v = v[text_indices]
+        vae_q = q[vae_indices]
+        vae_k = k[vae_indices]
+        vae_v = v[vae_indices]
 
         # Build joint K/V: [kv_cache, text_markers] (replicated across SP ranks)
         if past_key_values is not None and past_key_values.key_cache[self.layer_idx] is not None:
@@ -464,15 +449,19 @@ class PackedAttentionMoT(nn.Module):
                 joint_strategy="front",
             ),
         )
-        # attn_out: (1, text_len + local_vae_len, H, D)
+        # attn_out: (1, text_len + vae_len, H, D)
         text_len = text_q.shape[0]
-        attn_out = attn_out.squeeze(0)  # (text_len + local_vae_len, H, D)
+        attn_out = attn_out.squeeze(0)
         text_attn = attn_out[:text_len].reshape(text_len, self.q_size)
         vae_attn = attn_out[text_len:].reshape(-1, self.q_size)
 
-        # Apply output projections
-        text_out, _ = self.o_proj(text_attn)
-        vae_out, _ = self.o_proj_moe_gen(vae_attn)
+        # MoT output projection — construct local packed tensor with local indices
+        local_packed = torch.cat([text_attn, vae_attn], dim=0)
+        local_text_idx = torch.arange(text_len, device=local_packed.device)
+        local_vae_idx = torch.arange(text_len, text_len + vae_attn.shape[0], device=local_packed.device)
+        local_out, _ = self.o_proj(local_packed, local_text_idx, local_vae_idx)
+        text_out = local_out[:text_len]
+        vae_out = local_out[text_len:]
 
         # Merge back into packed format
         total_len = packed_query_sequence.shape[0]
