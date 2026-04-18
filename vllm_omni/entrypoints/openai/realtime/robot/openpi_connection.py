@@ -11,7 +11,7 @@ Protocol (compatible with DreamZero test_client_AR.py):
 
 from __future__ import annotations
 
-import traceback
+import asyncio
 from typing import Any
 
 from fastapi import WebSocket
@@ -23,18 +23,26 @@ from vllm_omni.entrypoints.openai.realtime.robot.openpi_serving import (
 )
 
 logger = init_logger(__name__)
+_DEFAULT_IDLE_TIMEOUT = 30.0
+
+def _get_msgpack_numpy() -> Any:
+    try:
+        from openpi_client import msgpack_numpy
+    except ImportError as exc:
+        raise ImportError(
+            "The `/v1/realtime/robot/openpi` endpoint requires the optional "
+            "`openpi-client` dependency. Install it with `pip install openpi-client`."
+        ) from exc
+
+    return msgpack_numpy
 
 
 def _pack(obj: Any) -> bytes:
-    from openpi_client import msgpack_numpy
-
-    return msgpack_numpy.packb(obj)
+    return _get_msgpack_numpy().packb(obj)
 
 
 def _unpack(data: bytes) -> Any:
-    from openpi_client import msgpack_numpy
-
-    return msgpack_numpy.unpackb(data)
+    return _get_msgpack_numpy().unpackb(data)
 
 
 class RobotRealtimeConnection:
@@ -44,28 +52,44 @@ class RobotRealtimeConnection:
         self,
         websocket: WebSocket,
         serving: ServingRealtimeRobotOpenPI,
+        idle_timeout: float = _DEFAULT_IDLE_TIMEOUT,
     ) -> None:
         self.websocket = websocket
         self.serving = serving
+        self._idle_timeout = idle_timeout
+
+    async def _send_error(self, message: str) -> None:
+        await self.websocket.send_bytes(_pack({"type": "error", "message": message}))
+
+    def _unpack_request(self, data: bytes) -> dict[str, Any]:
+        obs = _unpack(data)
+        if not isinstance(obs, dict):
+            raise ValueError("Invalid request payload")
+        return obs
 
     async def handle_connection(self) -> None:
         """Main loop. Matches DreamZero policy_server.py._handler."""
         await self.websocket.accept()
 
         try:
-            # Send metadata (PolicyServerConfig fields)
-            metadata = {
-                "image_resolution": (180, 320),
-                "n_external_cameras": 2,
-                "needs_wrist_camera": True,
-                "needs_stereo_camera": False,
-                "needs_session_id": True,
-                "action_space": "joint_position",
-            }
+            # Send model-specific PolicyServerConfig resolved by serving from
+            # diffusion od_config.model_config.
+            metadata = self.serving.policy_server_config.to_dict()
             await self.websocket.send_bytes(_pack(metadata))
 
             while True:
-                msg = await self.websocket.receive()
+                try:
+                    msg = await asyncio.wait_for(
+                        self.websocket.receive(),
+                        timeout=self._idle_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.info("Robot OpenPI connection idle timeout after %.1f seconds", self._idle_timeout)
+                    try:
+                        await self.websocket.close()
+                    except Exception:
+                        logger.debug("Failed to close idle robot OpenPI websocket", exc_info=True)
+                    return
 
                 if msg.get("type") == "websocket.disconnect":
                     break
@@ -74,7 +98,16 @@ class RobotRealtimeConnection:
                     continue
 
                 try:
-                    obs = _unpack(msg["bytes"])
+                    obs = self._unpack_request(msg["bytes"])
+                except Exception:
+                    logger.exception("Invalid robot OpenPI request payload")
+                    try:
+                        await self._send_error("Invalid request payload")
+                    except Exception:
+                        break
+                    continue
+
+                try:
                     endpoint = obs.pop("endpoint", "infer")
 
                     if endpoint == "reset":
@@ -86,7 +119,7 @@ class RobotRealtimeConnection:
                 except Exception:
                     logger.exception("Error handling request")
                     try:
-                        await self.websocket.send_text(traceback.format_exc())
+                        await self._send_error("Internal inference error")
                     except Exception:
                         break
 

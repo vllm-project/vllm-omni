@@ -630,7 +630,7 @@ async def omni_init_app_state(
         )
         state.openai_streaming_speech = None
         state.openai_streaming_video = None
-        state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI(
+        state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
             engine_client=engine_client,
             model_name=model_name,
         )

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Base transform interface for robot policy serving.
+"""Base transform interface for DreamZero robot policy serving.
 
 Transforms handle dataset-specific concerns ONLY:
   - Observation key mapping
@@ -18,12 +18,11 @@ Model-specific concerns belong in the pipeline:
 
 Flow:
   raw obs (dataset format)
-    → Transform.transform_input()
+    → DreamZeroPipeline selects transform by embodiment
       → unified dict (stitched video, templated prompt str, raw state)
-        → Pipeline.forward() (tokenize, pad, encode, denoise)
-          → DiffusionOutput
-            → Transform.transform_output()
-              → ndarray (N, action_dim)
+        → tokenize, pad, encode, denoise
+          → transform_action_output()
+            → ndarray (N, action_dim)
 """
 
 from __future__ import annotations
@@ -82,20 +81,8 @@ class RobotPolicyTransform:
             unified["session_id"] = obs["session_id"]
         return unified
 
-    def transform_output(self, result: Any) -> np.ndarray:
-        """Extract action ndarray (N, ACTION_DIM) from model output.
-
-        Engine outputs actions through ``multimodal_output["actions"]``.
-        Pipeline outputs (horizon, max_action_dim) after batch squeeze.
-        We slice to actual ACTION_DIM.
-        """
-        if not hasattr(result, "multimodal_output") or result.multimodal_output is None:
-            raise RuntimeError("Missing multimodal_output in robot policy result")
-
-        actions = result.multimodal_output.get("actions")
-        if actions is None:
-            raise RuntimeError("Missing multimodal_output['actions'] in robot policy result")
-
+    def transform_action_output(self, actions: Any) -> np.ndarray:
+        """Adapt model action output to this transform's action dimensions."""
         actions = np.asarray(actions, dtype=np.float32)
         # Handle any remaining batch dims: squeeze to 2D (horizon, dim)
         while actions.ndim > 2:

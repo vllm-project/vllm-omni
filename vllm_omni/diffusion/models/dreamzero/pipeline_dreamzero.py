@@ -34,6 +34,19 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.dreamzero.modeling.causal_wan_model import CausalWanModel
 from vllm_omni.diffusion.models.dreamzero.modeling.image_encoder import DreamZeroImageEncoder
 from vllm_omni.diffusion.models.dreamzero.state_dreamzero import DreamZeroState
+from vllm_omni.diffusion.models.dreamzero.transform import (
+    DEFAULT_EMBODIMENT,
+    ensure_transforms_loaded,
+)
+from vllm_omni.diffusion.models.dreamzero.transform.base import get_transform
+from vllm_omni.diffusion.models.dreamzero.utils import (
+    DEFAULT_CFG_SCALE,
+    DEFAULT_EMBODIMENT_NAME_TO_ID,
+    DEFAULT_NEGATIVE_PROMPT,
+    DEFAULT_NUM_INFERENCE_STEPS,
+    DEFAULT_SEED,
+    DEFAULT_SIGMA_SHIFT,
+)
 from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -112,6 +125,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         model_config = od_config.model_config
         local_files_only = os.path.exists(model_path)
         self.od_config = od_config
+        ensure_transforms_loaded()
+        self.default_robot_embodiment = model_config.get(
+            "default_robot_embodiment",
+            DEFAULT_EMBODIMENT,
+        )
 
         # ---- Parse root config.json ---- (last_steps.md P0-4)
         root_cfg = self._load_repo_json(model_path, "config.json", local_files_only)
@@ -256,9 +274,12 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # real-world inference loop consumes. Reading the config value here would
         # incorrectly shorten the denoising loop to 4 steps for the released
         # DreamZero checkpoint.
-        self.num_inference_steps: int = model_config.get("num_inference_steps", 16)
-        self.cfg_scale: float = model_config.get("cfg_scale", 5.0)
-        self.sigma_shift: float = model_config.get("sigma_shift", 5.0)
+        self.num_inference_steps: int = model_config.get(
+            "num_inference_steps",
+            DEFAULT_NUM_INFERENCE_STEPS,
+        )
+        self.cfg_scale: float = model_config.get("cfg_scale", DEFAULT_CFG_SCALE)
+        self.sigma_shift: float = model_config.get("sigma_shift", DEFAULT_SIGMA_SHIFT)
         # Source: `WANPolicyHead.__init__` reads `config.num_frames`
         # from `action_head_cfg.config.num_frames` (33 for DreamZero DROID),
         # not from the root HF config. This value feeds `encode_image()`
@@ -273,36 +294,20 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         self.video_inference_final_noise: float = ah_config["video_inference_final_noise"]
 
         # Fixed seed for deterministic noise generation                  # L176
-        self.seed: int = model_config.get("seed", 1140)
+        self.seed: int = model_config.get("seed", DEFAULT_SEED)
 
         # Model-level constants for state/action padding                 # dreamzero_cotrain.yaml
         self.max_state_dim: int = ah_config["max_state_dim"]
         self.max_action_dim: int = ah_config["max_action_dim"]
 
         # Fixed negative prompt for CFG uncond branch                    # dreamzero_cotrain.py L532
-        self.negative_prompt: str = (
-            "Vibrant colors, overexposed, static, blurry details, text, subtitles, "
-            "style, artwork, painting, image, still, grayscale, dull, worst quality, "
-            "low quality, JPEG artifacts, ugly, mutilated, extra fingers, bad hands, "
-            "bad face, deformed, disfigured, mutated limbs, fused fingers, stagnant "
-            "image, cluttered background, three legs, many people in the background, "
-            "walking backwards."
-        )
+        self.negative_prompt: str = model_config.get("negative_prompt", DEFAULT_NEGATIVE_PROMPT)
 
         # Embodiment name → numeric ID mapping (model knowledge)
         # Source: dreamzero transform/base.yaml embodiment_tag_to_projector_index
         self.embodiment_name_to_id: dict[str, int] = model_config.get(
             "embodiment_name_to_id",
-            {
-                "oxe_droid": 17,
-                "agibot": 26,
-                "gr1_unified": 24,
-                "xdof": 22,
-                "yam": 32,
-                "mecka_hands": 27,
-                "lapa": 27,
-                "dream": 31,
-            },
+            DEFAULT_EMBODIMENT_NAME_TO_ID,
         )
 
         # Action normalization stats (per-embodiment, from checkpoint metadata)
@@ -340,17 +345,6 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 ],
             ),
         ]
-
-    def to(self, *args, **kwargs):
-        """Defer dtype/device moves to the default module semantics.
-
-        Source: `WANPolicyHead.post_initialize()`
-        - upstream moves `model / text_encoder / image_encoder / vae`
-          to `dtype=torch.bfloat16` on the target CUDA device.
-        - the HF CLIP vision backbone must therefore follow the same dtype
-          move instead of being pinned to fp32.
-        """
-        return super().to(*args, **kwargs)
 
     # -----------------------------------------------------------------------
     # Root config loading
@@ -863,19 +857,25 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
     # Main entry point
     # -----------------------------------------------------------------------
 
+    def _transform_robot_obs(self, robot_obs: dict):
+        """Select DreamZero robot transform and convert raw obs to model input."""
+        embodiment = robot_obs.get("embodiment", self.default_robot_embodiment)
+        transform = get_transform(embodiment)
+        return transform, transform.transform_input(robot_obs)
+
     @torch.no_grad()
     def forward(self, req: OmniDiffusionRequest, **kwargs) -> DiffusionOutput:
         """Full inference step. Called by DiffusionEngine.step().
         Source: WANPolicyHead.lazy_joint_video_action (L929-1270)
         """
         extra_args = req.sampling_params.extra_args or {}
-        unified_obs = extra_args.get("unified_obs")
-        if unified_obs is None:
+        robot_obs = extra_args.get("robot_obs")
+        if robot_obs is None:
             first_prompt = req.prompts[0] if req.prompts else ""
             prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
             is_dummy_warmup = prompt == "dummy run" and req.sampling_params.num_inference_steps == 1
             if is_dummy_warmup:
-                logger.info("Skipping DreamZero dummy warmup request without unified_obs.")
+                logger.info("Skipping DreamZero dummy warmup request without robot_obs.")
                 return DiffusionOutput(
                     output={
                         "actions": np.zeros(
@@ -884,7 +884,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                         ),
                     },
                 )
-            raise KeyError("unified_obs")
+            raise KeyError("robot_obs")
+        transform, unified_obs = self._transform_robot_obs(robot_obs)
         device = get_local_device()
 
         # ---- Step 1: Extract inputs from unified observation ----
@@ -937,7 +938,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         attention_mask = text_inputs["attention_mask"].to(device)
 
         # ---- Step 2: Check reset + accumulate frames ---- (L968-981)
-        # Explicit reset from serving layer (session switch / client request)
+        # Explicit reset from OpenPI serving is carried by `extra_args["reset"]`
+        # on the next inference request after websocket reset/session switch.
         if extra_args.get("reset", False):
             self.state.reset()
         # Auto-reset based on model state (before accumulation)
@@ -1118,6 +1120,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
 
         # Squeeze batch dim for output: (B, horizon, dim) → (horizon, dim)
         actions_np = action_out.squeeze(0).float().cpu().numpy()  # (horizon, max_action_dim)
+        actions_np = transform.transform_action_output(actions_np)
 
         return DiffusionOutput(
             output={

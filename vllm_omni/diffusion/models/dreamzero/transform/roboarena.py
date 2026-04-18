@@ -11,10 +11,10 @@ Source: socket_test_optimized_AR.py L104-108 (key mapping)
 
 from __future__ import annotations
 
-from vllm_omni.entrypoints.openai.realtime.robot.transform.base import (
+from vllm_omni.diffusion.models.dreamzero.transform.base import (
     register_transform,
 )
-from vllm_omni.entrypoints.openai.realtime.robot.transform.droid import (
+from vllm_omni.diffusion.models.dreamzero.transform.droid import (
     DroidTransform,
 )
 

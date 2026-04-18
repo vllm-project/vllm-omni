@@ -88,7 +88,9 @@ class DreamZeroState:
         self.stitched_buffer: list[np.ndarray] = []
         self.call_count: int = 0
 
-        # KV cache — from WANPolicyHead.__init__ L185-188
+        # KV cache — from WANPolicyHead.__init__ L185-188.
+        # TODO(DreamZero): replace this model-local cache with vLLM's managed
+        # KV cache once robot-policy diffusion supports that integration.
         self.kv_cache: list[torch.Tensor] | None = None
         self.kv_cache_neg: list[torch.Tensor] | None = None
         self.crossattn_cache: list[dict[str, bool | torch.Tensor | None]] | None = None

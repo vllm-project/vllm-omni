@@ -29,7 +29,7 @@ import numpy as np
 import torch
 import torchvision.transforms.v2 as T
 
-from vllm_omni.entrypoints.openai.realtime.robot.transform.base import (
+from vllm_omni.diffusion.models.dreamzero.transform.base import (
     RobotPolicyTransform,
     register_transform,
 )
