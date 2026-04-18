@@ -24,6 +24,9 @@ class RealtimeConnection(VllmRealtimeConnection):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Last audio buffer seen for this realtime generation (cumulative or concatenation
+        # of increments); used to turn server cumulative PCM into true deltas.
+        self._realtime_audio_ref: np.ndarray | None = None
 
     async def start_generation(self):
         await super().start_generation()
@@ -45,6 +48,35 @@ class RealtimeConnection(VllmRealtimeConnection):
             arr = arr.reshape(-1)
         return arr.astype(np.float32, copy=False)
 
+    @staticmethod
+    def _numpy_audio_prefix_match(prev: np.ndarray, curr: np.ndarray) -> bool:
+        n = prev.shape[0]
+        if n == 0:
+            return True
+        if curr.shape[0] < n:
+            return False
+        return bool(np.allclose(curr[:n], prev, rtol=1e-3, atol=2e-4))
+
+    def _raw_waveform_to_deltas(self, arr: np.ndarray) -> list[np.ndarray]:
+        """Convert one streaming PCM f32 chunk into incremental piece(s) for the client.
+
+        Some engine paths emit a growing cumulative waveform each step; others emit
+        true per-step deltas. We support both without duplicating audio on the client.
+        """
+        if arr.size == 0:
+            return []
+        ref = self._realtime_audio_ref
+        if ref is None:
+            self._realtime_audio_ref = arr.copy()
+            return [arr]
+        if self._numpy_audio_prefix_match(ref, arr):
+            delta = arr[ref.shape[0] :]
+            self._realtime_audio_ref = arr.copy()
+            return [delta] if delta.size > 0 else []
+        # True per-step delta (not a prefix extension of what we have seen).
+        self._realtime_audio_ref = np.concatenate([ref, arr])
+        return [arr]
+
     def _extract_audio_chunks(self, output) -> tuple[list[np.ndarray], int]:
         mm = getattr(output, "multimodal_output", None)
         if not isinstance(mm, dict):
@@ -61,11 +93,11 @@ class RealtimeConnection(VllmRealtimeConnection):
             if len(raw_audio) > 0:
                 arr = self._tensor_to_numpy(raw_audio[-1])
                 if arr is not None and arr.size > 0:
-                    chunks.append(arr)
+                    chunks.extend(self._raw_waveform_to_deltas(arr))
         else:
             arr = self._tensor_to_numpy(raw_audio)
             if arr is not None and arr.size > 0:
-                chunks.append(arr)
+                chunks.extend(self._raw_waveform_to_deltas(arr))
         return chunks, int(sr)
 
     @staticmethod
@@ -86,6 +118,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         sent_text_len = 0
         prompt_token_ids_len = 0
         completion_tokens_len = 0
+        self._realtime_audio_ref = None
 
         try:
             result_gen = self.serving.engine_client.generate(

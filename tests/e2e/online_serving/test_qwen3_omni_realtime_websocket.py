@@ -173,7 +173,7 @@ class TestQwen3OmniRealtimeWebSocket:
         transcription. Verify Whisper(output audio) aligns with model text (same idea
         as multimodal omni e2e).
         """
-        syn = generate_synthetic_audio(1, 1, sample_rate=16000)
+        syn = generate_synthetic_audio(10, 1, sample_rate=16000)
         wav_bytes = base64.b64decode(syn["base64"])
         pcm16 = _pcm16_mono_16k_from_wav_bytes(wav_bytes)
 
