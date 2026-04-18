@@ -13,6 +13,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import logging
+import math
 import os
 import time
 from collections.abc import Iterable
@@ -78,6 +79,44 @@ def split_multichar_chinese(token_ids: list[int], split_map: dict[int, list[int]
         else:
             result.append(tid)
     return result
+
+
+def build_voxcpm2_prompt(
+    hf_config: Any,
+    tokenizer: Any,
+    split_map: dict[int, list[int]],
+    text: str,
+    ref_audio: Any | None = None,
+    ref_sr: int | None = None,
+    ref_text: str | None = None,
+) -> dict[str, Any]:
+    """Build a VoxCPM2 prefill prompt whose ``prompt_token_ids`` length matches
+    the talker-side prefill length.
+
+    Used by both online serving (``serving_speech._build_voxcpm2_prompt``) and
+    the offline example, so the talker-side length assertion never fires.
+    """
+    ids = split_multichar_chinese(tokenizer.encode(text, add_special_tokens=True), split_map)
+    bos = tokenizer.bos_token_id
+    if ids and ids[0] == bos:
+        ids = ids[1:]
+    prefill_len = len(ids) + 1  # + audio_start
+    additional: dict[str, Any] = {"text_token_ids": [ids]}
+    if ref_audio is not None:
+        vae = hf_config.audio_vae_config
+        patch_samples = hf_config.patch_size * math.prod(vae["encoder_rates"])
+        ref_len = math.ceil(math.ceil(len(ref_audio) * vae["sample_rate"] / ref_sr) / patch_samples)
+        if ref_text is not None:
+            additional["prompt_audio"] = [[ref_audio, ref_sr]]
+            additional["prompt_text"] = [ref_text]
+            ref_ids = split_multichar_chinese(tokenizer.encode(ref_text, add_special_tokens=True), split_map)
+            if ref_ids and ref_ids[0] == bos:
+                ref_ids = ref_ids[1:]
+            prefill_len += ref_len + len(ref_ids)
+        else:
+            additional["reference_audio"] = [[ref_audio, ref_sr]]
+            prefill_len += ref_len + 2  # ref_start / ref_end
+    return {"prompt_token_ids": [1] * prefill_len, "additional_information": additional}
 
 
 def _encode_raw_audio(
@@ -793,19 +832,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         tts_len = text_mask.shape[1]
         scaffold_len = base_lm_out.shape[0]
-
-        if scaffold_len < tts_len:
-            # Voice clone / continuation: scaffold only processed vllm tokens.
-            # Pad to match TTS sequence length (extra positions are masked out).
-            pad = torch.zeros(
-                tts_len - scaffold_len,
-                base_lm_out.shape[-1],
-                device=base_lm_out.device,
-                dtype=base_lm_out.dtype,
-            )
-            enc_out = torch.cat([base_lm_out, pad], dim=0).unsqueeze(0)
-        else:
-            enc_out = base_lm_out.unsqueeze(0)
+        assert scaffold_len == tts_len, (
+            f"voxcpm2 prefill length mismatch: scaffold_len={scaffold_len} tts_len={tts_len}; "
+            "caller must pad prompt_token_ids to the full prefill length "
+            "(see serving_speech._build_voxcpm2_prompt or the offline example)."
+        )
+        enc_out = base_lm_out.unsqueeze(0)
 
         prefix_feat_cond = (
             feat[:, -1, ...]
@@ -1063,7 +1095,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             for rid in [r for r, s in self._active_states.items() if r not in pending_ids and s.prefill_completed]:
                 self._cleanup_request(rid)
 
-            token_ids = input_ids.tolist()
+            real = info_dict.get("text_token_ids")
+            token_ids = input_ids.tolist() if real is None else real[0]
             # Fail-fast: unsplit multichar Chinese IDs in input_ids means the
             # serving layer didn't pre-split.  Silent fixup here would cause
             # input_ids/embeds length mismatch (scheduler slot count is fixed).
