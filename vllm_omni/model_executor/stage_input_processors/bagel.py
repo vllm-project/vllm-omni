@@ -82,6 +82,8 @@ def expand_cfg_prompts(
     neg_prompt = _get_negative_prompt(prompt, sampling_params)
 
     if "image" in modalities:
+        if not neg_prompt:
+            return []
         neg_prompt_dict = {
             "prompt": neg_prompt,
             "modalities": prompt.get("modalities", []),
@@ -166,6 +168,8 @@ def expand_cfg_prompts_think(
     companion_params = {"max_tokens": 1}
 
     if "image" in modalities:
+        if not neg_prompt:
+            return []
         neg_prompt_dict = {
             "prompt": neg_prompt,
             "modalities": prompt.get("modalities", []),
@@ -287,9 +291,10 @@ def _get_negative_prompt(
 ) -> str:
     """Resolve the negative prompt for CFG from prompt or sampling params.
 
-    An empty string is treated the same as absent (falls through to
-    the Bagel default token pair), because an empty negative prompt is
-    not meaningful for CFG guidance.
+    Returns the negative prompt string when one is supplied, otherwise an
+    empty string. Callers decide how to treat the empty case: text2img
+    skips the cfg_text companion entirely, while img2img substitutes it
+    into the cfg_text prompt template.
     """
     neg = prompt.get("negative_prompt")
     if neg:
@@ -300,4 +305,4 @@ def _get_negative_prompt(
         if neg:
             return neg
 
-    return "<|im_start|><|im_end|>"
+    return ""
