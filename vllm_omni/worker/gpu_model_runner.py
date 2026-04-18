@@ -308,6 +308,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             if req_id in self.requests:
+                self._update_streaming_input_additional_info(new_req_data, req_id)
                 req_state = self._update_streaming_request(req_id, new_req_data)
                 reqs_to_add.append(req_state)
                 continue
@@ -1414,3 +1415,30 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _merge_additional_information_update(self, req_id, upd):
         logger.warning_once("_merge_additional_information_update is deprecated, use _update_intermediate_buffer")
         return self._update_intermediate_buffer(req_id, upd)
+
+    def _update_streaming_input_additional_info(self, new_req_data, req_id):
+        # For streaming input prefill case only. Update buffer from last segment input
+        cached_additional_info = self.model_intermediate_buffer.get(req_id, {})
+        if cached_additional_info:
+            payload_info = getattr(new_req_data, "additional_information", None)
+            inc_info = deserialize_additional_information(payload_info)
+            if isinstance(inc_info, dict) and inc_info:
+                merged_info = dict(cached_additional_info)
+                for key, value in inc_info.items():
+                    accumulated_keys: set[str] = set()
+                    if hasattr(self, "model") and hasattr(self.model, "streaming_accumulated_keys"):
+                        accumulated_keys = self.model.streaming_accumulated_keys
+                    if key in accumulated_keys and isinstance(value, torch.Tensor):
+                        inc_tensor = value.detach().to("cpu").contiguous()
+                        old_tensor = merged_info.get(key)
+                        if old_tensor is None:
+                            merged_info[key] = inc_tensor
+                        else:
+                            merged_info[key] = torch.cat((old_tensor, inc_tensor), dim=0)
+                        continue
+
+                    # Default for other keys: latest value.
+                    merged_info[key] = value
+                merged_info["num_processed_tokens"] = 0
+                self.model_intermediate_buffer[req_id] = merged_info
+                setattr(self.requests[req_id], "additional_information_cpu", merged_info)

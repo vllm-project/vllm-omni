@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import time
 from collections import defaultdict
 
@@ -11,11 +13,16 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+)
 from vllm.v1.metrics.perf import PerfStats
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -25,7 +32,7 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 logger = init_logger(__name__)
 
 
-class OmniGenerationScheduler(VLLMScheduler):
+class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         model_config = self.vllm_config.model_config
@@ -599,3 +606,11 @@ class OmniGenerationScheduler(VLLMScheduler):
             eco.scheduler_stats = stats
 
         return engine_core_outputs
+
+    def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
+        """
+        Override: Just replace the existing session with the next streaming update.
+
+        Do not expend prompt id using update.
+        """
+        self._replace_session_with_streaming_update(session, update)

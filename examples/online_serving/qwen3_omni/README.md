@@ -18,6 +18,8 @@ If you want to open async chunking for qwen3-omni, launch the server with comman
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_omni_moe_async_chunk.yaml
 ```
 
+**Note:** The OpenAI-style **`/v1/realtime`** WebSocket (streaming PCM audio in, audio + transcription out) is **not supported** when `async_chunk` is enabled. Use the default omni layout or a stage config with `async_chunk: false` for realtime sessions.
+
 If you have custom stage configs file, launch the server with command below
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
@@ -38,36 +40,43 @@ python examples/online_serving/openai_chat_completion_client_for_multimodal_gene
 
 #### Realtime WebSocket client (`openai_realtime_client.py`)
 
-[`openai_realtime_client.py`](./openai_realtime_client.py) connects to **`ws://<host>:<port>/v1/realtime`**, uploads a local audio file as **PCM16 mono @ 16 kHz** chunks (OpenAI-style `input_audio_buffer.append` / `commit`), and prints **streaming transcription** (`transcription.delta` / `transcription.done`).
+[`openai_realtime_client.py`](./openai_realtime_client.py) connects to **`ws://<host>:<port>/v1/realtime`**, streams a local WAV as **PCM16 mono @ 16 kHz** in fixed-size chunks (OpenAI-style `input_audio_buffer.append` / `commit`), and receives **`response.audio.delta`** (incremental PCM for the reply) plus **`transcription.*`** events. By default it concatenates audio deltas and writes **`--output-wav`** (model output is typically **24 kHz**). Optional **`--delta-dump-dir`** saves each delta as `delta_000001.wav`, … for debugging.
+
+Streaming input works well for translation-style use cases; if the Thinker runs while input is still incomplete, consider limiting **`max_tokens`** in your session / server defaults to avoid over-generation.
 
 **Dependencies:**
 
 ```bash
-pip install websockets numpy
+pip install websockets
 ```
 
 **From this directory** (`examples/online_serving/qwen3_omni`):
 
 ```bash
 python openai_realtime_client.py \
-  --host localhost \
-  --port 8091 \
+  --url ws://localhost:8091/v1/realtime \
   --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
-  --audio_path /path/to/your.wav
+  --input-wav /path/to/input_16k_mono.wav \
+  --output-wav realtime_output.wav \
+  --delta-dump-dir ./rt_delta_wavs
 ```
-
-If `--audio_path` is omitted, the script uses a bundled default clip (`mary_had_lamb` via vLLM assets).
 
 **Arguments:**
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--host` | `localhost` | API server host |
-| `--port` | `8000` | API server port (match your `vllm serve` port, e.g. `8091`) |
-| `--model` | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | Must match the served model (also sent in `session.update`) |
-| `--audio_path` | *(optional)* | Path to input audio; resampled to 16 kHz mono inside the client |
+| `--url` | `ws://localhost:8091/v1/realtime` | Full WebSocket URL including path |
+| `--model` | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | Must match the served model (sent in `session.update`) |
+| `--input-wav` | *(required)* | Input WAV: mono, 16-bit PCM, **16 kHz** |
+| `--output-wav` | `realtime_output.wav` | Output path for concatenated reply audio |
+| `--output-text` | *(optional)* | If set, write final transcription text to this path |
+| `--chunk-ms` | `200` | Size of each uploaded audio chunk (milliseconds of audio) |
+| `--send-delay-ms` | `0` | Delay between chunk sends (simulate realtime upload) |
+| `--delta-dump-dir` | *(optional)* | Directory to write per-`response.audio.delta` WAV files |
+| `--num-requests` | `1` | Number of sequential sessions (see `--concurrency`) |
+| `--concurrency` | `1` | Max concurrent WebSocket sessions when `--num-requests` > 1 |
 
-Ensure the vLLM-Omni server is running with realtime support for this endpoint, for example:
+Ensure the server is running **without** `async_chunk` if you use `/v1/realtime`, for example:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
