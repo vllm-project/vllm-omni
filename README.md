@@ -67,8 +67,6 @@ Visit our [documentation](https://vllm-omni.readthedocs.io/en/latest/) to learn 
 - [Quickstart](https://vllm-omni.readthedocs.io/en/latest/getting_started/quickstart/)
 - [List of Supported Models](https://vllm-omni.readthedocs.io/en/latest/models/supported_models/)
 
-**Qwen3-Omni realtime (WebSocket):** stream PCM through the OpenAI-style `/v1/realtime` endpoint using the example client and server notes in [examples/online_serving/qwen3_omni/README.md](examples/online_serving/qwen3_omni/README.md) (requires `async_chunk` disabled on the server).
-
 ## Contributing
 
 We welcome and value any contributions and collaborations.
