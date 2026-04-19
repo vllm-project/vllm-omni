@@ -1,13 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""DreamZero pipeline persistent state.
-
-Consolidates all cross-forward() state that was originally scattered across:
-- ARDroidRoboarenaPolicy._frame_buffers   (socket_test_optimized_AR.py)
-- WANPolicyHead.kv_cache1/kv_cache_neg    (wan_flow_matching_action_tf.py)
-- WANPolicyHead.clip_feas/ys              (wan_flow_matching_action_tf.py)
-"""
+"""DreamZero pipeline persistent state."""
 
 from __future__ import annotations
 
@@ -19,7 +13,6 @@ import torch
 logger = logging.getLogger(__name__)
 
 # Number of frames per chunk for subsequent calls (first call uses 1)
-# Corresponds to: ARDroidRoboarenaPolicy.FRAMES_PER_CHUNK = 4
 FRAMES_PER_CHUNK = 4
 
 
@@ -39,7 +32,6 @@ class DreamZeroState:
     # Frame accumulation (single stitched buffer)
     # Transform outputs stitched single frame per call.
     # We accumulate here to build multi-frame video for AR inference.
-    # Source: socket_test_optimized_AR.py L110-144 (adapted from per-camera to stitched)
     # ------------------------------------------------------------------
 
     def accumulate_frames(self, stitched: np.ndarray) -> np.ndarray:
@@ -74,50 +66,35 @@ class DreamZeroState:
 
     # ------------------------------------------------------------------
     # Reset / should_reset
-    # Source: wan_flow_matching_action_tf.py L968-981
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
-        """Clear all state.
-
-        Source:
-        - socket_test_optimized_AR.py L302-330: ARDroidRoboarenaPolicy._reset_state
-        - wan_flow_matching_action_tf.py L185-199: WANPolicyHead.__init__ state fields
-        """
+        """Clear all state."""
         # Frame buffer — single stitched buffer
         self.stitched_buffer: list[np.ndarray] = []
         self.call_count: int = 0
 
-        # KV cache — from WANPolicyHead.__init__ L185-188.
-        # TODO(DreamZero): replace this model-local cache with vLLM's managed
         # KV cache once robot-policy diffusion supports that integration.
         self.kv_cache: list[torch.Tensor] | None = None
         self.kv_cache_neg: list[torch.Tensor] | None = None
         self.crossattn_cache: list[dict[str, bool | torch.Tensor | None]] | None = None
         self.crossattn_cache_neg: list[dict[str, bool | torch.Tensor | None]] | None = None
-        self.current_start_frame: int = 0  # WANPolicyHead L199
+        self.current_start_frame: int = 0
 
-        # Encoding cache — from WANPolicyHead.__init__ L197-200
         self.clip_feas: torch.Tensor | None = None
         self.ys: torch.Tensor | None = None
-        self.language: torch.Tensor | None = None  # WANPolicyHead L200
+        self.language: torch.Tensor | None = None
 
     def should_reset(self, text_tokens: torch.Tensor | None, num_video_frames: int, local_attn_size: int) -> bool:
-        """Determine if state should be reset before this forward().
-
-        Source: wan_flow_matching_action_tf.py L968-981
-        """
-        # L968-971: first call (language not set yet)
+        """Determine if state should be reset before this forward()."""
         if self.language is None:
             logger.info("language is None, resetting")
             return True
 
-        # L972-975: language changed
         if text_tokens is not None and not torch.equal(self.language, text_tokens):
             logger.info("language changed, resetting")
             return True
 
-        # L976-978: single-frame input (signals new episode in real-world eval)
         # NOTE: after accumulate_frames, num_video_frames is the accumulated T
         # (1 for first call, 4 for subsequent). Only reset on true single-frame
         # which happens when the stitched_buffer was cleared externally.
@@ -125,7 +102,6 @@ class DreamZeroState:
             logger.info("single frame input after first call, resetting")
             return True
 
-        # L979-981: KV cache exceeded local attention window
         if local_attn_size != -1 and self.current_start_frame >= local_attn_size:
             logger.info(
                 "current_start_frame %d >= local_attn_size %d, resetting", self.current_start_frame, local_attn_size
@@ -136,7 +112,6 @@ class DreamZeroState:
 
     # ------------------------------------------------------------------
     # KV cache management
-    # Source: wan_flow_matching_action_tf.py L480-512
     # ------------------------------------------------------------------
 
     def create_kv_caches(
@@ -148,9 +123,7 @@ class DreamZeroState:
         num_heads: int,
         head_dim: int,
     ) -> None:
-        """Initialize empty KV caches and cross-attention caches.
-        Source: wan_flow_matching_action_tf.py L480-512
-        """
+        """Initialize empty KV caches and cross-attention caches."""
         self.kv_cache = [
             torch.zeros(2, batch_size, 0, num_heads, head_dim, dtype=dtype, device=device) for _ in range(num_layers)
         ]
@@ -167,9 +140,7 @@ class DreamZeroState:
         updated_kv: torch.Tensor,
         is_negative: bool = False,
     ) -> None:
-        """Update a single layer's KV cache after prefill.
-        Source: wan_flow_matching_action_tf.py L856-858
-        """
+        """Update a single layer's KV cache after prefill."""
         cache = self.kv_cache_neg if is_negative else self.kv_cache
         assert cache is not None, "KV caches not initialized, call create_kv_caches first"
         cache[layer_index] = updated_kv.clone()
