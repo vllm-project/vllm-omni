@@ -6,7 +6,6 @@
 RoboArena uses 0-indexed exterior cameras, 3 views total (OXE_DROID embodiment).
 Same stitching layout as DROID — both map to OXE_DROID in DreamZero.
 
-Source: socket_test_optimized_AR.py L104-108 (key mapping)
 """
 
 from __future__ import annotations
@@ -30,7 +29,6 @@ class RoboArenaTransform(DroidTransform):
         observation/exterior_image_1_left  → right exterior
         observation/wrist_image_left       → wrist
 
-    Source: socket_test_optimized_AR.py L104-108
     """
 
     IMAGE_KEY_MAP = {

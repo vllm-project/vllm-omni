@@ -51,9 +51,7 @@ class RobotPolicyTransform:
     ACTION_DIM: int
 
     def transform_input(self, obs: dict) -> dict:
-        """Dataset-specific transform: key map → stitch → template → state.
-        Source: dreamzero_cotrain.py apply_single() L498-596
-        """
+        """Dataset-specific transform: key map → stitch → template → state."""
         # 1. Map image keys → unified keys
         images: dict[str, np.ndarray] = {}
         for src_key, dst_key in self.IMAGE_KEY_MAP.items():

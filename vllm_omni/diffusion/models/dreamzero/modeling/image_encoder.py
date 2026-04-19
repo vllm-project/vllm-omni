@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""DreamZero image encoder port.
-
-Corresponds to:
-- `wan_video_image_encoder.py` `VisionTransformer` / `AttentionBlock`
-- `wan_video_image_encoder.py` `WanImageEncoder.encode_image()`
+"""DreamZero image encoder.
 
 Only the visual tower used by DreamZero I2V inference is ported here. The
-checkpoint keys are kept source-compatible so root `action_head.image_encoder.*`
-weights can be loaded by simple prefix stripping.
+checkpoint keys under `action_head.image_encoder.*` load via simple prefix
+stripping.
 """
 
 from __future__ import annotations
@@ -23,14 +19,14 @@ import torchvision.transforms as T
 
 
 class DreamZeroLayerNorm(nn.LayerNorm):
-    """Source: `wan_video_image_encoder.py` `LayerNorm`."""
+    """LayerNorm that preserves the input dtype."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return super().forward(x).type_as(x)
 
 
 class DreamZeroVisionSelfAttention(nn.Module):
-    """Source: `wan_video_image_encoder.py` `SelfAttention` (vision branch)."""
+    """Self-attention for the vision tower."""
 
     def __init__(
         self,
@@ -61,7 +57,7 @@ class DreamZeroVisionSelfAttention(nn.Module):
 
 
 class DreamZeroVisionAttentionBlock(nn.Module):
-    """Source: `wan_video_image_encoder.py` `AttentionBlock`."""
+    """Attention block for the vision tower."""
 
     def __init__(
         self,
@@ -103,7 +99,7 @@ class DreamZeroVisionAttentionBlock(nn.Module):
 
 
 class DreamZeroVisionTransformer(nn.Module):
-    """Source: `wan_video_image_encoder.py` `VisionTransformer`."""
+    """Vision transformer used by the image encoder."""
 
     def __init__(
         self,
@@ -183,7 +179,7 @@ class DreamZeroVisionTransformer(nn.Module):
 
 
 class _DreamZeroCLIPContainer(nn.Module):
-    """Minimal container matching source checkpoint names under `model.visual.*`."""
+    """Container matching checkpoint names under `model.visual.*`."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -207,12 +203,11 @@ class _DreamZeroCLIPContainer(nn.Module):
 
 
 class DreamZeroImageEncoder(nn.Module):
-    """Source-equivalent port of `WanImageEncoder`."""
+    """Image encoder wrapper."""
 
     def __init__(self) -> None:
         super().__init__()
         self.model = _DreamZeroCLIPContainer()
-        # Source: `clip_xlm_roberta_vit_h_14(..., return_transforms=True)`
         # returns a composed transform whose last stage is CLIP normalization.
         self.transforms = T.Compose(
             [
@@ -224,7 +219,7 @@ class DreamZeroImageEncoder(nn.Module):
         )
 
     def encode_image(self, videos: torch.Tensor) -> torch.Tensor:
-        """Source: `wan_video_image_encoder.py` `WanImageEncoder.encode_image()`."""
+        """Encode images for I2V conditioning."""
         size = (self.model.visual.image_size,) * 2
         videos = torch.cat(
             [
