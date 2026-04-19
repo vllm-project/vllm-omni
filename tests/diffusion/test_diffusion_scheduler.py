@@ -657,3 +657,118 @@ class TestStepScheduler:
 
         with pytest.raises(ValueError):
             self.scheduler.add_request(request)
+
+    def test_step_splits_multi_prompt_audio_batch_per_request(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = Mock(model_class_name="mock_audio_model", enable_cpu_offload=False)
+        engine.pre_process_func = None
+        engine.post_process_func = None
+        engine.add_req_and_wait_for_response = Mock(
+            return_value=DiffusionOutput(
+                output=torch.arange(12, dtype=torch.float32).reshape(4, 3),
+                stage_durations={"decode": 1.0},
+                peak_memory_mb=123.0,
+            )
+        )
+
+        request = OmniDiffusionRequest(
+            prompts=["prompt_a", "prompt_b"],
+            sampling_params=OmniDiffusionSamplingParams(
+                num_inference_steps=1,
+                num_outputs_per_prompt=2,
+            ),
+            request_ids=["req-a", "req-b"],
+        )
+
+        with patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=True):
+            outputs = engine.step(request)
+
+        assert len(outputs) == 2
+        assert outputs[0].request_id == "req-a"
+        assert outputs[1].request_id == "req-b"
+        assert outputs[0].final_output_type == "audio"
+        assert outputs[1].final_output_type == "audio"
+        # Each payload must be a (K, ...) slice with the batch dim preserved.
+        assert outputs[0].multimodal_output["audio"].shape == (2, 3)
+        assert outputs[1].multimodal_output["audio"].shape == (2, 3)
+        torch.testing.assert_close(
+            outputs[0].multimodal_output["audio"],
+            torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        )
+        torch.testing.assert_close(
+            outputs[1].multimodal_output["audio"],
+            torch.arange(6, 12, dtype=torch.float32).reshape(2, 3),
+        )
+
+    def test_step_reports_exec_and_total_time_with_correct_names(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = Mock(model_class_name="mock_image_model", enable_cpu_offload=False)
+        engine.pre_process_func = None
+        engine.post_process_func = None
+        engine.add_req_and_wait_for_response = Mock(return_value=DiffusionOutput(output="image-bytes"))
+
+        request = _make_request("timing")
+
+        # perf_counter call order in step() (pre_process_func is None, so no
+        # preprocess calls):
+        #   0 → diffusion_engine_start_time
+        #   1 → exec_start_time
+        #   2 → exec_total_time  (exec = 2-1 = 1.0 s → 1000 ms)
+        #   3 → postprocess_start_time
+        #   4 → postprocess_time (post = 4-3 = 1.0 s)
+        #   5 → step_total_ms log line
+        #   6 → diffusion_engine_total_time_ms in metrics (total = 6-0 = 6.0 s → 6000 ms)
+        with (
+            patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False),
+            patch(
+                "vllm_omni.diffusion.diffusion_engine.time.perf_counter",
+                side_effect=[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ),
+        ):
+            outputs = engine.step(request)
+
+        metrics = outputs[0].metrics
+        assert metrics["diffusion_engine_exec_time_ms"] == pytest.approx(1000.0)
+        assert metrics["diffusion_engine_total_time_ms"] == pytest.approx(6000.0)
+        assert metrics["diffusion_engine_total_time_ms"] > metrics["diffusion_engine_exec_time_ms"]
+        assert "preprocessing_time_ms" not in metrics
+
+    def test_add_req_and_wait_for_response_sleeps_when_scheduler_temporarily_empty(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.executor = Mock()
+        engine._rpc_lock = threading.Lock()
+        engine.abort_queue = queue.Queue()
+
+        request = _make_request("sleepy")
+        runner_output = _make_request_output("sched-sleepy")
+        state = Mock(sched_req_id="sched-sleepy", req=request)
+        sched_output = Mock(
+            scheduled_new_reqs=[NewRequestData.from_state(state)],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            scheduled_req_ids=["sched-sleepy"],
+            is_empty=False,
+        )
+
+        engine.scheduler = Mock()
+        engine.scheduler.add_request.return_value = "sched-sleepy"
+        engine.scheduler.schedule.side_effect = [
+            Mock(
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=CachedRequestData.make_empty(),
+                scheduled_req_ids=[],
+                finished_req_ids=[],
+                is_empty=True,
+            ),
+            sched_output,
+        ]
+        engine.scheduler.has_requests.return_value = True
+        engine.scheduler.update_from_output.return_value = {"sched-sleepy"}
+        engine.execute_fn = Mock(return_value=runner_output)
+
+        with patch("vllm_omni.diffusion.diffusion_engine.time.sleep") as sleep_mock:
+            output = engine.add_req_and_wait_for_response(request)
+
+        assert output is runner_output.result
+        sleep_mock.assert_called_once_with(0.001)
+        engine.execute_fn.assert_called_once_with(sched_output)
+        engine.scheduler.pop_request_state.assert_called_once_with("sched-sleepy")

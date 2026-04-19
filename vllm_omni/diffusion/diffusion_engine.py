@@ -142,12 +142,13 @@ class DiffusionEngine:
         # post-processing to avoid device OOM — model weights may still
         # reside on the device and leave no headroom for intermediates.
         output_data = output.output
-        if (
-            self.od_config.enable_cpu_offload
-            and isinstance(output_data, torch.Tensor)
-            and output_data.device.type != "cpu"
-        ):
-            output_data = output_data.cpu()
+        if self.od_config.enable_cpu_offload:
+            if isinstance(output_data, torch.Tensor) and output_data.device.type != "cpu":
+                output_data = output_data.cpu()
+            elif isinstance(output_data, tuple):
+                output_data = tuple(
+                    t.cpu() if isinstance(t, torch.Tensor) and t.device.type != "cpu" else t for t in output_data
+                )
 
         postprocess_start_time = time.perf_counter()
         if self.post_process_func is not None:
@@ -182,21 +183,24 @@ class DiffusionEngine:
             step_total_ms,
         )
 
-        # Convert to OmniRequestOutput format
-        # Ensure outputs is a list
-        if not isinstance(outputs, list):
+        # Evaluate once; used in both single- and multi-prompt branches below.
+        is_audio_output = supports_audio_output(self.od_config.model_class_name)
+
+        # For image models, normalize to a flat list of per-output items.
+        # Audio models return a batched tensor shaped (N*K, C, T); keep it
+        # as-is and slice per-prompt below so the batch dimension is preserved
+        # in every per-request payload (e.g. (K, C, T) per prompt).
+        if not is_audio_output and not isinstance(outputs, list):
             outputs = [outputs] if outputs is not None else []
 
         metrics = {
             "preprocess_time_ms": preprocess_time * 1000,
-            "diffusion_engine_exec_time_ms": (time.perf_counter() - diffusion_engine_start_time) * 1000,
-            "diffusion_engine_total_time_ms": exec_total_time * 1000,
+            "diffusion_engine_exec_time_ms": exec_total_time * 1000,
+            "diffusion_engine_total_time_ms": (time.perf_counter() - diffusion_engine_start_time) * 1000,
             "image_num": int(request.sampling_params.num_outputs_per_prompt),
             "resolution": int(request.sampling_params.resolution),
             "postprocess_time_ms": postprocess_time * 1000,
         }
-        if self.pre_process_func is not None:
-            metrics["preprocessing_time_ms"] = preprocess_time * 1000
 
         # Handle single request or multiple requests
         if len(request.prompts) == 1:
@@ -204,8 +208,9 @@ class DiffusionEngine:
             prompt = request.prompts[0]
             request_id = request.request_ids[0] if request.request_ids else ""
 
-            if supports_audio_output(self.od_config.model_class_name):
-                request_audio_payload = outputs[0] if len(outputs) == 1 else outputs
+            if is_audio_output:
+                num_outputs = request.sampling_params.num_outputs_per_prompt
+                request_audio_payload = outputs[0:num_outputs] if outputs is not None else None
                 return [
                     OmniRequestOutput.from_diffusion(
                         request_id=request_id,
@@ -257,15 +262,14 @@ class DiffusionEngine:
             for i, prompt in enumerate(request.prompts):
                 request_id = request.request_ids[i] if i < len(request.request_ids) else ""
 
-                # Get images for this request
                 num_outputs = request.sampling_params.num_outputs_per_prompt
                 start_idx = output_idx
                 end_idx = start_idx + num_outputs
-                request_outputs = outputs[start_idx:end_idx] if output_idx < len(outputs) else []
                 output_idx = end_idx
 
-                if supports_audio_output(self.od_config.model_class_name):
-                    request_audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
+                if is_audio_output:
+                    # Slice batched tensor directly; batch dim is preserved.
+                    request_audio_payload = outputs[start_idx:end_idx] if outputs is not None else None
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,
@@ -284,6 +288,7 @@ class DiffusionEngine:
                         ),
                     )
                 else:
+                    request_outputs = outputs[start_idx:end_idx] if start_idx < len(outputs) else []
                     mm_output = {}
                     if audio_payload is not None:
                         sliced_audio = audio_payload
@@ -349,6 +354,7 @@ class DiffusionEngine:
                         return self._finalize_finished_request(target_sched_req_id)
                     if not self.scheduler.has_requests():
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
+                    time.sleep(0.001)
                     continue
 
                 # NOTE: add_req_and_wait_for_response() is synchronous, and
@@ -413,9 +419,7 @@ class DiffusionEngine:
 
         if supports_audio_input(self.od_config.model_class_name):
             audio_sr = 16000
-            audio_duration_sec = 4
-            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(np.float32)
-            dummy_audio = audio_array[audio_sr * 1 : audio_sr * 3]
+            dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
         else:
             dummy_audio = None
 
