@@ -30,7 +30,7 @@ th {
 | `QwenImagePipeline` | Qwen-Image-2512 | `Qwen/Qwen-Image-2512` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image-2512.md) |
 | `QwenImageEditPipeline` | Qwen-Image-Edit | `Qwen/Qwen-Image-Edit` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2509 | `Qwen/Qwen-Image-Edit-2509` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
-| `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
+| `QwenImageLayeredPipeline` | Qwen-Image-Layered | `Qwen/Qwen-Image-Layered` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image-Layered.md) |
 | `QwenImageEditPlusPipeline` | Qwen-Image-Edit-2511 | `Qwen/Qwen-Image-Edit-2511` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `GlmImagePipeline` | GLM-Image | `zai-org/GLM-Image` | ✅︎ | ✅︎ | | | — |
 | `ZImagePipeline` | Z-Image | `Tongyi-MAI/Z-Image-Turbo` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tongyi-MAI/Z-Image-Turbo.md) |
