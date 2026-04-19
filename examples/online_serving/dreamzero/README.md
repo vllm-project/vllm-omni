@@ -115,12 +115,8 @@ vllm serve \
 
 ### 2. Start the DROID simulation client
 
-This step runs from an external `sim-evals` checkout, because Isaac Lab /
-Isaac Sim assets and environment registration live there.
-
-Like upstream DreamZero, this client does not guess any local path for
-`sim_evals` or Isaac Lab. Run it from an environment where those packages are
-already importable (for example, the `sim-evals` project environment).
+Run this from an environment where `isaaclab`, `isaaclab_tasks`,
+`sim_evals`, and `gymnasium` are already importable.
 
 Environment:
 
@@ -136,14 +132,13 @@ Environment:
   - `cv2`
   - `mediapy`
 
-Example command:
+From the `vllm-omni` repository root, invoke the client through an external
+Isaac Lab launcher, for example:
 
 ```bash
-cd /path/to/sim-evals
-
 CUDA_VISIBLE_DEVICES=1 \
-./submodules/IsaacLab/isaaclab.sh -p \
-  /path/to/vllm-omni/examples/online_serving/dreamzero/droid_sim_eval_client.py \
+/path/to/isaaclab.sh -p \
+  examples/online_serving/dreamzero/droid_sim_eval_client.py \
   --host 127.0.0.1 \
   --port 8000 \
   --scene 1 \
