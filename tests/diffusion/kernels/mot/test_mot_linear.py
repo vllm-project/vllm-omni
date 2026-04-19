@@ -299,7 +299,7 @@ def _run_timing(
 @pytest.mark.parametrize(
     "image_num, K, N, dtype",
     [(num, 3584, 4608, "w16a16_bf16") for num in _IMAGE_NUM],
-    ids=lambda val: "",
+    ids=[f"img{num}_K3584_N4608" for num in _IMAGE_NUM],
 )
 def test_mot_qkv_parallel(image_num: int, K: int, N: int, dtype: str, bias: bool):
     dcfg = _parse_dtype(dtype)
@@ -384,7 +384,7 @@ def test_mot_qkv_parallel(image_num: int, K: int, N: int, dtype: str, bias: bool
 @pytest.mark.parametrize(
     "image_num, K, N, dtype",
     [(num, 3584, 3584, "w16a16_bf16") for num in _IMAGE_NUM],
-    ids=lambda val: "",
+    ids=[f"img{num}_K3584_N3584" for num in _IMAGE_NUM],
 )
 def test_mot_o_proj(
     image_num: int,

@@ -71,6 +71,13 @@ class MoTRowParallelLinear(RowParallelLinear):
         # ---- Step 2: Create vae weights (permanent submodule) ----
         assert self.quant_method is not None
 
+        # NOTE: We instantiate a bare torch.nn.Module() here as a lightweight namespace
+        # container to hold the secondary VAE weights.
+        # This is a design choice for dynamically attaching `quant_method` to the bare module.
+        # This is slightly unconventional but necessary. It allows vLLM's framework
+        # (specifically `process_weights_after_loading`) to automatically discover
+        # and process these secondary weights without requiring a dedicated,
+        # boilerplate Module subclass just for the VAE pathway.
         self.gen_exp = torch.nn.Module()
 
         # Select weight_loader consistent with text

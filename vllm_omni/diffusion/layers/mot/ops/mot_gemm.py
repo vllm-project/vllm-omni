@@ -152,6 +152,10 @@ def get_mot_default_config(
         }
 
     # Very small M (tail batches, final feature concat, etc.)
+    # NOTE If M is not a multiple of the block size (e.g., M=3 with BLOCK_SIZE_M=16),
+    # the kernel will allocate a full tile. Correctness is guaranteed by boundary masks.
+    # We tolerate this minor compute/SRAM padding to avoid generating excessive
+    # Triton compiled variants for extremely small sequence lengths.
     if M <= 64:
         return {
             "BLOCK_SIZE_M": 16 if M <= 16 else 32,

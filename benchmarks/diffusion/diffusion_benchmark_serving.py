@@ -827,6 +827,7 @@ def _save_generated_outputs(
     """Decode and save base64 images/videos from successful responses."""
     os.makedirs(save_dir, exist_ok=True)
     saved = 0
+    failed = 0
 
     for idx, (req, out) in enumerate(zip(requests_list, outputs)):
         if not out.success or not out.response_body:
@@ -879,9 +880,10 @@ def _save_generated_outputs(
                     f.write(img_bytes)
                 saved += 1
             except Exception as e:
-                print(f"Warning: failed to save image for request {idx}: {e}")
+                failed += 1
+                logger.warning(f"Failed to save image for request {idx}: {e}", exc_info=True)
 
-    print(f"Saved {saved} generated image(s) to {save_dir}")
+    logger.info(f"Saved {saved} generated image(s) to {save_dir}. Failed to save {failed} image(s).")
 
 
 def wait_for_service(base_url: str, timeout: int = 120) -> None:
@@ -1135,13 +1137,18 @@ if __name__ == "__main__":
         default=1,
         help="Number of warmup requests to run before measurement.",
     )
+    # NOTE Changed default from 1 to 2 because some models (e.g., Bagel) run
+    # `num_timesteps - 1` denoising iterations. A default of 1 results in 0 steps,
+    # which causes errors.
+    # TODO If this slightly longer warmup causes regression issues for other
+    # diffusion pipelines in the future, consider implementing model-specific
+    # overrides instead of a global default.
     parser.add_argument(
         "--warmup-num-inference-steps",
         type=int,
         default=2,
-        help="num_inference_steps used for warmup requests. "
-        "Must be >= 2 to ensure at least one denoising step is executed "
-        "(some models, e.g. Bagel, run num_timesteps-1 denoising iterations).",
+        help="Number of inference steps used for warmup requests. "
+        "Default is 2 to ensure at least one denoising step is executed.",
     )
     parser.add_argument("--width", type=int, default=None, help="Image/Video width.")
     parser.add_argument("--height", type=int, default=None, help="Image/Video height.")
