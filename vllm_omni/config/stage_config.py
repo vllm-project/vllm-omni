@@ -39,15 +39,18 @@ def build_stage_runtime_overrides(
 ) -> dict[str, Any]:
     """Build per-stage runtime overrides from global and ``stage_<id>_*`` kwargs.
 
-    ``internal_keys`` defaults to the set derived from ``OrchestratorArgs``
-    (via ``arg_utils.internal_blacklist_keys``) so that orchestrator
-    fields are never forwarded as per-stage engine args. Callers can pass an
-    explicit set for tests or specialized flows.
+    ``internal_keys`` defaults to the union of
+    ``arg_utils.internal_blacklist_keys()`` and ``arg_utils.SHARED_FIELDS``
+    so that neither orchestrator-only fields nor shared-pipeline fields
+    (``model`` / ``stage_configs_path`` / ``log_stats`` / ``stage_id``) leak
+    into a stage's per-stage runtime overrides — the orchestrator sets those
+    uniformly for every stage, they are not per-stage knobs. Callers can
+    pass an explicit set for tests or specialized flows.
     """
     if internal_keys is None:
-        from vllm_omni.engine.arg_utils import internal_blacklist_keys
+        from vllm_omni.engine.arg_utils import SHARED_FIELDS, internal_blacklist_keys
 
-        internal_keys = internal_blacklist_keys()
+        internal_keys = internal_blacklist_keys() | SHARED_FIELDS
 
     result: dict[str, Any] = {}
 
@@ -223,11 +226,140 @@ class PipelineConfig:
         return errors
 
 
-_PIPELINE_REGISTRY: dict[str, PipelineConfig] = {}
+class _LazyPipelineRegistry:
+    """Dict-like registry that lazy-loads pipelines from the central declaration.
+
+    In-tree pipelines are declared once in
+    ``vllm_omni/config/pipeline_registry.py`` as
+    ``model_type -> (module_path, variable_name)`` entries; the module is
+    imported only when the pipeline is first looked up. This mirrors the
+    pattern in ``vllm/model_executor/models/registry.py`` and addresses
+    https://github.com/vllm-project/vllm-omni/issues/2887 (item 4): having
+    every registration in one file makes a missing entry easy to spot.
+
+    Out-of-tree / dynamic registrations via ``register_pipeline()`` are stored
+    directly in ``_loaded`` and take precedence over the lazy-map entry with
+    the same ``model_type``.
+
+    The class exposes the subset of ``dict`` operations the rest of this
+    module relies on (``__contains__``, ``__getitem__``, ``__setitem__``,
+    ``get``, ``keys``, ``values``, ``items``, ``__iter__``), so existing call
+    sites don't need to change.
+    """
+
+    def __init__(self) -> None:
+        self._loaded: dict[str, PipelineConfig] = {}
+        # Populated lazily to avoid a circular import at module init time.
+        self._lazy_map: dict[str, tuple[str, str]] | None = None
+
+    def _get_lazy_map(self) -> dict[str, tuple[str, str]]:
+        if self._lazy_map is None:
+            from vllm_omni.config.pipeline_registry import _VLLM_OMNI_PIPELINES
+
+            self._lazy_map = _VLLM_OMNI_PIPELINES
+        return self._lazy_map
+
+    def _load_lazy(self, model_type: str) -> PipelineConfig | None:
+        entry = self._get_lazy_map().get(model_type)
+        if entry is None:
+            return None
+        module_path, var_name = entry
+        import importlib
+
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError as exc:
+            logger.error(
+                "Failed to import pipeline module %r for %r: %s",
+                module_path,
+                model_type,
+                exc,
+            )
+            return None
+        pipeline = getattr(module, var_name, None)
+        if pipeline is None:
+            logger.error(
+                "Pipeline variable %r not found in module %r (registered for %r)",
+                var_name,
+                module_path,
+                model_type,
+            )
+            return None
+        errors = pipeline.validate()
+        if errors:
+            logger.warning("Pipeline %s has issues: %s", pipeline.model_type, errors)
+        self._loaded[model_type] = pipeline
+        return pipeline
+
+    def __contains__(self, model_type: str) -> bool:
+        if model_type in self._loaded:
+            return True
+        return model_type in self._get_lazy_map()
+
+    def __getitem__(self, model_type: str) -> PipelineConfig:
+        if model_type in self._loaded:
+            return self._loaded[model_type]
+        pipeline = self._load_lazy(model_type)
+        if pipeline is None:
+            raise KeyError(model_type)
+        return pipeline
+
+    def get(self, model_type: str, default: PipelineConfig | None = None) -> PipelineConfig | None:
+        if model_type in self._loaded:
+            return self._loaded[model_type]
+        pipeline = self._load_lazy(model_type)
+        return pipeline if pipeline is not None else default
+
+    def __setitem__(self, model_type: str, pipeline: PipelineConfig) -> None:
+        self._loaded[model_type] = pipeline
+
+    def __delitem__(self, model_type: str) -> None:
+        """Remove a dynamically-registered pipeline.
+
+        Only the dynamic-cache side of the registry can be mutated; the
+        central declarative registry is immutable at runtime. Calling ``del``
+        on a model_type that only exists in the central registry raises
+        ``KeyError``.
+        """
+        if model_type in self._loaded:
+            del self._loaded[model_type]
+            return
+        if model_type in self._get_lazy_map():
+            raise KeyError(
+                f"{model_type!r} is declared in the central pipeline_registry and "
+                "cannot be removed at runtime. Edit "
+                "vllm_omni/config/pipeline_registry.py to delete a built-in entry."
+            )
+        raise KeyError(model_type)
+
+    def keys(self) -> set[str]:
+        return set(self._get_lazy_map().keys()) | set(self._loaded.keys())
+
+    def values(self):
+        # Iterating values forces load of every lazy pipeline.
+        for key in self.keys():
+            yield self[key]
+
+    def items(self):
+        for key in self.keys():
+            yield key, self[key]
+
+    def __iter__(self):
+        return iter(self.keys())
+
+
+_PIPELINE_REGISTRY = _LazyPipelineRegistry()
 
 
 def register_pipeline(pipeline: PipelineConfig) -> None:
-    """Register a pipeline config (called at import time by pipeline.py modules)."""
+    """Register a pipeline config dynamically.
+
+    In-tree pipelines are declared in ``pipeline_registry._VLLM_OMNI_PIPELINES``
+    and loaded lazily; calling ``register_pipeline`` is only needed for
+    out-of-tree plugins or tests that build a ``PipelineConfig`` at runtime.
+    A dynamic registration overrides the central-registry entry with the same
+    ``model_type``.
+    """
     errors = pipeline.validate()
     if errors:
         logger.warning("Pipeline %s has issues: %s", pipeline.model_type, errors)
@@ -826,41 +958,17 @@ class ModelPipeline:
         return errors
 
 
-def _discover_all_pipelines() -> None:
-    """Import every ``models/<dir>/pipeline.py`` once to populate the registry.
-
-    Each pipeline.py is expected to call ``register_pipeline(PipelineConfig(...))``
-    at import time. This function walks the models directory and imports any
-    pipeline.py it finds — contributors only need to drop a new pipeline.py
-    in their model's directory for the factory to pick it up.
-
-    Idempotent: Python's module cache ensures subsequent calls are no-ops.
-    """
-    if not _MODELS_DIR.exists():
-        return
-    for subdir in sorted(_MODELS_DIR.iterdir()):
-        if not subdir.is_dir():
-            continue
-        if not (subdir / "pipeline.py").exists():
-            continue
-        module_path = f"vllm_omni.model_executor.models.{subdir.name}.pipeline"
-        try:
-            __import__(module_path)
-        except Exception as exc:
-            logger.debug("Skipping pipeline module %s: %s", module_path, exc)
-
-
 class StageConfigFactory:
     """Factory that loads pipeline YAML and merges CLI overrides.
 
     Handles both single-stage and multi-stage models.
 
-    Pipelines are auto-discovered from ``models/<dir>/pipeline.py`` modules;
-    no hardcoded model-type → directory mapping is maintained here. Models
-    with generic HF ``model_type`` collisions (e.g. MiMo Audio reports
-    ``qwen2``) should declare ``hf_architectures=(...)`` on their
-    ``PipelineConfig`` so the factory can disambiguate via
-    ``hf_config.architectures``.
+    Pipelines are declared in ``vllm_omni/config/pipeline_registry.py`` and
+    loaded lazily via ``_PIPELINE_REGISTRY``; no hardcoded model-type →
+    directory mapping is maintained here. Models with generic HF
+    ``model_type`` collisions (e.g. MiMo Audio reports ``qwen2``) should
+    declare ``hf_architectures=(...)`` on their ``PipelineConfig`` so the
+    factory can disambiguate via ``hf_config.architectures``.
     """
 
     @classmethod
@@ -884,9 +992,6 @@ class StageConfigFactory:
             cli_overrides = {}
 
         trust_remote_code = cli_overrides.get("trust_remote_code", True)
-
-        # Ensure every pipeline.py has been imported so the registry is populated.
-        _discover_all_pipelines()
 
         # --- New path: check pipeline registry by model_type first ---
         model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)

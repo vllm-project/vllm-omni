@@ -11,7 +11,6 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
-    register_pipeline,
 )
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.qwen2_5_omni"
@@ -57,8 +56,6 @@ QWEN2_5_OMNI_PIPELINE = PipelineConfig(
     ),
 )
 
-register_pipeline(QWEN2_5_OMNI_PIPELINE)
-
 
 # Single-stage thinker-only variant for the abort test.
 QWEN2_5_OMNI_THINKER_ONLY_PIPELINE = PipelineConfig(
@@ -79,5 +76,3 @@ QWEN2_5_OMNI_THINKER_ONLY_PIPELINE = PipelineConfig(
         ),
     ),
 )
-
-register_pipeline(QWEN2_5_OMNI_THINKER_ONLY_PIPELINE)
