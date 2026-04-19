@@ -434,6 +434,20 @@ def build_vllm_config(
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
+
+    # Multi-stage pipelines (qwen3_tts code2wav, etc.) set max_model_len
+    # larger than HF max_position_embeddings by design. vLLM's validator
+    # rejects that without the env flag.
+    if filtered_engine_args_dict.get("max_model_len") is not None and not os.environ.get(
+        "VLLM_ALLOW_LONG_MAX_MODEL_LEN"
+    ):
+        os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+        logger.debug(
+            "Auto-set VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 for stage %s (max_model_len=%s).",
+            stage_config.stage_id,
+            filtered_engine_args_dict["max_model_len"],
+        )
+
     vllm_config = omni_engine_args.create_engine_config(
         usage_context=UsageContext.LLM_CLASS,
         headless=headless,

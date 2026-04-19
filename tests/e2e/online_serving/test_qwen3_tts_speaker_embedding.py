@@ -13,13 +13,12 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import struct
-from pathlib import Path
 
 import httpx
 import pytest
 
 from tests.conftest import OmniServer
-from tests.utils import hardware_test
+from tests.utils import get_deploy_config_path, hardware_test
 
 MODEL_BASE = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 MODEL_BASE_1_7B = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
@@ -37,10 +36,8 @@ MIN_AUDIO_BYTES = 2000
 MAX_NEW_TOKENS = 256
 
 
-def get_stage_config():
-    return str(
-        Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / "qwen3_tts.yaml"
-    )
+def get_stage_config() -> str:
+    return get_deploy_config_path("qwen3_tts.yaml")
 
 
 def _server_args():

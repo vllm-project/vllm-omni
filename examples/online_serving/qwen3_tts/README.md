@@ -43,7 +43,7 @@ Then open http://localhost:7860 in your browser.
 
 ### Launch the Server
 
-The default stage config is located at `vllm_omni/model_executor/stage_configs/qwen3_tts.yaml`. For other platforms (e.g., NPU), refer to `vllm_omni/platforms/npu/stage_configs/qwen3_tts.yaml`.
+The default deploy config is located at `vllm_omni/deploy/qwen3_tts.yaml` and is loaded automatically by the model registry — no `--deploy-config` flag needed for default use. Platform-specific deltas (NPU, ROCm, XPU) are merged in automatically from the `platforms:` block of the same YAML based on the detected runtime.
 
 ```bash
 # CustomVoice model (predefined speakers)
@@ -69,6 +69,22 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --omni \
     --port 8091
 ```
+
+#### Sync vs async-chunk mode
+
+Qwen3-TTS supports both **chunked streaming** (default, lower latency) and
+**synchronous end-to-end** modes from the same deploy YAML. The bundled
+`qwen3_tts.yaml` ships with `async_chunk: true`; flip with `--no-async-chunk`
+and the pipeline automatically dispatches to the end-to-end codec processor:
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8091 \
+    --no-async-chunk
+```
+
+No variant YAML or extra flag is needed — the `StagePipelineConfig` on each
+stage declares both processor functions and the runtime picks based on the
+`async_chunk:` bool.
 
 Alternatively, use the convenience script:
 ```bash

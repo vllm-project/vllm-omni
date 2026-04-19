@@ -31,8 +31,11 @@ PORT_OFF="${PORT_OFF:-8001}"
 RESULT_DIR="${SCRIPT_DIR}/results"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
-STAGE_CONFIG_ON="vllm_omni/model_executor/stage_configs/qwen3_tts.yaml"
-STAGE_CONFIG_OFF="vllm_omni/model_executor/stage_configs/qwen3_tts_no_async_chunk.yaml"
+# The bundled ``vllm_omni/deploy/qwen3_tts.yaml`` is auto-loaded by the model
+# registry; no ``--deploy-config`` flag needed on the default (ON) path.
+# async_chunk OFF is selected by the ``--no-async-chunk`` CLI flag —
+# the single ``qwen3_tts`` pipeline dispatches to the end-to-end codec
+# processor when ``deploy.async_chunk`` is false.
 
 mkdir -p "${RESULT_DIR}"
 
@@ -77,7 +80,6 @@ wait_for_server() {
 echo ""
 echo "[Phase 1] Starting async_chunk ON server on port ${PORT_ON}..."
 CUDA_VISIBLE_DEVICES=${GPU_DEVICE} vllm-omni serve "${MODEL}" \
-    --stage-configs-path "${STAGE_CONFIG_ON}" \
     --host 0.0.0.0 --port "${PORT_ON}" \
     --trust-remote-code --enforce-eager --omni \
     > "${RESULT_DIR}/server_on_${TIMESTAMP}.log" 2>&1 &
@@ -104,7 +106,7 @@ sleep 5
 echo ""
 echo "[Phase 2] Starting async_chunk OFF server on port ${PORT_OFF}..."
 CUDA_VISIBLE_DEVICES=${GPU_DEVICE} vllm-omni serve "${MODEL}" \
-    --stage-configs-path "${STAGE_CONFIG_OFF}" \
+    --no-async-chunk \
     --host 0.0.0.0 --port "${PORT_OFF}" \
     --trust-remote-code --enforce-eager --omni \
     > "${RESULT_DIR}/server_off_${TIMESTAMP}.log" 2>&1 &

@@ -5,8 +5,6 @@ See examples/online_serving/qwen3_omni/README.md
 
 import os
 
-from vllm_omni.platforms import current_omni_platform
-
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 from pathlib import Path
@@ -19,17 +17,14 @@ from tests.examples.conftest import (
     run_cmd,
     strip_trailing_audio_saved_line,
 )
-from tests.utils import hardware_test
+from tests.utils import get_deploy_config_path, hardware_test
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.example]
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
 
-stage_configs = [str(Path(__file__).parent.parent.parent / "e2e" / "stage_configs" / "qwen3_omni_ci.yaml")]
-
-if current_omni_platform.is_xpu():
-    stage_configs = [str(Path(__file__).parent.parent.parent / "e2e" / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")]
+stage_configs = [get_deploy_config_path("ci/qwen3_omni_moe.yaml")]
 
 
 example_dir = str(Path(__file__).parent.parent.parent.parent / "examples" / "online_serving")

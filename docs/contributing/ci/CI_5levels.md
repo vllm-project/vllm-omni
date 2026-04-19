@@ -231,8 +231,7 @@ vllm_omni/                                    tests/
                                                │   ├── test_qwen3_omni_expansion.py
                                                │   ├── test_mimo_audio.py
                                                │   ├── test_image_gen_edit.py
-                                               │   ├── test_images_generations_lora.py
-                                               │   └── stage_configs/
+                                               │   └── test_images_generations_lora.py
                                                └── offline_inference/                  ✅
                                                    ├── test_qwen2_5_omni.py
                                                    ├── test_qwen3_omni.py
@@ -248,11 +247,12 @@ vllm_omni/                                    tests/
                                                    ├── test_diffusion_layerwise_offload.py
                                                    ├── test_diffusion_lora.py
                                                    ├── test_sequence_parallel.py
-                                                   └── stage_configs/
-                                                       ├── qwen2_5_omni_ci.yaml
-                                                       ├── qwen3_omni_ci.yaml
-                                                       ├── bagel_*.yaml
-                                                       └── npu/, rocm/, etc.
+                                                   └── stage_configs/                  (legacy schema, still
+                                                       ├── bagel_*.yaml                 present for unmigrated
+                                                       └── npu/, rocm/, etc.            models)
+
+# Migrated models (qwen3_omni_moe, qwen2_5_omni, qwen3_tts) live under
+# vllm_omni/deploy/ instead — see docs/configuration/stage_configs.md.
 ```
 
 

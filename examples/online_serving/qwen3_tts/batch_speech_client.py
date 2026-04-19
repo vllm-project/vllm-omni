@@ -5,11 +5,13 @@ A particularly useful scenario is voice cloning: set ref_audio once at the
 batch level and generate many utterances in the cloned voice without repeating
 the reference for each item.
 
-Start the server (with batch-optimized config for best throughput):
+Start the server (with batch-optimized stage settings for best throughput):
 
     vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-        --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts_batch.yaml \
-        --trust-remote-code
+        --omni \
+        --trust-remote-code \
+        --stage-overrides '{"0":{"max_num_seqs":4,"gpu_memory_utilization":0.2},
+                            "1":{"max_num_seqs":4,"gpu_memory_utilization":0.2}}'
 
 Examples:
     # Batch with a predefined voice

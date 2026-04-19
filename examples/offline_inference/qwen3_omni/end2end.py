@@ -294,14 +294,7 @@ def main(args):
     else:
         query_result = query_func()
 
-    omni = Omni(
-        model=model_name,
-        dtype=args.dtype,
-        stage_configs_path=args.stage_configs_path,
-        log_stats=args.log_stats,
-        stage_init_timeout=args.stage_init_timeout,
-        init_timeout=args.init_timeout,
-    )
+    omni = Omni.from_cli_args(args, model=model_name)
 
     thinker_sampling_params = SamplingParams(
         temperature=0.9,
