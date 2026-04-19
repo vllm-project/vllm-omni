@@ -58,7 +58,8 @@ if current_omni_platform.is_rocm():
         {"position": (256, 256), "rgb": (181, 201, 221)},
     ]
 
-PIXEL_TOLERANCE = 10
+# Relax pixel tolerance to 15 to account for Triton kernel numerical drift
+PIXEL_TOLERANCE = 15
 
 DEFAULT_PROMPT = "<|fim_middle|><|im_start|>Change the grass color to red<|im_end|>"
 
