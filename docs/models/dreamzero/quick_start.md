@@ -10,6 +10,15 @@ For the self-contained example, use the bundled client and videos under
 Upstream DreamZero-dependent parity checks are optional and live under
 `tests/dreamzero/upstream/`.
 
+## Environment checklist
+
+- Sections 1-4: use the local `vllm-omni` environment.
+- Bundled OpenPI client extra deps: `openpi-client`, `websockets`, `opencv-python`
+- DROID sim-eval client: use an external Isaac Lab / `sim-evals` environment,
+  plus `openpi-client`, `websockets`, `opencv-python`, and `mediapy`
+- Optional upstream parity tests: also require `~/code/dreamzero` and
+  `~/code/dreamzero/checkpoints/dreamzero`
+
 ---
 
 ## 1. Start the vLLM DreamZero server

@@ -13,8 +13,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
+
+try:
+    import cv2
+except ImportError as exc:  # pragma: no cover - runtime dependency guard
+    raise ImportError("DreamZero OpenPI example requires `opencv-python`.") from exc
 
 try:
     import websockets.sync.client
