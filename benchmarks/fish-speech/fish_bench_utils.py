@@ -97,9 +97,14 @@ def pcm_bytes_to_duration(
     num_bytes: int,
     sample_rate: int = 24000,
     sample_width: int = 2,
+    channels: int = 1,
 ) -> float:
-    """Convert raw PCM byte count to duration in seconds."""
-    return num_bytes / sample_width / sample_rate
+    """Convert raw PCM byte count to duration in seconds.
+
+    Assumes mono PCM by default. Pass ``channels`` explicitly for multi-channel
+    output so the duration is computed correctly.
+    """
+    return num_bytes / sample_width / sample_rate / channels
 
 
 def _is_sse_response(response: aiohttp.ClientResponse) -> bool:
@@ -295,11 +300,12 @@ def save_results(
     all_results: list[dict],
     result_dir: str,
     config_name: str,
+    timestamp: str | None = None,
 ) -> Path:
     """Save benchmark results as JSON and return the file path."""
     out = Path(result_dir)
     out.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
     result_file = out / f"bench_{config_name}_{timestamp}.json"
 
     with open(result_file, "w") as f:
@@ -317,6 +323,7 @@ async def send_streaming_request(
     payload: dict,
     sample_rate: int,
     sample_width: int,
+    sample_channels: int = 1,
     pbar: tqdm | None = None,
 ) -> RequestResult:
     """Send a streaming TTS request and measure latency metrics."""
@@ -341,7 +348,12 @@ async def send_streaming_request(
 
                 result.e2e = time.perf_counter() - st
                 result.audio_bytes = total_bytes
-                result.audio_duration = pcm_bytes_to_duration(total_bytes, sample_rate, sample_width)
+                result.audio_duration = pcm_bytes_to_duration(
+                    total_bytes,
+                    sample_rate,
+                    sample_width,
+                    sample_channels,
+                )
 
                 if total_bytes <= 0 or result.ttfp <= 0:
                     result.error = "HTTP 200 but no audio bytes were received"
@@ -371,6 +383,7 @@ async def run_benchmark(
     create_payload_fn: Callable[[str], dict],
     sample_rate: int,
     sample_width: int = 2,
+    sample_channels: int = 1,
     num_warmups: int = 3,
     request_timeout_s: float = 120.0,
 ) -> BenchmarkResult:
@@ -381,6 +394,7 @@ async def run_benchmark(
             and returns the request JSON payload dict.
         sample_rate: PCM sample rate for audio duration calculation.
         sample_width: PCM sample width in bytes (default 2 for 16-bit).
+        sample_channels: PCM channel count (default 1 for mono).
     """
     api_url = f"http://{host}:{port}/v1/audio/speech"
 
@@ -400,19 +414,24 @@ async def run_benchmark(
     )
 
     try:
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def limited_request(prompt: str, pbar: tqdm | None = None) -> RequestResult:
+            async with semaphore:
+                return await send_streaming_request(
+                    session,
+                    api_url,
+                    create_payload_fn(prompt),
+                    sample_rate,
+                    sample_width,
+                    sample_channels,
+                    pbar,
+                )
+
         # Warmup
         if num_warmups > 0:
             print(f"  Warming up with {num_warmups} requests...")
-            warmup_tasks = [
-                send_streaming_request(
-                    session,
-                    api_url,
-                    create_payload_fn(PROMPTS[i % len(PROMPTS)]),
-                    sample_rate,
-                    sample_width,
-                )
-                for i in range(num_warmups)
-            ]
+            warmup_tasks = [asyncio.create_task(limited_request(PROMPTS[i % len(PROMPTS)])) for i in range(num_warmups)]
             warmup_results = await asyncio.gather(*warmup_tasks)
             warmup_ok = sum(1 for r in warmup_results if r.success)
             if warmup_ok == 0:
@@ -427,22 +446,10 @@ async def run_benchmark(
 
         # Run
         print(f"  Running {num_prompts} requests with concurrency={max_concurrency}...")
-        semaphore = asyncio.Semaphore(max_concurrency)
         pbar = tqdm(total=num_prompts, desc=f"  concurrency={max_concurrency}")
 
-        async def limited_request(prompt: str) -> RequestResult:
-            async with semaphore:
-                return await send_streaming_request(
-                    session,
-                    api_url,
-                    create_payload_fn(prompt),
-                    sample_rate,
-                    sample_width,
-                    pbar,
-                )
-
         start_time = time.perf_counter()
-        tasks = [asyncio.create_task(limited_request(p)) for p in request_prompts]
+        tasks = [asyncio.create_task(limited_request(prompt, pbar)) for prompt in request_prompts]
         results: list[RequestResult] = await asyncio.gather(*tasks)
         wall_time = time.perf_counter() - start_time
         pbar.close()
@@ -474,10 +481,12 @@ async def run_benchmark_sweep(
     create_payload_fn: Callable[[str], dict],
     sample_rate: int,
     sample_width: int = 2,
+    sample_channels: int = 1,
     num_warmups: int = 3,
     request_timeout_s: float = 120.0,
     config_name: str = "benchmark",
     result_dir: str = "results",
+    result_timestamp: str | None = None,
 ) -> list[dict]:
     """Run benchmarks across multiple concurrency levels and save results."""
     all_results = []
@@ -491,11 +500,12 @@ async def run_benchmark_sweep(
             create_payload_fn=create_payload_fn,
             sample_rate=sample_rate,
             sample_width=sample_width,
+            sample_channels=sample_channels,
             num_warmups=num_warmups,
             request_timeout_s=request_timeout_s,
         )
         result.config_name = config_name
         all_results.append(asdict(result))
 
-    save_results(all_results, result_dir, config_name)
+    save_results(all_results, result_dir, config_name, timestamp=result_timestamp)
     return all_results

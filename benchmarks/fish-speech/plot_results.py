@@ -248,13 +248,14 @@ def parse_args():
         help="Output image path",
     )
     parser.add_argument("--title", type=str, default="Fish Speech S2 Pro", help="Title prefix for the plot")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if len(args.results) != len(args.labels):
+        parser.error("--results and --labels must have the same count")
+    return args
 
 
 if __name__ == "__main__":
     args = parse_args()
-    assert len(args.results) == len(args.labels), "--results and --labels must have the same count"
-
     all_results = load_results(args.results)
     print_comparison_table(all_results, args.labels)
 

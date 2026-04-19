@@ -29,9 +29,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fish_bench_utils import run_benchmark_sweep  # noqa: E402
 
-# Fish Speech S2 Pro: DAC decoder outputs 44.1 kHz 16-bit mono PCM
-SAMPLE_RATE = 44100
+# Fish Speech S2 Pro: DAC decoder outputs 44.1 kHz 16-bit mono PCM by default.
+DEFAULT_SAMPLE_RATE = 44100
 SAMPLE_WIDTH = 2
+DEFAULT_CHANNELS = 1
 REQUEST_DEFAULTS = {
     # Match the stage config's AR generation limit explicitly so benchmark
     # requests do not depend on server-side defaults.
@@ -72,10 +73,13 @@ def parse_args():
     )
     parser.add_argument("--num-warmups", type=int, default=3)
     parser.add_argument("--request-timeout", type=float, default=120.0)
+    parser.add_argument("--sample-rate", type=int, default=DEFAULT_SAMPLE_RATE)
+    parser.add_argument("--channels", type=int, default=DEFAULT_CHANNELS)
     parser.add_argument("--ref-audio", type=str, default=None)
     parser.add_argument("--ref-text", type=str, default=None)
     parser.add_argument("--config-name", type=str, default="vllm_omni")
     parser.add_argument("--result-dir", type=str, default="results")
+    parser.add_argument("--timestamp", type=str, default=None)
     return parser.parse_args()
 
 
@@ -92,12 +96,14 @@ async def main():
         num_prompts=args.num_prompts,
         concurrency_levels=args.max_concurrency,
         create_payload_fn=payload_fn,
-        sample_rate=SAMPLE_RATE,
+        sample_rate=args.sample_rate,
         sample_width=SAMPLE_WIDTH,
+        sample_channels=args.channels,
         num_warmups=args.num_warmups,
         request_timeout_s=args.request_timeout,
         config_name=args.config_name,
         result_dir=args.result_dir,
+        result_timestamp=args.timestamp,
     )
 
 
