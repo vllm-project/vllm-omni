@@ -4,14 +4,11 @@ Wan2.2 reliability integration tests.
 
 from __future__ import annotations
 
-import base64
 import os
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import pytest
-import requests
 
 from tests.conftest import generate_synthetic_image
 from tests.dfx.conftest import (
@@ -53,14 +50,17 @@ FAULT_ERROR_KEYWORDS = (
     "oom",
     "out of memory",
     "cuda",
-    "internal",
-    "500",
-    "503",
+)
+PROCESS_KILL_ERROR_KEYWORDS = (
     "timeout",
+    "did not complete within",
     "connection",
     "engine",
     "orchestrator",
     "dead",
+    "internal",
+    "500",
+    "503",
 )
 
 WAN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, E2E_STAGE_CONFIGS_DIR)
@@ -149,53 +149,8 @@ def test_reliability_fault_process_kill_video_request_failure(
         "stream": False,
     }
     try:
-        form_data = request_config["form_data"]
-        normalized_form_data = {key: str(value) for key, value in form_data.items() if value is not None}
-        header, encoded = request_config["image_reference"].split(",", 1)
-        content_type = header.split(";")[0].removeprefix("data:")
-        extension = content_type.split("/")[-1]
-        files = {
-            "input_reference": (
-                f"reference.{extension}",
-                BytesIO(base64.b64decode(encoded)),
-                content_type,
-            )
-        }
-        create_url = openai_client_function._build_url("/v1/videos")
-        create_resp = requests.post(
-            create_url,
-            data=normalized_form_data,
-            files=files,
-            headers={"Accept": "application/json"},
-            timeout=15,
-        )
-
-        if create_resp.status_code >= 500:
-            raise RuntimeError(f"video create failed: http={create_resp.status_code} body={create_resp.text[:400]}")
-
-        # Avoid long polling in fault case: perform at most one short status check.
-        if create_resp.ok:
-            try:
-                video_id = create_resp.json().get("id")
-            except Exception:  # noqa: BLE001
-                video_id = None
-            if video_id:
-                status_url = openai_client_function._build_url(f"/v1/videos/{video_id}")
-                status_resp = requests.get(
-                    status_url,
-                    headers={"Accept": "application/json"},
-                    timeout=10,
-                )
-                if status_resp.status_code >= 500:
-                    raise RuntimeError(
-                        f"video status failed: http={status_resp.status_code} body={status_resp.text[:400]}"
-                    )
-                status_data = status_resp.json()
-                if status_data.get("status") == "failed":
-                    err = status_data.get("last_error", "internal job failure")
-                    raise RuntimeError(f"job failed: {err}")
-        pytest.fail("expected /v1/videos request failure after process-kill injection")
+        openai_client_function.send_video_diffusion_request(request_config, request_num=1)
     except Exception as exc:
-        assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
+        assert_fault_exception(exc, PROCESS_KILL_ERROR_KEYWORDS)
     else:
         pytest.fail("expected /v1/videos request failure after process-kill injection")
