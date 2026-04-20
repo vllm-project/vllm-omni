@@ -23,7 +23,6 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import OmniServer
 from tests.dfx.conftest import get_benchmark_params_for_server, run_benchmark
 from tests.dfx.stability.helpers import (
     finalize_resource_monitor,
@@ -31,6 +30,7 @@ from tests.dfx.stability.helpers import (
     start_resource_monitor,
     wait_for_run_dir,
 )
+from tests.helpers.runtime import OmniServer
 
 STABILITY_DIR = Path(__file__).resolve().parent
 RESOURCE_MONITOR_SCRIPT = STABILITY_DIR / "scripts" / "resource_monitor.sh"
