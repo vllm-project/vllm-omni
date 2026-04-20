@@ -375,6 +375,31 @@ class TestStageResolutionHelpers:
         }
         assert overridden == ["tensor_parallel_size"]
 
+    def test_strip_parent_engine_args_keeps_allowed_media_access_controls(self):
+        from dataclasses import fields as dc_fields
+
+        from vllm.engine.arg_utils import EngineArgs
+
+        parent_fields = {f.name: f for f in dc_fields(EngineArgs)}
+        filtered, overridden = strip_parent_engine_args(
+            {
+                "model": "some/model",
+                "stage_configs_path": "/tmp/stages.yaml",
+                "allowed_local_media_path": "/data/qwentts",
+                "allowed_media_domains": ["example.com"],
+            },
+            parent_fields=parent_fields,
+            keep_keys={"allowed_local_media_path", "allowed_media_domains"},
+            strip_keys={"stage_configs_path"},
+            no_warn_keys={"model"},
+        )
+
+        assert filtered == {
+            "allowed_local_media_path": "/data/qwentts",
+            "allowed_media_domains": ["example.com"],
+        }
+        assert overridden == []
+
 
 class TestPipelineYamlParsing:
     """Tests for pipeline YAML file parsing (@ZJY0516)."""
