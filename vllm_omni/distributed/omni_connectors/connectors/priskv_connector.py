@@ -1,5 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+Install pypriskv before using priskv connector.
+build the priskv library and install pypriskv in the same environment.
+git clone https://github.com/aibrix/PrisKV.git
+cd PrisKV
+python3 -m venv .venv
+source .venv/bin/activate
+pip3 install pybind11 yapf==0.32.0
+git submodule update --init --recursive
+make server
+make all
+cd pypriskv
+pip install --no-build-isolation -v -e .
+cd ..
+"""
+"""
+Then start the priskv server on the node of stage 0
+
+UCX TCP example:
+export PRISKV_TRANSPORT=ucx
+export UCX_TLS=tcp
+export PRISKV_CLIENT_DIRECT_MODE=y
+export PRISKV_USE_SHM=n
+
+./server/priskv-server -a 127.0.0.1 -p 6379 --acl any
+The server is running when you see READY
+"""
+
+"""
+Install pypriskv in your vllm-omni environment.
+uv pip install pybind11
+uv pip install --no-build-isolation -e /workspace/priskv/PrisKV/pypriskv
+Usage example:
+    python tests/distributed/omni_connectors/test_priskv_connector.py
+"""
 
 import base64
 import time
