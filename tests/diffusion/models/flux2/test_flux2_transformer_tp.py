@@ -2,7 +2,7 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.flux2.flux2_transformer import (
     Flux2PosEmbed,
     Flux2Transformer2DModel,

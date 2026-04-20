@@ -13,9 +13,10 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import OmniServer, OmniServerParams, assert_image_valid
-from tests.examples.conftest import EXAMPLES, OUTPUT_DIR, run_cmd, write_zimage_lora
-from tests.utils import hardware_marks
+from tests.examples.helpers import EXAMPLES, OUTPUT_DIR, run_cmd, write_zimage_lora
+from tests.helpers.assertions import assert_image_valid
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import OmniServer, OmniServerParams
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.example, *hardware_marks(res={"cuda": "H100"})]
 

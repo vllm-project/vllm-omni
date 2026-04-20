@@ -15,8 +15,8 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import pytest
 
-from tests.conftest import modify_stage_config
-from tests.utils import get_deploy_config_path, hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 REF_AUDIO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"

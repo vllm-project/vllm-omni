@@ -122,7 +122,11 @@ class OmniBase(PDDisaggregationMixin):
         stage_init_timeout = kwargs.pop("stage_init_timeout", 300)
         init_timeout = kwargs.pop("init_timeout", 600)
         log_stats = kwargs.pop("log_stats", False)
-        async_chunk = kwargs.pop("async_chunk", False)
+        # NOTE: read-only lookup — must NOT pop. Popping here drops the key
+        # before it reaches ``StageConfigFactory._create_from_registry``, so
+        # ``--no-async-chunk`` (``async_chunk=False``) silently fails to
+        # override the deploy YAML's ``async_chunk: true`` default.
+        async_chunk = kwargs.get("async_chunk")
         output_modalities = kwargs.pop("output_modalities", None)
         diffusion_batch_size: int = kwargs.pop("diffusion_batch_size", 1)
 
@@ -132,7 +136,10 @@ class OmniBase(PDDisaggregationMixin):
         self._name = self.__class__.__name__
         self.model = model
         self.log_stats = log_stats
-        self.async_chunk = async_chunk
+        # Provisional value (mirrors the CLI/caller kwarg); the engine resolves
+        # pipeline + deploy YAML + CLI precedence below and the final value is
+        # re-assigned from ``self.engine.async_chunk`` after init.
+        self.async_chunk = bool(async_chunk) if async_chunk is not None else False
         self.output_modalities = output_modalities or []
         self.tts_batch_max_items: int = kwargs.pop("tts_batch_max_items", 32)
 
@@ -150,7 +157,11 @@ class OmniBase(PDDisaggregationMixin):
         self._weak_finalizer = weakref.finalize(self, _weak_shutdown_engine, self.engine)
         et = time.time()
         logger.info("[%s] AsyncOmniEngine initialized in %.2f seconds", self.__class__.__name__, et - st)
-        self.async_chunk = bool(self.async_chunk or getattr(self.engine, "async_chunk", False))
+        # Authoritative: ``AsyncOmniEngine`` resolves (pipeline + deploy YAML +
+        # CLI overrides) through ``StageConfigFactory`` and stores the final
+        # value on ``engine.async_chunk``; mirror it here so ``--no-async-chunk``
+        # (explicit ``False``) is not fallen-back-through by ``or``.
+        self.async_chunk = bool(getattr(self.engine, "async_chunk", False))
 
         self.request_states: dict[str, ClientRequestState] = {}
 
