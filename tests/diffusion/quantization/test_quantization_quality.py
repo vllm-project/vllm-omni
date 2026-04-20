@@ -32,7 +32,7 @@ import numpy as np
 import pytest
 import torch
 
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
 
 # ---------------------------------------------------------------------------
 # Configuration — add new quantization methods / models here

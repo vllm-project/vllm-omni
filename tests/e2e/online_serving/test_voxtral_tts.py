@@ -17,8 +17,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from tests.conftest import OmniServerParams
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServerParams
 
 MODEL = "mistralai/Voxtral-4B-TTS-2603"
 

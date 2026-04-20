@@ -11,7 +11,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from tests.diffusion.lora.conftest import (
+from tests.diffusion.lora.helpers import (
     DummyBaseLayerWithLoRA,
     FakeLinearBase,
     fake_replace_submodule,
@@ -20,6 +20,7 @@ from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.lora.request import LoRARequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 _FakeLinearBase = FakeLinearBase
 

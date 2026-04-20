@@ -22,6 +22,7 @@ import torch.nn as nn
 
 pytestmark = [pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")]
 
+
 DEVICE = torch.device("cuda:0")
 NUM_QUANTIZERS = 8
 TOTAL_UPSAMPLE = 4

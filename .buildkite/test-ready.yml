@@ -1,3 +1,8 @@
+env:
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 60
+
 steps:
   - label: "Simple Unit Test"
     depends_on: upload-ready-pipeline
@@ -118,7 +123,7 @@ steps:
   - label: "Audio Generation Model Test"
     depends_on: upload-ready-pipeline
     commands:
-      - timeout 20m pytest -s -v tests/e2e/offline_inference/test_stable_audio_model.py
+      - timeout 20m pytest -s -v tests/e2e/offline_inference/test_stable_audio_expansion.py -m "advanced_model and diffusion and L4" --run-level advanced_model
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
@@ -173,7 +178,6 @@ steps:
     commands:
       - |
         timeout 15m bash -c '
-                export VLLM_WORKER_MULTIPROC_METHOD=spawn
                 pytest -s -v tests/engine/test_async_omni_engine_abort.py
         '
     agents:
@@ -190,35 +194,11 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
-
-  - label: "Omni Model Test"
-    depends_on: upload-ready-pipeline
-    commands:
-      - |
-        timeout 17m bash -c '
-          export VLLM_LOGGING_LEVEL=DEBUG
-          export VLLM_WORKER_MULTIPROC_METHOD=spawn
-          pytest -s -v tests/e2e/online_serving/test_qwen2_5_omni.py -m "core_model" --run-level "core_model"
-        '
-    agents:
-      queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
-    plugins:
-      - docker#v5.2.0:
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-          always-pull: true
-          propagate-environment: true
-          environment:
-            - "HF_HOME=/fsx/hf_cache"
-            - "HF_TOKEN"
-          volumes:
-            - "/fsx/hf_cache:/fsx/hf_cache"
-
   - label: "Omni Model Test with H100"
     depends_on: upload-ready-pipeline
     commands:
       - |
         timeout 20m bash -c '
-          export VLLM_WORKER_MULTIPROC_METHOD=spawn
           pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -m "core_model" --run-level "core_model"
         '
     agents:
@@ -256,7 +236,6 @@ steps:
       - |
         timeout 30m bash -c '
           export VLLM_LOGGING_LEVEL=DEBUG
-          export VLLM_WORKER_MULTIPROC_METHOD=spawn
           pytest -s -v tests/e2e/online_serving/test_mimo_audio.py -m "core_model" --run-level "core_model"
         '
     agents:
@@ -299,9 +278,58 @@ steps:
       - |
         timeout 20m bash -c '
           export VLLM_LOGGING_LEVEL=DEBUG
-          export VLLM_WORKER_MULTIPROC_METHOD=spawn
           export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py -m "core_model" --run-level "core_model"
+        '
+    agents:
+      queue: "gpu_1_queue"
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          shm-size: "8gb"
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "VoxCPM E2E Test"
+    timeout_in_minutes: 20
+    depends_on: upload-ready-pipeline
+    commands:
+      - |
+        timeout 20m bash -c '
+          pip install voxcpm
+          export VLLM_LOGGING_LEVEL=DEBUG
+          export VLLM_WORKER_MULTIPROC_METHOD=spawn
+          pytest -s -v tests/e2e/offline_inference/test_voxcpm.py -m "core_model" --run-level "core_model"
+        '
+    agents:
+      queue: "gpu_1_queue"
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          shm-size: "8gb"
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+  - label: "VoxCPM2 Native AR E2E Test"
+    timeout_in_minutes: 20
+    depends_on: upload-ready-pipeline
+    commands:
+      - |
+        timeout 20m bash -c '
+          pip install voxcpm
+          export VLLM_LOGGING_LEVEL=DEBUG
+          export VLLM_WORKER_MULTIPROC_METHOD=spawn
+          pytest -s -v tests/e2e/offline_inference/test_voxcpm2.py -m "core_model" --run-level "core_model"
         '
     agents:
       queue: "gpu_1_queue"
@@ -324,7 +352,6 @@ steps:
       - |
         timeout 20m bash -c '
           export VLLM_LOGGING_LEVEL=DEBUG
-          export VLLM_WORKER_MULTIPROC_METHOD=spawn
           pytest -s -v tests/e2e/online_serving/test_omnivoice.py -m "core_model" --run-level "core_model"
         '
     agents:
@@ -340,6 +367,33 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
+  - label: "Qwen3-TTS Base E2E Test (ModelRunner V2)"
+    depends_on: upload-ready-pipeline
+    soft_fail:
+      - exit_status: 1
+    commands:
+      - |
+        timeout 20m bash -c '
+          export VLLM_LOGGING_LEVEL=DEBUG
+          export VLLM_WORKER_MULTIPROC_METHOD=spawn
+          export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          export VLLM_OMNI_USE_V2_RUNNER="1"
+          pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py -m "core_model" --run-level "core_model"
+        '
+    agents:
+      queue: "gpu_1_queue"
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          shm-size: "8gb"
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
   - label: "Voxtral-TTS E2E Test"
     timeout_in_minutes: 20
     depends_on: upload-ready-pipeline
@@ -347,7 +401,6 @@ steps:
       - |
         timeout 20m bash -c '
           export VLLM_LOGGING_LEVEL=DEBUG
-          export VLLM_WORKER_MULTIPROC_METHOD=spawn
           pytest -s -v tests/e2e/online_serving/test_voxtral_tts.py -m "core_model" --run-level "core_model"
         '
     agents:
@@ -384,7 +437,6 @@ steps:
   #   commands:
   #     - |
   #       timeout 20m bash -c '
-  #         export VLLM_WORKER_MULTIPROC_METHOD=spawn
   #         pytest -s -v tests/e2e/online_serving/test_image_gen_edit.py
   #       '
   #   agents:
@@ -421,7 +473,6 @@ steps:
     commands:
       - |
         timeout 30m bash -c '
-          export VLLM_WORKER_MULTIPROC_METHOD=spawn
           export VLLM_TEST_CLEAN_GPU_MEMORY=1
           pytest -s -v tests/e2e/offline_inference/test_bagel_text2img.py -m "core_model" --run-level "core_model"
         '
@@ -464,7 +515,6 @@ steps:
     commands:
       - |
         timeout 30m bash -c '
-          export VLLM_WORKER_MULTIPROC_METHOD=spawn
           export VLLM_TEST_CLEAN_GPU_MEMORY=1
           pytest -s -v tests/e2e/offline_inference/test_bagel_img2img.py -m "core_model" --run-level "core_model"
         '
@@ -507,7 +557,6 @@ steps:
     commands:
       - |
         timeout 40m bash -c '
-          export VLLM_WORKER_MULTIPROC_METHOD=spawn
           export VLLM_TEST_CLEAN_GPU_MEMORY=1
           export VLLM_IMAGE_FETCH_TIMEOUT=60
           pytest -s -v tests/e2e/online_serving/test_bagel_online.py -m "core_model" --run-level "core_model"
@@ -552,7 +601,6 @@ steps:
     commands:
       - |
         timeout 20m bash -c '
-          export VLLM_WORKER_MULTIPROC_METHOD=spawn
           pytest -s -v tests/e2e/online_serving/test_cosyvoice3_tts.py -m "core_model" --run-level "core_model"
         '
     agents:

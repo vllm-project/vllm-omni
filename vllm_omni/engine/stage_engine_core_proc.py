@@ -37,8 +37,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_HANDSHAKE_POLL_TIMEOUT_S = 600
-
 
 class StageEngineCoreProc(EngineCoreProc):
     """Stage-specific engine core process for vLLM-Omni.
@@ -145,13 +143,14 @@ def complete_stage_handshake(
     handshake_address: str,
     addresses: EngineZmqAddresses,
     vllm_config: VllmConfig,
+    handshake_timeout: int,
 ) -> None:
     """Perform the HELLO/INIT/READY handshake with an already-spawned proc.
 
     On failure the process is terminated before re-raising.
     """
     try:
-        _perform_handshake(proc, handshake_address, addresses, vllm_config)
+        _perform_handshake(proc, handshake_address, addresses, vllm_config, handshake_timeout)
     except Exception:
         shutdown([proc])
         raise
@@ -162,6 +161,7 @@ def _perform_handshake(
     handshake_address: str,
     addresses: EngineZmqAddresses,
     vllm_config: VllmConfig,
+    handshake_timeout: int,
 ) -> None:
     """Run the HELLO / INIT / READY handshake with the subprocess."""
     with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
@@ -169,7 +169,7 @@ def _perform_handshake(
         poller.register(handshake_socket, zmq.POLLIN)
         poller.register(proc.sentinel, zmq.POLLIN)
 
-        identity, msg = _recv(poller, handshake_socket, proc, "HELLO")
+        identity, msg = _recv(poller, handshake_socket, proc, "HELLO", handshake_timeout)
         if msg.get("status") != "HELLO":
             raise RuntimeError(f"Expected HELLO, got: {msg}")
 
@@ -179,7 +179,7 @@ def _perform_handshake(
         )
         handshake_socket.send_multipart([identity, msgspec.msgpack.encode(init_payload)])
 
-        identity, msg = _recv(poller, handshake_socket, proc, "READY")
+        identity, msg = _recv(poller, handshake_socket, proc, "READY", handshake_timeout)
         if msg.get("status") != "READY":
             raise RuntimeError(f"Expected READY, got: {msg}")
         num_gpu_blocks = msg.get("num_gpu_blocks")
@@ -192,13 +192,18 @@ def _recv(
     handshake_socket: zmq.Socket,
     proc: BaseProcess,
     expected: str,
+    timeout_s: int = 600,
 ) -> tuple[bytes, dict]:
     """Wait for one handshake message; raise if the process dies first."""
-    timeout_ms = _HANDSHAKE_POLL_TIMEOUT_S * 1000
+    timeout_ms = timeout_s * 1000
     while True:
         events = dict(poller.poll(timeout=timeout_ms))
         if not events:
-            raise TimeoutError(f"Timed out waiting for {expected} from StageEngineCoreProc")
+            raise TimeoutError(
+                f"Timed out waiting for {expected} from StageEngineCoreProc after {timeout_s}s. "
+                f"This typically indicates model loading or initialization is taking too long. "
+                f"Consider increasing `stage_init_timeout` for large models."
+            )
         if handshake_socket in events:
             identity, raw = handshake_socket.recv_multipart()
             return identity, msgspec.msgpack.decode(raw)

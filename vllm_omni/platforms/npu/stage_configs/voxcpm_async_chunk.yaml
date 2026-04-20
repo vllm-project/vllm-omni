@@ -1,0 +1,89 @@
+async_chunk: true
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      dtype: bfloat16
+      model_stage: latent_generator
+      model_arch: VoxCPMForConditionalGeneration
+      # Optional persistent HF-compatible config dir for native VoxCPM models.
+      hf_config_path: ${oc.env:VLLM_OMNI_VOXCPM_HF_CONFIG_PATH,}
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: false
+      enable_prefix_caching: false
+      engine_output_type: latent
+      gpu_memory_utilization: 0.75
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 4096
+      max_model_len: 4096
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.voxcpm.latent2vae_async_chunk
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 4096
+      seed: 42
+      detokenize: false
+      repetition_penalty: 1.0
+    final_output: false
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      dtype: float32
+      model_stage: vae
+      model_arch: VoxCPMForConditionalGeneration
+      hf_config_path: ${oc.env:VLLM_OMNI_VOXCPM_HF_CONFIG_PATH,}
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: false
+      enable_prefix_caching: false
+      engine_output_type: audio
+      gpu_memory_utilization: 0.1
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 8192
+      max_model_len: 4096
+    engine_input_source: [0]
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
+
+runtime:
+  enabled: true
+
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+        codec_streaming: false
+        connector_get_sleep_s: 0.01
+        connector_get_max_wait_first_chunk: 3000
+        connector_get_max_wait: 300
+
+  edges:
+    - from: 0
+      to: 1

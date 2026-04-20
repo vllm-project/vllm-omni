@@ -18,6 +18,7 @@ from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+
 _FRAME = [1, 2, 3, 4]
 _Q = len(_FRAME)
 

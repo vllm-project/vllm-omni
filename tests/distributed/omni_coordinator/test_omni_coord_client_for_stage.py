@@ -17,6 +17,7 @@ from vllm_omni.distributed.omni_coordinator import (
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 

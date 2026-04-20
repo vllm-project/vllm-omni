@@ -26,6 +26,7 @@ pytestmark = [
     pytest.mark.L4,
 ]
 
+
 DEVICE = torch.device("cuda:0")
 HIDDEN_DIM = 64
 N_ACOUSTIC_CODEBOOK = 7
@@ -78,6 +79,13 @@ except Exception:
     AudioSpecialTokens = _mod2.AudioSpecialTokens
 
 
+class SyntheticAcousticTransformerArgs:
+    """Mimics AcousticTransformerArgs interface."""
+
+    def __init__(self):
+        self.n_decoding_steps = 7
+
+
 class SyntheticModelArgs:
     """Mimics MultimodalAudioModelArgs interface."""
 
@@ -96,6 +104,7 @@ class SyntheticAcousticTransformer(nn.Module):
     def __init__(self):
         super().__init__()
         self.model_args = SyntheticModelArgs()
+        self.acoustic_transformer_args = SyntheticAcousticTransformerArgs()
         self.acoustic_embeddings_levels = ACOUSTIC_EMBEDDINGS_LEVELS
 
         # semantic_codebook_output: hidden_dim -> padded_codebook_size

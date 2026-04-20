@@ -5,7 +5,7 @@ speaker encoder from a Qwen3-TTS checkpoint, then interpolates between them
 using SLERP and sends the result to the /v1/audio/speech API.
 
 Requirements:
-    pip install torch librosa soundfile numpy httpx
+    pip install torch soundfile numpy httpx
 
 Examples:
     # Extract and save an embedding
@@ -143,17 +143,18 @@ def _load_speaker_encoder_weights(encoder: torch.nn.Module, model_path: str) -> 
 
 def compute_mel_spectrogram(audio: np.ndarray, sr: int = 24000) -> torch.Tensor:
     """Compute 128-bin mel spectrogram matching Qwen3-TTS's extraction pipeline."""
-    import librosa
+    from vllm.multimodal.audio import AudioResampler
 
     # Resample to 24kHz if needed
     if sr != 24000:
-        audio = librosa.resample(audio.astype(np.float32), orig_sr=sr, target_sr=24000)
+        resampler = AudioResampler(target_sr=24000)
+        audio = resampler.resample(audio.astype(np.float32), orig_sr=sr)
 
     y = torch.from_numpy(audio).unsqueeze(0).float()
 
-    from librosa.filters import mel as librosa_mel_fn
+    from vllm_omni.utils.audio import mel_filter_bank
 
-    mel_basis = torch.from_numpy(librosa_mel_fn(sr=24000, n_fft=1024, n_mels=128, fmin=0, fmax=12000)).float()
+    mel_basis = mel_filter_bank(sr=24000, n_fft=1024, n_mels=128, fmin=0, fmax=12000)
 
     n_fft = 1024
     hop_size = 256
@@ -180,9 +181,9 @@ def compute_mel_spectrogram(audio: np.ndarray, sr: int = 24000) -> torch.Tensor:
 @torch.inference_mode()
 def extract_embedding(encoder: torch.nn.Module, audio_path: str, device: str = "cpu") -> np.ndarray:
     """Extract a 1024-dim speaker embedding from an audio file."""
-    import librosa
+    from vllm.multimodal.media.audio import load_audio
 
-    audio, sr = librosa.load(audio_path, sr=None, mono=True)
+    audio, sr = load_audio(audio_path, sr=None, mono=True)
     mel = compute_mel_spectrogram(audio, sr).to(device)
     embedding = encoder(mel.to(next(encoder.parameters()).dtype))[0]
     return embedding.float().cpu().numpy()

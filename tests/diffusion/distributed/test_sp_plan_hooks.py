@@ -25,6 +25,13 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     validate_sp_plan,
 )
 
+pytestmark = [
+    pytest.mark.diffusion,
+    pytest.mark.parallel,
+    pytest.mark.core_model,
+    pytest.mark.cpu,
+]
+
 
 def is_distributed_initialized() -> bool:
     """Check if distributed environment is initialized."""
@@ -44,12 +51,6 @@ requires_distributed = pytest.mark.skipif(
 )
 
 # Module-level markers: these tests are diffusion + parallel related
-pytestmark = [
-    pytest.mark.diffusion,
-    pytest.mark.parallel,
-    pytest.mark.core_model,
-    pytest.mark.cpu,
-]
 
 # =============================================================================
 # Tests for sp_plan.py

@@ -82,10 +82,6 @@ stage_args:
 # Top-level runtime config (concise): default windows and stage edges
 runtime:
   enabled: true
-  defaults:
-    window_size: -1             # Simplified: trigger downstream only after full upstream completion
-    max_inflight: 1             # Simplified: process serially within each stage
-
   connectors:
     connector_of_shared_memory:
       name: SharedMemoryConnector
@@ -102,4 +98,3 @@ runtime:
   edges:
     - from: 0                   # language_model → acoustic_transformer: trigger only after receiving full input (-1)
       to: 1
-      window_size: -1

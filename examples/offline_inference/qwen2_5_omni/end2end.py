@@ -9,7 +9,6 @@ import os
 import time
 from typing import NamedTuple
 
-import librosa
 import numpy as np
 import soundfile as sf
 from PIL import Image
@@ -17,6 +16,7 @@ from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
+from vllm.multimodal.media.audio import load_audio
 from vllm.sampling_params import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -96,7 +96,7 @@ def get_mixed_modalities_query(
     if audio_path:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_signal, sr = load_audio(audio_path, sr=sampling_rate)
         audio_data = (audio_signal.astype(np.float32), sr)
     else:
         audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
@@ -130,7 +130,7 @@ def get_use_audio_in_video_query(
             raise FileNotFoundError(f"Video file not found: {video_path}")
         video_frames = video_to_ndarrays(video_path, num_frames=num_frames)
         # Extract audio from video file
-        audio_signal, sr = librosa.load(video_path, sr=sampling_rate)
+        audio_signal, sr = load_audio(video_path, sr=sampling_rate)
         audio = (audio_signal.astype(np.float32), sr)
     else:
         asset = VideoAsset(name="baby_reading", num_frames=num_frames)
@@ -165,7 +165,7 @@ def get_multi_audios_query(audio_path: str | None = None, sampling_rate: int = 1
     if audio_path:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_signal, sr = load_audio(audio_path, sr=sampling_rate)
         audio_data = (audio_signal.astype(np.float32), sr)
         # Use the provided audio as the first audio, default as second
         audio_list = [
@@ -261,7 +261,7 @@ def get_audio_query(question: str = None, audio_path: str | None = None, samplin
     if audio_path:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_signal, sr = load_audio(audio_path, sr=sampling_rate)
         audio_data = (audio_signal.astype(np.float32), sr)
     else:
         audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
@@ -320,14 +320,7 @@ def main(args):
         query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
     else:
         query_result = query_func()
-    omni = Omni(
-        model=model_name,
-        log_stats=args.log_stats,
-        stage_init_timeout=args.stage_init_timeout,
-        batch_timeout=args.batch_timeout,
-        init_timeout=args.init_timeout,
-        shm_threshold_bytes=args.shm_threshold_bytes,
-    )
+    omni = Omni.from_cli_args(args, model=model_name)
     thinker_sampling_params = SamplingParams(
         temperature=0.0,  # Deterministic - no randomness
         top_p=1.0,  # Disable nucleus sampling
