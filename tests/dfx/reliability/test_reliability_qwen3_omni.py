@@ -11,7 +11,6 @@ from typing import Any, Protocol
 
 import pytest
 
-from tests.conftest import dummy_messages_from_mix_data, generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
 from tests.dfx.conftest import (
     assert_fault_exception,
     assert_no_extra_worker_processes,
@@ -28,6 +27,8 @@ from tests.dfx.reliability.conftest import (
     start_runtime_teardown_container_server,
     stop_gpu_oom_hogs,
 )
+from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.runtime import dummy_messages_from_mix_data
 from tests.utils import hardware_test
 from vllm_omni.platforms import current_omni_platform
 

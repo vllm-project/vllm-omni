@@ -10,7 +10,6 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import generate_synthetic_image
 from tests.dfx.conftest import (
     assert_fault_exception,
     create_reliability_omni_server_params,
@@ -18,6 +17,7 @@ from tests.dfx.conftest import (
     supports_video_generation,
 )
 from tests.dfx.reliability.conftest import inject_gpu_oom, make_process_kill_fault_injector, stop_gpu_oom_hogs
+from tests.helpers.media import generate_synthetic_image
 from tests.utils import hardware_test
 from vllm_omni.platforms import current_omni_platform
 

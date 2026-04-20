@@ -30,14 +30,14 @@ from uuid import uuid4
 import pytest
 import yaml
 
-from tests.conftest import (
+from tests.helpers.fixtures.runtime import omni_fixture_lock as _omni_server_lock
+from tests.helpers.runtime import (
     OmniServer,
     OmniServerParams,
     OmniServerStageCli,
     OpenAIClientHandler,
-    _omni_server_lock,
-    modify_stage_config,
 )
+from tests.helpers.stage_config import modify_stage_config
 
 FaultVariant = str
 logger = logging.getLogger(__name__)
