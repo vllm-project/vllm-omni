@@ -715,6 +715,7 @@ class OmniDiffusionConfig:
                 # Wan2.2 S2V model (original format with config.json at root)
                 if self.model_class_name is None:
                     self.model_class_name = "WanS2VPipeline"
+                self.tf_model_config = TransformerConfig()
                 self.update_multimodal_support()
             elif architectures and len(architectures) == 1:
                 self.model_class_name = architectures[0]

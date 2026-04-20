@@ -44,7 +44,8 @@ logger = init_logger(__name__)
 
 
 def sinusoidal_embedding_1d(dim, position):
-    assert dim % 2 == 0
+    if dim % 2 != 0:
+        raise ValueError(f"dim ({dim}) must be even")
     half = dim // 2
     position = position.type(torch.float64)
     sinusoid = torch.outer(position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
@@ -54,7 +55,8 @@ def sinusoidal_embedding_1d(dim, position):
 
 @torch.amp.autocast(current_omni_platform.device_type, enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
-    assert dim % 2 == 0
+    if dim % 2 != 0:
+        raise ValueError(f"dim ({dim}) must be even")
     freqs = torch.outer(
         torch.arange(max_seq_len), 1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim))
     )
@@ -246,7 +248,8 @@ class WanS2VSelfAttention(nn.Module):
     """S2V self-attention using vllm-omni ops (QKVParallelLinear + Attention)."""
 
     def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6):
-        assert dim % num_heads == 0
+        if dim % num_heads != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -330,7 +333,8 @@ class WanS2VCrossAttention(nn.Module):
     """S2V cross-attention using vllm-omni ops (ColumnParallelLinear + Attention)."""
 
     def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6):
-        assert dim % num_heads == 0
+        if dim % num_heads != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -573,7 +577,8 @@ class AudioCrossAttention(nn.Module):
     """Audio cross-attention using nn.Linear (no TP needed)."""
 
     def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6):
-        assert dim % num_heads == 0
+        if dim % num_heads != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -664,7 +669,8 @@ class SimpleSelfAttention(nn.Module):
     """Simple self-attention for motioner (no TP, uses nn.Linear)."""
 
     def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6):
-        assert dim % num_heads == 0
+        if dim % num_heads != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -709,7 +715,11 @@ class SimpleSelfAttention(nn.Module):
 class SwinSelfAttention(SimpleSelfAttention):
     def forward(self, x, seq_lens, grid_sizes, freqs):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-        assert b == 1, "Only support batch_size 1"
+        if b != 1:
+            raise ValueError(
+                f"SwinSelfAttention only supports batch_size=1, got batch_size={b}. "
+                "Batched inference requires refactoring the frame reference and rearrange logic."
+            )
 
         q = self.norm_q(self.q(x)).view(b, s, n, d)
         k = self.norm_k(self.k(x)).view(b, s, n, d)
@@ -746,11 +756,15 @@ class SwinSelfAttention(SimpleSelfAttention):
         return x
 
 
-class CasualSelfAttention(SimpleSelfAttention):
+class CausalSelfAttention(SimpleSelfAttention):
     def forward(self, x, seq_lens, grid_sizes, freqs):
         shifting = 3
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-        assert b == 1, "Only support batch_size 1"
+        if b != 1:
+            raise ValueError(
+                f"CausalSelfAttention only supports batch_size=1, got batch_size={b}. "
+                "Batched inference requires refactoring the causal masking and frame reference logic."
+            )
 
         q = self.norm_q(self.q(x)).view(b, s, n, d)
         k = self.norm_k(self.k(x)).view(b, s, n, d)
@@ -834,8 +848,8 @@ class MotionerAttentionBlock(nn.Module):
             self.self_attn = SimpleSelfAttention(dim, num_heads, window_size, qk_norm, eps)
         elif self_attn_block == "SwinSelfAttention":
             self.self_attn = SwinSelfAttention(dim, num_heads, window_size, qk_norm, eps)
-        elif self_attn_block == "CasualSelfAttention":
-            self.self_attn = CasualSelfAttention(dim, num_heads, window_size, qk_norm, eps)
+        elif self_attn_block == "CausalSelfAttention":
+            self.self_attn = CausalSelfAttention(dim, num_heads, window_size, qk_norm, eps)
 
         self.norm2 = FP32LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim))
@@ -908,7 +922,10 @@ class MotionerTransformers(nn.Module):
             ]
         )
 
-        assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
+        if dim % num_heads != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
+        if (dim // num_heads) % 2 != 0:
+            raise ValueError(f"dim // num_heads ({dim // num_heads}) must be even")
         d = dim // num_heads
         self.freqs = torch.cat(
             [rope_params(1024, d - 4 * (d // 6)), rope_params(1024, 2 * (d // 6)), rope_params(1024, 2 * (d // 6))],
@@ -917,7 +934,8 @@ class MotionerTransformers(nn.Module):
 
         self.gradient_checkpointing = False
         self.motion_side_len = int(math.sqrt(motion_token_num))
-        assert self.motion_side_len**2 == motion_token_num
+        if self.motion_side_len**2 != motion_token_num:
+            raise ValueError(f"motion_token_num ({motion_token_num}) must be a perfect square")
         self.token = nn.Parameter(torch.zeros(1, motion_token_num, dim).contiguous())
 
         self.trainable_token_pos_emb = trainable_token_pos_emb
@@ -1032,7 +1050,10 @@ class FramePackMotioner(nn.Module):
         self.inner_dim = inner_dim
         self.num_heads = num_heads
 
-        assert (inner_dim % num_heads) == 0 and (inner_dim // num_heads) % 2 == 0
+        if inner_dim % num_heads != 0:
+            raise ValueError(f"inner_dim ({inner_dim}) must be divisible by num_heads ({num_heads})")
+        if (inner_dim // num_heads) % 2 != 0:
+            raise ValueError(f"inner_dim // num_heads ({inner_dim // num_heads}) must be even")
         d = inner_dim // num_heads
         self.freqs = torch.cat(
             [rope_params(1024, d - 4 * (d // 6)), rope_params(1024, 2 * (d // 6)), rope_params(1024, 2 * (d // 6))],
@@ -1251,7 +1272,10 @@ class WanS2VTransformer3DModel(nn.Module):
         self.head = WanS2VHead(dim, out_dim, patch_size, eps)
 
         # RoPE base frequencies (complex-valued)
-        assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
+        if dim % num_heads != 0:
+            raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
+        if (dim // num_heads) % 2 != 0:
+            raise ValueError(f"dim // num_heads ({dim // num_heads}) must be even")
         d = dim // num_heads
         self.freqs = torch.cat(
             [rope_params(1024, d - 4 * (d // 6)), rope_params(1024, 2 * (d // 6)), rope_params(1024, 2 * (d // 6))],
