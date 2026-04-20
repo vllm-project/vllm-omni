@@ -24,8 +24,6 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.cache.teacache.extractors import extract_flux2_context, extract_flux2_klein_context
-from tests.utils import hardware_test
 from vllm_omni.diffusion.cache.teacache.extractors import (
     extract_flux2_context,
     extract_flux2_klein_context,
