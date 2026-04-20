@@ -107,7 +107,7 @@
                     "min": 0,
                     "max": 1000
                 },
-                "random_range_ratio": 0.999,
+                "random_range_ratio": 0.0,
                 "random_mm_base_items_per_request": {
                     "min": 0,
                     "max": 6
