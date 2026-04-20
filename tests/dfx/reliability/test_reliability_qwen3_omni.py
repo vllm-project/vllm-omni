@@ -29,7 +29,7 @@ from tests.dfx.reliability.conftest import (
 )
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
 from tests.helpers.runtime import dummy_messages_from_mix_data
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
 RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
@@ -37,7 +37,8 @@ RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
         "test_name": "qwen3_omni_reliability_async_chunk",
         "server_params": {
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-            "stage_config_name": "qwen3_omni_moe_async_chunk.yaml",
+            "stage_config_name": "qwen3_omni_moe.yaml",
+            "server_args": ["--async-chunk"],
         },
     },
     {
@@ -45,13 +46,12 @@ RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
         "server_params": {
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
             "stage_config_name": "qwen3_omni_moe.yaml",
+            "server_args": ["--no-async-chunk"],
         },
     },
 ]
 
-MODEL_EXECUTOR_STAGE_CONFIGS_DIR = (
-    Path(__file__).resolve().parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs"
-)
+DEPLOY_CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "vllm_omni" / "deploy"
 OOM_INJECTION_CONFIG = {
     "target_mem_ratio": 0.95,
     "hold_seconds": 0,
@@ -107,7 +107,7 @@ def _stage_config_path_from_omni_server(omni_server: _HasServeArgs) -> str | Non
     return None
 
 
-QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, MODEL_EXECUTOR_STAGE_CONFIGS_DIR)
+QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, DEPLOY_CONFIGS_DIR)
 
 
 @pytest.mark.slow
