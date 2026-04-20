@@ -11,8 +11,8 @@ import os
 import pytest
 import websockets
 
-from tests.conftest import OmniServer
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServer
 from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
