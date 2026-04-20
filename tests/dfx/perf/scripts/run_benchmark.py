@@ -1,5 +1,4 @@
-﻿import json
-import os
+﻿import os
 import subprocess
 import threading
 from datetime import datetime
