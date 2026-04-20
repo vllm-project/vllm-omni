@@ -127,9 +127,10 @@ Multi-stage omni serving:
 ```bash
 vllm serve Qwen/Qwen2.5-Omni-7B \
   --omni \
-  --stage-configs-path qwen2_5_omni.yaml \
   --port 8091
 ```
+
+(The default deploy config at `vllm_omni/deploy/qwen2_5_omni.yaml` is loaded automatically. Pass `--deploy-config /path/to/custom.yaml` to override.)
 
 Single-stage diffusion serving with torch profiler:
 

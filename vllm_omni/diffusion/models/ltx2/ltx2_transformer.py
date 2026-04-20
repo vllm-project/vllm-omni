@@ -1264,6 +1264,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
     _supports_gradient_checkpointing = True
     _skip_layerwise_casting_patterns = ["norm"]
     _repeated_blocks = ["LTX2VideoTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks"]
     _sp_plan: dict[str, Any] | None = None
 
     @staticmethod

@@ -53,7 +53,6 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.orca_metrics import metrics_header
-from vllm.entrypoints.openai.realtime.connection import RealtimeConnection
 from vllm.entrypoints.openai.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
 from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
@@ -108,6 +107,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoListResponse,
     VideoResponse,
 )
+from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
@@ -1204,6 +1204,22 @@ async def streaming_speech(websocket: WebSocket):
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
+    engine_client = getattr(websocket.app.state, "engine_client", None)
+    if engine_client is not None and getattr(engine_client, "async_chunk", False):
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "type": "error",
+                "error": (
+                    "The /v1/realtime API is not supported when async_chunk is enabled on the server. "
+                    "Use a stage configuration with async_chunk disabled and restart the server before using "
+                    "this endpoint."
+                ),
+                "code": "unsupported",
+            }
+        )
+        await websocket.close()
+        return
     serving = getattr(websocket.app.state, "openai_serving_realtime", None)
     if serving is None:
         await websocket.accept()
@@ -1305,11 +1321,10 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
     # Get engine client (AsyncOmni) from app state
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
 
-    # Validate model field (warn if mismatch, don't error)
     if request.model is not None and request.model != model_name:
-        logger.warning(
-            f"Model mismatch: request specifies '{request.model}' but "
-            f"server is running '{model_name}'. Using server model."
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=(f"Model mismatch: request specifies '{request.model}' but server is running '{model_name}'."),
         )
 
     try:
@@ -1501,8 +1516,9 @@ async def edit_images(
     # 1. get engine and model
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
     if model is not None and model != model_name:
-        logger.warning(
-            f"Model mismatch: request specifies '{model}' but server is running '{model_name}'. Using server model."
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=(f"Model mismatch: request specifies '{model}' but server is running '{model_name}'."),
         )
     # 2. get output format & compression
     output_format = _choose_output_format(output_format, background)
@@ -2218,10 +2234,12 @@ async def _parse_video_form(
         app_model_name, app_stage_configs = _resolve_video_runtime_context(raw_request)
         effective_model_name = handler.model_name or app_model_name or request.model or "unknown"
         if request.model is not None and effective_model_name is not None and request.model != effective_model_name:
-            logger.warning(
-                "Model mismatch: request specifies '%s' but server is running '%s'. Using server model.",
-                request.model,
-                effective_model_name,
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=(
+                    f"Model mismatch: request specifies '{request.model}' but server is running "
+                    f"'{effective_model_name}'."
+                ),
             )
         handler.set_stage_configs_if_missing(app_stage_configs)
     except HTTPException:

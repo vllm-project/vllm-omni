@@ -63,9 +63,6 @@ stage_args:
 
 runtime:
   enabled: true
-  defaults:
-    window_size: -1
-    max_inflight: 1
 
   connectors:
     connector_of_shared_memory:
@@ -82,4 +79,3 @@ runtime:
   edges:
     - from: 0
       to: 1
-      window_size: -1

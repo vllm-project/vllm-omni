@@ -33,6 +33,7 @@ from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm_omni.config.stage_config import strip_parent_engine_args
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.diffusion.stage_diffusion_proc import (
@@ -92,6 +93,27 @@ if TYPE_CHECKING:
     from vllm_omni.engine.arg_utils import OmniEngineArgs
 
 logger = init_logger(__name__)
+
+
+# ============================================================================
+# Parent-EngineArgs field-routing contracts (consumed by
+# AsyncOmniEngine._strip_parent_engine_args when ``stage_configs_path`` is set).
+# ============================================================================
+
+# Fields that must survive the "equal to default → strip" filter because
+# diffusion stages need them even when equal to vllm's default value
+# (e.g. colocate worker setup relies on worker_extension_cls being forwarded).
+_PARENT_ARGS_KEEP: frozenset[str] = frozenset({"worker_extension_cls"})
+
+# Omni orchestrator-level fields consumed by ``_resolve_stage_configs`` that
+# must never leak into per-stage EngineArgs (``stage_configs_path`` would
+# trigger the ``create_model_config`` guard).
+_PARENT_ARGS_STRIP: frozenset[str] = frozenset({"stage_configs_path"})
+
+# Fields always populated by callers (via ``from_cli_args`` / ``asdict``) so
+# their presence as an override is never a surprise — suppress the
+# "override ignored" warning for these.
+_PARENT_ARGS_NO_WARN: frozenset[str] = frozenset({"model"})
 
 
 def _patch_generation_config_if_needed(model_config: Any) -> None:
@@ -1310,45 +1332,17 @@ class AsyncOmniEngine:
 
         Logs a warning for any parent field whose value differs from the
         dataclass default, so users know their explicit overrides are ignored.
+        See the module-level ``_PARENT_ARGS_*`` constants for the routing
+        contracts this method enforces.
         """
-        # worker_extension_cls is a parent field but must pass through to
-        # diffusion stages for colocate worker setup.
-        _keep = {"worker_extension_cls"}
-        # Orchestrator-level OmniEngineArgs fields that are consumed by
-        # _resolve_stage_configs and must not leak into per-stage configs
-        # (stage_configs_path would trigger the create_model_config guard).
-        _strip_omni = {"stage_configs_path"}
-        # Fields that are always set by callers (via from_cli_args / asdict)
-        # and would always appear as overridden — suppress from the warning
-        # so it only surfaces genuinely surprising overrides.
-        _no_warn = {"model"}
-
         parent_fields: dict[str, dataclasses.Field] = {f.name: f for f in dataclasses.fields(EngineArgs)}
-        overridden: list[str] = []
-        result: dict[str, Any] = {}
-        for k, v in kwargs.items():
-            if k in _strip_omni:
-                continue
-            if k not in parent_fields or k in _keep:
-                result[k] = v
-                continue
-            # Detect explicitly-set values that differ from the default.
-            # Values may have been through asdict() which converts dataclass
-            # defaults to dicts, so normalise before comparing.
-            field = parent_fields[k]
-            if field.default is not dataclasses.MISSING:
-                default = field.default
-            elif field.default_factory is not dataclasses.MISSING:
-                default = field.default_factory()
-            else:
-                default = dataclasses.MISSING
-            if default is dataclasses.MISSING or v is None:
-                continue
-            # Normalise dataclass defaults to dicts for comparison
-            if dataclasses.is_dataclass(default) and not isinstance(default, type):
-                default = dataclasses.asdict(default)
-            if v != default and k not in _no_warn:
-                overridden.append(k)
+        result, overridden = strip_parent_engine_args(
+            kwargs,
+            parent_fields=parent_fields,
+            keep_keys=_PARENT_ARGS_KEEP,
+            strip_keys=_PARENT_ARGS_STRIP,
+            no_warn_keys=_PARENT_ARGS_NO_WARN,
+        )
 
         if overridden:
             logger.warning(
@@ -1363,6 +1357,12 @@ class AsyncOmniEngine:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
         stage_configs_path = kwargs.get("stage_configs_path", None)
+        deploy_config_path = kwargs.pop("deploy_config", None)
+        stage_overrides_json = kwargs.pop("stage_overrides", None)
+        # Set of CLI keys the user actually typed; ``None`` means we have no
+        # parser-level info (e.g. programmatic Omni() call) and the lower
+        # layers should treat all kwargs as explicit.
+        cli_explicit_keys = kwargs.pop("_cli_explicit_keys", None)
         explicit_stage_configs = kwargs.pop("stage_configs", None)
         if explicit_stage_configs is not None:
             logger.warning(
@@ -1375,13 +1375,27 @@ class AsyncOmniEngine:
         else:
             base_kwargs = kwargs
 
-        # Use the legacy config loading path (load_and_resolve_stage_configs).
-        # StageConfigFactory wiring will be done in config refactor [2/N].
+        # Parse --stage-overrides JSON string if provided
+        stage_overrides = None
+        if stage_overrides_json:
+            if isinstance(stage_overrides_json, str):
+                try:
+                    stage_overrides = json.loads(stage_overrides_json)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"--stage-overrides is not valid JSON: {exc}. Got: {stage_overrides_json!r}"
+                    ) from exc
+            else:
+                stage_overrides = stage_overrides_json
+
         config_path, stage_configs = load_and_resolve_stage_configs(
             model,
             stage_configs_path,
             base_kwargs,
             default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
+            deploy_config_path=deploy_config_path,
+            stage_overrides=stage_overrides,
+            cli_explicit_keys=cli_explicit_keys,
         )
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.

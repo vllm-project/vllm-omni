@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import ExitStack, contextmanager, suppress
+from pathlib import Path
 from typing import Any, Literal
 
 import cloudpickle
@@ -23,6 +24,221 @@ from vllm.utils.torch_utils import cuda_device_count_stateless
 from vllm_omni.platforms import current_omni_platform
 
 _P = ParamSpec("_P")
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_DEPLOY_DIR = _REPO_ROOT / "vllm_omni" / "deploy"
+_CI_GENERATED_DIR = _REPO_ROOT / "tests" / ".ci_generated"
+
+
+# CI overlays as Python dicts (LSP-friendly). Materialized on demand to
+# tests/.ci_generated/<model>.yaml via get_deploy_config_path("ci/<name>.yaml").
+_CI_OVERLAYS: dict[str, dict[str, Any]] = {
+    "qwen2_5_omni": {
+        "base_config": "qwen2_5_omni.yaml",
+        "async_chunk": False,
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_model_len": 16384,
+                "max_num_batched_tokens": 16384,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.9,
+                "skip_mm_profiling": True,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 128},
+            },
+            {
+                "stage_id": 1,
+                "max_model_len": 16384,
+                "max_num_batched_tokens": 16384,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.4,
+                "skip_mm_profiling": True,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 4096},
+            },
+            {
+                "stage_id": 2,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.5,
+                "max_num_batched_tokens": 8192,
+                "max_model_len": 8192,
+                "load_format": "dummy",
+                "devices": "2",
+                "default_sampling_params": {"max_tokens": 8192},
+            },
+        ],
+        "platforms": {
+            "rocm": {
+                "stages": [
+                    {"stage_id": 0, "gpu_memory_utilization": 0.9},
+                    {"stage_id": 1, "gpu_memory_utilization": 0.4},
+                    {"stage_id": 2, "gpu_memory_utilization": 0.5, "devices": "2"},
+                ],
+            },
+            "xpu": {
+                "stages": [
+                    {
+                        "stage_id": 0,
+                        "gpu_memory_utilization": 0.9,
+                        "max_num_batched_tokens": 16384,
+                        "max_model_len": 16384,
+                    },
+                    {"stage_id": 1, "gpu_memory_utilization": 0.5},
+                    {
+                        "stage_id": 2,
+                        "gpu_memory_utilization": 0.3,
+                        "max_num_batched_tokens": 4096,
+                        "max_model_len": 4096,
+                        "devices": "2",
+                    },
+                ],
+            },
+        },
+    },
+    "qwen3_omni_moe": {
+        "base_config": "qwen3_omni_moe.yaml",
+        "async_chunk": False,
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 5,
+                "max_model_len": 32768,
+                "mm_processor_cache_gb": 0,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 150, "ignore_eos": False},
+            },
+            {
+                "stage_id": 1,
+                "gpu_memory_utilization": 0.5,
+                "max_num_seqs": 5,
+                "max_model_len": 32768,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 1000},
+            },
+            {
+                "stage_id": 2,
+                "max_num_seqs": 5,
+                "max_num_batched_tokens": 100000,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 2000},
+            },
+        ],
+        "platforms": {
+            "rocm": {
+                "stages": [
+                    {"stage_id": 0, "max_num_seqs": 1, "default_sampling_params": {"max_tokens": 100}},
+                    {
+                        "stage_id": 1,
+                        "max_num_seqs": 1,
+                        "enforce_eager": True,
+                        "default_sampling_params": {"max_tokens": 100},
+                    },
+                    {
+                        "stage_id": 2,
+                        "max_num_seqs": 1,
+                        "max_num_batched_tokens": 1000000,
+                        "default_sampling_params": {"max_tokens": 200},
+                    },
+                ],
+            },
+            "xpu": {
+                "stages": [
+                    {
+                        "stage_id": 0,
+                        "gpu_memory_utilization": 0.85,
+                        "max_num_seqs": 1,
+                        "tensor_parallel_size": 4,
+                        "enforce_eager": True,
+                        "max_num_batched_tokens": 4096,
+                        "max_model_len": 4096,
+                        "max_cudagraph_capture_size": 0,
+                        "skip_mm_profiling": True,
+                        "devices": "0,1,2,3",
+                        "default_sampling_params": {"max_tokens": 100, "ignore_eos": False},
+                    },
+                    {
+                        "stage_id": 1,
+                        "gpu_memory_utilization": 0.6,
+                        "max_num_seqs": 1,
+                        "enforce_eager": True,
+                        "max_num_batched_tokens": 4096,
+                        "max_model_len": 4096,
+                        "max_cudagraph_capture_size": 0,
+                        "skip_mm_profiling": True,
+                        "devices": "4",
+                    },
+                    {
+                        "stage_id": 2,
+                        "gpu_memory_utilization": 0.3,
+                        "max_num_seqs": 1,
+                        "max_num_batched_tokens": 100000,
+                        "max_cudagraph_capture_size": 0,
+                        "skip_mm_profiling": True,
+                        "devices": "5",
+                        "default_sampling_params": {"max_tokens": 2000},
+                    },
+                ],
+            },
+        },
+    },
+    # Single-stage thinker-only topology for the abort test.
+    "qwen2_5_omni_thinker_only": {
+        "async_chunk": False,
+        "pipeline": "qwen2_5_omni_thinker_only",
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.9,
+                "enforce_eager": True,
+                "max_num_batched_tokens": 16384,
+                "max_model_len": 16384,
+                "skip_mm_profiling": True,
+                "mm_processor_cache_gb": 0,
+                "load_format": "dummy",
+                "devices": "0",
+                "default_sampling_params": {
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                    "max_tokens": 128,
+                    "seed": 42,
+                    "repetition_penalty": 1.1,
+                },
+            },
+        ],
+    },
+}
+
+
+def _materialize_ci_overlay(model_type: str) -> Path:
+    import yaml
+
+    if model_type not in _CI_OVERLAYS:
+        raise KeyError(f"No CI overlay registered for {model_type!r}. Available: {sorted(_CI_OVERLAYS)}")
+
+    _CI_GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+    out = _CI_GENERATED_DIR / f"{model_type}.yaml"
+
+    overlay = {**_CI_OVERLAYS[model_type]}
+    base = overlay.get("base_config")
+    if base:
+        overlay["base_config"] = str(_DEPLOY_DIR / base)
+
+    with open(out, "w", encoding="utf-8") as f:
+        yaml.safe_dump(overlay, f, sort_keys=False)
+    return out
+
+
+def get_deploy_config_path(rel_path: str) -> str:
+    """Resolve a deploy yaml; ``ci/<model>.yaml`` materializes from ``_CI_OVERLAYS``."""
+    if rel_path.startswith("ci/") and rel_path.endswith(".yaml"):
+        model_type = rel_path[len("ci/") : -len(".yaml")]
+        if model_type in _CI_OVERLAYS:
+            return str(_materialize_ci_overlay(model_type))
+    return str(_DEPLOY_DIR / rel_path)
+
 
 if current_platform.is_rocm():
     from amdsmi import (
