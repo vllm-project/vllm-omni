@@ -29,6 +29,7 @@ def _to_builtin_container(value: Any) -> Any:
         return [_to_builtin_container(item) for item in value]
     return value
 
+
 @dataclass(frozen=True)
 class PolicyServerConfig:
     """OpenPI policy server handshake config.
@@ -39,7 +40,7 @@ class PolicyServerConfig:
     values: dict[str, Any]
 
     @classmethod
-    def from_model_config(cls, model_config: Any) -> "PolicyServerConfig":
+    def from_model_config(cls, model_config: Any) -> PolicyServerConfig:
         if isinstance(model_config, Mapping):
             raw_config = model_config.get("policy_server_config")
         else:
@@ -79,7 +80,7 @@ class ServingRealtimeRobotOpenPI:
         cls,
         engine_client: Any,
         model_name: str | None = None,
-    ) -> "ServingRealtimeRobotOpenPI | None":
+    ) -> ServingRealtimeRobotOpenPI | None:
         try:
             return cls(engine_client=engine_client, model_name=model_name)
         except ValueError as exc:

@@ -58,6 +58,7 @@ def _pick_test_gpus() -> str:
     gpu_rows.sort()
     return ",".join(gpu_index for _, gpu_index in gpu_rows[:2]) or "0,1"
 
+
 test_params = [
     OmniServerParams(
         model=MODEL,

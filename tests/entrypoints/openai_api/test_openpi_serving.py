@@ -19,9 +19,7 @@ TEST_POLICY_SERVER_CONFIG = {
 
 
 def _engine_with_policy_config(policy_config=None):
-    od_config = SimpleNamespace(
-        model_config={"policy_server_config": policy_config or TEST_POLICY_SERVER_CONFIG}
-    )
+    od_config = SimpleNamespace(model_config={"policy_server_config": policy_config or TEST_POLICY_SERVER_CONFIG})
     return SimpleNamespace(get_diffusion_od_config=lambda: od_config)
 
 
@@ -54,9 +52,7 @@ def test_policy_server_config_reads_diffusion_model_config():
         "n_external_cameras": 1,
         "custom_model_key": {"nested": True},
     }
-    od_config = SimpleNamespace(
-        model_config={"policy_server_config": policy_config}
-    )
+    od_config = SimpleNamespace(model_config={"policy_server_config": policy_config})
     engine_client = SimpleNamespace(get_diffusion_od_config=lambda: od_config)
 
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine_client)
@@ -69,9 +65,10 @@ def test_policy_server_config_reads_stage_config_model_config():
     engine_client = SimpleNamespace(
         get_diffusion_od_config=lambda: None,
         stage_configs=[
-            SimpleNamespace(stage_type="diffusion", engine_args=SimpleNamespace(model_config={
-                "policy_server_config": policy_config
-            }))
+            SimpleNamespace(
+                stage_type="diffusion",
+                engine_args=SimpleNamespace(model_config={"policy_server_config": policy_config}),
+            )
         ],
     )
 
@@ -86,18 +83,16 @@ def test_policy_server_config_reads_omegaconf_stage_config():
         stage_configs=[
             SimpleNamespace(
                 stage_type="diffusion",
-                engine_args=SimpleNamespace(model_config=OmegaConf.create({
-                    "policy_server_config": {"custom_model_key": "from-omegaconf"}
-                })),
+                engine_args=SimpleNamespace(
+                    model_config=OmegaConf.create({"policy_server_config": {"custom_model_key": "from-omegaconf"}})
+                ),
             )
         ],
     )
 
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine_client)
 
-    assert serving.policy_server_config.to_dict() == {
-        "custom_model_key": "from-omegaconf"
-    }
+    assert serving.policy_server_config.to_dict() == {"custom_model_key": "from-omegaconf"}
 
 
 def test_policy_server_config_is_required():
@@ -124,9 +119,7 @@ def test_create_policy_server_returns_none_without_policy_config():
 
 def test_policy_server_config_reads_engine_model_config():
     policy_config = {"custom_model_key": "custom-value"}
-    engine_client = SimpleNamespace(
-        model_config=SimpleNamespace(policy_server_config=policy_config)
-    )
+    engine_client = SimpleNamespace(model_config=SimpleNamespace(policy_server_config=policy_config))
 
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine_client)
 
@@ -134,9 +127,7 @@ def test_policy_server_config_reads_engine_model_config():
 
 
 def test_reset_marks_next_request_for_engine_state_reset():
-    serving = openpi_serving.ServingRealtimeRobotOpenPI(
-        engine_client=_engine_with_policy_config()
-    )
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
     serving._call_count = 3
 
     serving.reset({})

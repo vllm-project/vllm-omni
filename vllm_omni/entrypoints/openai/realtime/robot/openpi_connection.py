@@ -25,6 +25,7 @@ from vllm_omni.entrypoints.openai.realtime.robot.openpi_serving import (
 logger = init_logger(__name__)
 _DEFAULT_IDLE_TIMEOUT = 30.0
 
+
 def _get_msgpack_numpy() -> Any:
     try:
         from openpi_client import msgpack_numpy

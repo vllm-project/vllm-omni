@@ -181,8 +181,7 @@ def _run_vllm_service(port: int, log_path: Path) -> subprocess.Popen[str]:
     cfg_parallel_size = _cfg_parallel_size()
     if cfg_parallel_size > len(gpus):
         raise RuntimeError(
-            f"cfg_parallel_size={cfg_parallel_size} requires at least {cfg_parallel_size} GPUs, "
-            f"but only got {gpus}."
+            f"cfg_parallel_size={cfg_parallel_size} requires at least {cfg_parallel_size} GPUs, but only got {gpus}."
         )
     env["CUDA_VISIBLE_DEVICES"] = ",".join(gpus[:cfg_parallel_size])
     env.setdefault("ATTENTION_BACKEND", "torch")
