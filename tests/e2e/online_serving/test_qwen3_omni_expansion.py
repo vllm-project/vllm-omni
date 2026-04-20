@@ -64,7 +64,6 @@ def get_async_chunk_config(default_path):
     return modify_stage_config(
         default_path,
         updates={
-            "async_chunk": True,
             "stages": {0: {"default_sampling_params.max_tokens": 2048}},
         },
     )
@@ -78,7 +77,9 @@ default_path = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 
 test_params = [
     pytest.param(
-        OmniServerParams(model=model, stage_config_path=default_path, use_stage_cli=True),
+        OmniServerParams(
+            model=model, stage_config_path=default_path, use_stage_cli=True, server_args=["--no-async-chunk"]
+        ),
         id="default",
     ),
     pytest.param(
