@@ -217,9 +217,9 @@ def _resolve_baseline_value(
     """Pick the baseline threshold for this sweep step.
 
     Supported shapes per metric:
-    - **Scalar** 鈥?same threshold for every concurrency / QPS.
-    - **List** 鈥?aligned with ``max_concurrency`` / ``request_rate`` sweep order; use ``sweep_index``.
-    - **Dict** 鈥?keyed by concurrency or rate, e.g. ``{"1": 500, "4": 800}`` (keys are strings in JSON).
+    - **Scalar** - same threshold for every concurrency / QPS.
+    - **List** - aligned with ``max_concurrency`` / ``request_rate`` sweep order; use ``sweep_index``.
+    - **Dict** - keyed by concurrency or rate, e.g. ``{"1": 500, "4": 800}`` (keys are strings in JSON).
 
     For dict lookup, ``max_concurrency`` is preferred when both are set (concurrency sweep).
     """
