@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import signal
 import time
+from collections.abc import Awaitable
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING, Any
@@ -50,7 +51,7 @@ class StageDiffusionProc:
         self._model = model
         self._od_config = od_config
         self._engine: DiffusionEngine | None = None
-        self._executor: ThreadPoolExecutor | None = None
+        self._utility_executor: ThreadPoolExecutor | None = None
         self._closed = False
 
     # ------------------------------------------------------------------
@@ -58,10 +59,10 @@ class StageDiffusionProc:
     # ------------------------------------------------------------------
 
     def initialize(self) -> None:
-        """Enrich config, create DiffusionEngine and thread pool."""
+        """Enrich config, create DiffusionEngine, and allocate helper workers."""
         self._enrich_config()
         self._engine = DiffusionEngine.make_engine(self._od_config)
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._utility_executor = ThreadPoolExecutor(max_workers=2)
         logger.info("StageDiffusionProc initialized with model: %s", self._model)
 
     def _enrich_config(self) -> None:
@@ -83,6 +84,67 @@ class StageDiffusionProc:
 
         return OmniDiffusionSamplingParams(**sampling_params_dict)
 
+    async def _run_on_utility_executor(self, fn, *args):
+        """Run CPU-side helper work off the asyncio event loop."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._utility_executor, fn, *args)
+
+    async def _execute_step_request_async(
+        self,
+        request: OmniDiffusionRequest,
+    ) -> list[OmniRequestOutput]:
+        """Execute one request through the engine core loop.
+
+        This mirrors ``DiffusionEngine.step()`` without serializing the whole
+        step call on a single worker thread:
+
+        1. preprocess on the utility executor
+        2. submit the prepared request to ``DiffusionEngine``'s core loop
+        3. await the terminal request future
+        4. materialize final outputs on the utility executor
+        """
+        diffusion_engine_start_time = time.perf_counter()
+        request, preprocess_time = await self._run_on_utility_executor(
+            self._engine._prepare_step_request,
+            request,
+        )
+
+        exec_start_time = time.perf_counter()
+        future = self._engine.submit_request(request)
+        output = await asyncio.wrap_future(future)
+        exec_total_time = time.perf_counter() - exec_start_time
+
+        return await self._run_on_utility_executor(
+            self._engine._materialize_step_outputs,
+            request,
+            output,
+            preprocess_time,
+            exec_total_time,
+            diffusion_engine_start_time,
+        )
+
+    async def _await_engine_rpc(
+        self,
+        method: str,
+        timeout: float | None,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any] | None = None,
+        unique_reply_rank: int | None = None,
+    ) -> Any:
+        """Await one queue-backed engine RPC from asyncio code."""
+        future = self._engine.submit_rpc(
+            method=method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs or {},
+            unique_reply_rank=unique_reply_rank,
+        )
+        try:
+            return await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+
     async def _process_request(
         self,
         request_id: str,
@@ -90,7 +152,7 @@ class StageDiffusionProc:
         sampling_params_dict: dict,
         kv_sender_info: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
-        """Build a diffusion request and run DiffusionEngine.step()."""
+        """Build a diffusion request and run it through the engine core loop."""
         sampling_params = self._reconstruct_sampling_params(sampling_params_dict)
 
         request = OmniDiffusionRequest(
@@ -101,8 +163,7 @@ class StageDiffusionProc:
             kv_sender_info=kv_sender_info,
         )
 
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(self._executor, self._engine.step, request)
+        results = await self._execute_step_request_async(request)
         result = results[0]
         if not result.request_id:
             result.request_id = request_id
@@ -115,9 +176,9 @@ class StageDiffusionProc:
         sampling_params_dict: dict,
         kv_sender_info: dict[str, Any] | None = None,
     ) -> OmniRequestOutput:
-        """Build a batched diffusion request and run DiffusionEngine.step().
+        """Build a batched diffusion request and run one engine request.
 
-        All prompts are processed in a single step() call.  The per-prompt
+        All prompts are processed in a single engine submission. The per-prompt
         results are merged into one :class:`OmniRequestOutput` whose
         ``images`` list contains every generated image, matching the
         contract expected by the orchestrator and tests.
@@ -132,8 +193,7 @@ class StageDiffusionProc:
             kv_sender_info=kv_sender_info,
         )
 
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(self._executor, self._engine.step, request)
+        results = await self._execute_step_request_async(request)
 
         # Merge per-prompt results into a single combined output.
         all_images: list = []
@@ -151,6 +211,11 @@ class StageDiffusionProc:
 
         for r in results:
             all_images.extend(r.images)
+            # The current diffusion engine emits step-scoped metrics and stage
+            # timings that are shared by every per-prompt result produced from
+            # the same engine submission. ``dict.update()`` is therefore safe
+            # here because identical keys are expected to carry identical
+            # values across all members of the batch.
             merged_mm.update(r._multimodal_output)
             merged_metrics.update(r.metrics)
             merged_durations.update(r.stage_durations)
@@ -202,17 +267,21 @@ class StageDiffusionProc:
         LoRA methods remap arguments and post-process results to match
         the contract that ``AsyncOmni`` provides.
         """
-        loop = asyncio.get_running_loop()
-
         if method == "profile":
             is_start = args[0] if args else True
             profile_prefix = args[1] if len(args) > 1 else None
-            return await loop.run_in_executor(
-                self._executor,
-                self._engine.profile,
-                is_start,
-                profile_prefix,
-            )
+            action = "start" if is_start else "stop"
+            try:
+                await self._await_engine_rpc(
+                    method="profile",
+                    timeout=timeout,
+                    args=(is_start, profile_prefix),
+                )
+            except Exception as e:
+                logger.error("Failed to %s profiling on workers", action, exc_info=True)
+                if is_start:
+                    raise RuntimeError(f"Could not {action} profiler: {e}") from e
+            return None
 
         if method == "add_lora":
             # Reconstruct LoRARequest after IPC if needed.
@@ -222,38 +291,29 @@ class StageDiffusionProc:
 
                 if not isinstance(lora_request, LoRARequest):
                     lora_request = msgspec.convert(lora_request, LoRARequest)
-            results = await loop.run_in_executor(
-                self._executor,
-                self._engine.collective_rpc,
-                "add_lora",
-                timeout,
-                (),
-                {"lora_request": lora_request},
-                None,
+            results = await self._await_engine_rpc(
+                method="add_lora",
+                timeout=timeout,
+                args=(),
+                kwargs={"lora_request": lora_request},
             )
             return all(results) if isinstance(results, list) else results
 
         if method == "remove_lora":
-            results = await loop.run_in_executor(
-                self._executor,
-                self._engine.collective_rpc,
-                "remove_lora",
-                timeout,
-                args,
-                kwargs or {},
-                None,
+            results = await self._await_engine_rpc(
+                method="remove_lora",
+                timeout=timeout,
+                args=args,
+                kwargs=kwargs or {},
             )
             return all(results) if isinstance(results, list) else results
 
         if method == "list_loras":
-            results = await loop.run_in_executor(
-                self._executor,
-                self._engine.collective_rpc,
-                "list_loras",
-                timeout,
-                (),
-                {},
-                None,
+            results = await self._await_engine_rpc(
+                method="list_loras",
+                timeout=timeout,
+                args=(),
+                kwargs={},
             )
             if not isinstance(results, list):
                 return results or []
@@ -264,27 +324,21 @@ class StageDiffusionProc:
 
         if method == "pin_lora":
             lora_id = args[0] if args else kwargs.get("adapter_id")
-            results = await loop.run_in_executor(
-                self._executor,
-                self._engine.collective_rpc,
-                "pin_lora",
-                timeout,
-                (),
-                {"adapter_id": lora_id},
-                None,
+            results = await self._await_engine_rpc(
+                method="pin_lora",
+                timeout=timeout,
+                args=(),
+                kwargs={"adapter_id": lora_id},
             )
             return all(results) if isinstance(results, list) else results
 
         # Fall back to DiffusionEngine.collective_rpc for all other methods
         # (e.g. worker extension RPCs like "test_extension_name").
-        return await loop.run_in_executor(
-            self._executor,
-            self._engine.collective_rpc,
-            method,
-            timeout,
-            args,
-            kwargs or {},
-            None,
+        return await self._await_engine_rpc(
+            method=method,
+            timeout=timeout,
+            args=args,
+            kwargs=kwargs or {},
         )
 
     # ------------------------------------------------------------------
@@ -310,20 +364,15 @@ class StageDiffusionProc:
 
         tasks: dict[str, asyncio.Task] = {}
 
-        async def _dispatch_request(
+        async def _dispatch_and_send(
             request_id: str,
-            prompt: Any,
-            sampling_params_dict: dict,
-            kv_sender_info: dict[str, Any] | None = None,
+            processor: Awaitable[Any],
+            *,
+            failure_log_label: str,
         ) -> None:
-            """Process a single diffusion request and send the response."""
+            """Run one request coroutine and send either a result or error."""
             try:
-                result = await self._process_request(
-                    request_id,
-                    prompt,
-                    sampling_params_dict,
-                    kv_sender_info=kv_sender_info,
-                )
+                result = await processor
                 await response_socket.send(encoder.encode({"type": "result", "output": result}))
             except DiffusionRequestAbortedError as e:
                 logger.info(
@@ -332,7 +381,7 @@ class StageDiffusionProc:
                     str(e),
                 )
             except Exception as e:
-                logger.exception("Diffusion request %s failed: %s", request_id, e)
+                logger.exception("%s %s failed: %s", failure_log_label, request_id, e)
                 await response_socket.send(
                     encoder.encode(
                         {
@@ -344,6 +393,42 @@ class StageDiffusionProc:
                 )
             finally:
                 tasks.pop(request_id, None)
+
+        async def _dispatch_request(
+            request_id: str,
+            prompt: Any,
+            sampling_params_dict: dict,
+            kv_sender_info: dict[str, Any] | None = None,
+        ) -> None:
+            """Process a single diffusion request and send the response."""
+            await _dispatch_and_send(
+                request_id,
+                self._process_request(
+                    request_id,
+                    prompt,
+                    sampling_params_dict,
+                    kv_sender_info=kv_sender_info,
+                ),
+                failure_log_label="Diffusion request",
+            )
+
+        async def _dispatch_batch_request(
+            request_id: str,
+            prompts: list[Any],
+            sampling_params_dict: dict,
+            kv_sender_info: dict[str, Any] | None = None,
+        ) -> None:
+            """Process a batched diffusion request and send the response."""
+            await _dispatch_and_send(
+                request_id,
+                self._process_batch_request(
+                    request_id,
+                    prompts,
+                    sampling_params_dict,
+                    kv_sender_info=kv_sender_info,
+                ),
+                failure_log_label="Batch diffusion request",
+            )
 
         try:
             while True:
@@ -365,43 +450,8 @@ class StageDiffusionProc:
 
                 elif msg_type == "add_batch_request":
                     request_id = msg["request_id"]
-
-                    async def _dispatch_batch(
-                        rid: str,
-                        prompts: list,
-                        sp_dict: dict,
-                        kv_sender_info: dict[str, Any] | None = None,
-                    ) -> None:
-                        try:
-                            result = await self._process_batch_request(
-                                rid,
-                                prompts,
-                                sp_dict,
-                                kv_sender_info=kv_sender_info,
-                            )
-                            await response_socket.send(encoder.encode({"type": "result", "output": result}))
-                        except DiffusionRequestAbortedError as e:
-                            logger.info(
-                                "request_id: %s aborted: %s",
-                                rid,
-                                str(e),
-                            )
-                        except Exception as e:
-                            logger.exception("Batch diffusion request %s failed: %s", rid, e)
-                            await response_socket.send(
-                                encoder.encode(
-                                    {
-                                        "type": "error",
-                                        "request_id": rid,
-                                        "error": str(e),
-                                    }
-                                )
-                            )
-                        finally:
-                            tasks.pop(rid, None)
-
                     task = asyncio.create_task(
-                        _dispatch_batch(
+                        _dispatch_batch_request(
                             request_id,
                             msg["prompts"],
                             msg["sampling_params"],
@@ -465,7 +515,7 @@ class StageDiffusionProc:
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Release engine and thread pool resources."""
+        """Release engine and helper thread-pool resources."""
         if self._closed:
             return
         self._closed = True
@@ -476,9 +526,9 @@ class StageDiffusionProc:
             except Exception as e:
                 logger.warning("Error closing diffusion engine: %s", e)
 
-        if self._executor is not None:
+        if self._utility_executor is not None:
             try:
-                self._executor.shutdown(wait=False)
+                self._utility_executor.shutdown(wait=False)
             except Exception as e:
                 logger.warning("Error shutting down executor: %s", e)
 

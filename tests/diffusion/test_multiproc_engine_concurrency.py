@@ -1,430 +1,270 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import queue
+from __future__ import annotations
+
 import threading
-from types import SimpleNamespace
+import time
+from unittest.mock import Mock
 
 import pytest
-import torch
 
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
-from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
-from vllm_omni.diffusion.sched import RequestScheduler
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched import RequestScheduler, StepScheduler
+from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
 
 
-# ───────────────────────────────────────────── helpers ─────────────────────
+def _make_request(req_id: str, *, num_inference_steps: int = 1) -> OmniDiffusionRequest:
+    """Create a small diffusion request used by concurrency-focused tests.
 
-
-def _tagged_output(tag: str) -> DiffusionOutput:
-    """Return a ``DiffusionOutput`` identifiable by its *error* field."""
-    return DiffusionOutput(output=torch.tensor([0]), error=tag)
-
-
-def _mock_request(tag: str):
-    """Return a lightweight request object identifiable by *tag*."""
-    return SimpleNamespace(request_ids=[tag])
-
-
-def _make_executor(num_gpus: int = 1):
-    """Create a ``MultiprocDiffusionExecutor`` without launching workers.
-
-    Returns ``(executor, request_queue, result_queue)``.
+    Args:
+        req_id: Public request id that also makes assertions easier to read.
+        num_inference_steps: Number of denoising steps for step-scheduler
+            scenarios.
     """
-    od_cfg = SimpleNamespace(num_gpus=num_gpus)
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(MultiprocDiffusionExecutor, "_init_executor", lambda self: None)
-    executor = MultiprocDiffusionExecutor(od_cfg)
-    monkeypatch.undo()
-
-    req_q: queue.Queue = queue.Queue()
-    res_q: queue.Queue = queue.Queue()
-
-    mock_broadcast_mq = SimpleNamespace(enqueue=req_q.put)
-
-    mock_rmq = SimpleNamespace(dequeue=lambda timeout=None: res_q.get(timeout=timeout if timeout is not None else 10))
-
-    executor._broadcast_mq = mock_broadcast_mq
-    executor._result_mq = mock_rmq
-    executor._closed = False
-    executor._processes = []
-    return executor, req_q, res_q
+    return OmniDiffusionRequest(
+        prompts=[f"prompt_{req_id}"],
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=num_inference_steps),
+        request_ids=[req_id],
+    )
 
 
-def _make_engine(num_gpus: int = 1):
-    """Create a lightweight ``DiffusionEngine`` wired to mocked executor."""
-    executor, req_q, res_q = _make_executor(num_gpus)
+def _make_engine(
+    *,
+    scheduler=None,
+    execute_fn=None,
+    executor=None,
+) -> DiffusionEngine:
+    """Create a minimal DiffusionEngine instance with the core loop running.
+
+    Args:
+        scheduler: Optional scheduler implementation to install.
+        execute_fn: Optional execution callback invoked by the core thread.
+        executor: Optional executor mock for RPC assertions.
+
+    Returns:
+        A test-only engine whose owner thread is already started.
+    """
     engine = DiffusionEngine.__new__(DiffusionEngine)
-    sched = RequestScheduler()
-    sched.initialize(SimpleNamespace())
-    engine.scheduler = sched
-    engine.executor = executor
-    engine._rpc_lock = threading.RLock()
-    engine.abort_queue = queue.Queue()
-    engine.execute_fn = executor.execute_request
-    return engine, executor, req_q, res_q
+    engine.od_config = Mock(model_class_name="mock_model", enable_cpu_offload=False)
+    engine.pre_process_func = None
+    engine.post_process_func = None
+    engine.step_execution = isinstance(scheduler, StepScheduler)
+    engine.scheduler = scheduler or RequestScheduler()
+    if scheduler is None:
+        engine.scheduler.initialize(Mock())
+    engine.executor = executor or Mock(collective_rpc=Mock(), shutdown=Mock())
+    engine.execute_fn = execute_fn or Mock(
+        return_value=RunnerOutput(
+            req_id="default",
+            step_index=None,
+            finished=True,
+            result=DiffusionOutput(output=None),
+        )
+    )
+    engine._start_core_thread()
+    engine._wait_for_core_ready()
+    return engine
 
 
-def _start_worker(req_q, res_q, count=2):
-    """Simulate workers: read *count* requests from *req_q* and put
-    tagged ``DiffusionOutput``s on *res_q* (FIFO order).
-    """
+class TestCoreLoopRequestExecution:
+    """Concurrency coverage for queue-based request execution."""
 
-    def _run():
-        for _ in range(count):
-            req = req_q.get(timeout=10)
-            method = req.get("method", "")
-            args = req.get("args", ())
-            if method in {"generate", "execute_model"} and args and hasattr(args[0], "request_ids"):
-                tag = f"result_for_{args[0].request_ids[0]}"
-            elif args:
-                tag = f"result_for_{args[0]}"
-            else:
-                tag = f"result_for_{method}"
-            res_q.put(_tagged_output(tag))
+    def test_request_submission_is_non_blocking_while_another_request_executes(self) -> None:
+        """Verify new requests can enqueue while another request is executing.
 
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    return t
-
-
-def _inject_interleave(executor):
-    """Monkey-patch ``executor._broadcast_mq.enqueue`` so that:
-
-    * The thread named **thread_a** *blocks* after its enqueue until the
-      thread named **thread_b** has finished entirely.
-    * All other threads pass through unblocked.
-
-    Returns ``(a_enqueued: Event, b_complete: Event)`` for wiring.
-    """
-    a_enqueued = threading.Event()
-    b_complete = threading.Event()
-    orig_enqueue = executor._broadcast_mq.enqueue  # points to req_q.put
-
-    def _controlled(item):
-        orig_enqueue(item)
-        if threading.current_thread().name == "thread_a":
-            a_enqueued.set()  # tell B: "A has enqueued"
-            b_complete.wait(5)  # block A until B finishes
-
-    executor._broadcast_mq.enqueue = _controlled
-    return a_enqueued, b_complete
-
-
-# ───────────────── concurrent request execution ─────────────────
-
-
-class TestConcurrentRequestExecution:
-    """Concurrent request execution should not swap results."""
-
-    def test_results_are_correctly_routed(self):
-        engine, executor, req_q, res_q = _make_engine()
-        a_enqueued, b_complete = _inject_interleave(executor)
-        wt = _start_worker(req_q, res_q, count=2)
-
+        Request A blocks inside ``execute_fn()`` to simulate a long-running
+        worker step. While A is still running, request B is submitted directly
+        through ``submit_request()``. B should stay pending until A completes,
+        proving that submission itself no longer requires the caller to own the
+        schedule/execute loop.
+        """
+        started = threading.Event()
+        release = threading.Event()
         results: dict[str, DiffusionOutput] = {}
+        execute_threads: list[str] = []
 
-        def _a():
-            results["A"] = engine.add_req_and_wait_for_response(_mock_request("A"))
-
-        def _b():
-            a_enqueued.wait(5)  # wait for A to enqueue
-            results["B"] = engine.add_req_and_wait_for_response(_mock_request("B"))
-            b_complete.set()  # release A
-
-        ta = threading.Thread(target=_a, name="thread_a")
-        tb = threading.Thread(target=_b, name="thread_b")
-        ta.start()
-        tb.start()
-        ta.join(10)
-        tb.join(10)
-        wt.join(5)
-
-        # With correct (locked) implementation both assertions hold.
-        # The bug causes them to be swapped.
-        assert results["A"].error == "result_for_A"
-        assert results["B"].error == "result_for_B"
-
-
-# ───────────────── concurrent collective RPC ─────────────────
-
-
-class TestConcurrentCollectiveRpc:
-    """Concurrent ``collective_rpc()`` calls should not swap results."""
-
-    def test_results_are_correctly_routed(self):
-        engine, executor, req_q, res_q = _make_engine()
-        a_enqueued, b_complete = _inject_interleave(executor)
-        wt = _start_worker(req_q, res_q, count=2)
-
-        results: dict[str, object] = {}
-
-        def _a():
-            results["A"] = engine.collective_rpc(
-                "ping",
-                args=("call_A",),
-                unique_reply_rank=0,
+        def execute_fn(sched_output):
+            req_id = sched_output.scheduled_req_ids[0]
+            execute_threads.append(threading.current_thread().name)
+            if req_id == "A":
+                started.set()
+                release.wait(timeout=5)
+            return RunnerOutput(
+                req_id=req_id,
+                step_index=None,
+                finished=True,
+                result=DiffusionOutput(error=f"result_for_{req_id}"),
             )
 
-        def _b():
-            a_enqueued.wait(5)
-            results["B"] = engine.collective_rpc(
-                "ping",
-                args=("call_B",),
-                unique_reply_rank=0,
+        engine = _make_engine(execute_fn=execute_fn)
+        try:
+            thread_a = threading.Thread(
+                target=lambda: results.setdefault("A", engine.add_req_and_wait_for_response(_make_request("A"))),
+                daemon=True,
             )
-            b_complete.set()
+            thread_a.start()
+            assert started.wait(timeout=1)
 
-        ta = threading.Thread(target=_a, name="thread_a")
-        tb = threading.Thread(target=_b, name="thread_b")
-        ta.start()
-        tb.start()
-        ta.join(10)
-        tb.join(10)
-        wt.join(5)
+            future_b = engine.submit_request(_make_request("B"))
+            time.sleep(0.05)
+            assert future_b.done() is False
 
-        assert results["A"].error == "result_for_call_A"
-        assert results["B"].error == "result_for_call_B"
+            release.set()
+            results["B"] = future_b.result(timeout=1)
+            thread_a.join(timeout=1)
 
+            assert results["A"].error == "result_for_A"
+            assert results["B"].error == "result_for_B"
+            assert execute_threads == ["DiffusionEngineCore", "DiffusionEngineCore"]
+        finally:
+            release.set()
+            engine.close()
 
-# ──────────── concurrent request execution and collective RPC ────────────
+    def test_running_request_abort_is_processed_before_update_from_output(self) -> None:
+        """Abort a running request and verify the second drain observes it."""
+        started = threading.Event()
+        release = threading.Event()
+        result_holder: dict[str, DiffusionOutput] = {}
 
-
-class TestConcurrentRequestExecutionAndCollectiveRpc:
-    """Request execution and ``collective_rpc()`` should not swap results."""
-
-    def test_results_are_correctly_routed(self):
-        engine, executor, req_q, res_q = _make_engine()
-        a_enqueued, b_complete = _inject_interleave(executor)
-        wt = _start_worker(req_q, res_q, count=2)
-
-        results: dict[str, object] = {}
-
-        def _a():  # request execution path
-            results["A"] = engine.add_req_and_wait_for_response(_mock_request("A"))
-
-        def _b():  # collective_rpc path
-            a_enqueued.wait(5)
-            results["B"] = engine.collective_rpc(
-                "ping",
-                args=("call_B",),
-                unique_reply_rank=0,
+        def execute_fn(sched_output):
+            req_id = sched_output.scheduled_req_ids[0]
+            started.set()
+            release.wait(timeout=5)
+            return RunnerOutput(
+                req_id=req_id,
+                step_index=None,
+                finished=True,
+                result=DiffusionOutput(output=None),
             )
-            b_complete.set()
 
-        ta = threading.Thread(target=_a, name="thread_a")
-        tb = threading.Thread(target=_b, name="thread_b")
-        ta.start()
-        tb.start()
-        ta.join(10)
-        tb.join(10)
-        wt.join(5)
+        engine = _make_engine(execute_fn=execute_fn)
+        try:
+            worker = threading.Thread(
+                target=lambda: result_holder.setdefault(
+                    "output",
+                    engine.add_req_and_wait_for_response(_make_request("run-abort")),
+                ),
+                daemon=True,
+            )
+            worker.start()
+            assert started.wait(timeout=1)
 
-        assert isinstance(results["A"], DiffusionOutput)
-        assert results["A"].error == "result_for_A"
-        assert results["B"].error == "result_for_call_B"
+            engine.abort("run-abort")
+            release.set()
+            worker.join(timeout=1)
+
+            assert result_holder["output"].aborted is True
+            assert result_holder["output"].abort_message == "Request run-abort aborted."
+        finally:
+            release.set()
+            engine.close()
 
 
-# ─────────────────────── serial operation coverage ───────────────────────
+class TestCoreLoopStepExecution:
+    """Coverage for step-scheduler behavior under the core loop."""
+
+    def test_step_scheduler_does_not_resolve_future_on_intermediate_step(self) -> None:
+        """Ensure intermediate step outputs do not resolve the caller future."""
+        scheduler = StepScheduler()
+        scheduler.initialize(Mock())
+
+        first_started = threading.Event()
+        second_started = threading.Event()
+        release_first = threading.Event()
+        release_second = threading.Event()
+        call_count = 0
+
+        def execute_fn(sched_output):
+            nonlocal call_count
+            call_count += 1
+            req_id = sched_output.scheduled_req_ids[0]
+            if call_count == 1:
+                first_started.set()
+                release_first.wait(timeout=5)
+                return RunnerOutput(
+                    req_id=req_id,
+                    step_index=1,
+                    finished=False,
+                    result=DiffusionOutput(output=None),
+                )
+
+            second_started.set()
+            release_second.wait(timeout=5)
+            return RunnerOutput(
+                req_id=req_id,
+                step_index=2,
+                finished=True,
+                result=DiffusionOutput(output=None),
+            )
+
+        engine = _make_engine(scheduler=scheduler, execute_fn=execute_fn)
+        try:
+            future = engine.submit_request(_make_request("step", num_inference_steps=2))
+            assert first_started.wait(timeout=1)
+            release_first.set()
+            assert second_started.wait(timeout=1)
+            assert future.done() is False
+
+            release_second.set()
+            output = future.result(timeout=1)
+            assert isinstance(output, DiffusionOutput)
+            assert output.error is None
+            assert call_count == 2
+        finally:
+            release_first.set()
+            release_second.set()
+            engine.close()
 
 
-class TestSerialEngineOperations:
-    """Verify correct behaviour for single-threaded (serial) usage.
+class TestCoreLoopRpcCoordination:
+    """Coverage for queue-based RPC timeout and cancellation semantics."""
 
-    These tests must pass both **before** and **after** any concurrency fix
-    is applied – they guard against regressions in the basic request path.
-    """
+    def test_collective_rpc_timeout_cancels_queued_rpc_before_execution(self) -> None:
+        """Verify a timed-out queued RPC is skipped by the core loop.
 
-    def test_serial_add_req_returns_correct_result(self):
-        engine, _, req_q, res_q = _make_engine()
-        wt = _start_worker(req_q, res_q, count=1)
-
-        result = engine.add_req_and_wait_for_response(_mock_request("X"))
-        wt.join(5)
-
-        assert isinstance(result, DiffusionOutput)
-        assert result.error == "result_for_X"
-
-    def test_serial_add_req_multiple_sequential(self):
-        engine, _, req_q, res_q = _make_engine()
-        wt = _start_worker(req_q, res_q, count=3)
-
-        for tag in ("one", "two", "three"):
-            out = engine.add_req_and_wait_for_response(_mock_request(tag))
-            assert out.error == f"result_for_{tag}"
-
-        wt.join(5)
-
-    def test_serial_collective_rpc_single_rank(self):
-        engine, _, req_q, res_q = _make_engine()
-        wt = _start_worker(req_q, res_q, count=1)
-
-        result = engine.collective_rpc(
-            "ping",
-            args=("Y",),
-            unique_reply_rank=0,
-        )
-        wt.join(5)
-
-        assert result.error == "result_for_Y"
-
-    def test_serial_collective_rpc_all_ranks(self):
-        """``collective_rpc`` without *unique_reply_rank* returns a single
-        response from rank 0 (only rank 0 has a result_mq).
+        A long-running request keeps the core thread busy. A concurrent
+        ``collective_rpc(timeout=...)`` call times out while still waiting in
+        the queue, cancels its future, and must therefore never reach
+        ``executor.collective_rpc()``.
         """
-        engine, _, _, res_q = _make_engine(num_gpus=2)
+        started = threading.Event()
+        release = threading.Event()
+        executor = Mock(collective_rpc=Mock(return_value="rpc-result"), shutdown=Mock())
 
-        # Pre-populate one result (only rank 0 replies via result_mq)
-        res_q.put(_tagged_output("rank0"))
+        def execute_fn(sched_output):
+            req_id = sched_output.scheduled_req_ids[0]
+            started.set()
+            release.wait(timeout=5)
+            return RunnerOutput(
+                req_id=req_id,
+                step_index=None,
+                finished=True,
+                result=DiffusionOutput(output=None),
+            )
 
-        results = engine.collective_rpc("ping", args=("multi",))
+        engine = _make_engine(execute_fn=execute_fn, executor=executor)
+        try:
+            worker = threading.Thread(
+                target=lambda: engine.add_req_and_wait_for_response(_make_request("stall")),
+                daemon=True,
+            )
+            worker.start()
+            assert started.wait(timeout=1)
 
-        # Only 1 response expected since only rank 0 has result_mq
-        assert len(results) == 1
-        assert results[0].error == "rank0"
+            with pytest.raises(TimeoutError, match="RPC call to health timed out"):
+                engine.collective_rpc("health", timeout=0.1)
 
-    def test_serial_add_req_then_collective_rpc(self):
-        engine, _, req_q, res_q = _make_engine()
-        wt = _start_worker(req_q, res_q, count=2)
+            release.set()
+            worker.join(timeout=1)
+            time.sleep(0.05)
 
-        gen_out = engine.add_req_and_wait_for_response(_mock_request("gen"))
-        rpc_out = engine.collective_rpc(
-            "ping",
-            args=("rpc",),
-            unique_reply_rank=0,
-        )
-        wt.join(5)
-
-        assert gen_out.error == "result_for_gen"
-        assert rpc_out.error == "result_for_rpc"
-
-    def test_serial_add_req_error_propagation(self):
-        """``add_req`` should raise when the worker reports an error."""
-        engine, _, _, res_q = _make_engine()
-        # Put an error response directly
-        res_q.put({"status": "error", "error": "boom"})
-
-        out = engine.add_req_and_wait_for_response(_mock_request("fail"))
-
-        assert isinstance(out, DiffusionOutput)
-        assert out.error is not None
-        assert "boom" in out.error
-
-    def test_serial_collective_rpc_error_propagation(self):
-        """``collective_rpc`` should raise when the worker reports an error."""
-        engine, _, _, res_q = _make_engine()
-        res_q.put({"status": "error", "error": "kaboom"})
-
-        with pytest.raises(RuntimeError, match="kaboom"):
-            engine.collective_rpc("bad", unique_reply_rank=0)
-
-    def test_collective_rpc_closed_executor_raises(self):
-        engine, executor, _, _ = _make_engine()
-        executor._closed = True
-
-        with pytest.raises(RuntimeError, match="closed"):
-            engine.collective_rpc("anything")
-
-
-# ─────────── timeout regression: RPC must not block on a stalled lock ─────
-
-
-class TestCollectiveRpcTimeoutWhileLockHeld:
-    """``collective_rpc(timeout=...)`` must honour its timeout even when
-    another thread holds ``engine._rpc_lock`` indefinitely (e.g. a stalled
-    ``add_req`` waiting on an unresponsive worker).
-    """
-
-    def test_rpc_times_out_when_lock_held_directly(self):
-        """Simplest case: lock is manually held by another thread."""
-        engine, _, _, _ = _make_engine()
-
-        stall_started = threading.Event()
-
-        def _hold_lock():
-            engine._rpc_lock.acquire()
-            stall_started.set()
-            # Hold the lock far longer than the RPC timeout.
-            threading.Event().wait(30)
-            engine._rpc_lock.release()
-
-        stall_thread = threading.Thread(target=_hold_lock, daemon=True)
-        stall_thread.start()
-        stall_started.wait(5)
-
-        # collective_rpc should raise TimeoutError, NOT block forever.
-        with pytest.raises(TimeoutError):
-            engine.collective_rpc("health", timeout=0.5)
-
-    def test_rpc_times_out_when_add_req_stalled_on_worker(self):
-        """Real-world scenario the bot flagged:
-
-        ``add_req`` holds ``_rpc_lock`` while blocked on
-        ``executor._result_mq.dequeue()`` because the worker never replies.
-        A concurrent ``collective_rpc(timeout=...)`` must still time out
-        instead of hanging forever waiting for the lock.
-        """
-        engine, executor, _, _ = _make_engine()
-
-        add_req_blocked = threading.Event()
-
-        # Patch dequeue: signal once entered, then block indefinitely
-        # (simulates a worker that never sends a result).
-        orig_dequeue = executor._result_mq.dequeue
-
-        def _hanging_dequeue(timeout=None):
-            add_req_blocked.set()
-            # Block forever — the worker is "hung".
-            threading.Event().wait(30)
-            return orig_dequeue(timeout=timeout)
-
-        executor._result_mq.dequeue = _hanging_dequeue
-
-        # Thread running request execution — acquires the lock, enqueues, then
-        # blocks on dequeue forever (worker hang).
-        def _stalled_request_execution():
-            try:
-                engine.add_req_and_wait_for_response(_mock_request("stalled"))
-            except Exception:
-                pass
-
-        t = threading.Thread(target=_stalled_request_execution, daemon=True)
-        t.start()
-
-        # Wait until request execution is truly inside the lock and blocking.
-        add_req_blocked.wait(5)
-
-        # collective_rpc should time out at lock acquisition, not hang.
-        with pytest.raises(TimeoutError):
-            engine.collective_rpc("health_check", timeout=0.5)
-
-    def test_rpc_without_timeout_still_waits_for_lock(self):
-        """When no timeout is given, ``collective_rpc`` should still wait
-        for the lock (blocking) — existing behaviour preserved.
-        """
-        engine, _, _, res_q = _make_engine()
-
-        def _hold_and_release():
-            engine._rpc_lock.acquire()
-            # Hold for a short time then release.
-            threading.Event().wait(0.3)
-            engine._rpc_lock.release()
-
-        # Pre-populate a result so collective_rpc succeeds after lock.
-        res_q.put(_tagged_output("ok"))
-
-        t = threading.Thread(target=_hold_and_release, daemon=True)
-        t.start()
-
-        # No timeout -> should block until lock is released, then succeed.
-        result = engine.collective_rpc(
-            "ping",
-            args=("wait",),
-            unique_reply_rank=0,
-        )
-        t.join(5)
-
-        assert result.error == "ok"
+            executor.collective_rpc.assert_not_called()
+        finally:
+            release.set()
+            engine.close()
