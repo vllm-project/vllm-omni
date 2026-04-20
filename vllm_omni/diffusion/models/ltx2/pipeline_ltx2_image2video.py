@@ -6,7 +6,7 @@ from __future__ import annotations
 import copy
 import os
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import PIL.Image
@@ -26,6 +26,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
+from vllm_omni.diffusion.models.interface import SupportsModuleOffload
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.lora.request import LoRARequest
 
@@ -733,10 +734,14 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
         return DiffusionOutput(output=(video, audio))
 
 
-class LTX2ImageToVideoTwoStagesPipeline(nn.Module):
+class LTX2ImageToVideoTwoStagesPipeline(nn.Module, SupportsModuleOffload):
     """LTXImageToVideoTwoStagesPipeline is for two stages image to video generation"""
 
     support_image_input = True
+
+    _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["pipe.text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["pipe.vae", "pipe.audio_vae"]
 
     def __init__(
         self,
