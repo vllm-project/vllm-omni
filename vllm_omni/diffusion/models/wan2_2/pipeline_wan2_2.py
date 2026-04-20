@@ -22,6 +22,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import Dist
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
@@ -955,3 +956,16 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
 
         if boundary_ratio is None and guidance_scale_2 is not None:
             raise ValueError("`guidance_scale_2` is only supported when `boundary_ratio` is set.")
+
+
+# ---------------------------------------------------------------------------
+# DMD2-distilled variant
+# ---------------------------------------------------------------------------
+
+
+class WanT2VDMD2Pipeline(DMD2PipelineMixin, Wan22Pipeline):
+    """Wan 2.x T2V pipeline for FastGen DMD2-distilled models."""
+
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
+        super().__init__(od_config=od_config, prefix=prefix)
+        self.__init_dmd2__()
