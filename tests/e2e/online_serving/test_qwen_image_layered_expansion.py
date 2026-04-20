@@ -16,8 +16,7 @@ import pytest
 
 from tests.helpers.mark import hardware_marks
 from tests.helpers.media import decode_b64_image, generate_synthetic_image
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
-from tests.helpers.stage_config import dummy_messages_from_mix_data
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
 MODEL = "Qwen/Qwen-Image-Layered"
 EDIT_PROMPT = "Decompose this image into layers."

@@ -253,7 +253,8 @@ def modify_stage_config(
     return str(output_path)
 
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
+# ``stage_config.py`` lives under ``tests/helpers/``; repo root is three parents up.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _DEPLOY_DIR = _REPO_ROOT / "vllm_omni" / "deploy"
 _CI_GENERATED_DIR = _REPO_ROOT / "tests" / ".ci_generated"
 

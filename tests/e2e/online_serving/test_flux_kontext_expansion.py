@@ -6,8 +6,7 @@ and are supported by the FluxKontext model.
 import pytest
 
 from tests.helpers.media import generate_synthetic_image
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
-from tests.helpers.stage_config import dummy_messages_from_mix_data
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
 EDIT_PROMPT = "Transform this modern, geometrist image into a Vincent van Gogh style impressionist painting."
 NEGATIVE_PROMPT = "blurry, low quality, modern, geometrist"

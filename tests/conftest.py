@@ -42,10 +42,7 @@ _MEDIA_EXPORT_NAMES = (
     "generate_synthetic_image",
     "generate_synthetic_video",
 )
-_STAGE_CONFIG_EXPORT_NAMES = (
-    "dummy_messages_from_mix_data",
-    "modify_stage_config",
-)
+_STAGE_CONFIG_EXPORT_NAMES = ("modify_stage_config",)
 _RUNTIME_EXPORT_NAMES = (
     "DiffusionResponse",
     "OmniResponse",
@@ -55,6 +52,7 @@ _RUNTIME_EXPORT_NAMES = (
     "OmniServerParams",
     "OmniServerStageCli",
     "OpenAIClientHandler",
+    "dummy_messages_from_mix_data",
 )
 _LAZY_EXPORT_MODULES = {
     **{name: "tests.helpers.assertions" for name in _ASSERTION_EXPORT_NAMES},
