@@ -1078,7 +1078,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                     .replace("img_emb.proj.4.", "img_emb.norm2.")
                 )
                 if new_name in params:
-                    default_weight_loader(params[new_name], tensor)
+                    param = params[new_name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, tensor)
                     loaded.add(new_name)
                 elif new_name in buffers:
                     buffers[new_name].data.copy_(tensor)

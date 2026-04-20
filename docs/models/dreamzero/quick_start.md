@@ -12,12 +12,14 @@ Upstream DreamZero-dependent parity checks are optional and live under
 
 ## Environment checklist
 
-- Sections 1-4: use the local `vllm-omni` environment.
+- Sections 1-5: use the local `vllm-omni` environment.
 - Bundled OpenPI client extra deps: `openpi-client`, `websockets`, `opencv-python`
+- Prediction-video export helpers: local `vllm-omni` environment plus
+  `opencv-python` and `pillow`
 - DROID sim-eval client: use an external Isaac Lab / `sim-evals` environment,
   plus `openpi-client`, `websockets`, `opencv-python`, and `mediapy`
-- Optional upstream parity tests: also require `~/code/dreamzero` and
-  `~/code/dreamzero/checkpoints/dreamzero`
+- Optional upstream parity tests: also require `DREAMZERO_REPO` with a
+  checkpoint under `DREAMZERO_REPO/checkpoints/dreamzero`
 
 ---
 
@@ -67,7 +69,51 @@ python examples/online_serving/dreamzero/openpi_client.py \
 
 ---
 
-## 3. Standard online e2e test
+## 3. Export prediction videos
+
+The OpenPI client receives only actions. For visual debugging, use the offline
+example helper to collect DreamZero `video_pred` latents from vLLM and decode
+them to MP4.
+
+Single `TP=1, CF_P=1` export:
+
+```bash
+python examples/online_serving/dreamzero/export_prediction_video.py \
+  --model GEAR-Dreams/DreamZero-DROID \
+  --stage-configs-path vllm_omni/model_executor/stage_configs/dreamzero.yaml \
+  --output-dir examples/online_serving/dreamzero/generated_predictions/comparison_videos \
+  --output-stem tp1_cfg1_vllm_example
+```
+
+Generate the comparison set:
+
+```bash
+python examples/online_serving/dreamzero/generate_comparison_videos.py \
+  --skip-existing \
+  --continue-on-error
+```
+
+Outputs are written to:
+
+- `examples/online_serving/dreamzero/generated_predictions/comparison_videos/`
+
+Useful files:
+
+- `dreamzero_input_reference.mp4`: stitched real camera input
+- `tp1_cfg1_vllm_example.mp4`
+- `tp1_cfg2_vllm_example.mp4`
+- `tp2_cfg1_vllm_example.mp4`
+- `tp2_cfg2_vllm_example.mp4`
+- `dreamzero_upstream_reference.mp4` when an upstream reference video is supplied with `--upstream-video`
+- `manifest.json`: successful videos and any failed variants
+
+`tp2_cfg2` requires four free GPUs (`TP=2`, `CF_P=2`). If GPU capacity is not
+available, the helper can still keep the successful variants and record the
+failure in `manifest.json`.
+
+---
+
+## 4. Standard online e2e test
 
 The standard self-contained online serving e2e test is:
 
@@ -80,7 +126,7 @@ checks metadata, action output shape, finite values, and reset behavior.
 
 ---
 
-## 4. Shared example test
+## 5. Shared example test
 
 The example test executes the same client script from `examples/`:
 
@@ -90,7 +136,7 @@ PYTHONPATH=. .venv/bin/python -m pytest tests/examples/online_serving/test_dream
 
 ---
 
-## 5. Optional upstream parity baseline
+## 6. Optional upstream parity baseline
 
 The currently validated strict-parity baseline is:
 
@@ -108,7 +154,7 @@ Current status:
 
 ---
 
-## 6. Recommended first run
+## 7. Recommended first run
 
 If you want the least surprising setup, start with:
 
@@ -121,7 +167,7 @@ Then move to `CF_P=2` if you want CFG parallel.
 
 ---
 
-## 7. Formal upstream end-to-end parity test
+## 8. Formal upstream end-to-end parity test
 
 The formal server-vs-server parity test is:
 
@@ -146,7 +192,7 @@ This test checks:
 
 ---
 
-## 8. Related docs
+## 9. Related docs
 
 - `docs/models/dreamzero/README.md`: DreamZero documentation index
 - `examples/online_serving/dreamzero/README.md`: bundled OpenPI example
