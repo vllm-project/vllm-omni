@@ -88,7 +88,7 @@ steps:
     - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py
+    - pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni_expansion.py
     - pytest -s -v tests/engine/test_async_omni_engine_abort.py
 
 - label: "Omni Model Test Qwen3-Omni"
