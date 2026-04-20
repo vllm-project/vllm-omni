@@ -27,10 +27,11 @@ def _upsample_token_ids(token_ids: torch.Tensor, token_h: int, token_w: int) -> 
     Returns:
         Upsampled token IDs of shape [num_tokens * 4]
     """
-    token_ids = token_ids.view(1, 1, token_h, token_w)
-    token_ids = torch.nn.functional.interpolate(token_ids.float(), scale_factor=2, mode="nearest").to(dtype=torch.long)
-    token_ids = token_ids.view(-1)
-    return token_ids
+    token_grid = token_ids.view(token_h, token_w)
+    # Integer nearest-neighbor upsampling avoids the float cast/interpolate
+    # overhead in the AR -> diffusion bridge.
+    token_grid = token_grid.repeat_interleave(2, dim=0).repeat_interleave(2, dim=1)
+    return token_grid.reshape(-1)
 
 
 def _parse_generated_tokens(
@@ -261,5 +262,4 @@ def ar2diffusion(
                 diffusion_input[key] = original_prompt[key]
 
         diffusion_inputs.append(diffusion_input)
-
     return diffusion_inputs

@@ -241,6 +241,13 @@ class GlmImageProcessingInfo(BaseProcessingInfo):
         return (image_size, image_size)
 
 
+def _upsample_token_grid_nearest(token_ids: torch.Tensor, grid_h: int, grid_w: int) -> torch.Tensor:
+    """Upsample a 2D token grid by 2x using integer nearest-neighbor."""
+    token_grid = token_ids.view(grid_h, grid_w)
+    token_grid = token_grid.repeat_interleave(2, dim=0).repeat_interleave(2, dim=1)
+    return token_grid.reshape(-1)
+
+
 class GlmImageDummyInputsBuilder(BaseDummyInputsBuilder[GlmImageProcessingInfo]):
     """
     Builds dummy inputs for GLM-Image model profiling.
@@ -2231,10 +2238,7 @@ class GlmImageModel(nn.Module):
             for i, tokens in enumerate(image_tokens_list):
                 grid_t, grid_h, grid_w = image_grid_thw[i].tolist()
                 # Reshape to 2D grid
-                tokens_2d = tokens.view(1, 1, grid_h, grid_w)
-                # Upsample by 2x (nearest neighbor)
-                tokens_upsampled = F.interpolate(tokens_2d.float(), scale_factor=2, mode="nearest").to(dtype=torch.long)
-                upsampled_token_ids.append(tokens_upsampled.view(-1))
+                upsampled_token_ids.append(_upsample_token_grid_nearest(tokens, grid_h, grid_w))
 
             prior_token_image_ids_info = {
                 "prior_token_image_ids": upsampled_token_ids,
@@ -2439,11 +2443,9 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         for i, tokens in enumerate(image_tokens_list):
             grid_t, grid_h, grid_w = image_grid_thw[i].tolist()
             # Reshape to 2D grid
-            tokens_2d = tokens.view(1, 1, grid_h, grid_w)
-            # Upsample by 2x (nearest neighbor)
-            tokens_upsampled = F.interpolate(tokens_2d.float(), scale_factor=2, mode="nearest").to(dtype=torch.long)
+            tokens_upsampled = _upsample_token_grid_nearest(tokens, grid_h, grid_w)
             # Keep as CPU tensor for proper serialization through pooling_output
-            upsampled_token_ids.append(tokens_upsampled.view(-1).detach().cpu().contiguous())
+            upsampled_token_ids.append(tokens_upsampled.detach().cpu().contiguous())
 
         # Note: We only include prior_token_image_ids in the info dict.
         # image_grid_thw is NOT included because:
