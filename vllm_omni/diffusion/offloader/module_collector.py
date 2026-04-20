@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
+from operator import attrgetter
 
 from torch import nn
 from vllm.logger import init_logger
@@ -60,6 +61,9 @@ class ModuleDiscovery:
     ) -> tuple[list[nn.Module], list[str]]:
         """Resolve attribute names to (module, name) pairs, skipping missing.
 
+        Dotted names (e.g. ``"pipe.transformer"``) are resolved by
+        walking the attribute chain via :func:`operator.attrgetter`.
+
         When *warn_missing* is True (protocol path), warn about
         declared attributes that do not exist.  Non-``nn.Module``
         attributes always produce a warning regardless (they indicate
@@ -69,7 +73,10 @@ class ModuleDiscovery:
         names: list[str] = []
         seen: set[int] = set()
         for attr in attr_names:
-            module = getattr(pipeline, attr, None)
+            try:
+                module = attrgetter(attr)(pipeline)
+            except AttributeError:
+                module = None
             if module is None:
                 if warn_missing:
                     logger.warning(

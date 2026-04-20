@@ -87,6 +87,32 @@ class MissingAttrPipeline(nn.Module, SupportsModuleOffload):
         self.vae = nn.Linear(10, 10)
 
 
+class MissingIntermediatePipeline(nn.Module, SupportsModuleOffload):
+    """Pipeline with dotted path referencing non-existent intermediate."""
+
+    _dit_modules: ClassVar[list[str]] = ["nonexistent.transformer"]
+    _encoder_modules: ClassVar[list[str]] = []
+    _vae_modules: ClassVar[list[str]] = []
+
+    def __init__(self):
+        super().__init__()
+
+
+class NestedPipeline(nn.Module, SupportsModuleOffload):
+    """Pipeline with nested modules accessed via dotted paths."""
+
+    _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["pipe.text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+
+    def __init__(self):
+        super().__init__()
+        self.pipe = nn.Module()
+        self.pipe.transformer = nn.Linear(10, 10)
+        self.pipe.text_encoder = nn.Linear(10, 10)
+        self.vae = nn.Linear(10, 10)
+
+
 class MultiVaePipeline(nn.Module, SupportsModuleOffload):
     """Pipeline with multiple VAEs."""
 
@@ -153,6 +179,21 @@ class TestProtocolDiscovery:
         result = ModuleDiscovery.discover(pipeline)
 
         assert len(result.encoders) == 0
+
+    def test_skips_missing_intermediate(self):
+        result = ModuleDiscovery.discover(MissingIntermediatePipeline())
+
+        assert len(result.dits) == 0
+
+    def test_dotted_path_resolves_nested_modules(self):
+        pipeline = NestedPipeline()
+        result = ModuleDiscovery.discover(pipeline)
+
+        assert result.dit_names == ["pipe.transformer"]
+        assert result.dits[0] is pipeline.pipe.transformer
+        assert result.encoder_names == ["pipe.text_encoder"]
+        assert result.encoders[0] is pipeline.pipe.text_encoder
+        assert result.vaes[0] is pipeline.vae
 
     def test_multiple_vaes(self):
         pipeline = MultiVaePipeline()
