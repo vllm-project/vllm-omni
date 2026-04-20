@@ -45,15 +45,24 @@ import time
 import uuid
 from pathlib import Path
 
-DREAMZERO_REPO = Path(os.environ.get("DREAMZERO_REPO", "~/code/dreamzero")).expanduser()
-if DREAMZERO_REPO.exists() and str(DREAMZERO_REPO) not in sys.path:
-    sys.path.insert(0, str(DREAMZERO_REPO))
-
 import cv2
-import eval_utils.policy_server as policy_server
 import numpy as np
-from eval_utils.policy_client import WebsocketClientPolicy
 from openpi_client import msgpack_numpy
+
+DREAMZERO_REPO = Path(os.environ.get("DREAMZERO_REPO", "~/code/dreamzero")).expanduser()
+
+
+def _import_upstream_policy_modules():
+    if DREAMZERO_REPO.exists() and str(DREAMZERO_REPO) not in sys.path:
+        sys.path.insert(0, str(DREAMZERO_REPO))
+
+    import eval_utils.policy_server as policy_server
+    from eval_utils.policy_client import WebsocketClientPolicy
+
+    return policy_server, WebsocketClientPolicy
+
+
+policy_server, WebsocketClientPolicy = _import_upstream_policy_modules()
 
 VIDEO_DIR = os.environ.get("DREAMZERO_VIDEO_DIR", str(DREAMZERO_REPO / "debug_image"))
 
