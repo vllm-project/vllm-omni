@@ -68,26 +68,45 @@ def _build_serve_args(serve_args: Any) -> list[str]:
 def create_unique_server_params(
     configs: list[dict[str, Any]],
     stage_configs_dir: Path,
-) -> list[tuple[str, str, str | None, list[str]]]:
-    unique_params = []
-    seen: set[tuple[str, str, str | None, tuple[str, ...]]] = set()
+) -> list[tuple[str, str, str | None, str | None, tuple[str, ...]]]:
+    """Return one row per unique server configuration (same 5-tuple shape as upstream).
+
+    ``(test_name, model, deploy_yaml_path, stage_overrides_json, extra_cli_args)``.
+
+    JSON ``server_params.serve_args`` (dict/list) is expanded via ``_build_serve_args``
+    and **prepended** to ``extra_cli_args`` so perf / stability ``omni_server`` fixtures
+    stay identical to main while still honoring ``serve_args`` in benchmark JSON.
+    """
+    unique_params: list[tuple[str, str, str | None, str | None, tuple[str, ...]]] = []
+    seen: set[tuple[str, str, str | None, str | None, tuple[str, ...]]] = set()
     for config in configs:
         test_name = config["test_name"]
-        model = config["server_params"]["model"]
-        serve_args = _build_serve_args(config["server_params"].get("serve_args"))
-        stage_config_name = config["server_params"].get("stage_config_name")
+        server_params = config["server_params"]
+        model = server_params["model"]
+        stage_config_name = server_params.get("stage_config_name")
         if stage_config_name:
             stage_config_path = str(stage_configs_dir / stage_config_name)
-            delete = config["server_params"].get("delete", None)
-            update = config["server_params"].get("update", None)
+            delete = server_params.get("delete", None)
+            update = server_params.get("update", None)
             stage_config_path = modify_stage(stage_config_path, update, delete)
         else:
             stage_config_path = None
 
-        server_param_key = (test_name, model, stage_config_path, tuple(serve_args))
-        if server_param_key not in seen:
-            seen.add(server_param_key)
-            unique_params.append((test_name, model, stage_config_path, serve_args))
+        stage_overrides = server_params.get("stage_overrides")
+        stage_overrides_json = json.dumps(stage_overrides) if stage_overrides else None
+
+        # ``extra_cli_args`` passes raw CLI flags straight through to
+        # ``vllm_omni.entrypoints.cli.main serve`` — used for flags that
+        # don't map to stage-level overrides, e.g. ``--async-chunk`` /
+        # ``--no-async-chunk`` toggling the deploy-level async_chunk bool.
+        serve_flat = _build_serve_args(server_params.get("serve_args"))
+        raw_extra = tuple(server_params.get("extra_cli_args") or ())
+        extra_cli_args = tuple(serve_flat) + raw_extra
+
+        server_param = (test_name, model, stage_config_path, stage_overrides_json, extra_cli_args)
+        if server_param not in seen:
+            seen.add(server_param)
+            unique_params.append(server_param)
 
     return unique_params
 

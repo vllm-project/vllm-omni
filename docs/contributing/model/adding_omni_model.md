@@ -313,7 +313,7 @@ The registry uses lazy loading, so the model class is imported only when needed.
 
 ## Stage Configuration
 
-Create a YAML configuration file in `vllm_omni/model_executor/stage_configs/`. For a complete example, see the [Qwen3-Omni configuration file](gh-file:vllm_omni/model_executor/stage_configs/qwen3_omni_moe.yaml).
+Create a YAML configuration file in `vllm_omni/deploy/`. For a complete example, see the [Qwen3-Omni configuration file](gh-file:vllm_omni/deploy/qwen3_omni_moe.yaml).
 
 ### Key Configuration Fields
 
@@ -614,7 +614,7 @@ For a complete reference implementation, see:
 - **Thinker**: `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_moe_thinker.py`
 - **Talker**: `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_moe_talker.py`
 - **Code2Wav**: `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_code2wav.py`
-- **Stage config**: `vllm_omni/model_executor/stage_configs/qwen3_omni_moe.yaml`
+- **Stage config**: `vllm_omni/deploy/qwen3_omni_moe.yaml`
 - **Input processors**: `vllm_omni/model_executor/stage_input_processors/qwen3_omni.py`
 - **Registry**: `vllm_omni/model_executor/models/registry.py`
 - **Testing**: `vllm_omni/tests/e2e/offline_inference/test_qwen3_omni.py`

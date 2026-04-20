@@ -78,6 +78,3 @@ stage_args:
 # Top-level runtime config (concise): default windows and stage edges
 runtime:
   enabled: true
-  defaults:
-    window_size: -1  # Simplified: trigger downstream only after full upstream completion
-    max_inflight: 1  # Simplified: process serially within each stage

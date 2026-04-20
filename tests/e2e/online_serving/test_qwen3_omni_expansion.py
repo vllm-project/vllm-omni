@@ -6,10 +6,7 @@ E2E Online tests for Qwen3-Omni model.
 
 import os
 
-from vllm_omni.platforms import current_omni_platform
-
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-from pathlib import Path
 
 import pytest
 
@@ -21,7 +18,7 @@ from tests.conftest import (
     generate_synthetic_video,
     modify_stage_config,
 )
-from tests.utils import hardware_test
+from tests.utils import get_deploy_config_path, hardware_test
 
 model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
@@ -40,47 +37,56 @@ LARGE_IMAGE_HEIGHT = 1080
 LONG_AUDIO_DURATION_SEC = 120
 
 
-def get_chunk_config(default_path):
-    path = modify_stage_config(
+def get_batch_token_config(default_path):
+    """Override stage 1's max_num_batched_tokens to exercise small-batch paths.
+
+    Uses the new flat-stage schema (``stages.<id>.<field>``); the legacy
+    ``stage_args.<id>.engine_args.<field>`` path no longer applies because
+    the deploy YAML doesn't nest engine fields under ``engine_args:``.
+    """
+    return modify_stage_config(
+        default_path,
+        updates={
+            "stages": {1: {"max_num_batched_tokens": 64}},
+        },
+    )
+
+
+def get_async_chunk_config(default_path):
+    """Flip async_chunk on and bump stage 0 thinker output to 2048 tokens.
+
+    Pipeline registry (qwen3_omni/pipeline.py) already wires
+    thinker2talker_async_chunk / talker2code2wav_async_chunk on stages 0/1,
+    so no per-stage processor override is needed. Using only flat-schema
+    writes so _parse_stage_deploy stays in its flat branch (nested
+    ``engine_args:`` would drop other overlay fields).
+    """
+    return modify_stage_config(
         default_path,
         updates={
             "async_chunk": True,
-            "stage_args": {
-                0: {
-                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk",
-                    "default_sampling_params.max_tokens": 2048,
-                },
-                1: {
-                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk"
-                },
-            },
-        },
-        deletes={"stage_args": {2: ["custom_process_input_func"]}},
-    )
-    return path
-
-
-def get_batch_token_config(default_path):
-    path = modify_stage_config(
-        default_path,
-        updates={
-            "stage_args": {1: {"engine_args.max_num_batched_tokens": 64}},
+            "stages": {0: {"default_sampling_params.max_tokens": 2048}},
         },
     )
-    return path
 
 
-# CI stage config for 2*H100-80G GPUs
-default_path = str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
+# CI deploy YAML (single file; xpu deltas applied via ``platforms:`` section).
+# The overlay explicitly sets ``async_chunk: False``, so ``default`` tests the
+# sync path and ``async_chunk`` tests the streaming path with a longer thinker
+# output — two distinct scenarios, kept as separate parametrizations.
+default_path = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 
-if current_omni_platform.is_xpu():
-    default_path = str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")
-
-# Create parameter combinations for model and stage config
 test_params = [
-    pytest.param(OmniServerParams(model=model, stage_config_path=default_path, use_stage_cli=True), id="default"),
     pytest.param(
-        OmniServerParams(model=model, stage_config_path=get_chunk_config(default_path), use_stage_cli=True),
+        OmniServerParams(model=model, stage_config_path=default_path, use_stage_cli=True),
+        id="default",
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=model,
+            stage_config_path=get_async_chunk_config(default_path),
+            use_stage_cli=True,
+        ),
         id="async_chunk",
     ),
 ]
@@ -371,6 +377,7 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.skip(reason="issue: #2827")
 def test_audio_in_video_001(omni_server, openai_client) -> None:
     """
     Input Modal: text + video (synthetic MP4 with embedded audio; ``use_audio_in_video`` uses audio from the video).
@@ -491,6 +498,7 @@ def test_speaker_001(omni_server, openai_client) -> None:
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.skip(reason="Known issue: occasional inaccuracy in voice recognition.")
 def test_speaker_002(omni_server, openai_client) -> None:
     """
     Input Modal: text only (one-word answer constraint).

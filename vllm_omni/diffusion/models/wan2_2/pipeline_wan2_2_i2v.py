@@ -12,6 +12,7 @@ from typing import Any, cast
 import numpy as np
 import PIL.Image
 import torch
+import torchvision.transforms.functional as TF
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
@@ -25,6 +26,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
+    WAN22_MAX_SEQUENCE_LENGTH,
     build_wan_scheduler,
     create_transformer_from_config,
     load_transformer_config,
@@ -35,6 +37,9 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.prompt_utils import (
+    validate_prompt_sequence_lengths,
+)
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -213,6 +218,7 @@ class Wan22I2VPipeline(
 
         # Text encoder
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+        self.tokenizer_max_length = WAN22_MAX_SEQUENCE_LENGTH
         self.text_encoder = UMT5EncoderModel.from_pretrained(
             model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
@@ -283,6 +289,82 @@ class Wan22I2VPipeline(
     @property
     def current_timestep(self):
         return self._current_timestep
+
+    def diffuse(
+        self,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None,
+        image_embeds: torch.Tensor | None,
+        guidance_low: float,
+        guidance_high: float,
+        boundary_timestep: float | None,
+        dtype: torch.dtype,
+        attention_kwargs: dict[str, Any],
+        condition: torch.Tensor,
+        first_frame_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for t in timesteps:
+                self._current_timestep = t
+
+                # Select model and guidance scale based on timestep
+                current_model = self.transformer
+                current_guidance_scale = guidance_low
+                if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
+                    current_model = self.transformer_2
+                    current_guidance_scale = guidance_high
+
+                # Prepare latent input
+                if self.expand_timesteps:
+                    # TI2V-5B style: blend condition with latents using mask
+                    latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
+                    latent_model_input = latent_model_input.to(dtype)
+
+                    # Expand timesteps for each patch
+                    temp_ts = (first_frame_mask[0][0][:, ::2, ::2] * t).flatten()
+                    timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+                else:
+                    # Wan2.1 style: concatenate condition with latents
+                    latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
+                    timestep = t.expand(latents.shape[0])
+
+                do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
+                positive_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep,
+                    "encoder_hidden_states": prompt_embeds,
+                    "encoder_hidden_states_image": image_embeds,
+                    "attention_kwargs": attention_kwargs,
+                    "return_dict": False,
+                    "current_model": current_model,
+                }
+                if do_true_cfg:
+                    negative_kwargs = {
+                        "hidden_states": latent_model_input,
+                        "timestep": timestep,
+                        "encoder_hidden_states": negative_prompt_embeds,
+                        "encoder_hidden_states_image": image_embeds,
+                        "attention_kwargs": attention_kwargs,
+                        "return_dict": False,
+                        "current_model": current_model,
+                    }
+                else:
+                    negative_kwargs = None
+
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=do_true_cfg,
+                    true_cfg_scale=current_guidance_scale,
+                    positive_kwargs=positive_kwargs,
+                    negative_kwargs=negative_kwargs,
+                    cfg_normalize=False,
+                )
+
+                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                pbar.update()
+
+        return latents
 
     def encode_image(
         self,
@@ -392,6 +474,7 @@ class Wan22I2VPipeline(
             image_embeds=image_embeds,
             guidance_scale_2=guidance_high if boundary_ratio is not None else None,
             boundary_ratio=boundary_ratio,
+            max_sequence_length=req.sampling_params.max_sequence_length or self.tokenizer_max_length,
         )
 
         # Adjust num_frames to be compatible with VAE temporal scaling
@@ -420,7 +503,7 @@ class Wan22I2VPipeline(
                 negative_prompt=negative_prompt,
                 do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
                 num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
-                max_sequence_length=req.sampling_params.max_sequence_length or 512,
+                max_sequence_length=req.sampling_params.max_sequence_length or self.tokenizer_max_length,
                 device=device,
                 dtype=dtype,
             )
@@ -478,6 +561,7 @@ class Wan22I2VPipeline(
         video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
         if isinstance(image, PIL.Image.Image):
+            image = TF.to_tensor(image).to(device)
             image_tensor = video_processor.preprocess(image, height=height, width=width)
         else:
             image_tensor = image
@@ -486,6 +570,7 @@ class Wan22I2VPipeline(
         # Handle last_image if provided
         if last_image is not None:
             if isinstance(last_image, PIL.Image.Image):
+                image = TF.to_tensor(last_image).to(device)
                 last_image_tensor = video_processor.preprocess(last_image, height=height, width=width)
             else:
                 last_image_tensor = last_image
@@ -516,68 +601,20 @@ class Wan22I2VPipeline(
 
         if DEBUG_PERF:
             _t_denoise_start = time.perf_counter()
-        with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
-                self._current_timestep = t
-
-                # Select model and guidance scale based on timestep
-                current_model = self.transformer
-                current_guidance_scale = guidance_low
-                if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
-                    current_model = self.transformer_2
-                    current_guidance_scale = guidance_high
-
-                # Prepare latent input
-                if self.expand_timesteps:
-                    # TI2V-5B style: blend condition with latents using mask
-                    latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
-                    latent_model_input = latent_model_input.to(dtype)
-
-                    # Expand timesteps for each patch
-                    temp_ts = (first_frame_mask[0][0][:, ::2, ::2] * t).flatten()
-                    timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
-                else:
-                    # Wan2.1 style: concatenate condition with latents
-                    latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
-                    timestep = t.expand(latents.shape[0])
-
-                do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
-                # Prepare kwargs for positive and negative predictions
-                positive_kwargs = {
-                    "hidden_states": latent_model_input,
-                    "timestep": timestep,
-                    "encoder_hidden_states": prompt_embeds,
-                    "encoder_hidden_states_image": image_embeds,
-                    "attention_kwargs": attention_kwargs,
-                    "return_dict": False,
-                    "current_model": current_model,
-                }
-                if do_true_cfg:
-                    negative_kwargs = {
-                        "hidden_states": latent_model_input,
-                        "timestep": timestep,
-                        "encoder_hidden_states": negative_prompt_embeds,
-                        "encoder_hidden_states_image": image_embeds,
-                        "attention_kwargs": attention_kwargs,
-                        "return_dict": False,
-                        "current_model": current_model,
-                    }
-                else:
-                    negative_kwargs = None
-
-                # Predict noise with automatic CFG parallel handling
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_true_cfg,
-                    true_cfg_scale=current_guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    cfg_normalize=False,
-                )
-
-                # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
-
-                pbar.update()
+        latents = self.diffuse(
+            latents=latents,
+            timesteps=timesteps,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            image_embeds=image_embeds,
+            guidance_low=guidance_low,
+            guidance_high=guidance_high,
+            boundary_timestep=boundary_timestep,
+            dtype=dtype,
+            attention_kwargs=attention_kwargs,
+            condition=condition,
+            first_frame_mask=first_frame_mask,
+        )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
         # so we empty the cache here to avoid OOM before vae decoding.
@@ -671,6 +708,20 @@ class Wan22I2VPipeline(
         prompt = [prompt] if isinstance(prompt, str) else prompt
         prompt_clean = [self._prompt_clean(p) for p in prompt]
         batch_size = len(prompt_clean)
+        text_inputs_untruncated = self.tokenizer(
+            prompt_clean,
+            padding=True,
+            truncation=False,
+            add_special_tokens=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )
+        validate_prompt_sequence_lengths(
+            text_inputs_untruncated.attention_mask,
+            max_sequence_length=max_sequence_length,
+            supported_max_sequence_length=self.tokenizer_max_length,
+            error_context="for Wan2.2 text encoding",
+        )
 
         text_inputs = self.tokenizer(
             prompt_clean,
@@ -699,8 +750,24 @@ class Wan22I2VPipeline(
         if do_classifier_free_guidance:
             negative_prompt = negative_prompt or ""
             negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+            negative_prompt_clean = [self._prompt_clean(p) for p in negative_prompt]
+            neg_text_inputs_untruncated = self.tokenizer(
+                negative_prompt_clean,
+                padding=True,
+                truncation=False,
+                add_special_tokens=True,
+                return_attention_mask=True,
+                return_tensors="pt",
+            )
+            validate_prompt_sequence_lengths(
+                neg_text_inputs_untruncated.attention_mask,
+                max_sequence_length=max_sequence_length,
+                supported_max_sequence_length=self.tokenizer_max_length,
+                prompt_name="negative_prompt",
+                error_context="for Wan2.2 text encoding",
+            )
             neg_text_inputs = self.tokenizer(
-                [self._prompt_clean(p) for p in negative_prompt],
+                negative_prompt_clean,
                 padding="max_length",
                 max_length=max_sequence_length,
                 truncation=True,
@@ -808,12 +875,14 @@ class Wan22I2VPipeline(
             return latents, latent_condition, first_frame_mask
 
         # Wan2.1 style: create mask and concatenate with condition
-        mask_lat_size = torch.ones(batch_size, 1, num_frames, latent_height, latent_width)
+        mask_lat_size = torch.ones(
+            batch_size, 1, num_frames, latent_height, latent_width, device=latent_condition.device
+        )
 
         if last_image is None:
-            mask_lat_size[:, :, list(range(1, num_frames))] = 0
+            mask_lat_size[:, :, 1:] = 0
         else:
-            mask_lat_size[:, :, list(range(1, num_frames - 1))] = 0
+            mask_lat_size[:, :, 1 : num_frames - 1] = 0
 
         first_frame_mask = mask_lat_size[:, :, 0:1]
         first_frame_mask = torch.repeat_interleave(first_frame_mask, dim=2, repeats=self.vae_scale_factor_temporal)
@@ -842,6 +911,7 @@ class Wan22I2VPipeline(
         image_embeds=None,
         guidance_scale_2=None,
         boundary_ratio=None,
+        max_sequence_length=None,
     ):
         if image is None and image_embeds is None:
             raise ValueError("Provide either `image` or `image_embeds`. Cannot leave both undefined.")
@@ -862,6 +932,11 @@ class Wan22I2VPipeline(
 
         if prompt is None and prompt_embeds is None:
             raise ValueError("Provide either `prompt` or `prompt_embeds`.")
+
+        if max_sequence_length is not None and max_sequence_length > self.tokenizer_max_length:
+            raise ValueError(
+                f"`max_sequence_length` cannot be greater than {self.tokenizer_max_length} but is {max_sequence_length}"
+            )
 
         if boundary_ratio is None and guidance_scale_2 is not None:
             raise ValueError("`guidance_scale_2` is only supported when `boundary_ratio` is set.")

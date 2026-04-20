@@ -39,21 +39,28 @@ def test_default_stage_id_is_concrete_int():
     assert cfg.stage_id == 0
 
 
-def test_multimodal_kwarg_overrides():
+def test_multimodal_kwarg_overrides(mocker):
     """Ensure that overrides in the multimodal config are preserved."""
-    # Get a different value than the default for a multimodal field
     sig = inspect.signature(OmniEngineArgs)
     default_mm_cache = sig.parameters["mm_processor_cache_gb"].default
     override_val = default_mm_cache + 1
 
-    # NOTE: This needs to be a model that resolves to supports_multimodal=True
-    # in vLLM, otherwise we won't have an MM config
+    fake_model_config = SimpleNamespace(
+        multimodal_config=SimpleNamespace(mm_processor_cache_gb=override_val),
+    )
+
+    def _fake_parent_create_model_config(self):
+        assert self.mm_processor_cache_gb == override_val
+        return fake_model_config
+
+    mocker.patch.object(EngineArgs, "create_model_config", _fake_parent_create_model_config)
+    mocker.patch.object(OmniModelConfig, "from_vllm_model_config", side_effect=lambda model_config, **_: model_config)
+
     cfg = OmniEngineArgs(
         model="Qwen/Qwen2-VL-2B-Instruct",
         mm_processor_cache_gb=override_val,
     ).create_model_config()
 
-    # Ensure that the override was applied correctly
     assert cfg.multimodal_config is not None
     assert cfg.multimodal_config.mm_processor_cache_gb == override_val
 

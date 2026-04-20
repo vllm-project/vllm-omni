@@ -7,6 +7,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 
 from vllm_omni.diffusion.layers.custom_op import CustomOp
+from vllm_omni.diffusion.layers.norm import LayerNorm
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -27,7 +28,7 @@ class AdaLayerNorm(CustomOp):
         self.eps = eps
         self.elementwise_affine = elementwise_affine
         self.hidden_size = hidden_size
-        self.layernorm = nn.LayerNorm(self.hidden_size, elementwise_affine=self.elementwise_affine, eps=self.eps)
+        self.layernorm = LayerNorm(self.hidden_size, elementwise_affine=self.elementwise_affine, eps=self.eps)
 
     def forward_cuda(
         self,
