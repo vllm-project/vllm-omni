@@ -191,6 +191,17 @@ _OMNI_MODELS = {
         "ming_flash_omni",
         "MingFlashOmniForConditionalGeneration",
     ),
+    ## Fun-Audio-Chat (FunAudioLLM/Fun-Audio-Chat-8B)
+    "FunAudioChatForConditionalGeneration": (
+        "fun_audio_chat",
+        "fun_audio_chat",
+        "FunAudioChatForConditionalGeneration",
+    ),
+    "FunAudioChatToken2Wav": (
+        "fun_audio_chat",
+        "token2wav",
+        "FunAudioChatToken2Wav",
+    ),
 }
 
 

@@ -1,6 +1,12 @@
 import re
 
-from vllm.logger import current_formatter_type, init_logger
+from vllm.logger import init_logger
+
+try:
+    from vllm.logger import current_formatter_type  # type: ignore[attr-defined]
+except ImportError:  # vllm < 0.14
+    def current_formatter_type(_logger):  # type: ignore[no-redef]
+        return "plain"
 
 logger = init_logger(__name__)
 
