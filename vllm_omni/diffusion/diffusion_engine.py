@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 from collections.abc import Iterable
+from dataclasses import fields, is_dataclass
 from typing import Any
 
 import numpy as np
@@ -59,6 +60,41 @@ def supports_audio_output(model_class_name: str) -> bool:
     if model_cls is None:
         return False
     return bool(getattr(model_cls, "support_audio_output", False))
+
+
+def _move_tensors_to_cpu(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.cpu() if value.device.type != "cpu" else value
+
+    if is_dataclass(value) and not isinstance(value, type):
+        kwargs = {
+            field.name: _move_tensors_to_cpu(getattr(value, field.name))
+            for field in fields(value)
+            if field.init and hasattr(value, field.name)
+        }
+        return type(value)(**kwargs)
+
+    if isinstance(value, tuple):
+        items = tuple(_move_tensors_to_cpu(item) for item in value)
+        if hasattr(value, "_fields"):
+            return type(value)(*items)
+        if type(value) is tuple:
+            return items
+        try:
+            return type(value)(items)
+        except TypeError:
+            try:
+                return type(value)(*items)
+            except TypeError:
+                return items
+
+    if isinstance(value, list):
+        return [_move_tensors_to_cpu(item) for item in value]
+
+    if type(value) is dict:
+        return {key: _move_tensors_to_cpu(item) for key, item in value.items()}
+
+    return value
 
 
 class DiffusionEngine:
@@ -136,12 +172,7 @@ class DiffusionEngine:
         # reside on the device and leave no headroom for intermediates.
         output_data = output.output
         if self.od_config.enable_cpu_offload:
-            if isinstance(output_data, torch.Tensor) and output_data.device.type != "cpu":
-                output_data = output_data.cpu()
-            elif isinstance(output_data, tuple):
-                output_data = tuple(
-                    t.cpu() if isinstance(t, torch.Tensor) and t.device.type != "cpu" else t for t in output_data
-                )
+            output_data = _move_tensors_to_cpu(output_data)
 
         postprocess_start_time = time.perf_counter()
         outputs = self.post_process_func(output_data) if self.post_process_func is not None else output_data
@@ -229,13 +260,14 @@ class DiffusionEngine:
             for i, prompt in enumerate(request.prompts):
                 request_id = request.request_ids[i] if i < len(request.request_ids) else ""
 
+                # Get images for this request
                 num_outputs = request.sampling_params.num_outputs_per_prompt
                 start_idx = output_idx
                 end_idx = start_idx + num_outputs
+                request_outputs = outputs[start_idx:end_idx] if output_idx < len(outputs) else []
                 output_idx = end_idx
 
                 if is_audio_output:
-                    # Slice batched tensor directly; batch dim is preserved.
                     request_audio_payload = outputs[start_idx:end_idx] if outputs is not None else None
                     results.append(
                         OmniRequestOutput.from_diffusion(
@@ -251,7 +283,6 @@ class DiffusionEngine:
                         ),
                     )
                 else:
-                    request_outputs = outputs[start_idx:end_idx] if start_idx < len(outputs) else []
                     mm_output = {}
                     if audio_payload is not None:
                         sliced_audio = audio_payload

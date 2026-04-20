@@ -3,11 +3,14 @@
 
 import queue
 import threading
+from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import NamedTuple
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from diffusers.utils import BaseOutput
 
 from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
@@ -55,6 +58,19 @@ def _make_step_output(
         finished=finished,
         result=DiffusionOutput(output=None, error=error) if error is not None else None,
     )
+
+
+class _FakeCudaTensor(torch.Tensor):
+    @staticmethod
+    def __new__(cls, value):
+        return torch.Tensor._make_subclass(cls, torch.as_tensor(value), require_grad=False)
+
+    @property
+    def device(self):
+        return torch.device("cuda")
+
+    def cpu(self):
+        return self.as_subclass(torch.Tensor).clone()
 
 
 def _make_step_request(
@@ -676,6 +692,106 @@ class TestStepScheduler:
             outputs[1].multimodal_output["audio"],
             torch.arange(6, 12, dtype=torch.float32).reshape(2, 3),
         )
+
+    def test_step_cpu_offload_moves_tuple_output_to_cpu(self) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = Mock(model_class_name="mock_image_model", enable_cpu_offload=True)
+        engine.pre_process_func = None
+        engine.add_req_and_wait_for_response = Mock(
+            return_value=DiffusionOutput(
+                output=(
+                    _FakeCudaTensor([1.0]),
+                    _FakeCudaTensor([2.0]),
+                ),
+            )
+        )
+
+        seen = {}
+
+        def post_process_func(output_data):
+            seen["output_data"] = output_data
+            return ["image"]
+
+        engine.post_process_func = post_process_func
+
+        with patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False):
+            outputs = engine.step(_make_request("cpu-offload-tuple"))
+
+        output_data = seen["output_data"]
+        assert type(output_data) is tuple
+        assert output_data[0].device.type == "cpu"
+        assert output_data[1].device.type == "cpu"
+        assert outputs[0].images == ["image"]
+
+    def test_step_cpu_offload_preserves_namedtuple_output_type(self) -> None:
+        class PipelineOutput(NamedTuple):
+            video: torch.Tensor
+            audio: torch.Tensor
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = Mock(model_class_name="mock_image_model", enable_cpu_offload=True)
+        engine.pre_process_func = None
+        engine.add_req_and_wait_for_response = Mock(
+            return_value=DiffusionOutput(
+                output=PipelineOutput(
+                    video=_FakeCudaTensor([1.0]),
+                    audio=_FakeCudaTensor([2.0]),
+                ),
+            )
+        )
+
+        seen = {}
+
+        def post_process_func(output_data):
+            seen["output_data"] = output_data
+            return ["image"]
+
+        engine.post_process_func = post_process_func
+
+        with patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False):
+            outputs = engine.step(_make_request("cpu-offload-namedtuple"))
+
+        output_data = seen["output_data"]
+        assert isinstance(output_data, PipelineOutput)
+        assert output_data.video.device.type == "cpu"
+        assert output_data.audio.device.type == "cpu"
+        assert outputs[0].images == ["image"]
+
+    def test_step_cpu_offload_preserves_base_output_type(self) -> None:
+        @dataclass
+        class PipelineOutput(BaseOutput):
+            sample: torch.Tensor
+            audio_sample: torch.Tensor | None = None
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.od_config = Mock(model_class_name="mock_image_model", enable_cpu_offload=True)
+        engine.pre_process_func = None
+        engine.add_req_and_wait_for_response = Mock(
+            return_value=DiffusionOutput(
+                output=PipelineOutput(
+                    sample=_FakeCudaTensor([1.0]),
+                    audio_sample=_FakeCudaTensor([2.0]),
+                ),
+            )
+        )
+
+        seen = {}
+
+        def post_process_func(output_data):
+            seen["output_data"] = output_data
+            return ["image"]
+
+        engine.post_process_func = post_process_func
+
+        with patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False):
+            outputs = engine.step(_make_request("cpu-offload-base-output"))
+
+        output_data = seen["output_data"]
+        assert isinstance(output_data, PipelineOutput)
+        assert output_data.sample.device.type == "cpu"
+        assert output_data.audio_sample is not None
+        assert output_data.audio_sample.device.type == "cpu"
+        assert outputs[0].images == ["image"]
 
     def test_step_reports_exec_and_total_time_with_correct_names(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
