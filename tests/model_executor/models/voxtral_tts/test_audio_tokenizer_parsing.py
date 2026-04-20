@@ -18,7 +18,6 @@ from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts import (
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-
 NUM_CODEBOOKS = 37
 
 

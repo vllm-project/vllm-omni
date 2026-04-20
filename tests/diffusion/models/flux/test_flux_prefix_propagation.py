@@ -15,7 +15,6 @@ import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
-
 # Standard dimensions for a minimal FLUX block
 _DIM = 64
 _HEADS = 2
