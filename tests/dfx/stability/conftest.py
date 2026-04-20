@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -43,6 +46,7 @@ RunOneBatchFn = Callable[
 ]
 
 _omni_server_lock = threading.Lock()
+_BUCKET_KEY_PATTERN = re.compile(r"^\(\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([^,]+)\s*\)$")
 
 
 def _normalize_bench_metrics(raw: dict[str, Any]) -> dict[str, Any]:
@@ -131,6 +135,73 @@ def _build_diffusion_cmd(
     return cmd
 
 
+def _sample_int_from_range_spec(value: Any, rng: random.Random) -> Any:
+    """Resolve one value that may be scalar or range spec into an int."""
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, (list, tuple)) and len(value) == 2 and all(isinstance(v, int) for v in value):
+        low, high = int(value[0]), int(value[1])
+        if low > high:
+            low, high = high, low
+        return rng.randint(low, high)
+
+    if isinstance(value, dict) and {"min", "max"} <= set(value):
+        low, high = int(value["min"]), int(value["max"])
+        if low > high:
+            low, high = high, low
+        return rng.randint(low, high)
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw.isdigit():
+            return int(raw)
+        if "-" in raw:
+            parts = [p.strip() for p in raw.split("-", 1)]
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                low, high = int(parts[0]), int(parts[1])
+                if low > high:
+                    low, high = high, low
+                return rng.randint(low, high)
+
+    return value
+
+
+def _sample_bucket_key(raw_key: str, rng: random.Random) -> str:
+    """Sample bucket tuple keys that use range syntax, e.g. ``(128-512, 128-512, 1)``."""
+    match = _BUCKET_KEY_PATTERN.match(raw_key.strip())
+    if not match:
+        return raw_key
+
+    sampled_parts: list[int] = []
+    for token in match.groups():
+        sampled = _sample_int_from_range_spec(token.strip(), rng)
+        if not isinstance(sampled, int):
+            return raw_key
+        sampled_parts.append(sampled)
+    return f"({sampled_parts[0]}, {sampled_parts[1]}, {sampled_parts[2]})"
+
+
+def _sample_stability_batch_params(params: dict[str, Any], batch_index: int) -> dict[str, Any]:
+    """Materialize per-batch random values for configured range fields."""
+    sampled = dict(params)
+    rng = random.Random(time.time_ns() + batch_index)
+
+    for field_name in ("random_input_len", "random_output_len", "random_mm_base_items_per_request"):
+        if field_name in sampled:
+            sampled[field_name] = _sample_int_from_range_spec(sampled[field_name], rng)
+
+    bucket_config = sampled.get("random_mm_bucket_config")
+    if isinstance(bucket_config, dict):
+        sampled_bucket_config: dict[str, float] = {}
+        for raw_key, probability in bucket_config.items():
+            sampled_key = _sample_bucket_key(str(raw_key), rng)
+            sampled_bucket_config[sampled_key] = sampled_bucket_config.get(sampled_key, 0.0) + float(probability)
+        sampled["random_mm_bucket_config"] = sampled_bucket_config
+
+    return sampled
+
+
 def _run_one_vllm_bench_batch(
     host: str,
     port: int,
@@ -156,6 +227,11 @@ def _run_one_vllm_bench_batch(
             "inf",
         ]
         flow = max_concurrency
+
+    # Print the exact per-batch benchmark CLI (randomized params are already materialized).
+    preview_cmd = ["vllm", "bench", "serve", "--omni", *args]
+    print(f"\n[Stability][Batch {_batch_index}] Benchmark command:")
+    print(shlex.join(preview_cmd))
 
     dataset_name = params.get("dataset_name", "random")
     old_benchmark_dir = os.environ.get("BENCHMARK_DIR")
@@ -351,11 +427,12 @@ def run_stability_benchmark_loop(
     while True:
         if (time.perf_counter() - start_time) >= duration_sec:
             break
+        sampled_params = _sample_stability_batch_params(params, batch_index)
         result = run_one_batch(
             host,
             port,
             model,
-            params,
+            sampled_params,
             num_prompts_per_batch,
             request_rate,
             max_concurrency,
