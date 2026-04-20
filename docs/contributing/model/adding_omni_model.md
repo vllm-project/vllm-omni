@@ -408,18 +408,17 @@ Understanding the data structures is crucial for implementing stage transitions:
 
 **Input to your function:**
 - `stage_list[source_stage_id].engine_outputs`: List of `EngineCoreOutput` objects
-  - Each contains `outputs`: List of `RequestOutput` objects
-  - Each `RequestOutput` has:
-    - `token_ids`: Generated token IDs
-    - `multimodal_output`: Dict with keys like `"code_predictor_codes"`, etc.
-      - These are the hidden states or intermediate outputs from the model's forward pass
-    - `prompt_token_ids`: Original prompt token IDs
+-   -  Each contains `outputs`: List of `RequestOutput` objects
+    - Each `RequestOutput` has:
+-   -  - `token_ids`: Generated token IDs
+       - `multimodal_output`: Dict with keys like `"code_predictor_codes"`, etc.These are the hidden states or intermediate outputs from the model's forward pass
+       - `prompt_token_ids`: Original prompt token IDs
 
 **Output from your function:**
 - Must return `list[OmniTokensPrompt]` where each `OmniTokensPrompt` contains:
-  - `prompt_token_ids`: List[int] - Token IDs for the next stage
-  - `additional_information`: Dict[str, Any] - Optional metadata (e.g., embeddings, hidden states)
-  - `multi_modal_data`: Optional multimodal data if needed
+-   - `prompt_token_ids`: List[int] - Token IDs for the next stage
+    - `additional_information`: Dict[str, Any] - Optional metadata (e.g., embeddings, hidden states)
+    - `multi_modal_data`: Optional multimodal data if needed
 
 ### How Model Outputs Are Stored
 
