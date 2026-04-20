@@ -194,7 +194,13 @@ def _sample_stability_batch_params(params: dict[str, Any], batch_index: int) -> 
     sampled = dict(params)
     rng = random.Random(time.time_ns() + batch_index)
 
-    for field_name in ("random_input_len", "random_output_len", "random_mm_base_items_per_request"):
+    for field_name in (
+        "random_input_len",
+        "random_output_len",
+        "random_mm_base_items_per_request",
+        "width",
+        "height",
+    ):
         if field_name in sampled:
             sampled[field_name] = _sample_int_from_range_spec(sampled[field_name], rng)
 
