@@ -179,6 +179,13 @@ def _sample_bucket_key(raw_key: str, rng: random.Random) -> str:
         if not isinstance(sampled, int):
             return raw_key
         sampled_parts.append(sampled)
+
+    # For video buckets (height>0 and num_frames>1), enforce even H/W to avoid
+    # ffmpeg yuv420p encoding/decoding failures ("Could not open video stream").
+    if sampled_parts[0] > 0 and sampled_parts[2] > 1:
+        sampled_parts[0] = max(2, sampled_parts[0] - (sampled_parts[0] % 2))
+        sampled_parts[1] = max(2, sampled_parts[1] - (sampled_parts[1] % 2))
+
     return f"({sampled_parts[0]}, {sampled_parts[1]}, {sampled_parts[2]})"
 
 
