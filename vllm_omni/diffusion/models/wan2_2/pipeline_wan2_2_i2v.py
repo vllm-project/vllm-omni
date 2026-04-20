@@ -23,8 +23,10 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import Dist
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
+from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     build_wan_scheduler,
     create_transformer_from_config,
@@ -41,29 +43,6 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 DEBUG_PERF = False
-
-
-def _load_model_index(model: str, local_files_only: bool) -> dict:
-    """Load model_index.json from local path or HF Hub."""
-    if local_files_only:
-        model_index_path = os.path.join(model, "model_index.json")
-        if os.path.exists(model_index_path):
-            import json
-
-            with open(model_index_path) as f:
-                return json.load(f)
-    else:
-        try:
-            import json
-
-            from huggingface_hub import hf_hub_download
-
-            model_index_path = hf_hub_download(model, "model_index.json")
-            with open(model_index_path) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
 
 
 def get_wan22_i2v_post_process_func(
@@ -196,7 +175,10 @@ class Wan22I2VPipeline(
         ]
 
         # Load model_index.json to detect available components
-        model_index = _load_model_index(model, local_files_only)
+        try:
+            model_index = _load_json(model, "model_index.json", local_files_only)
+        except Exception:
+            model_index = {}
 
         # Check if this is a two-stage model (MoE with transformer_2)
         self.has_transformer_2 = "transformer_2" in model_index
@@ -903,3 +885,16 @@ class Wan22I2VPipeline(
         """Load weights using AutoWeightsLoader for vLLM integration."""
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+
+# ---------------------------------------------------------------------------
+# DMD2-distilled variant
+# ---------------------------------------------------------------------------
+
+
+class WanI2VDMD2Pipeline(DMD2PipelineMixin, Wan22I2VPipeline):
+    """Wan 2.x I2V pipeline for FastGen DMD2-distilled models."""
+
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
+        super().__init__(od_config=od_config, prefix=prefix)
+        self.__init_dmd2__()
