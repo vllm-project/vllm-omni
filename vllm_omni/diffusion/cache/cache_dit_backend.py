@@ -67,6 +67,29 @@ def _build_db_cache_config(cache_config: Any) -> DBCacheConfig:
     )
 
 
+def enable_cache_for_ultraflux(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+    db_cache_config = _build_db_cache_config(cache_config)
+
+    calibrator = None
+    if cache_config.enable_taylorseer:
+        taylorseer_order = cache_config.taylorseer_order
+        calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
+        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
+
+    modifier = ParamsModifier(cache_config=db_cache_config, calibrator_config=calibrator)
+
+    transformer = pipeline.transformer
+    cache_dit.enable_cache(
+        BlockAdapter(
+            transformer=transformer,
+            blocks=[transformer.transformer_blocks, transformer.single_transformer_blocks],
+            forward_pattern=[ForwardPattern.Pattern_1, ForwardPattern.Pattern_1],
+            params_modifiers=[modifier],
+        ),
+        cache_config=db_cache_config,
+    )
+
+
 def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     """Enable cache-dit for Wan2.2 single or dual-transformer architecture.
 
@@ -1340,6 +1363,7 @@ CUSTOM_DIT_ENABLERS.update(
         "BagelPipeline": enable_cache_for_bagel,
         "GlmImagePipeline": enable_cache_for_glm_image,
         "Flux2Pipeline": enable_cache_for_flux2,
+        "UltraFluxPipeline": enable_cache_for_ultraflux,
     }
 )
 
