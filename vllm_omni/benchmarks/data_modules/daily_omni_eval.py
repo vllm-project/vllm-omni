@@ -5,7 +5,8 @@ Compares model ``generated_text`` to dataset ``Answer`` (A/B/C/D).
 **Alignment with open-source** (`Lliar-liar/Daily-Omni` ``test_model/.../testmodel.py``):
 
 - Answer extraction defaults to the same rules as ``extract_choice_letter`` (strip after an
-  ``assistant`` marker, then leading ``A``–``D``, else first ``\\b[A-D]\\b``). Set env
+  ``assistant`` marker, then leading ``A``–``D``, else ``\\b[A-D]\\b``, else a CJK-safe
+  non-letter-boundary pass). Set env
   ``DAILY_OMNI_EXTRACT_MODE=relaxed`` to use the older vLLM-Omni heuristics (last ``answer:``,
   tail scan, etc.).
 - Overall accuracy comparable to the official script uses **successful HTTP responses only** as
@@ -52,6 +53,16 @@ def extract_choice_letter_official(text: str | None) -> str | None:
     fallback = re.search(r"\b([A-D])\b", candidate.upper())
     if fallback:
         return fallback.group(1)
+    # ``\b`` is ASCII/Latin-word-centric; CJK (e.g. "选B", "答案：B") has no boundary before B.
+    loose = list(
+        re.finditer(
+            r"(?:[^A-Za-z]|^)([A-D])(?:[^A-Za-z]|$)",
+            candidate,
+            flags=re.IGNORECASE,
+        )
+    )
+    if loose:
+        return loose[-1].group(1).upper()
     return None
 
 
