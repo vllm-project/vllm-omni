@@ -30,25 +30,6 @@ _TOKENIZER_SUBFOLDER_MAP: dict[str, str] = {
 }
 
 
-def _apply_stage_specific_hf_overrides(engine_args: "OmniEngineArgs") -> None:
-    """Inject HF config overrides required by stage-specific wrappers.
-
-    Some Omni stages intentionally reuse a checkpoint config whose default text
-    metadata does not reflect the stage runtime semantics. For example,
-    ``Qwen3TTSCode2Wav`` is a pure waveform decoder wrapper, but recent vLLM
-    validates ``max_model_len`` against the config's derived text length.
-    Mirror the stage max length into ``hf_overrides`` so ModelConfig creation
-    doesn't incorrectly reject the stage.
-    """
-    if not isinstance(engine_args.hf_overrides, dict):
-        return
-
-    if engine_args.model_arch == "Qwen3TTSCode2Wav" and engine_args.max_model_len is not None:
-        talker_overrides = engine_args.hf_overrides.setdefault("talker_config", {})
-        if isinstance(talker_overrides, dict):
-            talker_overrides.setdefault("max_position_embeddings", int(engine_args.max_model_len))
-
-
 def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
@@ -240,7 +221,12 @@ class OmniEngineArgs(EngineArgs):
                     if model_type is not None:
                         self.hf_overrides.setdefault("model_type", model_type)
 
-            _apply_stage_specific_hf_overrides(self)
+                # Stage wrappers (e.g. Code2Wav) may need max_model_len larger
+                # than the base checkpoint's text max_position_embeddings.
+                if self.model_arch == "Qwen3TTSCode2Wav" and self.max_model_len is not None:
+                    self.hf_overrides.setdefault("talker_config", {}).setdefault(
+                        "max_position_embeddings", int(self.max_model_len)
+                    )
 
             # For models whose HF config.json is empty or lacks model_type
             # (e.g. CosyVoice3), AutoConfig.from_pretrained fails because it
