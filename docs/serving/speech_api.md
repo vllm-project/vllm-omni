@@ -5,6 +5,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-*`) -- Qwen3-based TTS with CustomVoice, VoiceDesign, and Base (voice cloning) task types. Output: 24 kHz.
 - **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
+- **Voxtream2** (`herimor/voxtream2`) -- TTS through the Voxtream2 generator. Supports voice cloning via reference audio. Output: 24 kHz.
 
 Each server instance runs a single model (specified at startup via `vllm serve <model> --omni`).
 
@@ -33,6 +34,15 @@ vllm-omni serve fishaudio/s2-pro \
 # Voxtral TTS
 vllm serve mistralai/Voxtral-4B-TTS-2603 \
     --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
+    --omni \
+    --port 8091 \
+    --trust-remote-code \
+    --enforce-eager
+
+# Voxtream2
+VLLM_WORKER_MULTIPROC_METHOD=spawn VOXTREAM2_ROOT=voxtream \
+  vllm serve herimor/voxtream2 \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/voxtream2_1stage.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
@@ -553,6 +563,26 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 | Model | Description |
 |-------|-------------|
 | `mistralai/Voxtral-4B-TTS-2603` | 3B AR + FlowMatching TTS. Supports text-to-speech with preset voices. |
+
+### Voxtream2
+
+| Model | Description |
+|-------|-------------|
+| `herimor/voxtream2` | Voxtream2 TTS. Requires `ref_audio` for voice cloning and reads generator settings from `voxtream/configs/generator.json`. |
+
+Example request with a local reference audio file under `VOXTREAM2_ROOT`:
+
+```bash
+REF_AUDIO="$(pwd)/voxtream/assets/audio/english_female.wav"
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d "{
+        \"input\": \"This is a Voxtream2 online serving example.\",
+        \"ref_audio\": \"file://${REF_AUDIO}\"
+    }" --output voxtream2.wav
+```
+
+`ref_audio` may be an HTTP URL, a base64 data URL, or a local `file://` URI under `VOXTREAM2_ROOT`. To allow reference audio outside the Voxtream checkout, set `VOXTREAM2_ALLOWED_LOCAL_MEDIA_PATH=/absolute/path/to/reference/audio/root`. Streaming responses (`stream=true`) are not supported for Voxtream2 yet; use the default non-streaming request.
 
 ## Error Responses
 

@@ -1,0 +1,37 @@
+# Voxtream2 1-stage pipeline.
+# Current limitation: this runs voxtream.SpeechGenerator end-to-end and
+# returns final audio from one vLLM-Omni stage.
+async_chunk: false
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: voxtream2
+      model_arch: Voxtream2ForConditionalGeneration
+      worker_type: generation
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      skip_tokenizer_init: true
+      async_scheduling: false
+      enable_prefix_caching: false
+      engine_output_type: audio
+      gpu_memory_utilization: 0.6
+      distributed_executor_backend: "mp"
+      max_num_seqs: 1
+      max_num_batched_tokens: 4096
+      max_model_len: 4096
+      skip_mm_profiling: true
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: true

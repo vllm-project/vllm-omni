@@ -2261,6 +2261,33 @@ class TestTTSAsyncOffloading:
         yield server
         server.shutdown()
 
+    @pytest.fixture
+    def voxtream2_server(self, mocker: MockerFixture, tmp_path: Path):
+        mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.model_config = mocker.MagicMock(model="herimor/voxtream2")
+        mock_engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=1)]
+        mock_engine_client.tts_batch_max_items = 32
+        mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+        mock_engine_client.tts_max_instructions_length = None
+        mock_engine_client.stage_configs = [
+            SimpleNamespace(
+                engine_args=SimpleNamespace(model_stage="voxtream2"),
+                tts_args={},
+            )
+        ]
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+        server.uploaded_speakers_dir = tmp_path
+        yield server
+        server.shutdown()
+
     def test_prepare_speech_generation_awaits_voxtral_async(self, voxtral_server, mocker: MockerFixture):
         """Voxtral path in _prepare_speech_generation should call the async wrapper."""
         voxtral_server._build_voxtral_prompt_async = mocker.AsyncMock(
@@ -2284,6 +2311,61 @@ class TestTTSAsyncOffloading:
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
         qwen3_tts_server._build_tts_params.assert_called_once()
         qwen3_tts_server._estimate_prompt_len_async.assert_awaited_once()
+
+    def test_prepare_speech_generation_builds_voxtream2_prompt(self, voxtream2_server, mocker: MockerFixture):
+        """Voxtream2 path should pass text and a resolved ref-audio path to Omni."""
+        voxtream2_server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.0] * 24000, 24000))
+        request = OpenAICreateSpeechRequest(input="hello voxtream", ref_audio="data:audio/wav;base64,AAAA")
+
+        request_id, generator, tts_params = asyncio.run(voxtream2_server._prepare_speech_generation(request))
+
+        assert request_id.startswith("speech-")
+        assert generator == "generator"
+        tmp_path = Path(tts_params["_voxtream2_temp_ref_audio_path"])
+        assert tmp_path.exists()
+
+        prompt = voxtream2_server.engine_client.generate.call_args.kwargs["prompt"]
+        assert prompt["additional_information"]["text"] == ["hello voxtream"]
+        assert prompt["additional_information"]["ref_audio_path"] == str(tmp_path)
+        assert len(prompt["prompt_token_ids"]) >= 64
+
+        tmp_path.unlink(missing_ok=True)
+
+    def test_prepare_speech_generation_accepts_voxtream2_file_under_root(
+        self, voxtream2_server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
+    ):
+        voxtream_root = tmp_path / "voxtream"
+        audio_dir = voxtream_root / "assets" / "audio"
+        audio_dir.mkdir(parents=True)
+        ref_audio = audio_dir / "english_female.wav"
+        ref_audio.write_bytes(b"not-a-real-wav")
+        monkeypatch.setenv("VOXTREAM2_ROOT", str(voxtream_root))
+        voxtream2_server._resolve_ref_audio = mocker.AsyncMock()
+
+        request = OpenAICreateSpeechRequest(input="hello voxtream", ref_audio=ref_audio.as_uri())
+        _, _, tts_params = asyncio.run(voxtream2_server._prepare_speech_generation(request))
+
+        voxtream2_server._resolve_ref_audio.assert_not_awaited()
+        assert "_voxtream2_temp_ref_audio_path" not in tts_params
+        prompt = voxtream2_server.engine_client.generate.call_args.kwargs["prompt"]
+        assert prompt["additional_information"]["ref_audio_path"] == str(ref_audio.resolve())
+
+    def test_prepare_speech_generation_rejects_voxtream2_file_outside_root(
+        self, voxtream2_server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        voxtream_root = tmp_path / "voxtream"
+        voxtream_root.mkdir()
+        ref_audio = tmp_path / "outside.wav"
+        ref_audio.write_bytes(b"not-a-real-wav")
+        monkeypatch.setenv("VOXTREAM2_ROOT", str(voxtream_root))
+
+        request = OpenAICreateSpeechRequest(input="hello voxtream", ref_audio=ref_audio.as_uri())
+        with pytest.raises(ValueError, match="configured media roots"):
+            asyncio.run(voxtream2_server._prepare_speech_generation(request))
+
+    def test_validate_voxtream2_requires_ref_audio(self, voxtream2_server):
+        request = OpenAICreateSpeechRequest(input="hello")
+        assert "ref_audio" in voxtream2_server._validate_tts_request(request)
 
     def test_shutdown_is_idempotent(self, mocker: MockerFixture):
         """Calling shutdown() twice should not raise."""

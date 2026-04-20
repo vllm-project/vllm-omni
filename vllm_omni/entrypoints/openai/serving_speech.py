@@ -51,6 +51,7 @@ _COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
 _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
 _VOXCPM_TTS_MODEL_STAGES = {"latent_generator", "vae"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
+_VOXTREAM2_TTS_MODEL_STAGES = {"voxtream2"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -59,6 +60,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _OMNIVOICE_TTS_MODEL_STAGES
     | _VOXCPM_TTS_MODEL_STAGES
     | _VOXCPM2_TTS_MODEL_STAGES
+    | _VOXTREAM2_TTS_MODEL_STAGES
 )
 _TTS_LANGUAGES: set[str] = {
     "Auto",
@@ -291,6 +293,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "voxcpm2"
         if model_arch == "VoxCPMForConditionalGeneration":
             return "voxcpm"
+        if model_stage in _VOXTREAM2_TTS_MODEL_STAGES:
+            return "voxtream2"
         if model_stage in _QWEN3_TTS_MODEL_STAGES:
             return "qwen3_tts"
         if model_stage in _VOXTRAL_TTS_MODEL_STAGES:
@@ -332,6 +336,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Load supported speakers (case-insensitive) from the model configuration."""
         try:
             if self._tts_model_type == "voxcpm":
+                return set()
+            if self._tts_model_type == "voxtream2":
                 return set()
             if self._tts_model_type == "voxtral_tts":
                 config = self.engine_client.model_config.hf_config.audio_config
@@ -831,6 +837,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_voxcpm_request(request)
         if self._tts_model_type == "voxcpm2":
             return None  # VoxCPM2 accepts any text input
+        if self._tts_model_type == "voxtream2":
+            return self._validate_voxtream2_request(request)
         return self._validate_qwen_tts_request(request)
 
     def _voxcpm2_encode(self, text: str) -> list[int]:
@@ -888,6 +896,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
 
         return None
+
+    def _validate_voxtream2_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate Voxtream2 request parameters."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+        if request.ref_audio is None:
+            return "Voxtream2 requires 'ref_audio' (reference audio for voice cloning)"
+        fmt_err = self._validate_ref_audio_format(request.ref_audio)
+        if fmt_err:
+            return fmt_err
+        if request.stream:
+            return "Voxtream2 online serving currently supports non-streaming speech requests only"
 
     def _validate_voxcpm_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate VoxCPM request parameters. Returns error message or None."""
@@ -1495,6 +1515,35 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             },
         }
 
+    async def _build_voxtream2_prompt(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Build prompt for Voxtream2.
+
+        Voxtream2 expects a reference-audio file path. The OpenAI API accepts
+        URLs, data URIs, and local file URIs. For local files, allow only files
+        under configured media roots or Voxtream roots because top-level
+        ``--allowed-local-media-path`` is ignored when stage YAML is used.
+        """
+        from vllm_omni.model_executor.models.voxtream2.voxtream2_utils import (
+            build_voxtream2_prompt,
+            prepare_voxtream2_ref_audio_path,
+        )
+
+        model_config = None if self._diffusion_mode else getattr(self, "model_config", None)
+        ref_audio_path, tmp_path = await prepare_voxtream2_ref_audio_path(
+            request.ref_audio,
+            resolve_ref_audio=self._resolve_ref_audio,
+            uploaded_speakers_dir=self.uploaded_speakers_dir,
+            allowed_local_media_path=getattr(model_config, "allowed_local_media_path", None),
+        )
+        tts_params: dict[str, Any] = {}
+        if tmp_path is not None:
+            tts_params["_voxtream2_temp_ref_audio_path"] = tmp_path
+
+        return build_voxtream2_prompt(request.input, ref_audio_path), tts_params
+
     # ---- Common speech generation helpers ----
 
     async def _prepare_speech_generation(
@@ -1556,6 +1605,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             elif self._tts_model_type == "cosyvoice3":
                 prompt = await self._build_cosyvoice3_prompt(request)
                 tts_params = {}
+            elif self._tts_model_type == "voxtream2":
+                prompt, tts_params = await self._build_voxtream2_prompt(request)
             else:
                 tts_params = self._build_tts_params(request)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
@@ -1670,16 +1721,29 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         async for chunk in self._generate_pcm_chunks(generator, request_id):
             yield chunk
 
+    @staticmethod
+    def _cleanup_temp_ref_audio(tts_params: dict[str, Any]) -> None:
+        tmp_ref_audio_path = tts_params.get("_voxtream2_temp_ref_audio_path")
+        if not tmp_ref_audio_path:
+            return
+        try:
+            Path(tmp_ref_audio_path).unlink(missing_ok=True)
+        except Exception:
+            logger.debug("Failed to remove temporary Voxtream2 ref audio %s", tmp_ref_audio_path, exc_info=True)
+
     async def _generate_audio_bytes(
         self,
         request: OpenAICreateSpeechRequest,
         base64_encode: bool = False,
     ) -> tuple[bytes | str, str]:
-        request_id, generator, _ = await self._prepare_speech_generation(request)
+        request_id, generator, tts_params = await self._prepare_speech_generation(request)
 
-        final_output: OmniRequestOutput | None = None
-        async for res in generator:
-            final_output = res
+        try:
+            final_output: OmniRequestOutput | None = None
+            async for res in generator:
+                final_output = res
+        finally:
+            self._cleanup_temp_ref_audio(tts_params)
 
         if final_output is None:
             raise ValueError("No output generated from the model.")
