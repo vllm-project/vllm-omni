@@ -26,8 +26,9 @@ from pathlib import Path
 import pytest
 from vllm.assets.image import ImageAsset
 
-from tests.conftest import OmniRunner, modify_stage_config
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import modify_stage_config
 
 MODEL_NAME = "ByteDance-Seed/BAGEL-7B-MoT"
 STAGE_CONFIG = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")

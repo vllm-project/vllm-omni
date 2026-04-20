@@ -14,7 +14,7 @@ import httpx
 import pytest
 from PIL import Image, ImageDraw
 
-from tests.conftest import OmniServer, OmniServerParams
+from tests.helpers.runtime import OmniServer, OmniServerParams
 
 MODEL = "black-forest-labs/FLUX.2-klein-4B"
 

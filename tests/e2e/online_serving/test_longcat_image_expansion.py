@@ -13,13 +13,8 @@ This validates:
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-    dummy_messages_from_mix_data,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
 TEXT_TO_IMAGE_PROMPT = (
     "A cinematic illustration of a cat typing on a silver laptop, soft window light, highly detailed."

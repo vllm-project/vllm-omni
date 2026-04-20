@@ -17,8 +17,9 @@ import struct
 import httpx
 import pytest
 
-from tests.conftest import OmniServer
-from tests.utils import get_deploy_config_path, hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServer
+from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL_BASE = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 MODEL_BASE_1_7B = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"

@@ -28,7 +28,7 @@ and can be placed on different devices. Qwen3-TTS has two stages:
 
 Each stage is a separate model class configured independently via YAML. The two stages
 are connected by the `async_chunk` framework, which enables inter-stage streaming for
-low first-packet latency (see [Async Chunk Design](../../design/feature/async_chunk_design.md)).
+low first-packet latency (see [Async Chunk Design](../../design/feature/async_chunk.md)).
 
 ### Without async_chunk (batch mode)
 
@@ -591,5 +591,5 @@ Adding a TTS model to vLLM-Omni involves:
 For more information, see:
 
 - [Architecture Overview](../../design/architecture_overview.md)
-- [Async Chunk Design](../../design/feature/async_chunk_design.md)
+- [Async Chunk Design](../../design/feature/async_chunk.md)
 - [Stage Configuration Guide](../../configuration/stage_configs.md)

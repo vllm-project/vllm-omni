@@ -4,13 +4,13 @@ E2E tests for Qwen2.5-Omni model with mixed modality inputs, audio and text outp
 
 import pytest
 
-from tests.conftest import (
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import (
     generate_synthetic_audio,
     generate_synthetic_image,
     generate_synthetic_video,
-    modify_stage_config,
 )
-from tests.utils import get_deploy_config_path, hardware_test
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen2.5-Omni-7B"]

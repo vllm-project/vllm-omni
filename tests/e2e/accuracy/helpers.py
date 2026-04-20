@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from pathlib import Path
 
 import numpy as np
@@ -7,6 +5,20 @@ import pytest
 import torch
 from PIL import Image
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+
+
+def reset_artifact_dir(path: Path) -> Path:
+    import shutil
+
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def infer_model_label(model: str) -> str:
+    label = Path(model.rstrip("/\\")).name or "model"
+    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in label)
 
 
 def model_output_dir(parent_dir: Path, model: str) -> Path:
