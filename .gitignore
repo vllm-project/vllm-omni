@@ -203,6 +203,7 @@ checkpoints/
 # Cache directories
 cache/
 !vllm_omni/diffusion/cache/
+!tests/diffusion/cache/
 .cache/
 diffusion_cache/
 kv_cache/
@@ -262,3 +263,5 @@ tmp_test
 vllm_omni/_version.py
 # output files
 *.wav
+# CI overlay yamls materialized from tests/utils.py:_CI_OVERLAYS at test time
+tests/.ci_generated/

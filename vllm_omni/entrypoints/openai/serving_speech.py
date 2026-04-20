@@ -216,6 +216,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "Re-upload voices after each restart if needed."
         )
         self._tts_tokenizer = None
+        self._voxcpm2_tokenizer = None
+        self._voxcpm2_split_map: dict[int, list[int]] = {}
 
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
 
@@ -454,6 +456,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             logger.warning("Failed to estimate Fish Speech prompt length, using fallback 2048: %s", e)
             return 2048
+
+    async def _build_voxcpm2_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Build prefill prompt for VoxCPM2 TTS (`prompt_token_ids` padded to full prefill length)."""
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import build_voxcpm2_prompt
+
+        self._voxcpm2_encode("")  # lazy-init tokenizer + split_map
+        ref_audio = None
+        ref_sr = None
+        if request.ref_audio is not None:
+            ref_audio, ref_sr = await self._resolve_ref_audio(request.ref_audio)
+        return build_voxcpm2_prompt(
+            hf_config=self.engine_client.model_config.hf_config,
+            tokenizer=self._voxcpm2_tokenizer,
+            split_map=self._voxcpm2_split_map,
+            text=request.input,
+            ref_audio=ref_audio,
+            ref_sr=ref_sr,
+            ref_text=request.ref_text,
+        )
 
     def _get_uploaded_audio_data(self, voice_name: str) -> str | None:
         """Get base64 encoded audio data for uploaded voice."""
@@ -811,6 +832,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self._tts_model_type == "voxcpm2":
             return None  # VoxCPM2 accepts any text input
         return self._validate_qwen_tts_request(request)
+
+    def _voxcpm2_encode(self, text: str) -> list[int]:
+        """Tokenize text for VoxCPM2, splitting multichar Chinese tokens."""
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
+            build_cjk_split_map,
+            split_multichar_chinese,
+        )
+
+        if self._voxcpm2_tokenizer is None:
+            from transformers import AutoTokenizer
+
+            model_name = self.engine_client.model_config.model
+            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            self._voxcpm2_split_map = build_cjk_split_map(tokenizer)
+            self._voxcpm2_tokenizer = tokenizer
+            logger.info("VoxCPM2 serving: built multichar split map (%d entries)", len(self._voxcpm2_split_map))
+
+        ids = self._voxcpm2_tokenizer.encode(text, add_special_tokens=True)
+        return split_multichar_chinese(ids, self._voxcpm2_split_map)
 
     def _validate_ref_audio_format(self, ref_audio: str) -> str | None:
         """Validate ref_audio is a supported URI format. Returns error or None."""
@@ -1503,14 +1543,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.instructions:
                 prompt["instruct"] = request.instructions
         elif self._tts_model_type == "voxcpm2":
+            prompt = await self._build_voxcpm2_prompt(request)
             tts_params = {}
-            additional: dict[str, Any] = {}
-            if request.ref_audio is not None:
-                wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
-                additional["reference_audio"] = [[wav_list, sr]]
-            prompt = {"prompt": request.input}
-            if additional:
-                prompt["additional_information"] = additional
         elif self._is_tts:
             validation_error = self._validate_tts_request(request)
             if validation_error:
