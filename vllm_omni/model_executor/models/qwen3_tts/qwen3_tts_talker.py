@@ -23,6 +23,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, WeightsMapper, maybe_prefix
+from vllm.multimodal.audio import AudioResampler
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -1094,9 +1095,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Resample to 24kHz for speaker encoder.
         target_sr = int(getattr(self.config.speaker_encoder_config, "sample_rate", 24000))
         if sr != target_sr:
-            from vllm.multimodal.audio import resample_audio_resampy
-
-            wav = resample_audio_resampy(wav.astype(np.float32), orig_sr=int(sr), target_sr=target_sr)
+            resampler = AudioResampler(target_sr=target_sr)
+            wav = resampler.resample(wav.astype(np.float32), orig_sr=int(sr))
             sr = target_sr
 
         # Follow official implementation: mel_spectrogram expects 24kHz.

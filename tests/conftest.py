@@ -1,3 +1,4 @@
+import atexit
 import base64
 import datetime
 import io
@@ -46,6 +47,7 @@ from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_port
 
+from vllm_omni.config.stage_config import resolve_deploy_yaml
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -167,7 +169,6 @@ def assert_audio_diffusion_response(
     Validate audio diffusion response.
     """
     raise NotImplementedError("Audio validation is not implemented yet")
-    # consider using assert_audio_valid defined above
 
 
 def _maybe_int(value: Any) -> int | None:
@@ -277,15 +278,32 @@ def assert_video_valid(
                 pass
 
 
-def assert_audio_valid(path: Path, *, sample_rate: int, channels: int, duration_s: float) -> None:
-    """Assert the WAV has the expected sample rate, channel count, and duration."""
+def assert_audio_valid(
+    audio_or_path: Path | np.ndarray,
+    *,
+    sample_rate: int,
+    channels: int,
+    duration_s: float,
+) -> None:
+    """Assert WAV file or (batch, channels, samples) ndarray matches expected audio format."""
+    expected_samples = int(duration_s * sample_rate)
+    if isinstance(audio_or_path, np.ndarray):
+        audio = audio_or_path
+        assert audio.ndim == 3, f"Expected audio ndim=3 (batch, channels, samples), got shape {audio.shape}"
+        assert audio.shape[0] == 1, f"Expected batch size 1, got {audio.shape[0]}"
+        assert audio.shape[1] == channels, f"Expected {channels} channels, got {audio.shape[1]}"
+        assert audio.shape[2] == expected_samples, (
+            f"Expected {expected_samples} samples ({duration_s}s @ {sample_rate} Hz), got {audio.shape[2]}"
+        )
+        return
+
+    path = audio_or_path
     assert path.exists(), f"Audio not found: {path}"
     info = sf.info(str(path))
     assert info.samplerate == sample_rate, f"Expected sample_rate={sample_rate}, got {info.samplerate}"
     assert info.channels == channels, f"Expected {channels} channel(s), got {info.channels}"
-    expected_frames = int(duration_s * sample_rate)
-    assert info.frames == expected_frames, (
-        f"Expected {expected_frames} frames ({duration_s}s @ {sample_rate} Hz), got {info.frames}"
+    assert info.frames == expected_samples, (
+        f"Expected {expected_samples} frames ({duration_s}s @ {sample_rate} Hz), got {info.frames}"
     )
 
 
@@ -1322,12 +1340,14 @@ def modify_stage_config(
         else:
             print(f"Path {path} does not exist")
 
+    _stage_key = "stages" if "stages" in config else "stage_args"
+
     # Apply deletions first
     if deletes:
         for key, value in deletes.items():
-            if key == "stage_args":
+            if key in ("stage_args", "stages"):
                 if value and isinstance(value, dict):
-                    stage_args = config.get("stage_args", [])
+                    stage_args = config.get(_stage_key, [])
                     if not stage_args:
                         raise ValueError("stage_args does not exist in config")
 
@@ -1346,9 +1366,10 @@ def modify_stage_config(
                             continue
 
                         # Delete specified paths in this stage
-                        for path in delete_paths:
-                            if path:  # Skip empty paths
-                                delete_by_path(target_stage, path)
+                        # Avoid shadowing the original YAML Path used for the output filename below.
+                        for delete_path in delete_paths:
+                            if delete_path:  # Skip empty paths
+                                delete_by_path(target_stage, delete_path)
             elif "." in key:
                 # Delete using dot-separated path
                 delete_by_path(config, key)
@@ -1359,9 +1380,9 @@ def modify_stage_config(
     # Apply updates
     if updates:
         for key, value in updates.items():
-            if key == "stage_args":
+            if key in ("stage_args", "stages"):
                 if value and isinstance(value, dict):
-                    stage_args = config.get("stage_args", [])
+                    stage_args = config.get(_stage_key, [])
                     if not stage_args:
                         raise ValueError("stage_args does not exist in config")
 
@@ -1378,15 +1399,15 @@ def modify_stage_config(
                             raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
 
                         # Apply updates to this stage
-                        for path, val in stage_updates.items():
+                        for update_path, val in stage_updates.items():
                             # Check if this is a simple key (not dot-separated)
                             # Example: 'engine_input_source' vs 'engine_args.max_model_len'
-                            if "." not in path:
+                            if "." not in update_path:
                                 # Direct key assignment (e.g., updating a list value)
-                                target_stage[path] = val
+                                target_stage[update_path] = val
                             else:
                                 # Dot-separated path (e.g., nested dict access)
-                                apply_update(target_stage, path, val)
+                                apply_update(target_stage, update_path, val)
             elif "." in key:
                 # Apply using dot-separated path
                 apply_update(config, key, value)
@@ -1398,13 +1419,14 @@ def modify_stage_config(
     # within the same second (e.g. test_qwen3_omni_expansion imports both
     # get_chunk_config and get_batch_token_config). int(time.time()) would collide
     # and the later write would overwrite the earlier YAML on disk.
-    base_name = yaml_path.rsplit(".", 1)[0] if "." in yaml_path else yaml_path
-    output_path = f"{base_name}_{time.time_ns()}.yaml"
+    # Keep generated configs outside the repo and delete them when pytest exits.
+    output_fd, output_path = tempfile.mkstemp(prefix=f"{path.stem}_", suffix=".yaml")
+    atexit.register(Path(output_path).unlink, missing_ok=True)
 
-    with open(output_path, "w", encoding="utf-8") as f:
+    with os.fdopen(output_fd, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=None, sort_keys=False, allow_unicode=True, indent=2)
 
-    return output_path
+    return str(output_path)
 
 
 class OmniServer:
@@ -1566,32 +1588,46 @@ class OmniServerStageCli(OmniServer):
         self.stage_config_path = stage_config_path
         self.master_port = get_open_port()
         self.visible_device_list = self._load_visible_device_list(env_dict)
-        self.stage_runtime_devices = self._load_stage_runtime_devices(stage_config_path)
-        self.stage_ids = stage_ids or self._load_stage_ids(stage_config_path)
+        resolved_cfg = resolve_deploy_yaml(stage_config_path)
+        # Dump the resolved deploy config so CI logs show each stage's
+        # gpu_memory_utilization / max_model_len / max_num_seqs after
+        # base_config inheritance and overlay merge — essential when
+        # diagnosing OOMs that depend on the merged values.
+        print(
+            f"[OmniServerStageCli] Resolved deploy config from {stage_config_path}:\n"
+            f"{yaml.safe_dump(resolved_cfg, sort_keys=False, default_flow_style=False)}",
+            flush=True,
+        )
+        self.stage_runtime_devices = self._load_stage_runtime_devices(resolved_cfg)
+        self.stage_ids = stage_ids or self._load_stage_ids(resolved_cfg)
         if 0 not in self.stage_ids:
             raise ValueError(f"Stage CLI test requires stage_id=0 in config: {stage_config_path}")
         self.stage_procs: dict[int, subprocess.Popen] = {}
         self.proc = None
 
     @staticmethod
-    def _load_stage_ids(stage_config_path: str) -> list[int]:
-        with open(stage_config_path, encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
+    def _stage_entries(cfg: dict) -> list[dict]:
+        """Return the list of stage entries from either legacy (``stage_args``)
+        or new-schema (``stages``) deploy YAMLs."""
+        return cfg.get("stage_args") or cfg.get("stages") or []
 
-        stage_ids = [stage["stage_id"] for stage in cfg.get("stage_args", []) if "stage_id" in stage]
+    @staticmethod
+    def _load_stage_ids(resolved_config: dict) -> list[int]:
+        stage_ids = [
+            stage["stage_id"] for stage in OmniServerStageCli._stage_entries(resolved_config) if "stage_id" in stage
+        ]
         if not stage_ids:
-            raise ValueError(f"No stage IDs found in config: {stage_config_path}")
+            raise ValueError("No stage IDs found in resolved config")
         return stage_ids
 
     @staticmethod
-    def _load_stage_runtime_devices(stage_config_path: str) -> dict[int, str]:
-        with open(stage_config_path, encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-
+    def _load_stage_runtime_devices(resolved_config: dict) -> dict[int, str]:
         runtime_devices: dict[int, str] = {}
-        for stage in cfg.get("stage_args", []):
+        for stage in OmniServerStageCli._stage_entries(resolved_config):
             stage_id = stage.get("stage_id")
-            devices = stage.get("runtime", {}).get("devices")
+            # New schema: stage.devices is flat at stage level.
+            # Legacy schema: stage.runtime.devices is nested.
+            devices = stage.get("devices") or stage.get("runtime", {}).get("devices")
             if stage_id is not None and devices:
                 runtime_devices[int(stage_id)] = str(devices)
         return runtime_devices
@@ -1677,10 +1713,21 @@ class OmniServerStageCli(OmniServer):
 
         cmd = self._build_stage_cmd(stage_id, headless=headless)
         print(f"Launching OmniServerStageCli stage {stage_id}: {' '.join(cmd)}")
+        # Capture each subprocess's stdout+stderr to a per-stage log file so
+        # debugging "Stage N exited before API server ready" doesn't rely on
+        # guessing; the file is surfaced in the RuntimeError message.
+        log_path = Path(tempfile.gettempdir()) / f"omni_stage_{stage_id}_{self.master_port}.log"
+        self._stage_log_paths = getattr(self, "_stage_log_paths", {})
+        self._stage_log_paths[stage_id] = log_path
+        log_fh = open(log_path, "w", buffering=1)  # noqa: SIM115 - closed in __exit__
+        self._stage_log_files = getattr(self, "_stage_log_files", {})
+        self._stage_log_files[stage_id] = log_fh
         proc = subprocess.Popen(
             cmd,
             env=env,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
         )
         self.stage_procs[stage_id] = proc
         if stage_id == 0:
@@ -1690,7 +1737,18 @@ class OmniServerStageCli(OmniServer):
         for stage_id, proc in self.stage_procs.items():
             ret = proc.poll()
             if ret is not None:
-                raise RuntimeError(f"Stage {stage_id} exited with code {ret} before API server became ready.")
+                log_path = getattr(self, "_stage_log_paths", {}).get(stage_id)
+                tail = ""
+                if log_path and log_path.exists():
+                    try:
+                        with open(log_path, encoding="utf-8", errors="replace") as f:
+                            lines = f.readlines()
+                        tail = "\n=== Last 60 lines of stage {} log ({}) ===\n{}".format(
+                            stage_id, log_path, "".join(lines[-60:]) or "<empty>"
+                        )
+                    except Exception as exc:  # pragma: no cover - diagnostic only
+                        tail = f"\n<failed to read stage log {log_path}: {exc}>"
+                raise RuntimeError(f"Stage {stage_id} exited with code {ret} before API server became ready.{tail}")
 
     def _start_server(self) -> None:
         ordered_stage_ids = [0, *[stage_id for stage_id in self.stage_ids if stage_id != 0]]
@@ -1716,7 +1774,46 @@ class OmniServerStageCli(OmniServer):
 
         raise RuntimeError(f"OmniServerStageCli failed to start within {max_wait} seconds")
 
+    def _dump_stage_logs_for_debug(self, head_lines: int = 300, tail_lines: int = 500) -> None:
+        """Tail each stage's subprocess log back to stdout on teardown.
+
+        Stage subprocesses redirect stdout/stderr to ``/tmp/omni_stage_*.log``
+        so we don't spam the main CI stream while tests run; but that also
+        hides engine init (KV cache size, Available KV cache memory, vLLM
+        engine config) when things go wrong. Dump them here so buildkite
+        captures them post-run. Head covers engine init; tail covers
+        whatever state the stage was in when it was torn down.
+        """
+        log_paths = getattr(self, "_stage_log_paths", {}) or {}
+        for stage_id in sorted(log_paths):
+            log_path = log_paths[stage_id]
+            if not log_path or not log_path.exists():
+                continue
+            try:
+                with open(log_path, encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+            except Exception as exc:  # pragma: no cover - diagnostic only
+                print(f"[OmniServerStageCli] stage {stage_id} log read failed: {exc}", flush=True)
+                continue
+            total = len(lines)
+            if total <= head_lines + tail_lines:
+                head_chunk = lines
+                tail_chunk = []
+                elided = 0
+            else:
+                head_chunk = lines[:head_lines]
+                tail_chunk = lines[-tail_lines:]
+                elided = total - head_lines - tail_lines
+            print(f"\n=== stage {stage_id} log HEAD ({log_path}) ===", flush=True)
+            print("".join(head_chunk).rstrip("\n"), flush=True)
+            if tail_chunk:
+                print(f"\n... [{elided} lines elided] ...", flush=True)
+                print(f"\n=== stage {stage_id} log TAIL ({log_path}) ===", flush=True)
+                print("".join(tail_chunk).rstrip("\n"), flush=True)
+            print(f"=== end stage {stage_id} log ===\n", flush=True)
+
     def __exit__(self, exc_type, exc_val, exc_tb):
+        self._dump_stage_logs_for_debug()
         for stage_id in sorted(self.stage_procs, reverse=True):
             proc = self.stage_procs[stage_id]
             if proc.poll() is None:
@@ -1762,10 +1859,18 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
         if run_level == "advanced_model" and stage_config_path is not None:
             with open(stage_config_path, encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
-            stage_ids = [stage["stage_id"] for stage in cfg.get("stage_args", []) if "stage_id" in stage]
+            # Strip ``load_format: dummy`` (CI overlay default) so advanced_model
+            # tests use real weights. New schema (``stages:``) writes the field
+            # flat at stage level; legacy schema (``stage_args:``) nests it as
+            # ``engine_args.load_format``. Handle both.
+            new_schema_stages = cfg.get("stages")
+            stage_key = "stages" if new_schema_stages is not None else "stage_args"
+            delete_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
+            stage_entries = cfg.get(stage_key, [])
+            stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
             stage_config_path = modify_stage_config(
                 stage_config_path,
-                deletes={"stage_args": {stage_id: ["engine_args.load_format"] for stage_id in stage_ids}},
+                deletes={stage_key: {stage_id: [delete_path] for stage_id in stage_ids}},
             )
 
         server_args = params.server_args or []
@@ -1782,6 +1887,7 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
                 raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
             if stage_config_path is None:
                 raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
+            server_args += ["--stage-configs-path", stage_config_path]
 
             with OmniServerStageCli(
                 model,
@@ -1831,6 +1937,7 @@ class OmniResponse:
     e2e_latency: float | None = None
     success: bool = False
     error_message: str | None = None
+    cached_tokens: int | None = None
 
 
 @dataclass
@@ -2326,6 +2433,11 @@ class OpenAIClientHandler:
                 if hasattr(choice.message, "content") and choice.message.content is not None:
                     text_content = choice.message.content
 
+            # Extract cached_tokens for prefix caching tests
+            usage = getattr(chat_completion, "usage", None)
+            if usage and (details := getattr(usage, "prompt_tokens_details", None)):
+                result.cached_tokens = details.cached_tokens
+
             # Calculate end-to-end latency
             result.e2e_latency = time.perf_counter() - start_time
 
@@ -2378,7 +2490,7 @@ class OpenAIClientHandler:
                                 image_url = item.get("image_url", {}).get("url")
                             else:
                                 image_url_obj = getattr(item, "image_url", None)
-                                image_url = hasattr(image_url_obj, "url", None) if image_url_obj else None
+                                image_url = getattr(image_url_obj, "url", None) if image_url_obj else None
                             if image_url and image_url.startswith("data:image"):
                                 b64_data = image_url.split(",", 1)[1]
                                 img = decode_b64_image(b64_data)
@@ -2684,7 +2796,7 @@ class OpenAIClientHandler:
 
         return responses
 
-    def send_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+    def send_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[DiffusionResponse]:
         """
         Send OpenAI requests for diffusion models.
 
@@ -2692,9 +2804,9 @@ class OpenAIClientHandler:
             request_config: Request configuration dictionary containing parameters like model, messages
             request_num: Number of requests to send concurrently, defaults to 1 (single request)
         Returns:
-            List[OmniResponse]: List of response objects
+            List[DiffusionResponse]: List of response objects
         """
-        responses = []
+        responses: list[DiffusionResponse] = []
         stream = request_config.get("stream", False)
         modalities = request_config.get("modalities", omit)  # Most diffusion models don't require modalities param
         extra_body = request_config.get("extra_body", None)
@@ -3001,6 +3113,10 @@ class OmniRunner:
             video_padding_token = "<|video_pad|>"
             image_padding_token = "<|image_pad|>"
             audio_padding_token = "<|audio_pad|>"
+        elif "Ming-flash-omni" in self.model_name:
+            video_padding_token = "<VIDEO>"
+            image_padding_token = "<IMAGE>"
+            audio_padding_token = "<AUDIO>"
 
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -3262,7 +3378,7 @@ def omni_runner(request, model_prefix):
     with _omni_server_lock:
         model, stage_config_path = request.param
         model = model_prefix + model
-        with OmniRunner(model, seed=42, stage_configs_path=stage_config_path) as runner:
+        with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, stage_init_timeout=300) as runner:
             print("OmniRunner started successfully")
             yield runner
             print("OmniRunner stopping...")

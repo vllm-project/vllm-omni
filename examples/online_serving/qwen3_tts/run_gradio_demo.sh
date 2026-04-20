@@ -127,7 +127,7 @@ echo "Starting vLLM server..."
 LOG_FILE="/tmp/vllm_tts_server_${SERVER_PORT}.log"
 
 vllm-omni serve "$MODEL" \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --host "$SERVER_HOST" \
     --port "$SERVER_PORT" \
     --gpu-memory-utilization 0.9 \

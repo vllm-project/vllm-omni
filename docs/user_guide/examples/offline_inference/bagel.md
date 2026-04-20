@@ -176,8 +176,6 @@ Example configuration for TP=2 on GPUs 0 and 1:
 
 | Parameter             | Value   | Description                      |
 | :-------------------- | :------ | :------------------------------- |
-| `window_size`         | `-1`    | Window size (-1 means unlimited) |
-| `max_inflight`        | `1`     | Maximum inflight requests        |
 | `shm_threshold_bytes` | `65536` | Shared memory threshold (64KB)   |
 
 ## Using Mooncake Connector

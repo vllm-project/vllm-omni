@@ -5,8 +5,6 @@ See examples/online_serving/qwen2_5_omni/README.md
 
 import os
 
-from vllm_omni.platforms import current_omni_platform
-
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 from pathlib import Path
@@ -19,19 +17,15 @@ from tests.examples.conftest import (
     run_cmd,
     strip_trailing_audio_saved_line,
 )
-from tests.utils import hardware_test
+from tests.utils import get_deploy_config_path, hardware_test
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.example]
 
 models = ["Qwen/Qwen2.5-Omni-7B"]
 
-
-stage_configs = [str(Path(__file__).parent.parent.parent / "e2e" / "stage_configs" / "qwen2_5_omni_ci.yaml")]
-
-if current_omni_platform.is_xpu():
-    stage_configs = [
-        str(Path(__file__).parent.parent.parent / "e2e" / "stage_configs" / "xpu" / "qwen2_5_omni_ci.yaml")
-    ]
+# Single CI deploy YAML; rocm/xpu deltas are picked automatically via the
+# platforms: section in vllm_omni/deploy/ci/qwen2_5_omni.yaml.
+stage_configs = [get_deploy_config_path("ci/qwen2_5_omni.yaml")]
 
 example_dir = str(Path(__file__).parent.parent.parent.parent / "examples" / "online_serving")
 # Create parameter combinations for model and stage config

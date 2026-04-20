@@ -4,6 +4,7 @@
 import logging
 import math
 import os
+from collections.abc import Iterable
 
 import torch
 import torch.distributed
@@ -16,6 +17,7 @@ from tqdm import tqdm
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioInput, SupportImageInput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -27,7 +29,6 @@ try:
         init_mmaudio_vae,
         init_text_model,
         init_wan_vae_2_2,
-        load_fusion_checkpoint,
     )
     from dreamid_omni.utils.rearrange import Rearrange
     from dreamid_omni.utils.resize import NaResize
@@ -36,6 +37,21 @@ except ImportError:
 from vllm_omni.diffusion.models.dreamid_omni.fusion import FusionModel
 
 logger = logging.getLogger(__name__)
+
+
+def get_dreamid_omni_post_process_func(*args, **kwargs):
+    def post_process(output):
+        if isinstance(output, tuple) and len(output) == 2:
+            video, audio = output
+            return {
+                "video": video,
+                "audio": audio,
+                "audio_sample_rate": 16000,
+                "fps": 24,
+            }
+        return output
+
+    return post_process
 
 
 AUDIO_CONFIG = {
@@ -107,15 +123,23 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
         self.text_model = init_text_model(model, rank=self.device)
         self.text_encoder = self.text_model.model
 
-        # Fusion model
-        ## load audio/video model config
-        Fusion_model = FusionModel(VIDEO_CONFIG, AUDIO_CONFIG)
-
-        checkpoint_path = self.od_config.tf_model_config.get("fusion", None)
-        assert checkpoint_path is not None, "fusion checkpoint path is None"
-        load_fusion_checkpoint(Fusion_model, checkpoint_path=os.path.join(model, checkpoint_path))
-        self.model = Fusion_model
+        # Fusion model — weights are loaded later via load_weights()
+        self.model = FusionModel(VIDEO_CONFIG, AUDIO_CONFIG)
         self.transformer = self.model
+
+        fusion_path = self.od_config.tf_model_config.get("fusion", None)
+        assert fusion_path is not None, "fusion checkpoint path is None in transformer config"
+        fusion_subfolder = os.path.dirname(fusion_path) or None
+        fusion_filename = os.path.basename(fusion_path)
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model,
+                subfolder=fusion_subfolder,
+                revision=None,
+                prefix="model.",
+                allow_patterns_overrides=[fusion_filename],
+            )
+        ]
 
         # Fixed attributes, non-configurable
         self.audio_latent_channel = AUDIO_CONFIG.get("in_dim")
@@ -211,8 +235,11 @@ class DreamIDOmniPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Suppor
 
         return ref_vae_latents, ref_audio_lengths
 
-    def load_weights(self, weights):
-        pass
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        prefix = "model."
+        state_dict = {name[len(prefix) :]: tensor for name, tensor in weights if name.startswith(prefix)}
+        self.model.load_state_dict(state_dict, strict=True)
+        return {prefix + k for k in state_dict}
 
     def get_scheduler_time_steps(self, sampling_steps, solver_name="unipc", device=0, shift=5.0):
         torch.manual_seed(4)
