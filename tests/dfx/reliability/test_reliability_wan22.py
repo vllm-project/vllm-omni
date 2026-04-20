@@ -18,7 +18,7 @@ from tests.dfx.conftest import (
 )
 from tests.dfx.reliability.conftest import inject_gpu_oom, make_process_kill_fault_injector, stop_gpu_oom_hogs
 from tests.helpers.media import generate_synthetic_image
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
 RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
@@ -50,6 +50,8 @@ FAULT_ERROR_KEYWORDS = (
     "oom",
     "out of memory",
     "cuda",
+    "job failed",
+    "unknown error",
 )
 PROCESS_KILL_ERROR_KEYWORDS = (
     "timeout",
