@@ -121,7 +121,7 @@
                 "random_mm_bucket_config": {
                     "(128-1024, 128-1024, 1)": 0.34,
                     "(256-1080, 256-1920, 2-16)": 0.33,
-                    "(0, 60, 3)": 0.33
+                    "(0, 1-60, 1-3)": 0.33
                 },
                 "ignore_eos": true,
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration"
