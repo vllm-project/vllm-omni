@@ -43,7 +43,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -51,18 +51,9 @@ import numpy as np
 import torch
 
 try:
-    import cv2
-except ImportError as exc:  # pragma: no cover - runtime dependency guard
-    raise ImportError(
-        "DreamZero sim-eval client requires `opencv-python`."
-    ) from exc
-
-try:
     import mediapy
 except ImportError as exc:  # pragma: no cover - runtime dependency guard
-    raise ImportError(
-        "DreamZero sim-eval client requires `mediapy`."
-    ) from exc
+    raise ImportError("DreamZero sim-eval client requires `mediapy`.") from exc
 
 try:
     from typing import override
@@ -70,16 +61,12 @@ except ImportError:
     try:
         from typing_extensions import override
     except ImportError as exc:  # pragma: no cover - runtime dependency guard
-        raise ImportError(
-            "DreamZero sim-eval client requires `typing-extensions` on Python < 3.12."
-        ) from exc
+        raise ImportError("DreamZero sim-eval client requires `typing-extensions` on Python < 3.12.") from exc
 
 try:
     import websockets.sync.client
 except ImportError as exc:  # pragma: no cover - runtime dependency guard
-    raise ImportError(
-        "DreamZero sim-eval client requires `websockets`."
-    ) from exc
+    raise ImportError("DreamZero sim-eval client requires `websockets`.") from exc
 
 # NOTE:
 # This directory already contains a local file named `openpi_client.py`.
@@ -101,9 +88,7 @@ try:
     from openpi_client import image_tools, msgpack_numpy
     from openpi_client.base_policy import BasePolicy
 except ImportError as exc:  # pragma: no cover - runtime dependency guard
-    raise ImportError(
-        "DreamZero sim-eval client requires the optional `openpi-client` package."
-    ) from exc
+    raise ImportError("DreamZero sim-eval client requires the optional `openpi-client` package.") from exc
 finally:
     if removed_path:
         sys.path.insert(0, example_dir)
@@ -340,15 +325,9 @@ class DreamZeroJointPosClient:
             # - cartesian_position is currently unused by DreamZero DROID, so
             #   a dummy zero vector is sent for protocol completeness
             request_data = {
-                "observation/exterior_image_0_left": image_tools.resize_with_pad(
-                    curr_obs["right_image"], 180, 320
-                ),
-                "observation/exterior_image_1_left": image_tools.resize_with_pad(
-                    curr_obs["left_image"], 180, 320
-                ),
-                "observation/wrist_image_left": image_tools.resize_with_pad(
-                    curr_obs["wrist_image"], 180, 320
-                ),
+                "observation/exterior_image_0_left": image_tools.resize_with_pad(curr_obs["right_image"], 180, 320),
+                "observation/exterior_image_1_left": image_tools.resize_with_pad(curr_obs["left_image"], 180, 320),
+                "observation/wrist_image_left": image_tools.resize_with_pad(curr_obs["wrist_image"], 180, 320),
                 "observation/joint_position": curr_obs["joint_position"].astype(np.float64),
                 "observation/cartesian_position": np.zeros((6,), dtype=np.float64),
                 "observation/gripper_position": curr_obs["gripper_position"].astype(np.float64),
@@ -368,9 +347,7 @@ class DreamZeroJointPosClient:
             if actions.ndim != 2:
                 raise AssertionError(f"Expected 2D action array, got shape {actions.shape}")
             if actions.shape != (ACTION_HORIZON, ACTION_DIM):
-                raise AssertionError(
-                    f"Expected action shape {(ACTION_HORIZON, ACTION_DIM)}, got {actions.shape}"
-                )
+                raise AssertionError(f"Expected action shape {(ACTION_HORIZON, ACTION_DIM)}, got {actions.shape}")
             self.pred_action_chunk = actions
 
         # Consume exactly one action row from the cached chunk for this
@@ -600,24 +577,19 @@ def main() -> None:
     try:
         import gymnasium as gym
     except ImportError as exc:  # pragma: no cover - runtime dependency guard
-        raise ImportError(
-            "DreamZero sim-eval client requires `gymnasium`."
-        ) from exc
+        raise ImportError("DreamZero sim-eval client requires `gymnasium`.") from exc
 
     try:
         import sim_evals.environments  # noqa: F401
     except ImportError as exc:  # pragma: no cover - runtime dependency guard
         raise ImportError(
-            "DreamZero sim-eval client requires the external `sim-evals` package "
-            "or checkout to be importable."
+            "DreamZero sim-eval client requires the external `sim-evals` package or checkout to be importable."
         ) from exc
 
     try:
         from isaaclab_tasks.utils import parse_env_cfg
     except ImportError as exc:  # pragma: no cover - runtime dependency guard
-        raise ImportError(
-            "DreamZero sim-eval client requires `isaaclab_tasks`."
-        ) from exc
+        raise ImportError("DreamZero sim-eval client requires `isaaclab_tasks`.") from exc
 
     # Resolve output location and scene prompt.
     output_dir = _make_output_dir(args.output_root.expanduser().resolve(), args.scene)
@@ -726,18 +698,14 @@ def main() -> None:
                             step_index=step_index,
                             used_server_call=bool(result["used_server_call"]),
                             chunk_latency_s=(
-                                float(result["chunk_latency_s"])
-                                if result["chunk_latency_s"] is not None
-                                else None
+                                float(result["chunk_latency_s"]) if result["chunk_latency_s"] is not None else None
                             ),
                             action=[float(x) for x in np.asarray(result["action"], dtype=np.float32).tolist()],
                             joint_position=[
-                                float(x)
-                                for x in np.asarray(result["joint_position"], dtype=np.float32).tolist()
+                                float(x) for x in np.asarray(result["joint_position"], dtype=np.float32).tolist()
                             ],
                             gripper_position=[
-                                float(x)
-                                for x in np.asarray(result["gripper_position"], dtype=np.float32).tolist()
+                                float(x) for x in np.asarray(result["gripper_position"], dtype=np.float32).tolist()
                             ],
                             reward=reward_value,
                             terminated=term_value,
