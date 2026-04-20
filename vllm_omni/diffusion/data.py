@@ -18,6 +18,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
 
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.quantization import build_quant_config
 
@@ -481,8 +482,10 @@ class OmniDiffusionConfig:
     # Scheduler flow_shift for Wan2.2 (12.0 for 480p, 5.0 for 720p)
     flow_shift: float | None = None
 
-    # support multi images input
+    # Support multi-image inputs and expose any model-specific request limit
+    # through a generic config field so serving code stays model-agnostic.
     supports_multimodal_inputs: bool = False
+    max_multimodal_image_inputs: int | None = None
 
     log_level: str = "info"
 
@@ -664,7 +667,11 @@ class OmniDiffusionConfig:
             )
 
     def update_multimodal_support(self) -> None:
-        self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
+        # Resolve serving-visible multimodal behavior from shared metadata
+        # instead of importing concrete pipeline modules into the config layer.
+        metadata = get_diffusion_model_metadata(self.model_class_name)
+        self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
+        self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
 
     def enrich_config(self) -> None:
         """Load model metadata from HuggingFace and populate config fields.

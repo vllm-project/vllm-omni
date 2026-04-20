@@ -16,6 +16,11 @@ from contextlib import contextmanager
 import torch
 
 
+def run_forced_gpu_cleanup_round() -> None:
+    run_pre_test_cleanup(enable_force=True)
+    run_post_test_cleanup(enable_force=True)
+
+
 def get_physical_device_indices(devices):
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible_devices is None:
@@ -270,5 +275,6 @@ __all__ = [
     "get_physical_device_indices",
     "run_post_test_cleanup",
     "run_pre_test_cleanup",
+    "run_forced_gpu_cleanup_round",
     "wait_for_gpu_memory_to_clear",
 ]

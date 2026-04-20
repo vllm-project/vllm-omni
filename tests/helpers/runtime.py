@@ -8,9 +8,11 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from io import BytesIO
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import psutil
@@ -21,6 +23,7 @@ import yaml
 from openai import OpenAI, omit
 from PIL import Image
 from vllm import TextPrompt
+from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 from vllm.logger import init_logger
 
 from tests.helpers.assertions import (
@@ -28,12 +31,14 @@ from tests.helpers.assertions import (
     assert_diffusion_response,
     assert_omni_response,
 )
+from tests.helpers.env import run_forced_gpu_cleanup_round
 from tests.helpers.media import (
     _merge_base64_audio_to_segment,
     convert_audio_bytes_to_text,
     cosine_similarity_text,
     decode_b64_image,
 )
+from vllm_omni.config.stage_config import resolve_deploy_yaml
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -50,18 +55,53 @@ except Exception:  # pragma: no cover
         return None
 
 
-def run_forced_gpu_cleanup_round() -> None:
-    """Defer ``tests.helpers.env`` import until cleanup runs (RFC #2299)."""
-    from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
-
-    run_pre_test_cleanup(enable_force=True)
-    run_post_test_cleanup(enable_force=True)
-
-
 def get_open_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return int(s.getsockname()[1])
+
+
+def dummy_messages_from_mix_data(
+    system_prompt: dict[str, Any] = None,
+    video_data_url: Any = None,
+    audio_data_url: Any = None,
+    image_data_url: Any = None,
+    content_text: str = None,
+):
+    """Create messages with video、image、audio data URL for OpenAI API."""
+    if content_text is not None:
+        content = [{"type": "text", "text": content_text}]
+    else:
+        content = []
+
+    media_items = []
+    if isinstance(video_data_url, list):
+        for video_url in video_data_url:
+            media_items.append((video_url, "video"))
+    else:
+        media_items.append((video_data_url, "video"))
+
+    if isinstance(image_data_url, list):
+        for url in image_data_url:
+            media_items.append((url, "image"))
+    else:
+        media_items.append((image_data_url, "image"))
+
+    if isinstance(audio_data_url, list):
+        for url in audio_data_url:
+            media_items.append((url, "audio"))
+    else:
+        media_items.append((audio_data_url, "audio"))
+
+    content.extend(
+        {"type": f"{media_type}_url", f"{media_type}_url": {"url": url}}
+        for url, media_type in media_items
+        if url is not None
+    )
+    messages = [{"role": "user", "content": content}]
+    if system_prompt is not None:
+        messages = [system_prompt] + messages
+    return messages
 
 
 def _omni_subprocess_cwd() -> str:
@@ -203,7 +243,7 @@ class OmniServer:
 
 
 class OmniServerStageCli(OmniServer):
-    """Omni server harness that exercises the stage CLI flow (matches upstream ``tests/conftest``)."""
+    """Omni server harness that exercises the stage CLI flow."""
 
     def __init__(
         self,
@@ -219,32 +259,46 @@ class OmniServerStageCli(OmniServer):
         self.stage_config_path = stage_config_path
         self.master_port = get_open_port()
         self.visible_device_list = self._load_visible_device_list(env_dict)
-        self.stage_runtime_devices = self._load_stage_runtime_devices(stage_config_path)
-        self.stage_ids = stage_ids or self._load_stage_ids(stage_config_path)
+        resolved_cfg = resolve_deploy_yaml(stage_config_path)
+        # Dump the resolved deploy config so CI logs show each stage's
+        # gpu_memory_utilization / max_model_len / max_num_seqs after
+        # base_config inheritance and overlay merge — essential when
+        # diagnosing OOMs that depend on the merged values.
+        print(
+            f"[OmniServerStageCli] Resolved deploy config from {stage_config_path}:\n"
+            f"{yaml.safe_dump(resolved_cfg, sort_keys=False, default_flow_style=False)}",
+            flush=True,
+        )
+        self.stage_runtime_devices = self._load_stage_runtime_devices(resolved_cfg)
+        self.stage_ids = stage_ids or self._load_stage_ids(resolved_cfg)
         if 0 not in self.stage_ids:
             raise ValueError(f"Stage CLI test requires stage_id=0 in config: {stage_config_path}")
         self.stage_procs: dict[int, subprocess.Popen] = {}
         self.proc = None
 
     @staticmethod
-    def _load_stage_ids(stage_config_path: str) -> list[int]:
-        with open(stage_config_path, encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
+    def _stage_entries(cfg: dict) -> list[dict]:
+        """Return the list of stage entries from either legacy (``stage_args``)
+        or new-schema (``stages``) deploy YAMLs."""
+        return cfg.get("stage_args") or cfg.get("stages") or []
 
-        stage_ids = [stage["stage_id"] for stage in cfg.get("stage_args", []) if "stage_id" in stage]
+    @staticmethod
+    def _load_stage_ids(resolved_config: dict) -> list[int]:
+        stage_ids = [
+            stage["stage_id"] for stage in OmniServerStageCli._stage_entries(resolved_config) if "stage_id" in stage
+        ]
         if not stage_ids:
-            raise ValueError(f"No stage IDs found in config: {stage_config_path}")
+            raise ValueError("No stage IDs found in resolved config")
         return stage_ids
 
     @staticmethod
-    def _load_stage_runtime_devices(stage_config_path: str) -> dict[int, str]:
-        with open(stage_config_path, encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-
+    def _load_stage_runtime_devices(resolved_config: dict) -> dict[int, str]:
         runtime_devices: dict[int, str] = {}
-        for stage in cfg.get("stage_args", []):
+        for stage in OmniServerStageCli._stage_entries(resolved_config):
             stage_id = stage.get("stage_id")
-            devices = stage.get("runtime", {}).get("devices")
+            # New schema: stage.devices is flat at stage level.
+            # Legacy schema: stage.runtime.devices is nested.
+            devices = stage.get("devices") or stage.get("runtime", {}).get("devices")
             if stage_id is not None and devices:
                 runtime_devices[int(stage_id)] = str(devices)
         return runtime_devices
@@ -330,10 +384,21 @@ class OmniServerStageCli(OmniServer):
 
         cmd = self._build_stage_cmd(stage_id, headless=headless)
         print(f"Launching OmniServerStageCli stage {stage_id}: {' '.join(cmd)}")
+        # Capture each subprocess's stdout+stderr to a per-stage log file so
+        # debugging "Stage N exited before API server ready" doesn't rely on
+        # guessing; the file is surfaced in the RuntimeError message.
+        log_path = Path(tempfile.gettempdir()) / f"omni_stage_{stage_id}_{self.master_port}.log"
+        self._stage_log_paths = getattr(self, "_stage_log_paths", {})
+        self._stage_log_paths[stage_id] = log_path
+        log_fh = open(log_path, "w", buffering=1)  # noqa: SIM115 - closed in __exit__
+        self._stage_log_files = getattr(self, "_stage_log_files", {})
+        self._stage_log_files[stage_id] = log_fh
         proc = subprocess.Popen(
             cmd,
             env=env,
-            cwd=_omni_subprocess_cwd(),
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
         )
         self.stage_procs[stage_id] = proc
         if stage_id == 0:
@@ -343,7 +408,18 @@ class OmniServerStageCli(OmniServer):
         for stage_id, proc in self.stage_procs.items():
             ret = proc.poll()
             if ret is not None:
-                raise RuntimeError(f"Stage {stage_id} exited with code {ret} before API server became ready.")
+                log_path = getattr(self, "_stage_log_paths", {}).get(stage_id)
+                tail = ""
+                if log_path and log_path.exists():
+                    try:
+                        with open(log_path, encoding="utf-8", errors="replace") as f:
+                            lines = f.readlines()
+                        tail = "\n=== Last 60 lines of stage {} log ({}) ===\n{}".format(
+                            stage_id, log_path, "".join(lines[-60:]) or "<empty>"
+                        )
+                    except Exception as exc:  # pragma: no cover - diagnostic only
+                        tail = f"\n<failed to read stage log {log_path}: {exc}>"
+                raise RuntimeError(f"Stage {stage_id} exited with code {ret} before API server became ready.{tail}")
 
     def _start_server(self) -> None:
         ordered_stage_ids = [0, *[stage_id for stage_id in self.stage_ids if stage_id != 0]]
@@ -369,7 +445,46 @@ class OmniServerStageCli(OmniServer):
 
         raise RuntimeError(f"OmniServerStageCli failed to start within {max_wait} seconds")
 
+    def _dump_stage_logs_for_debug(self, head_lines: int = 300, tail_lines: int = 500) -> None:
+        """Tail each stage's subprocess log back to stdout on teardown.
+
+        Stage subprocesses redirect stdout/stderr to ``/tmp/omni_stage_*.log``
+        so we don't spam the main CI stream while tests run; but that also
+        hides engine init (KV cache size, Available KV cache memory, vLLM
+        engine config) when things go wrong. Dump them here so buildkite
+        captures them post-run. Head covers engine init; tail covers
+        whatever state the stage was in when it was torn down.
+        """
+        log_paths = getattr(self, "_stage_log_paths", {}) or {}
+        for stage_id in sorted(log_paths):
+            log_path = log_paths[stage_id]
+            if not log_path or not log_path.exists():
+                continue
+            try:
+                with open(log_path, encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+            except Exception as exc:  # pragma: no cover - diagnostic only
+                print(f"[OmniServerStageCli] stage {stage_id} log read failed: {exc}", flush=True)
+                continue
+            total = len(lines)
+            if total <= head_lines + tail_lines:
+                head_chunk = lines
+                tail_chunk = []
+                elided = 0
+            else:
+                head_chunk = lines[:head_lines]
+                tail_chunk = lines[-tail_lines:]
+                elided = total - head_lines - tail_lines
+            print(f"\n=== stage {stage_id} log HEAD ({log_path}) ===", flush=True)
+            print("".join(head_chunk).rstrip("\n"), flush=True)
+            if tail_chunk:
+                print(f"\n... [{elided} lines elided] ...", flush=True)
+                print(f"\n=== stage {stage_id} log TAIL ({log_path}) ===", flush=True)
+                print("".join(tail_chunk).rstrip("\n"), flush=True)
+            print(f"=== end stage {stage_id} log ===\n", flush=True)
+
     def __exit__(self, exc_type, exc_val, exc_tb):
+        self._dump_stage_logs_for_debug()
         for stage_id in sorted(self.stage_procs, reverse=True):
             proc = self.stage_procs[stage_id]
             if proc.poll() is None:
@@ -981,6 +1096,10 @@ class OmniRunner:
             video_padding_token = "<|video_pad|>"
             image_padding_token = "<|image_pad|>"
             audio_padding_token = "<|audio_pad|>"
+        elif "Ming-flash-omni" in self.model_name:
+            video_padding_token = "<VIDEO>"
+            image_padding_token = "<IMAGE>"
+            audio_padding_token = "<AUDIO>"
         if isinstance(prompts, str):
             prompts = [prompts]
 
@@ -1290,4 +1409,5 @@ __all__ = [
     "OpenAIClientHandler",
     "get_open_port",
     "run_forced_gpu_cleanup_round",
+    "dummy_messages_from_mix_data",
 ]

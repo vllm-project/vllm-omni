@@ -64,9 +64,6 @@ stage_args:
 # Top-level runtime config with Mooncake connector
 runtime:
   enabled: true
-  defaults:
-    window_size: -1
-    max_inflight: 1
   connectors:
     mooncake_connector:
       name: MooncakeConnector
@@ -80,4 +77,3 @@ runtime:
   edges:
     - from: 0
       to: 1
-      window_size: -1

@@ -9,54 +9,37 @@ from typing import Any
 import yaml
 
 
-def dummy_messages_from_mix_data(
-    system_prompt: dict[str, Any] = None,
-    video_data_url: Any = None,
-    audio_data_url: Any = None,
-    image_data_url: Any = None,
-    content_text: str = None,
-):
-    """Create messages with video、image、audio data URL for OpenAI API."""
-    if content_text is not None:
-        content = [{"type": "text", "text": content_text}]
-    else:
-        content = []
-
-    media_items = []
-    if isinstance(video_data_url, list):
-        for video_url in video_data_url:
-            media_items.append((video_url, "video"))
-    else:
-        media_items.append((video_data_url, "video"))
-
-    if isinstance(image_data_url, list):
-        for url in image_data_url:
-            media_items.append((url, "image"))
-    else:
-        media_items.append((image_data_url, "image"))
-
-    if isinstance(audio_data_url, list):
-        for url in audio_data_url:
-            media_items.append((url, "audio"))
-    else:
-        media_items.append((audio_data_url, "audio"))
-
-    content.extend(
-        {"type": f"{media_type}_url", f"{media_type}_url": {"url": url}}
-        for url, media_type in media_items
-        if url is not None
-    )
-    messages = [{"role": "user", "content": content}]
-    if system_prompt is not None:
-        messages = [system_prompt] + messages
-    return messages
-
-
 def modify_stage_config(
     yaml_path: str,
     updates: dict[str, Any] = None,
     deletes: dict[str, Any] = None,
 ) -> str:
+    """
+    Modify configurations in a YAML file, supporting both top-level and stage-specific modifications,
+    including addition, modification, and deletion of configurations.
+
+    Args:
+        yaml_path: Path to the YAML configuration file.
+        updates: Dictionary containing both top-level and stage-specific modifications to add or update.
+                Format: {
+                    'async_chunk': True,
+                    'stage_args': {
+                        0: {'engine_args.max_model_len': 5800},
+                        1: {'engine_args.max_num_seqs': 2}
+                    }
+                }
+        deletes: Dictionary containing configurations to delete.
+                Format: {
+                    'old_config': None,  # Delete entire key
+                    'stage_args': {
+                        0: ['engine_args.old_param'],
+                        1: ['runtime.unused_setting']
+                    }
+                }
+
+    Returns:
+        str: Path to the newly created modified YAML file with timestamp suffix.
+    """
     path = Path(yaml_path)
     if not path.exists():
         raise FileNotFoundError(f"yaml does not exist: {path}")
@@ -67,57 +50,93 @@ def modify_stage_config(
     except Exception as e:
         raise ValueError(f"Cannot parse YAML file: {e}")
 
+    # Helper function to apply update
     def apply_update(config_dict: dict, key_path: str, value: Any) -> None:
+        """Apply update to dictionary using dot-separated path."""
+        # Handle direct list assignment (e.g., engine_input_source: [1, 2])
         if "." not in key_path:
+            # Simple key, set directly
             config_dict[key_path] = value
             return
+
         current = config_dict
         keys = key_path.split(".")
+
         for i in range(len(keys) - 1):
             key = keys[i]
+
+            # Handle list indices
             if key.isdigit() and isinstance(current, list):
                 index = int(key)
                 if index < 0:
                     raise ValueError(f"Negative list index not allowed: {index}")
                 if index >= len(current):
+                    # Expand list if needed
                     while len(current) <= index:
+                        # If we need to go deeper (more keys after this), create a dict
+                        # Otherwise, create None placeholder
                         current.append({} if i < len(keys) - 2 else None)
                 current = current[index]
             elif isinstance(current, dict):
+                # Handle dictionary keys
                 if key not in current:
+                    # If there are more keys after this, create appropriate structure
+                    if i < len(keys) - 1:
+                        # Check if next key is a digit (list index) or string (dict key)
+                        if keys[i + 1].isdigit():
+                            current[key] = []
+                        else:
+                            current[key] = {}
+                    else:
+                        # This is the last key, create based on value type
+                        current[key] = [] if isinstance(value, list) else {}
+                elif not isinstance(current[key], (dict, list)) and i < len(keys) - 1:
+                    # If current value is not dict/list but we need to go deeper, replace it
                     if keys[i + 1].isdigit():
                         current[key] = []
                     else:
                         current[key] = {}
-                elif not isinstance(current[key], (dict, list)) and i < len(keys) - 1:
-                    current[key] = [] if keys[i + 1].isdigit() else {}
                 current = current[key]
             else:
+                # Current is not a dict or list, cannot traverse further
                 raise TypeError(
                     f"Cannot access {'.'.join(keys[: i + 1])} as a dict/list. It's a {type(current).__name__}"
                 )
 
+        # Set the final value
         last_key = keys[-1]
         if isinstance(current, list) and last_key.isdigit():
+            # Setting a value in a list by index
             index = int(last_key)
             if index < 0:
                 raise ValueError(f"Negative list index not allowed: {index}")
             if index >= len(current):
+                # Expand list if needed
                 while len(current) <= index:
                     current.append(None)
             current[index] = value
         elif isinstance(current, dict):
+            # Special case: if the value is a list and we're setting a top-level key
+            # Example: updating engine_input_source with [1, 2]
             current[last_key] = value
         else:
-            raise TypeError(f"Cannot set value at {key_path}.")
+            # Current is not a dict, cannot set key
+            raise TypeError(f"Cannot set value at {key_path}. Current type is {type(current).__name__}, expected dict.")
 
+    # Helper function to delete by path
     def delete_by_path(config_dict: dict, path: str) -> None:
+        """Delete configuration by dot-separated path."""
         if not path:
             return
+
         current = config_dict
         keys = path.split(".")
+
+        # Traverse to the parent
         for i in range(len(keys) - 1):
             key = keys[i]
+
+            # Handle list indices
             if key.isdigit() and isinstance(current, list):
                 index = int(key)
                 if index < 0 or index >= len(current):
@@ -128,8 +147,13 @@ def modify_stage_config(
                     raise KeyError(f"Path {'.'.join(keys[: i + 1])} does not exist")
                 current = current[key]
             else:
-                raise TypeError(f"Cannot access {'.'.join(keys[: i + 1])} as a dict/list.")
+                raise TypeError(
+                    f"Cannot access {'.'.join(keys[: i + 1])} as a dict/list. It's a {type(current).__name__}"
+                )
+
+        # Delete the item
         last_key = keys[-1]
+
         if isinstance(current, list) and last_key.isdigit():
             index = int(last_key)
             if index < 0 or index >= len(current):
@@ -140,11 +164,14 @@ def modify_stage_config(
         else:
             print(f"Path {path} does not exist")
 
+    _stage_key = "stages" if "stages" in config else "stage_args"
+
+    # Apply deletions first
     if deletes:
         for key, value in deletes.items():
-            if key == "stage_args":
+            if key in ("stage_args", "stages"):
                 if value and isinstance(value, dict):
-                    stage_args = config.get("stage_args", [])
+                    stage_args = config.get(_stage_key, [])
                     if not stage_args:
                         raise ValueError("stage_args does not exist in config")
 
@@ -152,6 +179,7 @@ def modify_stage_config(
                         if not delete_paths:
                             continue
 
+                        # Find stage by ID
                         target_stage = None
                         for stage in stage_args:
                             if stage.get("stage_id") == int(stage_id):
@@ -161,60 +189,286 @@ def modify_stage_config(
                         if target_stage is None:
                             continue
 
+                        # Delete specified paths in this stage
+                        # Avoid shadowing the original YAML Path used for the output filename below.
                         for delete_path in delete_paths:
-                            if delete_path:
+                            if delete_path:  # Skip empty paths
                                 delete_by_path(target_stage, delete_path)
             elif "." in key:
+                # Delete using dot-separated path
                 delete_by_path(config, key)
             elif value is None and key in config:
+                # Delete entire key
                 del config[key]
 
+    # Apply updates
     if updates:
         for key, value in updates.items():
-            if key == "stage_args":
+            if key in ("stage_args", "stages"):
                 if value and isinstance(value, dict):
-                    stage_args = config.get("stage_args", [])
+                    stage_args = config.get(_stage_key, [])
                     if not stage_args:
                         raise ValueError("stage_args does not exist in config")
 
                     for stage_id, stage_updates in value.items():
+                        # Find stage by ID
                         target_stage = None
                         for stage in stage_args:
                             if stage.get("stage_id") == int(stage_id):
                                 target_stage = stage
                                 break
+
                         if target_stage is None:
                             available_ids = [s.get("stage_id") for s in stage_args if "stage_id" in s]
                             raise KeyError(f"Stage ID {stage_id} not found, available: {available_ids}")
-                        for p, val in stage_updates.items():
-                            if "." not in p:
-                                target_stage[p] = val
+
+                        # Apply updates to this stage
+                        for update_path, val in stage_updates.items():
+                            # Check if this is a simple key (not dot-separated)
+                            # Example: 'engine_input_source' vs 'engine_args.max_model_len'
+                            if "." not in update_path:
+                                # Direct key assignment (e.g., updating a list value)
+                                target_stage[update_path] = val
                             else:
-                                apply_update(target_stage, p, val)
+                                # Dot-separated path (e.g., nested dict access)
+                                apply_update(target_stage, update_path, val)
             elif "." in key:
+                # Apply using dot-separated path
                 apply_update(config, key, value)
             else:
+                # Direct top-level key
                 config[key] = value
 
-    # Unique paths: multiple modify_stage_config calls in one process would collide
-    # if writing next to the source with a coarse timestamp. Use mkstemp and unlink at exit.
-    output_fd, output_path_str = tempfile.mkstemp(prefix=f"{path.stem}_", suffix=".yaml")
-
-    def _unlink_temp_cfg() -> None:
-        try:
-            Path(output_path_str).unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    atexit.register(_unlink_temp_cfg)
+    # Unique suffix: multiple modify_stage_config calls in one process often run
+    # within the same second (e.g. test_qwen3_omni_expansion imports both
+    # get_chunk_config and get_batch_token_config). int(time.time()) would collide
+    # and the later write would overwrite the earlier YAML on disk.
+    # Keep generated configs outside the repo and delete them when pytest exits.
+    output_fd, output_path = tempfile.mkstemp(prefix=f"{path.stem}_", suffix=".yaml")
+    atexit.register(Path(output_path).unlink, missing_ok=True)
 
     with os.fdopen(output_fd, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=None, sort_keys=False, allow_unicode=True, indent=2)
 
-    return str(output_path_str)
+    return str(output_path)
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_DEPLOY_DIR = _REPO_ROOT / "vllm_omni" / "deploy"
+_CI_GENERATED_DIR = _REPO_ROOT / "tests" / ".ci_generated"
+
+
+# CI overlays as Python dicts (LSP-friendly). Materialized on demand to
+# tests/.ci_generated/<model>.yaml via get_deploy_config_path("ci/<name>.yaml").
+_CI_OVERLAYS: dict[str, dict[str, Any]] = {
+    "qwen2_5_omni": {
+        "base_config": "qwen2_5_omni.yaml",
+        "async_chunk": False,
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_model_len": 16384,
+                "max_num_batched_tokens": 16384,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.9,
+                "skip_mm_profiling": True,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 128},
+            },
+            {
+                "stage_id": 1,
+                "max_model_len": 16384,
+                "max_num_batched_tokens": 16384,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.4,
+                "skip_mm_profiling": True,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 4096},
+            },
+            {
+                "stage_id": 2,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.5,
+                "max_num_batched_tokens": 8192,
+                "max_model_len": 8192,
+                "load_format": "dummy",
+                "devices": "2",
+                "default_sampling_params": {"max_tokens": 8192},
+            },
+        ],
+        "platforms": {
+            "rocm": {
+                "stages": [
+                    {"stage_id": 0, "gpu_memory_utilization": 0.9},
+                    {"stage_id": 1, "gpu_memory_utilization": 0.4},
+                    {"stage_id": 2, "gpu_memory_utilization": 0.5, "devices": "2"},
+                ],
+            },
+            "xpu": {
+                "stages": [
+                    {
+                        "stage_id": 0,
+                        "gpu_memory_utilization": 0.9,
+                        "max_num_batched_tokens": 16384,
+                        "max_model_len": 16384,
+                    },
+                    {"stage_id": 1, "gpu_memory_utilization": 0.5},
+                    {
+                        "stage_id": 2,
+                        "gpu_memory_utilization": 0.3,
+                        "max_num_batched_tokens": 4096,
+                        "max_model_len": 4096,
+                        "devices": "2",
+                    },
+                ],
+            },
+        },
+    },
+    "qwen3_omni_moe": {
+        "base_config": "qwen3_omni_moe.yaml",
+        "async_chunk": False,
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 5,
+                "max_model_len": 32768,
+                "mm_processor_cache_gb": 0,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 150, "ignore_eos": False},
+            },
+            {
+                "stage_id": 1,
+                "gpu_memory_utilization": 0.5,
+                "max_num_seqs": 5,
+                "max_model_len": 32768,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 1000},
+            },
+            {
+                "stage_id": 2,
+                "max_num_seqs": 5,
+                "max_num_batched_tokens": 100000,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 2000},
+            },
+        ],
+        "platforms": {
+            "rocm": {
+                "stages": [
+                    {"stage_id": 0, "max_num_seqs": 1, "default_sampling_params": {"max_tokens": 100}},
+                    {
+                        "stage_id": 1,
+                        "max_num_seqs": 1,
+                        "enforce_eager": True,
+                        "default_sampling_params": {"max_tokens": 100},
+                    },
+                    {
+                        "stage_id": 2,
+                        "max_num_seqs": 1,
+                        "max_num_batched_tokens": 1000000,
+                        "default_sampling_params": {"max_tokens": 200},
+                    },
+                ],
+            },
+            "xpu": {
+                "stages": [
+                    {
+                        "stage_id": 0,
+                        "gpu_memory_utilization": 0.85,
+                        "max_num_seqs": 1,
+                        "tensor_parallel_size": 4,
+                        "enforce_eager": True,
+                        "max_num_batched_tokens": 4096,
+                        "max_model_len": 4096,
+                        "max_cudagraph_capture_size": 0,
+                        "skip_mm_profiling": True,
+                        "devices": "0,1,2,3",
+                        "default_sampling_params": {"max_tokens": 100, "ignore_eos": False},
+                    },
+                    {
+                        "stage_id": 1,
+                        "gpu_memory_utilization": 0.6,
+                        "max_num_seqs": 1,
+                        "enforce_eager": True,
+                        "max_num_batched_tokens": 4096,
+                        "max_model_len": 4096,
+                        "max_cudagraph_capture_size": 0,
+                        "skip_mm_profiling": True,
+                        "devices": "4",
+                    },
+                    {
+                        "stage_id": 2,
+                        "gpu_memory_utilization": 0.3,
+                        "max_num_seqs": 1,
+                        "max_num_batched_tokens": 100000,
+                        "max_cudagraph_capture_size": 0,
+                        "skip_mm_profiling": True,
+                        "devices": "5",
+                        "default_sampling_params": {"max_tokens": 2000},
+                    },
+                ],
+            },
+        },
+    },
+    # Single-stage thinker-only topology for the abort test.
+    "qwen2_5_omni_thinker_only": {
+        "async_chunk": False,
+        "pipeline": "qwen2_5_omni_thinker_only",
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.9,
+                "enforce_eager": True,
+                "max_num_batched_tokens": 16384,
+                "max_model_len": 16384,
+                "skip_mm_profiling": True,
+                "mm_processor_cache_gb": 0,
+                "load_format": "dummy",
+                "devices": "0",
+                "default_sampling_params": {
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                    "max_tokens": 128,
+                    "seed": 42,
+                    "repetition_penalty": 1.1,
+                },
+            },
+        ],
+    },
+}
+
+
+def _materialize_ci_overlay(model_type: str) -> Path:
+    import yaml
+
+    if model_type not in _CI_OVERLAYS:
+        raise KeyError(f"No CI overlay registered for {model_type!r}. Available: {sorted(_CI_OVERLAYS)}")
+
+    _CI_GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+    out = _CI_GENERATED_DIR / f"{model_type}.yaml"
+
+    overlay = {**_CI_OVERLAYS[model_type]}
+    base = overlay.get("base_config")
+    if base:
+        overlay["base_config"] = str(_DEPLOY_DIR / base)
+
+    with open(out, "w", encoding="utf-8") as f:
+        yaml.safe_dump(overlay, f, sort_keys=False)
+    return out
+
+
+def get_deploy_config_path(rel_path: str) -> str:
+    """Resolve a deploy yaml; ``ci/<model>.yaml`` materializes from ``_CI_OVERLAYS``."""
+    if rel_path.startswith("ci/") and rel_path.endswith(".yaml"):
+        model_type = rel_path[len("ci/") : -len(".yaml")]
+        if model_type in _CI_OVERLAYS:
+            return str(_materialize_ci_overlay(model_type))
+    return str(_DEPLOY_DIR / rel_path)
 
 
 __all__ = [
-    "dummy_messages_from_mix_data",
     "modify_stage_config",
+    "get_deploy_config_path",
 ]

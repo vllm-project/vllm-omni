@@ -62,23 +62,3 @@ _LAZY_EXPORT_MODULES = {
     **{name: "tests.helpers.stage_config" for name in _STAGE_CONFIG_EXPORT_NAMES},
     **{name: "tests.helpers.runtime" for name in _RUNTIME_EXPORT_NAMES},
 }
-
-
-def __getattr__(name: str):
-    module_name = _LAZY_EXPORT_MODULES.get(name)
-    if module_name is not None:
-        module = __import__(module_name, fromlist=[name])
-        return getattr(module, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-def __dir__():
-    return sorted(
-        {
-            *globals(),
-            *_ASSERTION_EXPORT_NAMES,
-            *_MEDIA_EXPORT_NAMES,
-            *_STAGE_CONFIG_EXPORT_NAMES,
-            *_RUNTIME_EXPORT_NAMES,
-        }
-    )

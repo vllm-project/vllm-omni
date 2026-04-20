@@ -457,6 +457,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             logger.warning("Failed to estimate Fish Speech prompt length, using fallback 2048: %s", e)
             return 2048
 
+    async def _build_voxcpm2_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Build prefill prompt for VoxCPM2 TTS (`prompt_token_ids` padded to full prefill length)."""
+        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import build_voxcpm2_prompt
+
+        self._voxcpm2_encode("")  # lazy-init tokenizer + split_map
+        ref_audio = None
+        ref_sr = None
+        if request.ref_audio is not None:
+            ref_audio, ref_sr = await self._resolve_ref_audio(request.ref_audio)
+        return build_voxcpm2_prompt(
+            hf_config=self.engine_client.model_config.hf_config,
+            tokenizer=self._voxcpm2_tokenizer,
+            split_map=self._voxcpm2_split_map,
+            text=request.input,
+            ref_audio=ref_audio,
+            ref_sr=ref_sr,
+            ref_text=request.ref_text,
+        )
+
     def _get_uploaded_audio_data(self, voice_name: str) -> str | None:
         """Get base64 encoded audio data for uploaded voice."""
         voice_name_lower = voice_name.lower()
@@ -1524,16 +1543,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.instructions:
                 prompt["instruct"] = request.instructions
         elif self._tts_model_type == "voxcpm2":
+            prompt = await self._build_voxcpm2_prompt(request)
             tts_params = {}
-            additional: dict[str, Any] = {}
-            if request.ref_audio is not None:
-                wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
-                additional["reference_audio"] = [[wav_list, sr]]
-            # Pre-split multichar Chinese tokens (VoxCPM2 was trained with single-char CJK IDs).
-            token_ids = self._voxcpm2_encode(request.input)
-            prompt: dict[str, Any] = {"prompt_token_ids": token_ids}
-            if additional:
-                prompt["additional_information"] = additional
         elif self._is_tts:
             validation_error = self._validate_tts_request(request)
             if validation_error:

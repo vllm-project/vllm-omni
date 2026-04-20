@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 import os
+import sys
 import time
 import types
 import weakref
@@ -14,7 +16,8 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
-from vllm_omni.entrypoints.utils import get_final_stage_id_for_e2e
+from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
+from vllm_omni.entrypoints.utils import detect_explicit_cli_keys, get_final_stage_id_for_e2e
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
@@ -65,8 +68,50 @@ def omni_snapshot_download(model_id: str) -> str:
 OutputMessageHandleResult = tuple[Literal[True], None, None, None] | tuple[Literal[False], str, int, ClientRequestState]
 
 
-class OmniBase:
+class OmniBase(PDDisaggregationMixin):
     """Shared runtime foundation for AsyncOmni and Omni."""
+
+    @classmethod
+    def from_cli_args(
+        cls,
+        args: argparse.Namespace,
+        *,
+        parser: argparse.ArgumentParser | None = None,
+        **overrides: Any,
+    ) -> OmniBase:
+        """Construct an ``Omni`` / ``AsyncOmni`` from an ``argparse.Namespace``.
+
+        Mirrors the ``EngineArgs.from_cli_args`` pattern used upstream and in
+        ``OmniEngineArgs.from_cli_args``. This is the recommended entry point
+        for any argparse-based caller (offline scripts, tests, CI): it
+        expands ``vars(args)`` into kwargs and automatically captures which
+        flags the user typed on the command line so that argparse defaults
+        do not silently override deploy YAML values.
+
+        Passing ``parser`` is strongly recommended: without it, flag-to-dest
+        resolution falls back to a name-based heuristic that misidentifies
+        flags with ``dest=`` overrides, alias flags, and ``--disable-X`` /
+        ``store_false`` pairs. See :func:`detect_explicit_cli_keys`.
+
+        Args:
+            args: Parsed argparse namespace from ``parser.parse_args()``.
+            parser: The argparse parser used to produce ``args``. When
+                provided, each user-typed flag is resolved to its real
+                ``dest`` via the parser's action table.
+            **overrides: Extra keyword arguments that take precedence over
+                attributes on ``args``.
+
+        Example::
+
+            parser = FlexibleArgumentParser()
+            parser.add_argument("--model", required=True)
+            args = parser.parse_args()
+            omni = Omni.from_cli_args(args, parser=parser)          # preferred
+            omni = Omni.from_cli_args(args, parser=parser, model="other")
+        """
+        kwargs: dict[str, Any] = {**vars(args), **overrides}
+        kwargs["_cli_explicit_keys"] = detect_explicit_cli_keys(sys.argv[1:], parser)
+        return cls(**kwargs)
 
     def __init__(
         self,
@@ -84,6 +129,7 @@ class OmniBase:
         if "log_requests" in kwargs:
             raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
         model = omni_snapshot_download(model)
+        self._name = self.__class__.__name__
         self.model = model
         self.log_stats = log_stats
         self.async_chunk = async_chunk
@@ -125,9 +171,17 @@ class OmniBase:
             model,
         )
 
+        # PD disaggregation state (detects if a prefill/decode stage pair is configured)
+        self._init_pd_state()
+
     @property
     def num_stages(self) -> int:
         return self.engine.num_stages
+
+    @property
+    def stage_configs(self) -> list:
+        """Expose engine stage configs for PD disaggregation detection and validation."""
+        return self.engine.stage_configs
 
     @property
     def is_running(self) -> bool:
