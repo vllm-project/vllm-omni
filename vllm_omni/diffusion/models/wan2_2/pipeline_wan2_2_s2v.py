@@ -931,6 +931,109 @@ class Wan22S2VPipeline(
             return result[0]
         return result[0] if isinstance(result, tuple) else result
 
+    def diffuse(
+        self,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None,
+        guidance_scale: float,
+        clip_generator: torch.Generator,
+        dtype: torch.dtype,
+        device: torch.device,
+        max_seq_len: int,
+        cond_latents: torch.Tensor,
+        input_motion_latents: torch.Tensor,
+        ref_latents: torch.Tensor,
+        motion_frames: list[int],
+        drop_first_motion: bool,
+        positive_audio_emb: torch.Tensor,
+        negative_audio_emb: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Denoising diffusion loop for one S2V clip.
+
+        Args:
+            latents: Initial noise tensor [C, T, H, W]
+            timesteps: Denoising timesteps
+            prompt_embeds: Text embeddings [1, seq_len, dim]
+            negative_prompt_embeds: Negative text embeddings (optional)
+            guidance_scale: CFG scale
+            clip_generator: Random generator for this clip
+            dtype: Data type for computation
+            device: Device for computation
+            max_seq_len: Maximum sequence length for transformer
+            cond_latents: Pose condition latents [1, 16, T, H, W]
+            input_motion_latents: Motion latents from previous clip
+            ref_latents: Reference image latents
+            motion_frames: Motion frame counts [pixel_frames, latent_frames]
+            drop_first_motion: Whether to drop first motion frames (first clip only)
+            positive_audio_emb: Precomputed audio embeddings for positive prompt
+            negative_audio_emb: Precomputed audio embeddings for negative prompt (optional)
+
+        Returns:
+            Denoised latents [C, T, H, W]
+        """
+        do_true_cfg = self.do_classifier_free_guidance and negative_prompt_embeds is not None
+
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for t in timesteps:
+                self._current_timestep = t
+
+                latent_model_input = [latents.to(device)]
+                timestep = t.unsqueeze(0).to(device) if t.dim() == 0 else t.to(device)
+
+                # -- Positive (conditional) prediction kwargs --
+                positive_kwargs = {
+                    "x": latent_model_input,
+                    "t": timestep,
+                    "context": prompt_embeds[0:1],
+                    "seq_len": max_seq_len,
+                    "cond_states": cond_latents,
+                    "motion_latents": input_motion_latents,
+                    "ref_latents": ref_latents,
+                    "motion_frames": motion_frames,
+                    "drop_motion_frames": drop_first_motion,
+                    "audio_emb": positive_audio_emb,
+                }
+
+                if do_true_cfg:
+                    negative_kwargs = {
+                        "x": latent_model_input,
+                        "t": timestep,
+                        "context": negative_prompt_embeds[0:1],
+                        "seq_len": max_seq_len,
+                        "cond_states": cond_latents,
+                        "motion_latents": input_motion_latents,
+                        "ref_latents": ref_latents,
+                        "motion_frames": motion_frames,
+                        "drop_motion_frames": drop_first_motion,
+                        "audio_emb": negative_audio_emb,
+                    }
+                else:
+                    negative_kwargs = None
+
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=do_true_cfg,
+                    true_cfg_scale=guidance_scale,
+                    positive_kwargs=positive_kwargs,
+                    negative_kwargs=negative_kwargs,
+                    cfg_normalize=False,
+                )
+
+                # Scheduler step
+                latents = self.scheduler.step(
+                    noise_pred.unsqueeze(0),
+                    t,
+                    latents.unsqueeze(0),
+                    return_dict=False,
+                    generator=clip_generator,
+                )[0].squeeze(0)
+
+                pbar.update()
+
+        self._current_timestep = None
+        return latents
+
     # ------------------------------------------------------------------
     # Main forward
     # ------------------------------------------------------------------
@@ -1142,64 +1245,24 @@ class Wan22S2VPipeline(
                 negative_audio_emb = None
 
             # -- Denoising loop --
-            with self.progress_bar(total=len(timesteps)) as pbar:
-                for t in timesteps:
-                    self._current_timestep = t
-
-                    latent_model_input = [latents.to(device)]
-                    timestep = t.unsqueeze(0).to(device) if t.dim() == 0 else t.to(device)
-
-                    # -- Positive (conditional) prediction kwargs --
-                    # These match WanModel_S2V.forward() signature
-                    positive_kwargs = {
-                        "x": latent_model_input,
-                        "t": timestep,
-                        "context": prompt_embeds[0:1],
-                        "seq_len": max_seq_len,
-                        "cond_states": cond_latents,
-                        "motion_latents": input_motion_latents,
-                        "ref_latents": ref_latents,
-                        "motion_frames": mf,
-                        "drop_motion_frames": drop_first_motion and r == 0,
-                        "audio_emb": positive_audio_emb,
-                    }
-
-                    if do_true_cfg:
-                        negative_kwargs = {
-                            "x": latent_model_input,
-                            "t": timestep,
-                            "context": negative_prompt_embeds[0:1],
-                            "seq_len": max_seq_len,
-                            "cond_states": cond_latents,
-                            "motion_latents": input_motion_latents,
-                            "ref_latents": ref_latents,
-                            "motion_frames": mf,
-                            "drop_motion_frames": drop_first_motion and r == 0,
-                            "audio_emb": negative_audio_emb,
-                        }
-                    else:
-                        negative_kwargs = None
-
-                    noise_pred = self.predict_noise_maybe_with_cfg(
-                        do_true_cfg=do_true_cfg,
-                        true_cfg_scale=guidance_scale,
-                        positive_kwargs=positive_kwargs,
-                        negative_kwargs=negative_kwargs,
-                        cfg_normalize=False,
-                    )
-
-                    # Scheduler step
-                    latents = self.scheduler.step(
-                        noise_pred.unsqueeze(0),
-                        t,
-                        latents.unsqueeze(0),
-                        return_dict=False,
-                        generator=clip_generator,
-                    )[0].squeeze(0)
-
-                    pbar.update()
-
-            self._current_timestep = None
+            latents = self.diffuse(
+                latents=latents,
+                timesteps=timesteps,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                guidance_scale=guidance_scale,
+                clip_generator=clip_generator,
+                dtype=dtype,
+                device=device,
+                max_seq_len=max_seq_len,
+                cond_latents=cond_latents,
+                input_motion_latents=input_motion_latents,
+                ref_latents=ref_latents,
+                motion_frames=mf,
+                drop_first_motion=drop_first_motion and r == 0,
+                positive_audio_emb=positive_audio_emb,
+                negative_audio_emb=negative_audio_emb,
+            )
 
             # ---- Decode this clip ----
             latents_for_decode = latents.unsqueeze(0)  # [1, C, T, H, W]
