@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import pytest
+import torch
 
 from tests.dfx.conftest import (
     assert_fault_exception,
@@ -52,7 +53,18 @@ RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
 ]
 
 DEPLOY_CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "vllm_omni" / "deploy"
+
+
+def _default_oom_device_spec() -> str:
+    """Use currently visible CUDA ordinals to avoid invalid device index in sidecar."""
+    count = torch.cuda.device_count()
+    if count <= 0:
+        return "0"
+    return ",".join(str(i) for i in range(count))
+
+
 OOM_INJECTION_CONFIG = {
+    "device": _default_oom_device_spec(),
     "target_mem_ratio": 0.95,
     "hold_seconds": 0,
     "startup_timeout_sec": 20,
