@@ -27,6 +27,8 @@ recipes/
 
 - [`Qwen/Qwen3-Omni.md`](./Qwen/Qwen3-Omni.md): online serving recipe for
   multimodal chat on `1x A100 80GB`
+- [`Qwen/Qwen-Image-Layered.md`](./Qwen/Qwen-Image-Layered.md): offline
+  inference recipe for layered image editing on `2x RTX 5880 48GB`
 
 Within a single recipe file, include different hardware support sections such
 as `GPU`, `ROCm`, and `NPU`, and add concrete tested configurations like
