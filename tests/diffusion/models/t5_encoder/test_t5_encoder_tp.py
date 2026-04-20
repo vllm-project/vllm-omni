@@ -12,7 +12,6 @@ from vllm_omni.diffusion.models.t5_encoder.t5_encoder import (
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-
 _T5_MODULE = "vllm_omni.diffusion.models.t5_encoder.t5_encoder"
 
 SMALL_T5_CONFIG = dict(

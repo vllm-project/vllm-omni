@@ -13,15 +13,13 @@ from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
-
-
 PROMPT = "A brown and white dog is running on the grass"
 MODEL_NAME = "tencent/HunyuanImage-3.0"
 LOCAL_CLIP_PATH = "openai/clip-vit-base-patch32"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 STAGE_CONFIG_PATH = REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "hunyuan_image3_t2i.yaml"
 
+pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
 
 # System prompt type. Options: None, dynamic, en_vanilla, en_recaption, en_think_recaption, en_unified
 # Below are the CLIP embedding tensors from the official HunyuanImage model (seed=1234, prompt: "A brown and white dog is running on the grass").

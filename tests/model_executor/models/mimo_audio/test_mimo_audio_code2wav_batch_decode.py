@@ -16,7 +16,6 @@ from vllm_omni.model_executor.models.mimo_audio.mimo_audio_code2wav import (
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-
 _GROUP = 4
 _AC = 8
 _GROUP_WIDTH = flat_codec_group_element_count(_GROUP, _AC)

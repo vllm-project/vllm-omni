@@ -145,7 +145,6 @@ def test_send_t2i_request_001(omni_server, openai_client) -> None:
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.core_model
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 def test_send_t2s_request_001(omni_server, dynin_t2s_openai_client) -> None:

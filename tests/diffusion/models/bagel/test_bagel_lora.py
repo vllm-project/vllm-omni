@@ -21,7 +21,6 @@ from vllm_omni.lora.request import LoRARequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-
 _FakeLinearBase = FakeLinearBase
 
 

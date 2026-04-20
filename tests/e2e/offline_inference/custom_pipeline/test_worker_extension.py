@@ -14,9 +14,6 @@ from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.worker.diffusion_worker import CustomPipelineWorkerExtension
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
-pytestmark = [pytest.mark.core_model]
-
-
 CUSTOM_PIPELINE_CLASS = (
     "tests.e2e.offline_inference.custom_pipeline.qwen_image_pipeline_with_logprob.QwenImagePipelineWithLogProbForTest"
 )
@@ -24,6 +21,8 @@ WORKER_EXTENSION_CLASS = (
     "tests.e2e.offline_inference.custom_pipeline.worker_extension.vLLMOmniColocateWorkerExtensionForTest"
 )
 MODEL = "tiny-random/Qwen-Image"
+
+pytestmark = [pytest.mark.core_model]
 
 
 @pytest.mark.cpu

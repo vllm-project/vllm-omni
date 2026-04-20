@@ -23,9 +23,8 @@ from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_c
     TransferEngine,
 )
 
-pytestmark = [pytest.mark.parallel, pytest.mark.gpu]
-
 # All tests in this file require Mooncake TransferEngine and an RDMA environment.
+pytestmark = [pytest.mark.parallel, pytest.mark.gpu]
 
 # ---------------------------------------------------------------------------
 # Shared helpers

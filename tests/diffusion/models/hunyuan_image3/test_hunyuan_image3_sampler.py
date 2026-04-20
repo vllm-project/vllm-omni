@@ -8,7 +8,6 @@ import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-
 # Fake token IDs for testing (avoid importing the real model).
 END_OF_THINK = 100
 RECAPTION = 101

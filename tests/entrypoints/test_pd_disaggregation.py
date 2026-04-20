@@ -24,7 +24,6 @@ from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 
 pytestmark = pytest.mark.skip(reason="Temporarily skip PD entrypoint tests while PD config is being removed.")
 
-
 # Suppress noisy DeprecationWarnings from optional Swig bindings imported by vLLM dependencies.
 warnings.filterwarnings(
     "ignore",

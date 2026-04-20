@@ -45,7 +45,6 @@ from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
-
 # ---------------------------------------------------------------------------
 # Helpers & fixtures
 # ---------------------------------------------------------------------------

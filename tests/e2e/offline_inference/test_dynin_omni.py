@@ -31,13 +31,13 @@ models = ["snu-aidas/Dynin-Omni"]
 stage_configs = [str(_DEFAULT_STAGE_CONFIG_PATH)]
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 
+DYNIN_CONFIG_PATH = str(_DEFAULT_DYNIN_CONFIG_PATH) if _DEFAULT_DYNIN_CONFIG_PATH is not None else None
+
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.omni,
     pytest.mark.parametrize("omni_runner", test_params, indirect=True),
 ]
-
-DYNIN_CONFIG_PATH = str(_DEFAULT_DYNIN_CONFIG_PATH) if _DEFAULT_DYNIN_CONFIG_PATH is not None else None
 
 
 # prompting util

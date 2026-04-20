@@ -16,7 +16,6 @@ from vllm_omni.diffusion.models.bagel.bagel_transformer import (
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-
 NUM_TOKENS = 8
 HIDDEN_DIM = 16
 NUM_TIMESTEPS = 5

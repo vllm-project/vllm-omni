@@ -26,7 +26,6 @@ pytestmark = [
     pytest.mark.L4,
 ]
 
-
 DEVICE = torch.device("cuda:0")
 HIDDEN_DIM = 64
 N_ACOUSTIC_CODEBOOK = 7

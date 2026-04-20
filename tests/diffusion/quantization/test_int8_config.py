@@ -14,7 +14,6 @@ from vllm_omni.quantization.factory import SUPPORTED_QUANTIZATION_METHODS
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
-
 npu_available = pytest.mark.skipif(not current_omni_platform.is_npu(), reason="NPU platform not available.")
 
 cuda_available = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="GPU platform not available.")

@@ -38,7 +38,6 @@ from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-
 logger = logging.getLogger(__name__)
 
 

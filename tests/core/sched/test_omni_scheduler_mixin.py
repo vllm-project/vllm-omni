@@ -21,10 +21,9 @@ from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
 # isort: on
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _SchedulerStub(OmniSchedulerMixin):

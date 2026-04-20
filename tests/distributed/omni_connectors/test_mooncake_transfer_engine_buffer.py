@@ -16,9 +16,8 @@ from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_c
     ManagedBuffer,
 )
 
-pytestmark = [pytest.mark.cpu, pytest.mark.parallel, pytest.mark.core_model]
-
 # All tests in this file are pure-CPU unit tests for the memory allocator.
+pytestmark = [pytest.mark.cpu, pytest.mark.parallel, pytest.mark.core_model]
 
 
 @pytest.mark.core_model

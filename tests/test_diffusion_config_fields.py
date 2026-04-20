@@ -13,7 +13,6 @@ import yaml
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-
 try:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 except Exception:
