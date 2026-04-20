@@ -28,7 +28,10 @@ from starlette.datastructures import State
 from starlette.routing import Route
 from vllm import SamplingParams
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
+try:
+    from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
+except ImportError:  # vllm < 0.14 lacks Anthropic endpoint
+    AnthropicServingMessages = None  # type: ignore[assignment]
 from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.launcher import serve_http
 from vllm.entrypoints.logger import RequestLogger
@@ -798,7 +801,7 @@ async def omni_init_app_state(
             enable_force_include_usage=args.enable_force_include_usage,
             default_chat_template_kwargs=args.default_chat_template_kwargs,
         )
-        if "generate" in supported_tasks
+        if AnthropicServingMessages is not None and "generate" in supported_tasks
         else None
     )
     state.serving_tokens = (

@@ -1,0 +1,33 @@
+# Fun-Audio-Chat-8B deploy: Stage 0 (LM + per-step CRQ) → Stage 1 (token2wav).
+# Sync mode (no async chunk streaming): Stage 0 accumulates CRQ tokens into
+# multimodal_output, Stage 1 consumes them in a single token2wav pass.
+# BS=1 because CRQ decoder state (audio_invert_tower) is module-level and not
+# separable per-request.
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.45
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      max_tokens: 2048
+      seed: 42
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.4
+    enforce_eager: true
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
