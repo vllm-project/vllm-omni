@@ -16,14 +16,14 @@ import wave
 import pytest
 import websockets
 
-from tests.conftest import (
-    OmniServerParams,
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import (
     convert_audio_bytes_to_text,
     cosine_similarity_text,
     generate_synthetic_audio,
-    modify_stage_config,
 )
-from tests.utils import get_deploy_config_path, hardware_test
+from tests.helpers.runtime import OmniServerParams
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 

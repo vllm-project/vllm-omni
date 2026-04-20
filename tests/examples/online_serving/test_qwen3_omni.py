@@ -11,13 +11,15 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import OmniServerParams, convert_audio_file_to_text, cosine_similarity_text
-from tests.examples.conftest import (
+from tests.examples.helpers import (
     extract_content_after_keyword,
     run_cmd,
     strip_trailing_audio_saved_line,
 )
-from tests.utils import get_deploy_config_path, hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import convert_audio_file_to_text, cosine_similarity_text
+from tests.helpers.runtime import OmniServerParams
+from tests.helpers.stage_config import get_deploy_config_path
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.example]
 

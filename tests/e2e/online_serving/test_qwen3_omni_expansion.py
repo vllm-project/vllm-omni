@@ -10,15 +10,10 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 import pytest
 
-from tests.conftest import (
-    OmniServerParams,
-    dummy_messages_from_mix_data,
-    generate_synthetic_audio,
-    generate_synthetic_image,
-    generate_synthetic_video,
-    modify_stage_config,
-)
-from tests.utils import get_deploy_config_path, hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
@@ -64,7 +59,6 @@ def get_async_chunk_config(default_path):
     return modify_stage_config(
         default_path,
         updates={
-            "async_chunk": True,
             "stages": {0: {"default_sampling_params.max_tokens": 2048}},
         },
     )
@@ -78,7 +72,9 @@ default_path = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 
 test_params = [
     pytest.param(
-        OmniServerParams(model=model, stage_config_path=default_path, use_stage_cli=True),
+        OmniServerParams(
+            model=model, stage_config_path=default_path, use_stage_cli=True, server_args=["--no-async-chunk"]
+        ),
         id="default",
     ),
     pytest.param(
@@ -454,7 +450,7 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["london"]},
     }
 
-    # Retry only when assert_omni_response fails on text/audio cosine similarity (see tests/conftest.py).
+    # Retry only when assert_omni_response fails on text/audio cosine similarity (see tests/helpers/assertions.py).
     _similarity_assert_msg = "The audio content is not same as the text"
     _max_retries = 3
     for attempt in range(_max_retries):
@@ -519,7 +515,7 @@ def test_speaker_002(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    # Retry only when assert_omni_response fails on preset voice gender (see tests/conftest.py).
+    # Retry only when assert_omni_response fails on preset voice gender (see tests/helpers/assertions.py).
     _gender_assert_substr = "estimated gender"
     _max_retries = 3
     for attempt in range(_max_retries):

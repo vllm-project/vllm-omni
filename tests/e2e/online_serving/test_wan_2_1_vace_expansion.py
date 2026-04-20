@@ -23,12 +23,8 @@ Coverage:
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
 
 MODEL = "Wan-AI/Wan2.1-VACE-1.3B-diffusers"
 PROMPT = "A cat walking slowly across a sunlit garden path"

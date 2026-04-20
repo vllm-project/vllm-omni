@@ -16,8 +16,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tests.conftest import OmniRunner
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
 
 MODEL = "k2-fsa/OmniVoice"
 

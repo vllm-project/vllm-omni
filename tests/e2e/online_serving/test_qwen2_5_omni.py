@@ -6,15 +6,10 @@ import os
 
 import pytest
 
-from tests.conftest import (
-    OmniServerParams,
-    dummy_messages_from_mix_data,
-    generate_synthetic_audio,
-    generate_synthetic_image,
-    generate_synthetic_video,
-    modify_stage_config,
-)
-from tests.utils import get_deploy_config_path, hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"

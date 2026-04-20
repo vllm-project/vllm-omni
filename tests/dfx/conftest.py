@@ -6,8 +6,9 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import OmniServerParams
 from tests.dfx.reliability.conftest import list_remote_process_pids_by_pattern, post_chat_completions_raw
+from tests.helpers.runtime import OmniServerParams
+from tests.helpers.stage_config import modify_stage_config
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -25,6 +26,17 @@ def load_configs(config_path: str) -> list[dict[str, Any]]:
         raise ValueError(f"Configuration file not found: {config_path}")
     except Exception as e:
         raise RuntimeError(f"Failed to load configuration file: {str(e)}")
+
+
+def modify_stage(default_path: str, updates: dict[str, Any] | None, deletes: dict[str, Any] | None) -> str:
+    kwargs: dict[str, Any] = {}
+    if updates is not None:
+        kwargs["updates"] = updates
+    if deletes is not None:
+        kwargs["deletes"] = deletes
+    if kwargs:
+        return modify_stage_config(default_path, **kwargs)
+    return default_path
 
 
 def create_unique_server_params(
@@ -94,7 +106,7 @@ def create_reliability_omni_server_params(configs: list[dict[str, Any]], stage_c
             stage_config_path=stage_config_path,
             server_args=server_args_by_name.get(test_name),
         )
-        for test_name, model, stage_config_path in unique_params
+        for test_name, model, stage_config_path, _stage_overrides_json, _extra_cli_args in unique_params
     ]
 
 

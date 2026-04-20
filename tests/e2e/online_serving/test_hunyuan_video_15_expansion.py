@@ -11,12 +11,8 @@ Coverage (H100, since model cannot fit L4):
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
 
 PROMPT = "A cat walking across a sunlit garden, cinematic lighting, slow motion."
 NEGATIVE_PROMPT = "low quality, blurry, distorted"
