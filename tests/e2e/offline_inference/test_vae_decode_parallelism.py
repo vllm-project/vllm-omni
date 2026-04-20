@@ -18,7 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import time
 
-from tests.conftest import OmniRunner
+from tests.helpers.runtime import OmniRunner
 from vllm_omni.platforms import current_omni_platform
 
 # os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"

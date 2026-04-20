@@ -11,12 +11,8 @@ Coverage:
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
 
 FOUR_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=4)
 POSITIVE_PROMPT = "A cat sitting on a windowsill"

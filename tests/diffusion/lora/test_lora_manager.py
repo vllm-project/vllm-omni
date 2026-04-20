@@ -8,7 +8,7 @@ import torch
 from vllm.lora.lora_weights import LoRALayerWeights
 from vllm.lora.utils import get_supported_lora_modules
 
-from tests.diffusion.lora.conftest import (
+from tests.diffusion.lora.helpers import (
     DummyBaseLayerWithLoRA,
     FakeLinearBase,
     fake_replace_submodule,
