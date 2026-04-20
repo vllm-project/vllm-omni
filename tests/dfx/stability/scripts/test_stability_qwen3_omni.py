@@ -19,14 +19,18 @@ from tests.dfx.conftest import (
 from tests.dfx.stability.conftest import _run_one_vllm_bench_batch, run_stability_benchmark_loop
 
 STABILITY_DIR = Path(__file__).resolve().parent.parent
-STAGE_CONFIGS_DIR = STABILITY_DIR / "stage_configs"
+DEPLOY_CONFIGS_DIR = STABILITY_DIR / "deploy"
 CONFIG_FILE_PATH = str(STABILITY_DIR / "tests" / "test_qwen3_omni.json")
 DEFAULT_NUM_PROMPTS_PER_BATCH = 20
 STABILITY_SERVER_TIMEOUT_ARGS = ["--stage-init-timeout", "120"]
 
-BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
-test_params = create_unique_server_params(BENCHMARK_CONFIGS, STAGE_CONFIGS_DIR)
-server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS)
+try:
+    BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
+except FileNotFoundError:
+    BENCHMARK_CONFIGS = []
+
+test_params = create_unique_server_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR) if BENCHMARK_CONFIGS else []
+server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS) if BENCHMARK_CONFIGS else {}
 benchmark_indices = create_benchmark_indices(BENCHMARK_CONFIGS, server_to_benchmark_mapping)
 
 
