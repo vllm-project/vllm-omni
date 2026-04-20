@@ -12,9 +12,9 @@ import numpy as np
 import pytest
 import torch
 
-import tests.conftest as omni_test_conftest
-from tests.conftest import OmniRunner
-from tests.utils import hardware_test
+import tests.helpers.runtime as omni_runtime
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
 from vllm_omni.model_executor.models.voxcpm.voxcpm_runtime_utils import (
     prepare_voxcpm_hf_config_dir,
     resolve_voxcpm_model_dir,
@@ -30,7 +30,7 @@ SAMPLE_RATE = 24000
 @pytest.fixture(autouse=True)
 def _patch_npu_cleanup_for_voxcpm(monkeypatch: pytest.MonkeyPatch):
     """Limit the NPU cleanup workaround to this VoxCPM test module only."""
-    original_cleanup = omni_test_conftest.cleanup_dist_env_and_memory
+    original_cleanup = omni_runtime.cleanup_dist_env_and_memory
 
     def _safe_cleanup() -> None:
         try:
@@ -40,7 +40,7 @@ def _patch_npu_cleanup_for_voxcpm(monkeypatch: pytest.MonkeyPatch):
                 return
             raise
 
-    monkeypatch.setattr(omni_test_conftest, "cleanup_dist_env_and_memory", _safe_cleanup)
+    monkeypatch.setattr(omni_runtime, "cleanup_dist_env_and_memory", _safe_cleanup)
 
 
 def _build_prompt(text: str) -> dict[str, Any]:

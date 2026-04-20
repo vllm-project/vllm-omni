@@ -9,13 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import (
-    OmniServerParams,
-    dummy_messages_from_mix_data,
-    generate_synthetic_audio,
-    modify_stage_config,
-)
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import generate_synthetic_audio
+from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
+from tests.helpers.stage_config import modify_stage_config
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )

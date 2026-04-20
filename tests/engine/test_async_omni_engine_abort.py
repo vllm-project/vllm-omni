@@ -7,18 +7,15 @@ import pytest
 from vllm import SamplingParams
 from vllm.inputs import PromptType
 
-# Side-effect import: registers QWEN2_5_OMNI_THINKER_ONLY_PIPELINE in the
-# pipeline registry so the materialized deploy overlay below can select it
-# via its top-level ``pipeline:`` field.
-import vllm_omni.model_executor.models.qwen2_5_omni.pipeline  # noqa: F401, E402
-from tests.utils import get_deploy_config_path, hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 SEED = 42
 
-# Single-stage thinker-only deploy, materialized from tests.utils._CI_OVERLAYS.
+# Single-stage thinker-only deploy, materialized from tests.helpers.stage_config._CI_OVERLAYS.
 stage_config = get_deploy_config_path("ci/qwen2_5_omni_thinker_only.yaml")
 model = "Qwen/Qwen2.5-Omni-7B"
 
@@ -64,7 +61,6 @@ async def generate(
 
 @pytest.mark.core_model
 @pytest.mark.omni
-@pytest.mark.real_hf_config
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.asyncio
 async def test_abort():

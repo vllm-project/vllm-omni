@@ -945,7 +945,7 @@ class TestBaseConfigInheritance:
     """Test deploy YAML base_config inheritance."""
 
     def test_ci_inherits_from_main(self):
-        from tests.utils import get_deploy_config_path
+        from tests.helpers.stage_config import get_deploy_config_path
         from vllm_omni.config.stage_config import load_deploy_config
 
         ci_path = Path(get_deploy_config_path("ci/qwen3_omni_moe.yaml"))
@@ -962,12 +962,12 @@ class TestBaseConfigInheritance:
         assert deploy.connectors is not None
         assert "connector_of_shared_memory" in deploy.connectors
         # CI overlay explicitly sets async_chunk: False (see
-        # tests/utils.py::_CI_OVERLAYS and PR #2383 discussion). Overlay
+        # tests.helpers.stage_config._CI_OVERLAYS and PR #2383 discussion). Overlay
         # bool overrides base even when the base yaml has async_chunk: true.
         assert deploy.async_chunk is False
 
     def test_ci_sampling_merge(self):
-        from tests.utils import get_deploy_config_path
+        from tests.helpers.stage_config import get_deploy_config_path
         from vllm_omni.config.stage_config import load_deploy_config
 
         ci_path = Path(get_deploy_config_path("ci/qwen3_omni_moe.yaml"))

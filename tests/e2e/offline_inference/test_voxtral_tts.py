@@ -29,8 +29,9 @@ from mistral_common.protocol.speech.request import SpeechRequest
 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from vllm import SamplingParams
 
-from tests.conftest import OmniRunner, modify_stage_config
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import modify_stage_config
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 MODEL = "mistralai/Voxtral-4B-TTS-2603"
