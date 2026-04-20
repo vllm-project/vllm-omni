@@ -1212,6 +1212,30 @@ class Wan22S2VPipeline(
             decode_latents = decode_latents.to(self.vae.dtype)
             clip_video = self.vae.decode(decode_latents, return_dict=False)[0]  # [1, C, T, H, W]
 
+            # Handle VAE patch parallel: only rank 0 gets result, broadcast to all ranks
+            # This is needed for S2V's autoregressive loop where all ranks need the decoded frames
+            if clip_video.numel() == 0:
+                # Non-rank0 received empty tensor from patch parallel decode
+                # Use the same broadcast mechanism as the VAE patch parallel code
+                from vllm.distributed import get_tensor_model_parallel_rank
+                import torch.distributed as dist
+
+                tp_rank = get_tensor_model_parallel_rank()
+                total_frames = decode_latents.shape[2]
+
+                # Create buffer for broadcast
+                clip_video = torch.empty(
+                    (1, 3, total_frames, height, width),
+                    device=decode_latents.device,
+                    dtype=decode_latents.dtype,
+                )
+
+                # Get the VAE's patch parallel group (same one used in decode)
+                vae_pp_group = getattr(self.vae, "_vae_pp_group", None)
+                if vae_pp_group is not None:
+                    # Broadcast using the same group as VAE patch parallel
+                    dist.broadcast(clip_video, src=0, group=vae_pp_group)
+
             # Trim to the infer_frames of interest
             clip_video = clip_video[:, :, -infer_frames:]
             if drop_first_motion and r == 0:
