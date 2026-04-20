@@ -356,14 +356,29 @@ def _is_diffusers_format(model_path: str) -> bool:
 def _resolve_model_path(model: str) -> str:
     """Resolve a HF repo ID or local path to a local directory.
 
-    For local paths, returns as-is. For HF repo IDs, downloads all files
+    For local paths, returns as-is. For HF repo IDs, downloads needed files
     and returns the snapshot directory.
     """
     if os.path.isdir(model):
         return model
     from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
-    return download_weights_from_hf_specific(model, None, ["*"])
+    # S2V models use a non-standard repo layout with files at root level.
+    # Download only the files needed for inference:
+    # - Transformer weights (sharded safetensors + index)
+    # - VAE weights
+    # - T5 encoder weights + tokenizer config
+    # - Audio encoder (wav2vec2) weights + config
+    # - Model config files
+    allow_patterns = [
+        "*.safetensors",                          # Transformer weights (sharded)
+        "*.safetensors.index.json",               # Weight shard index
+        "*.pth",                                  # VAE and T5 weights
+        "*.json",                                 # Config files (config.json, configuration.json)
+        "google/**",                              # T5 tokenizer/config directory
+        "wav2vec2-large-xlsr-53-english/**",      # Audio encoder directory
+    ]
+    return download_weights_from_hf_specific(model, None, allow_patterns)
 
 
 # ---------------------------------------------------------------------------
