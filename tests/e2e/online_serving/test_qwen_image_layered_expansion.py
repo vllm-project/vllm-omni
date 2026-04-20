@@ -14,15 +14,9 @@ Total distinct features covered: cache_dit, Ulysses-SP, CFG-Parallel, layerwise-
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-    decode_b64_image,
-    dummy_messages_from_mix_data,
-    generate_synthetic_image,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.media import decode_b64_image, generate_synthetic_image
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
 MODEL = "Qwen/Qwen-Image-Layered"
 EDIT_PROMPT = "Decompose this image into layers."

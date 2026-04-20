@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform

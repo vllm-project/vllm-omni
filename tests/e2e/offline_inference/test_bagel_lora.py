@@ -31,9 +31,10 @@ import torch
 from PIL import Image
 from safetensors.torch import save_file
 
-from tests.conftest import OmniRunner, modify_stage_config
-from tests.utils import hardware_test
-from vllm_omni import Omni
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import modify_stage_config
+from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 

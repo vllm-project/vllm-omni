@@ -24,7 +24,6 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import OmniServer
 from tests.dfx.conftest import (
     create_benchmark_indices,
     create_test_parameter_mapping,
@@ -33,6 +32,7 @@ from tests.dfx.conftest import (
     load_configs,
 )
 from tests.dfx.perf.scripts.run_benchmark import run_benchmark
+from tests.helpers.runtime import OmniServer
 
 STABILITY_DIR = Path(__file__).resolve().parent.parent
 DEPLOY_CONFIGS_DIR = STABILITY_DIR / "deploy"

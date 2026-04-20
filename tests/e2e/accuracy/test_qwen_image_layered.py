@@ -12,13 +12,10 @@ import torch
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from PIL import Image
 
-from tests.conftest import (
-    OmniServer,
-    _run_post_test_cleanup,
-    _run_pre_test_cleanup,
-)
-from tests.e2e.accuracy.utils import assert_image_sequence_similarity, model_output_dir
-from tests.utils import hardware_test
+from tests.e2e.accuracy.helpers import assert_image_sequence_similarity, model_output_dir
+from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServer
 
 MODEL_ID = "Qwen/Qwen-Image-Layered"
 MODEL_ENV_VAR = "QWEN_IMAGE_LAYERED_MODEL"
@@ -93,7 +90,7 @@ def _run_vllm_omni_qwen_image_layered(*, model: str, input_image: Image.Image, o
 
 
 def _run_diffusers_qwen_image_layered(*, model: str, input_image: Image.Image, output_dir: Path) -> list[Image.Image]:
-    _run_pre_test_cleanup(enable_force=True)
+    run_pre_test_cleanup(enable_force=True)
     pipe: DiffusionPipeline | None = None
     try:
         pipe = DiffusionPipeline.from_pretrained(
@@ -126,7 +123,7 @@ def _run_diffusers_qwen_image_layered(*, model: str, input_image: Image.Image, o
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        _run_post_test_cleanup(enable_force=True)
+        run_post_test_cleanup(enable_force=True)
 
 
 @pytest.mark.advanced_model
