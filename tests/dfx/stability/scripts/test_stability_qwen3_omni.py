@@ -22,7 +22,7 @@ STABILITY_DIR = Path(__file__).resolve().parent.parent
 DEPLOY_CONFIGS_DIR = STABILITY_DIR / "deploy"
 CONFIG_FILE_PATH = str(STABILITY_DIR / "tests" / "test_qwen3_omni.json")
 DEFAULT_NUM_PROMPTS_PER_BATCH = 20
-STABILITY_SERVER_TIMEOUT_ARGS = ["--stage-init-timeout", "120"]
+STABILITY_SERVER_TIMEOUT_ARGS = ["--stage-init-timeout", "600"]
 
 try:
     BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
