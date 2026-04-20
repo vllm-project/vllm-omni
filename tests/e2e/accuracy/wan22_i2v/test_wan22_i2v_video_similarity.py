@@ -567,7 +567,6 @@ def test_wan22_i2v_diffusers_offline_generates_video(
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.skip(reason="issue: #2874")
 @pytest.mark.parametrize("omni_server", SERVER_CASES, indirect=True)
 def test_wan22_i2v_online_serving_generates_video(
     omni_server,

@@ -627,11 +627,20 @@ class Orchestrator:
         if next_client.stage_type == "diffusion":
             self.stage_clients[stage_id].set_engine_outputs([output])
             if next_client.custom_process_input_func is not None:
+                _t_ar2d = _time.perf_counter()
                 diffusion_prompt = next_client.custom_process_input_func(
                     self.stage_clients,
                     next_client.engine_input_source,
                     req_state.prompt,
                     False,
+                )
+                _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
+                logger.info(
+                    "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
+                    req_id,
+                    _dt_ar2d,
+                    stage_id,
+                    next_stage_id,
                 )
                 if isinstance(diffusion_prompt, list):
                     diffusion_prompt = diffusion_prompt[0]
