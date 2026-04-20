@@ -75,17 +75,26 @@ class SupportsModuleOffload(Protocol):
     ``_vae_modules``: attribute names of VAE(s) (always kept on GPU,
     not part of the mutual exclusion hooks).
 
+    ``_resident_modules``: attribute names of small submodules that
+    must stay on GPU during layer-wise offloading (e.g. embedders,
+    connectors).  Optional — defaults to ``[]``.
+
+    All attribute names support dotted paths (e.g.
+    ``"bagel.time_embedder"``) for nested submodules.
+
     Example::
 
         class MyPipeline(nn.Module, SupportsModuleOffload):
             _dit_modules: ClassVar[list[str]] = ["transformer"]
             _encoder_modules: ClassVar[list[str]] = ["text_encoder", "vit"]
             _vae_modules: ClassVar[list[str]] = ["vae"]
+            _resident_modules: ClassVar[list[str]] = ["time_embedder"]
     """
 
     _dit_modules: ClassVar[list[str]]
     _encoder_modules: ClassVar[list[str]]
     _vae_modules: ClassVar[list[str]]
+    _resident_modules: ClassVar[list[str]] = []
 
 
 def supports_step_execution(pipeline: object) -> bool:

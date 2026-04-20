@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from operator import attrgetter
 
 from torch import nn
@@ -19,6 +19,8 @@ class PipelineModules:
     encoders: list[nn.Module]
     encoder_names: list[str]
     vaes: list[nn.Module]
+    resident_modules: list[nn.Module] = field(default_factory=list)
+    resident_names: list[str] = field(default_factory=list)
 
 
 class ModuleDiscovery:
@@ -112,14 +114,17 @@ class ModuleDiscovery:
             dit_attrs = pipeline._dit_modules
             enc_attrs = pipeline._encoder_modules
             vae_attrs = pipeline._vae_modules
+            res_attrs = pipeline._resident_modules
         else:
             dit_attrs = ModuleDiscovery._FALLBACK_DIT_ATTRS
             enc_attrs = ModuleDiscovery._FALLBACK_ENCODER_ATTRS
             vae_attrs = ModuleDiscovery._FALLBACK_VAE_ATTRS
+            res_attrs = []
 
         dit_modules, dit_names = ModuleDiscovery._collect_modules(pipeline, dit_attrs, warn_missing=declared)
         encoders, encoder_names = ModuleDiscovery._collect_modules(pipeline, enc_attrs, warn_missing=declared)
         vaes, _ = ModuleDiscovery._collect_modules(pipeline, vae_attrs, warn_missing=declared)
+        residents, resident_names = ModuleDiscovery._collect_modules(pipeline, res_attrs, warn_missing=declared)
 
         return PipelineModules(
             dits=dit_modules,
@@ -127,4 +132,6 @@ class ModuleDiscovery:
             encoders=encoders,
             encoder_names=encoder_names,
             vaes=vaes,
+            resident_modules=residents,
+            resident_names=resident_names,
         )

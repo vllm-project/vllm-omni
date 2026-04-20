@@ -113,6 +113,27 @@ class NestedPipeline(nn.Module, SupportsModuleOffload):
         self.vae = nn.Linear(10, 10)
 
 
+class ResidentPipeline(nn.Module, SupportsModuleOffload):
+    """Pipeline with resident modules that must stay on GPU."""
+
+    _dit_modules: ClassVar[list[str]] = ["language_model.model"]
+    _encoder_modules: ClassVar[list[str]] = []
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    _resident_modules: ClassVar[list[str]] = [
+        "bagel.time_embedder",
+        "bagel.vae2llm",
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.language_model = nn.Module()
+        self.language_model.model = nn.Linear(10, 10)
+        self.bagel = nn.Module()
+        self.bagel.time_embedder = nn.Linear(10, 10)
+        self.bagel.vae2llm = nn.Linear(10, 10)
+        self.vae = nn.Linear(10, 10)
+
+
 class MultiVaePipeline(nn.Module, SupportsModuleOffload):
     """Pipeline with multiple VAEs."""
 
@@ -145,6 +166,7 @@ class TestFallbackDiscovery:
         assert result.dits[0] is pipeline.transformer
         assert result.encoder_names == ["text_encoder", "text_encoder_2"]
         assert result.vaes[0] is pipeline.vae
+        assert result.resident_modules == []
 
     def test_deduplicates_encoders(self):
         pipeline = DuplicateAttrPipeline()
@@ -173,6 +195,8 @@ class TestProtocolDiscovery:
         assert len(result.vaes) == 1
         # self.transformer exists but is NOT in _dit_modules
         assert "transformer" not in result.dit_names
+        # No _resident_modules declared — defaults to empty
+        assert result.resident_modules == []
 
     def test_skips_missing_attr(self):
         pipeline = MissingAttrPipeline()
@@ -194,6 +218,18 @@ class TestProtocolDiscovery:
         assert result.encoder_names == ["pipe.text_encoder"]
         assert result.encoders[0] is pipeline.pipe.text_encoder
         assert result.vaes[0] is pipeline.vae
+
+    def test_resident_modules(self):
+        pipeline = ResidentPipeline()
+        result = ModuleDiscovery.discover(pipeline)
+
+        assert result.resident_names == [
+            "bagel.time_embedder",
+            "bagel.vae2llm",
+        ]
+        assert result.resident_modules[0] is pipeline.bagel.time_embedder
+        assert result.resident_modules[1] is pipeline.bagel.vae2llm
+        assert result.dits[0] is pipeline.language_model.model
 
     def test_multiple_vaes(self):
         pipeline = MultiVaePipeline()
