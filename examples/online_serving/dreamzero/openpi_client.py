@@ -44,10 +44,7 @@ PING_TIMEOUT_SECS = 3600
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 DEFAULT_PATH = "/v1/realtime/robot/openpi"
-DEFAULT_PROMPT = (
-    "Move the pan forward and use the brush in the middle of the plates "
-    "to brush the inside of the pan"
-)
+DEFAULT_PROMPT = "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan"
 ACTION_HORIZON = 24
 DEFAULT_ACTION_DIM = 8
 RELATIVE_OFFSETS = [-23, -16, -8, 0]
@@ -69,7 +66,7 @@ class DreamZeroServerMetadata:
     action_space: str
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "DreamZeroServerMetadata":
+    def from_dict(cls, payload: dict[str, Any]) -> DreamZeroServerMetadata:
         required_keys = (
             "image_resolution",
             "n_external_cameras",

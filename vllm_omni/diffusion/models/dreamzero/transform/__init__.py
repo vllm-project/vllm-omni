@@ -25,11 +25,7 @@ def ensure_transforms_loaded() -> None:
             importlib.import_module(module_name)
         except Exception as exc:
             logger.exception("Failed to import DreamZero transform module %s", module_name)
-            raise RuntimeError(
-                f"Failed to import DreamZero transform module '{module_name}'."
-            ) from exc
+            raise RuntimeError(f"Failed to import DreamZero transform module '{module_name}'.") from exc
 
     if DEFAULT_EMBODIMENT not in TRANSFORMS:
-        raise RuntimeError(
-            f"Built-in DreamZero transform '{DEFAULT_EMBODIMENT}' is not registered after import."
-        )
+        raise RuntimeError(f"Built-in DreamZero transform '{DEFAULT_EMBODIMENT}' is not registered after import.")
