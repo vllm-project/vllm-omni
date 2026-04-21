@@ -76,5 +76,5 @@ th {
 |`DyninOmniForConditionalGeneration` | Dynin-Omni | `snu-aidas/Dynin-Omni` | ✅︎ | | | |
 | `ErnieImagePipeline` | ERNIE-Image | `baidu/ERNIE-Image`, `baidu/ERNIE-Image-Turbo` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 |`HiDreamImagePipeline` | HiDream-I1-Full | `HiDream-ai/HiDream-I1-Full` | ✅︎ | ✅︎ | | |
-
+| `OmniWeavingPipeline` | OmniWeaving | `Tencent-Hunyuan/OmniWeaving` | ✅︎ | ✅︎ |   |   |
 ✅︎ indicates the model is supported on that backend. Empty cells mean not listed as supported on that backend.
