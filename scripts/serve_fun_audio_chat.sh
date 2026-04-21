@@ -67,4 +67,5 @@ exec uv run \
         --trust-remote-code \
         --enforce-eager \
         --omni \
+        --media-io-kwargs '{"audio": {"target_sr": 16000}}' \
         $EXTRA_ARGS

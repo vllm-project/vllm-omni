@@ -121,6 +121,13 @@ class FunAudioChatProcessingInfo(BaseProcessingInfo):
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"audio": None}  # allow multi-turn
 
+    def get_data_parser(self) -> MultiModalDataParser:
+        # vllm's OpenAI API calls info.data_parser.parse_mm_data at request
+        # validation time; the default has target_sr=None and rejects audio
+        # with "Audio resampling is not supported when `target_sr` is not
+        # provided". Whisper expects 16 kHz input, so set it here.
+        return MultiModalDataParser(target_sr=16000)
+
     def get_hf_processor(self, **kwargs: object):
         from transformers import WhisperFeatureExtractor
         return WhisperFeatureExtractor(
