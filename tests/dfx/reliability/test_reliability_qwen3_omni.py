@@ -71,17 +71,15 @@ OOM_INJECTION_CONFIG = {
     "strict": True,
 }
 FAULT_ERROR_KEYWORDS = (
+    "the request failed",
     "oom",
     "out of memory",
     "cuda",
-    "internal",
-    "500",
-    "503",
+    "orchestrator",
     "timeout",
     "connection",
-    "engine",
-    "orchestrator",
-    "dead",
+    "500",
+    "503",
 )
 RUNTIME_WORKER_PATTERN = "VLLM::Worker"
 
