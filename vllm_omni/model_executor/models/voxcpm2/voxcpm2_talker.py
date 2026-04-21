@@ -19,7 +19,6 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
-import librosa
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -30,6 +29,7 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     maybe_prefix,
 )
+from vllm.multimodal.audio import AudioResampler
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -145,7 +145,8 @@ def _encode_raw_audio(
     encode_sr = tts._encode_sample_rate
     if sr != encode_sr:
         audio_np = audio.squeeze(0).numpy()
-        audio_np = librosa.resample(audio_np, orig_sr=sr, target_sr=encode_sr)
+        resampler = AudioResampler(target_sr=encode_sr)
+        audio_np = resampler.resample(audio_np, orig_sr=sr)
         audio = torch.from_numpy(audio_np).unsqueeze(0)
 
     patch_len = tts.patch_size * tts.chunk_size
