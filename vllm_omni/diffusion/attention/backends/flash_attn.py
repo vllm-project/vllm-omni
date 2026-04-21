@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import partial
 
 import torch
 from vllm.logger import init_logger
@@ -9,6 +10,9 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
+)
+from vllm_omni.diffusion.attention.backends.utils.segmented import (
+    segmented_attn,
 )
 
 logger = init_logger(__name__)
@@ -53,6 +57,10 @@ class FlashAttentionImpl(AttentionImpl):
     def _unwrap_flash_output(out: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
         # FA3 may return (out, lse), FA2 returns out
         return out[0] if isinstance(out, tuple) else out
+
+    @staticmethod
+    def _flash_wrapper(q, k, v, *, attn_func, **kwargs):
+        return FlashAttentionImpl._unwrap_flash_output(attn_func(q, k, v, **kwargs))
 
     def _forward_varlen_masked(
         self,
@@ -151,6 +159,26 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        image_spans = attn_metadata.image_spans if attn_metadata is not None else None
+        q_global_positions = attn_metadata.q_global_positions if attn_metadata is not None else None
+
+        # Segmented attention flow
+        if image_spans is not None and q_global_positions is not None:
+            logger.debug("Using segmented Flash Attention for mixed causal/full mask")
+            attn_func = partial(
+                FlashAttentionImpl._flash_wrapper,
+                attn_func=flash_attn_func,
+            )
+
+            return segmented_attn(
+                query,
+                key,
+                value,
+                image_spans,
+                q_global_positions,
+                self.softmax_scale,
+                attn_func,
+            )
 
         if attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(

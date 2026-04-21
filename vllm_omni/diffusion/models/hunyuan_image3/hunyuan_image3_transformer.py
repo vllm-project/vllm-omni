@@ -1054,9 +1054,14 @@ class ImageKVCacheManager:
 
         attention_mask = attention_mask.contiguous()
 
+        image_spans = kwargs.get("image_spans")
+        q_global_positions = kwargs.get("q_global_positions")
+
         if self.sp_size <= 1:
             attn_metadata = AttentionMetadata(
                 attn_mask=attention_mask,
+                image_spans=image_spans,
+                q_global_positions=q_global_positions,
             )
         else:
             attn_metadata = AttentionMetadata(
@@ -1065,6 +1070,8 @@ class ImageKVCacheManager:
                 joint_value=joint_text_value,
                 joint_strategy="front",
                 attn_mask=attention_mask,
+                image_spans=image_spans,
+                q_global_positions=q_global_positions,
             )
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
@@ -2221,6 +2228,8 @@ class HunyuanImage3Model(nn.Module):
         num_image_tokens: int | None = None,
         gen_timestep_scatter_index: torch.Tensor | None = None,
         uncond_cfg_prefill: bool = False,
+        image_spans: list[list[tuple[int, int]]] | None = None,
+        q_global_positions: torch.Tensor | None = None,
     ) -> tuple | BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -2329,6 +2338,8 @@ class HunyuanImage3Model(nn.Module):
                 shard_image_size=shard_image_size,
                 shard_padding_size=shard_padding_size,
                 uncond_cfg_prefill=uncond_cfg_prefill,
+                image_spans=image_spans,
+                q_global_positions=q_global_positions,
             )
 
             hidden_states = layer_outputs[0]
@@ -2564,10 +2575,15 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             "cond_vae_image_mask",
             "cond_vit_image_mask",
             "cond_timestep_scatter_index",
+            "q_global_positions",
         ]
         for key in tensor_keys:
             if key in model_kwargs and model_kwargs[key] is not None:
                 model_kwargs[key] = model_kwargs[key][s]
+
+        # List[List[...]] per-sample metadata indexed along the CFG batch dim
+        if isinstance(model_kwargs.get("image_spans"), list):
+            model_kwargs["image_spans"] = model_kwargs["image_spans"][s.start : s.stop]
 
         # custom_pos_emb: tuple of (cos, sin)
         if "custom_pos_emb" in model_kwargs and model_kwargs["custom_pos_emb"] is not None:

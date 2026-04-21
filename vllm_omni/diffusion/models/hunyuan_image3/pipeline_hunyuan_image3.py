@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
-import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -340,11 +339,6 @@ class HunyuanImage3Pipeline(
             )
         ]
         quant_config = od_config.quantization_config
-        os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
-        logger.info(
-            "Setting attention backend to TORCH_SDPA. "
-            "HunyuanImage3Pipeline only supports TORCH_SDPA to handle mixed causal and full attention."
-        )
         self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
         self.transformer = self.model
         self.vae = AutoencoderKLConv3D.from_config(self.hf_config.vae)
@@ -962,10 +956,16 @@ class HunyuanImage3Pipeline(
             tokenizer_output.joint_image_slices[i] + tokenizer_output.gen_image_slices[i] for i in range(bsz)
         ]
         attention_mask = torch.ones(seq_len, seq_len, dtype=torch.bool).tril(diagonal=0).repeat(bsz, 1, 1)
+        image_spans: list[list[tuple[int, int]]] = [[] for _ in range(bsz)]
         for i in range(bsz):
             for j, image_slice in enumerate(batch_image_slices[i]):
                 attention_mask[i, image_slice, image_slice] = True
+                start = image_slice.start if image_slice.start is not None else 0
+                stop = image_slice.stop if image_slice.stop is not None else seq_len
+                assert start < stop, f"Invalid image slice: {image_slice}"
+                image_spans[i].append((int(start), int(stop)))
         attention_mask = attention_mask.unsqueeze(1)
+        model_kwargs["image_spans"] = image_spans  # For segmented attention
         return attention_mask
 
     def prepare_inputs_for_generation(
@@ -1009,6 +1009,8 @@ class HunyuanImage3Pipeline(
                 "query_lens": kwargs.get("query_lens"),
                 "seq_lens": kwargs.get("seq_lens"),
                 "num_image_tokens": kwargs.get("num_image_tokens"),
+                "image_spans": kwargs.get("image_spans"),
+                "q_global_positions": kwargs.get("q_global_positions", kwargs.get("position_ids")),
             }
         )
         return model_inputs
@@ -1027,6 +1029,10 @@ class HunyuanImage3Pipeline(
             "custom_pos_emb": model_kwargs["custom_pos_emb"],
             "num_image_tokens": model_kwargs["num_image_tokens"],
         }
+        # Propagate segmented-FA metadata across steps. image_spans is constant
+        # across the generation loop; q_global_positions is refreshed below.
+        if "image_spans" in model_kwargs:
+            updated_model_kwargs["image_spans"] = model_kwargs["image_spans"]
 
         # update past_key_values keeping its naming used in model code
         for possible_cache_name in ALL_CACHE_NAMES:
@@ -1057,6 +1063,9 @@ class HunyuanImage3Pipeline(
                     torch.arange(bsz), model_kwargs["gen_timestep_scatter_index"][:, -1]
                 ].unsqueeze(-1)
                 updated_model_kwargs["position_ids"] = torch.cat([timestep_position_ids, position_ids], dim=1)
+                # Absolute K-space position of each query row in the current step.
+                updated_model_kwargs["q_global_positions"] = updated_model_kwargs["position_ids"]
+
                 # attention mask
                 mask_list = []
                 for attention_mask_i, position_ids_i in zip(
@@ -1077,6 +1086,8 @@ class HunyuanImage3Pipeline(
                 updated_model_kwargs["position_ids"] = model_kwargs["position_ids"]
                 updated_model_kwargs["attention_mask"] = model_kwargs["attention_mask"]
                 updated_model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"]
+                if "q_global_positions" in model_kwargs:
+                    updated_model_kwargs["q_global_positions"] = model_kwargs["q_global_positions"]
 
         return updated_model_kwargs
 
@@ -1156,6 +1167,8 @@ class HunyuanImage3Pipeline(
         seq_lens: list[int] | None = None,
         num_image_tokens: int | None = None,
         uncond_cfg_prefill: bool = False,
+        image_spans: list[list[tuple[int, int]]] | None = None,
+        q_global_positions: torch.Tensor | None = None,
     ) -> tuple | CausalMMOutputWithPast:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # Sanity Check of Inputs
@@ -1251,6 +1264,8 @@ class HunyuanImage3Pipeline(
                 num_image_tokens=num_image_tokens,
                 gen_timestep_scatter_index=gen_timestep_scatter_index,
                 uncond_cfg_prefill=uncond_cfg_prefill,
+                image_spans=image_spans,
+                q_global_positions=q_global_positions,
             )
         hidden_states = outputs[0]
 
