@@ -81,7 +81,6 @@ nav:
 - Developer Guide:
   - General:
     - contributing/README.md
-    - pr_reviewer.md
     - glob: contributing/*
       flatten_single_child_sections: true
   - Model Implementation:
