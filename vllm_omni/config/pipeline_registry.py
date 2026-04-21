@@ -43,6 +43,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.qwen3_tts.pipeline",
         "QWEN3_TTS_PIPELINE",
     ),
+    "funaudiochat": (
+        "vllm_omni.model_executor.models.fun_audio_chat.pipeline",
+        "FUNAUDIOCHAT_PIPELINE",
+    ),
 }
 
 # --- Single-stage diffusion pipelines (populated in PR 3/N) ---
