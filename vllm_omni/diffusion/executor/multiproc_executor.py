@@ -357,11 +357,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         from vllm_omni.diffusion.worker.utils import RunnerOutput
 
         self._ensure_open()
-        last_pp_rank = self.od_config.parallel_config.pipeline_parallel_size - 1
+
         result = self.collective_rpc(
             "execute_micro_step",
             args=(scheduler_output,),
-            unique_reply_rank=last_pp_rank,
+            unique_reply_rank=0,
             exec_all_ranks=True,
         )
         if not isinstance(result, RunnerOutput):

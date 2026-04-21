@@ -358,7 +358,7 @@ class TestMicroStepWorker:
 class TestMicroStepExecutor:
     """MultiprocDiffusionExecutor.execute_micro_step"""
 
-    def test_passes_through_runner_output_and_uses_last_pp_rank(self, mocker: MockerFixture):
+    def test_passes_through_runner_output_and_uses_first_pp_rank(self, mocker: MockerFixture):
         executor = object.__new__(MultiprocDiffusionExecutor)
         executor._ensure_open = lambda: None
         executor.od_config = SimpleNamespace(
@@ -381,10 +381,10 @@ class TestMicroStepExecutor:
         result = MultiprocDiffusionExecutor.execute_micro_step(executor, sched_output)
 
         assert result is expected
-        # Reply is collected from the last PP rank (index pp_size - 1).
+        # Reply is collected from the first PP rank (index 0).
         rpc_mock.assert_called_once()
         kwargs = rpc_mock.call_args.kwargs
-        assert kwargs["unique_reply_rank"] == 3  # pp_size=4 → last rank=3
+        assert kwargs["unique_reply_rank"] == 0
         assert kwargs["exec_all_ranks"] is True
 
 
