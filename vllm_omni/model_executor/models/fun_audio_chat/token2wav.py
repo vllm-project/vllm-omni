@@ -90,16 +90,20 @@ class FunAudioChatToken2Wav(nn.Module):
         input_ids: flat CRQ token IDs from stage input processor, shape [N].
         Returns OmniOutput with multimodal_outputs={"audio": [wav_tensor], "sr": [sr_tensor]}.
         """
-        self._ensure_cosyvoice3()
-
         empty_out = OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={"audio": [torch.zeros(1, 0)], "sr": [torch.tensor(24000)]},
         )
 
+        # Short-circuit dummy/empty inputs BEFORE loading CosyVoice. vllm's
+        # worker warmup (_dummy_run) calls forward() with a fake 0-filled
+        # input; we must not trigger the multi-GB CosyVoice load there.
         if input_ids is None or input_ids.numel() == 0:
             logger.warning("FunAudioChatToken2Wav: empty input_ids — returning empty audio")
             return empty_out
+
+        # Now it's a real request — lazy-load CosyVoice3.
+        self._ensure_cosyvoice3()
 
         tokens = input_ids.reshape(-1).tolist()
         valid_tokens = [int(t) for t in tokens if 0 <= int(t) < 6561]
