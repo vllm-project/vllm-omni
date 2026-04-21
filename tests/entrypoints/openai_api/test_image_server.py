@@ -407,6 +407,29 @@ def test_health_endpoint_no_engine():
     assert data["status"] == "unhealthy"
 
 
+def test_health_endpoint_dead_engine():
+    """Health returns 503 when the engine raises EngineDeadError."""
+    from unittest.mock import AsyncMock
+
+    from fastapi import FastAPI
+    from vllm.v1.engine.exceptions import EngineDeadError
+
+    from vllm_omni.entrypoints.openai.api_server import router
+
+    app = FastAPI()
+    app.include_router(router)
+
+    dead_engine = AsyncMock()
+    dead_engine.check_health = AsyncMock(side_effect=EngineDeadError())
+    app.state.engine_client = dead_engine
+
+    client = TestClient(app)
+    response = client.get("/health")
+    assert response.status_code == 503
+    data = response.json()
+    assert data["status"] == "unhealthy"
+
+
 def test_models_endpoint(test_client):
     """Test /v1/models endpoint for diffusion mode"""
     response = test_client.get("/v1/models")
