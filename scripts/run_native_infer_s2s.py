@@ -240,9 +240,23 @@ def main() -> int:
     step_input_ids = None
 
     # Per-request CRQ state.
+    # Reference DEFAULT_S2M_GEN_KWARGS: do_sample=True, temperature=0.8,
+    # top_p=0.9, repetition_penalty=1.2. CRQ needs these or it gets stuck
+    # on a single codebook index under greedy sampling.
+    from transformers.generation.logits_process import (
+        LogitsProcessorList as LPL,
+        RepetitionPenaltyLogitsProcessor,
+        TemperatureLogitsWarper,
+        TopPLogitsWarper,
+    )
+    crq_lp = LPL([
+        RepetitionPenaltyLogitsProcessor(1.2),
+        TemperatureLogitsWarper(0.8),
+        TopPLogitsWarper(0.9),
+    ])
     crq_state = CRQState(
-        logits_processor=None,  # greedy, no processor
-        do_sample=False,
+        logits_processor=crq_lp,
+        do_sample=True,
         speech_ids=torch.empty(1, 0, dtype=torch.long, device=device),
     )
 
@@ -252,19 +266,20 @@ def main() -> int:
     for step in range(args.max_new_tokens):
         with torch.no_grad():
             if past_kv is None:
-                # Prefill: run LM over full prompt AND warm the CRQ decoder's
-                # KV cache over the whole prompt (ref L1309 monkey-patches
-                # audio_invert_tower.forward = crq_generate_forward, so its
-                # forward()-time call during the first iteration of generate()
-                # covers all prompt positions).
+                # Prefill: LM forward + warm CRQ KV cache over the whole prompt
+                # (ref L1309 monkey-patches audio_invert_tower.forward to
+                # crq_generate_forward so this happens implicitly).
                 out = lm.model(inputs_embeds=step_embeds, use_cache=True, return_dict=True)
                 past_kv = out.past_key_values
-                prefill_hidden = out.last_hidden_state      # [1, slen, H]
-                prefill_text_emb = lm.model.embed_tokens(input_ids).to(dtype)  # [1, slen, H]
+                prefill_hidden = out.last_hidden_state
+                prefill_text_emb = lm.model.embed_tokens(input_ids).to(dtype)
                 crq_input_prefill = prefill_hidden + prefill_text_emb.detach()
                 _, crq_state = crq.crq_generate_forward(crq_input_prefill, crq_state)
-                # Discard the prefill CRQ tokens; use only the final-position
-                # logits via the LM head below.
+                # Discard `audio_embeds` (and `generate_tokens`) from warmup:
+                # at the first REAL speech step we must reseed from BOS, not
+                # from the prefill's (discarded) last-position token.
+                from dataclasses import replace as _replace
+                crq_state = _replace(crq_state, audio_embeds=None)
                 last_hidden = prefill_hidden[:, -1:, :]
             else:
                 # Decode step: use inputs_embeds derived from previous text
@@ -284,28 +299,24 @@ def main() -> int:
                 last_hidden = out.last_hidden_state[:, -1:, :]  # [1, 1, H]
             logits = lm.lm_head(last_hidden).float()  # [1, 1, V]
 
-            # Force audio_bos on the first decoded token if requested.
-            if pending_force_text_abos:
-                next_token = torch.tensor([audio_bos_index], device=device)
-                pending_force_text_abos = False
-            else:
-                next_token = torch.argmax(logits[:, -1], dim=-1)  # [1]
-
-            tok_int = int(next_token.item())
-            generated_text_ids.append(tok_int)
-
-            # Flip speech mode if audio_bos sampled.
-            if tok_int == audio_bos_index and not generate_speech:
-                generate_speech = True
-            if tok_int == audio_eos_index:
-                speech_finished = True
-            if tok_int == eos_text_id:
-                break
-
-            # CRQ step: only when speech is active and not finished.
-            if generate_speech and not speech_finished:
-                text_embeds_for_crq = lm.model.embed_tokens(next_token).to(dtype).unsqueeze(0)  # [1,1,H]
-                crq_input = last_hidden + text_embeds_for_crq.detach()
+            # Ref ordering:
+            #   (1) Before sampling, CRQ runs inside forward() (using the step's
+            #       last_hidden + text_embeds) but speech tokens are only
+            #       consumed if `generate_speech` is already True at entry.
+            #   (2) After sampling, the model decides whether the NEXT step
+            #       enters speech mode (via `generate_speech |= (last_tok==
+            #       audio_bos_index)`).
+            # So CRQ for this step must use `generate_speech` *before* we flip
+            # it; that prevents the off-by-one where force_text_abos would
+            # immediately consume CRQ tokens from the prefill context.
+            speech_active_this_step = generate_speech and not speech_finished
+            if speech_active_this_step:
+                text_emb_crq = (
+                    lm.model.embed_tokens(step_input_ids.unsqueeze(0)).to(dtype)
+                    if step_input_ids is not None
+                    else lm.model.embed_tokens(input_ids[:, -1:]).to(dtype)
+                )
+                crq_input = last_hidden + text_emb_crq.detach()
                 new_tokens, crq_state = crq.crq_generate_forward(crq_input, crq_state)
                 new_tokens = new_tokens.long()
                 group = new_tokens[0].tolist()
@@ -318,6 +329,24 @@ def main() -> int:
                     crq_state.speech_ids = torch.cat(
                         [crq_state.speech_ids, new_tokens], dim=-1
                     )
+
+            # Force audio_bos on the very first decoded token if requested.
+            if pending_force_text_abos:
+                next_token = torch.tensor([audio_bos_index], device=device)
+                pending_force_text_abos = False
+            else:
+                next_token = torch.argmax(logits[:, -1], dim=-1)  # [1]
+
+            tok_int = int(next_token.item())
+            generated_text_ids.append(tok_int)
+
+            # Flip speech mode if audio_bos sampled (affects NEXT step's CRQ).
+            if tok_int == audio_bos_index and not generate_speech:
+                generate_speech = True
+            if tok_int == audio_eos_index:
+                speech_finished = True
+            if tok_int == eos_text_id:
+                break
 
             step_input_ids = next_token
 
