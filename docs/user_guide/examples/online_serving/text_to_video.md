@@ -288,6 +288,14 @@ vllm serve Lightricks/LTX-2 --omni --port 8098 \
     --enforce-eager --flow-shift 1.0 --boundary-ratio 1.0
 ```
 
+For multi-GPU memory reduction, you can enable HSDP:
+
+```bash
+vllm serve Lightricks/LTX-2 --omni --port 8098 \
+    --enforce-eager --flow-shift 1.0 --boundary-ratio 1.0 \
+    --use-hsdp --hsdp-shard-size 2
+```
+
 #### Start with Optimization Presets
 
 Use the LTX-2 startup script with built-in optimization presets:

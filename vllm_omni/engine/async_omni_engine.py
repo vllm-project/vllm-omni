@@ -793,6 +793,7 @@ class AsyncOmniEngine:
                                 else:
                                     use_inline = True if self.num_stages == 1 else False
                                     stage_clients[stage_idx] = initialize_diffusion_stage(
+                                        configured_stage_id,
                                         self.model,
                                         stage_cfg,
                                         metadata,
@@ -1401,6 +1402,12 @@ class AsyncOmniEngine:
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
         for cfg in stage_configs:
             try:
+                if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
+                    cfg.engine_args = OmegaConf.create({})
+                global_sleep_mode = kwargs.get("enable_sleep_mode")
+                if global_sleep_mode is not None:
+                    if not hasattr(cfg.engine_args, "enable_sleep_mode") or cfg.engine_args.enable_sleep_mode is None:
+                        cfg.engine_args.enable_sleep_mode = global_sleep_mode
                 if getattr(cfg, "stage_type", None) != "diffusion":
                     continue
                 if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
