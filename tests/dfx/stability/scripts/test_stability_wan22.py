@@ -16,7 +16,7 @@ from tests.dfx.conftest import (
     create_unique_server_params,
     load_configs,
 )
-from tests.dfx.stability.conftest import _run_one_diffusion_batch, run_stability_benchmark_loop
+from tests.dfx.stability.helpers import _run_one_diffusion_batch, run_stability_benchmark_loop
 
 STABILITY_DIR = Path(__file__).resolve().parent.parent
 DEPLOY_CONFIGS_DIR = STABILITY_DIR / "deploy"
