@@ -6,22 +6,14 @@ E2E Online tests for Qwen3-Omni model.
 
 import os
 
-from vllm_omni.platforms import current_omni_platform
-
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-from pathlib import Path
 
 import pytest
 
-from tests.conftest import (
-    OmniServerParams,
-    dummy_messages_from_mix_data,
-    generate_synthetic_audio,
-    generate_synthetic_image,
-    generate_synthetic_video,
-    modify_stage_config,
-)
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 model = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
@@ -40,47 +32,57 @@ LARGE_IMAGE_HEIGHT = 1080
 LONG_AUDIO_DURATION_SEC = 120
 
 
-def get_chunk_config(default_path):
-    path = modify_stage_config(
-        default_path,
-        updates={
-            "async_chunk": True,
-            "stage_args": {
-                0: {
-                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk",
-                    "default_sampling_params.max_tokens": 2048,
-                },
-                1: {
-                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk"
-                },
-            },
-        },
-        deletes={"stage_args": {2: ["custom_process_input_func"]}},
-    )
-    return path
-
-
 def get_batch_token_config(default_path):
-    path = modify_stage_config(
+    """Override stage 1's max_num_batched_tokens to exercise small-batch paths.
+
+    Uses the new flat-stage schema (``stages.<id>.<field>``); the legacy
+    ``stage_args.<id>.engine_args.<field>`` path no longer applies because
+    the deploy YAML doesn't nest engine fields under ``engine_args:``.
+    """
+    return modify_stage_config(
         default_path,
         updates={
-            "stage_args": {1: {"engine_args.max_num_batched_tokens": 64}},
+            "stages": {1: {"max_num_batched_tokens": 64}},
         },
     )
-    return path
 
 
-# CI stage config for 2*H100-80G GPUs
-default_path = str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
+def get_async_chunk_config(default_path):
+    """Flip async_chunk on and bump stage 0 thinker output to 2048 tokens.
 
-if current_omni_platform.is_xpu():
-    default_path = str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")
+    Pipeline registry (qwen3_omni/pipeline.py) already wires
+    thinker2talker_async_chunk / talker2code2wav_async_chunk on stages 0/1,
+    so no per-stage processor override is needed. Using only flat-schema
+    writes so _parse_stage_deploy stays in its flat branch (nested
+    ``engine_args:`` would drop other overlay fields).
+    """
+    return modify_stage_config(
+        default_path,
+        updates={
+            "stages": {0: {"default_sampling_params.max_tokens": 2048}},
+        },
+    )
 
-# Create parameter combinations for model and stage config
+
+# CI deploy YAML (single file; xpu deltas applied via ``platforms:`` section).
+# The overlay explicitly sets ``async_chunk: False``, so ``default`` tests the
+# sync path and ``async_chunk`` tests the streaming path with a longer thinker
+# output — two distinct scenarios, kept as separate parametrizations.
+default_path = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
+
 test_params = [
-    pytest.param(OmniServerParams(model=model, stage_config_path=default_path, use_stage_cli=True), id="default"),
     pytest.param(
-        OmniServerParams(model=model, stage_config_path=get_chunk_config(default_path), use_stage_cli=True),
+        OmniServerParams(
+            model=model, stage_config_path=default_path, use_stage_cli=True, server_args=["--no-async-chunk"]
+        ),
+        id="default",
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=model,
+            stage_config_path=get_async_chunk_config(default_path),
+            use_stage_cli=True,
+        ),
         id="async_chunk",
     ),
 ]
@@ -448,7 +450,7 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["london"]},
     }
 
-    # Retry only when assert_omni_response fails on text/audio cosine similarity (see tests/conftest.py).
+    # Retry only when assert_omni_response fails on text/audio cosine similarity (see tests/helpers/assertions.py).
     _similarity_assert_msg = "The audio content is not same as the text"
     _max_retries = 3
     for attempt in range(_max_retries):
@@ -513,7 +515,7 @@ def test_speaker_002(omni_server, openai_client) -> None:
         "key_words": {"text": ["beijing"]},
     }
 
-    # Retry only when assert_omni_response fails on preset voice gender (see tests/conftest.py).
+    # Retry only when assert_omni_response fails on preset voice gender (see tests/helpers/assertions.py).
     _gender_assert_substr = "estimated gender"
     _max_retries = 3
     for attempt in range(_max_retries):

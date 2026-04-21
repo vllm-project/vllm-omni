@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import base64
+import dataclasses
 import io
 import json
 import multiprocessing
@@ -53,7 +54,6 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.orca_metrics import metrics_header
-from vllm.entrypoints.openai.realtime.connection import RealtimeConnection
 from vllm.entrypoints.openai.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
 from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
@@ -108,6 +108,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoListResponse,
     VideoResponse,
 )
+from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
@@ -121,6 +122,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParam
 logger = init_logger(__name__)
 router = APIRouter()
 
+MAX_UINT32_SEED = 2**32 - 1
 profiler_router = APIRouter()
 
 
@@ -836,6 +838,7 @@ async def omni_init_app_state(
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
+    state.sleeping_stages = set()
 
 
 def Omnivideo(request: Request) -> OmniOpenAIServingVideo | None:
@@ -1203,6 +1206,22 @@ async def streaming_speech(websocket: WebSocket):
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
+    engine_client = getattr(websocket.app.state, "engine_client", None)
+    if engine_client is not None and getattr(engine_client, "async_chunk", False):
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "type": "error",
+                "error": (
+                    "The /v1/realtime API is not supported when async_chunk is enabled on the server. "
+                    "Use a stage configuration with async_chunk disabled and restart the server before using "
+                    "this endpoint."
+                ),
+                "code": "unsupported",
+            }
+        )
+        await websocket.close()
+        return
     serving = getattr(websocket.app.state, "openai_serving_realtime", None)
     if serving is None:
         await websocket.accept()
@@ -1304,14 +1323,64 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
     # Get engine client (AsyncOmni) from app state
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
 
-    # Validate model field (warn if mismatch, don't error)
     if request.model is not None and request.model != model_name:
-        logger.warning(
-            f"Model mismatch: request specifies '{request.model}' but "
-            f"server is running '{model_name}'. Using server model."
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=(f"Model mismatch: request specifies '{request.model}' but server is running '{model_name}'."),
         )
 
     try:
+        # Unify request construction for any multi-stage pipeline to avoid
+        # divergence between /v1/images and /v1/chat/completions.
+        if len(stage_configs) > 1:
+            chat_handler = getattr(raw_request.app.state, "openai_serving_chat", None)
+            if chat_handler is None:
+                logger.warning("openai_serving_chat is not initialized for multi-stage /v1/images/generations")
+                raise HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                    detail="openai_serving_chat is not initialized for multi-stage image generation.",
+                )
+
+            effective_seed = request.seed if request.seed is not None else random.randint(0, MAX_UINT32_SEED)
+            extra_body: dict[str, Any] = {
+                "seed": effective_seed,
+                "num_outputs_per_prompt": request.n,
+            }
+            if request.size is not None:
+                parse_size(request.size)
+                width, height = parse_size(request.size)
+                app_state_args = getattr(raw_request.app.state, "args", None)
+                _check_max_generated_image_size(app_state_args, width, height)
+                extra_body["size"] = request.size
+            if request.negative_prompt is not None:
+                extra_body["negative_prompt"] = request.negative_prompt
+            if request.num_inference_steps is not None:
+                extra_body["num_inference_steps"] = request.num_inference_steps
+            if request.guidance_scale is not None:
+                extra_body["guidance_scale"] = request.guidance_scale
+            if request.true_cfg_scale is not None:
+                extra_body["true_cfg_scale"] = request.true_cfg_scale
+            if request.generator_device is not None:
+                extra_body["generator_device"] = request.generator_device
+            if request.lora is not None:
+                # Keep /images validation semantics: invalid LoRA should fail with 400.
+                _parse_lora_request(request.lora)
+                extra_body["lora"] = request.lora
+
+            generation_result = await chat_handler.generate_diffusion_images(
+                prompt=request.prompt,
+                extra_body=extra_body,
+                request_id=f"img_gen-{random_uuid()}",
+            )
+            if isinstance(generation_result, ErrorResponse):
+                return JSONResponse(
+                    status_code=generation_result.error.code if generation_result.error else 400,
+                    content=generation_result.model_dump(),
+                )
+            flat_images, _, _ = generation_result
+            image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in flat_images]
+            return ImageGenerationResponse(created=int(time.time()), data=image_data)
+
         # Build params - pass through user values directly
         prompt: OmniTextPrompt = {"prompt": request.prompt}
         if request.negative_prompt is not None:
@@ -1337,6 +1406,16 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         else:
             size_str = "model default"
 
+        # Keep AR stage target grid in sync with requested output size.
+        # GLM-Image consumes target_h/target_w via mm_processor_kwargs.
+        if width is not None and height is not None:
+            prompt["mm_processor_kwargs"] = {
+                "target_h": height,
+                "target_w": width,
+            }
+            # Backward-compatible fallback for processors reading top-level fields.
+            prompt["height"] = height
+            prompt["width"] = width
         app_state_args = getattr(raw_request.app.state, "args", None)
         _check_max_generated_image_size(app_state_args, width, height)
 
@@ -1352,7 +1431,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         # This fixes issues where using the default global generator
         # might produce blurry images in some environments.
         _update_if_not_none(
-            gen_params, "seed", request.seed if request.seed is not None else random.randint(0, 2**32 - 1)
+            gen_params, "seed", request.seed if request.seed is not None else random.randint(0, MAX_UINT32_SEED)
         )
         _update_if_not_none(gen_params, "generator_device", request.generator_device)
         _update_if_not_none(gen_params, "layers", request.layers)
@@ -1449,8 +1528,9 @@ async def edit_images(
     # 1. get engine and model
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
     if model is not None and model != model_name:
-        logger.warning(
-            f"Model mismatch: request specifies '{model}' but server is running '{model_name}'. Using server model."
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            detail=(f"Model mismatch: request specifies '{model}' but server is running '{model_name}'."),
         )
     # 2. get output format & compression
     output_format = _choose_output_format(output_format, background)
@@ -1473,12 +1553,24 @@ async def edit_images(
             input_images_list.extend(urls)
         if not input_images_list:
             raise HTTPException(status_code=422, detail="Field 'image' or 'url' is required")
-        pil_images = await _load_input_images(input_images_list)
-        if len(pil_images) > 1 and not _supports_multimodal_image_inputs(raw_request, engine_client):
+        # Reject oversized multi-image edit requests before fetching or decoding
+        # any inputs. This keeps over-limit URL requests from burning network,
+        # CPU, and memory on work that will be rejected anyway.
+        max_input_images = _get_max_edit_input_images(raw_request, engine_client)
+        if max_input_images is not None and len(input_images_list) > max_input_images:
+            detail = (
+                "Received multiple input images. Only a single image is supported by this model."
+                if max_input_images == 1
+                else (
+                    f"Received {len(input_images_list)} input images. "
+                    f"At most {max_input_images} images are supported by this model."
+                )
+            )
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
-                detail="Received multiple input images. Only a single image is supported by this model.",
+                detail=detail,
             )
+        pil_images = await _load_input_images(input_images_list)
         prompt["multi_modal_data"] = {}
         prompt["multi_modal_data"]["image"] = pil_images
 
@@ -1549,6 +1641,18 @@ async def edit_images(
         _check_max_generated_image_size(app_state_args, width, height, resolution)
 
         size_str = f"{width}x{height}" if width is not None and height is not None else "auto"
+
+        # Keep AR stage target grid in sync with requested output size.
+        # GLM-Image consumes target_h/target_w via mm_processor_kwargs.
+        if width is not None and height is not None:
+            prompt["mm_processor_kwargs"] = {
+                "target_h": height,
+                "target_w": width,
+            }
+            # Backward-compatible fallback for processors reading top-level fields.
+            prompt["height"] = height
+            prompt["width"] = width
+
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
 
@@ -1561,7 +1665,7 @@ async def edit_images(
         # a proper generator is initialized in the backend.
         # This fixes issues where using the default global generator
         # might produce blurry images in some environments.
-        _update_if_not_none(gen_params, "seed", seed if seed is not None else random.randint(0, 2**32 - 1))
+        _update_if_not_none(gen_params, "seed", seed if seed is not None else random.randint(0, MAX_UINT32_SEED))
         _update_if_not_none(gen_params, "generator_device", generator_device)
         _update_if_not_none(gen_params, "layers", layers)
         _update_if_not_none(gen_params, "resolution", resolution)
@@ -1651,18 +1755,25 @@ def _get_engine_and_model(raw_request: Request):
     return engine_client, model_name, normalized_stage_configs
 
 
-def _supports_multimodal_image_inputs(raw_request: Request, engine_client: Any) -> bool:
+def _get_diffusion_od_config(raw_request: Request, engine_client: Any) -> Any:
     diffusion_engine = getattr(raw_request.app.state, "diffusion_engine", None) or engine_client
     get_diffusion_od_config = getattr(diffusion_engine, "get_diffusion_od_config", None)
-    od_config = (
+    return (
         get_diffusion_od_config() if callable(get_diffusion_od_config) else getattr(diffusion_engine, "od_config", None)
     )
 
+
+def _get_max_edit_input_images(raw_request: Request, engine_client: Any) -> int | None:
+    od_config = _get_diffusion_od_config(raw_request, engine_client)
     if od_config is None:
         # Preserve the existing compatibility behavior when the diffusion
         # config is not exposed on the serving surface.
-        return True
-    return bool(getattr(od_config, "supports_multimodal_inputs", False))
+        return None
+
+    if not bool(getattr(od_config, "supports_multimodal_inputs", False)):
+        return 1
+
+    return getattr(od_config, "max_multimodal_image_inputs", None)
 
 
 def _get_lora_from_json_str(lora_body):
@@ -2147,10 +2258,12 @@ async def _parse_video_form(
         app_model_name, app_stage_configs = _resolve_video_runtime_context(raw_request)
         effective_model_name = handler.model_name or app_model_name or request.model or "unknown"
         if request.model is not None and effective_model_name is not None and request.model != effective_model_name:
-            logger.warning(
-                "Model mismatch: request specifies '%s' but server is running '%s'. Using server model.",
-                request.model,
-                effective_model_name,
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=(
+                    f"Model mismatch: request specifies '{request.model}' but server is running "
+                    f"'{effective_model_name}'."
+                ),
             )
         handler.set_stage_configs_if_missing(app_stage_configs)
     except HTTPException:
@@ -2442,3 +2555,64 @@ async def stop_profile(raw_request: Request, request: ProfileRequest | None = No
         raise HTTPException(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=f"Failed to stop profiler: {str(e)}"
         )
+
+
+class OmniSleepRequest(BaseModel):
+    stage_ids: list[int]
+    level: int = 2
+
+
+class OmniWakeupRequest(BaseModel):
+    stage_ids: list[int]
+
+
+@router.post("/v1/omni/sleep")
+async def omni_sleep(request: OmniSleepRequest, raw_request: Request):
+    engine_client = raw_request.app.state.engine_client
+    sleeping_set = raw_request.app.state.sleeping_stages
+    if not hasattr(engine_client, "sleep"):
+        raise HTTPException(status_code=501, detail="Engine does not support sleep")
+    acks = await engine_client.sleep(stage_ids=request.stage_ids, level=request.level)
+    for sid in request.stage_ids:
+        sleeping_set.add(sid)
+    return {"status": "SUCCESS", "acks": [dataclasses.asdict(a) if dataclasses.is_dataclass(a) else a for a in acks]}
+
+
+@router.post("/v1/omni/wakeup")
+async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
+    engine_client = raw_request.app.state.engine_client
+    sleeping_set = raw_request.app.state.sleeping_stages
+    if not any(sid in sleeping_set for sid in request.stage_ids):
+        return {"status": "SKIPPED", "reason": "Target stages are not sleeping."}
+    if not hasattr(engine_client, "wake_up"):
+        raise HTTPException(status_code=501, detail="Engine does not support wake_up")
+    acks = await engine_client.wake_up(stage_ids=request.stage_ids)
+    for sid in request.stage_ids:
+        if sid in sleeping_set:
+            sleeping_set.remove(sid)
+    return {"status": "SUCCESS", "acks": [dataclasses.asdict(a) if dataclasses.is_dataclass(a) else a for a in acks]}
+
+
+if __name__ == "__main__":
+    import argparse
+    import asyncio
+
+    from vllm.entrypoints.openai.cli_args import make_arg_parser
+
+    parser = argparse.ArgumentParser(description="vLLM-Omni OpenAI-Compatible REST API server")
+    parser = make_arg_parser(parser)
+    registered_flags = set()
+    for action in parser._actions:
+        registered_flags.update(action.option_strings)
+    if "--omni" not in registered_flags:
+        parser.add_argument("--omni", action="store_true", default=False, help="Enable vLLM-Omni mode.")
+    if "--enable-sleep-mode" not in registered_flags:
+        parser.add_argument(
+            "--enable-sleep-mode", action="store_true", default=False, help="Enable GPU memory pool for sleep mode."
+        )
+    args = parser.parse_args()
+    if not hasattr(args, "model_tag"):
+        setattr(args, "model_tag", args.model)
+    if hasattr(args, "model_tag") and args.model_tag is None:
+        args.model_tag = args.model
+    asyncio.run(omni_run_server(args))

@@ -5,8 +5,8 @@ import os
 import pytest
 import torch
 
-from tests.conftest import OmniRunner
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
 
 VOXCPM2_MODEL = "openbmb/VoxCPM2"
 STAGE_CONFIG = os.path.join(
@@ -100,3 +100,31 @@ def test_voxcpm2_voice_clone_002(voxcpm2_engine):
     audio = _extract_audio(outputs[0].outputs[0].multimodal_output)
     duration_s = audio.shape[0] / SAMPLE_RATE
     assert 0.5 < duration_s < 30.0, f"Audio duration out of range: {duration_s:.2f}s"
+
+
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_voxcpm2_prefill_decode_mixed_batch_003(voxcpm2_engine):
+    """Regression: prefill+decode mixed batch must not crash (PR #2903)."""
+    long_prompt = (
+        "This is a deliberately long prompt that will stay in the decode "
+        "phase for many steps so that subsequent shorter prompts keep "
+        "entering prefill alongside it, reproducing the prefill plus "
+        "decode mixed batch scheduling pattern."
+    )
+    short_prompts = [
+        "Hello one.",
+        "Hello two.",
+        "Hello three.",
+        "Hello four.",
+    ]
+    requests = [{"prompt": long_prompt}] + [{"prompt": p} for p in short_prompts]
+
+    outputs = voxcpm2_engine.generate(requests)
+    assert len(outputs) == len(requests)
+
+    for i, out in enumerate(outputs):
+        audio = _extract_audio(out.outputs[0].multimodal_output)
+        duration_s = audio.shape[0] / SAMPLE_RATE
+        assert 0.1 < duration_s < 30.0, f"Request {i} audio duration out of range: {duration_s:.2f}s"

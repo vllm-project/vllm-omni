@@ -23,6 +23,7 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
@@ -442,6 +443,20 @@ def build_vllm_config(
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
+
+    # Multi-stage pipelines (qwen3_tts code2wav, etc.) set max_model_len
+    # larger than HF max_position_embeddings by design. vLLM's validator
+    # rejects that without the env flag.
+    if filtered_engine_args_dict.get("max_model_len") is not None and not os.environ.get(
+        "VLLM_ALLOW_LONG_MAX_MODEL_LEN"
+    ):
+        os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+        logger.debug(
+            "Auto-set VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 for stage %s (max_model_len=%s).",
+            stage_config.stage_id,
+            filtered_engine_args_dict["max_model_len"],
+        )
+
     vllm_config = omni_engine_args.create_engine_config(
         usage_context=UsageContext.LLM_CLASS,
         headless=headless,
@@ -644,6 +659,7 @@ def build_diffusion_config(
 
 
 def initialize_diffusion_stage(
+    stage_id: int,
     model: str,
     stage_cfg: Any,
     metadata: StageMetadata,
@@ -665,6 +681,15 @@ def initialize_diffusion_stage(
     """
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
+    engine_args = _to_dict(stage_cfg.engine_args)
+    engine_args.pop("stage_id", None)
+    od_config = OmniDiffusionConfig.from_kwargs(
+        stage_id=stage_id,
+        model=model,
+        **engine_args,
+    )
+    if metadata.cfg_kv_collect_func is not None:
+        od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func
     od_config = build_diffusion_config(model, stage_cfg, metadata)
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
 

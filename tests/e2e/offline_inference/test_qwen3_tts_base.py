@@ -13,12 +13,10 @@ import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
-from pathlib import Path
-
 import pytest
 
-from tests.conftest import modify_stage_config
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 REF_AUDIO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
@@ -26,23 +24,31 @@ REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know wh
 
 
 def get_cuda_graph_config():
-    path = modify_stage_config(
-        get_stage_config(),
+    """Build a temp deploy yaml mirroring the deleted qwen3_tts_no_async_chunk.yaml.
+
+    Composes the synchronous (no-async-chunk) variant on top of the bundled
+    qwen3_tts.yaml prod default, with cudagraphs disabled. Replaces the deleted
+    standalone variant yaml; same effective config, no checked-in file needed.
+    """
+    return modify_stage_config(
+        get_deploy_config_path("qwen3_tts.yaml"),
         updates={
-            "stage_args": {
+            "async_chunk": False,
+            "stages": {
                 0: {
-                    "engine_args.enforce_eager": "true",
+                    "max_num_seqs": 1,
+                    "gpu_memory_utilization": 0.2,
+                    "enforce_eager": True,
+                    "async_scheduling": False,
                 },
-                1: {"engine_args.enforce_eager": "true"},
+                1: {
+                    "gpu_memory_utilization": 0.2,
+                    "enforce_eager": True,
+                    "async_scheduling": False,
+                },
             },
         },
     )
-    return path
-
-
-def get_stage_config(name: str = "qwen3_tts_no_async_chunk.yaml"):
-    """Get the no_async_chunk stage config path (async_chunk disable, cuda_graph disabled)."""
-    return str(Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / name)
 
 
 # Same structure as test_qwen3_omni: models, stage_configs, test_params

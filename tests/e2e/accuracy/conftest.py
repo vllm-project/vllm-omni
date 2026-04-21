@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -13,7 +12,7 @@ import requests
 import torch
 from PIL import Image
 
-from tests.conftest import OmniServer, OmniServerParams
+from tests.helpers.runtime import OmniServer, OmniServerParams
 
 
 def pytest_addoption(parser):
@@ -206,18 +205,6 @@ def rabbit_image(accuracy_artifact_root: Path) -> Image.Image:
     image = Image.open(BytesIO(response.content)).convert("RGB")
     image.save(accuracy_artifact_root / "rabbit.png")
     return image
-
-
-def reset_artifact_dir(path: Path) -> Path:
-    if path.exists():
-        shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def infer_model_label(model: str) -> str:
-    label = Path(model.rstrip("/\\")).name or "model"
-    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in label)
 
 
 def _build_accuracy_server_config(

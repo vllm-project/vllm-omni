@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import modify_stage_config
+from tests.helpers.stage_config import modify_stage_config
 
 
 def load_configs(config_path: str) -> list[dict[str, Any]]:
@@ -40,22 +40,32 @@ def modify_stage(default_path, updates, deletes):
 def create_unique_server_params(
     configs: list[dict[str, Any]],
     stage_configs_dir: Path,
-) -> list[tuple[str, str, str]]:
+) -> list[tuple[str, str, str | None, str | None, tuple[str, ...]]]:
     unique_params = []
     seen = set()
     for config in configs:
         test_name = config["test_name"]
-        model = config["server_params"]["model"]
-        stage_config_name = config["server_params"].get("stage_config_name")
+        server_params = config["server_params"]
+        model = server_params["model"]
+        stage_config_name = server_params.get("stage_config_name")
         if stage_config_name:
             stage_config_path = str(stage_configs_dir / stage_config_name)
-            delete = config["server_params"].get("delete", None)
-            update = config["server_params"].get("update", None)
+            delete = server_params.get("delete", None)
+            update = server_params.get("update", None)
             stage_config_path = modify_stage(stage_config_path, update, delete)
         else:
             stage_config_path = None
 
-        server_param = (test_name, model, stage_config_path)
+        stage_overrides = server_params.get("stage_overrides")
+        stage_overrides_json = json.dumps(stage_overrides) if stage_overrides else None
+
+        # ``extra_cli_args`` passes raw CLI flags straight through to
+        # ``vllm_omni.entrypoints.cli.main serve`` — used for flags that
+        # don't map to stage-level overrides, e.g. ``--async-chunk`` /
+        # ``--no-async-chunk`` toggling the deploy-level async_chunk bool.
+        extra_cli_args = tuple(server_params.get("extra_cli_args") or ())
+
+        server_param = (test_name, model, stage_config_path, stage_overrides_json, extra_cli_args)
         if server_param not in seen:
             seen.add(server_param)
             unique_params.append(server_param)

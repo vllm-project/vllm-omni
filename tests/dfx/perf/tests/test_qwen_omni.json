@@ -3,7 +3,7 @@
         "test_name": "test_qwen3_omni",
         "server_params": {
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-            "stage_config_name": "qwen3_omni.yaml"
+            "extra_cli_args": ["--no-async-chunk"]
         },
         "benchmark_params": [
             {
@@ -109,25 +109,7 @@
         "test_name": "test_qwen3_omni_chunk",
         "server_params": {
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-            "stage_config_name": "qwen3_omni.yaml",
-            "update": {
-                "async_chunk": true,
-                "stage_args": {
-                    "0": {
-                        "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
-                    },
-                    "1": {
-                        "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk"
-                    }
-                }
-            },
-            "delete": {
-                "stage_args": {
-                    "2": [
-                        "custom_process_input_func"
-                    ]
-                }
-            }
+            "extra_cli_args": ["--async-chunk"]
         },
         "benchmark_params": [
             {

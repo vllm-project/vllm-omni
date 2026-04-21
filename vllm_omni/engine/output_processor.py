@@ -118,10 +118,9 @@ class OmniRequestState(RequestState):
                 if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
                     try:
                         if k == "audio":
-                            # Concatenate delta audio chunks (1-D) into the full waveform.
-                            # Each entry is a per-step slice; flatten to -1 so chunks with
-                            # inconsistent leading dims can still be joined on the sample axis.
-                            self.mm_accumulated[k] = torch.cat([t.reshape(-1) for t in v], dim=0)
+                            # When the audio tensor shape is inconsistent, torch.cat will fail.
+                            # We need to use torch.cat in -1 dimension.
+                            continue
                         elif k == "sr":
                             # Sample rate is a constant scalar, keep last value.
                             self.mm_accumulated[k] = v[-1]
@@ -233,10 +232,9 @@ class OmniRequestState(RequestState):
         # Reuse base text/logprobs logic, then annotate with pooling_result.
         base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason, routed_experts)
         try:
+            if not hasattr(base_output, "multimodal_output"):
+                setattr(base_output, "multimodal_output", {})
             if self.mm_accumulated is not None:
-                # Attach accumulated multimodal dict on the completion output
-                if not hasattr(base_output, "multimodal_output"):
-                    setattr(base_output, "multimodal_output", {})
                 mm_out = getattr(base_output, "multimodal_output")
                 if isinstance(mm_out, dict):
                     for k, v in self.mm_accumulated.items():

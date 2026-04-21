@@ -564,6 +564,18 @@ def test_missing_prompt_returns_422(test_client):
     assert response.status_code == 422
 
 
+def test_video_generation_rejects_model_mismatch(test_client):
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "bad model",
+            "model": "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        },
+    )
+    assert response.status_code == 400
+    assert "model mismatch" in response.json()["detail"].lower()
+
+
 def test_invalid_size_parse_returns_422(test_client):
     response = test_client.post(
         "/v1/videos",

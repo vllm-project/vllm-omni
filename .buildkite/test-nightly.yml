@@ -552,7 +552,7 @@ steps:
       - label: ":full_moon: Diffusion X2V · Accuracy Test"
         timeout_in_minutes: 180
         commands:
-          - pytest -s -v tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py --run-level advanced_model
+          - pytest -s -v tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py -m advanced_model --run-level advanced_model
         agents:
           queue: "mithril-h100-pool"
         plugins:

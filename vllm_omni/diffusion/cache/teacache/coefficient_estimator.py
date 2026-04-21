@@ -1,20 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import Any
 
 import numpy as np
 import torch
 from vllm.config import LoadConfig
-from vllm.utils.torch_utils import set_default_torch_dtype
+from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.cache.teacache.extractors import get_extractor
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
-from vllm_omni.diffusion.models.flux2.pipeline_flux2 import Flux2Pipeline
-from vllm_omni.diffusion.models.stable_audio.pipeline_stable_audio import StableAudioPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -36,6 +34,7 @@ class DataCollectionHook(ModelHook):
 
     def new_forward(self, module: torch.nn.Module, *args: Any, **kwargs: Any) -> Any:
         ctx = self.extractor_fn(module, *args, **kwargs)
+        # NOTE: We upcast to float32 to also handle bfloat16.
         modulated_input_cpu = ctx.modulated_input.detach().float().cpu().numpy()
 
         outputs = ctx.run_transformer_blocks()
@@ -54,19 +53,53 @@ class DataCollectionHook(ModelHook):
         return list(self.current_trajectory)
 
 
-class BagelAdapter:
-    """Adapter for Bagel model."""
+class DefaultAdapter:
+    """Default adapter for standard diffusers pipelines."""
+
+    model_class_name = None
+    uses_tf_config = True
+
+    @classmethod
+    def load_pipeline(cls, model_path: str, device: str, dtype: torch.dtype) -> Any:
+        if cls.model_class_name is None:
+            raise ValueError("Adapter doesn't have a set class name.")
+
+        od_config = OmniDiffusionConfig.from_kwargs(
+            model_class_name=cls.model_class_name,
+            model=model_path,
+            dtype=dtype,
+        )
+
+        if cls.uses_tf_config:
+            # TODO (Alex): Refactor to handle tf_model_config in OmniDiffusionConfig
+            # instead of OmniDiffusion and remove the manual population here
+            tf_config_dict = get_hf_file_to_dict(
+                os.path.join("transformer", "config.json"),
+                od_config.model,
+            )
+            od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+
+        loader = DiffusersPipelineLoader(LoadConfig(), od_config=od_config)
+        # load_model will handle dtypes / device placement, put in .eval() mode
+        return loader.load_model(od_config=od_config, load_device=device)
 
     @staticmethod
-    def load_pipeline(model_path: str, device: str = "cuda", dtype: torch.dtype = torch.bfloat16) -> BagelPipeline:
-        od_config = OmniDiffusionConfig.from_kwargs(model=model_path, dtype=dtype)
-        od_config.model_class_name = "BagelPipeline"
+    def get_transformer(pipeline: Any) -> tuple[Any, str]:
+        return pipeline.transformer, pipeline.transformer.__class__.__name__
 
-        pipeline = BagelPipeline(od_config=od_config)
-        loader = DiffusersPipelineLoader(LoadConfig())
-        loader.load_weights(pipeline)
-        pipeline.to(device)
-        return pipeline
+    @staticmethod
+    def install_hook(transformer: Any, hook: DataCollectionHook) -> None:
+        registry = HookRegistry.get_or_create(transformer)
+        registry.register_hook(hook._HOOK_NAME, hook)
+
+
+class BagelAdapter(DefaultAdapter):
+    """Adapter for Bagel model."""
+
+    model_class_name = "BagelPipeline"
+    # Skip the hack for loading the tf model config,
+    # because bagel doesn't use it.
+    uses_tf_config = False
 
     @staticmethod
     def get_transformer(pipeline: Any) -> tuple[Any, str]:
@@ -78,78 +111,32 @@ class BagelAdapter:
         registry.register_hook(hook._HOOK_NAME, hook)
 
 
-class StableAudioAdapter:
-    """Adapter for Stable Audio Open 1.0 coefficient estimation."""
-
-    @staticmethod
-    def load_pipeline(model_path: str, device: str = "cuda", dtype: torch.dtype = torch.float16) -> Any:
-        od_config = OmniDiffusionConfig.from_kwargs(model=model_path, dtype=dtype)
-
-        # Strictly necessary because we bypass loader.load_model()
-        with set_default_torch_dtype(dtype):
-            pipeline = StableAudioPipeline(od_config=od_config)
-
-        loader = DiffusersPipelineLoader(LoadConfig())
-        loader.load_weights(pipeline)
-        pipeline.to(device)
-        return pipeline
-
-    @staticmethod
-    def get_transformer(pipeline: Any) -> tuple[Any, str]:
-        return pipeline.transformer, "StableAudioDiTModel"
-
-    @staticmethod
-    def install_hook(transformer: Any, hook: DataCollectionHook) -> None:
-        registry = HookRegistry.get_or_create(transformer)
-        registry.register_hook(hook._HOOK_NAME, hook)
-
-
-class Flux2Adapter:
+class Flux2Adapter(DefaultAdapter):
     """Adapter for Flux2 model coefficient estimation."""
 
-    @staticmethod
-    def load_pipeline(model_path: str, device: str = "cuda", dtype: torch.dtype = torch.bfloat16) -> Flux2Pipeline:
-        """Load Flux2 pipeline for coefficient estimation."""
-        od_config = OmniDiffusionConfig.from_kwargs(model=model_path, dtype=dtype)
-        od_config.model_class_name = "Flux2Pipeline"
-
-        pipeline = Flux2Pipeline(od_config=od_config)
-        loader = DiffusersPipelineLoader(LoadConfig())
-        loader.load_weights(pipeline)
-        pipeline.to(device)
-        return pipeline
-
-    @staticmethod
-    def get_transformer(pipeline: Any) -> tuple[Any, str]:
-        return pipeline.transformer, pipeline.transformer.__class__.__name__
-
-    @staticmethod
-    def install_hook(transformer: Any, hook: DataCollectionHook) -> None:
-        registry = HookRegistry.get_or_create(transformer)
-        registry.register_hook(hook._HOOK_NAME, hook)
+    model_class_name = "Flux2Pipeline"
 
 
-class DefaultAdapter:
-    """Default adapter for standard diffusers pipelines."""
+class LongCatAdapter(DefaultAdapter):
+    """Adapter for LongCat Image - NOTE: currently this model needs the vLLM
+    context to be correctly configured to actually run the estimation, since it
+    uses vLLM norm layers etc.
+    """
 
-    @staticmethod
-    def load_pipeline(model_path: str, device: str, dtype: torch.dtype) -> Any:
-        raise NotImplementedError("DefaultAdapter.load_pipeline not implemented")
+    model_class_name = "LongCatImagePipeline"
 
-    @staticmethod
-    def get_transformer(pipeline: Any) -> tuple[Any, str]:
-        return pipeline.transformer, pipeline.transformer.__class__.__name__
 
-    @staticmethod
-    def install_hook(transformer: Any, hook: DataCollectionHook) -> None:
-        registry = HookRegistry.get_or_create(transformer)
-        registry.register_hook(hook._HOOK_NAME, hook)
+class StableAudioAdapter(DefaultAdapter):
+    """Adapter for Stable Audio Open 1.0 coefficient estimation."""
+
+    model_class_name = "StableAudioPipeline"
 
 
 _MODEL_ADAPTERS: dict[str, type] = {
     "Bagel": BagelAdapter,
     "StableAudio": StableAudioAdapter,
     "Flux2": Flux2Adapter,
+    "LongCat": LongCatAdapter,
 }
 
 _EPSILON = 1e-6
@@ -196,7 +183,6 @@ class TeaCacheCoefficientEstimator:
         device: str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
     ):
-        # Add validation here ⬇️
         if model_type not in _MODEL_ADAPTERS:
             available_types = list(_MODEL_ADAPTERS.keys())
             raise ValueError(
@@ -205,7 +191,7 @@ class TeaCacheCoefficientEstimator:
                 f"To add support for a new model, add an entry to _MODEL_ADAPTERS."
             )
 
-        adapter = _MODEL_ADAPTERS.get(model_type, DefaultAdapter)
+        adapter = _MODEL_ADAPTERS[model_type]
         self.pipeline = adapter.load_pipeline(model_path, device, dtype)
         self.transformer, self.transformer_type = adapter.get_transformer(self.pipeline)
         self.hook = DataCollectionHook(self.transformer_type)

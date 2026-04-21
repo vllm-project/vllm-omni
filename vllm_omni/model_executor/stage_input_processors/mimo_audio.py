@@ -9,6 +9,14 @@ from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import TALKER_
 
 logger = init_logger(__name__)
 
+# Maximum tokens supported by the code2wav stage. The flattened talker codec
+# sequence fed to stage-1 must not exceed this, otherwise gpu_input_batch
+# add_request will fail with a broadcast error when copying prompt_token_ids
+# into token_ids_cpu. Keep in sync with the stage-1 ``max_model_len`` in
+# ``vllm_omni/model_executor/stage_configs/mimo_audio.yaml`` and the offline
+# example ``examples/offline_inference/mimo_audio/end2end.py``.
+MAX_CODE2WAV_TOKENS = 18192
+
 
 def prepend_and_flatten_colmajor(x: torch.Tensor, pad_vec: torch.Tensor) -> torch.Tensor:
     """
@@ -234,6 +242,20 @@ def llm2code2wav(
 
         code_final = prepend_and_flatten_colmajor(codec_codes, pad_vec)
         code_final = code_final.tolist()
+
+        # Guard against flattened sequences longer than code2wav's max_model_len.
+        # Without this, add_request raises ``could not broadcast input array
+        # from shape (N,) into shape (max_model_len,)`` and kills the engine
+        # core (see issue #2683). Mirrors the offline end2end.py safeguard.
+        if len(code_final) > MAX_CODE2WAV_TOKENS:
+            request_id = getattr(talker_output, "request_id", f"unknown_{i}")
+            logger.warning(
+                "Request %s: code_final len=%d > MAX_CODE2WAV_TOKENS=%d, truncating.",
+                request_id,
+                len(code_final),
+                MAX_CODE2WAV_TOKENS,
+            )
+            code_final = code_final[:MAX_CODE2WAV_TOKENS]
 
         code2wav_inputs.append(
             OmniTokensPrompt(

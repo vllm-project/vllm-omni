@@ -22,19 +22,18 @@ import httpx
 import pytest
 import yaml
 
-from tests.conftest import (
-    OmniServer,
-    convert_audio_file_to_text,
-    cosine_similarity_text,
-)
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import convert_audio_file_to_text, cosine_similarity_text
+from tests.helpers.runtime import OmniServer
+from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 STAGE_INIT_TIMEOUT_S = 120
 
 
-def get_stage_config(name: str = "qwen3_tts.yaml"):
-    return str(Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / name)
+def get_stage_config(name: str = "qwen3_tts.yaml") -> str:
+    """Resolve a deploy config path under vllm_omni/deploy/."""
+    return get_deploy_config_path(name)
 
 
 @pytest.fixture(scope="module")

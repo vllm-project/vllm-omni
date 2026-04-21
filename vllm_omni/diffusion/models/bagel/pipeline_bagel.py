@@ -397,11 +397,26 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                     cfg_text_context["ropes"] = cfg_text_metadata["ropes"]
                 else:
                     cfg_text_context["ropes"] = [cfg_text_seq_len]
+            else:
+                # No cfg_text companion received.  For text2img this is the
+                # expected path: original BAGEL uses an empty KV cache (0
+                # tokens) as the text-unconditional branch.  Keep the default
+                # empty NaiveCache in cfg_text_context and preserve the
+                # original cfg_text_scale so CFG still applies.
+                pass
 
-            if cfg_img_kv is None and cfg_text_kv is not None:
-                cfg_img_kv = injected_kv
-
-            if cfg_img_kv is not None:
+            if cfg_img_kv is None:
+                # text2img multi-stage: cfg_img reuses gen KV (positive prompt,
+                # no image), mirroring forward_cache_update_text on cfg_img_context
+                # in the single-stage path.
+                cfg_img_seq_len = injected_kv.key_cache[0].shape[0]
+                cfg_img_context["past_key_values"] = injected_kv
+                cfg_img_context["kv_lens"] = [cfg_img_seq_len]
+                if req.sampling_params.kv_metadata and "ropes" in req.sampling_params.kv_metadata:
+                    cfg_img_context["ropes"] = req.sampling_params.kv_metadata["ropes"]
+                else:
+                    cfg_img_context["ropes"] = [cfg_img_seq_len]
+            else:
                 cfg_img_seq_len = cfg_img_kv.key_cache[0].shape[0]
                 cfg_img_context["past_key_values"] = cfg_img_kv
                 cfg_img_context["kv_lens"] = [cfg_img_seq_len]
@@ -409,15 +424,6 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                     cfg_img_context["ropes"] = cfg_img_metadata["ropes"]
                 else:
                     cfg_img_context["ropes"] = [cfg_img_seq_len]
-
-            if not cfg_parallel_contract:
-                logger.warning("CFG is disabled: only single KV cache available")
-                gen_params = BagelGenParams(
-                    num_timesteps=gen_params.num_timesteps,
-                    timestep_shift=gen_params.timestep_shift,
-                    cfg_text_scale=1.0,
-                    cfg_img_scale=1.0,
-                )
 
         else:
             image_input = (
