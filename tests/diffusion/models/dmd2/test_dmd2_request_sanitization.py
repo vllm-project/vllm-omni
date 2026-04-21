@@ -63,13 +63,13 @@ def pipeline(request):
 def test_num_inference_steps_forced_to_dmd2_value(pipeline):
     req = _make_request(num_inference_steps=40)
     pipeline._sanitize_dmd2_request(req)
-    assert req.sampling_params.num_inference_steps == pipeline.num_inference_steps
+    assert req.sampling_params.num_inference_steps == pipeline.dmd2_config.num_inference_steps
 
 
 def test_num_inference_steps_already_correct(pipeline):
-    req = _make_request(num_inference_steps=pipeline.num_inference_steps)
+    req = _make_request(num_inference_steps=pipeline.dmd2_config.num_inference_steps)
     pipeline._sanitize_dmd2_request(req)
-    assert req.sampling_params.num_inference_steps == pipeline.num_inference_steps
+    assert req.sampling_params.num_inference_steps == pipeline.dmd2_config.num_inference_steps
 
 
 # ---------------------------------------------------------------------------
@@ -80,19 +80,19 @@ def test_num_inference_steps_already_correct(pipeline):
 def test_guidance_scale_forced_to_one(pipeline):
     req = _make_request(guidance_scale=5.0, guidance_scale_provided=True)
     pipeline._sanitize_dmd2_request(req)
-    assert req.sampling_params.guidance_scale == pipeline.dmd2_guidance_scale
+    assert req.sampling_params.guidance_scale == pipeline.dmd2_config.guidance_scale
     assert req.sampling_params.guidance_scale_provided is False
 
 
 def test_guidance_scale_already_correct(pipeline):
-    req = _make_request(guidance_scale=pipeline.dmd2_guidance_scale, guidance_scale_provided=False)
+    req = _make_request(guidance_scale=pipeline.dmd2_config.guidance_scale, guidance_scale_provided=False)
     pipeline._sanitize_dmd2_request(req)
-    assert req.sampling_params.guidance_scale == pipeline.dmd2_guidance_scale
+    assert req.sampling_params.guidance_scale == pipeline.dmd2_config.guidance_scale
 
 
 def test_guidance_scale_provided_flag_cleared(pipeline):
     """guidance_scale_provided=True must be cleared even if scale is already dmd2_guidance_scale."""
-    req = _make_request(guidance_scale=pipeline.dmd2_guidance_scale, guidance_scale_provided=True)
+    req = _make_request(guidance_scale=pipeline.dmd2_config.guidance_scale, guidance_scale_provided=True)
     pipeline._sanitize_dmd2_request(req)
     assert req.sampling_params.guidance_scale_provided is False
 
@@ -166,13 +166,13 @@ def test_multiple_prompts_all_sanitized(pipeline):
 
 def test_clean_request_no_changes(pipeline):
     req = _make_request(
-        guidance_scale=pipeline.dmd2_guidance_scale,
+        guidance_scale=pipeline.dmd2_config.guidance_scale,
         guidance_scale_provided=False,
         do_classifier_free_guidance=False,
         is_cfg_negative=False,
     )
     pipeline._sanitize_dmd2_request(req)
-    assert req.sampling_params.guidance_scale == pipeline.dmd2_guidance_scale
+    assert req.sampling_params.guidance_scale == pipeline.dmd2_config.guidance_scale
     assert req.sampling_params.guidance_scale_provided is False
     assert req.sampling_params.guidance_scale_2 is None
     assert req.sampling_params.true_cfg_scale is None

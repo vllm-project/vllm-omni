@@ -13,7 +13,8 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest, OmniDiffusionSampl
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-_DMD2_TIMESTEPS = [999, 937, 833, 624]
+# Linspace fallback timesteps for num_inference_steps=4 (the mixin default when model_index is empty).
+_DMD2_TIMESTEPS = [999, 749, 499, 249]
 
 # DMD2 subclass → immediate base pipeline whose __init__ loads model weights (mocked in tests).
 _DMD2_BASE = {
