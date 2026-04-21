@@ -2,27 +2,26 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for GLM-Image Sequence Parallelism support."""
 
-from unittest.mock import MagicMock, patch
-
 import pytest
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 
 
 @pytest.fixture(scope="function", autouse=True)
-def setup_sp_groups():
+def setup_sp_groups(mocker):
     """Set up SP and TP groups for each test function."""
-    with patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group") as mock_get_sp_group:
-        with patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", return_value=1):
-            with patch("vllm.distributed.parallel_state.get_tp_group") as mock_get_tp_group:
-                mock_sp_group = MagicMock()
-                mock_sp_group.world_size = 4
-                mock_get_sp_group.return_value = mock_sp_group
+    mock_get_sp_group = mocker.patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group")
+    mocker.patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", return_value=1)
+    mock_get_tp_group = mocker.patch("vllm.distributed.parallel_state.get_tp_group")
 
-                mock_tp_group = MagicMock()
-                mock_tp_group.world_size = 1
-                mock_get_tp_group.return_value = mock_tp_group
-                yield
+    mock_sp_group = mocker.MagicMock()
+    mock_sp_group.world_size = 4
+    mock_get_sp_group.return_value = mock_sp_group
+
+    mock_tp_group = mocker.MagicMock()
+    mock_tp_group.world_size = 1
+    mock_get_tp_group.return_value = mock_tp_group
+    yield
 
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]

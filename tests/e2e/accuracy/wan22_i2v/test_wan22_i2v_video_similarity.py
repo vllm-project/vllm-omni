@@ -22,7 +22,6 @@ import torch
 from diffusers import UniPCMultistepScheduler
 from PIL import Image
 
-from tests.conftest import OmniServerParams
 from tests.e2e.accuracy.wan22_i2v.run_wan22_i2v_diffusers_cp import (
     _configure_scheduler,
     _ensure_wan_ftfy_fallback,
@@ -48,7 +47,8 @@ from tests.e2e.accuracy.wan22_i2v.wan22_i2v_video_similarity_common import (
     SSIM_THRESHOLD,
     WIDTH,
 )
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServerParams
 
 
 def test_parse_video_metadata_extracts_dimensions_and_fps() -> None:
@@ -567,7 +567,6 @@ def test_wan22_i2v_diffusers_offline_generates_video(
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.skip(reason="issue: #2874")
 @pytest.mark.parametrize("omni_server", SERVER_CASES, indirect=True)
 def test_wan22_i2v_online_serving_generates_video(
     omni_server,

@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import huggingface_hub
 from vllm.logger import init_logger
-from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
@@ -122,17 +122,24 @@ class OmniBase(PDDisaggregationMixin):
         stage_init_timeout = kwargs.pop("stage_init_timeout", 300)
         init_timeout = kwargs.pop("init_timeout", 600)
         log_stats = kwargs.pop("log_stats", False)
-        async_chunk = kwargs.pop("async_chunk", False)
+        # NOTE: read-only lookup — must NOT pop. Popping here drops the key
+        # before it reaches ``StageConfigFactory._create_from_registry``, so
+        # ``--no-async-chunk`` (``async_chunk=False``) silently fails to
+        # override the deploy YAML's ``async_chunk: true`` default.
+        async_chunk = kwargs.get("async_chunk")
         output_modalities = kwargs.pop("output_modalities", None)
         diffusion_batch_size: int = kwargs.pop("diffusion_batch_size", 1)
 
         if "log_requests" in kwargs:
             raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
         model = omni_snapshot_download(model)
-        self._name = self.__class__.__name__
+        self.__dict__["_name"] = self.__class__.__name__
         self.model = model
         self.log_stats = log_stats
-        self.async_chunk = async_chunk
+        # Provisional value (mirrors the CLI/caller kwarg); the engine resolves
+        # pipeline + deploy YAML + CLI precedence below and the final value is
+        # re-assigned from ``self.engine.async_chunk`` after init.
+        self.async_chunk = bool(async_chunk) if async_chunk is not None else False
         self.output_modalities = output_modalities or []
         self.tts_batch_max_items: int = kwargs.pop("tts_batch_max_items", 32)
 
@@ -150,7 +157,11 @@ class OmniBase(PDDisaggregationMixin):
         self._weak_finalizer = weakref.finalize(self, _weak_shutdown_engine, self.engine)
         et = time.time()
         logger.info("[%s] AsyncOmniEngine initialized in %.2f seconds", self.__class__.__name__, et - st)
-        self.async_chunk = bool(self.async_chunk or getattr(self.engine, "async_chunk", False))
+        # Authoritative: ``AsyncOmniEngine`` resolves (pipeline + deploy YAML +
+        # CLI overrides) through ``StageConfigFactory`` and stores the final
+        # value on ``engine.async_chunk``; mirror it here so ``--no-async-chunk``
+        # (explicit ``False``) is not fallen-back-through by ``or``.
+        self.async_chunk = bool(getattr(self.engine, "async_chunk", False))
 
         self.request_states: dict[str, ClientRequestState] = {}
 
@@ -187,9 +198,33 @@ class OmniBase(PDDisaggregationMixin):
     def is_running(self) -> bool:
         return self.engine.is_alive()
 
+    @property
+    def errored(self) -> bool:
+        """Whether the engine is in a non-recoverable error state.
+
+        True when the orchestrator thread is dead **or** any stage client
+        has been marked dead (e.g. diffusion worker OOM / process death).
+
+        Checks both ``_engine_dead`` (StageDiffusionClient) and
+        ``resources.engine_dead`` (StageEngineCoreClient / AsyncMPClient)
+        since the two client types store the flag differently.
+        """
+        if not self.engine.is_alive():
+            return True
+        for stage_client in self.engine.stage_clients:
+            if getattr(stage_client, "_engine_dead", False):
+                return True
+            resources = getattr(stage_client, "resources", None)
+            if resources is not None and getattr(resources, "engine_dead", False):
+                return True
+        return False
+
     def check_health(self) -> None:
         if not self.engine.is_alive():
             raise EngineDeadError("Orchestrator process is not alive")
+        for stage_client in self.engine.stage_clients:
+            if hasattr(stage_client, "check_health"):
+                stage_client.check_health()
 
     def resolve_sampling_params_list(
         self,
@@ -260,7 +295,10 @@ class OmniBase(PDDisaggregationMixin):
             return True, None, None, None
 
         if msg_type == "error":
-            raise RuntimeError(msg.get("error", "Orchestrator returned an error message"))
+            error_text = msg.get("error", "Orchestrator returned an error message")
+            if msg.get("fatal"):
+                raise EngineDeadError(error_text)
+            raise RuntimeError(error_text)
 
         if msg_type != "output":
             logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, msg_type)
@@ -288,6 +326,34 @@ class OmniBase(PDDisaggregationMixin):
         req_state.stage_id = stage_id
 
         return False, req_id, stage_id, req_state
+
+    def _check_engine_output_error(
+        self,
+        result: dict[str, Any],
+        request_id: str,
+        stage_id: int,
+    ) -> None:
+        """Raise if ``engine_outputs`` carries an error field.
+
+        Raises :class:`EngineDeadError` when ``self.errored`` indicates the
+        engine is unrecoverable, otherwise raises :class:`EngineGenerateError`
+        (recoverable, single-request failure).
+        """
+        engine_outputs = result.get("engine_outputs")
+        error_text = getattr(engine_outputs, "error", None)
+        if error_text is None:
+            return
+        logger.error(
+            "[%s] Stage error for req=%s stage-%s: %s",
+            self.__class__.__name__,
+            request_id,
+            stage_id,
+            error_text,
+        )
+        # NOTE: O(n_stages) check for every error.
+        if self.errored:
+            raise EngineDeadError(error_text)
+        raise EngineGenerateError(error_text)
 
     def _process_single_result(
         self,

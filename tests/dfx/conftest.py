@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import modify_stage_config
+from tests.helpers.stage_config import modify_stage_config
 
 
 def load_configs(config_path: str) -> list[dict[str, Any]]:

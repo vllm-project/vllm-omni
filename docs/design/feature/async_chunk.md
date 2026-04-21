@@ -1,4 +1,4 @@
-# Async Chunk Design
+# Async Chunk
 
 ## Table of Contents
 
@@ -88,8 +88,9 @@ The following diagram illustrates the **Async Chunk Architecture** for multi-sta
 </p>
 
 **Diagram Legend:**
+
 | Step | Stage Type | Description |
-|:------:|:-----------:|:------------|
+|------|-----------|------------|
 | `prefill` | Initialization | Context processing, KV cache initialization |
 | `decode` | Autoregressive | Token-by-token generation in AR stages |
 | `codes` | Audio Encoding | RVQ codec codes from Talker stage |

@@ -9,7 +9,6 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
-    register_pipeline,
 )
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.qwen3_tts"
@@ -47,5 +46,3 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
         ),
     ),
 )
-
-register_pipeline(QWEN3_TTS_PIPELINE)

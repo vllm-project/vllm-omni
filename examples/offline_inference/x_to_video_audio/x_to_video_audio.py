@@ -58,6 +58,11 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Enable CPU offloading for diffusion models.",
     )
+    parser.add_argument(
+        "--enable-layerwise-offload",
+        action="store_true",
+        help="Enable layerwise (blockwise) offloading on DiT modules.",
+    )
     return parser.parse_args()
 
 
@@ -126,6 +131,7 @@ def main() -> None:
         parallel_config=parallel_config,
         model_type=args.model_type,
         enable_cpu_offload=args.enable_cpu_offload,
+        enable_layerwise_offload=args.enable_layerwise_offload,
     )
     start = time.perf_counter()
     outputs = omni.generate(prompt, sampling_params)
