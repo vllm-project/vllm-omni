@@ -112,13 +112,11 @@ if sep not in text:
 _, continuation = text.split(sep, 1)
 
 skip = os.environ.get("SKIP_CI") == "1"
-# When docs-only skip-ci: skip default CI image, but still build for L4 nightly / weekly uploads
-# (PR labels or main scheduled env), otherwise upload-nightly / upload-weekly would be skipped too.
+# When docs-only skip-ci: skip default CI image, but still build for L4 nightly (PR label nightly-test or
+# main NIGHTLY=1), otherwise upload-nightly (depends_on image-build) would be skipped too.
 nightly_only = (
     '(build.pull_request.labels includes "nightly-test") '
-    '|| (build.branch == "main" && build.env("NIGHTLY") == "1") '
-    '|| (build.pull_request.labels includes "weekly-test") '
-    '|| (build.branch == "main" && build.env("WEEKLY") == "1")'
+    '|| (build.branch == "main" && build.env("NIGHTLY") == "1")'
 )
 # Placeholder in pipeline.yml is `if: __IMAGE_BUILD_IF__` (valid YAML); replace value only.
 if skip:
