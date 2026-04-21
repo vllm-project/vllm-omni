@@ -33,7 +33,6 @@ stage_args:
       temperature: 0.9 # From model's generation_config.json
       top_p: 0.75 # From model's generation_config.json
       top_k: 16512 # vision_vocab_size from generation_config.json
-      max_tokens: 1281 # For 1024x1024: small(16x16=256) + large(32x32=1024) + EOS(1)
       stop_token_ids: [16385] # eos_token_id from generation_config.json
       seed: 42
       detokenize: false
@@ -70,11 +69,6 @@ stage_args:
 # Top-level runtime config
 runtime:
   enabled: true
-  defaults:
-    window_size: -1 # Trigger downstream only after full upstream completion
-    max_inflight: 1 # Process serially within each stage
-
   edges:
     - from: 0 # AR → Diffusion: trigger after AR completes
       to: 1
-      window_size: -1

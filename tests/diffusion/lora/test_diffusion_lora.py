@@ -7,6 +7,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -16,15 +17,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from vllm_omni import Omni
-
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
 
 # This test is specific to Z-Image LoRA behavior. Keep it focused on a single
 # model to reduce runtime and avoid extra downloads.
 models = ["Tongyi-MAI/Z-Image-Turbo"]
-DIFFUSION_INIT_TIMEOUT_S = 600
 
 
 @pytest.mark.parametrize("model_name", models)
@@ -77,12 +75,8 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
         )
         return str(adapter_dir)
 
-    m = Omni(
-        model=model_name,
-        stage_init_timeout=DIFFUSION_INIT_TIMEOUT_S,
-        init_timeout=DIFFUSION_INIT_TIMEOUT_S,
-    )
-    try:
+    with OmniRunner(model_name) as runner:
+        m = runner.omni
         # high resolution may cause OOM on L4
         height = 256
         width = 256
@@ -140,5 +134,3 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
 
             diff = np.abs(np.array(images[0], dtype=np.int16) - np.array(images_lora[0], dtype=np.int16)).mean()
             assert diff > 0.0
-    finally:
-        m.close()

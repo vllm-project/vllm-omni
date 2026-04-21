@@ -44,11 +44,19 @@ steps:
     agents:
       queue: "cpu_queue_premerge"
 
-  # L4 Test — main+NIGHTLY=1 (scheduled), or PR with label nightly-test (e.g. add label then Rebuild)
+  # L4 Test — main+NIGHTLY=1 (scheduled), or PR with specific label (e.g. add label then Rebuild)
   - label: "Upload Nightly Pipeline"
     depends_on: image-build
     key: upload-nightly-pipeline
-    if: '(build.branch == "main" && build.env("NIGHTLY") == "1") || (build.branch != "main" && build.pull_request.labels includes "nightly-test")'
+    if: >-
+      (build.branch == "main" && build.env("NIGHTLY") == "1") ||
+      (build.branch != "main" && (
+        build.pull_request.labels includes "nightly-test" ||
+        build.pull_request.labels includes "omni-test" ||
+        build.pull_request.labels includes "tts-test" ||
+        build.pull_request.labels includes "diffusion-x2iat-test" ||
+        build.pull_request.labels includes "diffusion-x2v-test"
+      ))
     commands:
       - buildkite-agent pipeline upload .buildkite/test-nightly.yml
     agents:

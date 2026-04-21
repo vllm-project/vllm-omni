@@ -64,6 +64,7 @@ nav:
         - FP8: user_guide/diffusion/quantization/fp8.md
         - Int8: user_guide/diffusion/quantization/int8.md
         - GGUF: user_guide/diffusion/quantization/gguf.md
+      - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
       - Parallelism:
         - Overview: user_guide/diffusion/parallelism/overview.md
         - CFG Parallel: user_guide/diffusion/parallelism/cfg_parallel.md
@@ -97,14 +98,16 @@ nav:
       - design/feature/disaggregated_inference.md
       - design/feature/ray_based_execution.md
       - design/feature/omni_connectors/
+      - design/feature/prefix_caching.md
       - design/feature/cfg_parallel.md
+      - design/feature/expert_parallel.md
       - design/feature/sequence_parallel.md
       - design/feature/tensor_parallel.md
       - design/feature/vae_parallel.md
       - design/feature/hsdp.md
       - design/feature/cache_dit.md
       - design/feature/teacache.md
-      - design/feature/async_chunk_design.md
+      - design/feature/async_chunk.md
       - design/feature/vae_parallel.md
       - design/feature/diffusion_step_execution.md
     - Module Design:

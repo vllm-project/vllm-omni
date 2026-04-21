@@ -854,6 +854,7 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
             config, parallel_config=parallel_config, quant_config=quant_config, prefix=f"{prefix}.model"
         )
         self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -863,6 +864,12 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     def set_decoder(self, decoder):
         self.model = decoder
@@ -1207,7 +1214,7 @@ class Bagel(nn.Module):
             packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
             curr += curr_kvlen
 
-            text_ids = tokenizer.encode(prompt)
+            text_ids = tokenizer.encode(prompt, add_special_tokens=False)
             text_ids = [new_token_ids["bos_token_id"]] + text_ids + [new_token_ids["eos_token_id"]]
             text_token_lens.append(len(text_ids))
             packed_text_ids.extend(text_ids)
@@ -1619,9 +1626,109 @@ class Bagel(nn.Module):
         num_layers = len(caches[0].key_cache)
         merged = NaiveCache(num_layers)
         for layer_idx in range(num_layers):
-            merged.key_cache[layer_idx] = torch.cat([c.key_cache[layer_idx] for c in caches], dim=0)
-            merged.value_cache[layer_idx] = torch.cat([c.value_cache[layer_idx] for c in caches], dim=0)
+            key_parts = [c.key_cache[layer_idx] for c in caches if c.key_cache[layer_idx] is not None]
+            val_parts = [c.value_cache[layer_idx] for c in caches if c.value_cache[layer_idx] is not None]
+            merged.key_cache[layer_idx] = torch.cat(key_parts, dim=0) if key_parts else None
+            merged.value_cache[layer_idx] = torch.cat(val_parts, dim=0) if val_parts else None
         return merged
+
+    def prepare_start_tokens(self, curr_kvlens, curr_rope, new_token_ids):
+        """Prepare start tokens for autoregressive text generation.
+
+        Ported from the original BAGEL ``Bagel.prepare_start_tokens``.
+        """
+        packed_start_tokens, packed_key_value_indexes = list(), list()
+        packed_query_position_ids = list()
+
+        curr = 0
+        for curr_kvlen, curr_position_id in zip(curr_kvlens, curr_rope):
+            packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+            packed_start_tokens.append(new_token_ids["bos_token_id"])
+            packed_query_position_ids.append(curr_position_id)
+            curr += curr_kvlen
+
+        generation_input = {
+            "packed_start_tokens": torch.tensor(packed_start_tokens, dtype=torch.long),
+            "packed_query_position_ids": torch.tensor(packed_query_position_ids, dtype=torch.long),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+        }
+        return generation_input
+
+    @torch.no_grad()
+    def generate_text(
+        self,
+        past_key_values: NaiveCache,
+        packed_key_value_indexes: torch.LongTensor,
+        key_values_lens: torch.IntTensor,
+        packed_start_tokens: torch.LongTensor,
+        packed_query_position_ids: torch.LongTensor,
+        max_length: int,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        end_token_id: int | None = None,
+    ):
+        """Autoregressive text generation (ported from original BAGEL).
+
+        Decodes tokens one at a time, appending to ``past_key_values``
+        until ``max_length`` is reached or ``end_token_id`` is generated.
+        """
+        step = 0
+        generated_sequence = []
+        curr_tokens = packed_start_tokens
+        while step < max_length:
+            generated_sequence.append(curr_tokens)
+            packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
+            query_lens = torch.ones_like(curr_tokens)
+            packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
+                0,
+                len(key_values_lens),
+                device=key_values_lens.device,
+                dtype=key_values_lens.dtype,
+            )
+
+            uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
+            for i in range(len(uppacked)):
+                uppacked[i] += i
+            packed_key_value_indexes = torch.cat(uppacked, dim=0)
+
+            output = self.language_model(
+                packed_query_sequence=packed_text_embedding,
+                query_lens=query_lens,
+                packed_query_position_ids=packed_query_position_ids,
+                packed_query_indexes=packed_query_indexes,
+                past_key_values=past_key_values,
+                key_values_lens=key_values_lens,
+                packed_key_value_indexes=packed_key_value_indexes,
+                update_past_key_values=True,
+                is_causal=True,
+                mode="und",
+            )
+            past_key_values = output.past_key_values
+            packed_query_sequence = output.packed_query_sequence
+            pred_logits = self.language_model.lm_head(packed_query_sequence)
+
+            if do_sample:
+                probs = nn.functional.softmax(pred_logits / temperature, dim=-1)
+                curr_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                curr_tokens = torch.argmax(pred_logits, dim=-1)
+
+            uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
+            for i in range(len(uppacked)):
+                uppacked[i] = torch.cat(
+                    [uppacked[i], torch.tensor([uppacked[i][-1] + 1], device=uppacked[i].device)], dim=0
+                )
+            packed_key_value_indexes = torch.cat(uppacked, dim=0)
+            key_values_lens = key_values_lens + 1
+            packed_query_position_ids = packed_query_position_ids + 1
+            step += 1
+
+            if end_token_id is not None and curr_tokens[0] == end_token_id:
+                break
+
+        output_device = generated_sequence[0].device
+        return torch.stack([i.to(output_device) for i in generated_sequence], dim=0)
 
     def generate_image(
         self,
@@ -1655,6 +1762,9 @@ class Bagel(nn.Module):
         cfg_img_past_key_values: NaiveCache | None = None,
         cfg_img_key_values_lens: torch.IntTensor | None = None,
         cfg_img_packed_key_value_indexes: torch.LongTensor | None = None,
+        return_trajectory_latents: bool = False,
+        scheduler: object | None = None,
+        scheduler_kwargs: dict | None = None,
     ):
         x_t = packed_init_noises
 
@@ -1662,6 +1772,14 @@ class Bagel(nn.Module):
         timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
         dts = timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]
+
+        # Optional trajectory recording for RL rollout data collection
+        trajectory_latents: list[torch.Tensor] | None = [] if return_trajectory_latents else None
+        trajectory_timesteps: list[torch.Tensor] | None = [] if return_trajectory_latents else None
+        trajectory_log_probs: list[torch.Tensor] | None = (
+            [] if (return_trajectory_latents and scheduler is not None) else None
+        )
+        _sched_kw = scheduler_kwargs or {}
 
         use_cfg_text = cfg_text_scale > 1.0
         use_cfg_img = cfg_img_scale > 1.0
@@ -1699,6 +1817,9 @@ class Bagel(nn.Module):
                 cfg_img_past_key_values=cfg_img_past_key_values,
                 cfg_img_key_values_lens=cfg_img_key_values_lens,
                 cfg_img_packed_key_value_indexes=cfg_img_packed_key_value_indexes,
+                return_trajectory_latents=return_trajectory_latents,
+                scheduler=scheduler,
+                scheduler_kwargs=scheduler_kwargs,
             )
 
         # ── SP + CFG: sequential single-branch forwards ──
@@ -1720,7 +1841,7 @@ class Bagel(nn.Module):
                     packed_seqlens=packed_seqlens,
                 )
 
-                v_t = self._forward_flow_single_branch(
+                v_t = self.forward_single_branch(
                     **common,
                     packed_indexes=packed_indexes,
                     packed_position_ids=packed_position_ids,
@@ -1730,7 +1851,7 @@ class Bagel(nn.Module):
                 )
 
                 if cfg_text_scale_ > 1.0:
-                    cfg_text_v_t = self._forward_flow_single_branch(
+                    cfg_text_v_t = self.forward_single_branch(
                         **common,
                         packed_indexes=cfg_text_packed_query_indexes,
                         packed_position_ids=cfg_text_packed_position_ids,
@@ -1740,7 +1861,7 @@ class Bagel(nn.Module):
                     )
                     cfg_img_v_t = None
                     if cfg_img_scale_ > 1.0:
-                        cfg_img_v_t = self._forward_flow_single_branch(
+                        cfg_img_v_t = self.forward_single_branch(
                             **common,
                             packed_indexes=cfg_img_packed_query_indexes,
                             packed_position_ids=cfg_img_packed_position_ids,
@@ -1758,16 +1879,25 @@ class Bagel(nn.Module):
                         cfg_renorm_min,
                     )
 
-                x_t = x_t - v_t.to(x_t.device) * dts[i]
+                if scheduler is not None:
+                    out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
+                    x_t = out.prev_sample
+                    if trajectory_log_probs is not None and out.log_prob is not None:
+                        trajectory_log_probs.append(out.log_prob)
+                else:
+                    x_t = x_t - v_t.to(x_t.device) * dts[i]
+                if return_trajectory_latents:
+                    trajectory_latents.append(x_t.clone())
+                    trajectory_timesteps.append(timesteps[i] - dts[i])
 
             unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-            return unpacked_latent
+            return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
         # ── SP without CFG: direct single-branch loop ──
         if use_sp:
             for i, t in enumerate(timesteps):
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
-                v_t = self._forward_flow_single_branch(
+                v_t = self.forward_single_branch(
                     x_t=x_t,
                     timestep=timestep,
                     packed_vae_token_indexes=packed_vae_token_indexes,
@@ -1781,10 +1911,20 @@ class Bagel(nn.Module):
                     past_key_values=past_key_values,
                     packed_key_value_indexes=packed_key_value_indexes,
                 )
-                x_t = x_t - v_t.to(x_t.device) * dts[i]
+                if scheduler is not None:
+                    out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
+                    x_t = out.prev_sample
+                    out_log_prob = getattr(out, "log_prob", None)
+                    if trajectory_log_probs is not None and out_log_prob is not None:
+                        trajectory_log_probs.append(out_log_prob)
+                else:
+                    x_t = x_t - v_t.to(x_t.device) * dts[i]
+                if return_trajectory_latents:
+                    trajectory_latents.append(x_t.clone())
+                    trajectory_timesteps.append(timesteps[i] - dts[i])
 
             unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-            return unpacked_latent
+            return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
         # ── Batched CFG mode (cfg_parallel_size=1, no SP) ──
         cfg_batched = None
@@ -1850,7 +1990,7 @@ class Bagel(nn.Module):
             else:
                 cfg_text_scale_ = 1.0
                 cfg_img_scale_ = 1.0
-            v_t = self._forward_flow(
+            v_t = self.forward(
                 x_t=x_t,
                 timestep=timestep,
                 packed_vae_token_indexes=packed_vae_token_indexes,
@@ -1870,10 +2010,19 @@ class Bagel(nn.Module):
                 cfg_batched=cfg_batched,
             )
 
-            x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
+            if scheduler is not None:
+                out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
+                x_t = out.prev_sample
+                if trajectory_log_probs is not None and out.log_prob is not None:
+                    trajectory_log_probs.append(out.log_prob)
+            else:
+                x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
+            if return_trajectory_latents:
+                trajectory_latents.append(x_t.clone())
+                trajectory_timesteps.append(timesteps[i] - dts[i])
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-        return unpacked_latent
+        return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
     def _generate_image_parallel(
         self,
@@ -1905,6 +2054,9 @@ class Bagel(nn.Module):
         cfg_img_past_key_values: NaiveCache | None,
         cfg_img_key_values_lens: torch.IntTensor | None,
         cfg_img_packed_key_value_indexes: torch.LongTensor | None,
+        return_trajectory_latents: bool = False,
+        scheduler: object | None = None,
+        scheduler_kwargs: dict | None = None,
     ):
         """CFG parallel denoising loop: each rank computes one CFG branch.
 
@@ -1961,13 +2113,20 @@ class Bagel(nn.Module):
         else:
             raise RuntimeError(f"Unexpected cfg_rank={cfg_rank} for Bagel 3-branch CFG parallel")
 
+        trajectory_latents: list[torch.Tensor] | None = [] if return_trajectory_latents else None
+        trajectory_timesteps: list[torch.Tensor] | None = [] if return_trajectory_latents else None
+        trajectory_log_probs: list[torch.Tensor] | None = (
+            [] if (return_trajectory_latents and scheduler is not None) else None
+        )
+        _sched_kw = scheduler_kwargs or {}
+
         for i, t in enumerate(timesteps):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             use_cfg_this_step = t > cfg_interval[0] and t <= cfg_interval[1] and cfg_text_scale > 1.0
 
             if use_cfg_this_step:
                 # CFG interval: each rank computes its own branch
-                local_v_t = self._forward_flow_single_branch(
+                local_v_t = self.forward_single_branch(
                     x_t=x_t,
                     timestep=timestep,
                     packed_vae_token_indexes=packed_vae_token_indexes,
@@ -1994,7 +2153,7 @@ class Bagel(nn.Module):
                 )
             else:
                 # Outside CFG interval: all ranks compute with gen inputs, no comm
-                v_t = self._forward_flow_single_branch(
+                v_t = self.forward_single_branch(
                     x_t=x_t,
                     timestep=timestep,
                     packed_vae_token_indexes=packed_vae_token_indexes,
@@ -2009,10 +2168,19 @@ class Bagel(nn.Module):
                     packed_key_value_indexes=packed_key_value_indexes,
                 )
 
-            x_t = x_t - v_t.to(x_t.device) * dts[i]
+            if scheduler is not None:
+                out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
+                x_t = out.prev_sample
+                if trajectory_log_probs is not None and out.log_prob is not None:
+                    trajectory_log_probs.append(out.log_prob)
+            else:
+                x_t = x_t - v_t.to(x_t.device) * dts[i]
+            if return_trajectory_latents:
+                trajectory_latents.append(x_t.clone())
+                trajectory_timesteps.append(timesteps[i] - dts[i])
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-        return unpacked_latent
+        return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
     @staticmethod
     def _combine_cfg(
@@ -2067,7 +2235,7 @@ class Bagel(nn.Module):
 
         return v_t
 
-    def _forward_flow_single_branch(
+    def forward_single_branch(
         self,
         x_t: torch.Tensor,
         timestep: torch.LongTensor,
@@ -2197,7 +2365,7 @@ class Bagel(nn.Module):
         v_t = v_t[packed_vae_token_indexes]
         return v_t
 
-    def _forward_flow(
+    def forward(
         self,
         x_t: torch.Tensor,
         timestep: torch.LongTensor,

@@ -48,6 +48,7 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import (
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.t5_encoder.t5_gemma_encoder import T5GemmaEncoderModelTP
+from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -1624,7 +1625,12 @@ def get_magi_human_post_process_func(*args, **kwargs):
     def post_process(output):
         if isinstance(output, tuple) and len(output) == 2:
             video, audio = output
-            return {"video": video, "audio": audio}
+            return {
+                "video": video,
+                "audio": audio,
+                "audio_sample_rate": 44100,
+                "fps": 25,
+            }
         return output
 
     return post_process
@@ -1633,20 +1639,6 @@ def get_magi_human_post_process_func(*args, **kwargs):
 # ===========================================================================
 # HF Hub / local path helpers
 # ===========================================================================
-
-
-def _load_json(model_path: str, filename: str, local_files_only: bool = True) -> dict:
-    """Load a JSON config file from a local path or HuggingFace Hub repo."""
-    if local_files_only:
-        path = os.path.join(model_path, *filename.split("/"))
-        with open(path) as f:
-            return json.load(f)
-    else:
-        from huggingface_hub import hf_hub_download
-
-        cached = hf_hub_download(repo_id=model_path, filename=filename)
-        with open(cached) as f:
-            return json.load(f)
 
 
 def _resolve_subdir(

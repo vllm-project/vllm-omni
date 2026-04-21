@@ -29,7 +29,8 @@ This folder provides several entrypoints for experimenting with text-to-image di
 | `AIDC-AI/Ovis-Image-7B` | 1024 x 1024 | 71.8 | 17.1 |
 | `OmniGen2/OmniGen2` |  1024 x 1024 | 20.1 | 14.7 |
 | `stabilityai/stable-diffusion-3.5-medium` | 1024 x 1024 | 20.1 | 15.6 |
-| `black-forest-labs/FLUX.1-dev` | 1024 x 1024 | 77.6 | 31.4 |
+| `black-forest-labs/FLUX.1-dev` | 1024 x 1024 | 33.9 | 31.4 |
+| `black-forest-labs/FLUX.1-schnell` | 1024 x 1024 | 33.9 | 31.4 |
 | `black-forest-labs/FLUX.2-klein-4B` | 1024 x 1024 | 72.7 | 14.9 |
 | `black-forest-labs/FLUX.2-klein-9B` | 1024 x 1024 | 37.1 | 32.3 |
 | `black-forest-labs/FLUX.2-dev` | 1024 x 1024 | 65.7 | >80 (CPU offload required) |
@@ -247,7 +248,7 @@ python examples/offline_inference/text_to_image/text_to_image.py \
 #### CFG Parallel
 
 Set `--cfg-parallel-size 2` to enable CFG Parallel for faster inference on multi-GPU setups.
-See more examples in the [diffusion acceleration user guide](../../../docs/user_guide/diffusion_acceleration.md#using-cfg-parallel).
+See more examples in the [cfg_parallel user guide](../../../docs/user_guide/parallelism/cfg_parallel.md#using-cfg-parallel).
 
 #### LoRA
 

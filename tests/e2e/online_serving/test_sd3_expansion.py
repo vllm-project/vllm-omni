@@ -4,13 +4,13 @@ Tests for Stable Diffusion 3.5 medium model.
 
 import pytest
 
-from tests.conftest import (
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import (
     OmniServer,
     OmniServerParams,
     OpenAIClientHandler,
     dummy_messages_from_mix_data,
 )
-from tests.utils import hardware_marks
 
 FOUR_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=4)
 POSITIVE_PROMPT = "A serene mountain landscape at sunset"

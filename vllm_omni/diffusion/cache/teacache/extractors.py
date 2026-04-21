@@ -19,8 +19,12 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.platforms import current_omni_platform
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -221,7 +225,8 @@ def extract_qwen_context(
     block = module.transformer_blocks[0]
     img_mod_params = block.img_mod(temb)
     img_mod1, _ = img_mod_params.chunk(2, dim=-1)
-    img_modulated, _ = block.img_norm1(hidden_states, img_mod1)
+    img_scale1, img_shift1, _ = block._modulate(img_mod1)
+    img_modulated = block.img_norm1(hidden_states, img_scale1, img_shift1)
 
     # ============================================================================
     # DEFINE TRANSFORMER EXECUTION (Qwen-specific)
@@ -721,6 +726,105 @@ def extract_flux2_klein_context(
     )
 
 
+def extract_longcat_context(
+    module: nn.Module,  # LongCatImageTransformer2DModel
+    hidden_states,
+    timestep,
+    guidance,
+    encoder_hidden_states,
+    txt_ids,
+    img_ids,
+    **kwargs,
+) -> CacheContext:
+    """Extract the cache context for LongCat Image.
+
+    Similar to other extractors, this is currently the only code needed
+    for TeaCache support for LongCat image, and encapsulates preprocessing,
+    modulated input extraction, transformer execution, and postprocessing
+    logic.
+
+    Args & kawrgs are identical to the inputs to LongCat Image's forward.
+
+    Returns:
+        CacheContext with all information needed for generic caching
+    """
+    # TODO (Alex) - Refactor TeaCache extractors to more tightly integrate with .forward
+    from diffusers.models.modeling_outputs import Transformer2DModelOutput
+
+    # 1. Model specific preprocessing
+    fwd_context = get_forward_context()
+    sp_size = module.parallel_config.sequence_parallel_size
+    if sp_size is not None and sp_size > 1:
+        # NOTE: For now, we set this to False on the forward context
+        # to be consistent with LongCat Image's current behavior when
+        # TeaCache is enabled. We do not need to reset it in post process
+        # since we should never split text embed in sp for this model.
+        fwd_context.split_text_embed_in_sp = False
+
+    hidden_states = module.x_embedder(hidden_states)
+
+    timestep = timestep.to(hidden_states.dtype) * 1000
+
+    temb = module.time_embed(timestep, hidden_states.dtype)
+    encoder_hidden_states = module.context_embedder(encoder_hidden_states)
+
+    # Compute RoPE embeddings via rope_preparer module
+    # _sp_plan will automatically shard img_cos/img_sin (outputs 2, 3)
+    # txt_cos/txt_sin (outputs 0, 1) remain replicated for dual-stream attention
+    txt_cos, txt_sin, img_cos, img_sin = module.rope_preparer(txt_ids, img_ids)
+
+    # Reconstruct image_rotary_emb with chunked values
+    # Final shape: (txt_seq_len + img_seq_len // SP, head_dim)
+    image_rotary_emb = (
+        torch.cat([txt_cos, img_cos], dim=0),
+        torch.cat([txt_sin, img_sin], dim=0),
+    )
+
+    # 2. Extract the modulated output from the first mm-DiT block
+    first_block = module.transformer_blocks[0]
+    img_modulated = first_block.norm1(hidden_states, emb=temb)[0]
+
+    # 3. Define the transformer execution
+    def run_transformer_blocks():
+        """Execute all Longcat transformer blocks."""
+        h = hidden_states
+        e = encoder_hidden_states
+        for block in module.transformer_blocks:
+            e, h = block(
+                hidden_states=h,
+                encoder_hidden_states=e,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+            )
+
+        for block in module.single_transformer_blocks:
+            e, h = block(
+                hidden_states=h,
+                encoder_hidden_states=e,
+                temb=temb,
+                image_rotary_emb=image_rotary_emb,
+            )
+        # Hook expects hidden states to be first
+        return (h, e)
+
+    # 4. Postprocessing
+    def postprocess(h):
+        """Apply Longcat-specific output postprocessing."""
+        h = module.norm_out(h, temb)
+        output = module.proj_out(h)
+        return Transformer2DModelOutput(sample=output)
+
+    # 5. Return the CacheContext
+    return CacheContext(
+        modulated_input=img_modulated,
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+        temb=temb,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+    )
+
+
 def extract_stable_audio_context(
     module: nn.Module,
     hidden_states: torch.Tensor,
@@ -827,6 +931,144 @@ def extract_stable_audio_context(
     )
 
 
+def extract_flux2_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor = None,
+    timestep: torch.LongTensor = None,
+    img_ids: torch.Tensor = None,
+    txt_ids: torch.Tensor = None,
+    guidance: torch.Tensor | None = None,
+    joint_attention_kwargs: dict[str, Any] | None = None,
+    return_dict: bool = True,
+    **kwargs: Any,
+) -> CacheContext:
+    """
+    Extract cache context for Flux2Transformer2DModel.
+
+    This is the ONLY Flux2-specific code needed for TeaCache support.
+    It encapsulates preprocessing, modulated input extraction, transformer execution,
+    and postprocessing logic.
+
+    Args:
+        module: Flux2Transformer2DModel instance
+        hidden_states: Input hidden states tensor
+        encoder_hidden_states: Text encoder outputs
+        timestep: Current diffusion timestep
+        img_ids: Image inputs for position embedding
+        txt_ids: Text inputs for position embedding
+        guidance: Optional guidance scale for CFG
+        joint_attention_kwargs: Additional attention arguments
+        return_dict: Whether to return a Transformer2DModelOutput instead of a plain tensor
+        **kwargs: Additional keyword arguments ignored by this extractor
+
+    Returns:
+        CacheContext with all information needed for generic caching
+    """
+
+    from diffusers.models.modeling_outputs import Transformer2DModelOutput
+
+    if not hasattr(module, "transformer_blocks") or len(module.transformer_blocks) == 0:
+        raise ValueError("Module must have transformer_blocks")
+
+    # ============================================================================
+    # PREPROCESSING (Flux2-specific)
+    # ============================================================================
+    num_txt_tokens = encoder_hidden_states.shape[1]
+
+    timestep = timestep.to(hidden_states.dtype) * 1000
+    if guidance is not None:
+        guidance = guidance.to(hidden_states.dtype) * 1000
+
+    temb = module.time_guidance_embed(timestep, guidance)
+
+    double_stream_mod_img = module.double_stream_modulation_img(temb)
+    double_stream_mod_txt = module.double_stream_modulation_txt(temb)
+    single_stream_mod = module.single_stream_modulation(temb)[0]
+
+    hidden_states = module.x_embedder(hidden_states)
+    encoder_hidden_states = module.context_embedder(encoder_hidden_states)
+
+    if img_ids.ndim == 3:
+        img_ids = img_ids[0]
+    if txt_ids.ndim == 3:
+        txt_ids = txt_ids[0]
+
+    if current_omni_platform.is_npu():
+        freqs_cos_image, freqs_sin_image = module.pos_embed(img_ids.cpu())
+        image_rotary_emb = (freqs_cos_image.npu(), freqs_sin_image.npu())
+        freqs_cos_text, freqs_sin_text = module.pos_embed(txt_ids.cpu())
+        text_rotary_emb = (freqs_cos_text.npu(), freqs_sin_text.npu())
+    else:
+        image_rotary_emb = module.pos_embed(img_ids)
+        text_rotary_emb = module.pos_embed(txt_ids)
+    concat_rotary_emb = (
+        torch.cat([text_rotary_emb[0], image_rotary_emb[0]], dim=0),
+        torch.cat([text_rotary_emb[1], image_rotary_emb[1]], dim=0),
+    )
+
+    # ============================================================================
+    # EXTRACT MODULATED INPUT (for cache decision)
+    # ============================================================================
+    block = module.transformer_blocks[0]
+    (shift_msa, scale_msa, gate_msa), _ = double_stream_mod_img
+    modulated_input = block.norm1(hidden_states)
+    modulated_input = (1 + scale_msa) * modulated_input + shift_msa
+
+    # ============================================================================
+    # DEFINE TRANSFORMER EXECUTION (Flux2-specific)
+    # ============================================================================
+    def run_transformer_blocks():
+        """Execute all Flux2 transformer blocks."""
+        h = hidden_states
+        e = encoder_hidden_states
+
+        for transformer_block in module.transformer_blocks:
+            e, h = transformer_block(
+                hidden_states=h,
+                encoder_hidden_states=e,
+                temb_mod_params_img=double_stream_mod_img,
+                temb_mod_params_txt=double_stream_mod_txt,
+                image_rotary_emb=concat_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+        h = torch.cat([e, h], dim=1)
+
+        for single_transformer_block in module.single_transformer_blocks:
+            h = single_transformer_block(
+                hidden_states=h,
+                encoder_hidden_states=None,
+                temb_mod_params=single_stream_mod,
+                image_rotary_emb=concat_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+
+        h = h[:, num_txt_tokens:, ...]
+        return (h,)
+
+    # ============================================================================
+    # DEFINE POSTPROCESSING
+    # ============================================================================
+    def postprocess(h):
+        h = module.norm_out(h, temb)
+        output = module.proj_out(h)
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+    # ============================================================================
+    # RETURN CONTEXT
+    # ============================================================================
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=hidden_states,
+        encoder_hidden_states=encoder_hidden_states,
+        temb=temb,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+    )
+
+
 # Registry for model-specific extractors
 # Key: Transformer class name
 # Value: extractor function with signature (module, *args, **kwargs) -> CacheContext
@@ -839,6 +1081,8 @@ EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "ZImageTransformer2DModel": extract_zimage_context,
     "Flux2Klein": extract_flux2_klein_context,
     "StableAudioDiTModel": extract_stable_audio_context,
+    "Flux2Transformer2DModel": extract_flux2_context,
+    "LongCatImageTransformer2DModel": extract_longcat_context,
     # Future models:
     # "FluxTransformer2DModel": extract_flux_context,
     # "CogVideoXTransformer3DModel": extract_cogvideox_context,

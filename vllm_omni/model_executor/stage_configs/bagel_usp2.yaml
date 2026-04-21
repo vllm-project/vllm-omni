@@ -45,14 +45,9 @@ stage_args:
       max_batch_size: 1
     engine_args:
       model_stage: dit
-      gpu_memory_utilization: 0.45
       enforce_eager: true
       trust_remote_code: true
-      engine_output_type: image
       distributed_executor_backend: "mp"
-      enable_prefix_caching: false
-      max_num_batched_tokens: 32768
-      tensor_parallel_size: 1
       parallel_config:
         ulysses_degree: 2
         # ring_degree: 2
@@ -67,9 +62,6 @@ stage_args:
 
 runtime:
   enabled: true
-  defaults:
-    window_size: -1
-    max_inflight: 1
   connectors:
     shared_memory_connector:
       name: SharedMemoryConnector
@@ -78,4 +70,3 @@ runtime:
   edges:
     - from: 0
       to: 1
-      window_size: -1

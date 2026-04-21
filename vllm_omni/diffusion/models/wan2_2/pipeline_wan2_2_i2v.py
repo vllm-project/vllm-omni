@@ -12,6 +12,7 @@ from typing import Any, cast
 import numpy as np
 import PIL.Image
 import torch
+import torchvision.transforms.functional as TF
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
@@ -22,14 +23,19 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import Dist
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
-from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
+from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
+    build_wan_scheduler,
     create_transformer_from_config,
     load_transformer_config,
+    resolve_wan_flow_shift,
+    resolve_wan_sample_solver,
     retrieve_latents,
 )
+from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
@@ -37,29 +43,6 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 DEBUG_PERF = False
-
-
-def _load_model_index(model: str, local_files_only: bool) -> dict:
-    """Load model_index.json from local path or HF Hub."""
-    if local_files_only:
-        model_index_path = os.path.join(model, "model_index.json")
-        if os.path.exists(model_index_path):
-            import json
-
-            with open(model_index_path) as f:
-                return json.load(f)
-    else:
-        try:
-            import json
-
-            from huggingface_hub import hf_hub_download
-
-            model_index_path = hf_hub_download(model, "model_index.json")
-            with open(model_index_path) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
 
 
 def get_wan22_i2v_post_process_func(
@@ -72,10 +55,23 @@ def get_wan22_i2v_post_process_func(
     def post_process_func(
         video: torch.Tensor,
         output_type: str = "np",
+        sampling_params=None,
     ):
         if output_type == "latent":
             return video
-        return video_processor.postprocess_video(video, output_type=output_type)
+        custom_output = {}
+        if sampling_params is not None and getattr(sampling_params, "enable_frame_interpolation", False):
+            video, multiplier = interpolate_video_tensor(
+                video,
+                exp=sampling_params.frame_interpolation_exp,
+                scale=sampling_params.frame_interpolation_scale,
+                model_path=sampling_params.frame_interpolation_model_path,
+            )
+            custom_output["video_fps_multiplier"] = multiplier
+        return {
+            "video": video_processor.postprocess_video(video, output_type=output_type),
+            "custom_output": custom_output,
+        }
 
     return post_process_func
 
@@ -179,7 +175,10 @@ class Wan22I2VPipeline(
         ]
 
         # Load model_index.json to detect available components
-        model_index = _load_model_index(model, local_files_only)
+        try:
+            model_index = _load_json(model, "model_index.json", local_files_only)
+        except Exception:
+            model_index = {}
 
         # Check if this is a two-stage model (MoE with transformer_2)
         self.has_transformer_2 = "transformer_2" in model_index
@@ -217,7 +216,7 @@ class Wan22I2VPipeline(
 
         # VAE
         self.vae = DistributedAutoencoderKLWan.from_pretrained(
-            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
+            model, subfolder="vae", torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
 
         # Transformers (weights loaded via load_weights)
@@ -230,13 +229,9 @@ class Wan22I2VPipeline(
         else:
             self.transformer_2 = None
 
-        # Initialize UniPC scheduler
-        flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0  # default for 720p
-        self.scheduler = FlowUniPCMultistepScheduler(
-            num_train_timesteps=1000,
-            shift=flow_shift,
-            prediction_type="flow_prediction",
-        )
+        self._sample_solver = "unipc"
+        self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
+        self.scheduler = build_wan_scheduler(self._sample_solver, self._flow_shift)
 
         # VAE scale factors
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if hasattr(self.vae, "config") else 4
@@ -271,6 +266,82 @@ class Wan22I2VPipeline(
     @property
     def current_timestep(self):
         return self._current_timestep
+
+    def diffuse(
+        self,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None,
+        image_embeds: torch.Tensor | None,
+        guidance_low: float,
+        guidance_high: float,
+        boundary_timestep: float | None,
+        dtype: torch.dtype,
+        attention_kwargs: dict[str, Any],
+        condition: torch.Tensor,
+        first_frame_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for t in timesteps:
+                self._current_timestep = t
+
+                # Select model and guidance scale based on timestep
+                current_model = self.transformer
+                current_guidance_scale = guidance_low
+                if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
+                    current_model = self.transformer_2
+                    current_guidance_scale = guidance_high
+
+                # Prepare latent input
+                if self.expand_timesteps:
+                    # TI2V-5B style: blend condition with latents using mask
+                    latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
+                    latent_model_input = latent_model_input.to(dtype)
+
+                    # Expand timesteps for each patch
+                    temp_ts = (first_frame_mask[0][0][:, ::2, ::2] * t).flatten()
+                    timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
+                else:
+                    # Wan2.1 style: concatenate condition with latents
+                    latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
+                    timestep = t.expand(latents.shape[0])
+
+                do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
+                positive_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep,
+                    "encoder_hidden_states": prompt_embeds,
+                    "encoder_hidden_states_image": image_embeds,
+                    "attention_kwargs": attention_kwargs,
+                    "return_dict": False,
+                    "current_model": current_model,
+                }
+                if do_true_cfg:
+                    negative_kwargs = {
+                        "hidden_states": latent_model_input,
+                        "timestep": timestep,
+                        "encoder_hidden_states": negative_prompt_embeds,
+                        "encoder_hidden_states_image": image_embeds,
+                        "attention_kwargs": attention_kwargs,
+                        "return_dict": False,
+                        "current_model": current_model,
+                    }
+                else:
+                    negative_kwargs = None
+
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=do_true_cfg,
+                    true_cfg_scale=current_guidance_scale,
+                    positive_kwargs=positive_kwargs,
+                    negative_kwargs=negative_kwargs,
+                    cfg_normalize=False,
+                )
+
+                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                pbar.update()
+
+        return latents
 
     def encode_image(
         self,
@@ -440,6 +511,13 @@ class Wan22I2VPipeline(
             current_omni_platform.synchronize()
             _t_img_enc_ms = (time.perf_counter() - _t_img_enc_start) * 1000
 
+        sample_solver = resolve_wan_sample_solver(req, default=self._sample_solver)
+        flow_shift = resolve_wan_flow_shift(req, self.od_config)
+        if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
+            self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
+            self._sample_solver = sample_solver
+            self._flow_shift = flow_shift
+
         # Timesteps
         self.scheduler.set_timesteps(num_steps, device=device)
         timesteps = self.scheduler.timesteps
@@ -459,6 +537,7 @@ class Wan22I2VPipeline(
         video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
 
         if isinstance(image, PIL.Image.Image):
+            image = TF.to_tensor(image).to(device)
             image_tensor = video_processor.preprocess(image, height=height, width=width)
         else:
             image_tensor = image
@@ -467,6 +546,7 @@ class Wan22I2VPipeline(
         # Handle last_image if provided
         if last_image is not None:
             if isinstance(last_image, PIL.Image.Image):
+                image = TF.to_tensor(last_image).to(device)
                 last_image_tensor = video_processor.preprocess(last_image, height=height, width=width)
             else:
                 last_image_tensor = last_image
@@ -497,68 +577,20 @@ class Wan22I2VPipeline(
 
         if DEBUG_PERF:
             _t_denoise_start = time.perf_counter()
-        with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
-                self._current_timestep = t
-
-                # Select model and guidance scale based on timestep
-                current_model = self.transformer
-                current_guidance_scale = guidance_low
-                if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
-                    current_model = self.transformer_2
-                    current_guidance_scale = guidance_high
-
-                # Prepare latent input
-                if self.expand_timesteps:
-                    # TI2V-5B style: blend condition with latents using mask
-                    latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
-                    latent_model_input = latent_model_input.to(dtype)
-
-                    # Expand timesteps for each patch
-                    temp_ts = (first_frame_mask[0][0][:, ::2, ::2] * t).flatten()
-                    timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
-                else:
-                    # Wan2.1 style: concatenate condition with latents
-                    latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
-                    timestep = t.expand(latents.shape[0])
-
-                do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
-                # Prepare kwargs for positive and negative predictions
-                positive_kwargs = {
-                    "hidden_states": latent_model_input,
-                    "timestep": timestep,
-                    "encoder_hidden_states": prompt_embeds,
-                    "encoder_hidden_states_image": image_embeds,
-                    "attention_kwargs": attention_kwargs,
-                    "return_dict": False,
-                    "current_model": current_model,
-                }
-                if do_true_cfg:
-                    negative_kwargs = {
-                        "hidden_states": latent_model_input,
-                        "timestep": timestep,
-                        "encoder_hidden_states": negative_prompt_embeds,
-                        "encoder_hidden_states_image": image_embeds,
-                        "attention_kwargs": attention_kwargs,
-                        "return_dict": False,
-                        "current_model": current_model,
-                    }
-                else:
-                    negative_kwargs = None
-
-                # Predict noise with automatic CFG parallel handling
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_true_cfg,
-                    true_cfg_scale=current_guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    cfg_normalize=False,
-                )
-
-                # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
-
-                pbar.update()
+        latents = self.diffuse(
+            latents=latents,
+            timesteps=timesteps,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            image_embeds=image_embeds,
+            guidance_low=guidance_low,
+            guidance_high=guidance_high,
+            boundary_timestep=boundary_timestep,
+            dtype=dtype,
+            attention_kwargs=attention_kwargs,
+            condition=condition,
+            first_frame_mask=first_frame_mask,
+        )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
         # so we empty the cache here to avoid OOM before vae decoding.
@@ -789,12 +821,14 @@ class Wan22I2VPipeline(
             return latents, latent_condition, first_frame_mask
 
         # Wan2.1 style: create mask and concatenate with condition
-        mask_lat_size = torch.ones(batch_size, 1, num_frames, latent_height, latent_width)
+        mask_lat_size = torch.ones(
+            batch_size, 1, num_frames, latent_height, latent_width, device=latent_condition.device
+        )
 
         if last_image is None:
-            mask_lat_size[:, :, list(range(1, num_frames))] = 0
+            mask_lat_size[:, :, 1:] = 0
         else:
-            mask_lat_size[:, :, list(range(1, num_frames - 1))] = 0
+            mask_lat_size[:, :, 1 : num_frames - 1] = 0
 
         first_frame_mask = mask_lat_size[:, :, 0:1]
         first_frame_mask = torch.repeat_interleave(first_frame_mask, dim=2, repeats=self.vae_scale_factor_temporal)
@@ -851,3 +885,16 @@ class Wan22I2VPipeline(
         """Load weights using AutoWeightsLoader for vLLM integration."""
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+
+# ---------------------------------------------------------------------------
+# DMD2-distilled variant
+# ---------------------------------------------------------------------------
+
+
+class WanI2VDMD2Pipeline(DMD2PipelineMixin, Wan22I2VPipeline):
+    """Wan 2.x I2V pipeline for FastGen DMD2-distilled models."""
+
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
+        super().__init__(od_config=od_config, prefix=prefix)
+        self.__init_dmd2__()

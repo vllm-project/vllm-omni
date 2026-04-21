@@ -19,7 +19,6 @@ import os
 import uuid
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
 from pathlib import Path
 
@@ -30,9 +29,9 @@ from mistral_common.protocol.speech.request import SpeechRequest
 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from vllm import SamplingParams
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.entrypoints.omni import Omni
 
 MODEL = "mistralai/Voxtral-4B-TTS-2603"
 STAGE_CONFIG = str(
@@ -65,14 +64,14 @@ def _compose_request(model_name: str, text: str, voice: str) -> dict:
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_voxtral_tts_offline_basic():
     """Test basic Voxtral TTS offline inference with a voice preset."""
-    omni = Omni(
-        model=MODEL,
-        stage_configs_path=STAGE_CONFIG,
-        stage_init_timeout=300,
-        enforce_eager=True,
-    )
+    stage_config = STAGE_CONFIG
 
-    try:
+    with OmniRunner(
+        MODEL,
+        stage_configs_path=stage_config,
+        enforce_eager=True,
+    ) as runner:
+        omni = runner.omni
         inputs = _compose_request(MODEL, TEST_TEXT, VOICE)
 
         sampling_params = SamplingParams(max_tokens=2500)
@@ -108,9 +107,6 @@ def test_voxtral_tts_offline_basic():
 
         # Verify audio isn't all zeros / silence
         assert np.max(np.abs(audio_array)) > 0.01, "Audio appears to be silence"
-
-    finally:
-        omni.close()
 
 
 @pytest.mark.advanced_model

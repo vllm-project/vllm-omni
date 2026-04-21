@@ -18,12 +18,12 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 If you want to open async chunking for qwen3-omni, launch the server with command below
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path /vllm_omni/model_executor/stage_configs/qwen3_omni_moe_async_chunk.yaml
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --deploy-config /vllm_omni/deploy/qwen3_omni_moe.yaml
 ```
 
 If you have custom stage configs file, launch the server with command below
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --deploy-config /path/to/deploy_config_file
 ```
 
 ### Send Multi-modal Request
@@ -62,15 +62,6 @@ python openai_chat_completion_client_for_multimodal_generation.py \
 
 ```bash
 bash run_curl_multimodal_generation.sh use_image
-```
-
-
-### FAQ
-
-If you encounter error about backend of librosa, try to install ffmpeg with command below.
-```
-sudo apt update
-sudo apt install ffmpeg
 ```
 
 ## Modality control
@@ -196,7 +187,7 @@ The script supports the following arguments:
 - `--model`: Model name/path (default: Qwen/Qwen3-Omni-30B-A3B-Instruct)
 - `--server-port`: Port for vLLM server (default: 8091)
 - `--gradio-port`: Port for Gradio demo (default: 7861)
-- `--stage-configs-path`: Path to custom stage configs YAML file (optional)
+- `--deploy-config`: Path to custom deploy config YAML file (optional)
 - `--server-host`: Host for vLLM server (default: 0.0.0.0)
 - `--gradio-ip`: IP for Gradio demo (default: 127.0.0.1)
 - `--share`: Share Gradio demo publicly (creates a public link)
@@ -211,7 +202,7 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 
 If you have custom stage configs file:
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --deploy-config /path/to/deploy_config_file
 ```
 
 **Step 2: Run the Gradio demo**
