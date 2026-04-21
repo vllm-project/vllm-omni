@@ -556,6 +556,32 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 pp_rank = pp_group.rank_in_group
                 task = assignment[pp_rank]
 
+                if pp_group.is_first_rank:
+                    denoised_chunks = state.extra.pop("denoised_chunks", [])
+                    decoded_chunks = state.extra.get("decoded_chunks", [])
+                    
+                    for chunk in denoised_chunks:
+                        with state.use_chunk(chunk):
+                            decoded_chunks.append(self.pipeline.post_decode(state))
+
+                    if len(decoded_chunks) >= state.sampling.num_chunks:
+                        assert len(denoised_chunks) == state.sampling.num_chunks, (
+                            f"Expected {state.sampling.num_chunks} denoised chunks but got {len(denoised_chunks)}"
+                        )
+
+                        output = RunnerOutput(
+                            req_id=state.req_id,
+                            step_index=state.step_index,
+                            finished=True,
+                            result=self._merge_chunk_outputs(decoded_chunks),
+                        )
+
+                        self._update_states_after(state, finished=True)
+                        self.pipeline._registered_pp_comms = False
+
+                        return output
+
+
                 if task is None:
                     return RunnerOutput(req_id=state.req_id)
 
@@ -588,18 +614,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     chunk_idx=task.chunk_idx,
                 )
 
-                if chunk_done:
+                if chunk_done and pp_group.is_first_rank:
+                    state.extra.setdefault("denoised_chunks", []).append(chunk)
+
                     output.chunk_completed = True
-                    with state.use_chunk(chunk):
-                        chunk_output = self.pipeline.post_decode(state)
                     state.extra["chunks"].pop(task.chunk_idx, None)
 
-                    completed = state.extra.setdefault("completed_chunk_outputs", [])
-                    completed.append(chunk_output)
-                    if len(completed) >= state.sampling.num_chunks:
-                        output.finished = True
-                        output.result = self._merge_chunk_outputs(completed)
-                        self._update_states_after(state, finished=True)
-                        self.pipeline._registered_pp_comms = False
-
+            
                 return output

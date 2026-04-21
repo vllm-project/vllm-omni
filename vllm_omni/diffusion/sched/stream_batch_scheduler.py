@@ -45,7 +45,6 @@ class _ChunkProgress:
     num_chunks: int              # total chunks to produce for this request
     num_steps: int               # denoising steps per chunk
     chunks_admitted: int = 0
-    chunks_completed: int = 0
     in_flight: list[_InFlightChunk] = field(default_factory=list)
 
 
@@ -204,7 +203,6 @@ class StreamBatchScheduler(_BaseScheduler):
                         progress.in_flight = [
                             c for c in progress.in_flight if c.chunk_idx != output.chunk_idx
                         ]
-                        progress.chunks_completed += 1
 
         if output.finished:
             terminal[output.req_id] = DiffusionRequestStatus.FINISHED_COMPLETED
