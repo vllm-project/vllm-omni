@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for step-level diffusion runner and worker execution."""
+"""Tests for step-level diffusion execution across runner / worker / executor / engine."""
 
 import os
+import queue
+import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
 import torch
+from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.comm import RingComm, SeqAllToAll4D
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -20,10 +24,13 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.ipc import (
     pack_diffusion_output_shm,
     unpack_diffusion_output_shm,
 )
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched import StepScheduler
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
     DiffusionSchedulerOutput,
@@ -32,6 +39,8 @@ from vllm_omni.diffusion.sched.interface import (
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -84,6 +93,23 @@ class _StepPipeline:
         del kwargs
         self.decode_calls += 1
         return DiffusionOutput(output=torch.tensor([state.step_index], dtype=torch.float32))
+
+
+class _InterruptingStepPipeline(_StepPipeline):
+    interrupt = True
+
+    def denoise_step(self, state, **kwargs):
+        del state, kwargs
+        self.denoise_calls += 1
+        return None
+
+    def step_scheduler(self, state, noise_pred, **kwargs):
+        del state, noise_pred, kwargs
+        raise AssertionError("step_scheduler should not run after interrupt")
+
+    def post_decode(self, state, **kwargs):
+        del state, kwargs
+        raise AssertionError("post_decode should not run after interrupt")
 
 
 class _IdentityNoiseTransformer(torch.nn.Module):
@@ -188,6 +214,21 @@ def _make_step_request(num_inference_steps: int = 2):
     )
 
 
+def _assert_aborted_output(output: DiffusionOutput, request_id: str) -> None:
+    assert output.output is None
+    assert output.error is None
+    assert output.aborted is True
+    assert output.abort_message == f"Request {request_id} aborted."
+
+
+def _make_engine_request(req_id: str = "req-1", num_inference_steps: int = 2) -> OmniDiffusionRequest:
+    return OmniDiffusionRequest(
+        prompts=[f"prompt-{req_id}"],
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=num_inference_steps),
+        request_ids=[req_id],
+    )
+
+
 def _make_runner():
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()
@@ -240,6 +281,18 @@ def _make_cached_scheduler_output(sched_req_id="req-1", step_id=1, finished_req_
         num_running_reqs=1,
         num_waiting_reqs=0,
     )
+
+
+def _make_engine(scheduler, execute_fn=None) -> DiffusionEngine:
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(model_class_name="QwenImagePipeline")
+    engine.pre_process_func = None
+    engine.post_process_func = None
+    engine.scheduler = scheduler
+    engine.execute_fn = execute_fn
+    engine._rpc_lock = threading.RLock()
+    engine.abort_queue = queue.Queue()
+    return engine
 
 
 def _expected_output_for_mode(mode: str) -> torch.Tensor:
@@ -321,6 +374,52 @@ class TestRunner:
         assert runner.pipeline.denoise_calls == 2
         assert runner.pipeline.scheduler_calls == 2
         assert runner.pipeline.decode_calls == 1
+
+    def test_rejects_multi_request_step_batch(self):
+        runner = _make_runner()
+        req_1 = _make_step_request()
+        req_2 = _make_step_request()
+        req_2.request_ids = ["req-2"]
+
+        scheduler_output = DiffusionSchedulerOutput(
+            step_id=0,
+            scheduled_new_reqs=[
+                NewRequestData(sched_req_id="req-1", req=req_1),
+                NewRequestData(sched_req_id="req-2", req=req_2),
+            ],
+            scheduled_cached_reqs=CachedRequestData.make_empty(),
+            finished_req_ids=set(),
+            num_running_reqs=2,
+            num_waiting_reqs=0,
+        )
+
+        with pytest.raises(ValueError, match="batch_size=1"):
+            DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+
+    def test_rejects_missing_cached_state(self):
+        runner = _make_runner()
+
+        with pytest.raises(ValueError, match="Missing cached state"):
+            DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(sched_req_id="req-missing"))
+
+    def test_interrupt_marks_request_finished_and_clears_state(self, monkeypatch):
+        runner = _make_runner()
+        runner.pipeline = _InterruptingStepPipeline()
+        req = _make_step_request()
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+        output = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
+
+        assert output.req_id == "req-1"
+        assert output.step_index == 0
+        assert output.finished is True
+        assert output.result is not None
+        assert output.result.error == "stepwise denoise interrupted"
+        assert "req-1" not in runner.state_cache
+        assert runner.pipeline.prepare_calls == 1
+        assert runner.pipeline.denoise_calls == 1
+        assert runner.pipeline.scheduler_calls == 0
+        assert runner.pipeline.decode_calls == 0
 
     def test_load_model_rejects_unsupported_step_execution(self, monkeypatch):
         class _RequestOnlyPipeline:
@@ -440,6 +539,153 @@ class TestWorker:
 
 
 @pytest.mark.cpu
+class TestExecutor:
+    """MultiprocDiffusionExecutor.execute_step"""
+
+    def test_execute_step_passes_through_runner_output(self, mocker: MockerFixture):
+        executor = object.__new__(MultiprocDiffusionExecutor)
+        executor._ensure_open = lambda: None
+        expected = RunnerOutput(req_id="req-step", step_index=1, finished=False, result=None)
+        executor.collective_rpc = mocker.Mock(return_value=expected)
+
+        request = _make_engine_request("req-step", num_inference_steps=2)
+        scheduler_output = _make_scheduler_output(request, sched_req_id="req-step")
+
+        output = MultiprocDiffusionExecutor.execute_step(executor, scheduler_output)
+
+        assert output is expected
+
+
+@pytest.mark.cpu
+class TestEngine:
+    """Step-execution paths in DiffusionEngine.add_req_and_wait_for_response"""
+
+    @pytest.mark.parametrize(
+        ("execute_fn", "expected_error"),
+        [
+            (
+                lambda _: RunnerOutput(
+                    req_id="req-error",
+                    step_index=1,
+                    finished=True,
+                    result=DiffusionOutput(error="boom"),
+                ),
+                "boom",
+            ),
+            (
+                lambda _: (_ for _ in ()).throw(RuntimeError("gpu on fire")),
+                "gpu on fire",
+            ),
+        ],
+    )
+    def test_step_engine_returns_error(self, execute_fn, expected_error, mocker: MockerFixture):
+        scheduler = StepScheduler()
+        scheduler.initialize(mocker.Mock())
+        engine = _make_engine(scheduler, execute_fn=execute_fn)
+
+        output = engine.add_req_and_wait_for_response(_make_engine_request("req-error", num_inference_steps=2))
+
+        assert output.output is None
+        assert expected_error in output.error
+
+    def test_step_execution_completes(self, mocker: MockerFixture):
+        scheduler = StepScheduler()
+        scheduler.initialize(mocker.Mock())
+        engine = _make_engine(scheduler)
+        request = _make_engine_request("req-step", num_inference_steps=2)
+
+        call_count = {"n": 0}
+
+        def execute_fn(_):
+            call_count["n"] += 1
+            finished = call_count["n"] == 2
+            return RunnerOutput(
+                req_id="req-step",
+                step_index=call_count["n"],
+                finished=finished,
+                result=(DiffusionOutput(output=torch.tensor([2.0])) if finished else None),
+            )
+
+        engine.execute_fn = execute_fn
+
+        output = engine.add_req_and_wait_for_response(request)
+
+        assert call_count["n"] == 2
+        assert output.error is None
+        assert torch.equal(output.output, torch.tensor([2.0]))
+
+    def test_step_abort_stops_rescheduling_after_first_step(self, mocker: MockerFixture):
+        scheduler = StepScheduler()
+        scheduler.initialize(mocker.Mock())
+        engine = _make_engine(scheduler)
+        request = _make_engine_request("req-stop", num_inference_steps=4)
+
+        step = {"n": 0}
+
+        def execute_fn(_):
+            step["n"] += 1
+            engine.abort("req-stop")
+            return RunnerOutput(
+                req_id="req-stop",
+                step_index=1,
+                finished=False,
+                result=None,
+            )
+
+        engine.execute_fn = execute_fn
+
+        output = engine.add_req_and_wait_for_response(request)
+
+        assert step["n"] == 1
+        _assert_aborted_output(output, "req-stop")
+
+    def test_step_abort_after_reschedule_returns_aborted_output(self, mocker: MockerFixture):
+        scheduler = StepScheduler()
+        scheduler.initialize(mocker.Mock())
+        engine = _make_engine(scheduler)
+        request = _make_engine_request("req-mid", num_inference_steps=4)
+
+        step = {"n": 0}
+
+        def execute_fn(sched_output):
+            step["n"] += 1
+            if step["n"] == 2:
+                assert sched_output == _make_cached_scheduler_output("req-mid", step_id=1)
+                engine.abort("req-mid")
+            return RunnerOutput(
+                req_id="req-mid",
+                step_index=step["n"],
+                finished=False,
+                result=None,
+            )
+
+        engine.execute_fn = execute_fn
+
+        output = engine.add_req_and_wait_for_response(request)
+
+        assert step["n"] == 2
+        _assert_aborted_output(output, "req-mid")
+
+    def test_finished_step_without_result_returns_error(self, mocker: MockerFixture):
+        scheduler = StepScheduler()
+        scheduler.initialize(mocker.Mock())
+        engine = _make_engine(
+            scheduler,
+            execute_fn=lambda _: RunnerOutput(
+                req_id="req-missing",
+                step_index=1,
+                finished=True,
+                result=None,
+            ),
+        )
+
+        output = engine.add_req_and_wait_for_response(_make_engine_request("req-missing", num_inference_steps=1))
+
+        assert output.output is None
+        assert output.error == "Diffusion execution finished without a final output."
+
+
+@pytest.mark.cpu
 class TestIPC:
     def test_pack_unpack_runner_output_shm(self):
         tensor = torch.zeros(300_000, dtype=torch.float32)
@@ -457,6 +703,15 @@ class TestIPC:
 @pytest.mark.cpu
 class TestSupportedPipelines:
     """Step-execution protocol checks for supported pipelines."""
+
+    def test_default_stage_config_includes_step_execution(self):
+        stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+            {
+                "step_execution": True,
+            }
+        )[0]
+
+        assert stage_cfg["engine_args"]["step_execution"] is True
 
     def test_qwen_image_supports_step_execution(self):
         from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution

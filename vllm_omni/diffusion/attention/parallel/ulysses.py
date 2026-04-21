@@ -373,8 +373,14 @@ class UlyssesParallelAttention:
             orig_head_cnt=int(orig_head_cnt) if mode == "advanced_uaa" else 0,
             joint_orig_head_cnt=int(joint_orig_head_cnt) if mode == "advanced_uaa" else 0,
         )
-
+        use_2d_mask = False
         if attn_metadata is not None:
+            if attn_metadata.attn_mask is not None and attn_metadata.attn_mask.ndim == 2:
+                use_2d_mask = True
+            if attn_metadata.joint_attn_mask is not None and attn_metadata.joint_attn_mask.ndim == 2:
+                use_2d_mask = True
+
+        if attn_metadata is not None and use_2d_mask:
             if is_joint:
                 if attn_metadata.joint_attn_mask is None and attn_metadata.attn_mask is None:
                     attn_metadata.attn_mask = None
@@ -407,10 +413,6 @@ class UlyssesParallelAttention:
 
     def post_attention(self, attn_output: torch.Tensor, ctx: ParallelAttentionContext | None) -> torch.Tensor:
         assert isinstance(ctx, _UlyssesCtx), f"Unexpected ctx type: {type(ctx)!r}"
-
-        # If we have joint tensors (Text), they were Head-Sliced.
-        # The main sequence (Image) was Sequence-Sliced.
-        # attn_output contains [Joint_Sliced | Image_Sliced] (if strategy='front').
 
         if ctx.joint_len > 0:
             joint_len = ctx.joint_len

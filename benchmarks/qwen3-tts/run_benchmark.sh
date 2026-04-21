@@ -23,8 +23,11 @@
 #   # Use 1.7B model:
 #   MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice bash run_benchmark.sh --async-only
 #
-#   # Use batch_size=4 config:
-#   STAGE_CONFIG=vllm_omni/configs/qwen3_tts_bs4.yaml bash run_benchmark.sh --async-only
+#   # Use Voice Clone model
+#   MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-Base TASK_TYPE=Base bash run_benchmark.sh --async-only
+#
+#   # Use batch_size=4:
+#   BATCH_SIZE=4 bash run_benchmark.sh --async-only
 #
 # Environment variables:
 #   GPU_DEVICE       - GPU index to use (default: 0)
@@ -32,9 +35,10 @@
 #   CONCURRENCY      - Space-separated concurrency levels (default: "1 4 10")
 #   MODEL            - Model name (default: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice)
 #   PORT             - Server port (default: 8000)
-#   GPU_MEM_TALKER   - gpu_memory_utilization for talker stage (default: 0.3)
-#   GPU_MEM_CODE2WAV - gpu_memory_utilization for code2wav stage (default: 0.2)
-#   STAGE_CONFIG     - Path to stage config YAML (default: configs/qwen3_tts_bs1.yaml)
+#   BATCH_SIZE       - Per-stage ``max_num_seqs`` for both talker and code2wav (default: 1)
+#   GPU_MEM_TALKER   - gpu_memory_utilization for talker stage (default: 0.3 at bs=1, else 0.2)
+#   GPU_MEM_CODE2WAV - gpu_memory_utilization for code2wav stage (default: 0.3 at bs=1, else 0.2)
+#   TASK_TYPE        - Task type: CustomVoice, VoiceDesign, Base (default: CustomVoice)
 
 set -euo pipefail
 
@@ -47,12 +51,35 @@ NUM_PROMPTS="${NUM_PROMPTS:-50}"
 CONCURRENCY="${CONCURRENCY:-1 4 10}"
 MODEL="${MODEL:-Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice}"
 PORT="${PORT:-8000}"
-GPU_MEM_TALKER="${GPU_MEM_TALKER:-0.3}"
-GPU_MEM_CODE2WAV="${GPU_MEM_CODE2WAV:-0.2}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
+DEFAULT_MEM=$([ "${BATCH_SIZE}" = "1" ] && echo "0.3" || echo "0.2")
+GPU_MEM_TALKER="${GPU_MEM_TALKER:-${DEFAULT_MEM}}"
+GPU_MEM_CODE2WAV="${GPU_MEM_CODE2WAV:-${DEFAULT_MEM}}"
 NUM_WARMUPS="${NUM_WARMUPS:-3}"
-STAGE_CONFIG="${STAGE_CONFIG:-vllm_omni/configs/qwen3_tts_bs1.yaml}"
+DEPLOY_CONFIG="vllm_omni/deploy/qwen3_tts.yaml"
 RESULT_DIR="${SCRIPT_DIR}/results"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+TASK_TYPE="${TASK_TYPE:-CustomVoice}"
+
+# Build --stage-overrides JSON from BATCH_SIZE + GPU_MEM_*.
+STAGE_OVERRIDES=$(
+    BATCH_SIZE="${BATCH_SIZE}" \
+    GPU_MEM_TALKER="${GPU_MEM_TALKER}" \
+    GPU_MEM_CODE2WAV="${GPU_MEM_CODE2WAV}" \
+    python - <<'PYEOF'
+import json, os
+bs = int(os.environ["BATCH_SIZE"])
+mem_t = float(os.environ["GPU_MEM_TALKER"])
+mem_c = float(os.environ["GPU_MEM_CODE2WAV"])
+# Prefill budget grows with batch size on both stages.
+talker_batched = 512 if bs <= 4 else 4096
+code2wav_batched = 8192 if bs <= 4 else 32768
+print(json.dumps({
+    "0": {"max_num_seqs": bs, "gpu_memory_utilization": mem_t, "max_num_batched_tokens": talker_batched},
+    "1": {"max_num_seqs": bs, "gpu_memory_utilization": mem_c, "max_num_batched_tokens": code2wav_batched},
+}))
+PYEOF
+)
 
 # Parse args
 RUN_ASYNC=true
@@ -70,40 +97,27 @@ mkdir -p "${RESULT_DIR}"
 echo "============================================================"
 echo " Qwen3-TTS Benchmark"
 echo "============================================================"
-echo " GPU:          ${GPU_DEVICE}"
-echo " Model:        ${MODEL}"
-echo " Prompts:      ${NUM_PROMPTS}"
-echo " Concurrency:  ${CONCURRENCY}"
-echo " Port:         ${PORT}"
-echo " Stage config: ${STAGE_CONFIG}"
-echo " Results:      ${RESULT_DIR}"
+echo " GPU:            ${GPU_DEVICE}"
+echo " Model:          ${MODEL}"
+echo " Prompts:        ${NUM_PROMPTS}"
+echo " Concurrency:    ${CONCURRENCY}"
+echo " Port:           ${PORT}"
+echo " Deploy config:  ${DEPLOY_CONFIG}"
+echo " Batch size:     ${BATCH_SIZE}"
+echo " GPU mem T/C:    ${GPU_MEM_TALKER} / ${GPU_MEM_CODE2WAV}"
+echo " Results:        ${RESULT_DIR}"
+echo " Task type:      ${TASK_TYPE}"
 echo "============================================================"
-
-# Prepare stage config with correct GPU device and memory settings
-prepare_config() {
-    local config_template="$1"
-    local config_name="$2"
-    local output_path="${RESULT_DIR}/${config_name}_stage_config.yaml"
-
-    # Use sed to patch GPU device and memory utilization
-    sed \
-        -e "s/devices: \"0\"/devices: \"${GPU_DEVICE}\"/g" \
-        -e "s/gpu_memory_utilization: 0.3/gpu_memory_utilization: ${GPU_MEM_TALKER}/g" \
-        -e "s/gpu_memory_utilization: 0.2/gpu_memory_utilization: ${GPU_MEM_CODE2WAV}/g" \
-        "${config_template}" > "${output_path}"
-
-    echo "${output_path}"
-}
 
 # Start server and wait for it to be ready
 start_server() {
-    local stage_config="$1"
-    local config_name="$2"
+    local config_name="$1"
     local log_file="${RESULT_DIR}/server_${config_name}_${TIMESTAMP}.log"
 
     echo ""
     echo "Starting server with config: ${config_name}"
-    echo "  Stage config: ${stage_config}"
+    echo "  Deploy config: ${DEPLOY_CONFIG}"
+    echo "  Stage overrides: ${STAGE_OVERRIDES}"
     echo "  Log file: ${log_file}"
 
     VLLM_WORKER_MULTIPROC_METHOD=spawn \
@@ -112,7 +126,8 @@ start_server() {
         --omni \
         --host 127.0.0.1 \
         --port "${PORT}" \
-        --stage-configs-path "${stage_config}" \
+        --deploy-config "${DEPLOY_CONFIG}" \
+        --stage-overrides "${STAGE_OVERRIDES}" \
         --stage-init-timeout 120 \
         --trust-remote-code \
         --disable-log-stats \
@@ -169,17 +184,13 @@ trap 'stop_server' EXIT
 # Run benchmark for a given config
 run_bench() {
     local config_name="$1"
-    local config_template="$2"
 
     echo ""
     echo "============================================================"
     echo " Benchmarking: ${config_name}"
     echo "============================================================"
 
-    local stage_config
-    stage_config=$(prepare_config "${config_template}" "${config_name}")
-
-    start_server "${stage_config}" "${config_name}"
+    start_server "${config_name}"
 
     # Convert concurrency string to args
     local conc_args=""
@@ -195,7 +206,8 @@ run_bench() {
         --max-concurrency ${conc_args} \
         --num-warmups "${NUM_WARMUPS}" \
         --config-name "${config_name}" \
-        --result-dir "${RESULT_DIR}"
+        --result-dir "${RESULT_DIR}" \
+        --task-type "${TASK_TYPE}"
 
     stop_server
 
@@ -205,7 +217,7 @@ run_bench() {
 
 # Run vllm-omni benchmark
 if [ "${RUN_ASYNC}" = true ]; then
-    run_bench "async_chunk" "${SCRIPT_DIR}/${STAGE_CONFIG}"
+    run_bench "async_chunk"
 fi
 
 # Run HuggingFace baseline benchmark
@@ -222,7 +234,8 @@ if [ "${RUN_HF}" = true ]; then
         --num-warmups "${NUM_WARMUPS}" \
         --gpu-device "${GPU_DEVICE}" \
         --config-name "hf_transformers" \
-        --result-dir "${RESULT_DIR}"
+        --result-dir "${RESULT_DIR}" \
+        --task-type "${TASK_TYPE}"
 
     # Allow GPU memory to settle
     sleep 5

@@ -173,8 +173,6 @@ Example configuration for TP=2 on GPUs 0 and 1:
 
 | Parameter             | Value   | Description                      |
 | :-------------------- | :------ | :------------------------------- |
-| `window_size`         | `-1`    | Window size (-1 means unlimited) |
-| `max_inflight`        | `1`     | Maximum inflight requests        |
 | `shm_threshold_bytes` | `65536` | Shared memory threshold (64KB)   |
 
 ## Using Mooncake Connector
@@ -246,13 +244,6 @@ For more details on the Mooncake connector and multi-node setup, see the [Moonca
 ------
 
 ## FAQ
-
-- If you encounter an error about the backend of librosa, try to install ffmpeg with the command below.
-
-```bash
-sudo apt update
-sudo apt install ffmpeg
-```
 
 - If you don’t know how much VRAM is needed for the model or encounter the OOM error, you can try to decrease the max_model_len.
 

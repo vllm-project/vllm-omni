@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import multiprocessing as mp
 import time
 import weakref
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import zmq
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
@@ -13,6 +15,10 @@ from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import unpack_diffusion_output_shm
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker import WorkerProc
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
+    from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 logger = init_logger(__name__)
 
@@ -190,6 +196,61 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             logger.error(f"Generate call failed: {e}")
             raise
 
+    def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Adapt request-mode scheduler output to worker execute_model RPC."""
+        from vllm_omni.diffusion.worker.utils import RunnerOutput
+
+        self._ensure_open()
+        if scheduler_output.num_scheduled_reqs != 1:
+            raise ValueError(
+                f"Request mode currently supports batch_size=1, "
+                f"but got {scheduler_output.num_scheduled_reqs} scheduled requests."
+            )
+
+        new_req = scheduler_output.scheduled_new_reqs[0]
+        result = self.collective_rpc(
+            "execute_model",
+            args=(new_req.req, self.od_config),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+        if not isinstance(result, DiffusionOutput):
+            raise RuntimeError(f"Unexpected response type for execute_request: {type(result)!r}")
+
+        return RunnerOutput(
+            req_id=new_req.sched_req_id,
+            step_index=None,
+            finished=True,
+            result=result,
+        )
+
+    def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Forward step-mode scheduler output to worker execute_stepwise RPC."""
+        from vllm_omni.diffusion.worker.utils import RunnerOutput
+
+        self._ensure_open()
+        result = self.collective_rpc(
+            "execute_stepwise",
+            args=(scheduler_output,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+
+        if isinstance(result, RunnerOutput):
+            return result
+        # TODO: Remove this fallback; DiffusionOutput cannot faithfully represent
+        # failed multi-request step batches.
+        if isinstance(result, DiffusionOutput):
+            req_id = scheduler_output.scheduled_req_ids[0] if scheduler_output.scheduled_req_ids else ""
+            return RunnerOutput(
+                req_id=req_id,
+                step_index=None,
+                finished=True,
+                result=result,
+            )
+        else:
+            raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
+
     def collective_rpc(
         self,
         method: str,
@@ -197,6 +258,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         args: tuple = (),
         kwargs: dict | None = None,
         unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any:
         self._ensure_open()
 
@@ -212,7 +274,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             "args": args,
             "kwargs": kwargs,
             "output_rank": unique_reply_rank if unique_reply_rank is not None else 0,
-            "exec_all_ranks": unique_reply_rank is None,
+            "exec_all_ranks": unique_reply_rank is None or exec_all_ranks,
         }
 
         try:
@@ -227,6 +289,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 dequeue_timeout = None if deadline is None else max(0, deadline - time.monotonic())
                 try:
                     response = self._result_mq.dequeue(timeout=dequeue_timeout)
+
+                    try:
+                        unpack_diffusion_output_shm(response)
+                    except Exception as e:
+                        logger.warning("SHM unpack failed (data may already be inline): %s", e)
 
                     # Check if response indicates an error
                     if isinstance(response, dict) and response.get("status") == "error":

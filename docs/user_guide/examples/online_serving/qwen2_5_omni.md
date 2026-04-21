@@ -149,6 +149,15 @@ python openai_chat_completion_client_for_multimodal_generation.py \
 
 ## Run Local Web UI Demo
 
+!!! note "Gradio is an optional dependency"
+    The Gradio demo requires the `[demo]` extras. Install them first:
+
+    ```bash
+    pip install 'vllm-omni[demo]'
+    ```
+
+    Or, if installing from source: `pip install -e '.[demo]'`
+
 This Web UI demo allows users to interact with the model through a web browser.
 
 ### Running Gradio Demo
@@ -208,14 +217,6 @@ The gradio script supports the following arguments:
 - `--ip`: Host/IP for Gradio server (default: 127.0.0.1)
 - `--port`: Port for Gradio server (default: 7861)
 - `--share`: Share the Gradio demo publicly (creates a public link)
-
-### FAQ
-
-If you encounter error about backend of librosa, try to install ffmpeg with command below.
-```
-sudo apt update
-sudo apt install ffmpeg
-```
 
 ## Example materials
 

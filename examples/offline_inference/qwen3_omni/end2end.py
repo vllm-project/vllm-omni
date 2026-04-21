@@ -9,7 +9,6 @@ import os
 import time
 from typing import NamedTuple
 
-import librosa
 import numpy as np
 import soundfile as sf
 import vllm
@@ -19,6 +18,7 @@ from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
+from vllm.multimodal.media.audio import load_audio
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.omni import Omni
@@ -129,7 +129,7 @@ def get_audio_query(question: str = None, audio_path: str | None = None, samplin
     if audio_path:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_signal, sr = load_audio(audio_path, sr=sampling_rate)
         audio_data = (audio_signal.astype(np.float32), sr)
     else:
         audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
@@ -183,7 +183,7 @@ def get_mixed_modalities_query(
     if audio_path:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_signal, sr = load_audio(audio_path, sr=sampling_rate)
         audio_data = (audio_signal.astype(np.float32), sr)
     else:
         audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
@@ -294,14 +294,7 @@ def main(args):
     else:
         query_result = query_func()
 
-    omni = Omni(
-        model=model_name,
-        stage_configs_path=args.stage_configs_path,
-        log_stats=args.log_stats,
-        stage_init_timeout=args.stage_init_timeout,
-        init_timeout=args.init_timeout,
-        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
-    )
+    omni = Omni.from_cli_args(args, model=model_name)
 
     thinker_sampling_params = SamplingParams(
         temperature=0.9,
@@ -538,11 +531,6 @@ def parse_args():
         help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
     )
     parser.add_argument(
-        "--enable-diffusion-pipeline-profiler",
-        action="store_true",
-        help="Enable diffusion pipeline profiler to display stage durations.",
-    )
-    parser.add_argument(
         "--enable-profiler",
         action="store_true",
         default=False,
@@ -554,6 +542,12 @@ def parse_args():
         nargs="*",
         default=None,
         help="List of stage IDs to profile. If not set, profiles all stages.",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="auto",
+        help="Model dtype (auto, half, float16, bfloat16, float, float32).",
     )
 
     return parser.parse_args()

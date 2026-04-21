@@ -53,7 +53,24 @@ dev = [
     "av", # for ComfyUI tests
     "openpyxl>=3.0.0", # for nightly CI
     "pyttsx3>=2.99",
+    "opencc>=1.2.0",
     "mistune>=3.2.0", # for example tests
+    "torchmetrics>=1.4.0", # for accuracy similarity metrics
+]
+
+demo = [
+    "gradio>=6.7.0",
+]
+
+# Seed-TTS serve benchmark WER (BytedanceSpeech/seed-tts-eval run_wer.py protocol).
+seed-tts-eval = [
+    "jiwer>=3.0.0",
+    "zhon>=2.0.0",
+    "zhconv>=1.4.2",
+    "scipy>=1.10.0",
+    "soundfile>=0.12.0",
+    "transformers>=4.36.0",
+    "funasr>=1.0.0",
 ]
 
 docs = [
@@ -172,20 +189,25 @@ markers = [
     "rocm: Tests that run on AMD/ROCm (auto-added)",
     "xpu: Tests that run on XPU (auto-added)",
     "npu: Tests that run on NPU/Ascend (auto-added)",
+    "musa: Tests that run on MUSA/Moore Threads (auto-added)",
     # specified computation resources marks (auto-added)
     "H100: Tests that require H100 GPU",
     "L4: Tests that require L4 GPU",
     "MI325: Tests that require MI325 GPU (AMD/ROCm)",
+    "B60: Tests that require Intel Arc Pro B60 XPU",
+    "S5000: Tests that require S5000 GPU (Moore Threads/MUSA)",
     "A2: Tests that require A2 NPU",
     "A3: Tests that require A3 NPU",
     "distributed_cuda: Tests that require multi cards on CUDA platform",
     "distributed_rocm: Tests that require multi cards on ROCm platform",
     "distributed_xpu: Tests that require multi cards on XPU platform",
     "distributed_npu: Tests that require multi cards on NPU platform",
+    "distributed_musa: Tests that require multi cards on MUSA platform",
     "skipif_cuda: Skip if the num of CUDA cards is less than the required",
     "skipif_rocm: Skip if the num of ROCm cards is less than the required",
     "skipif_xpu: Skip if the num of XPU cards is less than the required",
     "skipif_npu: Skip if the num of NPU cards is less than the required",
+    "skipif_musa: Skip if the num of MUSA cards is less than the required",
     # more detailed markers
     "slow: Slow tests (may skip in quick CI)",
     "benchmark: Benchmark tests",
@@ -214,3 +236,5 @@ extend-ignore-identifiers-re = [
 ue = "ue"
 semantics = "semantics"
 fullset = "fullset"
+Vai = "Vai"
+CANN = "CANN"

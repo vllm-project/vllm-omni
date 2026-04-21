@@ -67,10 +67,6 @@ stage_args:
 # Runtime edges
 runtime:
   enabled: true
-  defaults:
-    window_size: -1
-    max_inflight: 1
-
   # Distributed connectors configuration (optional)
   # More connectors will be supported in the future.
   connectors:
@@ -83,4 +79,3 @@ runtime:
   edges:
     - from: 0
       to: 1
-      window_size: -1

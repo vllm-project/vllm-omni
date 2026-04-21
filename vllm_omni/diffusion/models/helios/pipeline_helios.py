@@ -9,7 +9,7 @@ import logging
 import math
 import os
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -30,6 +30,11 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.platforms import current_omni_platform
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +85,9 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     return load_json_config(model_path, subfolder, "config.json", local_files_only)
 
 
-def create_transformer_from_config(config: dict) -> HeliosTransformer3DModel:
+def create_transformer_from_config(
+    config: dict, quant_config: QuantizationConfig | None = None
+) -> HeliosTransformer3DModel:
     kwargs = {}
 
     key_map = [
@@ -112,7 +119,7 @@ def create_transformer_from_config(config: dict) -> HeliosTransformer3DModel:
                 val = tuple(val)
             kwargs[key] = val
 
-    return HeliosTransformer3DModel(**kwargs)
+    return HeliosTransformer3DModel(quant_config=quant_config, **kwargs)
 
 
 def get_helios_post_process_func(
@@ -192,7 +199,9 @@ class HeliosPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPip
         ).to(self.device)
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(transformer_config)
+        self.transformer = create_transformer_from_config(
+            transformer_config, quant_config=od_config.quantization_config
+        )
 
         # Read scheduler config to determine scheduler type
         sched_cfg = load_json_config(model, "scheduler", "scheduler_config.json", local_files_only)

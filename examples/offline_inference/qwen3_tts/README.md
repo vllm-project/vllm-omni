@@ -15,11 +15,11 @@ Please refer to the [stage configuration documentation](https://docs.vllm.ai/pro
 
 ### ROCm Dependencies
 
-You will need to install these two dependencies `onnxruntime-rocm` and `sox`.
+You will need to install the dependency `onnxruntime-rocm`.
 
 ```
 pip uninstall onnxruntime # should be removed before we can install onnxruntime-rocm
-pip install onnxruntime-rocm sox
+pip install onnxruntime-rocm
 ```
 
 ## Quick Start
@@ -104,13 +104,13 @@ completes. This demonstrates that audio data is available progressively rather t
 
 ## Batched Decoding
 
-The Code2Wav stage (stage 1) supports batched decoding, where multiple requests are decoded in a single forward pass through the SpeechTokenizer. To use it, provide a stage config with `max_num_seqs > 1` and pass multiple prompts via `--txt-prompts` with a matching `--batch-size`.
+The Code2Wav stage (stage 1) supports batched decoding, where multiple requests are decoded in a single forward pass through the SpeechTokenizer. To use it, set `max_num_seqs > 1` on both stages via `--stage-overrides` and pass multiple prompts via `--txt-prompts` with a matching `--batch-size`.
 
 ```
 python end2end.py --query-type CustomVoice \
     --txt-prompts benchmark_prompts.txt \
     --batch-size 4 \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts_batch.yaml
+    --stage-overrides '{"0":{"max_num_seqs":4,"gpu_memory_utilization":0.2},"1":{"max_num_seqs":4,"gpu_memory_utilization":0.2}}'
 ```
 
 **Important:** `--batch-size` must match a CUDA graph capture size (1, 2, 4, 8, 16...) because the Talker's code predictor KV cache is sized to `max_num_seqs`, and CUDA graphs pad the batch to the next capture size. Both stages need `max_num_seqs >= batch_size` in the stage config for batching to take effect. If only stage 1 has a higher `max_num_seqs`, it won't help — stage 1 can only batch chunks from requests that are in-flight simultaneously, which requires stage 0 to also process multiple requests concurrently.

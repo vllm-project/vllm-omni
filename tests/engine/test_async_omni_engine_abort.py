@@ -2,20 +2,21 @@ import asyncio
 import os
 import sys
 from contextlib import ExitStack
-from pathlib import Path
 
 import pytest
 from vllm import SamplingParams
 from vllm.inputs import PromptType
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 SEED = 42
 
-stage_config = str(Path(__file__).parent.parent / "e2e" / "stage_configs" / "qwen2_5_omni_thinker_ci.yaml")
+# Single-stage thinker-only deploy, materialized from tests.helpers.stage_config._CI_OVERLAYS.
+stage_config = get_deploy_config_path("ci/qwen2_5_omni_thinker_only.yaml")
 model = "Qwen/Qwen2.5-Omni-7B"
 
 

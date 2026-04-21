@@ -310,6 +310,7 @@ class FishSpeechFastAR(nn.Module):
         self._compiled_model_fwd: object | None = None
         self._compile_attempted = False
         self._compile_failed = False
+        self._disable_compile_for_graph = False
 
     def _ensure_buffers(self, bsz: int, device: torch.device, dtype: torch.dtype) -> None:
         max_seq = self._num_codebooks + 1  # hidden_state + num_codebooks codes
@@ -327,11 +328,20 @@ class FishSpeechFastAR(nn.Module):
         if self._compile_attempted:
             return
         self._compile_attempted = True
+        if self._disable_compile_for_graph:
+            try:
+                self._compiled_model_fwd = torch.compile(
+                    self.model.forward,
+                    dynamic=True,
+                    options={"epilogue_fusion": False},
+                )
+            except Exception as exc:
+                logger.warning("Fast AR torch.compile (graph mode) failed: %s", exc)
+                self._compiled_model_fwd = self.model.forward
+            return
         try:
             self._compiled_model_fwd = torch.compile(
                 self.model.forward,
-                # Keep the helper compiler separate from vLLM's outer
-                # cudagraph-managed Stage-0 execution.
                 mode="default",
                 dynamic=True,
                 fullgraph=False,
@@ -366,10 +376,10 @@ class FishSpeechFastAR(nn.Module):
 
     @torch.inference_mode()
     def _run_model(self, step_input: torch.Tensor, step_pos_ids: torch.Tensor, bsz: int) -> torch.Tensor:
-        # Default-on compile only pays off for single-request decode. For
-        # batched decode, eager preserves loaded throughput and avoids the
-        # regression seen with batch>1 compiled execution.
-        model_fwd = self._compiled_model_fwd if bsz == 1 else self.model.forward
+        if self._disable_compile_for_graph:
+            model_fwd = self._compiled_model_fwd or self.model.forward
+        else:
+            model_fwd = self._compiled_model_fwd if bsz == 1 else self.model.forward
         try:
             return model_fwd(step_input, step_pos_ids)
         except Exception as exc:

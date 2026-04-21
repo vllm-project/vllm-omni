@@ -28,8 +28,8 @@ from pathlib import Path
 import pytest
 from vllm.assets.image import ImageAsset
 
-from tests.conftest import OmniServerParams
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServerParams
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
@@ -47,7 +47,7 @@ test_params = [
     OmniServerParams(
         model=MODEL,
         stage_config_path=STAGE_CONFIGS_PATH,
-        server_args=["--stage-init-timeout", "300"],
+        stage_init_timeout=300,
     ),
 ]
 
@@ -78,7 +78,6 @@ def _build_img2img_messages(prompt: str, image_b64: str) -> list[dict]:
     ]
 
 
-@pytest.mark.skip(reason="L3 CI failed")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
@@ -90,12 +89,18 @@ def test_bagel_text2img_online(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "messages": _build_text2img_messages(TEXT2IMG_PROMPT),
         "modalities": ["image"],
+        "extra_body": {
+            "height": 512,
+            "width": 512,
+            "num_inference_steps": 2,
+            "guidance_scale": 0.0,
+            "seed": 42,
+        },
     }
 
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.skip(reason="L3 CI failed")
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
@@ -112,6 +117,11 @@ def test_bagel_img2img_online(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "messages": _build_img2img_messages(IMG2IMG_PROMPT, image_b64),
         "modalities": ["image"],
+        "extra_body": {
+            "num_inference_steps": 2,
+            "guidance_scale": 0.0,
+            "seed": 42,
+        },
     }
 
     openai_client.send_diffusion_request(request_config)

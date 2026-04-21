@@ -178,6 +178,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        help="Quantization method (e.g. 'fp8').",
+    )
 
     # Memory & parallelism
     parser.add_argument("--vae-use-slicing", action="store_true", help="Enable VAE slicing.")
@@ -213,6 +219,7 @@ def main():
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
+        quantization=args.quantization,
     )
 
     # Validate I2V / V2V arguments

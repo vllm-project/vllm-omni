@@ -13,6 +13,9 @@ import io
 
 import PIL.Image
 
+SUPPORTED_LAYERED_RESOLUTIONS = (640, 1024)
+SUPPORTED_LAYERED_LAYERS_RANGE = range(3, 11)
+
 
 def parse_size(size_str: str) -> tuple[int, int]:
     """Parse size string to width and height tuple.
@@ -63,3 +66,16 @@ def encode_image_base64(image: PIL.Image.Image) -> str:
     image.save(buffer, format="PNG")
     buffer.seek(0)
     return base64.b64encode(buffer.read()).decode("utf-8")
+
+
+def validate_layered_layers(layers: int | None) -> int | None:
+    """Validate the Qwen-Image-Layered ``layers`` parameter."""
+    if layers is None:
+        return None
+    if layers not in SUPPORTED_LAYERED_LAYERS_RANGE:
+        raise ValueError(
+            f"Invalid layers value {layers}. layers must be between "
+            f"{SUPPORTED_LAYERED_LAYERS_RANGE.start} and "
+            f"{SUPPORTED_LAYERED_LAYERS_RANGE.stop - 1} inclusive."
+        )
+    return layers

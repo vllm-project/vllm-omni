@@ -24,7 +24,6 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import OmniServer
 from tests.dfx.conftest import (
     create_benchmark_indices,
     create_test_parameter_mapping,
@@ -33,9 +32,10 @@ from tests.dfx.conftest import (
     load_configs,
 )
 from tests.dfx.perf.scripts.run_benchmark import run_benchmark
+from tests.helpers.runtime import OmniServer
 
 STABILITY_DIR = Path(__file__).resolve().parent.parent
-STAGE_CONFIGS_DIR = STABILITY_DIR / "stage_configs"
+DEPLOY_CONFIGS_DIR = STABILITY_DIR / "deploy"
 CONFIG_FILE_PATH = str(STABILITY_DIR / "tests" / "test.json")
 DEFAULT_NUM_PROMPTS_PER_BATCH = 20
 
@@ -45,7 +45,7 @@ try:
 except FileNotFoundError:
     BENCHMARK_CONFIGS = []
 
-test_params = create_unique_server_params(BENCHMARK_CONFIGS, STAGE_CONFIGS_DIR) if BENCHMARK_CONFIGS else []
+test_params = create_unique_server_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR) if BENCHMARK_CONFIGS else []
 server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS) if BENCHMARK_CONFIGS else {}
 
 _omni_server_lock = threading.Lock()
@@ -112,6 +112,8 @@ def _run_one_benchmark_batch(
             flow=flow,
             dataset_name=dataset_name,
             num_prompt=num_prompts,
+            random_input_len=params.get("random_input_len"),
+            random_output_len=params.get("random_output_len"),
         )
         return result
     except (FileNotFoundError, OSError) as e:
@@ -217,11 +219,20 @@ def omni_server(request):
     Multi-stage initialization can take 10-20+ minutes.
     """
     with _omni_server_lock:
-        test_name, model, stage_config_path = request.param
+        test_name, model, stage_config_path, stage_overrides, extra_cli_args = request.param
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
-        with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "120"]) as server:
+        server_args = ["--stage-init-timeout", "120"]
+        # --deploy-config and --stage-overrides compose at the CLI (see vllm_omni/entrypoints/utils.py):
+        # deploy-config sets the base; stage-overrides are applied on top. Both can be set.
+        if stage_config_path:
+            server_args = ["--deploy-config", stage_config_path] + server_args
+        if stage_overrides:
+            server_args = ["--stage-overrides", stage_overrides] + server_args
+        if extra_cli_args:
+            server_args = list(extra_cli_args) + server_args
+        with OmniServer(model, server_args) as server:
             server.test_name = test_name
             print("OmniServer started successfully")
             yield server

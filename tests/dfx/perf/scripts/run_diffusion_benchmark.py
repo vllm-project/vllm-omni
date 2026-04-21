@@ -1,21 +1,15 @@
 """
 Performance benchmark CI runner for diffusion models.
 
-Supports two server backends:
+Supports vLLM-Omni server backend:
   - vllm-omni (default): starts DiffusionServer via vllm_omni.entrypoints.cli.main,
     benchmarks with diffusion_benchmark_serving.py --backend vllm-omni
-  - sglang: starts SglangServer via `sglang serve`,
-    benchmarks with diffusion_benchmark_serving.py --backend sglang
 
-A config JSON file is REQUIRED via --config-file:
-  pytest run_diffusion_benchmark.py --config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
-  pytest run_diffusion_benchmark.py --config-file tests/dfx/perf/tests/test_qwen_image_sglang_diffusion.json
+A config JSON file is REQUIRED via --test-config-file:
+  pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
 
-JSON config entries are distinguished by a "server_type" field ("vllm-omni" or "sglang").
-sglang entries support two additional fields under server_params:
-  - "env": dict of extra environment variables (e.g. SGLANG_CACHE_DIT_ENABLED)
-  - "cache_dit_config": dict written to a temp YAML and passed as
-    --cache-dit-config to sglang serve (requires cache-dit == 1.3.0)
+JSON config entries use a "server_type" field, and this runner executes
+the vllm-omni path.
 
 All benchmark results for a session are consolidated into a single JSON file under
 BENCHMARK_RESULT_DIR (override via the DIFFUSION_BENCHMARK_DIR environment variable).
@@ -23,7 +17,6 @@ Each entry in the file contains the test metadata (test_name, backend, benchmark
 timestamp) together with the raw metrics returned by the benchmark script.
 """
 
-import importlib.metadata
 import json
 import os
 import socket
@@ -34,13 +27,14 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import psutil
 import pytest
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
+os.environ.setdefault("DIFFUSION_ATTENTION_BACKEND", "FLASH_ATTN")
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -57,19 +51,21 @@ BENCHMARK_SCRIPT = str(
 # Populated lazily after CONFIG_FILE_PATH is resolved.
 _SESSION_TIMESTAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 _RESULT_LOCK = threading.Lock()
+_BRANCHPOINT_COMMIT_SHA: str | None = None
+DIFFUSION_RESULT_TEMPLATE_PATH = Path(__file__).parent / "diffusion_result_template.json"
 
 
 def _get_config_file_from_argv() -> str | None:
-    """Read --config-file from sys.argv at import time so pytest parametrize can use it.
+    """Read --test-config-file from sys.argv at import time so pytest parametrize can use it.
 
     pytest_addoption (below) registers the same flag so pytest does not reject it.
-    Supports both ``--config-file path`` and ``--config-file=path`` forms.
+    Supports both ``--test-config-file path`` and ``--test-config-file=path`` forms.
     Returns None if the flag is not present; callers must handle the missing case.
     """
     for i, arg in enumerate(sys.argv):
-        if arg == "--config-file" and i + 1 < len(sys.argv):
+        if arg == "--test-config-file" and i + 1 < len(sys.argv):
             return sys.argv[i + 1]
-        if arg.startswith("--config-file="):
+        if arg.startswith("--test-config-file="):
             return arg.split("=", 1)[1]
     return None
 
@@ -117,7 +113,7 @@ def load_configs(config_path: str) -> list[dict[str, Any]]:
 BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
 
 _config_stem = Path(CONFIG_FILE_PATH).stem  # e.g. "test_qwen_image_vllm_omni"
-AGGREGATED_RESULT_FILE = BENCHMARK_RESULT_DIR / f"benchmark_results_{_config_stem}_{_SESSION_TIMESTAMP}.json"
+AGGREGATED_RESULT_FILE = BENCHMARK_RESULT_DIR / f"diffusion_result_{_config_stem}_{_SESSION_TIMESTAMP}.json"
 
 
 def _append_to_aggregated_file(record: dict[str, Any]) -> None:
@@ -136,19 +132,6 @@ def _append_to_aggregated_file(record: dict[str, Any]) -> None:
         records.append(record)
         with open(AGGREGATED_RESULT_FILE, "w", encoding="utf-8") as f:
             json.dump(records, f, indent=2, ensure_ascii=False)
-
-
-# Register --config-file with pytest so it does not reject the argument.
-def pytest_addoption(parser: pytest.Parser) -> None:
-    parser.addoption(
-        "--config-file",
-        action="store",
-        default=None,
-        help=(
-            "Path to the benchmark config JSON file (required). "
-            "Example: --config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json"
-        ),
-    )
 
 
 _server_lock = threading.Lock()
@@ -239,13 +222,13 @@ class DiffusionServer:
 
     def __init__(
         self,
-        model: str,
-        serve_args: list[str],
+        server_cfg: dict[str, Any],
         *,
         port: int | None = None,
     ) -> None:
-        self.model = model
-        self.serve_args = serve_args
+        self.server_cfg: dict[str, Any] = server_cfg
+        self.model = server_cfg["model"]
+        self.serve_args = server_cfg["serve_args"]
         self.host = "127.0.0.1"
         self.port = port if port is not None else _get_open_port()
         self.proc: subprocess.Popen | None = None
@@ -286,151 +269,113 @@ class DiffusionServer:
             _kill_process_tree(self.proc.pid)
 
 
-_CACHE_DIT_REQUIRED_VERSION = os.environ.get("CACHE_DIT_VERSION", "1.3.0")
-
-
-def _check_cache_dit_version(required: str = _CACHE_DIT_REQUIRED_VERSION) -> None:
-    """Verify that the installed cache-dit package matches *required* exactly.
-
-    Raises RuntimeError if the package is not installed or the version differs.
-    """
-    try:
-        installed = importlib.metadata.version("cache-dit")
-    except importlib.metadata.PackageNotFoundError:
-        raise RuntimeError(
-            f"cache-dit is not installed. Please install version {required}: pip install cache-dit=={required}"
-        )
-    if installed != required:
-        raise RuntimeError(
-            f"cache-dit version mismatch: required {required}, "
-            f"but found {installed}. "
-            f"Please install the correct version: pip install cache-dit=={required}"
-        )
-
-
-class SglangServer:
-    """Start a sglang serve process for diffusion benchmarking.
-
-    Supports two Cache-DiT activation modes:
-      1. Environment variable:  pass env={"SGLANG_CACHE_DIT_ENABLED": "true"}
-      2. YAML config file:      pass cache_dit_config={...} (written to a temp
-         file and forwarded as --cache-dit-config; requires cache-dit >= 1.3.0)
-    """
-
-    server_type = "sglang"
-
-    def __init__(
-        self,
-        model: str,
-        serve_args: list[str],
-        *,
-        port: int | None = None,
-        env_overrides: dict[str, str] | None = None,
-        cache_dit_config: dict[str, Any] | None = None,
-    ) -> None:
-        self.model = model
-        self.serve_args = serve_args
-        self.host = "127.0.0.1"
-        self.port = port if port is not None else _get_open_port()
-        self.env_overrides = env_overrides or {}
-        self.cache_dit_config = cache_dit_config
-        self.proc: subprocess.Popen | None = None
-        self._tmp_yaml: str | None = None
-        self.test_name: str = ""
-        if self.cache_dit_config is not None:
-            _check_cache_dit_version()
-
-    @staticmethod
-    def _write_cache_dit_yaml(config: dict[str, Any]) -> str:
-        """Serialize config dict to a temp YAML file and return its path.
-
-        Tries PyYAML first for clean block-style output; falls back to
-        json.dump since JSON is valid YAML and correctly handles arbitrary
-        nesting, lists, booleans, and null values.
-        """
-        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
-        try:
-            import yaml  # PyYAML
-
-            yaml.dump(config, tmp, default_flow_style=False, allow_unicode=True)
-        except ImportError:
-            json.dump(config, tmp, indent=2, ensure_ascii=False)
-            tmp.write("\n")
-        tmp.close()
-        print(f"  Cache-DiT config written to: {tmp.name}")
-        return tmp.name
-
-    def _start_server(self) -> None:
-        env = os.environ.copy()
-        env.update(self.env_overrides)
-
-        cmd = [
-            "sglang",
-            "serve",
-            "--model-path",
-            self.model,
-            "--host",
-            self.host,
-            "--port",
-            str(self.port),
-        ] + self.serve_args
-
-        if self.cache_dit_config is not None:
-            self._tmp_yaml = self._write_cache_dit_yaml(self.cache_dit_config)
-            cmd += ["--cache-dit-config", self._tmp_yaml]
-
-        print(f"Launching SglangServer: {' '.join(cmd)}")
-        if self.env_overrides:
-            print(f"  Extra env: {self.env_overrides}")
-
-        self.proc = subprocess.Popen(
-            cmd,
-            env=env,
-            cwd=str(Path(__file__).parent.parent.parent.parent),
-        )
-        _wait_for_port(self.host, self.port)
-        print(f"SglangServer ready on {self.host}:{self.port}")
-
-    def __enter__(self):
-        self._start_server()
-        return self
-
-    def __exit__(self, *_):
-        if self.proc:
-            _kill_process_tree(self.proc.pid)
-        if self._tmp_yaml:
-            try:
-                Path(self._tmp_yaml).unlink(missing_ok=True)
-            except Exception:
-                pass
-
-
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
 
 
-def _build_serve_args(serve_args_dict: dict[str, Any], server_type: str = "vllm-omni") -> list[str]:
-    """Convert a serve_args dict from test.json into a flat CLI argument list.
-
-    Boolean handling differs by server type:
-    - vllm-omni uses store_true/store_false style: True → add flag only,
-      False → omit flag entirely.
-    - sglang accepts explicit boolean values: always emit ``--flag true/false``.
-    """
+def _build_serve_args(serve_args_dict: dict[str, Any]) -> list[str]:
+    """Convert a serve_args dict from test.json into a flat CLI argument list."""
     args: list[str] = []
     for key, value in serve_args_dict.items():
         flag = f"--{key}"
         if isinstance(value, bool):
-            if server_type == "sglang":
-                args.extend([flag, str(value).lower()])
-            elif value:
+            if value:
                 args.append(flag)
         elif isinstance(value, dict):
             args.extend([flag, json.dumps(value, separators=(",", ":"))])
         else:
             args.extend([flag, str(value)])
     return args
+
+
+def _get_branchpoint_commit_sha() -> str:
+    """Return the branch-point commit SHA against main.
+
+    Uses git command: ``git merge-base HEAD origin/main``.
+    """
+    global _BRANCHPOINT_COMMIT_SHA
+    if _BRANCHPOINT_COMMIT_SHA is not None:
+        return _BRANCHPOINT_COMMIT_SHA
+
+    repo_root = Path(__file__).parent.parent.parent.parent
+    try:
+        sha = (
+            subprocess.check_output(
+                ["git", "merge-base", "HEAD", "origin/main"],
+                cwd=str(repo_root),
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            .strip()
+            .splitlines()[0]
+        )
+        _BRANCHPOINT_COMMIT_SHA = sha
+    except Exception as e:
+        print(f"Warning: failed to get branch-point commit SHA: {e}")
+        _BRANCHPOINT_COMMIT_SHA = ""
+    return _BRANCHPOINT_COMMIT_SHA
+
+
+def _to_resolution_string(params: dict[str, Any]) -> str:
+    width = params.get("width", "unknown width")
+    height = params.get("height", "unknown height")
+    return f"{width}x{height}"
+
+
+def _to_parallelism_string(framework: str, serve_args_dict: dict[str, Any]) -> str:
+    parts: list[str] = []
+    if framework == "vllm-omni":
+        keys = [
+            "num-gpus",
+            "usp",
+            "ulysses-degree",
+            "ring",
+            "ring-degree",
+            "cfg-parallel-size",
+            "vae-patch-parallel-size",
+            "vae-use-tiling",
+            "tensor-parallel-size",
+        ]
+        for key in keys:
+            if key in serve_args_dict:
+                parts.append(f"{key}={serve_args_dict[key]}")
+    return ",".join(parts) if parts else "none"
+
+
+def _to_cache_string(framework: str, serve_args_dict: dict[str, Any]) -> str:
+    if framework == "vllm-omni":
+        if "cache-backend" in serve_args_dict:
+            return str(serve_args_dict["cache-backend"])
+    return "disabled"
+
+
+def _to_offload_string(framework: str, serve_args_dict: dict[str, Any]) -> str:
+    selected: list[str] = []
+    if framework == "vllm-omni":
+        offload_keys = [
+            "enable-cpu-offload",
+            "enable-layerwise-offload",
+        ]
+        for key in offload_keys:
+            if key in serve_args_dict:
+                selected.append(key)
+    return f"enabled({';'.join(selected)})" if selected else "disabled"
+
+
+def _to_compile_value(framework: str, serve_args_dict: dict[str, Any]) -> str:
+    if framework == "vllm-omni":
+        if "enforce-eager" in serve_args_dict:
+            return "disabled"
+        return "enabled"
+    return "disabled"
+
+
+def _to_quantization_value(framework: str, serve_args_dict: dict[str, Any]) -> str:
+    if framework == "vllm-omni":
+        quant = serve_args_dict.get("quantization")
+        return str(quant) if quant else "disabled"
+    return "disabled"
 
 
 def _unique_server_params(configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -442,16 +387,18 @@ def _unique_server_params(configs: list[dict[str, Any]]) -> list[dict[str, Any]]
         if test_name in seen:
             continue
         seen.add(test_name)
-        server_type = cfg.get("server_type", "vllm-omni")
+        if cfg.get("server_type", "vllm-omni") != "vllm-omni":
+            raise ValueError(f"Unsupported server_type in config: {cfg.get('server_type')}")
+        serve_args_dict = cfg["server_params"].get("serve_args", {})
         result.append(
             {
                 "test_name": test_name,
-                "server_type": server_type,
+                "server_type": "vllm-omni",
                 "model": cfg["server_params"]["model"],
-                "serve_args": _build_serve_args(cfg["server_params"].get("serve_args", {}), server_type),
-                "env_overrides": cfg["server_params"].get("env", {}),
-                "cache_dit_config": cfg["server_params"].get("cache_dit_config"),
-                "benchmark_backend": server_type,  # "vllm-omni" or "sglang"
+                "serve_args_dict": serve_args_dict,
+                "serve_args": _build_serve_args(serve_args_dict),
+                "benchmark_backend": "vllm-omni",
+                "server_params": cfg["server_params"],
             }
         )
     return result
@@ -466,18 +413,9 @@ def _test_param_mapping(configs: list[dict[str, Any]]) -> dict[str, list[dict]]:
     return mapping
 
 
-def _make_server(server_cfg: dict[str, Any]) -> DiffusionServer | SglangServer:
-    """Factory: return the appropriate server instance for the given config."""
-    model = server_cfg["model"]
-    serve_args = server_cfg["serve_args"]
-    if server_cfg["server_type"] == "sglang":
-        return SglangServer(
-            model=model,
-            serve_args=serve_args,
-            env_overrides=server_cfg.get("env_overrides", {}),
-            cache_dit_config=server_cfg.get("cache_dit_config"),
-        )
-    return DiffusionServer(model=model, serve_args=serve_args)
+def _make_server(server_cfg: dict[str, Any]) -> DiffusionServer:
+    """Factory: return a vLLM-Omni diffusion server instance for the config."""
+    return DiffusionServer(server_cfg=server_cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +434,7 @@ benchmark_indices: list[int] = list(range(max(len(v) for v in test_param_map.val
 
 @pytest.fixture(scope="module")
 def diffusion_server(request):
-    """Start one server (vllm-omni or sglang) per unique test configuration."""
+    """Start one vLLM-Omni server per unique test configuration."""
     with _server_lock:
         server_cfg: dict[str, Any] = request.param
         test_name = server_cfg["test_name"]
@@ -542,15 +480,18 @@ def run_benchmark(
     params: dict[str, Any],
     test_name: str,
     backend: str = "vllm-omni",
+    server_cfg: dict[str, Any] | None = None,
+    source_file: str = "",
 ) -> dict[str, Any]:
     """Run diffusion_benchmark_serving.py as a subprocess and return parsed metrics.
 
     The raw metrics are written to a temporary file by the subprocess.  After
     the run completes the metrics are merged with full metadata (test_name,
-    backend, benchmark_params, timestamp) and appended to the session-wide
-    aggregated JSON file (AGGREGATED_RESULT_FILE).  The temporary file is
-    removed afterwards.  Subprocess stdout/stderr are tee'd to a .log file
-    under BENCHMARK_RESULT_DIR/logs/; its path is stored in the record.
+    backend, benchmark_params, timestamp, flat reporting fields) and appended
+    to the session-wide aggregated JSON file (AGGREGATED_RESULT_FILE).  The
+    temporary file is removed afterwards.  Subprocess stdout/stderr are tee'd
+    to a .log file under BENCHMARK_RESULT_DIR/logs/; its path is stored in
+    the record.
     """
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -623,10 +564,17 @@ def run_benchmark(
 
     if process.returncode != 0:
         tmp_result_file.unlink(missing_ok=True)
-        raise RuntimeError(f"Benchmark script exited with code {process.returncode}")
+        print(f"ERROR:Benchmark script exited with code {process.returncode}")
 
     if not tmp_result_file.exists():
-        raise FileNotFoundError(f"Benchmark result file not found: {tmp_result_file}")
+        with open(DIFFUSION_RESULT_TEMPLATE_PATH, encoding="utf-8") as f:
+            template_payload = json.load(f)
+        # Template schema is fixed and owned by this repo:
+        # ``diffusion_result_template.json`` is a one-item list and metrics live at [0]["result"].
+        template_metrics: dict[str, Any] = template_payload[0]["result"]
+        with open(tmp_result_file, "w", encoding="utf-8") as f:
+            json.dump(template_metrics, f, ensure_ascii=False, indent=2)
+        print(f"Benchmark result file not generated, fallback to template: {tmp_result_file}")
 
     try:
         with open(tmp_result_file, encoding="utf-8") as f:
@@ -634,13 +582,55 @@ def run_benchmark(
     finally:
         tmp_result_file.unlink(missing_ok=True)
 
+    server_cfg = server_cfg or {}
+    serve_args_dict = server_cfg.get("serve_args_dict", {})
+    if not isinstance(serve_args_dict, dict):
+        serve_args_dict = {}
+
+    completed = metrics.get("completed_requests", metrics.get("completed", 0))
+    failed = metrics.get("failed_requests", metrics.get("failed", 0))
+
     record: dict[str, Any] = {
         "test_name": test_name,
         "backend": backend,
         "timestamp": timestamp,
+        "server_params": server_cfg.get("server_params"),
         "benchmark_params": params,
         "result": metrics,
         "log_file": str(log_file),
+        "Model": model,
+        "Framework": backend,
+        "Hardware": "",
+        "Deployment": "",
+        "Task": params.get("task", "t2i"),
+        "Dataset": params.get("dataset", "random"),
+        "resolution": _to_resolution_string(params),
+        "Parallelism": _to_parallelism_string(backend, serve_args_dict),
+        "max_concurrency": params.get("max-concurrency", ""),
+        "Cache": _to_cache_string(backend, serve_args_dict),
+        "Quantization": _to_quantization_value(backend, serve_args_dict),
+        "offload": _to_offload_string(backend, serve_args_dict),
+        "compile": _to_compile_value(backend, serve_args_dict),
+        "Attn_backend": os.environ.get("DIFFUSION_ATTENTION_BACKEND", ""),
+        "num_inference_steps": params.get("num-inference-steps", ""),
+        "completed": completed,
+        "failed": failed,
+        "throughput_qps": metrics.get("throughput_qps"),
+        "latency_mean": metrics.get("latency_mean"),
+        "latency_median": metrics.get("latency_median"),
+        "latency_p99": metrics.get("latency_p99"),
+        "latency_p95": metrics.get("latency_p95"),
+        "latency_p50": metrics.get("latency_p50"),
+        "peak_memory_mb_max": metrics.get("peak_memory_mb_max"),
+        "peak_memory_mb_mean": metrics.get("peak_memory_mb_mean"),
+        "peak_memory_mb_median": metrics.get("peak_memory_mb_median"),
+        "stage_durations_mean": metrics.get("stage_durations_mean"),
+        "stage_durations_p50": metrics.get("stage_durations_p50"),
+        "stage_durations_p99": metrics.get("stage_durations_p99"),
+        "commit_sha": _get_branchpoint_commit_sha(),
+        "build_id": os.environ.get("BUILDKITE_BUILD_ID", ""),
+        "build_url": os.environ.get("BUILDKITE_BUILD_URL", ""),
+        "source_file": source_file,
     }
     _append_to_aggregated_file(record)
     print(f"\n  Result appended to: {AGGREGATED_RESULT_FILE}")
@@ -694,7 +684,7 @@ def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
     """
     test_name = benchmark_params["test_name"]
     params = benchmark_params["params"]
-    backend = diffusion_server.server_type  # "vllm-omni" or "sglang"
+    backend = diffusion_server.server_type  # "vllm-omni"
 
     result = run_benchmark(
         host=diffusion_server.host,
@@ -703,6 +693,8 @@ def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
         params=params,
         test_name=test_name,
         backend=backend,
+        server_cfg=getattr(diffusion_server, "server_cfg", {}),
+        source_file=cast(str, CONFIG_FILE_PATH),
     )
 
     print(f"\n{'=' * 60}")

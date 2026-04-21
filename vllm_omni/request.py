@@ -1,8 +1,11 @@
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
+from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.sampling_params import SamplingParams
 from vllm.v1.request import Request
 
 if TYPE_CHECKING:
@@ -91,4 +94,35 @@ class OmniRequest(Request):
             additional_information=request.additional_information,
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
+        )
+
+
+@dataclass
+class OmniStreamingUpdate:
+    """
+    Override: add additional information
+    Lightweight data for streaming session continuation.
+
+    Contains only the fields needed to update an existing streaming session
+    with new input data.
+    """
+
+    mm_features: list[MultiModalFeatureSpec] | None
+    prompt_token_ids: list[int] | None
+    max_tokens: int
+    arrival_time: float
+    sampling_params: SamplingParams | None
+    additional_information: AdditionalInformationPayload | None = None
+
+    @classmethod
+    def from_request(cls, request: "Request") -> "OmniStreamingUpdate | None":
+        if not request.resumable:
+            return None
+        return cls(
+            mm_features=request.mm_features,
+            prompt_token_ids=request.prompt_token_ids,
+            max_tokens=request.max_tokens,
+            arrival_time=request.arrival_time,
+            sampling_params=request.sampling_params,
+            additional_information=request.additional_information,
         )

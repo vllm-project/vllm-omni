@@ -326,8 +326,40 @@ for prompt in tqdm(prompts, desc="Collecting data"):
 
 # Estimate coefficients
 coeffs = estimator.estimate(poly_order=4)
-print(f"Estimated coefficients: {coeffs.tolist()}")
+print(f"Estimated coefficients: {coeffs}")
 ```
+
+Note: some models may require the vLLM context and config to be initialized to initialize vLLM modules. To this end, you may need a workaround like the following to be able to run coefficient estimation.
+```python
+from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.distributed.parallel_state import (
+    init_distributed_environment,
+    initialize_model_parallel,
+)
+from vllm.config import VllmConfig
+...
+
+if __name__ == "__main__":
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "8192"
+    os.environ["LOCAL_RANK"] = "0"
+    os.environ["RANK"] = "0"
+    os.environ["WORLD_SIZE"] = "1"
+
+    vllm_config = VllmConfig()
+    init_distributed_environment()
+    initialize_model_parallel()
+
+    # NOTE: you may have to pass an initialized OmniDiffusionConfig as a kwarg
+    # here to make current sp checks happy; if this is the case, just create one
+    # .from_kwargs() with the model name to get around this check for now,
+    # since your estimator subclass should handle the actual model configuration.
+    #
+    # This will be cleaned up in the future
+    with set_forward_context(vllm_config):
+        <create the estimator + run estimation here>
+```
+
 
 **Data Statistics Guide:**
 
@@ -369,7 +401,7 @@ images = omni.generate(
 2. **Compare performance** - Measure speedup vs baseline (expect 1.5x-2.0x)
 3. **Verify output quality** - Visually compare cached vs uncached outputs (should be nearly identical)
 
-See more detailed examples in [user guide for teacache](../../user_guide/diffusion/teacache.md).
+See more detailed examples in [user guide for teacache](../../user_guide/diffusion/cache_acceleration/teacache.md).
 
 ---
 

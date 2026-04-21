@@ -28,7 +28,7 @@ and can be placed on different devices. Qwen3-TTS has two stages:
 
 Each stage is a separate model class configured independently via YAML. The two stages
 are connected by the `async_chunk` framework, which enables inter-stage streaming for
-low first-packet latency (see [Async Chunk Design](../../design/feature/async_chunk_design.md)).
+low first-packet latency (see [Async Chunk Design](../../design/feature/async_chunk.md)).
 
 ### Without async_chunk (batch mode)
 
@@ -120,8 +120,18 @@ vllm_omni/model_executor/stage_configs/
 | `models/qwen3_tts/qwen3_tts.py` | Unified model class |
 | `models/qwen3_tts/qwen3_tts_code_predictor_vllm.py` | Stage 0 - optimized AR |
 | `models/qwen3_tts/qwen3_tts_code2wav.py` | Stage 1 - decoder |
-| `stage_configs/qwen3_tts.yaml` | Stage config (async_chunk enabled) |
-| `stage_configs/qwen3_tts_batch.yaml` | Batch mode config |
+| `deploy/qwen3_tts.yaml` (new schema) | Deploy config (async_chunk enabled) — paired with `models/qwen3_tts/pipeline.py` for the frozen topology |
+
+> **Chunked vs end-to-end modes**: `qwen3_tts` registers a single
+> pipeline whose stage 1 declares alternate processor functions — an
+> `async_chunk_process_next_stage_input_func` (per-chunk streaming, used
+> when `deploy.async_chunk=True`) and a `sync_process_input_func`
+> (batch-end, used when `deploy.async_chunk=False`). The loader selects
+> one at merge time based on the bool, so `--no-async-chunk` alone
+> switches modes — no variant yaml or variant pipeline registration is
+> needed. Pipelines that only make sense in one mode (e.g.
+> `qwen3_omni_moe` is always chunked) can keep using the unconditional
+> `custom_process_*` fields.
 | `stage_input_processors/qwen3_tts.py` | Stage transition processors |
 
 ## Step-by-Step Implementation
@@ -574,11 +584,12 @@ Adding a TTS model to vLLM-Omni involves:
 | `models/qwen3_tts/qwen3_tts.py` | Unified model class |
 | `models/qwen3_tts/qwen3_tts_code_predictor_vllm.py` | AR stage with vLLM fused ops |
 | `models/qwen3_tts/qwen3_tts_code2wav.py` | Decoder stage with `chunked_decode_streaming()` |
-| `stage_configs/qwen3_tts.yaml` | Stage configuration |
+| `models/qwen3_tts/pipeline.py` | Frozen pipeline topology (registered at import time) |
+| `deploy/qwen3_tts.yaml` | Deploy config (user-editable, async_chunk + SharedMemoryConnector) |
 | `stage_input_processors/qwen3_tts.py` | Stage transition processors |
 
 For more information, see:
 
 - [Architecture Overview](../../design/architecture_overview.md)
-- [Async Chunk Design](../../design/feature/async_chunk_design.md)
+- [Async Chunk Design](../../design/feature/async_chunk.md)
 - [Stage Configuration Guide](../../configuration/stage_configs.md)

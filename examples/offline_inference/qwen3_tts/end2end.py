@@ -366,13 +366,7 @@ def main(args):
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    omni = Omni(
-        model=model_name,
-        stage_configs_path=args.stage_configs_path,
-        log_stats=args.log_stats,
-        stage_init_timeout=args.stage_init_timeout,
-        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
-    )
+    omni = Omni.from_cli_args(args, model=model_name)
 
     batch_size = args.batch_size
     for batch_start in range(0, len(inputs), batch_size):
@@ -388,13 +382,7 @@ async def main_streaming(args):
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    omni = AsyncOmni(
-        model=model_name,
-        stage_configs_path=args.stage_configs_path,
-        log_stats=args.log_stats,
-        stage_init_timeout=args.stage_init_timeout,
-        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
-    )
+    omni = AsyncOmni.from_cli_args(args, model=model_name)
 
     for i, prompt in enumerate(inputs):
         request_id = str(i)
@@ -534,11 +522,6 @@ def parse_args():
         type=int,
         default=1,
         help="Number of prompts per batch (default: 1, sequential).",
-    )
-    parser.add_argument(
-        "--enable-diffusion-pipeline-profiler",
-        action="store_true",
-        help="Enable diffusion pipeline profiler to display stage durations.",
     )
 
     return parser.parse_args()
