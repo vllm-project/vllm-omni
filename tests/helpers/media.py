@@ -544,7 +544,12 @@ def cosine_similarity_text(text1, text2, n: int = 3):
     norm2 = sum(b * b for b in vec2) ** 0.5
     if norm1 == 0 or norm2 == 0:
         return 0.0
-    return dot_product / (norm1 * norm2)
+    cosine = dot_product / (norm1 * norm2)
+    # Down-weight when lengths differ: repeated/hallucinated transcripts stay
+    # high in bag-of-ngrams cosine (e.g. ABCABCABC vs ABC) but should score low.
+    len1, len2 = len(text1), len(text2)
+    length_harmony = (2.0 * min(len1, len2)) / (len1 + len2)
+    return cosine * length_harmony
 
 
 def _merge_base64_audio_to_segment(base64_list: list[str]):
