@@ -360,6 +360,46 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
+  - label: "Omni Sleep Mode Test with H100"
+    timeout_in_minutes: 30
+    depends_on: upload-merge-pipeline
+    commands:
+      - export VLLM_TEST_CLEAN_GPU_MEMORY="1"
+      - pytest -s -v tests/e2e/offline_inference/test_omni_sleep_mode.py -m "advanced_model and H100 and omni" --run-level "advanced_model"
+    agents:
+      queue: "mithril-h100-pool"
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                resources:
+                  limits:
+                    nvidia.com/gpu: 2
+                volumeMounts:
+                  - name: devshm
+                    mountPath: /dev/shm
+                  - name: hf-cache
+                    mountPath: /root/.cache/huggingface
+                env:
+                  - name: HF_HOME
+                    value: /root/.cache/huggingface
+                  - name: HF_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: hf-token-secret
+                        key: token
+            nodeSelector:
+              node.kubernetes.io/instance-type: gpu-h100-sxm
+            volumes:
+              - name: devshm
+                emptyDir:
+                  medium: Memory
+              - name: hf-cache
+                hostPath:
+                  path: /mnt/hf-cache
+                  type: DirectoryOrCreate
+
   - label: "Voxtral-TTS E2E Test"
     timeout_in_minutes: 20
     depends_on: upload-merge-pipeline
