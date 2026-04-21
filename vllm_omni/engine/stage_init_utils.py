@@ -660,16 +660,32 @@ def get_stage_connector_spec(
     stage_id: int,
     async_chunk: bool,
 ) -> dict[str, Any]:
-    """Return the first connector spec for the stage when async chunking is enabled."""
-    from vllm_omni.distributed.omni_connectors import get_stage_connector_config
+    """Return the primary connector spec for async-chunk stage-local tuning.
+
+    Async stage-local model behavior often needs the connector that carries the
+    stage's *output* stream (for example the talker stage reading codec-streaming
+    knobs from its edge to code2wav). Align this selection with
+    ``resolve_omni_kv_config_for_stage`` by preferring outgoing edges and
+    falling back to incoming edges when the stage has no downstream consumer.
+    """
+    from vllm_omni.distributed.omni_connectors.utils.initialization import (
+        resolve_omni_kv_config_for_stage,
+    )
 
     if not async_chunk:
         return {}
 
-    stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
-    for cfg in stage_connectors_cfg.values():
-        return dict(cfg.get("spec", {}))
-    return {}
+    omni_conn_cfg, _omni_from, _omni_to = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
+    if not omni_conn_cfg:
+        return {}
+
+    connector_cfg = dict(omni_conn_cfg)
+    connector_name = connector_cfg.pop("type", "SharedMemoryConnector")
+    connector_cfg.pop("role", None)
+    return {
+        "name": connector_name,
+        "extra": connector_cfg,
+    }
 
 
 def build_diffusion_config(

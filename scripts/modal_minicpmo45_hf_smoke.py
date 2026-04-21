@@ -18,6 +18,7 @@ from __future__ import annotations
 import inspect
 import io
 import json
+import hashlib
 import uuid
 from pathlib import Path
 from typing import Any, Final
@@ -142,6 +143,63 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write("\n")
 
 
+def _summarize_tensor(tensor: Any) -> dict[str, Any]:
+    import torch
+
+    tensor_cpu = torch.as_tensor(tensor).detach().cpu().contiguous()
+    tensor_buffer = io.BytesIO()
+    torch.save(tensor_cpu, tensor_buffer)
+    summary: dict[str, Any] = {
+        "shape": list(tensor_cpu.shape),
+        "dtype": str(tensor_cpu.dtype),
+        "numel": int(tensor_cpu.numel()),
+        "sha256": hashlib.sha256(tensor_buffer.getvalue()).hexdigest(),
+    }
+    if tensor_cpu.numel() == 0:
+        return summary
+
+    if tensor_cpu.is_floating_point():
+        values = tensor_cpu.to(torch.float32)
+        summary.update(
+            {
+                "mean": float(values.mean().item()),
+                "std": float(values.std(unbiased=False).item()),
+                "min": float(values.min().item()),
+                "max": float(values.max().item()),
+                "l2_norm": float(torch.linalg.vector_norm(values).item()),
+            }
+        )
+    else:
+        summary.update(
+            {
+                "min": int(tensor_cpu.min().item()),
+                "max": int(tensor_cpu.max().item()),
+            }
+        )
+
+    return summary
+
+
+def _write_tensor_dump(path: Path, tensor: Any) -> dict[str, Any]:
+    import torch
+
+    tensor_cpu = torch.as_tensor(tensor).detach().cpu().contiguous()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(tensor_cpu, path)
+    summary = _summarize_tensor(tensor_cpu)
+    _write_json(path.with_suffix(".summary.json"), summary)
+    return summary
+
+
+def _relative_to_root(path: Path, root: Path | None) -> str:
+    if root is None:
+        return str(path)
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
 def _call_with_supported_kwargs(func: Any, /, **kwargs: Any) -> Any:
     try:
         signature = inspect.signature(func)
@@ -189,6 +247,38 @@ def _coerce_token_chunk(chunk: Any) -> list[int]:
         token_np = np.asarray(chunk)
     token_np = np.asarray(token_np).reshape(-1)
     return [int(token) for token in token_np.tolist()]
+
+
+def _load_local_blob(path_str: str) -> bytes:
+    path = Path(path_str).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Tensor file not found: {path}")
+    return path.read_bytes()
+
+
+def _topk_logits_summary(logits: Any, probs: Any, k: int = 8) -> list[dict[str, Any]]:
+    import torch
+
+    logits_tensor = torch.as_tensor(logits)
+    probs_tensor = torch.as_tensor(probs)
+    if logits_tensor.ndim != 2 or probs_tensor.ndim != 2 or logits_tensor.shape != probs_tensor.shape:
+        return []
+    vocab_size = int(logits_tensor.shape[-1])
+    if vocab_size <= 0:
+        return []
+    k = max(1, min(int(k), vocab_size))
+    top_vals, top_ids = torch.topk(logits_tensor, k=k, dim=-1)
+    top_probs = probs_tensor.gather(-1, top_ids)
+    rows: list[dict[str, Any]] = []
+    for token_id, logit_val, prob_val in zip(top_ids[0], top_vals[0], top_probs[0], strict=False):
+        rows.append(
+            {
+                "token_id": int(token_id.item()),
+                "logit": float(logit_val.item()),
+                "prob": float(prob_val.item()),
+            }
+        )
+    return rows
 
 
 def _best_effort_prompt_token_ids(snapshot_path: str, msgs: list[dict[str, Any]]) -> list[int] | None:
@@ -337,6 +427,7 @@ def _inspect_streaming_trace_targets(model: Any) -> tuple[type[Any] | None, type
 def _install_streaming_trace_hooks(
     model: Any,
     *,
+    artifact_dir: Path | None,
     tokenizer: Any | None,
     thinker_rows: list[dict[str, Any]],
     talker_rows: list[dict[str, Any]],
@@ -355,6 +446,8 @@ def _install_streaming_trace_hooks(
         "chunk_index": 0,
         "condition_index": 0,
     }
+    thinker_tensor_root = artifact_dir / "condition_dumps" / "hf_thinker" if artifact_dir is not None else None
+    talker_tensor_root = artifact_dir / "condition_dumps" / "hf_talker" if artifact_dir is not None else None
 
     def traced_chunk_generate(this: Any, *args: Any, **kwargs: Any) -> Any:
         output = original_chunk_generate(this, *args, **kwargs)
@@ -375,6 +468,35 @@ def _install_streaming_trace_hooks(
 
         hidden_states = getattr(output, "last_hidden_states", None)
         current_inputs_embeds = getattr(output, "current_inputs_embeds", None)
+        dump_dir_rel: str | None = None
+        tensor_summaries: dict[str, Any] | None = None
+        if thinker_tensor_root is not None and yield_chunk_ids and hasattr(hidden_states, "shape"):
+            import torch
+            import torch.nn.functional as F
+
+            hidden_states_tensor = torch.as_tensor(hidden_states)
+            if hidden_states_tensor.ndim == 3 and int(hidden_states_tensor.shape[1]) == len(yield_chunk_ids):
+                yield_chunk_token_ids = torch.tensor(
+                    yield_chunk_ids,
+                    dtype=torch.long,
+                    device=hidden_states_tensor.device,
+                ).reshape(1, -1)
+                llm_embeds = model.tts.emb_text(yield_chunk_token_ids)
+                hidden_embeds = model.tts.projector_semantic(hidden_states_tensor)
+                if getattr(model.tts.config, "normalize_projected_hidden", False):
+                    hidden_embeds = F.normalize(hidden_embeds, p=2, dim=-1)
+                tts_embeds = llm_embeds + hidden_embeds
+
+                dump_dir = thinker_tensor_root / f"chunk_{int(chunk_state['chunk_index']):04d}"
+                tensor_summaries = {
+                    "yield_chunk_token_ids": _write_tensor_dump(dump_dir / "yield_chunk_token_ids.pt", yield_chunk_token_ids),
+                    "last_hidden_states": _write_tensor_dump(dump_dir / "last_hidden_states.pt", hidden_states_tensor),
+                    "llm_embeds": _write_tensor_dump(dump_dir / "llm_embeds.pt", llm_embeds),
+                    "hidden_embeds": _write_tensor_dump(dump_dir / "hidden_embeds.pt", hidden_embeds),
+                    "tts_embeds": _write_tensor_dump(dump_dir / "tts_embeds.pt", tts_embeds),
+                }
+                dump_dir_rel = _relative_to_root(dump_dir, artifact_dir)
+
         thinker_rows.append(
             {
                 "chunk_index": int(chunk_state["chunk_index"]),
@@ -392,6 +514,8 @@ def _install_streaming_trace_hooks(
                 "current_inputs_embeds_shape": (
                     list(current_inputs_embeds.shape) if hasattr(current_inputs_embeds, "shape") else None
                 ),
+                "tensor_dump_dir": dump_dir_rel,
+                "tensor_summaries": tensor_summaries,
             }
         )
         chunk_state["chunk_index"] += 1
@@ -407,6 +531,20 @@ def _install_streaming_trace_hooks(
 
         condition_index = int(talker_state["condition_index"])
         talker_state["condition_index"] += 1
+        condition_dump_dir_rel: str | None = None
+        condition_summary: dict[str, Any] | None = None
+        if talker_tensor_root is not None and hasattr(condition, "shape"):
+            dump_dir = talker_tensor_root / f"condition_{condition_index:04d}"
+            condition_summary = _write_tensor_dump(dump_dir / "condition.pt", condition)
+            _write_json(
+                dump_dir / "metadata.json",
+                {
+                    "condition_index": condition_index,
+                    "condition_shape": list(condition.shape) if hasattr(condition, "shape") else None,
+                    "text_finished": bool(text_finished),
+                },
+            )
+            condition_dump_dir_rel = _relative_to_root(dump_dir, artifact_dir)
         generator = original_generate_with_buffer(this, *args, **kwargs)
         for audio_token_chunk, is_last_audio_chunk in generator:
             token_ids = _coerce_token_chunk(audio_token_chunk)
@@ -419,6 +557,8 @@ def _install_streaming_trace_hooks(
                     "condition_shape": list(condition.shape) if hasattr(condition, "shape") else None,
                     "audio_token_ids": token_ids,
                     "audio_token_count": len(token_ids),
+                    "condition_dump_dir": condition_dump_dir_rel,
+                    "condition_summary": condition_summary,
                 }
             )
             talker_state["chunk_index"] += 1
@@ -699,7 +839,9 @@ def run_hf_smoke(
     system_mode: str = "omni",
     system_profile: str | None = None,
     language: str = "en",
+    do_sample: bool = True,
     temperature: float = 0.7,
+    seed: int = 42,
     max_new_tokens: int = 4096,
     init_audio: bool = True,
     streaming: bool = False,
@@ -724,6 +866,9 @@ def run_hf_smoke(
     )
     model.eval().cuda()
     model.init_tts()
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
 
     debug_trace = [] if debug else None
 
@@ -777,7 +922,9 @@ def run_hf_smoke(
             payload={
                 "system_mode": system_mode,
                 "language": language,
+                "do_sample": bool(do_sample),
                 "temperature": temperature,
+                "seed": int(seed),
                 "max_new_tokens": max_new_tokens,
                 "messages": [_summarize_message(message) for message in msgs],
             },
@@ -796,7 +943,9 @@ def run_hf_smoke(
                 "system_mode": system_mode,
                 "system_profile": system_profile,
                 "language": language,
+                "do_sample": bool(do_sample),
                 "temperature": temperature,
+                "seed": int(seed),
                 "max_new_tokens": max_new_tokens,
                 "streaming": streaming,
                 "messages": [_summarize_message(message) for message in msgs],
@@ -868,6 +1017,7 @@ def run_hf_smoke(
                         )
                 patches = _install_streaming_trace_hooks(
                     model,
+                    artifact_dir=artifact_dir,
                     tokenizer=tokenizer,
                     thinker_rows=thinker_rows,
                     talker_rows=talker_rows,
@@ -906,7 +1056,7 @@ def run_hf_smoke(
                     generate_audio=True,
                     use_tts_template=True,
                     enable_thinking=False,
-                    do_sample=True,
+                    do_sample=do_sample,
                     temperature=temperature,
                     max_new_tokens=max_new_tokens,
                 )
@@ -984,7 +1134,7 @@ def run_hf_smoke(
         else:
             text_output = model.chat(
                 msgs=msgs,
-                do_sample=True,
+                do_sample=do_sample,
                 max_new_tokens=max_new_tokens,
                 use_tts_template=True,
                 generate_audio=True,
@@ -1058,6 +1208,110 @@ def run_hf_smoke(
     return result
 
 
+@app.function(
+    image=image,
+    gpu=GPU_REQUEST,
+    timeout=20 * MINUTES,
+    volumes={
+        HF_CACHE_DIR: hf_cache_volume,
+    },
+)
+def replay_hf_talker_decode_step(
+    inputs_embeds_blob: bytes,
+    position_ids_blob: bytes | None = None,
+    temperature: float = 0.9,
+    topk: int = 8,
+    seed: int = 42,
+) -> dict[str, Any]:
+    import torch
+    import torch.nn.functional as F
+    from transformers import AutoModel
+
+    snapshot_path = _download_model()
+    hf_cache_volume.commit()
+    _patch_minicpm_audio_io()
+
+    model = AutoModel.from_pretrained(
+        snapshot_path,
+        trust_remote_code=True,
+        attn_implementation="eager",
+        torch_dtype=torch.bfloat16,
+        init_vision=False,
+        init_audio=False,
+        init_tts=True,
+    )
+    model.eval().cuda()
+    model.init_tts()
+
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+    inputs_embeds = torch.load(io.BytesIO(inputs_embeds_blob), map_location="cpu")
+    inputs_embeds = torch.as_tensor(inputs_embeds)
+    if inputs_embeds.ndim == 2:
+        inputs_embeds = inputs_embeds.unsqueeze(0)
+    if inputs_embeds.ndim != 3:
+        raise ValueError(f"Expected inputs_embeds to have 2 or 3 dims, got {tuple(inputs_embeds.shape)}")
+    inputs_embeds = inputs_embeds.cuda().to(dtype=torch.bfloat16)
+
+    if position_ids_blob is not None:
+        position_ids = torch.load(io.BytesIO(position_ids_blob), map_location="cpu")
+        position_ids = torch.as_tensor(position_ids, dtype=torch.long)
+        if position_ids.ndim == 1:
+            position_ids = position_ids.unsqueeze(0)
+    else:
+        position_ids = torch.arange(inputs_embeds.shape[1], dtype=torch.long).unsqueeze(0)
+    if position_ids.ndim != 2:
+        raise ValueError(f"Expected position_ids to have 1 or 2 dims, got {tuple(position_ids.shape)}")
+    position_ids = position_ids.cuda()
+
+    outputs = model.tts.model(
+        inputs_embeds=inputs_embeds,
+        position_ids=position_ids,
+        past_key_values=None,
+        use_cache=True,
+        return_dict=True,
+    )
+    hidden_states = outputs.last_hidden_state
+
+    logits = torch.empty(
+        hidden_states.size(0),
+        hidden_states.size(1),
+        model.tts.num_audio_tokens,
+        model.tts.num_vq,
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+    for num_vq_iter in range(model.tts.num_vq):
+        logits[..., num_vq_iter] = model.tts.head_code[num_vq_iter](hidden_states)
+
+    logits = logits[:, -1].float()
+    logits = logits.permute(0, 2, 1)
+    logits = logits.reshape(-1, logits.size(2))
+
+    safe_temperature = max(float(temperature), 1e-5)
+    sampling_logits = logits / safe_temperature
+    raw_probs = F.softmax(logits, dim=-1)
+    sampling_probs = F.softmax(sampling_logits, dim=-1)
+    greedy_token = torch.argmax(sampling_logits, dim=-1, keepdim=True)
+
+    return {
+        "snapshot_path": snapshot_path,
+        "seed": int(seed),
+        "temperature": float(temperature),
+        "inputs_embeds_summary": _summarize_tensor(inputs_embeds),
+        "position_ids_summary": _summarize_tensor(position_ids),
+        "hidden_states_summary": _summarize_tensor(hidden_states),
+        "raw_logits_summary": _summarize_tensor(logits),
+        "sampling_logits_summary": _summarize_tensor(sampling_logits),
+        "raw_top_tokens": _topk_logits_summary(logits, raw_probs, topk),
+        "sampling_top_tokens": _topk_logits_summary(sampling_logits, sampling_probs, topk),
+        "greedy_token_id": int(greedy_token.reshape(-1)[0].item()),
+        "position_ids": [int(x) for x in position_ids.detach().cpu().reshape(-1).tolist()],
+    }
+
+
 @app.local_entrypoint()
 def main(
     prompt: str = (
@@ -1071,16 +1325,37 @@ def main(
     system_mode: str = "omni",
     system_profile: str = "",
     language: str = "en",
+    do_sample: bool = True,
     temperature: float = 0.7,
+    seed: int = 42,
     max_new_tokens: int = 4096,
     init_audio: bool = True,
     streaming: bool = False,
     debug: bool = False,
+    replay_inputs_embeds_path: str = "",
+    replay_position_ids_path: str = "",
+    replay_output_json: str = "",
 ) -> None:
     snapshot_path = preload_model.remote()
     print(f"Model cached at: {snapshot_path}")
 
     if preload_only:
+        return
+
+    if replay_inputs_embeds_path:
+        replay_result = replay_hf_talker_decode_step.remote(
+            inputs_embeds_blob=_load_local_blob(replay_inputs_embeds_path),
+            position_ids_blob=_load_local_blob(replay_position_ids_path) if replay_position_ids_path else None,
+            temperature=temperature,
+            seed=seed,
+        )
+        replay_json = json.dumps(replay_result, indent=2, ensure_ascii=False, sort_keys=True)
+        if replay_output_json:
+            output_json_path = Path(replay_output_json)
+            output_json_path.parent.mkdir(parents=True, exist_ok=True)
+            output_json_path.write_text(replay_json, encoding="utf-8")
+            print(f"Saved replay JSON to: {output_json_path}")
+        print(replay_json)
         return
 
     ref_audio_payload: dict[str, Any] | None = None
@@ -1100,7 +1375,9 @@ def main(
         system_mode=system_mode,
         system_profile=system_profile or None,
         language=language,
+        do_sample=do_sample,
         temperature=temperature,
+        seed=seed,
         max_new_tokens=max_new_tokens,
         init_audio=init_audio,
         streaming=streaming,

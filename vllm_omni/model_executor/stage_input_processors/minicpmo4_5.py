@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 import re
@@ -87,6 +89,177 @@ def _write_json(path: Path, payload: Any) -> None:
 
 def _write_int_tokens(path: Path, tokens: list[int]) -> None:
     path.write_text(" ".join(str(int(tok)) for tok in tokens), encoding="utf-8")
+
+
+def _summarize_tensor(tensor: Any) -> dict[str, Any]:
+    tensor_cpu = torch.as_tensor(tensor).detach().cpu().contiguous()
+    tensor_buffer = io.BytesIO()
+    torch.save(tensor_cpu, tensor_buffer)
+    summary: dict[str, Any] = {
+        "shape": list(tensor_cpu.shape),
+        "dtype": str(tensor_cpu.dtype),
+        "numel": int(tensor_cpu.numel()),
+        "sha256": hashlib.sha256(tensor_buffer.getvalue()).hexdigest(),
+    }
+
+    if tensor_cpu.numel() == 0:
+        return summary
+
+    if tensor_cpu.is_floating_point():
+        values = tensor_cpu.to(torch.float32)
+        summary.update(
+            {
+                "mean": float(values.mean().item()),
+                "std": float(values.std(unbiased=False).item()),
+                "min": float(values.min().item()),
+                "max": float(values.max().item()),
+                "l2_norm": float(torch.linalg.vector_norm(values).item()),
+            }
+        )
+    else:
+        summary.update(
+            {
+                "min": int(tensor_cpu.min().item()),
+                "max": int(tensor_cpu.max().item()),
+            }
+        )
+
+    return summary
+
+
+def _write_tensor_dump(path: Path, tensor: Any) -> dict[str, Any]:
+    tensor_cpu = torch.as_tensor(tensor).detach().cpu().contiguous()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(tensor_cpu, path)
+    summary = _summarize_tensor(tensor_cpu)
+    _write_json(path.with_suffix(".summary.json"), summary)
+    return summary
+
+
+def _snapshot_async_tts_state(state: dict[str, Any]) -> dict[str, Any]:
+    pending_llm_tokens = [int(tok) for tok in state.get("pending_llm_tokens", [])]
+    pending_unpaired_output_tokens = [int(tok) for tok in state.get("pending_unpaired_output_tokens", [])]
+    debug_emitted_llm_tokens = [int(tok) for tok in state.get("debug_emitted_llm_tokens", [])]
+    pending_hidden = state.get("pending_hidden_states")
+
+    return {
+        "tts_started": bool(state.get("tts_started", False)),
+        "tts_closed": bool(state.get("tts_closed", False)),
+        "hidden_size": state.get("hidden_size"),
+        "seen_output_token_count": int(state.get("seen_output_token_count", 0) or 0),
+        "prompt_state_initialized": bool(state.get("prompt_state_initialized", False)),
+        "pending_unpaired_output_token_count": int(len(pending_unpaired_output_tokens)),
+        "pending_unpaired_output_tokens": pending_unpaired_output_tokens,
+        "pending_llm_token_count": int(len(pending_llm_tokens)),
+        "pending_llm_tokens": pending_llm_tokens,
+        "pending_hidden_states_summary": (
+            _summarize_tensor(pending_hidden) if isinstance(pending_hidden, torch.Tensor) else None
+        ),
+        "debug_chunk_index": int(state.get("debug_chunk_index", 0) or 0),
+        "debug_step_index": int(state.get("debug_step_index", 0) or 0),
+        "emitted_chunk_serial": int(state.get("emitted_chunk_serial", 0) or 0),
+        "debug_emitted_llm_token_count": int(len(debug_emitted_llm_tokens)),
+        "debug_emitted_llm_tokens": debug_emitted_llm_tokens,
+    }
+
+
+def _dump_async_tts_processor_step(
+    *,
+    request_id: str,
+    step_index: int,
+    pooling_output: dict[str, Any] | None,
+    prompt_token_ids: list[int],
+    output_token_ids: list[int],
+    seen_output_token_count: int,
+    new_output_count: int,
+    usable: int,
+    latent_source: str | None,
+    raw_hidden_states: torch.Tensor | None,
+    aligned_hidden_states: torch.Tensor | None,
+    chunk_token_ids: list[int],
+    delta_llm_tokens: torch.Tensor,
+    delta_tts_hidden_states: torch.Tensor,
+    pending_count_before_append: int,
+    pending_count_after_append: int,
+    stream_finished: bool,
+    saw_tts_eos: bool,
+    is_finished_flag: bool,
+    tts_started_before: bool,
+    tts_closed_before: bool,
+    tts_started_after: bool,
+    tts_closed_after: bool,
+    emit_mode: str,
+    emitted_chunk_serial: int | None,
+    emitted_tokens: list[int],
+    new_output_tokens: list[int],
+    relevant_new_output_tokens: list[int],
+    next_hidden_candidate_tokens: list[int],
+    remaining_unpaired_output_tokens: list[int],
+    state_before: dict[str, Any],
+    state_after_append: dict[str, Any],
+    state_after_emit: dict[str, Any],
+) -> None:
+    request_dir = _async_debug_request_dir(request_id)
+    if request_dir is None:
+        return
+
+    step_dir = request_dir / "thinker_tts_processor_steps" / f"step_{step_index:04d}"
+    step_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_hidden_summary = None
+    aligned_hidden_summary = None
+    delta_hidden_summary = None
+    if isinstance(raw_hidden_states, torch.Tensor):
+        raw_hidden_summary = _write_tensor_dump(step_dir / "raw_hidden_states.pt", raw_hidden_states)
+    if isinstance(aligned_hidden_states, torch.Tensor):
+        aligned_hidden_summary = _write_tensor_dump(step_dir / "aligned_hidden_states.pt", aligned_hidden_states)
+    if isinstance(delta_tts_hidden_states, torch.Tensor):
+        delta_hidden_summary = _write_tensor_dump(
+            step_dir / "delta_tts_hidden_states.pt",
+            delta_tts_hidden_states,
+        )
+
+    delta_token_list = [int(tok) for tok in torch.as_tensor(delta_llm_tokens, dtype=torch.long).reshape(-1).tolist()]
+    _write_json(step_dir / "chunk_token_ids.json", [int(tok) for tok in chunk_token_ids])
+    _write_json(step_dir / "delta_llm_tokens.json", delta_token_list)
+    _write_int_tokens(step_dir / "delta_llm_tokens.txt", delta_token_list)
+
+    metadata = {
+        "step_index": int(step_index),
+        "pooling_output_keys": sorted(pooling_output.keys()) if isinstance(pooling_output, dict) else [],
+        "latent_source": latent_source,
+        "prompt_token_ids": [int(tok) for tok in prompt_token_ids],
+        "output_token_ids": [int(tok) for tok in output_token_ids],
+        "seen_output_token_count": int(seen_output_token_count),
+        "new_output_count": int(new_output_count),
+        "usable": int(usable),
+        "chunk_token_ids": [int(tok) for tok in chunk_token_ids],
+        "delta_llm_tokens": delta_token_list,
+        "pending_count_before_append": int(pending_count_before_append),
+        "pending_count_after_append": int(pending_count_after_append),
+        "stream_finished": bool(stream_finished),
+        "saw_tts_eos": bool(saw_tts_eos),
+        "is_finished_flag": bool(is_finished_flag),
+        "tts_started_before": bool(tts_started_before),
+        "tts_closed_before": bool(tts_closed_before),
+        "tts_started_after": bool(tts_started_after),
+        "tts_closed_after": bool(tts_closed_after),
+        "emit_mode": emit_mode,
+        "emitted_chunk_serial": emitted_chunk_serial,
+        "emitted_tokens": [int(tok) for tok in emitted_tokens],
+        "new_output_tokens": [int(tok) for tok in new_output_tokens],
+        "relevant_new_output_tokens": [int(tok) for tok in relevant_new_output_tokens],
+        "next_hidden_candidate_tokens": [int(tok) for tok in next_hidden_candidate_tokens],
+        "remaining_unpaired_output_tokens": [int(tok) for tok in remaining_unpaired_output_tokens],
+        "raw_hidden_states_summary": raw_hidden_summary,
+        "aligned_hidden_states_summary": aligned_hidden_summary,
+        "delta_tts_hidden_states_summary": delta_hidden_summary,
+        "state_before": state_before,
+        "state_after_append": state_after_append,
+        "state_after_emit": state_after_emit,
+    }
+    _write_json(step_dir / "metadata.json", metadata)
+    _append_jsonl(request_dir / "thinker_tts_processor_steps.jsonl", metadata)
 
 
 def _dump_async_chunk_tokens(
@@ -184,9 +357,11 @@ def _get_async_tts_state(transfer_manager: Any, request_id: str) -> dict[str, An
             "tts_started": False,
             "tts_closed": False,
             "hidden_size": None,
+            "pending_unpaired_output_tokens": [],
             "pending_llm_tokens": [],
             "pending_hidden_states": None,
             "debug_chunk_index": 0,
+            "debug_step_index": 0,
             "debug_emitted_llm_tokens": [],
             "emitted_chunk_serial": 0,
             "prompt_state_initialized": False,
@@ -518,50 +693,104 @@ def thinker2talker_async_chunk(
     request_id = request.external_req_id
     state = _get_async_tts_state(transfer_manager, request_id)
     _initialize_async_tts_state_from_prompt(state, request)
+    step_index = int(state.get("debug_step_index", 0) or 0)
+    state_before_snapshot = _snapshot_async_tts_state(state)
+    state["debug_step_index"] = step_index + 1
 
     hidden_states = None
     saw_tts_eos = False
     latent_payload = None
+    latent_source = None
     if isinstance(pooling_output, dict):
         latent_payload = pooling_output.get("latent")
         if latent_payload is None:
             # Async chunk callbacks receive the raw per-step hidden slice under
             # "hidden" from GPUARModelRunner.pooler_output.
             latent_payload = pooling_output.get("hidden")
+            if latent_payload is not None:
+                latent_source = "hidden"
+        elif latent_payload is not None:
+            latent_source = "latent"
 
     if latent_payload is not None:
         hidden_states = _extract_token_hidden_states(latent_payload).detach().cpu().to(torch.float32)
         if hidden_states.ndim == 2 and hidden_states.shape[-1] > 0:
             state["hidden_size"] = int(hidden_states.shape[-1])
 
+    prompt_token_ids = [int(tok) for tok in _ensure_list(getattr(request, "prompt_token_ids", None))]
     output_token_ids = [int(tok) for tok in _ensure_list(getattr(request, "output_token_ids", None))]
     seen_output_token_count = int(state.get("seen_output_token_count", 0) or 0)
     new_output_count = max(0, len(output_token_ids) - seen_output_token_count)
+    new_output_tokens = output_token_ids[seen_output_token_count:]
+    pending_unpaired_output_tokens = [int(tok) for tok in state.get("pending_unpaired_output_tokens", [])]
+    pending_count_before_append = len(state.get("pending_llm_tokens", []))
+    tts_started_before = bool(state.get("tts_started", False))
+    tts_closed_before = bool(state.get("tts_closed", False))
+    usable = 0
+    chunk_token_ids: list[int] = []
+    relevant_new_output_tokens: list[int] = []
+    next_hidden_candidate_tokens: list[int] = []
+    remaining_unpaired_output_tokens: list[int] = list(pending_unpaired_output_tokens)
+    aligned_hidden_states = _empty_tts_hidden_states(state.get("hidden_size"))
+    llm_tokens = torch.empty((0,), dtype=torch.long)
+    tts_hidden_states = _empty_tts_hidden_states(state.get("hidden_size"))
+    saw_tts_eos_in_new = False
 
-    if hidden_states is not None and hidden_states.numel() > 0 and new_output_count > 0:
+    if new_output_tokens:
+        for token_id in new_output_tokens:
+            token_id = int(token_id)
+            relevant_new_output_tokens.append(token_id)
+            if token_id == TTS_EOS_ID:
+                saw_tts_eos_in_new = True
+                break
+
+        if relevant_new_output_tokens:
+            next_hidden_candidate_tokens = pending_unpaired_output_tokens + relevant_new_output_tokens[:-1]
+            last_new_token = int(relevant_new_output_tokens[-1])
+            remaining_unpaired_output_tokens = [] if last_new_token == TTS_EOS_ID else [last_new_token]
+        else:
+            next_hidden_candidate_tokens = list(pending_unpaired_output_tokens)
+            remaining_unpaired_output_tokens = []
+
+    if hidden_states is not None and hidden_states.numel() > 0 and next_hidden_candidate_tokens:
         current_chunk_len = int(hidden_states.shape[0])
-        usable = min(current_chunk_len, new_output_count)
-        if usable != current_chunk_len or usable != new_output_count:
+        usable = min(current_chunk_len, len(next_hidden_candidate_tokens))
+        if usable != len(next_hidden_candidate_tokens):
             logger.warning(
-                "MiniCPM async thinker output/latent mismatch; trimming to tail. "
-                "request_id=%s new_output_count=%d latent=%d usable=%d",
+                "MiniCPM async thinker output/latent alignment mismatch; trimming candidate pairs. "
+                "request_id=%s candidate_tokens=%d latent=%d usable=%d",
                 request_id,
-                new_output_count,
+                len(next_hidden_candidate_tokens),
                 current_chunk_len,
                 usable,
             )
-        chunk_token_ids = output_token_ids[-usable:]
+
+        chunk_token_ids = [int(tok) for tok in next_hidden_candidate_tokens[:usable]]
+        aligned_hidden_states = hidden_states[-usable:].contiguous()
         llm_tokens, tts_hidden_states, saw_tts_eos = _extract_async_tts_delta(
-            hidden_states[-usable:],
+            aligned_hidden_states,
             chunk_token_ids,
             state,
         )
         _append_async_tts_pending(state, llm_tokens, tts_hidden_states)
 
+        if usable < len(next_hidden_candidate_tokens):
+            remaining_unpaired_output_tokens = next_hidden_candidate_tokens[usable:] + remaining_unpaired_output_tokens
+
+    elif next_hidden_candidate_tokens:
+        remaining_unpaired_output_tokens = next_hidden_candidate_tokens + remaining_unpaired_output_tokens
+
+    state["pending_unpaired_output_tokens"] = [int(tok) for tok in remaining_unpaired_output_tokens]
+    if saw_tts_eos_in_new:
+        state["tts_closed"] = True
+        saw_tts_eos = True
+
     state["seen_output_token_count"] = len(output_token_ids)
 
     stream_finished = bool(is_finished or saw_tts_eos)
     pending_count = len(state.get("pending_llm_tokens", []))
+    state_after_append_snapshot = _snapshot_async_tts_state(state)
+
     if stream_finished:
         llm_tokens, tts_hidden_states = _pop_async_tts_pending(state, count=None)
         emitted_tokens = [int(tok) for tok in llm_tokens.tolist()]
@@ -593,7 +822,43 @@ def thinker2talker_async_chunk(
         )
         state["debug_chunk_index"] = int(state["debug_chunk_index"]) + 1
         state["emitted_chunk_serial"] = chunk_serial + 1
+        _dump_async_tts_processor_step(
+            request_id=request_id,
+            step_index=step_index,
+            pooling_output=pooling_output if isinstance(pooling_output, dict) else None,
+            prompt_token_ids=prompt_token_ids,
+            output_token_ids=output_token_ids,
+            seen_output_token_count=seen_output_token_count,
+            new_output_count=new_output_count,
+            usable=usable,
+            latent_source=latent_source,
+            raw_hidden_states=hidden_states,
+            aligned_hidden_states=aligned_hidden_states,
+            chunk_token_ids=chunk_token_ids,
+            delta_llm_tokens=llm_tokens,
+            delta_tts_hidden_states=tts_hidden_states,
+            pending_count_before_append=pending_count_before_append,
+            pending_count_after_append=pending_count,
+            stream_finished=stream_finished,
+            saw_tts_eos=saw_tts_eos,
+            is_finished_flag=bool(is_finished),
+            tts_started_before=tts_started_before,
+            tts_closed_before=tts_closed_before,
+            tts_started_after=bool(state.get("tts_started", False)),
+            tts_closed_after=bool(state.get("tts_closed", False)),
+            emit_mode="flush_all",
+            emitted_chunk_serial=chunk_serial,
+            emitted_tokens=emitted_tokens,
+            new_output_tokens=new_output_tokens,
+            relevant_new_output_tokens=relevant_new_output_tokens,
+            next_hidden_candidate_tokens=next_hidden_candidate_tokens,
+            remaining_unpaired_output_tokens=remaining_unpaired_output_tokens,
+            state_before=state_before_snapshot,
+            state_after_append=state_after_append_snapshot,
+            state_after_emit=_snapshot_async_tts_state(state),
+        )
         return {
+            "override_keys": ["llm_tokens", "tts_hidden_states"],
             "llm_tokens": llm_tokens,
             "tts_hidden_states": tts_hidden_states,
             "async_tts_chunk_id": chunk_serial,
@@ -602,6 +867,41 @@ def thinker2talker_async_chunk(
         }
 
     if pending_count < ASYNC_TTS_CHUNK_SIZE:
+        _dump_async_tts_processor_step(
+            request_id=request_id,
+            step_index=step_index,
+            pooling_output=pooling_output if isinstance(pooling_output, dict) else None,
+            prompt_token_ids=prompt_token_ids,
+            output_token_ids=output_token_ids,
+            seen_output_token_count=seen_output_token_count,
+            new_output_count=new_output_count,
+            usable=usable,
+            latent_source=latent_source,
+            raw_hidden_states=hidden_states,
+            aligned_hidden_states=aligned_hidden_states,
+            chunk_token_ids=chunk_token_ids,
+            delta_llm_tokens=llm_tokens,
+            delta_tts_hidden_states=tts_hidden_states,
+            pending_count_before_append=pending_count_before_append,
+            pending_count_after_append=pending_count,
+            stream_finished=stream_finished,
+            saw_tts_eos=saw_tts_eos,
+            is_finished_flag=bool(is_finished),
+            tts_started_before=tts_started_before,
+            tts_closed_before=tts_closed_before,
+            tts_started_after=bool(state.get("tts_started", False)),
+            tts_closed_after=bool(state.get("tts_closed", False)),
+            emit_mode="buffer_only",
+            emitted_chunk_serial=None,
+            emitted_tokens=[],
+            new_output_tokens=new_output_tokens,
+            relevant_new_output_tokens=relevant_new_output_tokens,
+            next_hidden_candidate_tokens=next_hidden_candidate_tokens,
+            remaining_unpaired_output_tokens=remaining_unpaired_output_tokens,
+            state_before=state_before_snapshot,
+            state_after_append=state_after_append_snapshot,
+            state_after_emit=state_after_append_snapshot,
+        )
         return None
 
     llm_tokens, tts_hidden_states = _pop_async_tts_pending(state, count=ASYNC_TTS_CHUNK_SIZE)
@@ -624,7 +924,43 @@ def thinker2talker_async_chunk(
     )
     state["debug_chunk_index"] = int(state["debug_chunk_index"]) + 1
     state["emitted_chunk_serial"] = chunk_serial + 1
+    _dump_async_tts_processor_step(
+        request_id=request_id,
+        step_index=step_index,
+        pooling_output=pooling_output if isinstance(pooling_output, dict) else None,
+        prompt_token_ids=prompt_token_ids,
+        output_token_ids=output_token_ids,
+        seen_output_token_count=seen_output_token_count,
+        new_output_count=new_output_count,
+        usable=usable,
+        latent_source=latent_source,
+        raw_hidden_states=hidden_states,
+        aligned_hidden_states=aligned_hidden_states,
+        chunk_token_ids=chunk_token_ids,
+        delta_llm_tokens=llm_tokens,
+        delta_tts_hidden_states=tts_hidden_states,
+        pending_count_before_append=pending_count_before_append,
+        pending_count_after_append=pending_count,
+        stream_finished=stream_finished,
+        saw_tts_eos=saw_tts_eos,
+        is_finished_flag=bool(is_finished),
+        tts_started_before=tts_started_before,
+        tts_closed_before=tts_closed_before,
+        tts_started_after=bool(state.get("tts_started", False)),
+        tts_closed_after=bool(state.get("tts_closed", False)),
+        emit_mode="emit_chunk",
+        emitted_chunk_serial=chunk_serial,
+        emitted_tokens=emitted_tokens,
+        new_output_tokens=new_output_tokens,
+        relevant_new_output_tokens=relevant_new_output_tokens,
+        next_hidden_candidate_tokens=next_hidden_candidate_tokens,
+        remaining_unpaired_output_tokens=remaining_unpaired_output_tokens,
+        state_before=state_before_snapshot,
+        state_after_append=state_after_append_snapshot,
+        state_after_emit=_snapshot_async_tts_state(state),
+    )
     return {
+        "override_keys": ["llm_tokens", "tts_hidden_states"],
         "llm_tokens": llm_tokens,
         "tts_hidden_states": tts_hidden_states,
         "async_tts_chunk_id": chunk_serial,

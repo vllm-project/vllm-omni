@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 import re
@@ -55,6 +57,56 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         f.write("\n")
 
 
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _summarize_tensor(tensor: Any) -> dict[str, Any]:
+    tensor_cpu = torch.as_tensor(tensor).detach().cpu().contiguous()
+    tensor_buffer = io.BytesIO()
+    torch.save(tensor_cpu, tensor_buffer)
+    summary: dict[str, Any] = {
+        "shape": list(tensor_cpu.shape),
+        "dtype": str(tensor_cpu.dtype),
+        "numel": int(tensor_cpu.numel()),
+        "sha256": hashlib.sha256(tensor_buffer.getvalue()).hexdigest(),
+    }
+
+    if tensor_cpu.numel() == 0:
+        return summary
+
+    if tensor_cpu.is_floating_point():
+        values = tensor_cpu.to(torch.float32)
+        summary.update(
+            {
+                "mean": float(values.mean().item()),
+                "std": float(values.std(unbiased=False).item()),
+                "min": float(values.min().item()),
+                "max": float(values.max().item()),
+                "l2_norm": float(torch.linalg.vector_norm(values).item()),
+            }
+        )
+    else:
+        summary.update(
+            {
+                "min": int(tensor_cpu.min().item()),
+                "max": int(tensor_cpu.max().item()),
+            }
+        )
+
+    return summary
+
+
+def _write_tensor_dump(path: Path, tensor: Any) -> dict[str, Any]:
+    tensor_cpu = torch.as_tensor(tensor).detach().cpu().contiguous()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(tensor_cpu, path)
+    summary = _summarize_tensor(tensor_cpu)
+    _write_json(path.with_suffix(".summary.json"), summary)
+    return summary
+
+
 def _ordered_unique(values: list[Any]) -> list[Any]:
     unique: list[Any] = []
     for value in values:
@@ -75,6 +127,100 @@ def _resolve_global_request_id(info_dict: dict[str, Any]) -> str | None:
             if value_str:
                 return value_str
     return None
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    value_str = str(value).strip().lower()
+    if value_str in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if value_str in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    if value is None or value == "":
+        return int(default)
+    return int(value)
+
+
+def _coerce_optional_int(value: Any, default: int | None = None) -> int | None:
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _coerce_float(value: Any, default: float) -> float:
+    if value is None or value == "":
+        return float(default)
+    return float(value)
+
+
+def _topk_logits_summary(logits: torch.Tensor, probs: torch.Tensor, k: int) -> list[dict[str, Any]]:
+    if logits.ndim != 2 or probs.ndim != 2 or logits.shape != probs.shape:
+        return []
+    vocab_size = int(logits.shape[-1])
+    if vocab_size <= 0:
+        return []
+    k = max(1, min(int(k), vocab_size))
+    top_vals, top_ids = torch.topk(logits, k=k, dim=-1)
+    top_probs = probs.gather(-1, top_ids)
+    rows: list[dict[str, Any]] = []
+    for token_id, logit_val, prob_val in zip(top_ids[0], top_vals[0], top_probs[0], strict=False):
+        rows.append(
+            {
+                "token_id": int(token_id.item()),
+                "logit": float(logit_val.item()),
+                "prob": float(prob_val.item()),
+            }
+        )
+    return rows
+
+
+def _extract_connector_extra(connector_cfg: Any) -> dict[str, Any]:
+    """Best-effort normalizer for stage connector config payloads.
+
+    Different initialization paths may surface the connector config either as:
+    - ``{"name": ..., "extra": {...}}``
+    - ``{"spec": {"name": ..., "extra": {...}}}``
+    - an object with ``extra`` and/or ``spec.extra`` attributes
+
+    Normalizing here keeps async talker sampling/debug controls resilient to
+    the exact wrapper shape used by the engine bootstrap path.
+    """
+    extra: dict[str, Any] = {}
+    if connector_cfg is None:
+        return extra
+
+    if isinstance(connector_cfg, dict):
+        raw_extra = connector_cfg.get("extra")
+        if isinstance(raw_extra, dict):
+            extra.update(raw_extra)
+        spec = connector_cfg.get("spec")
+        if isinstance(spec, dict):
+            spec_extra = spec.get("extra")
+            if isinstance(spec_extra, dict):
+                extra.update(spec_extra)
+        for key, value in connector_cfg.items():
+            if key in {"name", "type", "spec", "extra"}:
+                continue
+            extra.setdefault(key, value)
+        return extra
+
+    raw_extra = getattr(connector_cfg, "extra", None)
+    if isinstance(raw_extra, dict):
+        extra.update(raw_extra)
+    spec = getattr(connector_cfg, "spec", None)
+    spec_extra = getattr(spec, "extra", None)
+    if isinstance(spec_extra, dict):
+        extra.update(spec_extra)
+    return extra
 
 
 @dataclass
@@ -109,6 +255,9 @@ class _MiniCPMOAsyncTalkerState:
     debug_pending_emitted_condition_indices: list[int | None] = field(default_factory=list)
     debug_pending_emitted_condition_shapes: list[list[int] | None] = field(default_factory=list)
     debug_pending_emitted_text_finished: list[bool] = field(default_factory=list)
+    debug_decode_step_index: int = 0
+    sampling_generator: torch.Generator | None = None
+    sampling_generator_device: str | None = None
 
 
 class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
@@ -125,6 +274,29 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
     ASYNC_ENQUEUED_TOKEN_COUNT_KEY = "async_condition_tokens_enqueued"
     ASYNC_PENDING_STEPS_KEY = "async_pending_condition_steps"
     ASYNC_FINISHED_ENQUEUED_KEY = "async_finished_enqueued"
+
+    def _build_llama_backbone_config(self) -> LlamaConfig:
+        """Clone the real TTS Llama config instead of reconstructing a subset.
+
+        The async private decoder must match HF ``self.tts.model`` as closely
+        as possible. Rebuilding ``LlamaConfig`` from only a handful of shape
+        fields can silently drop behavior-critical settings such as RoPE,
+        activation, norm epsilon, attention options, or other model-specific
+        overrides present in the checkpoint config.
+        """
+        if hasattr(self.config, "to_dict"):
+            llama_config = LlamaConfig.from_dict(dict(self.config.to_dict()))
+        else:
+            llama_config = LlamaConfig()
+
+        # Re-assert the core structural fields that the talker depends on.
+        llama_config.hidden_size = int(self.config.hidden_size)
+        llama_config.intermediate_size = int(self.config.intermediate_size)
+        llama_config.num_attention_heads = int(self.config.num_attention_heads)
+        llama_config.num_hidden_layers = int(self.config.num_hidden_layers)
+        llama_config.num_key_value_heads = int(self.config.num_key_value_heads)
+        llama_config.max_position_embeddings = int(self.config.max_position_embeddings)
+        return llama_config
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -173,14 +345,7 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
             ]
         )
 
-        llama_config = LlamaConfig(
-            hidden_size=int(self.config.hidden_size),
-            intermediate_size=int(self.config.intermediate_size),
-            num_attention_heads=int(self.config.num_attention_heads),
-            num_hidden_layers=int(self.config.num_hidden_layers),
-            num_key_value_heads=int(self.config.num_key_value_heads),
-            max_position_embeddings=int(self.config.max_position_embeddings),
-        )
+        llama_config = self._build_llama_backbone_config()
         self.model = init_vllm_registered_model(
             vllm_config=vllm_config,
             prefix="model",
@@ -194,46 +359,74 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         self._async_backbone_synced = False
         self._async_stream_state: _MiniCPMOAsyncTalkerState | None = None
         self._async_eos_token_id = int(self.config.num_audio_tokens) - 1
-        self._async_sampling_temperature = 0.8
-        self._async_sampling_top_p = 0.85
-        self._async_sampling_top_k = 25
-        self._async_sampling_min_p = 0.01
-        self._async_sampling_repetition_penalty = 1.05
         self._async_max_prefetch_tokens = 25
 
         connector_cfg = getattr(vllm_config.model_config, "stage_connector_config", None)
-        if isinstance(connector_cfg, dict):
-            connector_extra = connector_cfg.get("extra", connector_cfg) or {}
-        else:
-            connector_extra = getattr(connector_cfg, "extra", {}) or {}
+        connector_extra = _extract_connector_extra(connector_cfg)
         self._async_codec_chunk_frames = int(connector_extra.get("codec_chunk_frames", 25))
+        self._async_sampling_do_sample = _coerce_bool(
+            os.environ.get("MINICPMO45_ASYNC_TALKER_DO_SAMPLE", connector_extra.get("async_talker_do_sample")),
+            default=True,
+        )
+        self._async_sampling_temperature = _coerce_float(
+            os.environ.get("MINICPMO45_ASYNC_TALKER_TEMPERATURE", connector_extra.get("async_talker_temperature")),
+            default=0.9,
+        )
+        self._async_sampling_top_p = _coerce_float(
+            os.environ.get("MINICPMO45_ASYNC_TALKER_TOP_P", connector_extra.get("async_talker_top_p")),
+            default=1.0,
+        )
+        self._async_sampling_top_k = _coerce_int(
+            os.environ.get("MINICPMO45_ASYNC_TALKER_TOP_K", connector_extra.get("async_talker_top_k")),
+            default=50,
+        )
+        self._async_sampling_min_p = _coerce_float(
+            os.environ.get("MINICPMO45_ASYNC_TALKER_MIN_P", connector_extra.get("async_talker_min_p")),
+            default=0.0,
+        )
+        self._async_sampling_repetition_penalty = _coerce_float(
+            os.environ.get(
+                "MINICPMO45_ASYNC_TALKER_REPETITION_PENALTY",
+                connector_extra.get("async_talker_repetition_penalty"),
+            ),
+            default=1.05,
+        )
+        self._async_sampling_seed = _coerce_optional_int(
+            os.environ.get("MINICPMO45_ASYNC_TALKER_SEED", connector_extra.get("async_talker_seed")),
+            default=42,
+        )
+        self._async_debug_dump_decode_tensor_steps = _coerce_int(
+            os.environ.get(
+                "MINICPMO45_ASYNC_TALKER_DEBUG_DUMP_DECODE_STEPS",
+                connector_extra.get("async_talker_debug_dump_decode_steps"),
+            ),
+            default=4,
+        )
+        self._async_debug_top_logprobs = _coerce_int(
+            os.environ.get(
+                "MINICPMO45_ASYNC_TALKER_DEBUG_TOPK",
+                connector_extra.get("async_talker_debug_top_logprobs"),
+            ),
+            default=8,
+        )
+        if _coerce_bool(
+            os.environ.get("MINICPMO45_ASYNC_TALKER_GREEDY", connector_extra.get("async_talker_greedy")),
+            default=False,
+        ):
+            self._async_sampling_do_sample = False
+            self._async_sampling_top_p = 1.0
+            self._async_sampling_top_k = -1
+            self._async_sampling_min_p = 0.0
 
         if self._async_chunk_enabled:
-            async_llama_config = LlamaConfig(
-                hidden_size=int(self.config.hidden_size),
-                intermediate_size=int(self.config.intermediate_size),
-                num_attention_heads=int(self.config.num_attention_heads),
-                num_hidden_layers=int(self.config.num_hidden_layers),
-                num_key_value_heads=int(self.config.num_key_value_heads),
-                max_position_embeddings=int(self.config.max_position_embeddings),
-                attention_bias=False,
-            )
+            async_llama_config = self._build_llama_backbone_config()
             async_llama_config._attn_implementation = "eager"
             object.__setattr__(self, "_async_hf_model", HFLlamaModel(async_llama_config))
             self._async_hf_model.eval()
 
-        self._async_logits_processors = (
-            [RepetitionPenaltyLogitsProcessor(self._async_sampling_repetition_penalty)]
-            if self._async_chunk_enabled and self._async_sampling_repetition_penalty != 1.0
-            else []
-        )
-        self._async_logits_warpers = []
-        if self._async_chunk_enabled and self._async_sampling_top_p < 1.0:
-            self._async_logits_warpers.append(TopPLogitsWarper(self._async_sampling_top_p))
-        if self._async_chunk_enabled and self._async_sampling_top_k > 0:
-            self._async_logits_warpers.append(TopKLogitsWarper(self._async_sampling_top_k))
-        if self._async_chunk_enabled and self._async_sampling_min_p > 0.0:
-            self._async_logits_warpers.append(MinPLogitsWarper(self._async_sampling_min_p))
+        self._async_logits_processors: list[Any] = []
+        self._async_logits_warpers: list[Any] = []
+        self._rebuild_async_sampling_controls()
 
         self.hf_to_vllm_mapper = WeightsMapper(
             orig_to_new_prefix={
@@ -400,6 +593,22 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
     def _reset_async_stream_state(self) -> None:
         self._async_stream_state = None
 
+    def _rebuild_async_sampling_controls(self) -> None:
+        self._async_logits_processors = (
+            [RepetitionPenaltyLogitsProcessor(self._async_sampling_repetition_penalty)]
+            if self._async_chunk_enabled and self._async_sampling_repetition_penalty != 1.0
+            else []
+        )
+        self._async_logits_warpers = []
+        if not self._async_chunk_enabled or not self._async_sampling_do_sample:
+            return
+        if self._async_sampling_top_p < 1.0:
+            self._async_logits_warpers.append(TopPLogitsWarper(self._async_sampling_top_p))
+        if self._async_sampling_top_k > 0:
+            self._async_logits_warpers.append(TopKLogitsWarper(self._async_sampling_top_k))
+        if self._async_sampling_min_p > 0.0:
+            self._async_logits_warpers.append(MinPLogitsWarper(self._async_sampling_min_p))
+
     def _append_async_debug_event(
         self,
         state: _MiniCPMOAsyncTalkerState,
@@ -411,6 +620,109 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         if request_dir is None:
             return
         _append_jsonl(request_dir / file_name, payload)
+
+    def _get_async_sampling_generator(
+        self,
+        state: _MiniCPMOAsyncTalkerState,
+        *,
+        device: torch.device,
+    ) -> torch.Generator | None:
+        if self._async_sampling_seed is None:
+            return None
+        device_str = str(device)
+        if state.sampling_generator is None or state.sampling_generator_device != device_str:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(self._async_sampling_seed))
+            state.sampling_generator = generator
+            state.sampling_generator_device = device_str
+        return state.sampling_generator
+
+    def _dump_async_condition_components(
+        self,
+        state: _MiniCPMOAsyncTalkerState,
+        *,
+        condition_index: int,
+        async_tts_chunk_id: int,
+        text_finished: bool,
+        include_text_eos: bool,
+        include_audio_bos: bool,
+        components: dict[str, torch.Tensor],
+    ) -> str | None:
+        request_dir = _async_debug_request_dir(state.request_id)
+        if request_dir is None:
+            return None
+
+        dump_dir = request_dir / "condition_tensors" / f"condition_{condition_index:04d}"
+        tensor_summaries = {
+            "llm_tokens": _write_tensor_dump(dump_dir / "llm_tokens.pt", components["llm_tokens"]),
+            "last_hidden_states": _write_tensor_dump(
+                dump_dir / "last_hidden_states.pt", components["last_hidden_states"]
+            ),
+            "llm_embeds": _write_tensor_dump(dump_dir / "llm_embeds.pt", components["llm_embeds"]),
+            "hidden_embeds": _write_tensor_dump(dump_dir / "hidden_embeds.pt", components["hidden_embeds"]),
+            "tts_embeds": _write_tensor_dump(dump_dir / "tts_embeds.pt", components["tts_embeds"]),
+            "condition": _write_tensor_dump(dump_dir / "condition.pt", components["condition"]),
+        }
+        if int(components["text_eos_embed"].shape[0]) > 0:
+            tensor_summaries["text_eos_embed"] = _write_tensor_dump(
+                dump_dir / "text_eos_embed.pt", components["text_eos_embed"]
+            )
+        if int(components["audio_bos_embed"].shape[0]) > 0:
+            tensor_summaries["audio_bos_embed"] = _write_tensor_dump(
+                dump_dir / "audio_bos_embed.pt", components["audio_bos_embed"]
+            )
+
+        _write_json(
+            dump_dir / "metadata.json",
+            {
+                "condition_index": int(condition_index),
+                "async_tts_chunk_id": int(async_tts_chunk_id),
+                "text_finished": bool(text_finished),
+                "include_text_eos": bool(include_text_eos),
+                "include_audio_bos": bool(include_audio_bos),
+                "tensor_summaries": tensor_summaries,
+            },
+        )
+        return str(dump_dir.relative_to(request_dir))
+
+    def _dump_async_decode_step_tensors(
+        self,
+        state: _MiniCPMOAsyncTalkerState,
+        *,
+        step_index: int,
+        input_kind: str,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        raw_logits: torch.Tensor,
+        sampling_logits: torch.Tensor,
+        probs: torch.Tensor,
+    ) -> str | None:
+        request_dir = _async_debug_request_dir(state.request_id)
+        if request_dir is None:
+            return None
+
+        dump_dir = request_dir / "talker_decode_step_tensors" / f"step_{int(step_index):04d}"
+        tensor_summaries = {
+            "inputs_embeds": _write_tensor_dump(dump_dir / "inputs_embeds.pt", inputs_embeds),
+            "position_ids": _write_tensor_dump(dump_dir / "position_ids.pt", position_ids),
+            "hidden_states": _write_tensor_dump(dump_dir / "hidden_states.pt", hidden_states),
+            "raw_logits": _write_tensor_dump(dump_dir / "raw_logits.pt", raw_logits),
+            "sampling_logits": _write_tensor_dump(dump_dir / "sampling_logits.pt", sampling_logits),
+            "probs": _write_tensor_dump(dump_dir / "probs.pt", probs),
+        }
+        _write_json(
+            dump_dir / "metadata.json",
+            {
+                "step_index": int(step_index),
+                "input_kind": input_kind,
+                "condition_index": state.current_condition_index,
+                "condition_shape": state.current_condition_shape,
+                "condition_text_finished": bool(state.current_condition_text_finished),
+                "tensor_summaries": tensor_summaries,
+            },
+        )
+        return str(dump_dir.relative_to(request_dir))
 
     def _flush_async_debug_codec_chunk(
         self,
@@ -551,6 +863,67 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         llm_embeds = self.emb_text(llm_tokens)
         return llm_embeds + hidden_embeds
 
+    def _prepare_condition_components(
+        self,
+        additional_information: dict[str, Any],
+        *,
+        include_text_eos: bool = True,
+        include_audio_bos: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        llm_tokens = additional_information["llm_tokens"]
+        hidden_states = additional_information["tts_hidden_states"]
+
+        device = self.emb_text.weight.device
+        dtype = self.emb_text.weight.dtype
+        hidden_size = int(self.config.hidden_size)
+        llm_dim = int(self.config.llm_dim)
+
+        llm_tokens_tensor = torch.as_tensor(llm_tokens, dtype=torch.long, device=device).reshape(-1)
+        if llm_tokens_tensor.numel() == 0:
+            hidden_states_tensor = torch.empty((0, llm_dim), device=device, dtype=dtype)
+            llm_embeds = torch.empty((0, hidden_size), device=device, dtype=dtype)
+            hidden_embeds = torch.empty((0, hidden_size), device=device, dtype=dtype)
+            tts_embeds = torch.empty((0, hidden_size), device=device, dtype=dtype)
+        else:
+            hidden_states_tensor = torch.as_tensor(hidden_states, device=device, dtype=dtype).reshape(
+                llm_tokens_tensor.shape[0], llm_dim
+            )
+            hidden_embeds = self.projector_semantic(hidden_states_tensor)
+            if bool(getattr(self.config, "normalize_projected_hidden", False)):
+                hidden_embeds = F.normalize(hidden_embeds, p=2, dim=-1)
+            llm_embeds = self.emb_text(llm_tokens_tensor)
+            tts_embeds = llm_embeds + hidden_embeds
+
+        spk_embeds = torch.empty((0, hidden_size), device=device, dtype=dtype)
+        text_eos_embed = (
+            self._get_text_eos_embed(device=device, dtype=dtype)
+            if include_text_eos
+            else torch.empty((0, hidden_size), device=device, dtype=dtype)
+        )
+        audio_bos_embed = (
+            self._get_audio_bos_embed(device=device, dtype=dtype)
+            if include_audio_bos
+            else torch.empty((0, hidden_size), device=device, dtype=dtype)
+        )
+
+        pieces = [spk_embeds, tts_embeds]
+        if include_text_eos:
+            pieces.append(text_eos_embed)
+        if include_audio_bos:
+            pieces.append(audio_bos_embed)
+
+        return {
+            "llm_tokens": llm_tokens_tensor,
+            "last_hidden_states": hidden_states_tensor,
+            "spk_embeds": spk_embeds,
+            "llm_embeds": llm_embeds,
+            "hidden_embeds": hidden_embeds,
+            "tts_embeds": tts_embeds,
+            "text_eos_embed": text_eos_embed,
+            "audio_bos_embed": audio_bos_embed,
+            "condition": torch.cat(pieces, dim=0),
+        }
+
     def prepare_condition_inputs(
         self,
         additional_information: dict[str, Any],
@@ -565,26 +938,11 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         - ``llm_tokens``: LongTensor [T_text]
         - ``tts_hidden_states``: Tensor [T_text, llm_dim]
         """
-        llm_tokens = additional_information["llm_tokens"]
-        hidden_states = additional_information["tts_hidden_states"]
-
-        device = self.emb_text.weight.device
-        dtype = self.emb_text.weight.dtype
-
-        spk_embeds = torch.empty((0, int(self.config.hidden_size)), device=device, dtype=dtype)
-        tts_embeds = self._build_condition_embeds(
-            llm_tokens=llm_tokens,
-            hidden_states=hidden_states,
-            device=device,
-            dtype=dtype,
-        )
-
-        pieces = [spk_embeds, tts_embeds]
-        if include_text_eos:
-            pieces.append(self._get_text_eos_embed(device=device, dtype=dtype))
-        if include_audio_bos:
-            pieces.append(self._get_audio_bos_embed(device=device, dtype=dtype))
-        return torch.cat(pieces, dim=0)
+        return self._prepare_condition_components(
+            additional_information,
+            include_text_eos=include_text_eos,
+            include_audio_bos=include_audio_bos,
+        )["condition"]
 
     def _maybe_enqueue_async_condition_chunk(
         self,
@@ -615,16 +973,22 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         llm_tokens = info_dict.get("llm_tokens")
         hidden_states = info_dict.get("tts_hidden_states")
         finished = self._info_flag(info_dict.get("finished", False))
-        condition = self.prepare_condition_inputs(
+        # HF ``generate_with_buffer(condition=..., text_finished=...)`` takes
+        # raw text-conditioned embeddings and manages end-of-text / audio BOS
+        # transitions inside its stateful streaming decoder.
+        include_text_eos = False
+        include_audio_bos = False
+        components = self._prepare_condition_components(
             {
                 "llm_tokens": [] if llm_tokens is None else llm_tokens,
                 "tts_hidden_states": hidden_states
                 if hidden_states is not None
                 else torch.empty((0, int(self.config.llm_dim)), dtype=self.emb_text.weight.dtype),
             },
-            include_text_eos=finished,
-            include_audio_bos=True,
+            include_text_eos=include_text_eos,
+            include_audio_bos=include_audio_bos,
         )
+        condition = components["condition"]
         condition = condition.detach().to("cpu").contiguous()
         condition_index = int(state.next_condition_index)
         state.next_condition_index += 1
@@ -641,6 +1005,15 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         state.all_conditions.append(condition)
         state.last_ingested_chunk_id = chunk_id
         state.text_finished = finished
+        dump_dir_rel = self._dump_async_condition_components(
+            state,
+            condition_index=condition_index,
+            async_tts_chunk_id=chunk_id,
+            text_finished=finished,
+            include_text_eos=include_text_eos,
+            include_audio_bos=include_audio_bos,
+            components=components,
+        )
         self._append_async_debug_event(
             state,
             file_name="talker_condition_events.jsonl",
@@ -652,6 +1025,7 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
                 "pending_audio_token_buffer_size": int(len(state.pending_audio_token_ids)),
                 "text_finished": bool(finished),
                 "async_tts_chunk_id": chunk_id,
+                "condition_dump_dir": dump_dir_rel,
             },
         )
 
@@ -659,7 +1033,7 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         self,
         state: _MiniCPMOAsyncTalkerState,
         inputs_embeds: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if self._async_hf_model is None:
             raise RuntimeError("MiniCPM async HF talker backbone is not initialized.")
         if not self._async_backbone_synced:
@@ -681,26 +1055,64 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         )
         state.past_key_values = outputs.past_key_values
         state.text_start_pos = self._async_cache_length(state.past_key_values)
-        return outputs.last_hidden_state
+        return outputs.last_hidden_state, position_ids
 
     def _sample_async_next_token(
         self,
         state: _MiniCPMOAsyncTalkerState,
         hidden_state: torch.Tensor,
-    ) -> torch.Tensor:
-        logits = self.head_code[0](hidden_state).reshape(1, -1).to(dtype=torch.float32)
-        logits = logits / self._async_sampling_temperature
+    ) -> tuple[torch.Tensor, dict[str, Any], dict[str, torch.Tensor]]:
+        raw_logits = self.head_code[0](hidden_state).reshape(1, -1).to(dtype=torch.float32)
+        sampling_logits = raw_logits.clone()
+        if self._async_sampling_do_sample:
+            temperature = max(float(self._async_sampling_temperature), 1e-5)
+            sampling_logits = sampling_logits / temperature
 
         if state.all_generated_tokens:
-            generated = torch.cat(state.all_generated_tokens, dim=1).to(device=logits.device, dtype=torch.long)
+            generated = torch.cat(state.all_generated_tokens, dim=1).to(device=sampling_logits.device, dtype=torch.long)
             for processor in self._async_logits_processors:
-                logits = processor(generated, logits)
+                sampling_logits = processor(generated, sampling_logits)
             for warper in self._async_logits_warpers:
-                logits = warper(generated, logits)
+                sampling_logits = warper(generated, sampling_logits)
+        else:
+            generated = None
 
-        probs = torch.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-        return next_token.reshape(1, 1).to(dtype=torch.long)
+        probs = torch.softmax(sampling_logits, dim=-1)
+        greedy_token = torch.argmax(sampling_logits, dim=-1, keepdim=True)
+        if self._async_sampling_do_sample:
+            generator = self._get_async_sampling_generator(state, device=probs.device)
+            next_token = torch.multinomial(probs, num_samples=1, generator=generator)
+        else:
+            next_token = greedy_token
+
+        trace = {
+            "sampling_do_sample": bool(self._async_sampling_do_sample),
+            "temperature": float(self._async_sampling_temperature),
+            "top_p": float(self._async_sampling_top_p),
+            "top_k": int(self._async_sampling_top_k),
+            "min_p": float(self._async_sampling_min_p),
+            "repetition_penalty": float(self._async_sampling_repetition_penalty),
+            "seed": self._async_sampling_seed,
+            "generated_token_count_before": int(0 if generated is None else generated.shape[1]),
+            "generated_token_tail": (
+                []
+                if generated is None or generated.numel() == 0
+                else [int(tok) for tok in generated[0, -16:].tolist()]
+            ),
+            "raw_top_tokens": _topk_logits_summary(raw_logits, torch.softmax(raw_logits, dim=-1), self._async_debug_top_logprobs),
+            "sample_top_tokens": _topk_logits_summary(sampling_logits, probs, self._async_debug_top_logprobs),
+            "greedy_token_id": int(greedy_token.reshape(-1)[0].item()),
+            "sampled_token_id": int(next_token.reshape(-1)[0].item()),
+            "sample_matches_greedy": bool(
+                int(greedy_token.reshape(-1)[0].item()) == int(next_token.reshape(-1)[0].item())
+            ),
+        }
+        tensor_payload = {
+            "raw_logits": raw_logits.detach(),
+            "sampling_logits": sampling_logits.detach(),
+            "probs": probs.detach(),
+        }
+        return next_token.reshape(1, 1).to(dtype=torch.long), trace, tensor_payload
 
     def _top_up_async_token_buffer(
         self,
@@ -727,7 +1139,14 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
             if state.pending_condition_chunks:
                 condition_chunk = state.pending_condition_chunks.pop(0)
                 condition = condition_chunk.tensor.to(device=device, dtype=dtype, non_blocking=True)
-                inputs_embeds = condition.unsqueeze(0)
+                condition_pieces = [condition]
+                if condition_chunk.text_finished:
+                    condition_pieces.append(self._get_text_eos_embed(device=device, dtype=dtype))
+                if state.last_generated_token is None:
+                    condition_pieces.append(self._get_audio_bos_embed(device=device, dtype=dtype))
+                inputs_embeds = torch.cat(condition_pieces, dim=0).unsqueeze(0)
+                input_kind = "condition"
+                input_audio_token_id = None
                 state.current_condition_index = int(condition_chunk.index)
                 state.current_condition_shape = [1, int(condition.shape[0]), int(condition.shape[1])]
                 state.current_condition_text_finished = bool(condition_chunk.text_finished)
@@ -748,10 +1167,34 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
                     break
                 inputs_embeds = self.embed_input_ids(state.last_generated_token.reshape(-1)).reshape(1, 1, -1)
                 inputs_embeds = inputs_embeds.to(device=device, dtype=dtype)
+                input_kind = "audio_feedback"
+                input_audio_token_id = int(state.last_generated_token.reshape(-1)[0].item())
 
-            hidden_states = self._forward_async_hf_chunk(state, inputs_embeds)
-            next_token = self._sample_async_next_token(state, hidden_states[:, -1:, :])
+            step_index = int(state.debug_decode_step_index)
+            state.debug_decode_step_index = step_index + 1
+            cache_len_before = self._async_cache_length(state.past_key_values)
+            text_start_pos_before = int(state.text_start_pos)
+            hidden_states, position_ids = self._forward_async_hf_chunk(state, inputs_embeds)
+            cache_len_after = self._async_cache_length(state.past_key_values)
+            text_start_pos_after = int(state.text_start_pos)
+            next_token, sample_trace, sample_tensors = self._sample_async_next_token(state, hidden_states[:, -1:, :])
             token_id = int(next_token.reshape(-1)[0].item())
+            decode_tensor_dump_dir: str | None = None
+            if (
+                self._async_debug_dump_decode_tensor_steps < 0
+                or step_index < int(self._async_debug_dump_decode_tensor_steps)
+            ):
+                decode_tensor_dump_dir = self._dump_async_decode_step_tensors(
+                    state,
+                    step_index=step_index,
+                    input_kind=input_kind,
+                    inputs_embeds=inputs_embeds,
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    raw_logits=sample_tensors["raw_logits"],
+                    sampling_logits=sample_tensors["sampling_logits"],
+                    probs=sample_tensors["probs"],
+                )
 
             state.last_generated_token = next_token.detach().to(device=device, dtype=torch.long)
             state.all_generated_tokens.append(state.last_generated_token.clone())
@@ -761,6 +1204,29 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
                 None if state.current_condition_shape is None else list(state.current_condition_shape)
             )
             state.pending_audio_token_text_finished.append(bool(state.current_condition_text_finished))
+            self._append_async_debug_event(
+                state,
+                file_name="talker_decode_steps.jsonl",
+                payload={
+                    "step_index": step_index,
+                    "input_kind": input_kind,
+                    "input_audio_token_id": input_audio_token_id,
+                    "input_embeds_shape": list(inputs_embeds.shape),
+                    "condition_index": state.current_condition_index,
+                    "condition_shape": state.current_condition_shape,
+                    "condition_text_finished": bool(state.current_condition_text_finished),
+                    "pending_condition_queue_size_after_pop": int(len(state.pending_condition_chunks)),
+                    "pending_audio_token_buffer_size_after_append": int(len(state.pending_audio_token_ids)),
+                    "cache_len_before": int(cache_len_before),
+                    "cache_len_after": int(cache_len_after),
+                    "text_start_pos_before": int(text_start_pos_before),
+                    "text_start_pos_after": int(text_start_pos_after),
+                    "hidden_state_shape": list(hidden_states.shape),
+                    "decode_tensor_dump_dir": decode_tensor_dump_dir,
+                    "sampled_token_id": int(token_id),
+                    **sample_trace,
+                },
+            )
             if token_id == self._async_eos_token_id:
                 state.stream_finished = True
                 break
@@ -803,8 +1269,10 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
             dev = input_ids.device
             is_async_chunk = bool(getattr(self.vllm_config.model_config, "async_chunk", False))
             include_text_eos = True
+            include_audio_bos = True
             if is_async_chunk:
-                include_text_eos = self._info_flag(info_dict.get("finished", False))
+                include_text_eos = False
+                include_audio_bos = False
 
             is_first_prefill = not isinstance(prompt_embeds_buf, torch.Tensor) or prompt_embeds_buf.ndim != 2
             if is_first_prefill:
@@ -812,7 +1280,7 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
                     self.prepare_condition_inputs(
                         info_dict,
                         include_text_eos=include_text_eos,
-                        include_audio_bos=True,
+                        include_audio_bos=include_audio_bos,
                     )
                     .detach()
                     .to("cpu")
