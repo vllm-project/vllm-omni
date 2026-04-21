@@ -60,35 +60,17 @@ class SupportsStepExecution(Protocol):
 
 @runtime_checkable
 class SupportsModuleOffload(Protocol):
-    """Declares which submodules participate in sequential CPU offload.
+    """Declares which submodules participate in CPU offload.
 
-    The offload system uses mutual exclusion: when one group runs,
-    the other is moved to CPU.  Pipelines must declare both groups
-    because only the pipeline knows its own architecture.
+    All attribute names support dotted paths for nested submodules
+    (e.g. ``"pipe.transformer"``).
 
-    ``_dit_modules``: attribute names of denoising submodules (kept
-    on GPU during the diffusion loop).
-
-    ``_encoder_modules``: attribute names of encoder/vision
-    submodules (offloaded to CPU during the diffusion loop).
-
-    ``_vae_modules``: attribute names of VAE(s) (always kept on GPU,
-    not part of the mutual exclusion hooks).
-
-    ``_resident_modules``: attribute names of small submodules that
-    must stay on GPU during layer-wise offloading (e.g. embedders,
-    connectors).  Optional — defaults to ``[]``.
-
-    All attribute names support dotted paths (e.g.
-    ``"bagel.time_embedder"``) for nested submodules.
-
-    Example::
-
-        class MyPipeline(nn.Module, SupportsModuleOffload):
-            _dit_modules: ClassVar[list[str]] = ["transformer"]
-            _encoder_modules: ClassVar[list[str]] = ["text_encoder", "vit"]
-            _vae_modules: ClassVar[list[str]] = ["vae"]
-            _resident_modules: ClassVar[list[str]] = ["time_embedder"]
+    Attributes:
+        _dit_modules: Denoising submodules (on GPU during diffusion).
+        _encoder_modules: Encoder submodules (offloaded during diffusion).
+        _vae_modules: VAE(s) (always on GPU).
+        _resident_modules: Extra modules pinned on GPU during layerwise
+            offloading.  Optional, defaults to ``[]``.
     """
 
     _dit_modules: ClassVar[list[str]]

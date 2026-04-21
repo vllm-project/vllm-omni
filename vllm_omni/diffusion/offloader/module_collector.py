@@ -63,13 +63,8 @@ class ModuleDiscovery:
     ) -> tuple[list[nn.Module], list[str]]:
         """Resolve attribute names to (module, name) pairs, skipping missing.
 
-        Dotted names (e.g. ``"pipe.transformer"``) are resolved by
-        walking the attribute chain via :func:`operator.attrgetter`.
-
-        When *warn_missing* is True (protocol path), warn about
-        declared attributes that do not exist.  Non-``nn.Module``
-        attributes always produce a warning regardless (they indicate
-        a real bug, even in the fallback scan).
+        Supports dotted paths via :func:`operator.attrgetter`.
+        Warns on missing attributes when *warn_missing* is True.
         """
         modules: list[nn.Module] = []
         names: list[str] = []
