@@ -86,10 +86,30 @@ _AUDIO_BOS_INDEX_DEFAULT = 151670  # <|audio_bos|>
 _AUDIO_EOS_INDEX_DEFAULT = 151671  # <|audio_eos|>
 _AUDIO_PAD_TOKEN_ID = 151672       # <|audio_pad|>
 
-# Sampling defaults for the CRQ side (ref: utils/constant.py DEFAULT_SP_GEN_KWARGS).
-_DEFAULT_CRQ_DO_SAMPLE = False
+# Sampling defaults for the CRQ side. Ref DEFAULT_S2M_GEN_KWARGS:
+# do_sample=True, temperature=0.8, top_p=0.9, repetition_penalty=1.2.
+# Greedy CRQ (do_sample=False) gets stuck on a single codebook index after
+# ~25 tokens and produces silence — verified via scripts/run_native_infer_s2s.py.
+_DEFAULT_CRQ_DO_SAMPLE = True
+_DEFAULT_CRQ_TEMPERATURE = 0.8
+_DEFAULT_CRQ_TOP_P = 0.9
+_DEFAULT_CRQ_REPETITION_PENALTY = 1.2
 _DEFAULT_TEXT_GREEDY = True
 _DEFAULT_FORCE_TEXT_ABOS = True  # S2S turns always need to start in speech mode
+
+
+def _make_default_crq_logits_processor():
+    from transformers.generation.logits_process import (
+        LogitsProcessorList,
+        RepetitionPenaltyLogitsProcessor,
+        TemperatureLogitsWarper,
+        TopPLogitsWarper,
+    )
+    return LogitsProcessorList([
+        RepetitionPenaltyLogitsProcessor(_DEFAULT_CRQ_REPETITION_PENALTY),
+        TemperatureLogitsWarper(_DEFAULT_CRQ_TEMPERATURE),
+        TopPLogitsWarper(_DEFAULT_CRQ_TOP_P),
+    ])
 
 
 # ─── Multi-modal processing ──────────────────────────────────────────────────
@@ -462,9 +482,11 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         self._last_crq_tokens = None
 
         if ntokens > 1:
-            # Prefill: (re)initialize CRQ state for this request.
+            # Prefill: (re)initialize CRQ state for this request, including
+            # the ref-default sampling config so the CRQ stream doesn't
+            # degenerate under greedy argmax.
             self._crq_state = CRQState(
-                logits_processor=LogitsProcessorList(),
+                logits_processor=_make_default_crq_logits_processor(),
                 do_sample=_DEFAULT_CRQ_DO_SAMPLE,
                 speech_ids=torch.empty(1, 0, dtype=torch.long, device=device),
             )
