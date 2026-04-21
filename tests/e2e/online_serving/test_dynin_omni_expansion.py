@@ -15,7 +15,7 @@ from vllm.assets.image import ImageAsset
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
@@ -24,7 +24,7 @@ MODEL = "snu-aidas/Dynin-Omni"
 STAGE_CONFIG = str(Path(__file__).parent.parent / "stage_configs" / "dynin_omni_ci.yaml")
 
 T2I_PROMPT = "A high quality detailed living room interior photo."
-T2A_PROMPT = "Please read this sentence naturally: Hello from Dynin-Omni online serving."
+T2S_PROMPT = "Please read this sentence naturally: Hello from online serving."
 I2I_PROMPT = "Transform this outdoor nature boardwalk scene into a painting style with vivid colors."
 
 TEST_PARAMS = [OmniServerParams(model=MODEL, stage_config_path=STAGE_CONFIG, stage_init_timeout=600)]
@@ -36,7 +36,7 @@ def _build_t2i_messages(prompt: str) -> list[dict]:
     return [{"role": "user", "content": [{"type": "text", "text": f"<|t2i|> {prompt}"}]}]
 
 
-def _build_t2a_messages(prompt: str) -> list[dict]:
+def _build_t2s_messages(prompt: str) -> list[dict]:
     return [{"role": "user", "content": [{"type": "text", "text": f"<|t2s|> {prompt}"}]}]
 
 
@@ -83,10 +83,11 @@ def test_send_t2i_request_001(omni_server, openai_client) -> None:
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
-def test_send_t2a_request_001(omni_server, openai_client) -> None:
+def test_send_t2s_request_001(omni_server, openai_client) -> None:
     request_config = {
         "model": omni_server.model,
-        "messages": _build_t2a_messages(T2A_PROMPT),
+        "messages": _build_t2s_messages(T2S_PROMPT),
         "modalities": ["audio"],
+        "audio_ref_text": T2S_PROMPT,
     }
-    openai_client.send_diffusion_request(request_config)
+    openai_client.send_omni_request(request_config)

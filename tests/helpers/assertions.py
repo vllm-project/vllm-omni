@@ -12,13 +12,11 @@ import soundfile as sf
 from PIL import Image
 
 from tests.helpers.media import (
-    convert_audio_bytes_to_text,
     cosine_similarity_text,
 )
 
 _GENDER_PIPELINE = None
 _GENDER_PIPELINE_LOCK = threading.Lock()
-_WHISPER_SAMPLE_RATE_HZ = 16_000
 _PCM_SPEECH_SAMPLE_RATE_HZ = 24_000
 _MIN_PCM_SPEECH_HNR_DB = 1.0
 _PRESET_VOICE_GENDER_MAP: dict[str, str] = {
@@ -110,86 +108,15 @@ def assert_video_diffusion_response(
         )
 
 
-def _prepare_audio_waveform_for_whisper(audio_data: np.ndarray, samplerate: int) -> np.ndarray:
-    """Normalize decoded audio into a mono 16 kHz float32 waveform for Whisper."""
-    if samplerate <= 0:
-        raise ValueError(f"Invalid audio sample rate: {samplerate}")
-
-    waveform = np.asarray(audio_data, dtype=np.float32)
-    if waveform.ndim == 0:
-        raise ValueError("Audio waveform must have at least one dimension")
-    if waveform.ndim > 1:
-        waveform = np.mean(waveform, axis=1)
-    if waveform.size == 0:
-        raise ValueError("Empty audio waveform")
-
-    if samplerate != _WHISPER_SAMPLE_RATE_HZ:
-        target_num_samples = max(int(round(waveform.shape[0] * _WHISPER_SAMPLE_RATE_HZ / samplerate)), 1)
-        source_positions = np.arange(waveform.shape[0], dtype=np.float64)
-        target_positions = np.linspace(
-            0.0,
-            max(waveform.shape[0] - 1, 0),
-            num=target_num_samples,
-            dtype=np.float64,
-        )
-        waveform = np.interp(target_positions, source_positions, waveform).astype(np.float32)
-
-    return np.ascontiguousarray(np.clip(waveform, -1.0, 1.0), dtype=np.float32)
-
-
-def _transcribe_audio_bytes_adapted(raw_bytes: bytes) -> str:
-    """Pre-normalize raw bytes then call :func:`convert_audio_bytes_to_text` once."""
-    data, samplerate = sf.read(io.BytesIO(raw_bytes), dtype="float32", always_2d=True)
-    audio_waveform = _prepare_audio_waveform_for_whisper(data, samplerate)
-    wav_buf = io.BytesIO()
-    sf.write(wav_buf, audio_waveform, _WHISPER_SAMPLE_RATE_HZ, format="WAV", subtype="PCM_16")
-    return convert_audio_bytes_to_text(wav_buf.getvalue())
-
-
 def assert_audio_diffusion_response(
     response,
     request_config: dict[str, Any],
     run_level: str = None,
 ) -> None:
     """
-    Validate audio from diffusion ``response.audios`` and/or omni ``response.audio_bytes``.
-
-    Transcription adapts raw bytes to mono 16 kHz WAV first, then calls
-    :func:`~tests.helpers.media.convert_audio_bytes_to_text`.
+    Validate audio diffusion response.
     """
-    audios = getattr(response, "audios", None)
-    modalities = request_config.get("modalities", ["text", "audio"])
-
-    if audios is not None:
-        assert len(audios) > 0, "No audio in diffusion response"
-
-    if run_level not in {"advanced_model", "full_model"}:
-        return
-
-    def _validate_transcript(transcript: str) -> None:
-        assert transcript.strip(), "No audio output is generated (empty Whisper transcript)"
-        print(f"audio content is: {transcript}")
-
-        word_types = ["text", "image", "audio", "video"]
-        keywords_dict = request_config.get("key_words", {})
-        if "text" not in modalities:
-            for word_type in word_types:
-                keywords = keywords_dict.get(word_type)
-                if keywords:
-                    audio_lower = transcript.lower()
-                    assert any(str(kw).lower() in audio_lower for kw in keywords), (
-                        "The output does not contain any of the keywords."
-                    )
-
-        if "text" in modalities and "audio" in modalities and getattr(response, "text_content", None) is not None:
-            similarity = cosine_similarity_text(transcript.lower(), response.text_content.lower())
-            assert similarity is not None and similarity > 0.9, "The audio content is not same as the text"
-            print(f"similarity is: {similarity}")
-
-    if "audio" in modalities and audios is not None:
-        transcript = _transcribe_audio_bytes_adapted(audios)
-        _validate_transcript(transcript)
-        return
+    raise NotImplementedError("Audio validation is not implemented yet")
 
 
 def _maybe_int(value: Any) -> int | None:
@@ -483,6 +410,7 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
     modalities = request_config.get("modalities", ["text", "audio"])
 
     if run_level in {"advanced_model", "full_model"}:
+        # Verify output success
         if "audio" in modalities:
             assert response.audio_content is not None, "No audio output is generated"
             print(f"audio content is: {response.audio_content}")
@@ -492,22 +420,44 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                     response.audio_bytes,
                     speaker,
                 )
-
         if "text" in modalities:
             assert response.text_content is not None, "No text output is generated"
             print(f"text content is: {response.text_content}")
 
-        # Verify image description
+        # Verify keywords in output
         word_types = ["text", "image", "audio", "video"]
         keywords_dict = request_config.get("key_words", {})
-        if "text" in modalities:
-            for word_type in word_types:
-                keywords = keywords_dict.get(word_type)
+        for word_type in word_types:
+            keywords = keywords_dict.get(word_type)
+            if "text" in modalities:
                 if keywords:
                     text_lower = response.text_content.lower()
                     assert any(str(kw).lower() in text_lower for kw in keywords), (
                         "The output does not contain any of the keywords."
                     )
+            else:
+                if keywords:
+                    audio_lower = response.audio_content.lower()
+                    assert any(str(kw).lower() in audio_lower for kw in keywords), (
+                        "The output does not contain any of the keywords."
+                    )
+
+        # Verify similarity (Whisper transcript vs streamed/detokenized text)
+        if "audio" in modalities:
+            audio_ref_text = request_config.get("audio_ref_text")
+            if "text" in modalities:
+                assert response.similarity is not None and response.similarity > 0.9, (
+                    "The audio content is not same as the text"
+                )
+                print(f"similarity is: {response.similarity}")
+            if audio_ref_text:
+                audio_similarity = cosine_similarity_text(
+                    response.audio_content.lower(),
+                    str(audio_ref_text).lower(),
+                )
+                assert audio_similarity > 0.9, (
+                    f"The audio content does not match reference text: similarity={audio_similarity:.3f}"
+                )
 
 
 def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str) -> None:
