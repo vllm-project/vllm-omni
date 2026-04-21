@@ -4,8 +4,11 @@ Qwen3-Omni reliability integration tests.
 
 from __future__ import annotations
 
+import concurrent.futures
+import http.client
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -114,6 +117,17 @@ def _stage_config_path_from_omni_server(omni_server: _HasServeArgs) -> str | Non
         if arg.startswith("--stage-configs-path="):
             return arg.split("=", 1)[1]
     return None
+
+
+def _get_health_raw(host: str, port: int, *, timeout_sec: int = 20) -> tuple[int, bytes]:
+    """GET /health with stdlib HTTP client; returns (status, body)."""
+    conn = http.client.HTTPConnection(host, port, timeout=timeout_sec)
+    try:
+        conn.request("GET", "/health")
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
 
 
 QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, DEPLOY_CONFIGS_DIR)
@@ -242,6 +256,109 @@ def test_reliability_fault_process_kill_request_failure(
         assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
     else:
         pytest.fail("expected request failure after process-kill injection")
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@pytest.mark.parametrize(
+    "fault_injector",
+    [
+        pytest.param(
+            make_process_kill_fault_injector(
+                grep_patterns="VLLM::Worker",
+                signal_name="SIGKILL",
+                limit=1,
+                post_kill_wait_seconds=2.0,
+            ),
+            id="runtime_process_chain",
+        ),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+def test_reliability_fault_process_kill_health_unhealthy(
+    omni_server_after_fault_function,
+) -> None:
+    """Black-box: after runtime process kill, /health should report unhealthy."""
+    host = omni_server_after_fault_function.host
+    port = omni_server_after_fault_function.port
+    deadline = time.monotonic() + 20.0
+    last_observation = ""
+    while time.monotonic() < deadline:
+        try:
+            status, body = _get_health_raw(host, port, timeout_sec=5)
+            last_observation = f"http={status}, body={body[:200]!r}"
+            if status == 503:
+                return
+        except Exception as exc:  # noqa: BLE001
+            last_observation = f"exception={exc!r}"
+        time.sleep(0.5)
+    pytest.fail(f"expected /health to become 503 after fault injection, got {last_observation}")
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@pytest.mark.parametrize(
+    "fault_injector",
+    [
+        pytest.param(
+            make_process_kill_fault_injector(
+                grep_patterns="VLLM::Worker",
+                signal_name="SIGKILL",
+                limit=1,
+                post_kill_wait_seconds=2.0,
+            ),
+            id="runtime_process_chain",
+        ),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+def test_reliability_fault_process_kill_concurrent_requests_no_hang(
+    omni_server_after_fault_function,
+) -> None:
+    """Black-box: concurrent requests should finish within timeout after fault."""
+    host = omni_server_after_fault_function.host
+    port = omni_server_after_fault_function.port
+    payload = json.dumps(
+        {
+            "model": omni_server_after_fault_function.model,
+            "messages": [{"role": "user", "content": "What is the capital of China? Answer in one word."}],
+            "stream": False,
+            "modalities": ["text"],
+        }
+    )
+    start = time.monotonic()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(
+                post_chat_completions_raw,
+                host,
+                port,
+                payload,
+                timeout_sec=20,
+            )
+            for _ in range(4)
+        ]
+        done, pending = concurrent.futures.wait(
+            futures,
+            timeout=30,
+            return_when=concurrent.futures.ALL_COMPLETED,
+        )
+
+    elapsed = time.monotonic() - start
+    assert not pending, f"some fault-time requests hung: pending={len(pending)}"
+    assert elapsed < 30, f"fault-time request convergence is too slow: {elapsed:.2f}s"
+
+    fault_observed = False
+    for future in done:
+        try:
+            status, _ = future.result()
+            if status >= 500:
+                fault_observed = True
+        except Exception:
+            fault_observed = True
+    assert fault_observed, "expected at least one request to fail after process-kill fault injection"
 
 
 @pytest.mark.slow
