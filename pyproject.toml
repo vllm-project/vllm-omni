@@ -62,6 +62,51 @@ demo = [
     "gradio>=6.7.0",
 ]
 
+# Fun-Audio-Chat-8B S2S reference + vllm-omni port dependencies.
+# Exact pins captured from a known-good .venv used to produce clean S2S
+# audio (design/IMPLEMENTATION-STATUS.md). Run:
+#   uv lock --extra fun-audio-chat-ref
+#   uv sync --frozen --extra fun-audio-chat-ref
+# to recreate the environment bit-for-bit.
+fun-audio-chat-ref = [
+    # vllm is intentionally excluded from the top-level dynamic deps (see
+    # setup.py comment) because its console_scripts overlap with vllm-omni's.
+    # Pin it here so `uv sync --extra fun-audio-chat-ref` produces a working
+    # server env. Use `vllm-omni serve ...` at the CLI, not `vllm serve ...`.
+    "vllm==0.19.1",
+    # Pin torch/torchaudio to the build that works against this box's driver
+    # (CUDA 12.4). torch 2.11 resolves to +cu130 and misses libcusparseLt.so.0
+    # which isn't provided by CUDA 12.4.
+    "torch==2.10.0",
+    "torchaudio==2.10.0",
+    "accelerate==1.12.0",
+    "conformer==0.3.2",
+    "diffusers==0.37.1",
+    "hydra-core==1.3.2",
+    "hyperpyyaml==1.2.2",
+    "inflect==7.3.1",
+    "librosa==0.11.0",
+    "lightning==2.2.4",
+    "loguru==0.7.3",
+    # matcha-tts is loaded from src/funaudiochat/third_party/CosyVoice/third_party/Matcha-TTS
+    # via PYTHONPATH at runtime; we don't install the PyPI package because it
+    # pins gradio==3.43.2 which conflicts with the demo extra's gradio>=6.7.
+    "modelscope==1.36.1",
+    # numpy: reference repo pins <2.0.0 but vllm 0.19 → opencv-python-headless
+    # ≥4.13 wants numpy≥2. Leave unpinned; uv will pick a compatible version.
+    "omegaconf==2.3.0",
+    "onnxruntime==1.23.2",
+    "onnxruntime-gpu==1.18.0",
+    "openai-whisper==20250625",
+    "pyarrow==23.0.1",
+    "pyworld==0.3.5",
+    "scipy==1.15.3",
+    "soundfile==0.13.1",
+    "transformers==5.5.4",
+    "wetext==0.1.2",
+    "x-transformers==2.18.8",
+]
+
 # Seed-TTS serve benchmark WER (BytedanceSpeech/seed-tts-eval run_wer.py protocol).
 seed-tts-eval = [
     "jiwer>=3.0.0",
@@ -86,6 +131,33 @@ docs = [
     "regex",
     "ruff",
     "pydantic",
+]
+
+
+[tool.uv]
+# fun-audio-chat-ref: the reference CosyVoice + onnxruntime-gpu 1.18 stack
+# was compiled against numpy 1.x. Force numpy<2 and an older
+# opencv-python-headless that's compatible with it; vllm's stated
+# opencv-python-headless>=4.13 constraint is too strict (0.19.1 runs fine
+# on older opencv in practice).
+override-dependencies = [
+    "numpy<2",
+    "opencv-python<4.13",
+    "opencv-python-headless<4.13",
+]
+
+# dev and seed-tts-eval bring in deps that genuinely need numpy>=2 (opencv
+# 4.13, funasr). Declare them mutually exclusive with fun-audio-chat-ref
+# so `uv lock` resolves per-extra.
+conflicts = [
+    [
+        { extra = "dev" },
+        { extra = "fun-audio-chat-ref" },
+    ],
+    [
+        { extra = "seed-tts-eval" },
+        { extra = "fun-audio-chat-ref" },
+    ],
 ]
 
 

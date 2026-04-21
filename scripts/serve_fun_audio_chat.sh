@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Start vllm-omni server for Fun-Audio-Chat-8B S2S.
+# Start vllm-omni server for Fun-Audio-Chat-8B S2S via `uv run`.
+#
+# The env is defined by pyproject.toml + uv.lock. No need to pre-activate a
+# .venv; `uv run --extra fun-audio-chat-ref` resolves the right interpreter
+# and deps from the lockfile.
 #
 # Usage:
 #   ./scripts/serve_fun_audio_chat.sh
@@ -18,17 +22,6 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
-# ─── venv ─────────────────────────────────────────────────────────────────────
-if [[ -z "${VIRTUAL_ENV:-}" ]]; then
-    if [[ -f "$REPO/.venv/bin/activate" ]]; then
-        # shellcheck disable=SC1091
-        source "$REPO/.venv/bin/activate"
-    else
-        echo "No .venv found at $REPO/.venv — activate your env first." >&2
-        exit 1
-    fi
-fi
-
 # ─── config ───────────────────────────────────────────────────────────────────
 : "${PORT:=8091}"
 : "${HOST:=0.0.0.0}"
@@ -40,7 +33,8 @@ fi
 
 export FUN_AUDIO_COSYVOICE_PATH FUN_AUDIO_VOCODER_PATH
 export FUN_AUDIO_REF_PATH="$REPO/src/funaudiochat"
-# Let CosyVoice's own Python + Matcha-TTS deps resolve.
+# Reference CosyVoice + Matcha-TTS are source-only (no PyPI install); extend
+# PYTHONPATH so Stage-1 token2wav can import them at runtime.
 export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$FUN_AUDIO_COSYVOICE_PATH:$FUN_AUDIO_COSYVOICE_PATH/third_party/Matcha-TTS:$FUN_AUDIO_REF_PATH"
 
 # ─── sanity ───────────────────────────────────────────────────────────────────
@@ -51,7 +45,7 @@ export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$FUN_AUDIO_COSYVOICE_PATH:$FUN_AUD
 
 cat <<INFO
 ================================================================================
-vllm-omni Fun-Audio-Chat-8B S2S server
+vllm-omni Fun-Audio-Chat-8B S2S server (uv-managed env)
   model        : $FUN_AUDIO_CKPT
   stage config : $STAGE_CONFIG
   vocoder      : $FUN_AUDIO_VOCODER_PATH
@@ -61,11 +55,16 @@ vllm-omni Fun-Audio-Chat-8B S2S server
 INFO
 
 # ─── serve ────────────────────────────────────────────────────────────────────
-exec vllm-omni serve "$FUN_AUDIO_CKPT" \
-    --stage-configs-path "$STAGE_CONFIG" \
-    --host "$HOST" \
-    --port "$PORT" \
-    --trust-remote-code \
-    --enforce-eager \
-    --omni \
-    $EXTRA_ARGS
+exec uv run \
+    --extra fun-audio-chat-ref \
+    --index-strategy unsafe-best-match \
+    --frozen \
+    -- \
+    vllm-omni serve "$FUN_AUDIO_CKPT" \
+        --stage-configs-path "$STAGE_CONFIG" \
+        --host "$HOST" \
+        --port "$PORT" \
+        --trust-remote-code \
+        --enforce-eager \
+        --omni \
+        $EXTRA_ARGS
