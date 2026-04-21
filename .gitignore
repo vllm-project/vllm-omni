@@ -265,3 +265,10 @@ vllm_omni/_version.py
 *.wav
 # CI overlay yamls materialized from tests/utils.py:_CI_OVERLAYS at test time
 tests/.ci_generated/
+
+# Fun-Audio-Chat reference clone, kept for side-by-side parity tests only
+/src/funaudiochat/
+# Downloaded model weights
+/pretrained_models/
+# Reference inference outputs
+/saves/
