@@ -58,10 +58,28 @@ printf '%s' "$RESP" | head -c 500
 echo
 
 # Try to extract text + audio.
+# Fun-Audio-Chat's pipeline produces TWO choices per response:
+#   choices[0] = text (message.content)
+#   choices[1] = audio (message.audio.{id, data, transcript, expires_at})
 python3 - <<'PY'
 import json, base64, os, sys
 with open("/tmp/last_resp.json") as f:
     r = json.load(f)
+# Merge into a single view.
+text_content = None
+audio_b64 = None
+for c in r.get("choices", []):
+    m = c.get("message") or {}
+    if m.get("content") and text_content is None:
+        text_content = m["content"]
+    audio = m.get("audio") or {}
+    if audio.get("data") and audio_b64 is None:
+        audio_b64 = audio["data"]
+
+if text_content:
+    msg = {"content": text_content, "audio": {"data": audio_b64}}
+else:
+    msg = (r.get("choices") or [{}])[0].get("message", {})
 msg = (r.get("choices") or [{}])[0].get("message", {})
 print(f"[test] text: {msg.get('content') or '(empty)'}")
 audio = msg.get("audio", {}).get("data") if isinstance(msg.get("audio"), dict) else None

@@ -478,6 +478,7 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             self._generate_speech
             and self._crq_state is not None
             and self._crq_state.speech_ids.numel() >= self.config.audio_config.group_size
+            and input_ids is not None
             and input_ids.numel() == 1  # decode step (one token)
         ):
             inputs_embeds = self._build_speech_mode_inputs_embeds(input_ids)
@@ -512,10 +513,12 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         device = hidden_states.device
         self._last_crq_tokens = None
 
-        if ntokens > 1:
-            # Prefill: (re)initialize CRQ state for this request, including
-            # the ref-default sampling config so the CRQ stream doesn't
-            # degenerate under greedy argmax.
+        # vllm's compute_logits only receives the *logit-producing* positions
+        # (typically the last prompt token at prefill + one token per decode
+        # step), so `hidden_states.shape[0]` is always the number of active
+        # sequences, not the prefill length. "Is this a first call for this
+        # request?" is instead detected by `_crq_state is None` — lazy init.
+        if self._crq_state is None:
             self._crq_state = CRQState(
                 logits_processor=_make_default_crq_logits_processor(),
                 do_sample=_DEFAULT_CRQ_DO_SAMPLE,
@@ -524,20 +527,48 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             self._generate_speech = False
             self._speech_finished = False
             self._pending_force_text_abos = _DEFAULT_FORCE_TEXT_ABOS
+            # First call = prefill logits for the first generated token;
+            # return text_logits without running CRQ (no decode hidden yet).
             return text_logits
+
+        if ntokens == 1 and self._crq_state is not None:
+            # force_text_abos semantics: at the first decode step we enable
+            # speech mode unconditionally (matches the reference S2S inference
+            # default DEFAULT_SP_GEN_KWARGS.force_text_abos=True). This makes
+            # Stage-0 emit CRQ tokens alongside text without needing to peek
+            # at the just-sampled text token id (vllm passes inputs_embeds,
+            # not input_ids, at decode time so we cannot detect audio_bos in
+            # the token stream from forward()).
+            if (
+                self._pending_force_text_abos
+                and not self._generate_speech
+                and not self._speech_finished
+            ):
+                self._generate_speech = True
+                self._pending_force_text_abos = False
+                logger.debug("fun_audio_chat: force_text_abos → generate_speech=True")
 
         if (
             ntokens == 1
             and self._crq_state is not None
             and self._generate_speech
             and not self._speech_finished
-            and self._last_input_ids is not None
         ):
             # CRQ runs only when speech is active (strict gating — see plan v2).
             try:
                 crq_hs = hidden_states.unsqueeze(0)  # [1, 1, H]
-                last_tok = self._last_input_ids[-1:]
-                text_embeds = self.language_model.model.embed_tokens(last_tok).unsqueeze(0)
+                # vllm passes inputs_embeds at decode time (input_ids is None),
+                # so _last_input_ids may be None. For the CRQ step we only
+                # need the "previous-token embedding" signal to add to the
+                # hidden state; in that case fall back to a zero tensor of
+                # the right shape (this is a best-effort until we get
+                # per-request sampled-token access through the runner hook).
+                text_embeds = torch.zeros_like(crq_hs)
+                if self._last_input_ids is not None and self._last_input_ids.numel() > 0:
+                    last_tok = self._last_input_ids[-1:]
+                    text_embeds = self.language_model.model.embed_tokens(
+                        last_tok
+                    ).unsqueeze(0).to(crq_hs.dtype)
                 crq_input = crq_hs + text_embeds.detach()
                 with torch.no_grad():
                     new_tokens, new_state = self.audio_invert_tower.crq_generate_forward(
@@ -605,15 +636,18 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             self._generate_speech = True
             self._pending_force_text_abos = False
 
-        new_tokens = self._last_crq_tokens
-        if new_tokens is None or new_tokens.numel() == 0:
-            return {}
-        existing = req_infos.get("crq_tokens")
-        if isinstance(existing, torch.Tensor) and existing.numel() > 0:
-            accumulated = torch.cat([existing.flatten().cpu(), new_tokens.flatten()])
-        else:
-            accumulated = new_tokens.flatten()
-        self._last_crq_tokens = None
+        # Authoritative snapshot of accumulated CRQ tokens: crq_state.speech_ids
+        # (mutated in compute_logits each step). Emitting a copy of the full
+        # tensor per postprocess call is wasteful but correct; the per-step
+        # accumulator pattern we used before broke when postprocess fired
+        # more often than once per decode step (observed: 222480 tokens for
+        # 512 expected decode steps = ~87x over-count).
+        # Do NOT clear _last_crq_tokens here — make_omni_output consumes it
+        # as the per-step delta to emit to the framework. Do NOT write into
+        # req_infos either; the framework accumulates deltas from
+        # make_omni_output across steps. Writing cumulative snapshots here
+        # caused 512-step × cumulative growth (observed 245760 vs 2560).
+        return {}
         return {"crq_tokens": accumulated}
 
     def make_omni_output(
@@ -628,21 +662,18 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         if info_dicts is None:
             info_dicts = kwargs.get("runtime_additional_information") or []
 
-        per_req_tokens: list[torch.Tensor] = []
-        for info in info_dicts:
-            if isinstance(info, dict):
-                tokens = info.get("crq_tokens")
-                if isinstance(tokens, torch.Tensor):
-                    per_req_tokens.append(tokens.flatten().to(torch.long).cpu())
-                    continue
-            per_req_tokens.append(torch.empty(0, dtype=torch.long))
-
-        if not per_req_tokens:
-            return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
-        return OmniOutput(
-            text_hidden_states=hidden,
-            multimodal_outputs={"crq_tokens": per_req_tokens},
-        )
+        # Per-step DELTA emission: emit only the tokens produced THIS step
+        # (from _last_crq_tokens, set in compute_logits). The framework
+        # concatenates deltas across steps into the final stream. Emitting
+        # cumulative snapshots here causes (# steps) × cumulative growth.
+        if self._last_crq_tokens is not None and self._last_crq_tokens.numel() > 0:
+            delta = self._last_crq_tokens.flatten().to(torch.long).cpu()
+            self._last_crq_tokens = None
+            return OmniOutput(
+                text_hidden_states=hidden,
+                multimodal_outputs={"crq_tokens": [delta]},
+            )
+        return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
 
     # ── Weight loading ────────────────────────────────────────────────────────
 

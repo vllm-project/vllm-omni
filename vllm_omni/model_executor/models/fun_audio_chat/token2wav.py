@@ -128,6 +128,10 @@ class FunAudioChatToken2Wav(nn.Module):
             if wav.dim() == 1:
                 wav = wav.unsqueeze(0)  # [1, T]
             sr = torch.tensor(self._cosyvoice3.sample_rate, dtype=torch.int32)
+            logger.info(
+                "FunAudioChatToken2Wav.forward: synthesised wav shape=%s sr=%d",
+                tuple(wav.shape), int(sr.item()),
+            )
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={"audio": [wav.cpu()], "sr": [sr]},
