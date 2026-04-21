@@ -494,7 +494,6 @@ def test_speaker_001(omni_server, openai_client) -> None:
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-@pytest.mark.skip(reason="Known issue: occasional inaccuracy in voice recognition.")
 def test_speaker_002(omni_server, openai_client) -> None:
     """
     Input Modal: text only (one-word answer constraint).
