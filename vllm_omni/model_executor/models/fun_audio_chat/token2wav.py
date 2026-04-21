@@ -96,10 +96,22 @@ class FunAudioChatToken2Wav(nn.Module):
         )
 
         # Short-circuit dummy/empty inputs BEFORE loading CosyVoice. vllm's
-        # worker warmup (_dummy_run) calls forward() with a fake 0-filled
-        # input; we must not trigger the multi-GB CosyVoice load there.
+        # worker warmup (_dummy_run) feeds raw-token stages a non-empty tensor
+        # of dummy IDs (all zeros). Those tokens pass the later 0<=t<6561
+        # codebook filter, so a naive `numel()==0` check does NOT exclude them
+        # and CosyVoice ends up loading + running during warmup. Detect:
+        #   a) truly empty input
+        #   b) all-zero input (dummy-run pattern)
+        # Any real CRQ stream will contain a mix of non-zero codebook indices
+        # almost immediately; a stream that is all zeros is never a real
+        # generation from our decoder (reference greedy emits BOS=6561 first).
         if input_ids is None or input_ids.numel() == 0:
             logger.warning("FunAudioChatToken2Wav: empty input_ids — returning empty audio")
+            return empty_out
+        if bool((input_ids == 0).all().item()):
+            logger.debug(
+                "FunAudioChatToken2Wav: all-zero input (dummy warmup) — skipping CosyVoice load"
+            )
             return empty_out
 
         # Now it's a real request — lazy-load CosyVoice3.

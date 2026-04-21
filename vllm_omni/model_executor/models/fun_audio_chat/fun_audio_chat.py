@@ -375,7 +375,7 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         group_size = audio_cfg.group_size
         pad_id = audio_cfg.pad_token_id
 
-        # Normalize input: we want a list of per-audio [num_mel_bins, T] tensors.
+        # Normalize input: per-audio [num_mel_bins, T] tensors + matching masks.
         if isinstance(input_features, (list, tuple)):
             feats = [
                 f.squeeze(0) if f.dim() == 3 else f for f in input_features
@@ -383,12 +383,36 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         else:
             feats = [input_features[i] for i in range(input_features.size(0))]
 
+        # Whisper pads features to max_length (30 s = 3000 frames). Using
+        # feat.shape[-1] directly makes every clip look like 30 s and yields
+        # ~150 fused embeddings for a 1 s clip while _get_prompt_updates only
+        # allocates 5 <|AUDIO|> placeholders — masked_scatter mismatch, prefill
+        # embeds are garbage. Derive the true length from feature_attention_mask
+        # (Whisper's mel-level mask, one entry per mel frame) when available.
+        masks: list[torch.Tensor | None]
+        if feature_attention_mask is not None:
+            if isinstance(feature_attention_mask, (list, tuple)):
+                masks = list(feature_attention_mask)
+            else:
+                masks = [feature_attention_mask[i] for i in range(feature_attention_mask.size(0))]
+        else:
+            masks = [None] * len(feats)
+
         results: list[torch.Tensor] = []
-        for feat in feats:
+        for feat, mask in zip(feats, masks):
             # feat: [num_mel_bins, T_mel]
             if feat.dim() == 1:
                 feat = feat.unsqueeze(0)
-            feature_lens = torch.tensor([feat.shape[-1]], device=feat.device)
+            if mask is not None:
+                real_len = int(mask.sum().item())
+            else:
+                real_len = feat.shape[-1]
+            feature_lens = torch.tensor([real_len], device=feat.device)
+            # Trim feat to the real length so the encoder never sees Whisper's
+            # zero-padded tail (the encoder's own chunking would otherwise emit
+            # junk tokens from padded frames that our placeholder count can't
+            # account for).
+            feat = feat[:, :real_len].contiguous()
             aftercnn_lens, output_lens = self.continuous_audio_tower._get_feat_extract_output_lengths(
                 feature_lens
             )
