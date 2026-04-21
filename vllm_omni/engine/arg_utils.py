@@ -6,11 +6,12 @@ import tempfile
 from dataclasses import dataclass, field, fields
 from typing import Any
 
-from vllm.engine.arg_utils import EngineArgs
+from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
 
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.engine.output_modality import OutputModality
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.plugins import load_omni_general_plugins
 
 logger = init_logger(__name__)
@@ -139,11 +140,30 @@ class OmniEngineArgs(EngineArgs):
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
+    subtalker_sampling_params: dict[str, Any] | None = None
     async_chunk: bool = False
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     worker_type: str | None = None
     task_type: str | None = None
+    worker_cls: str = None
+    enable_sleep_mode: bool = False
+    omni: bool = False
+
+    @classmethod
+    def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+        try:
+            parser.add_argument("--omni", action="store_true", default=False, help="Enable Omni engine features.")
+        except argparse.ArgumentError:
+            pass
+        try:
+            parser.add_argument(
+                "--enable-sleep-mode", action="store_true", default=False, help="Enable GPU memory pool for sleep mode."
+            )
+        except argparse.ArgumentError:
+            pass
+        return parser
+
     omni_master_address: str | None = None
     omni_master_port: int | None = None
     stage_configs_path: str | None = None
@@ -152,6 +172,11 @@ class OmniEngineArgs(EngineArgs):
     custom_pipeline_args: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.worker_cls is None:
+            if self.worker_type == "ar":
+                self.worker_cls = current_omni_platform.get_omni_ar_worker_cls()
+            elif self.worker_type == "generation":
+                self.worker_cls = current_omni_platform.get_omni_generation_worker_cls()
         load_omni_general_plugins()
         super().__post_init__()
 
@@ -291,10 +316,20 @@ class OmniEngineArgs(EngineArgs):
             hf_config_name=self.hf_config_name,
             custom_process_next_stage_input_func=self.custom_process_next_stage_input_func,
             stage_connector_config=stage_connector_config,
+            subtalker_sampling_params=self.subtalker_sampling_params,
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,
         )
         return omni_config
+
+
+@dataclass
+class OmniAsyncEngineArgs(AsyncEngineArgs, OmniEngineArgs):
+    @classmethod
+    def add_cli_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+        parser = AsyncEngineArgs.add_cli_args(parser)
+        parser = OmniEngineArgs._add_omni_specific_args(parser)
+        return parser
 
     @property
     def output_modality(self) -> OutputModality:

@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 async def run_streaming(inputs, sampling_params_list, model_name, args, output_dir):
     async_omni = AsyncOmni(
         model=model_name,
-        stage_configs_path=args.stage_configs_path,
+        deploy_config=args.deploy_config,
         log_stats=args.log_stats,
     )
 
@@ -192,7 +192,7 @@ def run_non_streaming(inputs, sampling_params_list, model_name, args, output_dir
     llm = Omni(
         model=model_name,
         log_stats=args.log_stats,
-        stage_configs_path=args.stage_configs_path,
+        deploy_config=args.deploy_config,
     )
 
     if args.profiling_mode:
@@ -253,10 +253,11 @@ def parse_args() -> Namespace:
         help="Directory to write output wav files.",
     )
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         type=str,
         default=None,
-        help="Path to stage configs YAML. Auto-resolved from model if not set.",
+        help="Override the deploy config path. If unset, auto-loads "
+        "vllm_omni/deploy/voxtral_tts.yaml based on the HF model_type.",
     )
     parser.add_argument(
         "--num-prompts", type=int, default=1, help="Number of replicate prompts to run for measuring performance"

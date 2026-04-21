@@ -166,6 +166,8 @@ class Omni(OmniBase):
                     logger.warning("[Omni] Received output for unknown/finished request_id=%s", req_id)
                     continue
 
+                self._check_engine_output_error(msg, req_id, stage_id)
+
                 if req_state.metrics is None:
                     continue
                 output_to_yield = self._process_single_result(
