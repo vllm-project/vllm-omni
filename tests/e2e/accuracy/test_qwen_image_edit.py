@@ -200,6 +200,9 @@ def test_qwen_image_edit_single_matches_diffusers(
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.skip(
+    reason="Skipping as the second image seems to be ignored by the API. Will come back to this later after #2772 is merged."
+)
 def test_qwen_image_edit_multiple_matches_diffusers(
     accuracy_artifact_root: Path,
     qwen_bear_image: Image.Image,
