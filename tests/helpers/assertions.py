@@ -446,10 +446,14 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
         if "audio" in modalities:
             audio_ref_text = request_config.get("audio_ref_text")
             if "text" in modalities:
-                assert response.similarity is not None and response.similarity > 0.9, (
-                    "The audio content is not same as the text"
+                transcript = (response.audio_content or "").strip()
+                text_output = (response.text_content or "").strip()
+                similarity = cosine_similarity_text(
+                    transcript.lower(),
+                    text_output.lower(),
                 )
-                print(f"similarity is: {response.similarity}")
+                assert similarity > 0.9, "The audio content is not same as the text"
+                print(f"similarity is: {similarity}")
             if audio_ref_text:
                 audio_similarity = cosine_similarity_text(
                     response.audio_content.lower(),
