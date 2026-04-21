@@ -32,6 +32,7 @@ class DMD2PipelineMixin:
             num_train_timesteps=1000,
             shift=1.0,
             dmd2_timesteps=self.dmd2_config.resolve_timesteps(),
+            stochastic_sampling=(self.dmd2_config.solver == "sde"),
         )
 
     def _sanitize_dmd2_request(self, req: OmniDiffusionRequest) -> None:
@@ -65,6 +66,14 @@ class DMD2PipelineMixin:
 
         sp.do_classifier_free_guidance = False
         sp.is_cfg_negative = False
+
+        # defense: strip scheduler-override extra_args that would let the base pipeline
+        # (e.g. Wan22Pipeline.forward) rebuild self.scheduler mid-forward and clobber DMD2EulerScheduler.
+        extra_args = getattr(sp, "extra_args", None) or {}
+        for key in ("sample_solver", "flow_shift"):
+            if key in extra_args:
+                logger.warning("DMD2: ignoring extra_args.%s.", key)
+                extra_args.pop(key)
 
         fixed = []
         for p in req.prompts:

@@ -10,8 +10,14 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 class DMD2EulerScheduler(FlowMatchEulerDiscreteScheduler):
     """Euler scheduler that always uses the fixed DMD2 training timestep schedule."""
 
-    def __init__(self, *args, dmd2_timesteps: list[int], **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        *args,
+        dmd2_timesteps: list[int],
+        stochastic_sampling: bool = False,
+        **kwargs,
+    ):
+        super().__init__(*args, stochastic_sampling=stochastic_sampling, **kwargs)
         self._dmd2_timesteps = dmd2_timesteps
 
     def set_timesteps(

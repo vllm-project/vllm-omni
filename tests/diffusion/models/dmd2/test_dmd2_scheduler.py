@@ -83,6 +83,27 @@ def test_forward_timesteps_match_dmd2_schedule(pipeline):
     assert pipeline.scheduler.timesteps.long().tolist() == _DMD2_TIMESTEPS
 
 
+def test_default_solver_is_ode(pipeline):
+    """Default dmd2_config.solver is 'ode' → scheduler.stochastic_sampling is False."""
+    assert pipeline.dmd2_config.solver == "ode"
+    assert pipeline.scheduler.config.stochastic_sampling is False
+
+
+def test_sde_solver_plumbed_to_scheduler():
+    """solver='sde' in model_index → scheduler.stochastic_sampling is True."""
+    from vllm_omni.diffusion.models.dmd2 import DMD2Config
+    from vllm_omni.diffusion.models.schedulers import DMD2EulerScheduler
+
+    cfg = DMD2Config.from_model_index({"dmd2_config": {"solver": "sde"}})
+    scheduler = DMD2EulerScheduler(
+        num_train_timesteps=1000,
+        shift=1.0,
+        dmd2_timesteps=cfg.resolve_timesteps(),
+        stochastic_sampling=(cfg.solver == "sde"),
+    )
+    assert scheduler.config.stochastic_sampling is True
+
+
 def test_forward_timesteps_idempotent_across_calls(pipeline):
     """Successive forward() calls must not cause scheduler state to drift."""
     parent = _DMD2_BASE[type(pipeline)]

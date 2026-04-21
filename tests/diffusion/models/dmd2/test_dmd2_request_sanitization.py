@@ -164,6 +164,35 @@ def test_multiple_prompts_all_sanitized(pipeline):
 # ---------------------------------------------------------------------------
 
 
+def test_sample_solver_stripped_from_extra_args(pipeline):
+    """[C1] defense: sample_solver must not leak into req for the base pipeline to read."""
+    req = _make_request()
+    req.sampling_params.extra_args = {"sample_solver": "euler"}
+    pipeline._sanitize_dmd2_request(req)
+    assert "sample_solver" not in req.sampling_params.extra_args
+
+
+def test_flow_shift_stripped_from_extra_args(pipeline):
+    """[C1] defense: flow_shift must not leak into req for the base pipeline to read."""
+    req = _make_request()
+    req.sampling_params.extra_args = {"flow_shift": 3.0}
+    pipeline._sanitize_dmd2_request(req)
+    assert "flow_shift" not in req.sampling_params.extra_args
+
+
+def test_unrelated_extra_args_preserved(pipeline):
+    """Sanitizer only strips sample_solver / flow_shift; other extras pass through."""
+    req = _make_request()
+    req.sampling_params.extra_args = {"sample_solver": "euler", "unrelated": 42}
+    pipeline._sanitize_dmd2_request(req)
+    assert req.sampling_params.extra_args == {"unrelated": 42}
+
+
+# ---------------------------------------------------------------------------
+# Clean request — nothing changes
+# ---------------------------------------------------------------------------
+
+
 def test_clean_request_no_changes(pipeline):
     req = _make_request(
         guidance_scale=pipeline.dmd2_config.guidance_scale,
