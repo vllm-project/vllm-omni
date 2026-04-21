@@ -14,6 +14,7 @@ import numpy as np
 import PIL.Image
 import torch
 from vllm.logger import init_logger
+from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
@@ -122,7 +123,7 @@ class DiffusionEngine:
         if output.aborted:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
-            raise RuntimeError(f"{output.error}")
+            raise RuntimeError(output.error)
         logger.info("Generation completed successfully.")
 
         if output.output is None:
@@ -358,6 +359,8 @@ class DiffusionEngine:
                 sched_req_id = sched_output.scheduled_req_ids[0]
                 try:
                     runner_output = self.execute_fn(sched_output)
+                except EngineDeadError:
+                    raise
                 except Exception as exc:
                     logger.error("Execution failed for diffusion request %s", sched_req_id, exc_info=True)
                     runner_output = RunnerOutput(

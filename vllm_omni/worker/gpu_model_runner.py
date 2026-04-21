@@ -1355,10 +1355,22 @@ class OmniGPUModelRunner(GPUModelRunner):
         req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
         last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
         text_step = self.text_step.gpu[:num_tokens_padded]
+        subtalker_params = getattr(self.vllm_config.model_config, "subtalker_sampling_params", None)
+        if not isinstance(subtalker_params, dict):
+            subtalker_params = {}
         with set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
-            req_embeds, code_predictor_codes = self.talker_mtp(req_input_ids, req_embeds, last_talker_hidden, text_step)
+            req_embeds, code_predictor_codes = self.talker_mtp(
+                req_input_ids,
+                req_embeds,
+                last_talker_hidden,
+                text_step,
+                do_sample=subtalker_params.get("do_sample"),
+                temperature=subtalker_params.get("temperature"),
+                top_k=subtalker_params.get("top_k"),
+                top_p=subtalker_params.get("top_p"),
+            )
         # code_predictor_codes stays on GPU here; _update_intermediate_buffer
         # keeps it device-resident when the key is in gpu_resident_buffer_keys.
         # D2H is deferred to sample_tokens where hidden_states.to("cpu") already

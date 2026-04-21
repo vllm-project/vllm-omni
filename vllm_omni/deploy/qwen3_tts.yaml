@@ -43,6 +43,11 @@ stages:
       max_tokens: 4096
       seed: 42
       repetition_penalty: 1.05
+    subtalker_sampling_params:
+      do_sample: true
+      temperature: 0.9
+      top_k: 50
+      top_p: 1.0
 
   - stage_id: 1
     max_num_seqs: 1

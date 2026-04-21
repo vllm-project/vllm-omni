@@ -940,6 +940,36 @@ class TestQwen3TTSPipeline:
         # Stage 1 uses its per-stage override
         assert stages[1].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
 
+    def test_subtalker_sampling_params_deep_merge_preserves_base_keys(self):
+        """Verify subtalker sampling params participate in stage deep-merge."""
+        from vllm_omni.config.stage_config import _deep_merge_stage
+
+        base = {
+            "stage_id": 0,
+            "subtalker_sampling_params": {
+                "do_sample": True,
+                "temperature": 0.9,
+                "top_k": 50,
+                "top_p": 1.0,
+            },
+        }
+        overlay = {
+            "stage_id": 0,
+            "subtalker_sampling_params": {
+                "temperature": 0.7,
+                "top_k": 32,
+            },
+        }
+
+        merged = _deep_merge_stage(base, overlay)
+
+        assert merged["subtalker_sampling_params"] == {
+            "do_sample": True,
+            "temperature": 0.7,
+            "top_k": 32,
+            "top_p": 1.0,
+        }
+
 
 class TestBaseConfigInheritance:
     """Test deploy YAML base_config inheritance."""
