@@ -19,7 +19,7 @@ from tests.dfx.conftest import (
     resolve_oom_device_spec,
     wait_chat_request_ready,
 )
-from tests.dfx.reliability.conftest import (
+from tests.dfx.reliability.helpers import (
     force_remove_container,
     inject_gpu_oom,
     list_remote_process_pids_by_pattern,

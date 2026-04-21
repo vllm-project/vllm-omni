@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from tests.dfx.reliability.conftest import list_remote_process_pids_by_pattern, post_chat_completions_raw
+from tests.dfx.reliability.helpers import list_remote_process_pids_by_pattern, post_chat_completions_raw
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import modify_stage_config
 from vllm_omni.platforms import current_omni_platform
