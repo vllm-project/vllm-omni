@@ -470,6 +470,26 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         # Save raw input_ids for compute_logits (needed for text_embed = E[last_tok])
         self._last_input_ids = input_ids
 
+        # Request-boundary reset: `forward` with multi-token input_ids / inputs_embeds
+        # means we're prefilling a new request (`num_computed_tokens==0`). On a
+        # long-lived worker the module-level `_crq_state` from the previous
+        # request's final decode step would otherwise leak into the new request
+        # (stale KV cache + speech_ids + _speech_finished). Reset here so the
+        # lazy-init in compute_logits creates a fresh state for this request.
+        # BS=1 only; BS>=1 must thread state through model_intermediate_buffer
+        # (plan O6).
+        is_prefill = False
+        if input_ids is not None and input_ids.numel() > 1:
+            is_prefill = True
+        elif inputs_embeds is not None and inputs_embeds.dim() >= 2 and inputs_embeds.shape[0] > 1:
+            is_prefill = True
+        if is_prefill:
+            self._crq_state = None
+            self._generate_speech = False
+            self._speech_finished = False
+            self._pending_force_text_abos = _DEFAULT_FORCE_TEXT_ABOS
+            self._last_crq_tokens = None
+
         # Decode-time feedback: once speech is active and we have >=group_size
         # accumulated speech tokens, replace the text embedding with
         # (text_emb + audio_tower(last group_size speech_ids)) / 2 for this
@@ -575,17 +595,27 @@ class FunAudioChatForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                         crq_input, self._crq_state
                     )
                 self._crq_state = new_state
-                # Detect audio EOS: any sub-token equals crq_eos_token_id.
-                finish = (new_tokens == self._crq_eos_token_id).any()
-                if finish:
+                # Detect audio EOS. If any of the group_size subtokens is
+                # crq_eos_token_id, truncate the whole group at the first EOS
+                # and stop speech generation. Reference semantics: subtokens
+                # after EOS in the same group are pad/eos fill, NOT valid
+                # codebook ids; keeping them would make the vocoder render
+                # spurious noise after the intended stop.
+                flat = new_tokens.flatten()
+                eos_mask = (flat == self._crq_eos_token_id)
+                if eos_mask.any():
+                    first_eos = int(eos_mask.nonzero(as_tuple=False)[0, 0].item())
+                    flat = flat[:first_eos]
                     self._speech_finished = True
-                else:
-                    # Append only the new group of 5 to speech_ids history.
+                if flat.numel() > 0:
                     self._crq_state.speech_ids = torch.cat(
-                        [self._crq_state.speech_ids.to(device), new_tokens.long()],
+                        [
+                            self._crq_state.speech_ids.to(device),
+                            flat.view(1, -1).long(),
+                        ],
                         dim=-1,
                     )
-                self._last_crq_tokens = new_tokens.flatten().detach().to(
+                self._last_crq_tokens = flat.detach().to(
                     dtype=torch.long, device="cpu"
                 )
             except Exception as exc:

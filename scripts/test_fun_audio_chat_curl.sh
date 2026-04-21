@@ -76,11 +76,10 @@ for c in r.get("choices", []):
     if audio.get("data") and audio_b64 is None:
         audio_b64 = audio["data"]
 
-if text_content:
-    msg = {"content": text_content, "audio": {"data": audio_b64}}
+if text_content or audio_b64:
+    msg = {"content": text_content, "audio": {"data": audio_b64} if audio_b64 else None}
 else:
     msg = (r.get("choices") or [{}])[0].get("message", {})
-msg = (r.get("choices") or [{}])[0].get("message", {})
 print(f"[test] text: {msg.get('content') or '(empty)'}")
 audio = msg.get("audio", {}).get("data") if isinstance(msg.get("audio"), dict) else None
 out = os.environ.get("OUT_WAV", "/tmp/fac_serve_reply.wav")
