@@ -34,7 +34,6 @@ class _InFlightChunk:
     """One chunk of an active request, tracked through the temporal pipeline."""
 
     chunk_idx: int               
-    step_index: int = 0         
     in_pipeline: bool = True     # currently flowing through ranks (True between admission and exit)
     entered_rank0_at: int = -1   # micro-step at which the chunk last entered rank 0
 
@@ -151,7 +150,7 @@ class StreamBatchScheduler(_BaseScheduler):
         # 1. Try to re-admit a returning chunk (FIFO oldest-first across requests).
         for progress in self._chunk_progress.values():
             for chunk in progress.in_flight:
-                if not chunk.in_pipeline and chunk.step_index < progress.num_steps:
+                if not chunk.in_pipeline:
                     chunk.in_pipeline = True
                     chunk.entered_rank0_at = self._global_micro_step
                     return  # rank 0 is now taken
@@ -161,7 +160,6 @@ class StreamBatchScheduler(_BaseScheduler):
             if progress.chunks_admitted < progress.num_chunks:
                 new_chunk = _InFlightChunk(
                     chunk_idx=progress.chunks_admitted,
-                    step_index=0,
                     in_pipeline=True,
                     entered_rank0_at=self._global_micro_step,
                 )
@@ -185,7 +183,6 @@ class StreamBatchScheduler(_BaseScheduler):
                     assignment[r] = RankTask(
                         sched_req_id=progress.sched_req_id,
                         chunk_idx=chunk.chunk_idx,
-                        step_index=chunk.step_index,
                     )
         return assignment
 
@@ -195,9 +192,6 @@ class StreamBatchScheduler(_BaseScheduler):
         if not self._chunk_progress or sched_output.per_rank_assignment is None:
             return set()
 
-        # Read per-chunk fields from RunnerOutput (set by execute_micro_step)
-        # to advance chunk state — same pattern as StepScheduler reading
-        # step_index / finished.
         terminal: dict[str, DiffusionRequestStatus] = {}
 
         if output.chunk_idx is not None:
@@ -205,7 +199,6 @@ class StreamBatchScheduler(_BaseScheduler):
             if progress is not None:
                 chunk = self._find_chunk(progress, output.chunk_idx)
                 if chunk is not None:
-                    chunk.step_index = output.step_index
                     chunk.in_pipeline = False
                     if output.chunk_completed:
                         progress.in_flight = [

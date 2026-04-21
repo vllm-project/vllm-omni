@@ -5,6 +5,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import pickle
 from collections import namedtuple
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -21,6 +22,14 @@ logger = init_logger(__name__)
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 env_info = envs.PACKAGES_CHECKER.get_packages_info()
+
+
+@dataclass
+class _RegisteredRecvChannel:
+    """Pre-allocated recv buffer for a registered P2P channel."""
+
+    tensor_dict: dict[str, Any]
+    ordered_tensors: list[tuple[str, torch.Tensor]]
 
 
 def _split_tensor_dict(
@@ -122,6 +131,9 @@ class GroupCoordinator:
         assert self.device_group is not None
 
         self.device = current_omni_platform.get_torch_device(local_rank)
+
+        # Registered recv buffers for zero-metadata P2P channels.
+        self._recv_channels: dict[str, _RegisteredRecvChannel] = {}
 
     @property
     def first_rank(self):
@@ -500,6 +512,87 @@ class GroupCoordinator:
                 _update_nested_dict(tensor_dict, key, value)
 
         return tensor_dict, handles, []
+
+    def register_recv_channel(
+        self,
+        name: str,
+        tensor_specs: list[tuple[str, torch.Size, torch.dtype, str]],
+    ) -> None:
+        """Pre-allocate recv buffers for a channel. Local only, no comm.
+
+        Each spec is ``(flattened_key, shape, dtype, device_type)``;
+        ``device_type`` is ``"cpu"`` or any type accepted by ``torch.device``
+        (the coordinator's device is used for non-cpu types).
+        """
+        tensor_dict: dict[str, Any] = {}
+        ordered: list[tuple[str, torch.Tensor]] = []
+        for key, shape, dtype, device_type in tensor_specs:
+            device = torch.device("cpu") if device_type == "cpu" else self.device
+            tensor = torch.empty(shape, dtype=dtype, device=device)
+            _update_nested_dict(tensor_dict, key, tensor)
+            ordered.append((key, tensor))
+        self._recv_channels[name] = _RegisteredRecvChannel(tensor_dict=tensor_dict, ordered_tensors=ordered)
+
+    def isend_registered(
+        self,
+        name: str,
+        tensor_dict: dict[str, torch.Tensor | Any],
+        dst: int | None = None,
+    ) -> list[torch.distributed.Work]:
+        """NCCL-only isend — no metadata handshake. ``name`` is a label for
+        symmetry with ``irecv_registered``; peer must have registered the
+        matching recv channel with the same name and specs.
+
+        Caller must ``.wait()`` each returned handle before reusing the source tensors.
+        """
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return []
+
+        if dst is None:
+            dst = self.group_next_rank
+        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+
+        _, tensor_list = _split_tensor_dict(tensor_dict)
+
+        handles: list[torch.distributed.Work] = []
+        for tensor in tensor_list:
+            if tensor.numel() == 0:
+                continue
+            group = self.cpu_group if tensor.is_cpu else self.device_group
+            handle = torch.distributed.isend(tensor, dst=self.ranks[dst], group=group)
+            if tensor.is_cuda:
+                tensor.record_stream(torch.cuda.current_stream(tensor.device))
+            handles.append(handle)
+        return handles
+
+    def irecv_registered(
+        self,
+        name: str,
+        src: int | None = None,
+    ) -> tuple[dict[str, torch.Tensor | Any], list[torch.distributed.Work], list]:
+        """NCCL-only irecv into the pre-allocated buffer for a registered channel.
+
+        Returns ``(tensor_dict, handles, postproc)`` compatible with
+        ``AsyncLatents`` / ``AsyncIntermediateTensors``. Same buffer dict is
+        returned on every call — caller resolves the wrapper before the next
+        ``irecv_registered`` on the same channel overwrites it (``sync_pp_send``
+        invariant on the recv side).
+        """
+        channel = self._recv_channels[name]
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return channel.tensor_dict, [], []
+
+        if src is None:
+            src = self.group_prev_rank
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        handles: list[torch.distributed.Work] = []
+        for _, tensor in channel.ordered_tensors:
+            if tensor.numel() == 0:
+                continue
+            group = self.cpu_group if tensor.is_cpu else self.device_group
+            handles.append(torch.distributed.irecv(tensor, src=self.ranks[src], group=group))
+        return channel.tensor_dict, handles, []
 
     def send_tensor_dict(
         self,

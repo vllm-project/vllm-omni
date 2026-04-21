@@ -184,7 +184,7 @@ class RunnerOutput:
     finished: bool = False
     result: DiffusionOutput | None = None
 
-    # ── Temporal-PP micro-step fields (set by execute_micro_step) ──
+    # ── Temporal-PP micro-step fields ──
     chunk_idx: int | None = None
     chunk_completed: bool = False
 

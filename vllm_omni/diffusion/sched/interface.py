@@ -108,14 +108,10 @@ class CachedRequestData:
 
 @dataclass
 class RankTask:
-    """One ``(request, chunk, step_index)`` triple assigned to a single PP rank for one micro-step.
-
-    Used by ``StreamBatchScheduler`` to tell each rank which work to perform in the current micro-step.
-    """
+    """Used by ``StreamBatchScheduler`` to tell each rank which work to perform in the current micro-step."""
 
     sched_req_id: str
     chunk_idx: int
-    step_index: int
 
 
 @dataclass
