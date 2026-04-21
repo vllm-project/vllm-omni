@@ -782,6 +782,8 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
         self.device = current_omni_platform.get_torch_device(local_rank)
 
+        self._recv_channels: dict[str, _RegisteredRecvChannel] = {}
+
         self.recv_buffer_set: bool = False
         self.recv_tasks_queue: list[tuple[str, int]] = []
         self.receiving_tasks: list[tuple[torch.distributed.Work, str, int]] = []
