@@ -12,6 +12,7 @@ from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 from vllm.v1.worker.utils import request_memory
 from vllm.v1.worker.workspace import init_workspace_manager
 
+from vllm_omni.diffusion.data import OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.worker.base import OmniGPUWorkerBase
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.mixins import OmniWorkerMixin
@@ -104,3 +105,23 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
+
+    def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK:
+        """
+        Explicitly handle sleep commands.
+        Calls the implementation in the base class OmniGPUWorkerBase.
+        """
+        logger.debug(f"[AR Worker {self.rank}] Resolving handle_sleep_task dispatch")
+        if isinstance(task, dict):
+            task = OmniSleepTask(**task)
+        return super().handle_sleep_task(task)
+
+    def handle_wake_task(self, task: OmniWakeTask | dict) -> OmniACK:
+        """
+        Explicitly handle wake-up commands.
+        Calls the implementation in the base class OmniGPUWorkerBase.
+        """
+        logger.debug(f"[AR Worker {self.rank}] Resolving handle_wake_task dispatch")
+        if isinstance(task, dict):
+            task = OmniWakeTask(**task)
+        return super().handle_wake_task(task)
