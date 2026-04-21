@@ -9,8 +9,8 @@ import socket
 import subprocess
 import sys
 import tempfile
-import time
 import threading
+import time
 from collections.abc import Generator
 from dataclasses import dataclass
 from io import BytesIO
