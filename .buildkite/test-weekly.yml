@@ -9,7 +9,7 @@ steps:
     depends_on: upload-weekly-pipeline
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
     steps:
-      - label: ":calendar: DFX Reliability · Wan22"
+      - label: ":calendar: DFX Reliability"
         commands:
           - timeout 25m pytest -s -v tests/dfx/reliability/ -m "slow"
         agents:
