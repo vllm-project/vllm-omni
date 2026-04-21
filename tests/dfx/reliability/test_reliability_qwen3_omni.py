@@ -30,7 +30,6 @@ from tests.dfx.reliability.helpers import (
 )
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
 from tests.helpers.runtime import dummy_messages_from_mix_data
-from tests.helpers.mark import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
 RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
@@ -223,7 +222,9 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_funct
     indirect=True,
 )
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_process_kill_request_failure(omni_server_after_fault_function, openai_client_function) -> None:
+def test_reliability_fault_process_kill_request_failure(
+    omni_server_after_fault_function, openai_client_function
+) -> None:
     messages = dummy_messages_from_mix_data(
         system_prompt=_get_system_prompt(),
         content_text="What is the capital of China? Answer in 20 words.",

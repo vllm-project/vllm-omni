@@ -18,7 +18,6 @@ from tests.dfx.conftest import (
 )
 from tests.dfx.reliability.helpers import inject_gpu_oom, make_process_kill_fault_injector, stop_gpu_oom_hogs
 from tests.helpers.media import generate_synthetic_image
-from tests.helpers.mark import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
 RELIABILITY_SCENARIOS: list[dict[str, Any]] = [

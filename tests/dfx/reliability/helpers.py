@@ -13,7 +13,6 @@ import http.client
 import json
 import logging
 import os
-import psutil
 import select
 import shlex
 import signal
@@ -27,6 +26,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import psutil
 import pytest
 
 FaultVariant = str
@@ -397,11 +397,7 @@ def _runtime_teardown_ssh_target() -> str:
 
 def _runtime_teardown_ssh_cmd(remote_cmd: str, *, step: str | None = None) -> subprocess.CompletedProcess[str]:
     ssh_target = _runtime_teardown_ssh_target()
-    default_reuse_opts = (
-        "-o ControlMaster=auto "
-        "-o ControlPersist=10m "
-        "-o ControlPath=/tmp/vllm-rt-ssh-%r@%h:%p"
-    )
+    default_reuse_opts = "-o ControlMaster=auto -o ControlPersist=10m -o ControlPath=/tmp/vllm-rt-ssh-%r@%h:%p"
     raw_opts = os.getenv("RUNTIME_TEARDOWN_SSH_OPTS", "").strip()
     ssh_opts = shlex.split(raw_opts or default_reuse_opts)
     timeout_sec = int(os.getenv("RUNTIME_TEARDOWN_SSH_TIMEOUT_SEC", "600"))
@@ -422,8 +418,7 @@ def _runtime_teardown_ssh_cmd(remote_cmd: str, *, step: str | None = None) -> su
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
-            f"{step_prefix} timed out after {timeout_sec}s. "
-            "Increase RUNTIME_TEARDOWN_SSH_TIMEOUT_SEC if needed."
+            f"{step_prefix} timed out after {timeout_sec}s. Increase RUNTIME_TEARDOWN_SSH_TIMEOUT_SEC if needed."
         ) from exc
     print(f"{step_prefix} exit_code={out.returncode}", flush=True)
     return out
@@ -609,7 +604,7 @@ def start_runtime_teardown_container_server(
         logs = _runtime_teardown_ssh_cmd(
             (
                 f"docker exec {shlex.quote(container_name)} bash -lc "
-                f"\"tail -n 200 {shlex.quote(serve_log_path)} 2>/dev/null || "
+                f'"tail -n 200 {shlex.quote(serve_log_path)} 2>/dev/null || '
                 f"echo '[no-serve-log-file] {shlex.quote(serve_log_path)}'\""
             ),
             step="docker-exec-tail-serve-log",

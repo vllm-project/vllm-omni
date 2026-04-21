@@ -96,7 +96,9 @@ def extract_server_args_by_test_name(configs: list[dict[str, Any]]) -> dict[str,
     return mapping
 
 
-def create_reliability_omni_server_params(configs: list[dict[str, Any]], stage_configs_dir: Path) -> list[OmniServerParams]:
+def create_reliability_omni_server_params(
+    configs: list[dict[str, Any]], stage_configs_dir: Path
+) -> list[OmniServerParams]:
     adjusted_configs = configs_with_platform_stage_configs(configs)
     unique_params = create_unique_server_params(adjusted_configs, stage_configs_dir)
     server_args_by_name = extract_server_args_by_test_name(adjusted_configs)
