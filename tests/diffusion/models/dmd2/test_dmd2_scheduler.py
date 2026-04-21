@@ -5,8 +5,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.flux.pipeline_flux import FluxDMD2Pipeline, FluxPipeline
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import LTX2Pipeline, LTX2T2VDMD2Pipeline
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_image2video import LTX2I2VDMD2Pipeline, LTX2ImageToVideoPipeline
+from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import QwenImageDMD2Pipeline, QwenImagePipeline
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, WanT2VDMD2Pipeline
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import Wan22I2VPipeline, WanI2VDMD2Pipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest, OmniDiffusionSamplingParams
@@ -22,6 +24,8 @@ _DMD2_BASE = {
     WanI2VDMD2Pipeline: Wan22I2VPipeline,
     LTX2T2VDMD2Pipeline: LTX2Pipeline,
     LTX2I2VDMD2Pipeline: LTX2ImageToVideoPipeline,
+    FluxDMD2Pipeline: FluxPipeline,
+    QwenImageDMD2Pipeline: QwenImagePipeline,
 }
 
 
@@ -49,7 +53,7 @@ def _make_request(**sp_kwargs) -> OmniDiffusionRequest:
 
 @pytest.fixture(
     params=list(_DMD2_BASE.keys()),
-    ids=["wan_t2v", "wan_i2v", "ltx2_t2v", "ltx2_i2v"],
+    ids=["wan_t2v", "wan_i2v", "ltx2_t2v", "ltx2_i2v", "flux", "qwen_image"],
 )
 def pipeline(request):
     return _make_pipeline(request.param)
