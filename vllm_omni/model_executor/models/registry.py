@@ -207,6 +207,27 @@ _OMNI_MODELS = {
         "ming_flash_omni",
         "MingFlashOmniForConditionalGeneration",
     ),
+    ## MiniCPMO4.5
+    "MiniCPMO4_5ForConditionalGeneration": (
+        "minicpmo4_5",
+        "minicpmo4_5",
+        "MiniCPMO4_5ForConditionalGeneration",
+    ),
+    "MiniCPMO4_5ThinkerForConditionalGeneration": (
+        "minicpmo4_5",
+        "minicpmo4_5_thinker",
+        "MiniCPMO4_5ThinkerForConditionalGeneration",
+    ),
+    "MiniCPMO4_5TalkerForConditionalGeneration": (
+        "minicpmo4_5",
+        "minicpmo4_5_talker",
+        "MiniCPMO4_5TalkerForConditionalGeneration",
+    ),
+    "MiniCPMO4_5Code2Wav": (
+        "minicpmo4_5",
+        "minicpmo4_5_code2wav",
+        "MiniCPMO4_5Code2Wav",
+    ),
 }
 
 

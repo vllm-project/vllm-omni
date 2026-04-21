@@ -1,0 +1,144 @@
+# Stage config scaffold for MiniCPM-o 4.5 async-chunk streaming.
+#
+# This is intentionally separate from minicpmo.yaml so the current
+# non-streaming path remains stable while we wire the async processors and
+# stateful Token2wav streaming decoder.
+
+async_chunk: true
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0"
+    engine_args:
+      model_stage: thinker
+      max_num_seqs: 1
+      model_arch: MiniCPMO4_5ForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.5
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      max_num_batched_tokens: 4096
+      mm_processor_cache_gb: 0
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.minicpmo4_5.thinker2talker_async_chunk
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    output_connectors:
+      to_stage_1: connector_stage0_to_1
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "1"
+    engine_args:
+      model_stage: talker
+      max_num_seqs: 1
+      model_arch: MiniCPMO4_5ForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.6
+      enforce_eager: false
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+      distributed_executor_backend: "mp"
+      hf_config_name: tts_config
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.minicpmo4_5.talker2code2wav_async_chunk
+    engine_input_source: [0]
+    input_connectors:
+      from_stage_0: connector_stage0_to_1
+    output_connectors:
+      to_stage_2: connector_stage1_to_2
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      detokenize: False
+      repetition_penalty: 1.05
+      stop_token_ids: [6561]
+
+  - stage_id: 2
+    stage_type: llm
+    runtime:
+      devices: "1"
+    engine_args:
+      model_stage: code2wav
+      max_num_seqs: 1
+      model_arch: MiniCPMO4_5ForConditionalGeneration
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: false
+      enable_prefix_caching: false
+      engine_output_type: audio
+      gpu_memory_utilization: 0.1
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 1000000
+      hf_config_name: tts_config
+    engine_input_source: [1]
+    final_output: true
+    final_output_type: audio
+    input_connectors:
+      from_stage_1: connector_stage1_to_2
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.1
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+
+  connectors:
+    connector_stage0_to_1:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+
+    connector_stage1_to_2:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+        codec_streaming: true
+        connector_get_sleep_s: 0.01
+        connector_get_max_wait_first_chunk: 3000
+        connector_get_max_wait: 300
+        # MiniCPM-o 4.5 Token2wav uses a 25 Hz speech tokenizer, so 25 codec
+        # tokens correspond to roughly one second of speech.
+        codec_chunk_frames: 25
+        # Native Token2wav streaming keeps its own internal state/cache, so we
+        # plan to stream only newly generated codec tokens instead of
+        # overlap-and-trim decode windows.
+        codec_left_context_frames: 0
+        initial_codec_chunk_frames: 4
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
+    - from: 1
+      to: 2
+      window_size: -1
