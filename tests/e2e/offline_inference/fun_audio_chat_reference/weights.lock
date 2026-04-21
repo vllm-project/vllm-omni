@@ -1,0 +1,12 @@
+{
+  "Fun-Audio-Chat-8B": {
+    "repo_id": "FunAudioLLM/Fun-Audio-Chat-8B",
+    "revision": "7bf72dc7c705493f817178a0859efff91e9cf73c",
+    "pinned_at": "2026-04-21"
+  },
+  "Fun-CosyVoice3-0.5B-2512": {
+    "repo_id": "FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
+    "revision": "29e01c4e8d000f4bcd70751be16fa94bf3d85a18",
+    "pinned_at": "2026-04-21"
+  }
+}

@@ -178,7 +178,7 @@ All items gated on B1 resolving. Order is load-bearing — later items depend on
 
 ## Open questions to confirm during implementation (not blockers)
 
-- **`continuous_features_mode`** — default in ref config is `"replace"` but training-code config uses `"add"`; confirmed against the actual HF `config.json` once downloaded.
+- **`continuous_features_mode`** — confirmed 2026-04-21 against `Fun-Audio-Chat-8B/config.json`: `"replace"`. Discrete encoder's `continual_output_matching` output *replaces* the group-pooled discrete embedding at the positions flagged by `feature_exist_mask`. No blending.
 - **`force_text_abos` default** — user's current yaml is BS≥1 sync, but ref `infer_s2s.py` uses `force_text_abos=True`. Plan sets it True for S2S turns; re-evaluate if multi-turn hits cases where the first turn should *not* force abos.
 - **`text_greedy` for BS>1** — ref infers with `text_greedy=True` for S2S. Works with temperature=0 + seed. Keep as default until acceptance check says otherwise.
 
