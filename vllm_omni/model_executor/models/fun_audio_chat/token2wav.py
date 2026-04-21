@@ -26,19 +26,22 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
 
-# ─── Paths (same defaults as fun_audio_chat.py) ───────────────────────────────
+# ─── Paths ────────────────────────────────────────────────────────────────────
+# Default to the reference repo clone + its CosyVoice submodule, and the
+# HF-downloaded Fun-CosyVoice3 weights checked in under pretrained_models/.
+# All three are override-able via env vars.
 _FUN_REF = os.environ.get(
     "FUN_AUDIO_REF_PATH",
     str(Path(__file__).parents[5] / "src" / "funaudiochat"),
 )
+_COSY_SRC = os.environ.get(
+    "FUN_AUDIO_COSYVOICE_PATH",
+    str(Path(_FUN_REF) / "third_party" / "CosyVoice"),
+)
 _VOCODER_PATH = os.environ.get(
     "FUN_AUDIO_VOCODER_PATH",
-    str(
-        Path(__file__).parents[5]
-        / "benchmarks/_data/_hf_cache/hub/models--FunAudioLLM--Fun-CosyVoice3-0.5B-2512"
-    ),
+    str(Path(__file__).parents[5] / "pretrained_models" / "Fun-CosyVoice3-0.5B-2512"),
 )
-_COSY_SRC = "/wbl-fast/usrs/shl/speech-data-synthesis-new/CosyVoice"
 
 
 class FunAudioChatToken2Wav(nn.Module):
