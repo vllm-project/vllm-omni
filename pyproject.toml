@@ -84,6 +84,15 @@ fun-audio-chat-ref = [
     "diffusers==0.37.1",
     "hydra-core==1.3.2",
     "hyperpyyaml==1.2.2",
+    # ruamel.yaml 0.18+ introduced composer.py max_depth check that assumes
+    # it's on the Loader subclass; hyperpyyaml 1.2.2's Loader doesn't define
+    # it, so CosyVoice3 yaml load dies with "'Loader' object has no attribute
+    # 'max_depth'". Pin <0.18 until hyperpyyaml is upgraded upstream.
+    "ruamel-yaml<0.18",
+    # Transitively imported by cosyvoice.flow.flow_matching at yaml load time
+    # (not a real download dependency in our path — we supply the model files
+    # locally — but the import must resolve).
+    "gdown",
     "inflect==7.3.1",
     "librosa==0.11.0",
     "lightning==2.2.4",
