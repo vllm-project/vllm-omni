@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import pytest
+import requests
 import torch
 
 from tests.dfx.conftest import (
@@ -128,6 +129,119 @@ def _get_health_raw(host: str, port: int, *, timeout_sec: int = 20) -> tuple[int
         return resp.status, resp.read()
     finally:
         conn.close()
+
+
+def _post_json_raw(
+    host: str,
+    port: int,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    timeout_sec: int = 30,
+) -> tuple[int, bytes]:
+    """POST JSON to one endpoint; returns (status, body)."""
+    return (
+        post_chat_completions_raw(
+            host,
+            port,
+            json.dumps(payload),
+            content_type="application/json",
+            timeout_sec=timeout_sec,
+        )
+        if path == "/v1/chat/completions"
+        else _post_json_raw_http_client(
+            host,
+            port,
+            path,
+            payload,
+            timeout_sec=timeout_sec,
+        )
+    )
+
+
+def _post_json_raw_http_client(
+    host: str,
+    port: int,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    timeout_sec: int = 30,
+) -> tuple[int, bytes]:
+    conn = http.client.HTTPConnection(host, port, timeout=timeout_sec)
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        conn.request("POST", path, body=body, headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
+def _extract_error_contract(response_body: bytes) -> dict[str, Any] | None:
+    """Best-effort parse OpenAI-style error response."""
+    try:
+        payload = json.loads(response_body.decode("utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error_obj = payload.get("error")
+    if not isinstance(error_obj, dict):
+        return None
+    if not isinstance(error_obj.get("message"), str):
+        return None
+    return error_obj
+
+
+def _create_video_job_with_invalid_lora(host: str, port: int, *, timeout_sec: int = 30) -> tuple[int, dict[str, Any]]:
+    """Create one video job expected to fail due to malformed lora payload."""
+    url = f"http://{host}:{port}/v1/videos"
+    response = requests.post(
+        url,
+        data={
+            "prompt": "qwen async failure mapping",
+            "lora": '{"name": "bad-lora"}',
+        },
+        headers={"Accept": "application/json"},
+        timeout=timeout_sec,
+    )
+    payload = response.json() if response.content else {}
+    return response.status_code, payload
+
+
+def _poll_video_job_status(
+    host: str,
+    port: int,
+    video_id: str,
+    *,
+    timeout_sec: int = 180,
+    interval_sec: float = 1.0,
+) -> tuple[int, dict[str, Any]]:
+    """Poll /v1/videos/{id} until completed/failed and return latest status+payload."""
+    url = f"http://{host}:{port}/v1/videos/{video_id}"
+    deadline = time.monotonic() + timeout_sec
+    last_status = 0
+    last_payload: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        response = requests.get(
+            url,
+            headers={"Accept": "application/json"},
+            timeout=20,
+        )
+        last_status = response.status_code
+        try:
+            payload = response.json()
+        except Exception:  # noqa: BLE001
+            payload = {"raw": response.text}
+        if isinstance(payload, dict):
+            last_payload = payload
+            if payload.get("status") in {"completed", "failed"}:
+                return last_status, payload
+        time.sleep(interval_sec)
+    raise TimeoutError(
+        f"video job {video_id} did not reach terminal status within {timeout_sec}s; "
+        f"last_status={last_status}, last_payload={json.dumps(last_payload)[:500]}"
+    )
 
 
 QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, DEPLOY_CONFIGS_DIR)
@@ -276,6 +390,47 @@ def test_reliability_fault_process_kill_request_failure(
     indirect=True,
 )
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+def test_reliability_fault_process_kill_new_request_fast_fail(
+    omni_server_after_fault_function,
+) -> None:
+    """Black-box: requests after fatal fault should fail quickly (no long blocking)."""
+    host = omni_server_after_fault_function.host
+    port = omni_server_after_fault_function.port
+    payload = {
+        "model": omni_server_after_fault_function.model,
+        "messages": [{"role": "user", "content": "Say hello in one short sentence."}],
+        "stream": False,
+        "modalities": ["text"],
+    }
+    start = time.monotonic()
+    try:
+        status, body = _post_json_raw(host, port, "/v1/chat/completions", payload, timeout_sec=20)
+        elapsed = time.monotonic() - start
+        assert elapsed < 15, f"request did not fail fast after fault: {elapsed:.2f}s"
+        assert status >= 500, f"expected server-side failure after fault, got status={status}, body={body[:200]!r}"
+    except Exception:
+        elapsed = time.monotonic() - start
+        assert elapsed < 15, f"request exception was too slow after fault: {elapsed:.2f}s"
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@pytest.mark.parametrize(
+    "fault_injector",
+    [
+        pytest.param(
+            make_process_kill_fault_injector(
+                grep_patterns="VLLM::Worker",
+                signal_name="SIGKILL",
+                limit=1,
+                post_kill_wait_seconds=2.0,
+            ),
+            id="runtime_process_chain",
+        ),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_health_unhealthy(
     omni_server_after_fault_function,
 ) -> None:
@@ -359,6 +514,182 @@ def test_reliability_fault_process_kill_concurrent_requests_no_hang(
         except Exception:
             fault_observed = True
     assert fault_observed, "expected at least one request to fail after process-kill fault injection"
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
+    reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
+)
+@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
+    omni_server_function,
+) -> None:
+    """Black-box: chat/speech should expose a consistent error contract under OOM."""
+    device_spec = resolve_oom_device_spec(
+        OOM_INJECTION_CONFIG,
+        _stage_config_path_from_omni_server(omni_server_function),
+    )
+    handle = inject_gpu_oom(
+        device=device_spec,
+        target_mem_ratio=OOM_INJECTION_CONFIG["target_mem_ratio"],
+        hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
+        startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
+        strict=OOM_INJECTION_CONFIG["strict"],
+    )
+    host = omni_server_function.host
+    port = omni_server_function.port
+    try:
+        chat_status, chat_body = _post_json_raw(
+            host,
+            port,
+            "/v1/chat/completions",
+            {
+                "model": omni_server_function.model,
+                "messages": [{"role": "user", "content": "Summarize this sentence in one word."}],
+                "stream": False,
+                "modalities": ["text"],
+            },
+            timeout_sec=25,
+        )
+        speech_status, speech_body = _post_json_raw(
+            host,
+            port,
+            "/v1/audio/speech",
+            {
+                "model": omni_server_function.model,
+                "input": "hello reliability test",
+                "voice": "alloy",
+                "response_format": "wav",
+            },
+            timeout_sec=25,
+        )
+    finally:
+        stop_gpu_oom_hogs(handle)
+
+    assert chat_status >= 500, f"expected chat error under OOM, got status={chat_status}"
+    assert speech_status >= 500, f"expected speech error under OOM, got status={speech_status}"
+
+    chat_error = _extract_error_contract(chat_body)
+    speech_error = _extract_error_contract(speech_body)
+    assert chat_error is not None, f"chat error payload not OpenAI-compatible: {chat_body[:300]!r}"
+    assert speech_error is not None, f"speech error payload not OpenAI-compatible: {speech_body[:300]!r}"
+    assert "code" in chat_error, f"chat error lacks code field: {chat_error!r}"
+    assert "code" in speech_error, f"speech error lacks code field: {speech_error!r}"
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+def test_reliability_async_failed_job_observable_with_mapped_status(
+    omni_server_function,
+) -> None:
+    """Black-box: failed async job should be observable with mapped status/code."""
+    create_status, create_payload = _create_video_job_with_invalid_lora(
+        omni_server_function.host,
+        omni_server_function.port,
+        timeout_sec=30,
+    )
+    # Some deployments may reject this endpoint synchronously for the current model;
+    # in that case still require an explicit error contract.
+    if create_status != 200 or "id" not in create_payload:
+        assert create_status >= 400, f"unexpected /v1/videos create status={create_status}, payload={create_payload!r}"
+        assert isinstance(create_payload.get("error"), dict), (
+            f"sync rejection should still return structured error payload, got payload={create_payload!r}"
+        )
+        return
+
+    video_id = str(create_payload["id"])
+    retrieve_status, retrieve_payload = _poll_video_job_status(
+        omni_server_function.host,
+        omni_server_function.port,
+        video_id,
+        timeout_sec=180,
+    )
+    assert retrieve_payload.get("status") == "failed", (
+        f"expected async failed terminal status, got retrieve_status={retrieve_status}, payload={retrieve_payload!r}"
+    )
+    error_obj = retrieve_payload.get("error")
+    assert isinstance(error_obj, dict), f"failed payload must include error object: {retrieve_payload!r}"
+    assert "message" in error_obj, f"failed payload error missing message: {error_obj!r}"
+    assert "code" in error_obj, f"failed payload error missing code: {error_obj!r}"
+    assert retrieve_status >= 400, (
+        "failed retrieve should expose non-2xx status for observability, "
+        f"got status={retrieve_status}, payload={retrieve_payload!r}"
+    )
+    if isinstance(error_obj.get("code"), int):
+        assert error_obj["code"] == retrieve_status, (
+            f"failed retrieve error.code should match HTTP status, status={retrieve_status}, error={error_obj!r}"
+        )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
+    reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
+)
+@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+def test_reliability_fault_gpu_oom_recovers_after_fault_removed(
+    omni_server_function,
+    openai_client_function,
+) -> None:
+    """Black-box: after removing transient OOM pressure, health and requests recover."""
+    device_spec = resolve_oom_device_spec(
+        OOM_INJECTION_CONFIG,
+        _stage_config_path_from_omni_server(omni_server_function),
+    )
+    handle = inject_gpu_oom(
+        device=device_spec,
+        target_mem_ratio=OOM_INJECTION_CONFIG["target_mem_ratio"],
+        hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
+        startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
+        strict=OOM_INJECTION_CONFIG["strict"],
+    )
+    host = omni_server_function.host
+    port = omni_server_function.port
+    payload = {
+        "model": omni_server_function.model,
+        "messages": [{"role": "user", "content": "Tell me one short sentence about Beijing."}],
+        "stream": False,
+        "modalities": ["text"],
+    }
+
+    failure_observed = False
+    try:
+        for _ in range(3):
+            try:
+                status, _ = _post_json_raw(host, port, "/v1/chat/completions", payload, timeout_sec=20)
+                if status >= 500:
+                    failure_observed = True
+                    break
+            except Exception:
+                failure_observed = True
+                break
+            time.sleep(1.0)
+    finally:
+        stop_gpu_oom_hogs(handle)
+
+    assert failure_observed, "expected at least one request failure while OOM pressure is active"
+
+    recovery_deadline = time.monotonic() + 90.0
+    while time.monotonic() < recovery_deadline:
+        try:
+            status, _ = _get_health_raw(host, port, timeout_sec=5)
+            if status == 200:
+                break
+        except Exception:
+            pass
+        time.sleep(1.0)
+    else:
+        pytest.fail("server did not recover to healthy state after OOM pressure was removed")
+
+    request_config = {
+        "model": omni_server_function.model,
+        "messages": [{"role": "user", "content": "What is the capital of China? Answer in one word."}],
+        "stream": False,
+        "modalities": ["text"],
+        "key_words": {"text": ["beijing"]},
+    }
+    openai_client_function.send_omni_request(request_config, request_num=1)
 
 
 @pytest.mark.slow
