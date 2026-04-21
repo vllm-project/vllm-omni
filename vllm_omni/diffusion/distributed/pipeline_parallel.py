@@ -186,12 +186,15 @@ class PipelineParallelMixin:
         return [("hidden_states", latents.shape, latents.dtype, latents.device.type)]
 
     def register_pp_channels(self, state: Any) -> None:
-        """Pre-allocate recv buffers for the ``pp_its`` and ``pp_latents`` channels."""
+        """Pre-allocate recv buffers for the ``pp_its_{i}`` and ``pp_latents`` channels."""
         pp_group = get_pp_group()
         if pp_group.world_size == 1:
             return
         if not pp_group.is_first_rank:
-            pp_group.register_recv_channel("pp_its", self._pp_it_channel_specs(state))
+            cfg_parallel = get_classifier_free_guidance_world_size() > 1
+            n_branches = 2 if (getattr(state, "do_true_cfg", False) and not cfg_parallel) else 1
+            for i in range(n_branches):
+                pp_group.register_recv_channel(f"pp_its_{i}", self._pp_it_channel_specs(state))
         if pp_group.is_first_rank:
             latents = state.latents
             pp_group.register_recv_channel(
@@ -242,28 +245,22 @@ class PipelineParallelMixin:
 
         registered_comms = getattr(self, "_registered_pp_comms", False)
 
-        # Non-first ranks receive intermediate tensors asynchronously
+        # Non-first ranks receive intermediate tensors asynchronously.
         n = len(all_kwargs)
-        if registered_comms and n > 1:
-            raise NotImplementedError(
-                "registered_comms currently supports a single branch (n=1). "
-                "Sequential CFG (n=2) requires per-branch channels."
-            )
-            
         its: list[AsyncIntermediateTensors | None] = [None] * n
         if not pp_group.is_first_rank:
             for i in range(n):
                 if registered_comms:
-                    its[i] = AsyncIntermediateTensors(*pp_group.irecv_registered("pp_its"))
+                    its[i] = AsyncIntermediateTensors(*pp_group.irecv_registered(f"pp_its_{i}"))
                 else:
                     its[i] = AsyncIntermediateTensors(*pp_group.irecv_tensor_dict())
 
         if not pp_group.is_last_rank:
             # First / middle rank: run partial forwards and propagate ITs downstream.
-            for kwargs, it in zip(all_kwargs, its):
+            for i, (kwargs, it) in enumerate(zip(all_kwargs, its)):
                 result = self.predict_noise(**kwargs, intermediate_tensors=it)
                 if registered_comms:
-                    self._pp_send_work.extend(pp_group.isend_registered("pp_its", result.tensors))
+                    self._pp_send_work.extend(pp_group.isend_registered(f"pp_its_{i}", result.tensors))
                 else:
                     self._pp_send_work.extend(pp_group.isend_tensor_dict(result.tensors))
             return None
