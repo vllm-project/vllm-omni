@@ -20,9 +20,18 @@ FUNAUDIOCHAT_PIPELINE = PipelineConfig(
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
             owns_tokenizer=True,
+            # Stage 0 is the text-generating LM; its decoded tokens are the
+            # "content" side of the response. Mark it as a final-output text
+            # stage so the chat-completions API actually requests decode
+            # iterations. Without this the request finishes after prefill with
+            # 0 generated tokens (request shows up at Stage-1 immediately,
+            # which then crashes on the empty-prompt assert). This is the
+            # same pattern Qwen3-Omni Thinker uses.
+            final_output=True,
+            final_output_type="text",
             engine_output_type="latent",
             sampling_constraints={
-                "detokenize": False,
+                "detokenize": True,
             },
         ),
         StagePipelineConfig(

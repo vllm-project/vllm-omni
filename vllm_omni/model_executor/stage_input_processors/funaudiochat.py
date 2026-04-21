@@ -38,8 +38,15 @@ def talker2code2wav(
         if isinstance(crq_tokens, torch.Tensor) and crq_tokens.numel() > 0:
             token_ids = crq_tokens.flatten().to(torch.long).tolist()
         else:
-            logger.warning("funaudiochat talker2code2wav: no crq_tokens in stage 0 output")
-            token_ids = []
+            # Stage-1 (vllm scheduler) asserts total_num_scheduled_tokens > 0
+            # when handed an empty prompt. Emit a single sentinel token (0)
+            # — FunAudioChatToken2Wav.forward detects all-zero input and
+            # returns an empty-audio OmniOutput without loading CosyVoice.
+            logger.warning(
+                "funaudiochat talker2code2wav: no crq_tokens in stage 0 output — "
+                "emitting sentinel token to avoid Stage-1 scheduler assertion"
+            )
+            token_ids = [0]
 
         result.append(
             OmniTokensPrompt(
