@@ -330,6 +330,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
+    # Z-Image I2I strength in [0.0, 1.0]. Lower keeps more source image.
+    parser.add_argument(
+        "--strength",
+        type=float,
+        default=0.6,
+        help="Z-Image I2I strength in [0.0, 1.0]. Lower keeps more source image.",
+    )
     return parser.parse_args()
 
 
@@ -440,6 +447,7 @@ def main():
             num_outputs_per_prompt=args.num_outputs_per_prompt,
             layers=args.layers,
             resolution=args.resolution,
+            strength=args.strength,
         ),
     )
     generation_end = time.perf_counter()

@@ -291,6 +291,7 @@ steps:
         commands:
           - export VLLM_TEST_CLEAN_GPU_MEMORY="1"
           - pytest -s -v tests/examples/*/test_text_to_image.py -m "advanced_model and example and H100" --run-level "advanced_model"
+          - pytest -s -v tests/examples/*/test_image_to_image.py -m "advanced_model and example and H100" --run-level "advanced_model"
         agents:
           queue: "mithril-h100-pool"
         plugins:
