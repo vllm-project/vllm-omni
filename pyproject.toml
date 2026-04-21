@@ -92,7 +92,24 @@ fun-audio-chat-ref = [
     # Transitively imported by cosyvoice.flow.flow_matching at yaml load time
     # (not a real download dependency in our path — we supply the model files
     # locally — but the import must resolve).
+    # CosyVoice's flow_matching yaml is resolved via pydoc.locate() at load
+    # time; that traverses every trainer module and forces import of these
+    # training-only deps even during inference. List everything.
     "gdown",
+    "matplotlib",
+    "tensorboard",
+    "deepspeed; sys_platform == 'linux'",
+    "wget",
+    "networkx",
+    "grpcio-tools",
+    "fastapi",
+    "fastapi-cli",
+    # gradio is only for CosyVoice's web demo which we don't invoke.
+    "onnx",
+    "protobuf",
+    "rich",
+    "uvicorn",
+    "pydantic",
     "inflect==7.3.1",
     "librosa==0.11.0",
     "lightning==2.2.4",
