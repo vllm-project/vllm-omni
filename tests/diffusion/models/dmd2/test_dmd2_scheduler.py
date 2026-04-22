@@ -108,6 +108,27 @@ def test_sde_solver_plumbed_to_scheduler():
     assert scheduler.config.stochastic_sampling is True
 
 
+def test_solver_case_insensitive():
+    """'SDE', 'Sde', ' sde ' all normalize to 'sde'."""
+    from vllm_omni.diffusion.models.dmd2 import DMD2Config
+
+    for raw in ("SDE", "Sde", " sde ", "sde"):
+        cfg = DMD2Config.from_model_index({"dmd2_config": {"solver": raw}})
+        assert cfg.solver == "sde"
+
+
+def test_solver_invalid_raises():
+    """Unknown solver strings raise ValueError with a clear message."""
+    import pytest
+
+    from vllm_omni.diffusion.models.dmd2 import DMD2Config
+
+    with pytest.raises(ValueError, match="solver must be one of"):
+        DMD2Config.from_model_index({"dmd2_config": {"solver": "euler"}})
+    with pytest.raises(ValueError, match="solver must be one of"):
+        DMD2Config(solver="dpmpp")  # type: ignore[arg-type]
+
+
 def test_forward_timesteps_idempotent_across_calls(pipeline):
     """Successive forward() calls must not cause scheduler state to drift."""
     parent = _DMD2_BASE[type(pipeline)]

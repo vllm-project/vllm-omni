@@ -24,6 +24,8 @@ class DMD2EulerScheduler(FlowMatchEulerDiscreteScheduler):
         self,
         num_inference_steps: int | None = None,
         device: str | torch.device | None = None,
+        timesteps: list[int] | None = None,
+        sigmas: list[float] | None = None,
         **kwargs,
     ) -> None:
         super().set_timesteps(timesteps=self._dmd2_timesteps, device=device)
