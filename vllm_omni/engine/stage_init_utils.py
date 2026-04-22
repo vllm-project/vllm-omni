@@ -411,6 +411,10 @@ def build_engine_args_dict(
     if stage_type != "diffusion":
         resolve_worker_cls(engine_args_dict)
 
+    # Check whether the stage's default_sampling_params defines extra_args.
+    default_sp = _to_dict(getattr(stage_config, "default_sampling_params", {}))
+    engine_args_dict["has_sampling_extra_args"] = bool(default_sp.get("extra_args"))
+
     return engine_args_dict
 
 

@@ -94,6 +94,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_STARTUP_POLL_INTERVAL_S = 1.0
+
 
 # ============================================================================
 # Parent-EngineArgs field-routing contracts (consumed by
@@ -341,22 +343,7 @@ class AsyncOmniEngine:
             name="orchestrator",
         )
         self.orchestrator_thread.start()
-
-        # Wait for stage/runtime initialization result from orchestrator thread.
-        try:
-            startup_future.result(timeout=startup_timeout)
-        except concurrent.futures.TimeoutError as e:
-            try:
-                self.shutdown()
-            except Exception:
-                logger.exception("[AsyncOmniEngine] Failed to cleanup after orchestrator startup timeout")
-            raise TimeoutError(f"Orchestrator did not become ready within {startup_timeout}s") from e
-        except Exception:
-            try:
-                self.shutdown()
-            except Exception:
-                logger.exception("[AsyncOmniEngine] Failed to cleanup after orchestrator startup failure")
-            raise
+        self._wait_for_orchestrator_init(startup_future, startup_timeout)
 
         # Stage runtime fields are assigned directly on self by the bootstrap thread.
         self._weak_finalizer = weakref.finalize(
@@ -946,13 +933,17 @@ class AsyncOmniEngine:
             loop.run_until_complete(_run_orchestrator())
         except Exception as e:
             if not startup_future.done():
-                startup_future.set_exception(RuntimeError(f"Orchestrator initialization failed: {e}"))
+                wrapped = RuntimeError(f"Orchestrator initialization failed: {e}")
+                wrapped.__cause__ = e
+                startup_future.set_exception(wrapped)
             logger.exception("[AsyncOmniEngine] Orchestrator thread crashed")
+            error_text = str(e) or "Orchestrator thread crashed"
             try:
+                error_msg = {"type": "error", "error": error_text, "fatal": True}
                 if self.output_queue is not None:
-                    self.output_queue.sync_q.put_nowait({"type": "error", "error": "Orchestrator thread crashed"})
+                    self.output_queue.sync_q.put_nowait(error_msg)
                 if self.rpc_output_queue is not None:
-                    self.rpc_output_queue.sync_q.put_nowait({"type": "error", "error": "Orchestrator thread crashed"})
+                    self.rpc_output_queue.sync_q.put_nowait(error_msg)
             except Exception:
                 pass
             raise
@@ -971,6 +962,31 @@ class AsyncOmniEngine:
             finally:
                 asyncio.set_event_loop(None)
                 loop.close()
+
+    def _wait_for_orchestrator_init(self, startup_future: concurrent.futures.Future, startup_timeout: int) -> None:
+        """
+        Wait for orchestrator startup future to return ready. Raises exception on any failures to the init process.
+        """
+        deadline = time.monotonic() + startup_timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._try_shutdown("[AsyncOmniEngine] Failed to cleanup after orchestrator startup timeout")
+                raise TimeoutError(f"Orchestrator did not become ready within {startup_timeout}s")
+            try:
+                startup_future.result(
+                    timeout=min(remaining, _STARTUP_POLL_INTERVAL_S),
+                )
+                break
+            except concurrent.futures.TimeoutError:
+                if not self.orchestrator_thread.is_alive():
+                    self._try_shutdown("[AsyncOmniEngine] Failed to cleanup after orchestrator startup failure")
+                    if startup_future.done():
+                        startup_future.result()  # re-raises the real exception
+                    raise RuntimeError("Orchestrator thread died during startup")
+            except Exception:
+                self._try_shutdown("[AsyncOmniEngine] Failed to cleanup after orchestrator startup failure")
+                raise
 
     # ---- request helpers ----
 
@@ -1729,3 +1745,9 @@ class AsyncOmniEngine:
             except Exception:
                 logger.exception("[AsyncOmniEngine] Failed to stop OmniMasterServer during shutdown")
             self._omni_master_server = None
+
+    def _try_shutdown(self, *args, **kwargs) -> None:
+        try:
+            self.shutdown()
+        except Exception:
+            logger.exception(*args, **kwargs)

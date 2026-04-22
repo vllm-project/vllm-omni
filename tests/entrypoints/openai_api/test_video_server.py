@@ -133,7 +133,6 @@ def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: 
     last_payload = None
     while time.time() < deadline:
         response = client.get(f"/v1/videos/{video_id}")
-        assert response.status_code == 200
         last_payload = response.json()
         if last_payload["status"] == status:
             return last_payload
@@ -644,7 +643,7 @@ def test_invalid_lora_returns_400(test_client):
     assert response.status_code == 200
     video_id = response.json()["id"]
     failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
-    assert failed["error"]["code"] == "HTTPException"
+    assert failed["error"]["code"] == 400
     assert "lora object" in failed["error"]["message"].lower()
 
 

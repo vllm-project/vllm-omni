@@ -393,6 +393,7 @@ class StageDeployConfig:
     output_connectors: dict[str, str] | None = None
     input_connectors: dict[str, str] | None = None
     default_sampling_params: dict[str, Any] | None = None
+    subtalker_sampling_params: dict[str, Any] | None = None
     engine_extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -463,7 +464,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     return StageDeployConfig(**kwargs)
 
 
-_DEEP_MERGE_KEYS = frozenset({"default_sampling_params", "engine_extras", "engine_args"})
+_DEEP_MERGE_KEYS = frozenset({"default_sampling_params", "subtalker_sampling_params", "engine_extras", "engine_args"})
 
 
 def _deep_merge_stage(base: dict, overlay: dict) -> dict:
@@ -1366,10 +1367,31 @@ class StageConfigFactory:
             from vllm.transformers_utils.config import get_hf_file_to_dict
 
             config_dict = get_hf_file_to_dict("config.json", model, revision=None)
-            if config_dict and "model_type" in config_dict:
-                return config_dict["model_type"], None
+            if config_dict:
+                if "model_type" in config_dict:
+                    return config_dict["model_type"], None
+                # VoxCPM2-style configs use singular ``architecture`` rather
+                # than HF's standard ``model_type`` / ``architectures``. Accept
+                # it as a fallback so the pipeline registry can still match.
+                if "architecture" in config_dict and isinstance(config_dict["architecture"], str):
+                    return config_dict["architecture"], None
         except Exception as e:
             logger.debug(f"Failed to auto-detect model type for {model}: {e}")
+
+        # Final fallback: some models (e.g. CosyVoice3) ship an empty
+        # config.json and rely on naming conventions. Match the model path
+        # basename against registered pipeline keys — longest match wins
+        # so "cosyvoice3" (length 10) beats "cosyvoice" (length 9).
+        model_lower = model.lower().replace("-", "").replace("_", "")
+        best: str | None = None
+        best_len = 0
+        for registered_key in _PIPELINE_REGISTRY.keys():
+            candidate = registered_key.lower().replace("-", "").replace("_", "")
+            if candidate and candidate in model_lower and len(candidate) > best_len:
+                best = registered_key
+                best_len = len(candidate)
+        if best is not None:
+            return best, None
 
         return None, None
 

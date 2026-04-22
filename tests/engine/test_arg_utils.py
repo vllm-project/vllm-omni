@@ -139,6 +139,41 @@ def test_from_cli_args_picks_up_stage_configs_path():
     assert args.custom_pipeline_args is None
 
 
+def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
+    """Ensure Code2Wav mirrors stage max_model_len into nested HF overrides.
+
+    Qwen3-TTS Code2Wav is a pure decoder stage whose runtime max_model_len can
+    legitimately exceed the base checkpoint's default text max length. Recent
+    vLLM validates these values during ModelConfig creation, so we inject
+    ``talker_config.max_position_embeddings`` before delegating to vLLM.
+    """
+    captured: dict[str, object] = {}
+    baseline_config = Mock()
+
+    def fake_create_model_config(self):
+        captured["hf_overrides"] = self.hf_overrides
+        return baseline_config
+
+    monkeypatch.setattr(EngineArgs, "create_model_config", fake_create_model_config)
+    monkeypatch.setattr(
+        OmniModelConfig,
+        "from_vllm_model_config",
+        classmethod(lambda cls, model_config, **omni_kwargs: model_config),
+    )
+
+    OmniEngineArgs(
+        model_arch="Qwen3TTSCode2Wav",
+        max_model_len=65536,
+    ).create_model_config()
+
+    assert captured["hf_overrides"] == {
+        "architectures": ["Qwen3TTSCode2Wav"],
+        "talker_config": {
+            "max_position_embeddings": 65536,
+        },
+    }
+
+
 def test_stage_specific_text_config_override():
     """Ensure dependent attributes are updated when using stage-specific config."""
     vllm_config = EngineArgs().create_model_config()
