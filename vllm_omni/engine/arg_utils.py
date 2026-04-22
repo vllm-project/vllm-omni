@@ -170,6 +170,7 @@ class OmniEngineArgs(EngineArgs):
     output_modalities: list[str] | None = None
     log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
+    has_sampling_extra_args: bool = False
 
     def __post_init__(self) -> None:
         if self.worker_cls is None:
@@ -246,6 +247,13 @@ class OmniEngineArgs(EngineArgs):
                     if model_type is not None:
                         self.hf_overrides.setdefault("model_type", model_type)
 
+                # Stage wrappers (e.g. Code2Wav) may need max_model_len larger
+                # than the base checkpoint's text max_position_embeddings.
+                if self.model_arch == "Qwen3TTSCode2Wav" and self.max_model_len is not None:
+                    self.hf_overrides.setdefault("talker_config", {}).setdefault(
+                        "max_position_embeddings", int(self.max_model_len)
+                    )
+
             # For models whose HF config.json is empty or lacks model_type
             # (e.g. CosyVoice3), AutoConfig.from_pretrained fails because it
             # cannot determine which config class to use from the empty dict.
@@ -319,6 +327,7 @@ class OmniEngineArgs(EngineArgs):
             subtalker_sampling_params=self.subtalker_sampling_params,
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,
+            has_sampling_extra_args=self.has_sampling_extra_args,
         )
         return omni_config
 

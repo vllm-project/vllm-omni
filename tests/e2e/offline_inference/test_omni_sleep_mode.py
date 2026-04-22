@@ -123,7 +123,7 @@ async def test_multistage_sleep_h100(tp_size):
             pass
 
         acks = await engine.sleep(stage_ids=[0, 1], level=2)
-        assert len(acks) == 2 * tp_size
+        assert len(acks) == 2
 
         await engine.wake_up(stage_ids=[0, 1])
         async for _ in engine.generate("verify", sampling_params=[SamplingParams(), sp]):

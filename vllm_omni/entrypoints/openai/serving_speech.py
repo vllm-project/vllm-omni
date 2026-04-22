@@ -8,13 +8,14 @@ import re
 import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import soundfile as sf
 import torch
-from fastapi import Request, UploadFile
+from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from transformers.utils.hub import cached_file
 from vllm.entrypoints.launcher import terminate_if_errored
@@ -1663,6 +1664,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 min_tokens,
                 max_tokens,
             )
+
+        # Apply model-specific extra parameters
+        if request.extra_params is not None and sampling_params_list:
+            if not isinstance(request.extra_params, dict):
+                raise HTTPException(
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                    detail="extra_params must be a JSON object/dict.",
+                )
+            import copy
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            if sampling_params_list[0].extra_args is None:
+                sampling_params_list[0].extra_args = {}
+            sampling_params_list[0].extra_args.update(request.extra_params)
+            logger.info("Applied extra_params: %s", request.extra_params)
 
         # Fish defaults come from stage_configs YAML. Only override when the caller
         # explicitly requests a different generation length.
