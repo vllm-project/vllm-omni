@@ -401,10 +401,13 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
     deadline = time.monotonic() + 20.0
     last_observation = ""
     saw_503 = False
+    health_final_status: int | None = None
+    health_final_body = b""
     while time.monotonic() < deadline:
         try:
             status, body = _get_health_raw(host, port, timeout_sec=5)
             last_observation = f"http={status}, body={body[:200]!r}"
+            health_final_status, health_final_body = status, body
             if status == 503:
                 saw_503 = True
                 break
@@ -421,16 +424,20 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
         "stream": False,
         "modalities": ["text"],
     }
+    ff_status: int | None = None
+    ff_body = b""
+    ff_exc: BaseException | None = None
     start = time.monotonic()
     try:
-        status, body = _post_json_raw(host, port, "/v1/chat/completions", payload, timeout_sec=20)
+        ff_status, ff_body = _post_json_raw(host, port, "/v1/chat/completions", payload, timeout_sec=20)
         elapsed = time.monotonic() - start
         assert elapsed < 15, f"[process_kill fast_fail] request did not fail fast after fault: {elapsed:.2f}s"
-        assert status >= 500, (
+        assert ff_status >= 500, (
             f"[process_kill fast_fail] expected server-side failure after fault, "
-            f"got status={status}, body={body[:200]!r}"
+            f"got status={ff_status}, body={ff_body[:200]!r}"
         )
-    except Exception:
+    except Exception as exc:
+        ff_exc = exc
         elapsed = time.monotonic() - start
         assert elapsed < 15, f"[process_kill fast_fail] request exception was too slow after fault: {elapsed:.2f}s"
 
@@ -465,13 +472,25 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
     assert elapsed < 30, f"[process_kill concurrent] fault-time request convergence is too slow: {elapsed:.2f}s"
 
     fault_observed = False
+    conc_debug: list[Any] = []
     for future in done:
         try:
-            status, _ = future.result()
+            status, body = future.result()
+            conc_debug.append((status, body[:200]))
             if status >= 500:
                 fault_observed = True
-        except Exception:
+        except Exception as exc:
+            conc_debug.append(repr(exc))
             fault_observed = True
+    # DEBUG: remove before merge
+    print(
+        health_final_status,
+        health_final_body[:200],
+        ff_status,
+        ff_body[:200],
+        ff_exc,
+        conc_debug,
+    )
     assert fault_observed, (
         "[process_kill concurrent] expected at least one request to fail after process-kill fault injection"
     )
