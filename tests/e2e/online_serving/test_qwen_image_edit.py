@@ -20,14 +20,14 @@ From ``tests/``::
 
 import pytest
 
-from tests.conftest import (
+from tests.helpers.mark import hardware_marks
+from tests.helpers.media import generate_synthetic_image
+from tests.helpers.runtime import (
     OmniServer,
     OmniServerParams,
     OpenAIClientHandler,
     dummy_messages_from_mix_data,
-    generate_synthetic_image,
 )
-from tests.utils import hardware_marks
 
 EDIT_PROMPT = "Transform this modern, geometrist image into a Vincent van Gogh style impressionist painting."
 MULTI_EDIT_PROMPT = (
