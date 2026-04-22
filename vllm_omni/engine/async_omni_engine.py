@@ -1010,6 +1010,7 @@ class AsyncOmniEngine:
     ) -> dict[str, Any]:
         """Build an add_request message after stage-0 preprocessing."""
         build_add_request_message_start = time.perf_counter()
+        input_preprocess_time_ms = 0.0
         effective_sampling_params_list = (
             list(sampling_params_list) if sampling_params_list is not None else list(self.default_sampling_params_list)
         )
@@ -1033,6 +1034,7 @@ class AsyncOmniEngine:
                     _inject_global_id(item, request_id)
 
             # Full input processing (tokenization, multimodal, etc.)
+            input_preprocess_start = time.perf_counter()
             request = self.input_processor.process_inputs(
                 request_id=request_id,
                 prompt=prompt,
@@ -1046,6 +1048,7 @@ class AsyncOmniEngine:
                 data_parallel_rank=data_parallel_rank,
                 resumable=resumable,
             )
+            input_preprocess_time_ms = (time.perf_counter() - input_preprocess_start) * 1000.0
             # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
             # additional_information field in the prompt.
             request = _upgrade_to_omni_request(request, prompt)
@@ -1083,7 +1086,7 @@ class AsyncOmniEngine:
             "original_prompt": original_prompt,
             "sampling_params_list": effective_sampling_params_list,
             "final_stage_id": final_stage_id,
-            "input_preprocess_time_ms": build_add_request_message_time_ms,
+            "input_preprocess_time_ms": input_preprocess_time_ms,
             "build_add_request_message_time_ms": build_add_request_message_time_ms,
         }
 
