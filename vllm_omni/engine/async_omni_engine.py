@@ -1388,10 +1388,11 @@ class AsyncOmniEngine:
         stage_configs_path = kwargs.get("stage_configs_path", None)
         deploy_config_path = kwargs.pop("deploy_config", None)
         stage_overrides_json = kwargs.pop("stage_overrides", None)
-        # Set of CLI keys the user actually typed; ``None`` means we have no
-        # parser-level info (e.g. programmatic Omni() call) and the lower
-        # layers should treat all kwargs as explicit.
-        cli_explicit_keys = kwargs.pop("_cli_explicit_keys", None)
+        # RFC #3035: parser-level nullification means un-typed flags arrive
+        # as None; the merge layer's None-guard is now the entire precedence
+        # rule. Discard any legacy ``_cli_explicit_keys`` kwarg from
+        # pre-RFC callers.
+        kwargs.pop("_cli_explicit_keys", None)
         explicit_stage_configs = kwargs.pop("stage_configs", None)
         if explicit_stage_configs is not None:
             logger.warning(
@@ -1424,7 +1425,6 @@ class AsyncOmniEngine:
             default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
-            cli_explicit_keys=cli_explicit_keys,
         )
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.

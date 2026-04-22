@@ -351,3 +351,97 @@ def test_ambiguous_field_non_strict_routes_to_orchestrator(caplog):
     assert orch.deploy_config == "x"
     assert "deploy_config" not in engine
     assert any("both OrchestratorArgs" in r.message for r in caplog.records)
+
+
+# ============================================================================
+# RFC #3035 — sentinel-default precedence invariants
+# ============================================================================
+
+
+def test_nullify_stage_engine_defaults_resets_inherited_defaults():
+    """After nullify, stage-level engine flags have ``default=None`` while
+    server-level flags keep their real defaults."""
+    import argparse
+
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    from vllm_omni.engine.arg_utils import (
+        derive_server_dests_from_vllm_parser,
+        nullify_stage_engine_defaults,
+    )
+
+    try:
+        from vllm.entrypoints.openai.cli_args import make_arg_parser
+    except ImportError:
+        pytest.skip("vllm parser not importable")
+
+    parser = make_arg_parser(FlexibleArgumentParser())
+    nullify_stage_engine_defaults(parser)
+
+    server_dests = derive_server_dests_from_vllm_parser()
+    offenders: list[tuple[str, object]] = []
+    for action in parser._actions:
+        if action.dest in ("help", "version") or not action.option_strings:
+            continue
+        if action.dest in server_dests:
+            continue
+        if action.dest in {f.name for f in fields(_FakeEngineArgs)}:
+            # Engine-level — must be None after nullify.
+            if action.default is not None and action.default is not argparse.SUPPRESS:
+                offenders.append((action.dest, action.default))
+
+    assert not offenders, (
+        f"Stage-level engine flags with non-None defaults after nullify: "
+        f"{offenders}. nullify_stage_engine_defaults should have reset them."
+    )
+
+
+def test_server_flags_keep_real_defaults_after_nullify():
+    """Server-level flags (host, port, etc.) must keep their real defaults
+    so uvicorn/FastAPI start cleanly."""
+    import argparse
+
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    from vllm_omni.engine.arg_utils import (
+        derive_server_dests_from_vllm_parser,
+        nullify_stage_engine_defaults,
+    )
+
+    try:
+        from vllm.entrypoints.openai.cli_args import make_arg_parser
+    except ImportError:
+        pytest.skip("vllm parser not importable")
+
+    parser = make_arg_parser(FlexibleArgumentParser())
+    nullify_stage_engine_defaults(parser)
+
+    server_dests = derive_server_dests_from_vllm_parser()
+    if not server_dests:
+        pytest.skip("server dest derivation returned empty set")
+
+    # At least one server-level dest should have a non-None default still.
+    server_actions_with_defaults = [
+        a
+        for a in parser._actions
+        if a.dest in server_dests and a.default is not None and a.default is not argparse.SUPPRESS
+    ]
+    assert server_actions_with_defaults, "All server-level flags lost their defaults — nullify is over-reaching."
+
+
+def test_help_text_preserves_default_after_nullify():
+    """Real defaults stay visible in --help text via ``(default: X)`` suffix
+    even though parser stores None."""
+    import argparse
+
+    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--example-flag", type=int, default=42, help="Example knob.")
+
+    # Use a dummy "engine" by leaving server dests empty.
+    nullify_stage_engine_defaults(parser)
+
+    action = next(a for a in parser._actions if a.dest == "example_flag")
+    assert action.default is None
+    assert "(default: 42)" in action.help

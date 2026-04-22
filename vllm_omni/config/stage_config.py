@@ -996,17 +996,26 @@ class StageConfigFactory:
         model: str,
         cli_overrides: dict[str, Any] | None = None,
         deploy_config_path: str | None = None,
-        cli_explicit_keys: set[str] | None = None,
+        **deprecated_kwargs: Any,
     ) -> list[StageConfig] | None:
         """Load pipeline + deploy config, merge with CLI overrides.
 
         Checks _PIPELINE_REGISTRY first (new path), falls back to legacy YAML.
 
-        ``cli_explicit_keys`` is the set of CLI keys the user actually typed
-        (captured at the parser layer in ``vllm serve``). When ``None`` —
-        which is the case for programmatic ``Omni()`` callers — every kwarg
-        in ``cli_overrides`` is treated as explicit.
+        Per RFC #3035, the CLI/parser layer nullifies un-typed flags so the
+        merge layer's ``if value is None: continue`` guard is the entire
+        precedence rule. Pre-RFC callers passed a ``cli_explicit_keys=`` set
+        explicitly; that parameter is now accepted-and-ignored for one
+        version with a ``DeprecationWarning``.
         """
+        if "cli_explicit_keys" in deprecated_kwargs:
+            warnings.warn(
+                "cli_explicit_keys= is deprecated and ignored — RFC #3035 "
+                "moved precedence to the parser layer. Remove the kwarg.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         if cli_overrides is None:
             cli_overrides = {}
 
@@ -1015,7 +1024,7 @@ class StageConfigFactory:
         # --- New path: check pipeline registry by model_type first ---
         model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
         if model_type and model_type in _PIPELINE_REGISTRY:
-            return cls._create_from_registry(model_type, cli_overrides, deploy_config_path, cli_explicit_keys)
+            return cls._create_from_registry(model_type, cli_overrides, deploy_config_path)
 
         # --- HF architecture fallback: some models report a generic
         # model_type that collides with another model. Match by the
@@ -1025,9 +1034,7 @@ class StageConfigFactory:
             if hf_archs:
                 for registered in _PIPELINE_REGISTRY.values():
                     if hf_archs.intersection(registered.hf_architectures):
-                        return cls._create_from_registry(
-                            registered.model_type, cli_overrides, deploy_config_path, cli_explicit_keys
-                        )
+                        return cls._create_from_registry(registered.model_type, cli_overrides, deploy_config_path)
 
         # --- Legacy path: load from pipeline YAML ---
         pipeline = cls._load_pipeline(model, trust_remote_code=trust_remote_code)
@@ -1063,20 +1070,30 @@ class StageConfigFactory:
         model_type: str,
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None = None,
-        cli_explicit_keys: set[str] | None = None,
+        **deprecated_kwargs: Any,
     ) -> list[StageConfig]:
         """Create StageConfigs from pipeline registry + deploy YAML.
 
         Precedence (high → low):
-            explicit CLI args  >  deploy YAML  >  parser default CLI values
+            caller-typed value  >  deploy YAML  >  StageDeployConfig dataclass
 
-        ``cli_explicit_keys`` carries the set of long-option attribute names
-        the user actually typed (captured in ``OmniServeCommand.cmd``). Any
-        kwarg whose key is not in that set is treated as a parser default
-        and is only used to fill fields YAML doesn't already cover. When the
-        set is ``None`` (programmatic ``Omni()`` callers, which have no
-        argparse layer), every kwarg is treated as explicit.
+        Per RFC #3035, the CLI/parser layer nullifies un-typed flags before
+        kwargs reach this layer. Every key in ``cli_overrides`` with a
+        non-None value is treated as caller intent. Per-stage keys
+        (``stage_N_*``) are routed to their respective stage by
+        ``build_stage_runtime_overrides``.
+
+        ``cli_explicit_keys=`` is accepted-and-ignored for one version with
+        a ``DeprecationWarning``.
         """
+        if "cli_explicit_keys" in deprecated_kwargs:
+            warnings.warn(
+                "cli_explicit_keys= is deprecated and ignored — RFC #3035 "
+                "moved precedence to the parser layer. Remove the kwarg.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         # Resolve deploy config path
         if deploy_config_path is None:
             deploy_path = _DEPLOY_DIR / f"{model_type}.yaml"
@@ -1093,7 +1110,7 @@ class StageConfigFactory:
             deploy_cfg = load_deploy_config(deploy_path)
 
         cli_async_chunk = cli_overrides.get("async_chunk")
-        if cli_async_chunk is not None and (cli_explicit_keys is None or "async_chunk" in cli_explicit_keys):
+        if cli_async_chunk is not None:
             deploy_cfg.async_chunk = bool(cli_async_chunk)
 
         pipeline_key = deploy_cfg.pipeline or model_type
@@ -1107,25 +1124,14 @@ class StageConfigFactory:
 
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
 
-        # Precedence: explicit CLI > yaml > parser-default CLI.
-        # Per-stage (``stage_N_*``) keys are always treated as explicit.
-        explicit_overrides: dict[str, Any] = {}
-        default_overrides: dict[str, Any] = {}
-        for key, value in cli_overrides.items():
-            if value is None:
-                continue
-            is_per_stage = bool(re.match(r"stage_\d+_", key))
-            is_explicit = cli_explicit_keys is None or key in cli_explicit_keys or is_per_stage
-            if is_explicit:
-                explicit_overrides[key] = value
-            else:
-                default_overrides[key] = value
+        # Single-rule precedence (RFC #3035): every kwarg with a non-None
+        # value wins over YAML for its key. Un-typed CLI flags arrive as
+        # None thanks to ``nullify_stage_engine_defaults`` and are filtered
+        # by the loop below.
+        explicit_overrides = {k: v for k, v in cli_overrides.items() if v is not None}
 
         for stage in stages:
-            yaml_keys = set(stage.yaml_engine_args)
-            fallback = {k: v for k, v in default_overrides.items() if k not in yaml_keys}
-            merged = {**fallback, **explicit_overrides}
-            stage.runtime_overrides = cls._merge_cli_overrides(stage, merged)
+            stage.runtime_overrides = cls._merge_cli_overrides(stage, explicit_overrides)
 
         return stages
 

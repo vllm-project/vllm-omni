@@ -595,3 +595,66 @@ def orchestrator_args_from_argparse(args: Any) -> OrchestratorArgs:
             if value is not None or f.default is None:
                 kwargs[f.name] = value
     return OrchestratorArgs(**kwargs)
+
+
+# ============================================================================
+# Sentinel-default precedence (RFC #3035)
+# ============================================================================
+#
+# Stage-level engine flags (gpu_memory_utilization, max_num_seqs, dtype, ...)
+# must default to ``None`` after the parser is built. The merge layer's
+# existing ``if value is None: continue`` guard then becomes the entire
+# precedence rule:
+#
+#     caller-typed value  >  deploy YAML  >  StageDeployConfig dataclass
+#
+# vLLM's ``make_arg_parser`` ships real parser defaults for inherited
+# EngineArgs fields. ``nullify_stage_engine_defaults`` walks the built
+# parser and resets ``action.default = None`` for every action that isn't
+# server-level, preserving the visible default in the help text.
+#
+# Server-level flags (--host, --port, --api-key, ssl_*, ...) bypass the
+# stage merge layer and need real defaults so uvicorn/FastAPI start cleanly.
+
+
+def nullify_stage_engine_defaults(parser: argparse.ArgumentParser) -> None:
+    """Set ``action.default = None`` for every stage-level engine flag.
+
+    Call this AFTER ``make_arg_parser`` has populated the parser with
+    inherited vLLM defaults and AFTER any vllm-omni-specific flags are
+    added. Idempotent.
+
+    Server-level flags (host, port, api_key, ssl_*, etc.) keep their real
+    defaults because they bypass the stage merge layer.
+
+    Real default values are appended to ``action.help`` as ``(default: X)``
+    so ``--help`` output stays informative even though the parser stores
+    ``None``.
+
+    Boolean flags using ``store_true`` / ``store_false`` actions are also
+    nullified — the parser still recognizes the flag and sets True/False
+    when typed, but absent flags become ``None`` instead of False/True.
+    """
+    server_dests = derive_server_dests_from_vllm_parser()
+
+    for action in parser._actions:
+        # Skip help, positionals, server-level flags, and the version action
+        if action.dest in ("help", "version") or not action.option_strings:
+            continue
+        if action.dest in server_dests:
+            continue
+        # Skip orchestrator-only fields that argparse_args_from_argparse
+        # consumes directly — they don't go through the stage merge layer.
+        if action.dest in orchestrator_field_names() and action.dest not in SHARED_FIELDS:
+            continue
+
+        # Don't double-process if already None
+        if action.default is None or action.default is argparse.SUPPRESS:
+            continue
+
+        # Preserve real default in help text for visibility
+        real_default = action.default
+        if action.help and "(default:" not in action.help and "%(default)" not in action.help:
+            action.help = f"{action.help} (default: {real_default})"
+
+        action.default = None

@@ -9,7 +9,6 @@ import argparse
 import json
 import os
 import signal
-import sys
 from types import FrameType
 from typing import Any
 
@@ -22,7 +21,6 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import omni_run_server
-from vllm_omni.entrypoints.utils import detect_explicit_cli_keys
 
 logger = init_logger(__name__)
 
@@ -95,9 +93,9 @@ class OmniServeCommand(CLISubcommand):
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
 
-        # Stash the set of long-option keys the user actually typed so the
-        # stage-config factory can give YAML precedence over argparse defaults.
-        args._cli_explicit_keys = detect_explicit_cli_keys(sys.argv[1:], OmniServeCommand._parser)
+        # RFC #3035: parser defaults are nullified for stage-level flags in
+        # subparser_init, so un-typed flags reach the merge layer as None.
+        # No need to compute an explicit-key set anymore.
 
         if args.headless:
             run_headless(args)
@@ -485,6 +483,12 @@ class OmniServeCommand(CLISubcommand):
         # Stash via type(self) so the docs hook (which execs this function in a
         # sandboxed globals dict via ``DummySelf``) doesn't fail on a NameError.
         type(self)._parser = serve_parser
+        # RFC #3035: nullify stage-level engine flag defaults so un-typed CLI
+        # values arrive as None and the merge layer's None-guard becomes the
+        # entire precedence rule. Real defaults stay visible in --help.
+        from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+
+        nullify_stage_engine_defaults(serve_parser)
         return serve_parser
 
 
@@ -540,15 +544,14 @@ def run_headless(args: argparse.Namespace) -> None:
         raise ValueError("headless mode requires worker_backend=multi_process")
 
     args_dict = vars(args).copy()
-    # Preserve the explicit-keys set captured at parse time so per-stage yaml
-    # values (e.g. stage 1's ``gpu_memory_utilization: 0.5``) are not
-    # overwritten by argparse defaults for flags the user didn't type.
-    cli_explicit_keys = args_dict.pop("_cli_explicit_keys", None)
+    # RFC #3035: parser defaults are nullified for stage-level flags, so
+    # un-typed flags arrive as None and get filtered by the merge layer's
+    # None-guard. No more explicit-key set required.
+    args_dict.pop("_cli_explicit_keys", None)
     config_path, stage_configs = load_and_resolve_stage_configs(
         model,
         args_dict.get("stage_configs_path"),
         args_dict,
-        cli_explicit_keys=cli_explicit_keys,
     )
 
     # Locate the stage config that matches stage_id.
