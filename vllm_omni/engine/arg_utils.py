@@ -192,19 +192,12 @@ class OmniEngineArgs(EngineArgs):
 
     @classmethod
     def create(cls, **explicit: Any) -> "OmniEngineArgs":
-        """Constructor that records caller-set fields.
-
-        Prefer this over the bare constructor when passing via
-        ``Omni(..., engine_args=ea)`` — only recorded fields reach the merge
-        layer as caller-explicit.
-        """
+        """Tracks caller-set fields for ``Omni(..., engine_args=ea)``."""
         ea = cls(**explicit)
         ea._explicit_fields = frozenset(explicit.keys())
         return ea
 
     def explicit_kwargs(self) -> dict[str, Any]:
-        """Caller-set fields, or all non-None fields for bare-constructor
-        instances (legacy fallback)."""
         explicit = getattr(self, "_explicit_fields", None)
         if explicit is None:
             return {
@@ -623,13 +616,9 @@ def orchestrator_args_from_argparse(args: Any) -> OrchestratorArgs:
 
 
 def nullify_stage_engine_defaults(parser: argparse.ArgumentParser) -> None:
-    """Reset stage-level engine flag defaults to ``None`` so un-typed flags
-    arrive at the merge layer as ``None``. Real defaults are appended to
-    each action's help as ``(default: X)``. Idempotent.
-
-    Server-level flags (host, port, api_key, ssl_*) and orchestrator-only
-    fields are exempt — they bypass the stage merge layer.
-    """
+    """Reset stage-level engine flag defaults to ``None``; preserve real
+    default in help text. Server- and orchestrator-only flags are exempt.
+    Idempotent."""
     server_dests = derive_server_dests_from_vllm_parser()
     orch_only = orchestrator_field_names() - SHARED_FIELDS
 

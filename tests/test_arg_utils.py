@@ -356,88 +356,73 @@ def test_ambiguous_field_non_strict_routes_to_orchestrator(caplog):
 # Sentinel-default precedence invariants (#3035)
 
 
-def test_nullify_stage_engine_defaults_resets_inherited_defaults():
-    """After nullify, stage-level engine flags have ``default=None`` while
-    server-level flags keep their real defaults."""
-    import argparse
-
+def _build_full_serve_parser():
     from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    try:
+        from vllm.entrypoints.openai.cli_args import make_arg_parser
+    except ImportError:
+        pytest.skip("vllm parser not importable")
+    return make_arg_parser(FlexibleArgumentParser())
+
+
+def test_nullify_stage_engine_defaults_resets_inherited_defaults():
+    import argparse
 
     from vllm_omni.engine.arg_utils import (
         derive_server_dests_from_vllm_parser,
         nullify_stage_engine_defaults,
     )
 
-    try:
-        from vllm.entrypoints.openai.cli_args import make_arg_parser
-    except ImportError:
-        pytest.skip("vllm parser not importable")
-
-    parser = make_arg_parser(FlexibleArgumentParser())
+    parser = _build_full_serve_parser()
     nullify_stage_engine_defaults(parser)
 
     server_dests = derive_server_dests_from_vllm_parser()
-    offenders: list[tuple[str, object]] = []
-    for action in parser._actions:
-        if action.dest in ("help", "version") or not action.option_strings:
-            continue
-        if action.dest in server_dests:
-            continue
-        if action.dest in {f.name for f in fields(_FakeEngineArgs)}:
-            # Engine-level — must be None after nullify.
-            if action.default is not None and action.default is not argparse.SUPPRESS:
-                offenders.append((action.dest, action.default))
-
-    assert not offenders, (
-        f"Stage-level engine flags with non-None defaults after nullify: "
-        f"{offenders}. nullify_stage_engine_defaults should have reset them."
-    )
+    engine_dests = {f.name for f in fields(_FakeEngineArgs)}
+    offenders = [
+        (a.dest, a.default)
+        for a in parser._actions
+        if a.dest not in ("help", "version")
+        and a.option_strings
+        and a.dest not in server_dests
+        and a.dest in engine_dests
+        and a.default is not None
+        and a.default is not argparse.SUPPRESS
+    ]
+    assert not offenders, f"Stage flags with non-None defaults after nullify: {offenders}"
 
 
 def test_server_flags_keep_real_defaults_after_nullify():
-    """Server-level flags (host, port, etc.) must keep their real defaults
-    so uvicorn/FastAPI start cleanly."""
     import argparse
-
-    from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     from vllm_omni.engine.arg_utils import (
         derive_server_dests_from_vllm_parser,
         nullify_stage_engine_defaults,
     )
 
-    try:
-        from vllm.entrypoints.openai.cli_args import make_arg_parser
-    except ImportError:
-        pytest.skip("vllm parser not importable")
-
-    parser = make_arg_parser(FlexibleArgumentParser())
+    parser = _build_full_serve_parser()
     nullify_stage_engine_defaults(parser)
 
     server_dests = derive_server_dests_from_vllm_parser()
     if not server_dests:
         pytest.skip("server dest derivation returned empty set")
 
-    # At least one server-level dest should have a non-None default still.
-    server_actions_with_defaults = [
+    kept = [
         a
         for a in parser._actions
         if a.dest in server_dests and a.default is not None and a.default is not argparse.SUPPRESS
     ]
-    assert server_actions_with_defaults, "All server-level flags lost their defaults — nullify is over-reaching."
+    assert kept, "Server flags lost their defaults — nullify over-reach"
 
 
 def test_help_text_preserves_default_after_nullify():
-    """Real defaults stay visible in --help text via ``(default: X)`` suffix
-    even though parser stores None."""
+    # Real defaults must stay visible in --help even though parser stores None.
     import argparse
 
     from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--example-flag", type=int, default=42, help="Example knob.")
-
-    # Use a dummy "engine" by leaving server dests empty.
     nullify_stage_engine_defaults(parser)
 
     action = next(a for a in parser._actions if a.dest == "example_flag")
@@ -445,18 +430,8 @@ def test_help_text_preserves_default_after_nullify():
     assert "(default: 42)" in action.help
 
 
-def test_omniengineargs_user_input_fields_default_to_none():
-    """User-input fields default to None so ``OmniEngineArgs.create()`` can
-    distinguish set from unset. Internal flags are exempt."""
-    try:
-        from vllm_omni.engine.arg_utils import OmniEngineArgs
-    except Exception as exc:
-        pytest.skip(f"OmniEngineArgs not importable: {exc}")
-
-    INTERNAL = {"omni", "has_sampling_extra_args", "stage_id"}
-    # default_factory fields (e.g. dict) and inherited EngineArgs fields
-    # are out of scope for this invariant.
-    OWN_FIELDS = {
+_OMNIENGINEARGS_USER_INPUT_FIELDS = frozenset(
+    {
         "model_stage",
         "model_arch",
         "engine_output_type",
@@ -477,23 +452,26 @@ def test_omniengineargs_user_input_fields_default_to_none():
         "log_stats",
         "custom_pipeline_args",
     }
-
-    offenders: list[tuple[str, object]] = []
-    for f in fields(OmniEngineArgs):
-        if f.name not in OWN_FIELDS:
-            continue
-        if f.default is not dataclasses.MISSING and f.default is not None:
-            offenders.append((f.name, f.default))
-
-    assert not offenders, (
-        f"OmniEngineArgs fields with non-None defaults: {offenders}. "
-        f"User-input fields must default to None for explicit-vs-unset tracking."
-    )
+)
 
 
-def test_omniengineargs_create_factory_tracks_explicit_fields():
-    """``OmniEngineArgs.create(**explicit)`` records which fields the caller
-    set in ``_explicit_fields``; ``explicit_kwargs()`` returns only those."""
+def test_omniengineargs_user_input_fields_default_to_none():
+    try:
+        from vllm_omni.engine.arg_utils import OmniEngineArgs
+    except Exception as exc:
+        pytest.skip(f"OmniEngineArgs not importable: {exc}")
+
+    offenders = [
+        (f.name, f.default)
+        for f in fields(OmniEngineArgs)
+        if f.name in _OMNIENGINEARGS_USER_INPUT_FIELDS
+        and f.default is not dataclasses.MISSING
+        and f.default is not None
+    ]
+    assert not offenders, f"User-input fields with non-None defaults: {offenders}"
+
+
+def test_omniengineargs_create_tracks_explicit_fields():
     try:
         from vllm_omni.engine.arg_utils import OmniEngineArgs
     except Exception as exc:
@@ -501,26 +479,18 @@ def test_omniengineargs_create_factory_tracks_explicit_fields():
 
     ea = OmniEngineArgs.create(model="x", gpu_memory_utilization=0.5)
     assert ea._explicit_fields == frozenset({"model", "gpu_memory_utilization"})
-    explicit = ea.explicit_kwargs()
-    assert explicit == {"model": "x", "gpu_memory_utilization": 0.5}
+    assert ea.explicit_kwargs() == {"model": "x", "gpu_memory_utilization": 0.5}
 
 
-def test_omniengineargs_bare_constructor_warns_when_passed_to_omnibase():
-    """Bare ``OmniEngineArgs(...)`` cannot distinguish caller-set from
-    dataclass-default. Passing such an instance via ``engine_args=`` triggers
-    a DeprecationWarning."""
+def test_omniengineargs_bare_constructor_has_no_explicit_tracking():
     try:
         from vllm_omni.engine.arg_utils import OmniEngineArgs
     except Exception as exc:
         pytest.skip(f"OmniEngineArgs not importable: {exc}")
 
     ea = OmniEngineArgs(model="x")
-    # Bare constructor doesn't set _explicit_fields
     assert not hasattr(ea, "_explicit_fields")
-
-    # explicit_kwargs() falls back to all-non-None for legacy
-    explicit = ea.explicit_kwargs()
-    assert "model" in explicit
+    assert "model" in ea.explicit_kwargs()
 
 
 # dataclasses already imported via ``from dataclasses import dataclass, fields``
