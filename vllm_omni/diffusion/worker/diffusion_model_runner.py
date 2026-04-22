@@ -547,10 +547,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 if is_new_request:
                     self.pipeline.prepare_encode(state)
-                    pp_size = get_pp_group().world_size
-                    self.pipeline._registered_pp_comms = pp_size > 1
-                    if pp_size > 1:
-                        self.pipeline.register_pp_channels(state)
 
                 pp_group = get_pp_group()
                 pp_rank = pp_group.rank_in_group
@@ -565,8 +561,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             decoded_chunks.append(self.pipeline.post_decode(state))
 
                     if len(decoded_chunks) >= state.sampling.num_chunks:
-                        assert len(denoised_chunks) == state.sampling.num_chunks, (
-                            f"Expected {state.sampling.num_chunks} denoised chunks but got {len(denoised_chunks)}"
+                        assert len(decoded_chunks) == state.sampling.num_chunks, (
+                            f"Expected {state.sampling.num_chunks} denoised chunks but got {len(decoded_chunks)}"
                         )
 
                         output = RunnerOutput(
@@ -577,7 +573,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         )
 
                         self._update_states_after(state, finished=True)
-                        self.pipeline._registered_pp_comms = False
 
                         return output
 
