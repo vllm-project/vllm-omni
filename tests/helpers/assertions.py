@@ -11,7 +11,9 @@ import numpy as np
 import soundfile as sf
 from PIL import Image
 
-from tests.helpers.media import cosine_similarity_text
+from tests.helpers.media import (
+    cosine_similarity_text,
+)
 
 _GENDER_PIPELINE = None
 _GENDER_PIPELINE_LOCK = threading.Lock()
@@ -56,7 +58,7 @@ def assert_image_diffusion_response(
             f"Expected {num_outputs_per_prompt} images, got {len(response.images)}"
         )
 
-    if run_level == "advanced_model":
+    if run_level in {"advanced_model", "full_model"}:
         width = extra_body.get("width")
         height = extra_body.get("height")
 
@@ -407,7 +409,8 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
 
     modalities = request_config.get("modalities", ["text", "audio"])
 
-    if run_level == "advanced_model":
+    if run_level in {"advanced_model", "full_model"}:
+        # Verify output success
         if "audio" in modalities:
             assert response.audio_content is not None, "No audio output is generated"
             print(f"audio content is: {response.audio_content}")
@@ -417,12 +420,11 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                     response.audio_bytes,
                     speaker,
                 )
-
         if "text" in modalities:
             assert response.text_content is not None, "No text output is generated"
             print(f"text content is: {response.text_content}")
 
-        # Verify image description
+        # Verify keywords in output
         word_types = ["text", "image", "audio", "video"]
         keywords_dict = request_config.get("key_words", {})
         for word_type in word_types:
@@ -441,11 +443,25 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                     )
 
         # Verify similarity (Whisper transcript vs streamed/detokenized text)
-        if "text" in modalities and "audio" in modalities:
-            assert response.similarity is not None and response.similarity > 0.9, (
-                "The audio content is not same as the text"
-            )
-            print(f"similarity is: {response.similarity}")
+        if "audio" in modalities:
+            audio_ref_text = request_config.get("audio_ref_text")
+            if "text" in modalities:
+                transcript = (response.audio_content or "").strip()
+                text_output = (response.text_content or "").strip()
+                similarity = cosine_similarity_text(
+                    transcript.lower(),
+                    text_output.lower(),
+                )
+                assert similarity > 0.9, "The audio content is not same as the text"
+                print(f"similarity is: {similarity}")
+            if audio_ref_text:
+                audio_similarity = cosine_similarity_text(
+                    response.audio_content.lower(),
+                    str(audio_ref_text).lower(),
+                )
+                assert audio_similarity > 0.9, (
+                    f"The audio content does not match reference text: similarity={audio_similarity:.3f}"
+                )
 
 
 def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str) -> None:
@@ -464,7 +480,7 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
     elif req_fmt == "wav" and response.audio_format:
         assert req_fmt in response.audio_format
 
-    if run_level == "advanced_model" and req_fmt != "pcm":
+    if run_level in {"advanced_model", "full_model"} and req_fmt != "pcm":
         expected_text = request_config.get("input")
         if expected_text:
             transcript = (response.audio_content or "").strip()

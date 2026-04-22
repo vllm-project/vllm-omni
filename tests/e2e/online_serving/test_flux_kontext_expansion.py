@@ -8,6 +8,8 @@ import pytest
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+
 EDIT_PROMPT = "Transform this modern, geometrist image into a Vincent van Gogh style impressionist painting."
 NEGATIVE_PROMPT = "blurry, low quality, modern, geometrist"
 MODEL = "black-forest-labs/FLUX.1-Kontext-dev"
@@ -29,8 +31,6 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases(MODEL),
@@ -54,8 +54,6 @@ def test_flux_kontext_text_to_image(omni_server: OmniServer, openai_client: Open
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases(MODEL),
@@ -83,8 +81,6 @@ def test_flux_kontext_image_edit(omni_server: OmniServer, openai_client: OpenAIC
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases(MODEL),
@@ -110,8 +106,6 @@ def test_flux_kontext_image_edit_no_negative(omni_server: OmniServer, openai_cli
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases(MODEL),
@@ -135,8 +129,6 @@ def test_flux_kontext_high_resolution(omni_server: OmniServer, openai_client: Op
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases(MODEL),

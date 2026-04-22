@@ -100,8 +100,21 @@ class OmniRequestOutput:
     # memory usage info
     peak_memory_mb: float = 0.0
 
-    # error handling
+    # Error information -- set when the output represents a failed request.
     error: str | None = None
+
+    @classmethod
+    def from_error(
+        cls,
+        request_id: str,
+        error: str,
+    ) -> "OmniRequestOutput":
+        """Create an error output for a request that failed during generation."""
+        return cls(
+            request_id=request_id,
+            finished=True,
+            error=error,
+        )
 
     @classmethod
     def from_pipeline(
