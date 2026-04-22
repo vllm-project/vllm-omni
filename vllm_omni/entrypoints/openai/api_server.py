@@ -632,6 +632,7 @@ async def omni_init_app_state(
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
+        state.sleeping_stages = set()
         logger.info("Pure diffusion API server initialized for model: %s", model_name)
         return
 
