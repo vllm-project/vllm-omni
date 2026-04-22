@@ -25,8 +25,8 @@ from tests.dfx.reliability.helpers import (
     make_process_kill_fault_injector,
     stop_gpu_oom_hogs,
 )
+from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_image
-from vllm_omni.platforms import current_omni_platform
 
 RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
     {
@@ -59,6 +59,8 @@ FAULT_ERROR_KEYWORDS = (
     "cuda",
     "job failed",
     "unknown error",
+    "internal server error",
+    "500 server error",
 )
 PROCESS_KILL_ERROR_KEYWORDS = (
     "timeout",
@@ -77,10 +79,7 @@ DIFFUSION_VIDEO_PARAMS = [param for param in WAN_PARAMS if supports_video_genera
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(
-    current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
-    reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
-)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server_function, openai_client_function) -> None:
     stage_config_path = getattr(omni_server_function, "stage_config_path", None)
@@ -287,10 +286,7 @@ def test_reliability_fault_process_kill_video_health_fast_fail_and_concurrent(
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(
-    current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
-    reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
-)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skip(reason="issue#2327")
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
 def test_reliability_video_oom_recovers_after_fault_removed(

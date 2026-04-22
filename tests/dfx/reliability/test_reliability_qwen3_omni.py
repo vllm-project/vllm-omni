@@ -34,9 +34,9 @@ from tests.dfx.reliability.helpers import (
     start_runtime_teardown_container_server,
     stop_gpu_oom_hogs,
 )
+from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
 from tests.helpers.runtime import dummy_messages_from_mix_data
-from vllm_omni.platforms import current_omni_platform
 
 RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
     {
@@ -203,10 +203,7 @@ QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, DEPLO
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(
-    current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
-    reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
-)
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_function, openai_client_function) -> None:
     device_spec = resolve_oom_device_spec(
@@ -248,10 +245,7 @@ def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_functi
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(
-    current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
-    reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
-)
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_function, openai_client_function) -> None:
     device_spec = resolve_oom_device_spec(
@@ -452,10 +446,7 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
 
 
 @pytest.mark.slow
-@pytest.mark.skipif(
-    current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
-    reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
-)
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
     omni_server_function,
@@ -522,10 +513,7 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
 
 @pytest.mark.slow
 @pytest.mark.skip(reason="issue#2327")
-@pytest.mark.skipif(
-    current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
-    reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
-)
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
     omni_server_function,
