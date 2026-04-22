@@ -17,6 +17,9 @@ from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
 
+pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+
+
 MODEL_ID = "Qwen/Qwen-Image"
 MODEL_ENV_VAR = "QWEN_IMAGE_MODEL"
 PROMPT = "A photo of a cat sitting on a laptop keyboard, digital art style."
@@ -99,9 +102,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> Image.Image:
         run_post_test_cleanup(enable_force=True)
 
 
-@pytest.mark.advanced_model
 @pytest.mark.benchmark
-@pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
     model = _model_name()

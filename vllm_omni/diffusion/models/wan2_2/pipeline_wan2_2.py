@@ -190,9 +190,6 @@ def get_wan22_pre_process_func(
 ):
     """Pre-process function for Wan2.2: optionally load and resize input image for I2V mode."""
     import numpy as np
-    from diffusers.video_processor import VideoProcessor
-
-    video_processor = VideoProcessor(vae_scale_factor=8)
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         for i, prompt in enumerate(request.prompts):
@@ -236,10 +233,6 @@ def get_wan22_pre_process_func(
             )
             prompt["multi_modal_data"]["image"] = image  # type: ignore # key existence already checked above
 
-            # Preprocess for VAE
-            prompt["additional_information"]["preprocessed_image"] = video_processor.preprocess(
-                image, height=request.sampling_params.height, width=request.sampling_params.width
-            )
             request.prompts[i] = prompt
         return request
 

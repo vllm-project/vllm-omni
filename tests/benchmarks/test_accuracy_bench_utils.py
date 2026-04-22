@@ -6,6 +6,9 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -36,8 +39,6 @@ from benchmarks.accuracy.text_to_image.gbench import (
     summarize_generated_records as summarize_gebench_generated_records,
     summarize_gebench_results,
 )
-
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 def test_summarize_gebench_generated_records_groups_by_type():

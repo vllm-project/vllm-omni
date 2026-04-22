@@ -11,18 +11,13 @@ MODEL="${MODEL:-fishaudio/s2-pro}"
 PORT="${PORT:-8091}"
 GRADIO_PORT="${GRADIO_PORT:-7860}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 echo "Starting Fish Speech S2 Pro server (port $PORT)..."
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
-vllm-omni serve "$MODEL" \
-    --stage-configs-path "$REPO_ROOT/vllm_omni/model_executor/stage_configs/fish_speech_s2_pro.yaml" \
+vllm serve "$MODEL" \
+    --omni \
     --host 0.0.0.0 \
-    --port "$PORT" \
-    --gpu-memory-utilization 0.9 \
-    --trust-remote-code \
-    --enforce-eager \
-    --omni &
+    --port "$PORT" &
 SERVER_PID=$!
 
 cleanup() {
