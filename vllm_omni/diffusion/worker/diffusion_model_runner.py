@@ -554,7 +554,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
                 if pp_group.is_first_rank:
                     denoised_chunks = state.extra.pop("denoised_chunks", [])
-                    decoded_chunks = state.extra.get("decoded_chunks", [])
+                    decoded_chunks = state.extra.setdefault("decoded_chunks", [])
                     
                     for chunk in denoised_chunks:
                         with state.use_chunk(chunk):
