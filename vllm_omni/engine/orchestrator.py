@@ -22,6 +22,7 @@ from vllm.outputs import RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 from vllm_omni.engine import (
@@ -179,6 +180,7 @@ class Orchestrator:
         # Shutdown coordination
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
+        self._fatal_error: str | None = None
 
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
@@ -207,6 +209,12 @@ class Orchestrator:
                 await asyncio.gather(request_task, output_task, return_exceptions=True)
             except Exception:
                 pass
+
+            # If a fatal error caused the shutdown, drain any pending
+            # add_request messages that were never processed and broadcast
+            # fatal error responses so callers are not left hanging.
+            if self._fatal_error is not None:
+                await self._drain_pending_requests_on_fatal()
 
             self._shutdown_stages()
 
@@ -271,6 +279,21 @@ class Orchestrator:
                     output = stage_client.get_diffusion_output_nowait()
                     if output is not None:
                         idle = False
+
+                        if getattr(output, "error", None) is not None:
+                            await self.output_async_queue.put(
+                                {
+                                    "type": "output",
+                                    "request_id": output.request_id,
+                                    "stage_id": stage_id,
+                                    "engine_outputs": output,
+                                    "metrics": None,
+                                    "finished": True,
+                                }
+                            )
+                            self.request_states.pop(output.request_id, None)
+                            continue
+
                         req_state = self.request_states.get(output.request_id)
                         if req_state is not None:
                             if getattr(output, "error", None) is not None:
@@ -300,6 +323,26 @@ class Orchestrator:
                 except asyncio.TimeoutError:
                     continue
                 except asyncio.CancelledError:
+                    raise
+                except EngineDeadError as e:
+                    logger.error(
+                        "[Orchestrator] Stage-%s is dead: %s",
+                        stage_id,
+                        e,
+                    )
+                    self._fatal_error = str(e)
+                    for req_id, req_state in list(self.request_states.items()):
+                        if stage_id in req_state.stage_submit_ts:
+                            await self.output_async_queue.put(
+                                {
+                                    "type": "error",
+                                    "error": str(e),
+                                    "fatal": True,
+                                    "request_id": req_id,
+                                }
+                            )
+                            self.request_states.pop(req_id, None)
+                    self._shutdown_event.set()
                     raise
                 except Exception:
                     if self._shutdown_event.is_set():
@@ -1063,6 +1106,53 @@ class Orchestrator:
                 "results": results,
             }
         )
+
+    async def _drain_pending_requests_on_fatal(self) -> None:
+        """Drain the request queue and broadcast fatal errors for any
+        pending add_request messages that were never processed.
+
+        Called from the ``run()`` finally block when a fatal error
+        (e.g. ``EngineDeadError``) caused the orchestrator to shut down
+        before the request handler could process all queued messages.
+        Also broadcasts for any already-tracked requests still in
+        ``request_states`` that were not yet notified.
+        """
+        assert self._fatal_error is not None
+
+        notified: set[str] = set()
+
+        # 1) Drain pending messages from the request queue.
+        while True:
+            try:
+                msg = self.request_async_queue.get_nowait()
+            except Exception:
+                break
+            if msg.get("type") == "add_request":
+                req_id = msg["request_id"]
+                await self.output_async_queue.put(
+                    {
+                        "type": "error",
+                        "error": self._fatal_error,
+                        "fatal": True,
+                        "request_id": req_id,
+                    }
+                )
+                notified.add(req_id)
+
+        # 2) Broadcast for any tracked requests not already notified
+        #    (e.g. request was registered but the EngineDeadError handler
+        #    missed it because it wasn't submitted to the dead stage yet).
+        for req_id in list(self.request_states):
+            if req_id not in notified:
+                await self.output_async_queue.put(
+                    {
+                        "type": "error",
+                        "error": self._fatal_error,
+                        "fatal": True,
+                        "request_id": req_id,
+                    }
+                )
+            self.request_states.pop(req_id, None)
 
     def _shutdown_stages(self) -> None:
         """Shutdown all stage clients."""

@@ -127,12 +127,13 @@ exclude = [
 
 [tool.ruff.lint]
 select = [
-    "E",  # pycodestyle errors
-    "W",  # pycodestyle warnings
-    "F",  # pyflakes
-    "I",  # isort (handled separately, but included for compatibility)
-    "N",  # pep8-naming
-    "UP", # pyupgrade
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort (handled separately, but included for compatibility)
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "TID251", # flake8-tidy-imports.banned-api
 ]
 ignore = [
     "E203",  # whitespace before ':' (conflicts with black)
@@ -146,6 +147,9 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "examples/**" = ["E501"]  # Allow long lines in examples
 "tests/**" = ["E501"]  # Allow long lines in tests
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"
 
 [tool.mypy]
 python_version = "3.12, 3.13"

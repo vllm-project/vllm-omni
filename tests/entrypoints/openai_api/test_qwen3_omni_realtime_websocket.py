@@ -23,33 +23,28 @@ from tests.helpers.media import (
     generate_synthetic_audio,
 )
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
+# Synthetic input for realtime E2E (``generate_synthetic_audio``); distinct cache file per phrase.
+REALTIME_SYNTH_PHRASE_TEXT = "Translate into Chinese: Beijing is the Capital of China"
+
 # The new-schema CI overlay bakes in async_chunk: False and covers CUDA/ROCm/XPU
 # via its ``platforms:`` section, so one path serves all three.
 default_stage_config = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
-
-
-def _realtime_stage_config_path() -> str:
-    """CI omni layout without async_chunk; stage 0 thinker max_tokens=10."""
-    return modify_stage_config(
-        default_stage_config,
-        updates={"stages": {0: {"default_sampling_params.max_tokens": 10}}},
-    )
-
 
 realtime_server_params = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=_realtime_stage_config_path(),
+            stage_config_path=default_stage_config,
             use_stage_cli=True,
+            server_args=["--no-async-chunk"],
         ),
-        id="thinker_max_tokens_10",
+        id="default",
     ),
 ]
 
@@ -169,9 +164,15 @@ class TestQwen3OmniRealtimeWebSocket:
         """
         Short streamed 16 kHz mono PCM16 input; expect streamed PCM16 audio deltas and
         transcription. Verify Whisper(output audio) aligns with model text (same idea
-        as multimodal omni e2e).
+        as multimodal omni e2e). Input speech is synthesized from
+        ``REALTIME_SYNTH_PHRASE_TEXT``.
         """
-        syn = generate_synthetic_audio(10, 1, sample_rate=16000)
+        syn = generate_synthetic_audio(
+            10,
+            1,
+            sample_rate=16000,
+            phrase_text=REALTIME_SYNTH_PHRASE_TEXT,
+        )
         wav_bytes = base64.b64decode(syn["base64"])
         pcm16 = _pcm16_mono_16k_from_wav_bytes(wav_bytes)
 
