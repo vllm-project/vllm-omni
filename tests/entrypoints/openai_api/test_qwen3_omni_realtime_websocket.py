@@ -36,23 +36,15 @@ REALTIME_SYNTH_PHRASE_TEXT = "Translate into Chinese: Beijing is the Capital of 
 # via its ``platforms:`` section, so one path serves all three.
 default_stage_config = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 
-
-def _realtime_stage_config_path() -> str:
-    """CI omni layout without async_chunk"""
-    return modify_stage_config(
-        default_stage_config,
-    )
-
-
 realtime_server_params = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=_realtime_stage_config_path(),
+            stage_config_path=default_stage_config,
             use_stage_cli=True,
             server_args=["--no-async-chunk"],
         ),
-        id="thinker_max_tokens_10",
+        id="default",
     ),
 ]
 
