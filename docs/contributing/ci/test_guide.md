@@ -42,15 +42,10 @@ Our test scripts use the pytest framework. First, please use `git clone https://
     ```
     The latest test commands for various test suites can be found in the [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-ready.yml).
 
-=== "L3 level & L4 level"
+=== "L3 level"
 
     ```bash
-    cd tests
     pytest -s -v -m "advanced_model" --run-level=advanced_model
-    ```
-    If you only want to run L3 test case, you can use:
-    ```bash
-    pytest -s -v e2e/ --ignore-glob='*expansion.py' -m "advanced_model" --run-level=advanced_model
     ```
     If you only want to run a specific test case, you can use:
     ```bash
@@ -58,16 +53,35 @@ Our test scripts use the pytest framework. First, please use `git clone https://
     ```
     If you only want to run specific test cases on a particular platform, you can use:
     ```bash
-    pytest -s -v -m "core_model and distributed_cuda and L4"  --run-level=core_model
+    pytest -s -v -m "advanced_model and distributed_cuda and L4"  --run-level=advanced_model
     ```
-    Note: To run performance tests, use:
-    ```bash
-    pytest -s -v perf/scripts/run_benchmark.py
-    ```
-
     The latest L3 test commands for various test suites can be found in the [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-merge.yml).
 
-    The latest L4 test commands for various test suites can be found in the [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly.yml).
+
+=== "L4 level"
+
+    ```bash
+    cd tests
+    pytest -s -v -m "full_model" --run-level=full_model
+    ```
+    If you only want to run a specific test case, you can use:
+    ```bash
+    pytest -s -v test_xxxx.py --run-level=full_model
+    ```
+    If you only want to run specific test cases on a particular platform, you can use:
+    ```bash
+    pytest -s -v -m "full_model and distributed_cuda and L4"  --run-level=full_model
+    ```
+    Note: To run performance tests (defaults to ``test_qwen_omni.json``; use ``--test-config-file tests/dfx/perf/tests/test_tts.json`` for TTS):
+    ```bash
+    pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
+    ```
+    The latest L4 (nightly) test commands use the `full_model` marker and `--run-level full_model` (see [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly.yml) and [test-nightly-diffusion.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly-diffusion.yml)). Example:
+
+    ```bash
+    cd tests
+    pytest -s -v -m "full_model and omni and H100" --run-level=full_model
+    ```
 
 You can find more information about markers in the documentation: [marker doc](./tests_markers.md)
 

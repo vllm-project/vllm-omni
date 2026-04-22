@@ -47,15 +47,9 @@ stage_args:
     engine_args:
       model_stage: dit
       max_num_seqs: 1
-      gpu_memory_utilization: 0.45
       enforce_eager: true
       trust_remote_code: true
-      engine_output_type: image
       distributed_executor_backend: mp
-      enable_prefix_caching: false
-      max_num_batched_tokens: 32768
-      tensor_parallel_size: 1
-      load_format: dummy
       omni_kv_config:
         need_recv_cache: true
     engine_input_source: [0]
@@ -70,9 +64,6 @@ stage_args:
 # Top-level runtime config with Mooncake connector
 runtime:
   enabled: true
-  defaults:
-    window_size: -1
-    max_inflight: 1
   connectors:
     mooncake_connector:
       name: MooncakeConnector
@@ -86,4 +77,3 @@ runtime:
   edges:
     - from: 0
       to: 1
-      window_size: -1

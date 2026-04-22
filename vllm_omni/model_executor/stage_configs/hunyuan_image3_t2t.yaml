@@ -1,0 +1,42 @@
+# Stage config for HunyuanImage-3.0 Text-to-Text (T2T / pure text generation).
+# Single LLM stage: AR model reads text prompt only, generates text output.
+# Sampling params aligned with official generation_config.json.
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0,1,2,3"
+      max_batch_size: 1
+      requires_multimodal_data: false
+    engine_args:
+      model_stage: AR
+      max_num_seqs: 1
+      model_arch: HunyuanImage3ForCausalMM
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.95
+      enforce_eager: true
+      trust_remote_code: true
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+      tensor_parallel_size: 4
+      pipeline_parallel_size: 1
+      hf_overrides:
+        rope_parameters:
+          mrope_section: [0, 32, 32]
+          rope_type: default
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 0.95
+      top_k: 1024
+      max_tokens: 2048
+      stop_token_ids: [127957, 128026]  # <|endoftext|>, </answer>
+      detokenize: True
+
+runtime:
+  enabled: true

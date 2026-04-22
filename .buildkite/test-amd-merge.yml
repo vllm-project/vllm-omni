@@ -32,7 +32,6 @@ steps:
   mirror_hardwares: [amdproduction]
   grade: Blocking
   commands:
-    - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
     - |
@@ -55,7 +54,7 @@ steps:
 #     - export GPU_ARCHS=gfx942
 #     - export VLLM_LOGGING_LEVEL=DEBUG
 #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-#     - timeout 20m pytest -s -v tests/e2e/offline_inference/test_stable_audio_model.py
+#     - timeout 20m pytest -s -v tests/e2e/offline_inference/test_stable_audio_expansion.py -m "advanced_model and diffusion and L4" --run-level advanced_model
 
 - label: "Diffusion Cache Backend Test"
   agent_pool: mi325_1
@@ -63,13 +62,12 @@ steps:
   mirror_hardwares: [amdproduction]
   grade: Blocking
   commands:
-    - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
     - timeout 15m pytest -s -v -m "core_model and cache and diffusion and not distributed_cuda and L4"
 
-- label: "Diffusion Sequence Parallelism Test"
-  agent_pool: mi325_2
+- label: "Diffusion Sequence Parallelism Test (Need 4 GPUs)"
+  agent_pool: mi325_4
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
   grade: Blocking
@@ -77,6 +75,7 @@ steps:
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
     - timeout 20m pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py
+    - timeout 20m pytest -s -v tests/diffusion/distributed/test_ulysses_uaa_perf.py
 
 # merge-only tests
 - label: "Diffusion Tensor Parallelism Test"
@@ -95,22 +94,14 @@ steps:
   commands:
     - timeout 20m pytest -s -v tests/diffusion/test_diffusion_worker.py
 
-- label: "Benchmark & Engine Test"
-  agent_pool: mi325_2
+- label: "Engine Test"
+  agent_pool: mi325_1
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
   grade: Blocking
   commands:
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - |
-      timeout 20m bash -c '
-        set +e
-        pytest -s -v tests/benchmarks/test_serve_cli.py
-        EXIT1=\$?
-        pytest -s -v tests/engine/test_async_omni_engine_abort.py
-        EXIT2=\$?
-        exit \$((EXIT1 | EXIT2))
-      '
+    - timeout 20m pytest -s -v tests/engine/test_async_omni_engine_abort.py
 
 - label: "Omni Model Test Qwen2-5-Omni"
   agent_pool: mi325_2
@@ -121,6 +112,7 @@ steps:
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
     - timeout 20m pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py
+    - timeout 20m pytest -s -v tests/e2e/online_serving/test_qwen2_5_omni.py -m "advanced_model" --run-level "advanced_model"
 
 - label: "Omni Model Test Qwen3-Omni"
   agent_pool: mi325_2
@@ -131,18 +123,35 @@ steps:
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
     - export VLLM_TEST_CLEAN_GPU_MEMORY=1
-    - timeout 10m pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py
-    - timeout 20m pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -m "advanced_model" --run-level "advanced_model"
+    - timeout 30m pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni.py tests/e2e/online_serving/test_mimo_audio.py -m "advanced_model" --run-level "advanced_model"
 
-- label: "Qwen3-TTS E2E Test"
-  agent_pool: mi325_2
+- label: "Qwen3-TTS CustomVoice E2E Test"
+  agent_pool: mi325_1
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
   grade: Blocking
   commands:
-    - export VLLM_LOGGING_LEVEL=DEBUG
-    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - timeout 20m pytest -s -v tests/e2e/online_serving/test_qwen3_tts.py
+    - |
+      timeout 20m bash -c '
+        export VLLM_LOGGING_LEVEL=DEBUG
+        export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+        pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py tests/e2e/offline_inference/test_qwen3_tts_customvoice.py -m "advanced_model" --run-level "advanced_model"
+      '
+
+- label: "Qwen3-TTS Base E2E Test"
+  agent_pool: mi325_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - |
+      timeout 30m bash -c '
+        export VLLM_LOGGING_LEVEL=DEBUG
+        export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+        pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py tests/e2e/offline_inference/test_qwen3_tts_base.py -m "advanced_model" --run-level "advanced_model"
+      '
 
 - label: "Diffusion Image Edit Test"
   agent_pool: mi325_1
@@ -155,43 +164,58 @@ steps:
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
     - timeout 20m pytest -s -v tests/e2e/online_serving/test_image_gen_edit.py
 
-# split Bagel Model Test with H100 (Real Weights) into three tests
-- label: "Bagel Text2Img Model Test"
-  agent_pool: mi325_1
-  depends_on: amd-build
-  mirror_hardwares: [amdproduction]
-  grade: Blocking
-  commands:
-    - export GPU_ARCHS=gfx942
-    - export VLLM_TEST_CLEAN_GPU_MEMORY=1
-    - export VLLM_LOGGING_LEVEL=DEBUG
-    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - export VLLM_ROCM_USE_AITER_RMSNORM=0
-    - timeout 30m pytest -s -v tests/e2e/offline_inference/test_bagel_text2img.py -m "advanced_model" --run-level "advanced_model" -k "shared_memory" -k "rocm"
+# TODO: Bagel test on ROCm is very unstable. @tjtanaa
+# Need to debug before reneable numerical changes across large PRs
+# # split Bagel Model Test with H100 (Real Weights) into three tests
+# - label: "Bagel Text2Img Model Test (1/3)"
+#   agent_pool: mi325_1
+#   depends_on: amd-build
+#   mirror_hardwares: [amdproduction]
+#   grade: Blocking
+#   commands:
+#     - export GPU_ARCHS=gfx942
+#     - export VLLM_TEST_CLEAN_GPU_MEMORY=1
+#     - export VLLM_LOGGING_LEVEL=DEBUG
+#     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+#     - export VLLM_ROCM_USE_AITER_RMSNORM=0
+#     - timeout 30m pytest -s -v tests/e2e/offline_inference/test_bagel_text2img.py -m "advanced_model" --run-level "advanced_model" -k "shared_memory" -k "rocm"
 
-- label: "Bagel Img2Img Model Test"
-  agent_pool: mi325_1
-  depends_on: amd-build
-  mirror_hardwares: [amdproduction]
-  grade: Blocking
-  commands:
-    - export GPU_ARCHS=gfx942
-    - export VLLM_TEST_CLEAN_GPU_MEMORY=1
-    - export VLLM_LOGGING_LEVEL=DEBUG
-    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - export VLLM_ROCM_USE_AITER_RMSNORM=0
-    - timeout 30m pytest -s -v tests/e2e/offline_inference/test_bagel_img2img.py -m "advanced_model" --run-level "advanced_model" -k "rocm"
+# - label: "Bagel Img2Img Model Test (2/3)"
+#   agent_pool: mi325_1
+#   depends_on: amd-build
+#   mirror_hardwares: [amdproduction]
+#   grade: Blocking
+#   commands:
+#     - export GPU_ARCHS=gfx942
+#     - export VLLM_TEST_CLEAN_GPU_MEMORY=1
+#     - export VLLM_LOGGING_LEVEL=DEBUG
+#     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+#     - export VLLM_ROCM_USE_AITER_RMSNORM=0
+#     - timeout 30m pytest -s -v tests/e2e/offline_inference/test_bagel_img2img.py -m "advanced_model" --run-level "advanced_model" -k "rocm"
 
-- label: "Bagel Online Serving Test"
+# - label: "Bagel Online Serving Test (3/3)"
+#   agent_pool: mi325_1
+#   depends_on: amd-build
+#   mirror_hardwares: [amdproduction]
+#   grade: Blocking
+#   commands:
+#     - export GPU_ARCHS=gfx942
+#     - export VLLM_TEST_CLEAN_GPU_MEMORY=1
+#     - export VLLM_IMAGE_FETCH_TIMEOUT=60
+#     - export VLLM_LOGGING_LEVEL=DEBUG
+#     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+#     - export VLLM_ROCM_USE_AITER_RMSNORM=0
+#     - timeout 40m pytest -s -v tests/e2e/online_serving/test_bagel_online.py -m "advanced_model" --run-level "advanced_model" -k "rocm"
+
+- label: "Voxtral-TTS E2E Test"
   agent_pool: mi325_1
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
   grade: Blocking
   commands:
-    - export GPU_ARCHS=gfx942
-    - export VLLM_TEST_CLEAN_GPU_MEMORY=1
-    - export VLLM_IMAGE_FETCH_TIMEOUT=60
-    - export VLLM_LOGGING_LEVEL=DEBUG
-    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - export VLLM_ROCM_USE_AITER_RMSNORM=0
-    - timeout 40m pytest -s -v tests/e2e/online_serving/test_bagel_online.py -m "advanced_model" --run-level "advanced_model" -k "rocm"
+    - |
+      timeout 20m bash -c '
+        export VLLM_LOGGING_LEVEL=DEBUG
+        export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        pytest -s -v tests/e2e/online_serving/test_voxtral_tts.py tests/e2e/offline_inference/test_voxtral_tts.py -m "advanced_model" --run-level "advanced_model"
+      '

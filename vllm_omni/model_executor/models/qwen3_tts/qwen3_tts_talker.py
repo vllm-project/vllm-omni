@@ -13,7 +13,6 @@ import soundfile as sf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from librosa.filters import mel as librosa_mel_fn
 from transformers import AutoTokenizer
 from transformers.activations import ACT2FN
 from transformers.utils.hub import cached_file
@@ -24,9 +23,12 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, WeightsMapper, maybe_prefix
+from vllm.multimodal.audio import AudioResampler
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.audio import mel_filter_bank
+from vllm_omni.utils.voice_cache import VoiceEmbeddingCache
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
@@ -257,14 +259,19 @@ def mel_spectrogram(
     fmax: int | None = None,
     center: bool = False,
 ) -> torch.Tensor:
-    """Calculate mel spectrogram of an input signal using librosa mel filterbank and torch STFT."""
+    """Calculate mel spectrogram of an input signal using torchaudio mel filterbank and torch STFT."""
     if torch.min(y) < -1.0:
         logger.warning("Min value of input waveform signal is %s", torch.min(y))
     if torch.max(y) > 1.0:
         logger.warning("Max value of input waveform signal is %s", torch.max(y))
     device = y.device
-    mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
-    mel_basis = torch.from_numpy(mel).float().to(device)
+    mel_basis = mel_filter_bank(
+        sr=sampling_rate,
+        n_fft=n_fft,
+        n_mels=num_mels,
+        fmin=fmin,
+        fmax=fmax,
+    ).to(device)
     hann_window = torch.hann_window(win_size).to(device)
     padding = (n_fft - hop_size) // 2
     y = torch.nn.functional.pad(y.unsqueeze(1), (padding, padding), mode="reflect").squeeze(1)
@@ -405,6 +412,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Tokenizer for prompt building.
         self._tokenizer = None
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
+
+        # In-memory LRU cache for voice extraction artifacts (Base voice clone).
+        self._voice_cache = VoiceEmbeddingCache()
+        raw_subtalker_sampling = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
+        self._subtalker_sampling_params: dict[str, Any] = (
+            dict(raw_subtalker_sampling) if isinstance(raw_subtalker_sampling, Mapping) else {}
+        )
 
     # -------------------- vLLM required hooks --------------------
 
@@ -867,7 +881,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         Uses upstream vLLM's MediaConnector for http(s) URLs and ``file:``
         URIs, with unrestricted local access (offline inference is trusted).
         """
-        import librosa
+        from vllm.multimodal.media.audio import load_audio
 
         if self._is_url(x):
             from vllm.multimodal.media import MediaConnector
@@ -879,7 +893,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             with io.BytesIO(wav_bytes) as f:
                 audio, sr = sf.read(f, dtype="float32", always_2d=False)
         else:
-            audio, sr = librosa.load(x, sr=None, mono=True)
+            audio, sr = load_audio(x, sr=None, mono=True)
 
         if isinstance(audio, np.ndarray) and audio.ndim > 1:
             audio = np.mean(audio, axis=-1)
@@ -1085,9 +1099,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Resample to 24kHz for speaker encoder.
         target_sr = int(getattr(self.config.speaker_encoder_config, "sample_rate", 24000))
         if sr != target_sr:
-            import librosa
-
-            wav = librosa.resample(y=wav.astype(np.float32), orig_sr=int(sr), target_sr=target_sr)
+            resampler = AudioResampler(target_sr=target_sr)
+            wav = resampler.resample(wav.astype(np.float32), orig_sr=int(sr))
             sr = target_sr
 
         # Follow official implementation: mel_spectrogram expects 24kHz.
@@ -1120,14 +1133,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             speech_tokenizer_dir,
             torch_dtype=torch.bfloat16,
         )
-        # Prefer GPU for encoder if available; otherwise keep CPU.
+        # Only move encoder to GPU; the decoder is unused by Talker (which
+        # only calls tok.encode()) and would otherwise waste bf16 VRAM.
+        # NOTE: after this point the tokenizer instance is encode-only;
+        # calling tok.decode() will fail because tok.model.decoder is None.
         dev = next(self.parameters()).device
-        if getattr(dev, "type", None) == "cuda":
+        if dev.type != "cpu":
             try:
-                tok.model.to(dev)
+                del tok.model.decoder
+                tok.model.decoder = None
+                tok.model.encoder.to(dev)
                 tok.device = dev
             except Exception as e:
-                raise RuntimeError(f"Failed to move speech tokenizer to {dev}: {e}") from e
+                raise RuntimeError(f"Failed to move speech tokenizer encoder to {dev}: {e}") from e
         else:
             tok.device = dev
         self._speech_tokenizer = tok
@@ -1326,6 +1344,25 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             xvec_only = bool((info_dict.get("x_vector_only_mode") or [False])[0])
             in_context_mode = not xvec_only
             voice_clone_prompt = _normalize_voice_clone_prompt(info_dict.get("voice_clone_prompt"))
+
+            # Voice cache: only for uploaded voices (created_at > 0)
+            _voice_cache_key = None
+            if voice_clone_prompt is None:
+                _speaker_list = info_dict.get("speaker")
+                if isinstance(_speaker_list, list) and _speaker_list:
+                    _voice_name = str(_speaker_list[0]).lower()
+                    _voice_created_at = float((info_dict.get("voice_created_at") or [0])[0])
+                    if _voice_created_at > 0:
+                        _voice_cache_key = self._voice_cache.make_cache_key(_voice_name, xvec_only, _voice_created_at)
+                    _cached = self._voice_cache.get(_voice_cache_key) if _voice_cache_key is not None else None
+                    if _cached is not None:
+                        voice_clone_prompt = {
+                            "ref_code": _cached.get("ref_code"),
+                            "ref_spk_embedding": _cached.get("ref_spk_embedding"),
+                            "icl_mode": _cached.get("icl_mode"),
+                        }
+                        _voice_cache_key = None  # hit -> don't store again
+
             # Official implementation may pass `voice_clone_prompt.icl_mode`.
             if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt:
                 icl_flag = _as_singleton(voice_clone_prompt.get("icl_mode"))
@@ -1375,6 +1412,19 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 wav_np, sr = self._normalize_ref_audio(ref_audio_list[0])
                 speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
 
+            # Cache miss: store extraction result
+            if _voice_cache_key is not None and speaker_embed is not None:
+                self._voice_cache.put(
+                    _voice_cache_key,
+                    {
+                        "ref_code": ref_code_prompt.detach().cpu()
+                        if isinstance(ref_code_prompt, torch.Tensor)
+                        else None,
+                        "ref_spk_embedding": speaker_embed.detach().cpu().reshape(-1),
+                        "icl_mode": in_context_mode,
+                    },
+                )
+
             codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
 
             # Role header (<|im_start|>assistant\n) -> projected text embeds.
@@ -1393,11 +1443,16 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     )
                 if ref_ids is None:
                     ref_text = _as_singleton(info_dict.get("ref_text"))
-                    if not isinstance(ref_text, str) or not ref_text.strip():
-                        raise ValueError("Base in-context voice cloning requires `ref_text` or tokenized `ref_ids`.")
-                    ref_ids = tok(self._build_ref_text(ref_text), return_tensors="pt", padding=False)["input_ids"].to(
-                        device=input_ids.device
-                    )
+                    if isinstance(ref_text, str) and ref_text.strip():
+                        ref_ids = tok(
+                            self._build_ref_text(ref_text),
+                            return_tensors="pt",
+                            padding=False,
+                        )["input_ids"].to(device=input_ids.device)
+                    else:
+                        logger.warning("Base ICL: ref_text/ref_ids missing, falling back to x-vector-only mode.")
+                        in_context_mode = False
+            if in_context_mode:
                 icl_input_embed, trailing_text_hidden = self._generate_icl_prompt(
                     text_id=input_ids[:, 3:-5],
                     ref_id=ref_ids[:, 3:-2],
@@ -1450,10 +1505,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
             if not speaker:
                 raise ValueError("CustomVoice requires additional_information.speaker.")
-            spk_id_map = getattr(self.talker_config, "spk_id", None) or {}
+            spk_id_map = {k.lower(): v for k, v in (getattr(self.talker_config, "spk_id", None) or {}).items()}
             if speaker not in spk_id_map:
                 raise ValueError(f"Unsupported speaker: {speaker}")
-            spk_id = spk_id_map[speaker.lower()]
+            spk_id = spk_id_map[speaker]
             # Keep it at least 1D; embedding on a 0-d tensor can return 1D.
             spk_tensor = torch.tensor([spk_id], device=input_ids.device, dtype=torch.long)
             spk_embed = self.embed_input_ids(spk_tensor)
@@ -1587,6 +1642,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         input_embeds: torch.Tensor,
         last_talker_hidden: torch.Tensor,
         text_step: torch.Tensor,
+        do_sample: bool | None = None,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """GPU fast-path used by OmniGPUModelRunner to predict residual codebooks (1..Q-1).
         Returns (inputs_embeds, audio_codes) for the current step."""
@@ -1605,15 +1664,24 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             audio_codes = input_ids.reshape(bsz, 1)
             return (last_id_hidden + text_step).reshape(bsz, -1), audio_codes
 
-        # Predict residual codes (1..Q-1) with HF reference sampling params.
+        subtalker_params = self._subtalker_sampling_params
+        if do_sample is None:
+            do_sample = bool(subtalker_params.get("do_sample", True))
+        if temperature is None:
+            temperature = float(subtalker_params.get("temperature", 0.9))
+        if top_k is None:
+            top_k = int(subtalker_params.get("top_k", 50))
+        if top_p is None:
+            top_p = float(subtalker_params.get("top_p", 1.0))
+
         audio_codes = self.code_predictor(
             layer0_code=input_ids.reshape(bsz, 1),
             layer0_embed=last_id_hidden,
             last_talker_hidden=past_hidden,
-            do_sample=True,
-            temperature=0.9,
-            top_k=50,
-            top_p=1.0,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
         )  # [B, Q]
 
         # Map invalid layer-0 ids (e.g. EOS) to PAD=0 so SpeechTokenizer sees only real codes.

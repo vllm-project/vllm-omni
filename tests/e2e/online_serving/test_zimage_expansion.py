@@ -3,19 +3,20 @@ Tests of common diffusion feature combinations in online serving mode
 for Z-Image.
 
 Coverage is intentionally limited to the minimal 4xL4 cases that
-exercise Z-Image's supported parallel feature combinations:
+exercise Z-Image's supported feature combinations:
 - CacheDiT + FP8 + Ring=2 + TP=2
 - TeaCache + FP8 + Ulysses=2 + Ring=2
+- Layerwise CPU offload + Ulysses=2 + Ring=2
+- Layerwise CPU offload + TP=2
+- Layerwise CPU offload + HSDP
 """
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 MODEL = "Tongyi-MAI/Z-Image-Turbo"
 PROMPT = "A high-detail studio photo of an orange tabby cat sitting on a laptop keyboard."
@@ -60,11 +61,48 @@ def _get_diffusion_feature_cases():
             id="parallel_teacache_fp8_ulysses2_ring2",
             marks=FOUR_CARD_MARKS,
         ),
+        pytest.param(
+            OmniServerParams(
+                model=MODEL,
+                server_args=[
+                    "--enable-layerwise-offload",
+                    "--ulysses-degree",
+                    "2",
+                    "--ring",
+                    "2",
+                ],
+            ),
+            id="layerwise_ulysses2_ring2",
+            marks=FOUR_CARD_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=MODEL,
+                server_args=[
+                    "--enable-layerwise-offload",
+                    "--tensor-parallel-size",
+                    "2",
+                ],
+            ),
+            id="layerwise_tp2",
+            marks=FOUR_CARD_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=MODEL,
+                server_args=[
+                    "--enable-layerwise-offload",
+                    "--use-hsdp",
+                    "--hsdp-shard-size",
+                    "2",
+                ],
+            ),
+            id="layerwise_hsdp",
+            marks=[*FOUR_CARD_MARKS, pytest.mark.skip(reason="issue #2435")],
+        ),
     ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases(),

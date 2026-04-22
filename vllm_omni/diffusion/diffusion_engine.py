@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
+import inspect
+import queue
 import threading
 import time
 from collections.abc import Iterable
@@ -10,8 +14,13 @@ import numpy as np
 import PIL.Image
 import torch
 from vllm.logger import init_logger
+from vllm.v1.engine.exceptions import EngineDeadError
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    DiffusionOutput,
+    DiffusionRequestAbortedError,
+    OmniDiffusionConfig,
+)
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.registry import (
     DiffusionModelRegistry,
@@ -19,7 +28,9 @@ from vllm_omni.diffusion.registry import (
     get_diffusion_pre_process_func,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface
+from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
+from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -69,12 +80,23 @@ class DiffusionEngine:
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
+        # Cache whether the model-specific postprocess accepts request-level
+        # sampling params so step() can support both legacy and extended hooks.
+        self._post_process_accepts_sampling_params = bool(
+            self.post_process_func is not None
+            and "sampling_params" in inspect.signature(self.post_process_func).parameters
+        )
 
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
-        self.scheduler: SchedulerInterface = scheduler or RequestScheduler()
+        self.step_execution = bool(getattr(od_config, "step_execution", False))
+        self.scheduler: SchedulerInterface = scheduler or (
+            StepScheduler() if self.step_execution else RequestScheduler()
+        )
         self.scheduler.initialize(od_config)
-        self._rpc_lock = threading.Lock()
+        self._rpc_lock = threading.RLock()
+        self.abort_queue: queue.Queue[str] = queue.Queue()
+        self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
 
         try:
             self._dummy_run()
@@ -98,8 +120,10 @@ class DiffusionEngine:
         output = self.add_req_and_wait_for_response(request)
         exec_total_time = time.perf_counter() - exec_start_time
 
+        if output.aborted:
+            raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
-            raise Exception(f"{output.error}")
+            raise RuntimeError(output.error)
         logger.info("Generation completed successfully.")
 
         if output.output is None:
@@ -127,10 +151,24 @@ class DiffusionEngine:
             output_data = output_data.cpu()
 
         postprocess_start_time = time.perf_counter()
-        outputs = self.post_process_func(output_data) if self.post_process_func is not None else output_data
+        if self.post_process_func is not None:
+            # Some video pipelines need request-level controls during
+            # postprocess (for example worker-side frame interpolation).
+            if self._post_process_accepts_sampling_params:
+                outputs = self.post_process_func(output_data, sampling_params=request.sampling_params)
+            else:
+                outputs = self.post_process_func(output_data)
+        else:
+            outputs = output_data
         audio_payload = None
+        custom_output = output.custom_output or {}
+        model_audio_sample_rate = None
+        model_fps = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
+            custom_output.update(outputs.get("custom_output") or {})
+            model_audio_sample_rate = outputs.get("audio_sample_rate")
+            model_fps = outputs.get("fps")
             outputs = outputs.get("video", outputs)
         postprocess_time = time.perf_counter() - postprocess_start_time
         logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
@@ -176,6 +214,10 @@ class DiffusionEngine:
                         prompt=prompt,
                         metrics=metrics,
                         latents=output.trajectory_latents,
+                        trajectory_latents=output.trajectory_latents,
+                        trajectory_timesteps=output.trajectory_timesteps,
+                        trajectory_log_probs=output.trajectory_log_probs,
+                        trajectory_decoded=output.trajectory_decoded,
                         multimodal_output={"audio": request_audio_payload},
                         final_output_type="audio",
                         stage_durations=output.stage_durations,
@@ -186,6 +228,10 @@ class DiffusionEngine:
                 mm_output = {}
                 if audio_payload is not None:
                     mm_output["audio"] = audio_payload
+                if model_audio_sample_rate is not None:
+                    mm_output["audio_sample_rate"] = model_audio_sample_rate
+                if model_fps is not None:
+                    mm_output["fps"] = model_fps
                 return [
                     OmniRequestOutput.from_diffusion(
                         request_id=request_id,
@@ -193,7 +239,11 @@ class DiffusionEngine:
                         prompt=prompt,
                         metrics=metrics,
                         latents=output.trajectory_latents,
-                        custom_output=output.custom_output or {},
+                        trajectory_latents=output.trajectory_latents,
+                        trajectory_timesteps=output.trajectory_timesteps,
+                        trajectory_log_probs=output.trajectory_log_probs,
+                        trajectory_decoded=output.trajectory_decoded,
+                        custom_output=custom_output,
                         multimodal_output=mm_output,
                         stage_durations=output.stage_durations,
                         peak_memory_mb=output.peak_memory_mb,
@@ -224,6 +274,10 @@ class DiffusionEngine:
                             prompt=prompt,
                             metrics=metrics,
                             latents=output.trajectory_latents,
+                            trajectory_latents=output.trajectory_latents,
+                            trajectory_timesteps=output.trajectory_timesteps,
+                            trajectory_log_probs=output.trajectory_log_probs,
+                            trajectory_decoded=output.trajectory_decoded,
                             multimodal_output={"audio": request_audio_payload},
                             final_output_type="audio",
                             stage_durations=output.stage_durations,
@@ -244,6 +298,10 @@ class DiffusionEngine:
                                 if num_outputs == 1:
                                     sliced_audio = sliced_audio[0]
                         mm_output["audio"] = sliced_audio
+                    if model_audio_sample_rate is not None:
+                        mm_output["audio_sample_rate"] = model_audio_sample_rate
+                    if model_fps is not None:
+                        mm_output["fps"] = model_fps
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,
@@ -251,7 +309,11 @@ class DiffusionEngine:
                             prompt=prompt,
                             metrics=metrics,
                             latents=output.trajectory_latents,
-                            custom_output=output.custom_output or {},
+                            trajectory_latents=output.trajectory_latents,
+                            trajectory_timesteps=output.trajectory_timesteps,
+                            trajectory_log_probs=output.trajectory_log_probs,
+                            trajectory_decoded=output.trajectory_decoded,
+                            custom_output=custom_output,
                             multimodal_output=mm_output,
                             stage_durations=output.stage_durations,
                             peak_memory_mb=output.peak_memory_mb,
@@ -264,7 +326,7 @@ class DiffusionEngine:
     def make_engine(
         config: OmniDiffusionConfig,
         scheduler: SchedulerInterface | None = None,
-    ) -> "DiffusionEngine":
+    ) -> DiffusionEngine:
         """Factory method to create a DiffusionEngine instance.
 
         Args:
@@ -281,8 +343,11 @@ class DiffusionEngine:
 
             # keep scheduling and executing until the target request is finished
             while True:
+                self._process_aborts_queue()
                 sched_output = self.scheduler.schedule()
                 if sched_output.is_empty:
+                    if target_sched_req_id in sched_output.finished_req_ids:
+                        return self._finalize_finished_request(target_sched_req_id)
                     if not self.scheduler.has_requests():
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
                     continue
@@ -292,32 +357,35 @@ class DiffusionEngine:
                 # vllm_omni/diffusion/sched/base_scheduler.py), so we directly
                 # take the single scheduled request here.
                 sched_req_id = sched_output.scheduled_req_ids[0]
-                req = sched_output.scheduled_new_reqs[0].req
                 try:
-                    output = self.executor.add_req(req)
+                    runner_output = self.execute_fn(sched_output)
+                except EngineDeadError:
+                    raise
                 except Exception as exc:
-                    logger.error(
-                        "Execution failed for diffusion request %s",
-                        sched_req_id,
-                        exc_info=True,
+                    logger.error("Execution failed for diffusion request %s", sched_req_id, exc_info=True)
+                    runner_output = RunnerOutput(
+                        req_id=sched_req_id,
+                        step_index=None,
+                        finished=True,
+                        result=DiffusionOutput(error=str(exc)),
                     )
-                    output = DiffusionOutput(error=str(exc))
 
-                finished_req_ids = self.scheduler.update_from_output(sched_output, output)
+                self._process_aborts_queue()
+
+                finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
                 if target_sched_req_id in finished_req_ids:
-                    self.scheduler.pop_request_state(target_sched_req_id)
-                    return output
+                    return self._finalize_finished_request(
+                        target_sched_req_id,
+                        runner_output=runner_output,
+                        missing_result_error="Diffusion execution finished without a final output.",
+                    )
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
-        """Start or stop torch profiling on all diffusion workers.
+        """Start or stop profiling on all diffusion workers.
 
         Args:
             is_start: True to start profiling, False to stop.
-            profile_prefix: Optional prefix for trace filename (vLLM compat).
-
-        Note:
-            Matches vLLM's worker.profile() signature for consistency.
-            Traces are saved automatically via on_trace_ready callback.
+            profile_prefix: Optional prefix for trace filename.
         """
         if is_start:
             if profile_prefix is None:
@@ -337,8 +405,8 @@ class DiffusionEngine:
     def _dummy_run(self):
         """A dummy run to warm up the model."""
         num_inference_steps = 1
-        height = 1024
-        width = 1024
+        height = 512
+        width = 512
         if supports_image_input(self.od_config.model_class_name):
             # Provide a dummy image input if the model supports it
             color_format = image_color_format(self.od_config.model_class_name)
@@ -437,6 +505,55 @@ class DiffusionEngine:
             self.executor.shutdown()
 
     def abort(self, request_id: str | Iterable[str]) -> None:
-        # TODO implement it
-        logger.warning("DiffusionEngine abort is not implemented yet")
-        pass
+        request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
+        for req_id in request_ids:
+            self.abort_queue.put(req_id)
+
+    def _process_aborts_queue(self) -> None:
+        if self.abort_queue.empty():
+            return
+
+        request_ids: list[str] = []
+        while not self.abort_queue.empty():
+            ids = self.abort_queue.get_nowait()
+            request_ids.extend((ids,) if isinstance(ids, str) else ids)
+
+        self._abort_requests(request_ids)
+
+    def _abort_requests(self, request_ids: str | Iterable[str]) -> None:
+        request_ids = [request_ids] if isinstance(request_ids, str) else list(request_ids)
+
+        sched_req_ids: list[str] = []
+        for request_id in dict.fromkeys(request_ids):
+            sched_req_id = self.scheduler.get_sched_req_id(request_id)
+            if sched_req_id is not None:
+                sched_req_ids.append(sched_req_id)
+
+        for sched_req_id in dict.fromkeys(sched_req_ids):
+            if self.scheduler.get_request_state(sched_req_id) is not None:
+                self.scheduler.finish_requests(sched_req_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+    def _finalize_finished_request(
+        self,
+        sched_req_id: str,
+        runner_output: RunnerOutput | None = None,
+        missing_result_error: str = "Diffusion scheduler finished target request without execution output.",
+    ) -> DiffusionOutput:
+        state = self.scheduler.get_request_state(sched_req_id)
+        popped_state = self.scheduler.pop_request_state(sched_req_id)
+        state = state or popped_state
+
+        if state is None:
+            raise RuntimeError(f"Diffusion scheduler lost state for request {sched_req_id}.")
+
+        if state.status == DiffusionRequestStatus.FINISHED_ABORTED:
+            request_id = state.req.request_ids[0] if state.req.request_ids else sched_req_id
+            return DiffusionOutput(
+                aborted=True,
+                abort_message=f"Request {request_id} aborted.",
+            )
+
+        if runner_output is not None and runner_output.result is not None:
+            return runner_output.result
+
+        return DiffusionOutput(error=missing_result_error)

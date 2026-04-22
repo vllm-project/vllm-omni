@@ -10,6 +10,7 @@ reducing kernel launch overhead during inference.
 import torch
 from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -129,7 +130,7 @@ class CUDAGraphDecoderWrapper:
 
         graph = CUDAGraph()
         with torch.no_grad():
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                 static_output = self.decoder(static_input)
 
         self.graphs[size] = graph
@@ -138,6 +139,15 @@ class CUDAGraphDecoderWrapper:
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         if not self.enabled or not self._warmed_up or codes.shape[0] != 1:
+            return self.decoder(codes)
+
+        # Inner CUDA graph replay is illegal while an outer stream capture is
+        # active (e.g. vLLM's cudagraph_mode=FULL warmup on Stage 1). Fall back
+        # to eager in that case so the outer capture can complete. The guard is
+        # a no-op at runtime: is_current_stream_capturing() returns False
+        # outside the startup capture window, so normal inference still hits
+        # the graph fast path.
+        if torch.cuda.is_current_stream_capturing():
             return self.decoder(codes)
 
         actual_size = codes.shape[-1]

@@ -44,7 +44,52 @@
             }
         ]
     },
-
+    {
+        "test_name": "test_qwen_image_single_device_step_execution",
+        "description": "Single-device baseline (no parallelism) with step execution",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Qwen/Qwen-Image",
+            "serve_args": {
+                "enable-diffusion-pipeline-profiler": true,
+                "step-execution": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "512x512_steps20",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 512,
+                "height": 512,
+                "num-inference-steps": 20,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true,
+                "baseline": {
+                    "throughput_qps": 0.30,
+                    "latency_mean": 3.50,
+                    "peak_memory_mb_mean": 67000
+                }
+            },
+            {
+                "name": "1536x1536_steps35",
+                "dataset": "random",
+                "task": "t2i",
+                "width": 1536,
+                "height": 1536,
+                "num-inference-steps": 35,
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true,
+                "baseline": {
+                    "throughput_qps": 0.037,
+                    "latency_mean": 27.0,
+                    "peak_memory_mb_mean": 74000
+                }
+            }
+        ]
+    },
     {
         "test_name": "test_qwen_image_ulysses2_cfg2_vae_patch4",
         "description": "Ulysses SP=2 + CFG-parallel=2 + VAE Patch Parallel=4",
@@ -60,22 +105,6 @@
             }
         },
         "benchmark_params": [
-            {
-                "name": "512x512_steps20",
-                "dataset": "random",
-                "task": "t2i",
-                "width": 512,
-                "height": 512,
-                "num-inference-steps": 20,
-                "num-prompts": 10,
-                "max-concurrency": 1,
-                "enable-negative-prompt": true,
-                "baseline": {
-                    "throughput_qps": 0.1,
-                    "latency_mean": 2.34,
-                    "peak_memory_mb_mean": 61000
-                }
-            },
             {
                 "name": "1536x1536_steps35",
                 "dataset": "random",
@@ -94,7 +123,6 @@
             }
         ]
     },
-
     {
         "test_name": "test_qwen_image_ulysses2_cfg2_cache_dit",
         "description": "Ulysses SP=2 + CFG-parallel=2 + CacheDiT acceleration",

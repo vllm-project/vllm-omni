@@ -48,16 +48,7 @@ def enable_bagel_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
         coefficients=config.coefficients,
     )
     transformer = pipeline.bagel
-    original_forward_flow = transformer._forward_flow
-
-    import types
-
-    def forward_alias(self, *args, **kwargs):
-        return original_forward_flow(*args, **kwargs)
-
-    transformer.forward = types.MethodType(forward_alias, transformer)
     apply_teacache_hook(transformer, teacache_config)
-    transformer._forward_flow = transformer.forward
     pipeline.transformer = transformer
 
     logger.info(

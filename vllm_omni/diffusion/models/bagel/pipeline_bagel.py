@@ -12,6 +12,7 @@ from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass
 from math import isqrt
+from typing import ClassVar
 
 import numpy as np
 import torch
@@ -26,6 +27,7 @@ from vllm.transformers_utils.configs.bagel import BagelConfig
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.interface import SupportsModuleOffload
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -148,16 +150,32 @@ class SiglipNaViTWrapper(nn.Module):
         return outputs.last_hidden_state.squeeze(0)
 
 
-class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
+class BagelPipeline(nn.Module, SupportsModuleOffload, DiffusionPipelineProfilerMixin):
     """Bagel generation pipeline (MoT) packaged for vllm-omni diffusion engine.
 
     This pipeline is self-contained and uses the ported Bagel core files.
     """
 
+    _dit_modules: ClassVar[list[str]] = ["language_model.model"]
+    _encoder_modules: ClassVar[list[str]] = []
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    _resident_modules: ClassVar[list[str]] = [
+        "bagel.time_embedder",
+        "bagel.vae2llm",
+        "bagel.llm2vae",
+        "bagel.latent_pos_embed",
+        "bagel.vit_model",
+        "bagel.connector",
+        "bagel.vit_pos_embed",
+    ]
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         self.od_config = od_config
         self.device = get_local_device()
+
+        self.scheduler: object | None = None
+        self.scheduler_kwargs: dict = {}
 
         model = od_config.model
         local_files_only = os.path.exists(model)
@@ -326,11 +344,18 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         cfg_text_scale = extra_args.get("cfg_text_scale", 4.0)
         cfg_img_scale = extra_args.get("cfg_img_scale", 1.5)
 
+        cfg_interval = extra_args.get("cfg_interval", (0.4, 1.0))
+        cfg_renorm_type = extra_args.get("cfg_renorm_type", "global")
+        cfg_renorm_min = extra_args.get("cfg_renorm_min", 0.0)
+
         gen_params = BagelGenParams(
             num_timesteps=int(req.sampling_params.num_inference_steps or 50),
             timestep_shift=3.0,
             cfg_text_scale=cfg_text_scale,
             cfg_img_scale=cfg_img_scale,
+            cfg_interval=cfg_interval,
+            cfg_renorm_type=cfg_renorm_type,
+            cfg_renorm_min=cfg_renorm_min,
         )
 
         gen_context = {
@@ -355,39 +380,74 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             if req.sampling_params.kv_metadata and "image_shape" in req.sampling_params.kv_metadata:
                 image_shape = tuple(req.sampling_params.kv_metadata["image_shape"])
 
-            cfg_text_kv = getattr(req.sampling_params, "cfg_text_past_key_values", None)
+            branch_kvs = getattr(req.sampling_params, "cfg_branch_past_key_values", None) or {}
+            branch_metadata = getattr(req.sampling_params, "cfg_branch_kv_metadata", None) or {}
+            active_branch = getattr(req.sampling_params, "cfg_active_branch", None)
+            branch_roles = getattr(req.sampling_params, "cfg_branch_roles", None) or list(branch_kvs.keys())
+
+            cfg_text_kv = getattr(req.sampling_params, "cfg_text_past_key_values", None) or branch_kvs.get("cfg_text")
+            cfg_text_metadata = getattr(req.sampling_params, "cfg_text_kv_metadata", None) or branch_metadata.get(
+                "cfg_text"
+            )
+            cfg_img_kv = getattr(req.sampling_params, "cfg_img_past_key_values", None) or branch_kvs.get("cfg_img")
+            cfg_img_metadata = getattr(req.sampling_params, "cfg_img_kv_metadata", None) or branch_metadata.get(
+                "cfg_img"
+            )
+
+            cfg_parallel_contract = (
+                active_branch is not None or bool(branch_roles) or cfg_text_kv is not None or cfg_img_kv is not None
+            )
+            if cfg_parallel_contract:
+                logger.info(
+                    "CFG enabled with injected branch KV context roles=%s active=%s",
+                    branch_roles,
+                    active_branch,
+                )
+
             if cfg_text_kv is not None:
-                logger.info("CFG enabled with multi-KV: using injected cfg_text KV Cache")
                 cfg_text_seq_len = cfg_text_kv.key_cache[0].shape[0]
                 cfg_text_context["past_key_values"] = cfg_text_kv
                 cfg_text_context["kv_lens"] = [cfg_text_seq_len]
-                cfg_text_metadata = getattr(req.sampling_params, "cfg_text_kv_metadata", None)
                 if cfg_text_metadata and "ropes" in cfg_text_metadata:
                     cfg_text_context["ropes"] = cfg_text_metadata["ropes"]
                 else:
                     cfg_text_context["ropes"] = [cfg_text_seq_len]
+            else:
+                # No cfg_text companion received.  For text2img this is the
+                # expected path: original BAGEL uses an empty KV cache (0
+                # tokens) as the text-unconditional branch.  Keep the default
+                # empty NaiveCache in cfg_text_context and preserve the
+                # original cfg_text_scale so CFG still applies.
+                pass
 
-                cfg_img_kv = getattr(req.sampling_params, "cfg_img_past_key_values", None) or injected_kv
+            if cfg_img_kv is None:
+                # text2img multi-stage: cfg_img reuses gen KV (positive prompt,
+                # no image), mirroring forward_cache_update_text on cfg_img_context
+                # in the single-stage path.
+                cfg_img_seq_len = injected_kv.key_cache[0].shape[0]
+                cfg_img_context["past_key_values"] = injected_kv
+                cfg_img_context["kv_lens"] = [cfg_img_seq_len]
+                if req.sampling_params.kv_metadata and "ropes" in req.sampling_params.kv_metadata:
+                    cfg_img_context["ropes"] = req.sampling_params.kv_metadata["ropes"]
+                else:
+                    cfg_img_context["ropes"] = [cfg_img_seq_len]
+            else:
                 cfg_img_seq_len = cfg_img_kv.key_cache[0].shape[0]
                 cfg_img_context["past_key_values"] = cfg_img_kv
                 cfg_img_context["kv_lens"] = [cfg_img_seq_len]
-                cfg_img_metadata = getattr(req.sampling_params, "cfg_img_kv_metadata", None)
                 if cfg_img_metadata and "ropes" in cfg_img_metadata:
                     cfg_img_context["ropes"] = cfg_img_metadata["ropes"]
                 else:
                     cfg_img_context["ropes"] = [cfg_img_seq_len]
-            else:
-                logger.warning("CFG is disabled: only single KV cache available")
-                gen_params = BagelGenParams(
-                    num_timesteps=gen_params.num_timesteps,
-                    timestep_shift=gen_params.timestep_shift,
-                    cfg_text_scale=1.0,
-                    cfg_img_scale=1.0,
-                )
 
         else:
             image_input = (
-                None if isinstance(first_prompt, str) else (first_prompt.get("multi_modal_data") or {}).get("image")
+                None
+                if isinstance(first_prompt, str)
+                else (
+                    (first_prompt.get("multi_modal_data") or {}).get("image")
+                    or (first_prompt.get("multi_modal_data") or {}).get("img2img")
+                )
             )
             if image_input and not isinstance(image_input, list):
                 image_input = [image_input]
@@ -480,11 +540,15 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
                     cfg_text_context = deepcopy(gen_context)
 
+            # Strip <|im_start|>/<|im_end|> wrappers that end2end.py may have
+            # already added, so prepare_prompts doesn't double-add bos/eos.
+            clean_prompt = prompt.removeprefix("<|im_start|>").removesuffix("<|im_end|>")
+
             # Update gen_context with text prompt
             generation_input, newlens, new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=gen_context["kv_lens"],
                 curr_rope=gen_context["ropes"],
-                prompts=[prompt],
+                prompts=[clean_prompt],
                 tokenizer=self.tokenizer,
                 new_token_ids=self.new_token_ids,
             )
@@ -512,34 +576,37 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             gen_context["kv_lens"] = newlens
             gen_context["ropes"] = new_rope
 
-            # cfg_text_context: update with negative prompt (no text condition)
+            # cfg_text_context: update with negative prompt (no text condition).
+            # When empty, keep cfg_text_context as-is (kv_lens=0) to match
+            # original BAGEL; _merge_naive_caches handles None KV entries.
             neg_prompt = extra_args.get("negative_prompt", "")
-            neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(
-                curr_kvlens=cfg_text_context["kv_lens"],
-                curr_rope=cfg_text_context["ropes"],
-                prompts=[neg_prompt],
-                tokenizer=self.tokenizer,
-                new_token_ids=self.new_token_ids,
-            )
-            for k, v in neg_input.items():
-                if torch.is_tensor(v):
-                    neg_input[k] = v.to(self.device)
-            with torch.autocast(
-                device_type=self.device.type,
-                enabled=self.device.type != "cpu",
-                dtype=self.od_config.dtype,
-            ):
-                cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_text(
-                    cfg_text_context["past_key_values"], **neg_input
+            if neg_prompt:
+                neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(
+                    curr_kvlens=cfg_text_context["kv_lens"],
+                    curr_rope=cfg_text_context["ropes"],
+                    prompts=[neg_prompt],
+                    tokenizer=self.tokenizer,
+                    new_token_ids=self.new_token_ids,
                 )
-            cfg_text_context["kv_lens"] = neg_newlens
-            cfg_text_context["ropes"] = neg_rope
+                for k, v in neg_input.items():
+                    if torch.is_tensor(v):
+                        neg_input[k] = v.to(self.device)
+                with torch.autocast(
+                    device_type=self.device.type,
+                    enabled=self.device.type != "cpu",
+                    dtype=self.od_config.dtype,
+                ):
+                    cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_text(
+                        cfg_text_context["past_key_values"], **neg_input
+                    )
+                cfg_text_context["kv_lens"] = neg_newlens
+                cfg_text_context["ropes"] = neg_rope
 
             # cfg_img_context: update with text prompt (no image condition)
             cfg_img_generation_input, cfg_img_newlens, cfg_img_new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=cfg_img_context["kv_lens"],
                 curr_rope=cfg_img_context["ropes"],
-                prompts=[prompt],
+                prompts=[clean_prompt],
                 tokenizer=self.tokenizer,
                 new_token_ids=self.new_token_ids,
             )
@@ -557,6 +624,96 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             cfg_img_context["kv_lens"] = cfg_img_newlens
             cfg_img_context["ropes"] = cfg_img_new_rope
 
+        # ---- Detect output modality and think mode ----
+        modalities = first_prompt.get("modalities", []) if isinstance(first_prompt, dict) else []
+        is_text_output = "text" in modalities
+        think_enabled = extra_args.get("think", False)
+        think_text = None
+
+        if think_enabled and injected_kv is None:
+            max_think_tokens = int(extra_args.get("max_think_tokens", 1000))
+            do_sample = bool(extra_args.get("do_sample", False))
+            text_temperature = float(extra_args.get("text_temperature", 0.3))
+
+            with torch.autocast(
+                device_type=self.device.type,
+                enabled=self.device.type != "cpu",
+                dtype=self.od_config.dtype,
+            ):
+                start_input = self.bagel.prepare_start_tokens(
+                    gen_context["kv_lens"], gen_context["ropes"], self.new_token_ids
+                )
+                for k, v in start_input.items():
+                    if torch.is_tensor(v):
+                        start_input[k] = v.to(self.device)
+
+                gen_ctx_copy = deepcopy(gen_context)
+                token_ids = self.bagel.generate_text(
+                    past_key_values=gen_ctx_copy["past_key_values"],
+                    max_length=max_think_tokens,
+                    do_sample=do_sample,
+                    temperature=text_temperature,
+                    end_token_id=self.new_token_ids["eos_token_id"],
+                    **start_input,
+                )
+                # token_ids shape: (seq_len, batch=1)
+                decoded = self.tokenizer.decode(token_ids[:, 0].tolist())
+                # Strip chat markers to get clean text
+                think_text = decoded.split("<|im_end|>")[0]
+                if "<|im_start|>" in think_text:
+                    think_text = think_text.split("<|im_start|>")[-1]
+                logger.info("Think mode generated %d tokens", token_ids.shape[0])
+
+            if not is_text_output:
+                # Use the autoregressive KV cache from think generation
+                # directly, instead of decode→re-encode which adds extra
+                # bos/eos and may alter tokenization.
+                num_think_tokens = token_ids.shape[0]
+                gen_context["past_key_values"] = gen_ctx_copy["past_key_values"]
+                gen_context["kv_lens"] = [kl + num_think_tokens for kl in gen_context["kv_lens"]]
+                gen_context["ropes"] = [r + num_think_tokens for r in gen_context["ropes"]]
+
+        # ---- Text-only output (text2text / img2text) ----
+        if is_text_output and injected_kv is None:
+            if think_text is not None:
+                # Think mode already generated the text (including reasoning)
+                text_output = think_text
+            else:
+                max_text_tokens = int(extra_args.get("max_think_tokens", 500))
+                do_sample = bool(extra_args.get("do_sample", False))
+                text_temperature = float(extra_args.get("text_temperature", 0.3))
+
+                with torch.autocast(
+                    device_type=self.device.type,
+                    enabled=self.device.type != "cpu",
+                    dtype=self.od_config.dtype,
+                ):
+                    start_input = self.bagel.prepare_start_tokens(
+                        gen_context["kv_lens"], gen_context["ropes"], self.new_token_ids
+                    )
+                    for k, v in start_input.items():
+                        if torch.is_tensor(v):
+                            start_input[k] = v.to(self.device)
+                    token_ids = self.bagel.generate_text(
+                        past_key_values=gen_context["past_key_values"],
+                        max_length=max_text_tokens,
+                        do_sample=do_sample,
+                        temperature=text_temperature,
+                        end_token_id=self.new_token_ids["eos_token_id"],
+                        **start_input,
+                    )
+                    decoded = self.tokenizer.decode(token_ids[:, 0].tolist())
+                    text_output = decoded.split("<|im_end|>")[0]
+                    if "<|im_start|>" in text_output:
+                        text_output = text_output.split("<|im_start|>")[-1]
+
+            return DiffusionOutput(
+                output=text_output,
+                custom_output={"text_output": text_output},
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
+
+        # ---- Image generation (text2img / img2img) ----
         if req.sampling_params.seed is not None:
             torch.manual_seed(req.sampling_params.seed)
             if self.device.type == "cuda":
@@ -618,7 +775,7 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             enabled=self.device.type != "cpu",
             dtype=self.od_config.dtype,
         ):
-            latents = self.bagel.generate_image(
+            latents, trajectory_latents, trajectory_timesteps, trajectory_log_probs = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
                 cfg_text_past_key_values=cfg_text_context["past_key_values"],
                 cfg_img_past_key_values=cfg_img_context["past_key_values"],
@@ -638,11 +795,41 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 cfg_img_packed_query_indexes=generation_input_cfg_img["cfg_packed_query_indexes"],
                 cfg_img_key_values_lens=generation_input_cfg_img["cfg_key_values_lens"],
                 cfg_img_packed_key_value_indexes=generation_input_cfg_img["cfg_packed_key_value_indexes"],
+                return_trajectory_latents=req.sampling_params.return_trajectory_latents,
+                scheduler=self.scheduler,
+                scheduler_kwargs=self.scheduler_kwargs,
             )
 
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
+
+        # Build trajectory output when requested
+        trajectory_latents_stacked: torch.Tensor | None = None
+        trajectory_timesteps_stacked: torch.Tensor | None = None
+        trajectory_decoded: list[Image.Image] | None = None
+        if trajectory_latents:
+            trajectory_latents_stacked = torch.stack(trajectory_latents)
+            trajectory_timesteps_stacked = torch.stack(trajectory_timesteps)
+            if req.sampling_params.return_trajectory_decoded:
+                trajectory_decoded = [
+                    self._decode_image_from_latent(self.bagel, self.vae, lat, image_shape) for lat in trajectory_latents
+                ]
+
+        trajectory_log_probs_stacked: torch.Tensor | None = None
+        if trajectory_log_probs:
+            trajectory_log_probs_stacked = torch.stack(trajectory_log_probs)
+
+        custom = {}
+        if think_text is not None:
+            custom["think_text"] = think_text
+
         return DiffusionOutput(
-            output=img, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+            output=img,
+            trajectory_latents=trajectory_latents_stacked,
+            trajectory_timesteps=trajectory_timesteps_stacked,
+            trajectory_log_probs=trajectory_log_probs_stacked,
+            trajectory_decoded=trajectory_decoded,
+            custom_output=custom,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -663,6 +850,8 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             (".qkv_proj_moe_gen", ".q_proj_moe_gen"),
             (".qkv_proj_moe_gen", ".k_proj_moe_gen"),
             (".qkv_proj_moe_gen", ".v_proj_moe_gen"),
+            (".gate_up_proj", ".gate_proj"),
+            (".gate_up_proj", ".up_proj"),
         ]
         stacked_source_names: set[str] = set()
         for name in list(allowed):

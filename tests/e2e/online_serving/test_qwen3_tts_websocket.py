@@ -7,24 +7,23 @@ E2E online tests for Qwen3-TTS WebSocket streaming speech.
 import asyncio
 import json
 import os
-from pathlib import Path
 
 import pytest
 import websockets
 
-from tests.conftest import OmniServer
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServer
+from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+STAGE_INIT_TIMEOUT_S = 120
 
 
 def get_stage_config() -> str:
-    return str(
-        Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / "qwen3_tts.yaml"
-    )
+    return get_deploy_config_path("qwen3_tts.yaml")
 
 
 @pytest.fixture(scope="module")
@@ -37,7 +36,7 @@ def omni_server():
             "--stage-configs-path",
             stage_config_path,
             "--stage-init-timeout",
-            "120",
+            str(STAGE_INIT_TIMEOUT_S),
             "--trust-remote-code",
             "--enforce-eager",
             "--disable-log-stats",

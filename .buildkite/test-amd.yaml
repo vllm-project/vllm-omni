@@ -117,3 +117,17 @@ steps:
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
     - pytest -s -v tests/e2e/online_serving/test_image_gen_edit.py
+
+
+- label: "Omni Sleep Mode Test"
+  timeout_in_minutes: 40
+  agent_pool: mi325_2
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - export GPU_ARCHS=gfx942
+    - export VLLM_LOGGING_LEVEL=DEBUG
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - export VLLM_TEST_CLEAN_GPU_MEMORY="1"
+    - pytest -s -v tests/e2e/offline_inference/test_omni_sleep_mode.py -m "advanced_model and omni and MI325" --run-level "advanced_model"

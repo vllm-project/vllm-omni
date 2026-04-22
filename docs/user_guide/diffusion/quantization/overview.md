@@ -11,6 +11,7 @@ vLLM-Omni provides a unified quantization framework that supports both diffusion
 | FP8 | [FP8](fp8.md) | FP8 W8A8, dynamic or static | Z-Image, Qwen-Image, Flux, Bagel | SM 89 (Ada) |
 | Int8 | [Int8](int8.md) | Int8 W8A8 | Z-Image, Qwen-Image | SM 89 (Ada) / Ascend NPU |
 | GGUF | [GGUF](gguf.md) | GGUF format, dequant+GEMM for N-D tensors | Z-Image, Flux | SM 60 |
+| AutoRound | [AutoRound](autoround.md) | W4A16 (pre-quantized) | Flux | SM 80 (Ampere) |
 
 ### Multi-stage Omni Models (Pre-quantized Checkpoints)
 
@@ -101,6 +102,9 @@ config = build_quant_config("fp8")
 
 # Dict with parameters
 config = build_quant_config({"method": "fp8", "activation_scheme": "static"})
+
+# AutoRound / INC (auto-detected from checkpoint, or explicit)
+config = build_quant_config("auto-round", bits=4, group_size=128)
 
 # Per-component dict
 config = build_quant_config({

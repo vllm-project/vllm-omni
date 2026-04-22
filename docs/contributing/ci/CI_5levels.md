@@ -86,7 +86,8 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
         /tests/e2e/online_serving/test_{model_name}_expansion.py<br>
         /tests/e2e/offline_inference/test_{model_name}_expansion.py<br>
         <strong>Performance:</strong><br>
-        /tests/dfx/perf/tests/test.json<br>
+        /tests/dfx/perf/tests/test_qwen_omni.json (Omni), test_tts.json (TTS),<br>
+        and /tests/dfx/perf/tests/test_{diffusion_model}_vllm_omni.json (Diffusion)<br>
         <strong>Doc Test:</strong><br>
         tests/example/online_serving/test_{model_name}.py<br>
         tests/example/offline_inference/test_{model_name}.py
@@ -168,7 +169,6 @@ vllm_omni/                                    tests/
 │   └── arg_utils.py                            │   └── test_arg_utils.py               ⬜
 │
 ├── entrypoints/                        →     ├── entrypoints/
-│   ├── async_omni_diffusion.py                 │   ├── test_async_omni_diffusion_config.py  ✅
 │   ├── stage_utils.py                          │   ├── test_stage_utils.py            ✅
 │   ├── cli/                                     │   ├── cli/                           (benchmarks/test_serve_cli.py covers CLI serve)
 │   │   └── ...                                  │   │   └── test_*.py                  ⬜
@@ -231,8 +231,7 @@ vllm_omni/                                    tests/
                                                │   ├── test_qwen3_omni_expansion.py
                                                │   ├── test_mimo_audio.py
                                                │   ├── test_image_gen_edit.py
-                                               │   ├── test_images_generations_lora.py
-                                               │   └── stage_configs/
+                                               │   └── test_images_generations_lora.py
                                                └── offline_inference/                  ✅
                                                    ├── test_qwen2_5_omni.py
                                                    ├── test_qwen3_omni.py
@@ -243,16 +242,17 @@ vllm_omni/                                    tests/
                                                    ├── test_zimage_tensor_parallel.py
                                                    ├── test_cache_dit.py
                                                    ├── test_teacache.py
-                                                   ├── test_stable_audio_model.py
+                                                   ├── test_stable_audio_expansion.py
                                                    ├── test_diffusion_cpu_offload.py
                                                    ├── test_diffusion_layerwise_offload.py
                                                    ├── test_diffusion_lora.py
                                                    ├── test_sequence_parallel.py
-                                                   └── stage_configs/
-                                                       ├── qwen2_5_omni_ci.yaml
-                                                       ├── qwen3_omni_ci.yaml
-                                                       ├── bagel_*.yaml
-                                                       └── npu/, rocm/, etc.
+                                                   └── stage_configs/                  (legacy schema, still
+                                                       ├── bagel_*.yaml                 present for unmigrated
+                                                       └── npu/, rocm/, etc.            models)
+
+# Migrated models (qwen3_omni_moe, qwen2_5_omni, qwen3_tts) live under
+# vllm_omni/deploy/ instead — see docs/configuration/stage_configs.md.
 ```
 
 
@@ -272,7 +272,7 @@ Before entering specific testing levels, the project establishes two common spec
 
 L1 and L2 level testing form the foundation of the quality assurance system. L1 level testing focuses on verifying the internal logic correctness of code units (e.g., functions, classes), ensuring each independent component behaves as designed.
 
-L2 level testing builds upon L1 by introducing GPU resources and verifying that the end-to-end (E2E) process of the model in basic deployment scenarios is smooth. For example, it uses dummy models to confirm that core interfaces like the inference pipeline, output format, and streaming response work properly. The common goal of these two levels is to provide developers with rapid feedback, discovering and fixing issues early in the development cycle  .
+L2 level testing builds upon L1 by introducing GPU resources and verifying that the end-to-end (E2E) process of the model in basic deployment scenarios is smooth. For example, it uses dummy models to confirm that core interfaces like the inference pipeline, output format, and streaming response work properly. The common goal of these two levels is to provide developers with rapid feedback, discovering and fixing issues early in the development cycle.
 
 
 
@@ -418,13 +418,13 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 
     **Explanation**:
 
-    @pytest.mark.advanced_model: Marks the test as L3 or L4 level, indicating that this test case performs deep validation, using real models for performance, integration, and accuracy testing. This forms a "basic-advanced" correspondence with the core_model mark at the L2 level.
+    @pytest.mark.advanced_model: Marks the test as L3 merge level, indicating deep validation with real models. @pytest.mark.full_model: Marks L4 nightly-only suites (e.g. `test_*_expansion.py`, doc examples).
 
     @pytest.mark.core_model: Marks the test as L1 or L2 level, indicating that this test case validates the basic functionality of the core model. It uses mock weights and only checks if the relevant interface functions correctly.
 
     @pytest.mark.parametrize: A parameterization decorator that allows abstracting test data into parameters, enabling reuse of the same test logic across different data configurations. indirect=True indicates that parameters will be passed to the fixture for processing.
 
-    **Notes**: If you believe the test case only needs to execute basic run logic at the PR-level CI, you can mark it only with @pytest.mark.core_model. If you believe it only needs to execute deep validation run logic at the merge or nightly level, you can mark it only with @pytest.mark.advanced_model. If you believe the test case needs to accommodate both basic run and deep validation test logic, you should mark it with both @pytest.mark.core_model and @pytest.mark.advanced_model.
+    **Notes**: If you believe the test case only needs to execute basic run logic at the PR-level CI, you can mark it only with @pytest.mark.core_model. If you believe it only needs to execute deep validation at merge (L3), use @pytest.mark.advanced_model. For L4 nightly-only expansion and doc-example tests, use @pytest.mark.full_model with `--run-level full_model`. If the test case needs both basic run and deep validation, mark with @pytest.mark.core_model and the appropriate L3/L4 marker (`advanced_model` and/or `full_model`).
 
     **2.4.2 Test Function Definition and Documentation**
 
@@ -516,9 +516,11 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 
     **Single Request**: The comment clearly states this is a single-request completion test. For concurrent testing, it can be extended to multiple requests using request_num = n.
 
-    **Implicit Validation**: The `send_omni_request` and `send_diffusion_request` methods internally includes validation logic dynamically selected based on the --run-level parameter: core_model performs basic validation, while advanced_model performs deep validation.
+    **Implicit Validation**: The `send_omni_request` and `send_diffusion_request` methods internally includes validation logic dynamically selected based on the --run-level parameter: core_model performs basic validation, while advanced_model and full_model perform deep validation.
 
--   ***Run Command***: `pytest -s -v /tests/e2e/online_serving/test_{model_name}.py -m advanced_model --run-level=advanced_model`
+-   ***Run Command (L3 merge)***: `pytest -s -v /tests/e2e/online_serving/test_{model_name}.py -m advanced_model --run-level=advanced_model`
+
+-   ***Run Command (L4 nightly expansion)***: `pytest -s -v /tests/e2e/online_serving/test_{model_name}_expansion.py -m full_model --run-level=full_model`
 
 ## Chapter 3: L4 Level Testing - Full Functionality, Performance, and Documentation Testing
 
@@ -531,13 +533,13 @@ L4 level testing is a comprehensive quality audit before a version release. It e
 ### 3.2 Testing Content and Scope
 
 -   ***Full Functionality Testing***: Executes all test cases defined in `test_{model_name}_expansion.py`, covering all implemented features, positive flows, boundary conditions, and exception handling.
--   ***Performance Testing***: Uses the `tests/dfx/perf/tests/test.json` configuration file to drive performance testing tools for stress, load, and endurance tests, collecting metrics like throughput, response time, and resource utilization.
+-   ***Performance Testing***: Uses `tests/dfx/perf/tests/test_qwen_omni.json`, `tests/dfx/perf/tests/test_tts.json`, and diffusion configs in the form `tests/dfx/perf/tests/test_*_vllm_omni.json` (passed to `run_benchmark.py` via `--test-config-file`) to drive performance testing tools for stress, load, and endurance tests, collecting metrics like throughput, response time, and resource utilization.
 -   ***Documentation Testing***: Verifies whether the example code provided to users is runnable and its results match the description.
 
 ### 3.3 Test Directory and Execution Files
 
 -   ***Functional Testing***: Same directories as L3.
--   ***Performance Test Configuration***: `tests/dfx/perf/tests/test.json`
+-   ***Performance Test Configuration***: `tests/dfx/perf/tests/test_qwen_omni.json`, `tests/dfx/perf/tests/test_tts.json`, and diffusion configs `tests/dfx/perf/tests/test_*_vllm_omni.json` (e.g. `test_qwen_image_vllm_omni.json`)
 -   ***Documentation Example Tests***:
 -   -   `tests/example/online_serving/test_{model_name}.py`
     -   `tests/example/offline_inference/test_{model_name}.py`
@@ -548,103 +550,19 @@ L4 level testing is a comprehensive quality audit before a version release. It e
 -   ***Execution Environment***: ***GPU*** server clusters to meet the resource demands of performance testing.
 -   ***Script Example***:
 
-???+ example "Test Examples"
+??? example "Test Examples: Documentation Example Tests"
 
-    When adding L4-level ***documentation example Tests***, please pay attention to the following guides.
+    --8<-- "docs/contributing/ci/test_examples/l4_doc_example_tests.inc.md"
 
-    --8<-- "docs/contributing/ci/test_examples/doc_example_tests.inc.md"
+??? example "Test Examples: Performance Tests"
 
-    When you want to add L4-level ***performance test*** cases, you can refer to the following format for case addition in tests/dfx/perf/tests/test.json:
+    --8<-- "docs/contributing/ci/test_examples/l4_performance_tests.inc.md"
 
-    ```JSON
-    {
-        "test_name": "test_qwen3_omni",
-        "server_params": {
-            "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-            "stage_config_name": "qwen3_omni.yaml"
-        },
-        "benchmark_params": [
-            {
-                "dataset_name": "random",
-                "num_prompts": [10, 20],
-                "max_concurrency": [1, 4],
-                "random_input_len": 2500,
-                "random_output_len": 900,
-                "ignore_eos": true,
-                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
-                "baseline": {
-                    "mean_ttft_ms": [500, 800],
-                    "mean_audio_ttfp_ms": [2000, 3500],
-                    "mean_audio_rtf": [0.25, 0.35]
-                }
-            }
-        ]
-    }
-    ```
+??? example "Test Examples: Functionality Tests"
 
-    **Parameter Explanation**
+    --8<-- "docs/contributing/ci/test_examples/l4_functionality_tests.inc.md"
 
-    *Overview*
-
-    | Field            | Required | Description                                                     |
-    | ---------------- | -------- | --------------------------------------------------------------- |
-    | test_name        | Yes      | Unique identifier for the test case                             |
-    | server_params    | Yes      | Server-side configuration parameters                            |
-    | benchmark_params | Yes      | Benchmark running parameters (supports multiple configurations) |
-
-    **server_params Configuration**
-
-    *Basic Parameters*
-
-    | Parameter         | Required | Example                            | Description                   |
-    | ----------------- | -------- | ---------------------------------- | ----------------------------- |
-    | model             | Yes      | "Qwen/Qwen3-Omni-30B-A3B-Instruct" | Model name or path            |
-    | stage_config_name | Yes      | "qwen3_omni.yaml"                  | Stage configuration file name |
-
-    *Dynamic Configuration (update/delete)*
-
-    Supports incremental modifications based on the basic configuration:
-
-    | Operation | Description                          |
-    | --------- | ------------------------------------ |
-    | update    | Update or add configuration items    |
-    | delete    | Delete specified configuration items |
-
-    ***Example***:
-
-    ```
-    "update": {
-        "async_chunk": true,  // Enable asynchronous chunk processing
-        "stage_args": {
-            "0": {
-                "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
-            }
-        }
-    },
-    "delete": {
-        "stage_args": {
-            "2": ["custom_process_input_func"]  // Delete this configuration for stage 2
-        }
-    }
-    ```
-
-    **benchmark_params Configuration**
-
-    You can add any benchmark running parameters you need here. For all optional parameters, refer to the [benchmark documentation](https://github.com/vllm-project/vllm-omni/blob/main/docs/cli/bench/serve.md). General modifications are as follows:
-
-    1.  Change the ---xxx-xx-xx running parameters to xxx_xx_xx format and fill them as keys in the JSON file.
-    2.  For boolean variables in the running parameters, modify them to forms such as ignore_eos: true/false and fill them into the JSON file.
-    3.  Optionally add a `baseline` object (see **Baseline thresholds** below). If you omit `baseline` or leave it empty, the performance test still runs but does not assert metric thresholds from this field.
-    4.  The qps and concurrency modes are mutually exclusive. For detailed explanations, see the table below:
-
-    | Parameter       | Type        | Required | Example/Values  | Description                                                                                                                                                                                                                                                          |
-    | --------------- | ----------- | -------- | --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-    | num_prompts     | int / array | Yes      | 10,[10, 20, 30] | Number of requests. Supports single values or arrays. If a single value is used, it will be automatically expanded to match the number of qps or max_concurrency, e.g., [10,10,10]. If an array is used, its length must match the number of qps or max_concurrency. |
-    | request_rate    | int / array | No       | 1, [1, 2, 3]    | Queries per second. Supports single values or arrays. If a single value is used, it will be automatically expanded to match the number of num_prompts, e.g., [1,1,1]. If an array is used, its length must match the number of num_prompts.                          |
-    | max_concurrency | int / array | No       | 1, [1, 2, 3]    | Maximum concurrent in-flight requests. Same array / expansion rules as `request_rate` (mutually exclusive with QPS mode).                                                                                                                                                                                                             |
-    | baseline        | object      | No       | see above       | Optional per-metric thresholds; keys must match benchmark output fields. Scalar, list (per sweep step), or object (keyed by concurrency or QPS string).                                                                                                               |
-
-    -   -   ***Run Command***: (Specific commands would depend on the performance testing tool and configuration defined in `nightly.json`).
+-   ***Run Command***: (Specific commands would depend on the performance testing tool and configuration defined in `nightly.json`).
 
 ## Chapter 4: L5 Level Testing - Stability and Reliability Testing
 

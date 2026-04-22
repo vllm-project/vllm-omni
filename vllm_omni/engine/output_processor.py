@@ -232,10 +232,9 @@ class OmniRequestState(RequestState):
         # Reuse base text/logprobs logic, then annotate with pooling_result.
         base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason, routed_experts)
         try:
+            if not hasattr(base_output, "multimodal_output"):
+                setattr(base_output, "multimodal_output", {})
             if self.mm_accumulated is not None:
-                # Attach accumulated multimodal dict on the completion output
-                if not hasattr(base_output, "multimodal_output"):
-                    setattr(base_output, "multimodal_output", {})
                 mm_out = getattr(base_output, "multimodal_output")
                 if isinstance(mm_out, dict):
                     for k, v in self.mm_accumulated.items():

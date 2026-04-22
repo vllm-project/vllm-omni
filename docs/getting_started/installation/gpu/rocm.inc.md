@@ -13,7 +13,7 @@ vLLM-Omni current recommends the steps in under setup through Docker Images.
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
-uv pip install vllm==0.18.0+rocm700 --extra-index-url https://wheels.vllm.ai/rocm/0.18.0/rocm700
+uv pip install vllm==0.19.0+rocm700 --extra-index-url https://wheels.vllm.ai/rocm/0.19.0/rocm700
 ```
 
 #### Installation of vLLM-Omni
@@ -26,7 +26,7 @@ uv pip install vllm-omni
 
 # Optional if want to run Qwen3 TTS
 uv pip uninstall onnxruntime # should be removed before we can install onnxruntime-rocm
-uv pip install onnxruntime-rocm sox
+uv pip install onnxruntime-rocm
 ```
 
 # --8<-- [end:pre-built-wheels]
@@ -34,13 +34,13 @@ uv pip install onnxruntime-rocm sox
 # --8<-- [start:build-wheel-from-source]
 
 #### Installation of vLLM
-If you do not need to modify source code of vLLM, you can directly install the stable 0.18.0 release version of the library
+If you do not need to modify source code of vLLM, you can directly install the stable 0.19.0 release version of the library
 
 ```bash
-uv pip install vllm==0.18.0+rocm700 --extra-index-url https://wheels.vllm.ai/rocm/0.18.0/rocm700
+uv pip install vllm==0.19.0+rocm700 --extra-index-url https://wheels.vllm.ai/rocm/0.19.0/rocm700
 ```
 
-The pre-built 0.18.0 vLLM wheel targets ROCm 7.0. If you need a different ROCm stack or want to reuse an existing PyTorch installation, build vLLM from source instead.
+The pre-built 0.19.0 vLLM wheel targets ROCm 7.0. If you need a different ROCm stack or want to reuse an existing PyTorch installation, build vLLM from source instead.
 
 #### Installation of vLLM-Omni
 Since vllm-omni is rapidly evolving, it's recommended to install it from source
@@ -58,7 +58,7 @@ If you want to check, modify or debug with source code of vLLM, install the libr
 ```bash
 git clone https://github.com/vllm-project/vllm.git
 cd vllm
-git checkout v0.18.0
+git checkout v0.19.0
 python3 -m pip install -r requirements/rocm.txt
 python3 setup.py develop
 ```
@@ -130,7 +130,7 @@ docker run --rm \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --env "HF_TOKEN=$HF_TOKEN" \
   -p 8091:8091 \
-  vllm/vllm-omni-rocm:v0.18.0 \
+  vllm/vllm-omni-rocm:v0.19.0 \
   --model Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
@@ -149,7 +149,7 @@ docker run --rm -it \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --env "HF_TOKEN=$HF_TOKEN" \
   --entrypoint bash \
-  vllm/vllm-omni-rocm:v0.18.0
+  vllm/vllm-omni-rocm:v0.19.0
 ```
 
 # --8<-- [end:pre-built-images]

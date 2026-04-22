@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+import requests
 import torch
+from PIL import Image
 
-from tests.conftest import OmniServer, OmniServerParams
+from tests.helpers.runtime import OmniServer, OmniServerParams
 
 
 def pytest_addoption(parser):
@@ -47,6 +49,19 @@ def pytest_addoption(parser):
         help="Balanced sample count per GEdit task group",
     )
     group.addoption("--accuracy-workers", action="store", type=int, default=1, help="Worker count for accuracy benches")
+    group.addoption(
+        "--wan22-i2v-image-source",
+        action="store",
+        default=None,
+        help="Image source for Wan2.2 I2V accuracy tests. Can be local path or remote URL.",
+    )
+    group.addoption(
+        "--wan22-i2v-online-timeout-seconds",
+        action="store",
+        type=int,
+        default=1200,
+        help="Online serving timeout in seconds for Wan2.2 I2V accuracy tests.",
+    )
 
 
 def _hf_cache_root() -> Path:
@@ -101,8 +116,8 @@ class AccuracyServerConfig:
         params = self.generate_params
         model = self.model_prefix + params.model
         server_args = params.server_args or []
-        if params.use_omni:
-            server_args = ["--stage-init-timeout", "120", *server_args]
+        if params.use_omni and params.stage_init_timeout is not None:
+            server_args = ["--stage-init-timeout", str(params.stage_init_timeout), *server_args]
         with OmniServer(
             model,
             server_args,
@@ -143,6 +158,17 @@ def accuracy_workers(request: pytest.FixtureRequest) -> int:
 
 
 @pytest.fixture(scope="session")
+def wan22_i2v_image_source(request: pytest.FixtureRequest) -> str | None:
+    value = request.config.getoption("wan22_i2v_image_source")
+    return str(value) if value else None
+
+
+@pytest.fixture(scope="session")
+def wan22_i2v_online_timeout_seconds(request: pytest.FixtureRequest) -> int:
+    return int(request.config.getoption("wan22_i2v_online_timeout_seconds"))
+
+
+@pytest.fixture(scope="session")
 def gebench_samples_per_type(request: pytest.FixtureRequest) -> int:
     return int(request.config.getoption("gebench_samples_per_type"))
 
@@ -159,16 +185,26 @@ def accuracy_artifact_root() -> Path:
     return root
 
 
-def reset_artifact_dir(path: Path) -> Path:
-    if path.exists():
-        shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+@pytest.fixture(scope="session")
+def qwen_bear_image(accuracy_artifact_root: Path) -> Image.Image:
+    """Download the Qwen bear image from the URL and save it to the accuracy artifact root."""
+    QWEN_BEAR_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/qwen-bear.png"
+    response = requests.get(QWEN_BEAR_IMAGE_URL, timeout=60)
+    response.raise_for_status()
+    image = Image.open(BytesIO(response.content)).convert("RGB")
+    image.save(accuracy_artifact_root / "qwen_bear.png")
+    return image
 
 
-def infer_model_label(model: str) -> str:
-    label = Path(model.rstrip("/\\")).name or "model"
-    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in label)
+@pytest.fixture(scope="session")
+def rabbit_image(accuracy_artifact_root: Path) -> Image.Image:
+    """Download the rabbit image from the URL and save it to the accuracy artifact root."""
+    RABBIT_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/rabbit.png"
+    response = requests.get(RABBIT_IMAGE_URL, timeout=60)
+    response.raise_for_status()
+    image = Image.open(BytesIO(response.content)).convert("RGB")
+    image.save(accuracy_artifact_root / "rabbit.png")
+    return image
 
 
 def _build_accuracy_server_config(
@@ -202,6 +238,7 @@ def _build_accuracy_server_config(
             server_args=generate_server_args,
             env_dict={"CUDA_VISIBLE_DEVICES": shared_gpu},
             use_omni=True,
+            stage_init_timeout=300,
         ),
         judge_params=OmniServerParams(
             model=judge_model,
