@@ -66,7 +66,7 @@ def test_text_to_text(omni_runner, omni_runner_handler) -> None:
     prompt = build_prompt("请详细介绍鹦鹉的生活习性。")
     request_config = {"prompts": prompt, "modalities": ["text"]}
 
-    omni_runner_handler.send_request(request_config)
+    omni_runner_handler.send_omni_request(request_config)
 
 
 @pytest.mark.core_model
@@ -83,7 +83,7 @@ def test_image_to_text(omni_runner, omni_runner_handler) -> None:
     prompt = build_prompt(f"{IMAGE_TOKEN}Describe this image briefly.")
     request_config = {"prompts": prompt, "images": image, "modalities": ["text"]}
 
-    omni_runner_handler.send_request(request_config)
+    omni_runner_handler.send_omni_request(request_config)
 
 
 @pytest.mark.core_model
@@ -102,7 +102,7 @@ def test_audio_to_text(omni_runner, omni_runner_handler) -> None:
     prompt = build_prompt(f"{AUDIO_TOKEN}Please recognize the language of this speech and transcribe it. Format: oral.")
     request_config = {"prompts": prompt, "audios": audio, "modalities": ["text"]}
 
-    omni_runner_handler.send_request(request_config)
+    omni_runner_handler.send_omni_request(request_config)
 
 
 @pytest.mark.core_model
@@ -119,7 +119,7 @@ def test_video_to_text(omni_runner, omni_runner_handler) -> None:
     prompt = build_prompt(f"{VIDEO_TOKEN}Describe what is happening in this video.")
     request_config = {"prompts": prompt, "videos": video, "modalities": ["text"]}
 
-    omni_runner_handler.send_request(request_config)
+    omni_runner_handler.send_omni_request(request_config)
 
 
 @pytest.mark.core_model
@@ -139,4 +139,4 @@ def test_mixed_to_text(omni_runner, omni_runner_handler) -> None:
     prompt = build_prompt(f"{IMAGE_TOKEN}{AUDIO_TOKEN}Describe the image and transcribe the audio.")
     request_config = {"prompts": prompt, "images": image, "audios": audio, "modalities": ["text"]}
 
-    omni_runner_handler.send_request(request_config)
+    omni_runner_handler.send_omni_request(request_config)

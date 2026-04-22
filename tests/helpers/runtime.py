@@ -1296,7 +1296,7 @@ class OmniRunnerHandler:
             print(f"Error: {result.error_message}")
         return result
 
-    def send_request(self, request_config: dict[str, Any] | None = None) -> OmniResponse:
+    def send_omni_request(self, request_config: dict[str, Any] | None = None) -> OmniResponse:
         if request_config is None:
             request_config = {}
         prompts = request_config.get("prompts")
