@@ -723,12 +723,19 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
     port = omni_server_function.port
     mix_payload = _mix_chat_completions_probe_payload(omni_server_function)
     mix_chat_timeout_sec = 180
+    print(
+        "[oom-recover] injection ready "
+        f"device={device_spec} target_mem_ratio={OOM_RECOVER_INJECTION_CONFIG['target_mem_ratio']} "
+        f"strict={OOM_RECOVER_INJECTION_CONFIG['strict']} hold_seconds={OOM_RECOVER_INJECTION_CONFIG['hold_seconds']}"
+    )
+    print(f"[oom-recover] target endpoint http://{host}:{port}/v1/chat/completions")
 
     failure_observed = False
     fault_status: int | None = None
     fault_body = b""
     try:
         try:
+            print(f"[oom-recover] fault-phase request start timeout={mix_chat_timeout_sec}s")
             fault_status, fault_body = _post_json_raw(
                 host,
                 port,
@@ -736,8 +743,13 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
                 mix_payload,
                 timeout_sec=mix_chat_timeout_sec,
             )
+            print(
+                "[oom-recover] fault-phase request done "
+                f"status={fault_status} body_prefix={fault_body[:200]!r}"
+            )
         except Exception as exc:
             failure_observed = True
+            print(f"[oom-recover] fault-phase request raised {type(exc).__name__}: {exc!r}")
             assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
         else:
             assert fault_status is not None
@@ -766,7 +778,9 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
                     f"body_prefix={fault_body[:500]!r}"
                 )
     finally:
+        print("[oom-recover] stopping OOM sidecar(s)")
         stop_gpu_oom_hogs(handle)
+        print("[oom-recover] OOM sidecar(s) stopped")
 
     recovery_deadline = time.monotonic() + 90.0
     terminal_health: int | None = None
@@ -778,6 +792,7 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
             unreachable_streak = 0
             if status in (200, 503):
                 terminal_health = status
+                print(f"[oom-recover] terminal health reached status={terminal_health}")
                 break
         except Exception as exc:
             last_health_exc = exc
@@ -812,6 +827,7 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
     try:
         assert terminal_health is not None
         if terminal_health == 200:
+            print(f"[oom-recover] recovery-phase mix request start timeout={mix_chat_timeout_sec}s")
             post_mix_status, post_mix_body = _post_json_raw(
                 host,
                 port,
@@ -819,8 +835,14 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
                 mix_payload,
                 timeout_sec=mix_chat_timeout_sec,
             )
+            print(
+                "[oom-recover] recovery-phase mix request done "
+                f"status={post_mix_status} body_prefix={post_mix_body[:200]!r}"
+            )
         else:
+            print("[oom-recover] terminal health=503, send lightweight probe request")
             request_status, _ = _post_json_raw(host, port, "/v1/chat/completions", probe_payload, timeout_sec=20)
+            print(f"[oom-recover] lightweight probe done status={request_status}")
     except Exception:
         post_mix_status = None
         request_status = None
