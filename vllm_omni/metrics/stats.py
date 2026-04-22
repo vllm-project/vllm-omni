@@ -164,12 +164,8 @@ class OrchestratorAggregator:
             return None
         engine_pipeline_time_ms = float(e2e_evt.e2e_total_ms)
         input_preprocess_time_ms = float(self.input_preprocess_time_ms)
-        return (
-            rid,
-            engine_pipeline_time_ms,
-            input_preprocess_time_ms,
-            engine_pipeline_time_ms + input_preprocess_time_ms,
-        )
+        request_wall_time_ms = engine_pipeline_time_ms + input_preprocess_time_ms
+        return rid, engine_pipeline_time_ms, input_preprocess_time_ms, request_wall_time_ms
 
     def format_request_timing_line(self, request_id: str) -> str | None:
         timing_fields = self.get_request_timing_fields(request_id)
