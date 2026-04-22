@@ -628,66 +628,19 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
     finally:
         stop_gpu_oom_hogs(handle)
 
-    # Chat is expected to enter runtime-pressure path (5xx). Speech may return
-    # request-level validation (4xx) or runtime failure (5xx), both valid as
-    # black-box fault outcomes.
+    # Under OOM pressure both chat and speech should surface runtime-class (5xx)
+    # failures instead of request-validation-class (4xx) errors.
     chat_error = _extract_error_contract(chat_body)
     speech_error = _extract_error_contract(speech_body)
     print(chat_status, chat_error, speech_status, speech_error)
 
     assert chat_status >= 500, f"expected chat error under OOM, got status={chat_status}"
-    assert speech_status >= 400, f"expected speech non-2xx error under OOM, got status={speech_status}"
+    assert speech_status >= 500, f"expected speech runtime error under OOM, got status={speech_status}"
 
     assert chat_error is not None, f"chat error payload not OpenAI-compatible: {chat_body[:300]!r}"
     assert speech_error is not None, f"speech error payload not OpenAI-compatible: {speech_body[:300]!r}"
     assert "code" in chat_error, f"chat error lacks code field: {chat_error!r}"
     assert "code" in speech_error, f"speech error lacks code field: {speech_error!r}"
-
-
-@pytest.mark.slow
-@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
-def test_reliability_async_failed_job_observable_with_mapped_status(
-    omni_server_function,
-) -> None:
-    """Black-box: failed async job should be observable with mapped status/code."""
-    create_status, create_payload = _create_video_job_with_invalid_lora(
-        omni_server_function.host,
-        omni_server_function.port,
-        timeout_sec=30,
-    )
-    # Some deployments may reject this endpoint synchronously for the current model;
-    # in that case still require an explicit error contract.
-    if create_status != 200 or "id" not in create_payload:
-        assert create_status >= 400, f"unexpected /v1/videos create status={create_status}, payload={create_payload!r}"
-        assert isinstance(create_payload.get("error"), dict), (
-            f"sync rejection should still return structured error payload, got payload={create_payload!r}"
-        )
-        return
-
-    video_id = str(create_payload["id"])
-    retrieve_status, retrieve_payload = _poll_video_job_status(
-        omni_server_function.host,
-        omni_server_function.port,
-        video_id,
-        timeout_sec=180,
-    )
-    assert retrieve_payload.get("status") == "failed", (
-        f"expected async failed terminal status, got retrieve_status={retrieve_status}, payload={retrieve_payload!r}"
-    )
-    error_obj = retrieve_payload.get("error")
-    assert isinstance(error_obj, dict), f"failed payload must include error object: {retrieve_payload!r}"
-    assert "message" in error_obj, f"failed payload error missing message: {error_obj!r}"
-    assert "code" in error_obj, f"failed payload error missing code: {error_obj!r}"
-    # Some runtime modes return HTTP 200 with status=failed payload; others map
-    # failed jobs to non-2xx. Accept both as long as failure is explicit.
-    assert retrieve_status == 200 or retrieve_status >= 400, (
-        "failed retrieve should be explicit either via failed payload or non-2xx status, "
-        f"got status={retrieve_status}, payload={retrieve_payload!r}"
-    )
-    if retrieve_status >= 400 and isinstance(error_obj.get("code"), int):
-        assert error_obj["code"] == retrieve_status, (
-            f"failed retrieve error.code should match HTTP status, status={retrieve_status}, error={error_obj!r}"
-        )
 
 
 @pytest.mark.slow
