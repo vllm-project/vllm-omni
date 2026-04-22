@@ -5,6 +5,7 @@ Qwen3-Omni reliability integration tests.
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import http.client
 import json
 import os
@@ -118,6 +119,21 @@ def _stage_config_path_from_omni_server(omni_server: _HasServeArgs) -> str | Non
         if arg.startswith("--stage-configs-path="):
             return arg.split("=", 1)[1]
     return None
+
+
+def _looks_like_server_unreachable(exc: BaseException) -> bool:
+    """True when /health cannot be reached because nothing is listening (process exited)."""
+    if isinstance(exc, (ConnectionRefusedError, BrokenPipeError, ConnectionResetError)):
+        return True
+    errno_val = getattr(exc, "errno", None)
+    if isinstance(exc, OSError) and errno_val is not None:
+        return errno_val in (
+            errno.ECONNREFUSED,
+            errno.ECONNRESET,
+            errno.EPIPE,
+        )
+    msg = str(exc).lower()
+    return "connection refused" in msg or "actively refused" in msg
 
 
 def _get_health_raw(host: str, port: int, *, timeout_sec: int = 20) -> tuple[int, bytes]:
@@ -665,17 +681,34 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
 
     recovery_deadline = time.monotonic() + 90.0
     terminal_health: int | None = None
+    unreachable_streak = 0
+    last_health_exc: BaseException | None = None
     while time.monotonic() < recovery_deadline:
         try:
             status, _ = _get_health_raw(host, port, timeout_sec=5)
+            unreachable_streak = 0
             if status in (200, 503):
                 terminal_health = status
                 break
-        except Exception:
-            pass
+        except Exception as exc:
+            last_health_exc = exc
+            if _looks_like_server_unreachable(exc):
+                unreachable_streak += 1
+                if unreachable_streak >= 5:
+                    pytest.fail(
+                        "after OOM sidecar stopped, /health is unreachable (connection refused / reset). "
+                        "The APIServer process likely exited (e.g. orchestrator thread crash under OOM); "
+                        "this test expects the server to stay up for post-fault health polling. "
+                        f"last_exc={last_health_exc!r}"
+                    )
+            else:
+                unreachable_streak = 0
         time.sleep(1.0)
     else:
-        pytest.fail("server did not converge to a terminal health state after OOM pressure was removed")
+        pytest.fail(
+            "server did not converge to a terminal health state after OOM pressure was removed; "
+            f"last_health_exc={last_health_exc!r}"
+        )
 
     request_payload = {
         "model": omni_server_function.model,
