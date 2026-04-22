@@ -90,6 +90,16 @@ python end2end.py --modality text2img \
                   --prompts "A photo-realistic sunset over the ocean"
 ```
 
+### Additional Config
+
+You can pass diffusion worker `additional_config` from the offline example as a JSON object:
+
+```bash
+python end2end.py --modality text2img \
+                  --prompts "A cute cat" \
+                  --additional-config '{"torchair_graph_config":{"enabled":true}}'
+```
+
 ### Key Arguments
 
 #### 📌 Command Line Arguments (end2end.py)
@@ -109,6 +119,7 @@ python end2end.py --modality text2img \
 | `--bot-task`           | string | auto                                 | Override prompt task (e.g. `it2i_think`, `t2i_recaption`)    |
 | `--sys-type`           | string | auto                                 | Override system prompt type (e.g. `en_unified`, `en_vanilla`) |
 | `--stage-configs-path` | string | auto                                 | Custom stage config YAML path                                |
+| `--additional-config`  | string | `None`                               | JSON object forwarded to diffusion `additional_config`       |
 | `--enforce-eager`      | flag   | `False`                              | Disable torch.compile                                        |
 | `--init-timeout`       | int    | `300`                                | Initialization timeout (seconds)                             |
 | `--vae-use-tiling`     | flag   | `False`                              | Enable VAE tiling for memory optimization (required to avoid OOM on A100) |
