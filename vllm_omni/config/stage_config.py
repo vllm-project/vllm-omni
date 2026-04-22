@@ -28,6 +28,15 @@ def get_pipeline_path(model_dir: str, filename: str) -> Path:
 logger = init_logger(__name__)
 
 
+def _warn_deprecated_kwargs(kwargs: dict[str, Any]) -> None:
+    if "cli_explicit_keys" in kwargs:
+        warnings.warn(
+            "cli_explicit_keys= is deprecated and ignored. Remove the kwarg.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
 
@@ -1002,12 +1011,7 @@ class StageConfigFactory:
 
         Checks _PIPELINE_REGISTRY first (new path), falls back to legacy YAML.
         """
-        if "cli_explicit_keys" in deprecated_kwargs:
-            warnings.warn(
-                "cli_explicit_keys= is deprecated and ignored. Remove the kwarg.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
+        _warn_deprecated_kwargs(deprecated_kwargs)
 
         if cli_overrides is None:
             cli_overrides = {}
@@ -1070,12 +1074,7 @@ class StageConfigFactory:
         Precedence: caller-typed (non-None) value > deploy YAML >
         StageDeployConfig dataclass default.
         """
-        if "cli_explicit_keys" in deprecated_kwargs:
-            warnings.warn(
-                "cli_explicit_keys= is deprecated and ignored. Remove the kwarg.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
+        _warn_deprecated_kwargs(deprecated_kwargs)
 
         # Resolve deploy config path
         if deploy_config_path is None:

@@ -96,10 +96,8 @@ class OmniBase(PDDisaggregationMixin):
         parser: argparse.ArgumentParser | None = None,
         **overrides: Any,
     ) -> OmniBase:
-        """Build from an argparse namespace. If ``parser`` is passed and not
-        already nullified, un-typed engine fields are reset to ``None`` so the
-        merge layer's None-guard handles precedence.
-        """
+        """Build from argparse. If ``parser`` is passed and not yet nullified,
+        un-typed engine fields are reset to ``None``."""
         kwargs: dict[str, Any] = {k: v for k, v in vars(args).items() if not k.startswith("_")}
 
         if parser is not None and not getattr(parser, "_omni_nullified", False):
@@ -109,14 +107,14 @@ class OmniBase(PDDisaggregationMixin):
             )
             from vllm_omni.entrypoints.utils import detect_explicit_cli_keys
 
-            typed = detect_explicit_cli_keys(sys.argv[1:], parser) or set()
-            orch = orchestrator_field_names()
-            server_dests = derive_server_dests_from_vllm_parser()
-            shared = orch & {"model", "stage_id", "log_stats", "stage_configs_path"}
-            for key in list(kwargs.keys()):
-                if key in typed or key in server_dests or key in shared or key in orch:
-                    continue
-                kwargs[key] = None
+            keep = (
+                (detect_explicit_cli_keys(sys.argv[1:], parser) or set())
+                | derive_server_dests_from_vllm_parser()
+                | orchestrator_field_names()
+            )
+            for key in list(kwargs):
+                if key not in keep:
+                    kwargs[key] = None
 
         kwargs.update(overrides)
         return cls(**kwargs)
