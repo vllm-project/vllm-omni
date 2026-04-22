@@ -34,8 +34,9 @@ class _InFlightChunk:
     """One chunk of an active request, tracked through the temporal pipeline."""
 
     chunk_idx: int               
-    in_pipeline: bool = True     # currently flowing through ranks (True between admission and exit)
-    entered_rank0_at: int = -1   # micro-step at which the chunk last entered rank 0
+    is_active: bool = True    
+    is_completed: bool = False 
+    entered_rank0_at: int = -1 
 
 
 @dataclass
@@ -149,8 +150,8 @@ class StreamBatchScheduler(_BaseScheduler):
         # 1. Try to re-admit a returning chunk (FIFO oldest-first across requests).
         for progress in self._chunk_progress.values():
             for chunk in progress.in_flight:
-                if not chunk.in_pipeline:
-                    chunk.in_pipeline = True
+                if not chunk.is_active:
+                    chunk.is_active = True
                     chunk.entered_rank0_at = self._global_micro_step
                     return  # rank 0 is now taken
 
@@ -159,7 +160,7 @@ class StreamBatchScheduler(_BaseScheduler):
             if progress.chunks_admitted < progress.num_chunks:
                 new_chunk = _InFlightChunk(
                     chunk_idx=progress.chunks_admitted,
-                    in_pipeline=True,
+                    is_active=True,
                     entered_rank0_at=self._global_micro_step,
                 )
                 progress.in_flight.append(new_chunk)
@@ -170,7 +171,7 @@ class StreamBatchScheduler(_BaseScheduler):
         assignment: list[RankTask | None] = [None] * self.pp_size
         for progress in self._chunk_progress.values():
             for chunk in progress.in_flight:
-                if not chunk.in_pipeline:
+                if not chunk.is_active:
                     continue
                 r = self._global_micro_step - chunk.entered_rank0_at
                 if 0 <= r < self.pp_size:
@@ -193,16 +194,31 @@ class StreamBatchScheduler(_BaseScheduler):
 
         terminal: dict[str, DiffusionRequestStatus] = {}
 
-        if output.chunk_idx is not None:
-            progress = self._chunk_progress.get(output.req_id)
-            if progress is not None:
-                chunk = self._find_chunk(progress, output.chunk_idx)
-                if chunk is not None:
-                    chunk.in_pipeline = False
-                    if output.chunk_completed:
-                        progress.in_flight = [
-                            c for c in progress.in_flight if c.chunk_idx != output.chunk_idx
-                        ]
+        progress = self._chunk_progress.get(output.req_id)
+        if progress is None:
+            return set()
+
+
+        chunk = self._find_chunk(progress, output.chunk_idx) if output.chunk_idx is not None else None
+        if chunk is not None:
+            chunk.is_completed = output.chunk_completed
+
+        last_task = sched_output.per_rank_assignment[-1]
+        logger.debug(
+            "update_from_output: Processing output for micro-step %d: chunk=%s, last_chunk=%s, finished=%s",
+            self._global_micro_step, chunk, last_task, output.finished,
+        )
+        if last_task is not None and last_task.chunk_idx is not None:
+            last_chunk = self._find_chunk(progress, last_task.chunk_idx)
+            if last_chunk is not None:
+                if last_chunk.is_completed:
+                    progress.in_flight = [
+                        c for c in progress.in_flight if c.chunk_idx != last_chunk.chunk_idx
+                    ]
+                else:
+                    last_chunk.is_active = False                       
+
+
 
         if output.finished:
             terminal[output.req_id] = DiffusionRequestStatus.FINISHED_COMPLETED
