@@ -220,31 +220,62 @@ def _register_omni_exception_handlers(app) -> None:
         req: Request,
         exc: EngineDeadError | EngineGenerateError,
     ):
-        request_id = req.state.request_metadata.request_id if hasattr(req.state, "request_metadata") else None
+        request_id = _get_request_id_from_request(req)
 
         if req.app.state.args.log_error_stack:
             logger.exception("Engine Exception caught. Request id: %s", request_id)
 
-        engine = req.app.state.engine_client
-        if isinstance(exc, EngineDeadError):
-            # Log Omni-specific diagnostic information for dead engines.
-            orchestrator_alive = engine.engine.is_alive() if hasattr(engine, "engine") else "N/A"
-            logger.error(
-                "EngineDeadError: orchestrator_alive=%s, errored=%s, request_id=%s",
-                orchestrator_alive,
-                engine.errored,
-                request_id,
-            )
-
-        terminate_if_errored(
-            server=req.app.state.server,
-            engine=engine,
-        )
-        err = create_error_response(exc)
-        return JSONResponse(err.model_dump(), status_code=err.error.code)
+        return _create_engine_error_json_response(req, exc)
 
     app.exception_handler(EngineGenerateError)(omni_engine_error_handler)
     app.exception_handler(EngineDeadError)(omni_engine_error_handler)
+
+
+def _get_request_id_from_request(req: Request) -> str | None:
+    return req.state.request_metadata.request_id if hasattr(req.state, "request_metadata") else None
+
+
+def _build_engine_error_payload(
+    exc: EngineDeadError | EngineGenerateError,
+    *,
+    request_id: str | None,
+) -> tuple[dict[str, Any], int]:
+    err = create_error_response(exc)
+    payload = err.model_dump()
+    error_body = payload.get("error", {})
+
+    error_body["request_id"] = request_id
+    error_body["error_stage_id"] = getattr(exc, "error_stage_id", None)
+
+    return payload, err.error.code
+
+
+def _create_engine_error_json_response(
+    req: Request,
+    exc: EngineDeadError | EngineGenerateError,
+) -> JSONResponse:
+    request_id = _get_request_id_from_request(req)
+    error_stage_id = getattr(exc, "error_stage_id", None)
+    engine = req.app.state.engine_client
+
+    if isinstance(exc, EngineDeadError):
+        # Log Omni-specific diagnostic information for dead engines.
+        orchestrator_alive = engine.engine.is_alive() if hasattr(engine, "engine") else "N/A"
+        logger.error(
+            "EngineDeadError: orchestrator_alive=%s, errored=%s, request_id=%s, error_stage_id=%s",
+            orchestrator_alive,
+            engine.errored,
+            request_id,
+            error_stage_id,
+        )
+
+    terminate_if_errored(
+        server=req.app.state.server,
+        engine=engine,
+    )
+
+    payload, status_code = _build_engine_error_payload(exc, request_id=request_id)
+    return JSONResponse(content=payload, status_code=status_code)
 
 
 class _DiffusionServingModels:
@@ -930,8 +961,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         return base_server.create_error_response(message="The model does not support Chat Completions API")
     try:
         generator = await handler.create_chat_completion(request, raw_request)
-    except (EngineGenerateError, EngineDeadError):
-        raise  # Propagate to the global Omni exception handler
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
     except Exception as e:
         logger.exception("Chat completion failed: %s", e)
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
@@ -1027,8 +1058,8 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
                 status_code=result.error.code if result.error else 400,
             )
         return result
-    except (EngineGenerateError, EngineDeadError):
-        raise  # Propagate to the global Omni exception handler
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
 
@@ -1063,8 +1094,8 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
                 status_code=result.error.code if result.error else 400,
             )
         return JSONResponse(content=result.model_dump())
-    except (EngineGenerateError, EngineDeadError):
-        raise  # Propagate to the global Omni exception handler
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
     except ValueError as e:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e)) from e
     except Exception as e:
@@ -1522,8 +1553,8 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             data=image_data,
         )
 
-    except (EngineGenerateError, EngineDeadError):
-        raise  # Propagate to the global Omni exception handler
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
     except ValueError as e:
@@ -1759,8 +1790,8 @@ async def edit_images(
             size=size_str,
         )
 
-    except (EngineGenerateError, EngineDeadError):
-        raise  # Propagate to the global Omni exception handler
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
     except ValueError as e:
@@ -2481,8 +2512,8 @@ async def create_video_sync(
             status_code=HTTPStatus.GATEWAY_TIMEOUT.value,
             detail=f"Video generation timed out after {VIDEO_SYNC_TIMEOUT_S}s.",
         )
-    except (EngineGenerateError, EngineDeadError):
-        raise  # Propagate to the global Omni exception handler
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
     except HTTPException:
         raise
     except Exception as exc:

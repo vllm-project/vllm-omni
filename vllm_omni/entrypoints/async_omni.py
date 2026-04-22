@@ -27,7 +27,10 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
-from vllm_omni.entrypoints.omni_base import OmniBase
+from vllm_omni.entrypoints.omni_base import (
+    OmniBase,
+    OmniEngineDeadError,
+)
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -494,7 +497,10 @@ class AsyncOmni(EngineClient, OmniBase):
             stage_id = result.get("stage_id", 0)
 
             if result.get("type") == "error" and result.get("fatal"):
-                raise EngineDeadError(result.get("error", ""))
+                raise OmniEngineDeadError(
+                    result.get("error", ""),
+                    error_stage_id=result.get("stage_id"),
+                )
 
             # Check for errors
             if "error" in result:
@@ -580,6 +586,18 @@ class AsyncOmni(EngineClient, OmniBase):
 
             except asyncio.CancelledError:
                 raise
+            except OmniEngineDeadError as e:
+                logger.error("[AsyncOmni] Engine dead: %s", e)
+                for req_state in list(self.request_states.values()):
+                    error_msg = {
+                        "type": "error",
+                        "error": str(e),
+                        "fatal": True,
+                        "request_id": req_state.request_id,
+                    }
+                    if e.error_stage_id is not None:
+                        error_msg["stage_id"] = e.error_stage_id
+                    await req_state.queue.put(error_msg)
             except EngineDeadError as e:
                 logger.error("[AsyncOmni] Engine dead: %s", e)
                 for req_state in list(self.request_states.values()):
@@ -884,7 +902,7 @@ class AsyncOmni(EngineClient, OmniBase):
     @property
     def dead_error(self) -> BaseException:
         """EngineClient abstract property implementation."""
-        return EngineDeadError()
+        return OmniEngineDeadError()
 
     # ==================== EngineClient Interface ====================
 
