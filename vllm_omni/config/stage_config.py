@@ -1001,17 +1001,10 @@ class StageConfigFactory:
         """Load pipeline + deploy config, merge with CLI overrides.
 
         Checks _PIPELINE_REGISTRY first (new path), falls back to legacy YAML.
-
-        Per RFC #3035, the CLI/parser layer nullifies un-typed flags so the
-        merge layer's ``if value is None: continue`` guard is the entire
-        precedence rule. Pre-RFC callers passed a ``cli_explicit_keys=`` set
-        explicitly; that parameter is now accepted-and-ignored for one
-        version with a ``DeprecationWarning``.
         """
         if "cli_explicit_keys" in deprecated_kwargs:
             warnings.warn(
-                "cli_explicit_keys= is deprecated and ignored — RFC #3035 "
-                "moved precedence to the parser layer. Remove the kwarg.",
+                "cli_explicit_keys= is deprecated and ignored. Remove the kwarg.",
                 DeprecationWarning,
                 stacklevel=2,
             )
@@ -1074,22 +1067,12 @@ class StageConfigFactory:
     ) -> list[StageConfig]:
         """Create StageConfigs from pipeline registry + deploy YAML.
 
-        Precedence (high → low):
-            caller-typed value  >  deploy YAML  >  StageDeployConfig dataclass
-
-        Per RFC #3035, the CLI/parser layer nullifies un-typed flags before
-        kwargs reach this layer. Every key in ``cli_overrides`` with a
-        non-None value is treated as caller intent. Per-stage keys
-        (``stage_N_*``) are routed to their respective stage by
-        ``build_stage_runtime_overrides``.
-
-        ``cli_explicit_keys=`` is accepted-and-ignored for one version with
-        a ``DeprecationWarning``.
+        Precedence: caller-typed (non-None) value > deploy YAML >
+        StageDeployConfig dataclass default.
         """
         if "cli_explicit_keys" in deprecated_kwargs:
             warnings.warn(
-                "cli_explicit_keys= is deprecated and ignored — RFC #3035 "
-                "moved precedence to the parser layer. Remove the kwarg.",
+                "cli_explicit_keys= is deprecated and ignored. Remove the kwarg.",
                 DeprecationWarning,
                 stacklevel=2,
             )
@@ -1124,10 +1107,6 @@ class StageConfigFactory:
 
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
 
-        # Single-rule precedence (RFC #3035): every kwarg with a non-None
-        # value wins over YAML for its key. Un-typed CLI flags arrive as
-        # None thanks to ``nullify_stage_engine_defaults`` and are filtered
-        # by the loop below.
         explicit_overrides = {k: v for k, v in cli_overrides.items() if v is not None}
 
         for stage in stages:

@@ -353,10 +353,6 @@ def load_stage_configs_from_model(
 
     For other models (legacy path), loads stage configs from YAML.
 
-    Per RFC #3035, the parser layer nullifies un-typed flags so the merge
-    layer's None-guard is the entire precedence rule. ``cli_explicit_keys=``
-    is accepted-and-ignored for one version with a ``DeprecationWarning``.
-
     Args:
         model: Model name or path (used to determine model_type)
         base_engine_args: Base engine args to merge as CLI overrides.
@@ -370,8 +366,7 @@ def load_stage_configs_from_model(
         import warnings
 
         warnings.warn(
-            "cli_explicit_keys= is deprecated and ignored — RFC #3035 moved "
-            "precedence to the parser layer. Remove the kwarg.",
+            "cli_explicit_keys= is deprecated and ignored. Remove the kwarg.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -597,8 +592,7 @@ def load_and_resolve_stage_configs(
         import warnings
 
         warnings.warn(
-            "cli_explicit_keys= is deprecated and ignored — RFC #3035 moved "
-            "precedence to the parser layer. Remove the kwarg.",
+            "cli_explicit_keys= is deprecated and ignored. Remove the kwarg.",
             DeprecationWarning,
             stacklevel=2,
         )

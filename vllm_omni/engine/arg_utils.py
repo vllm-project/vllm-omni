@@ -133,26 +133,22 @@ class OmniEngineArgs(EngineArgs):
             Passed through to the diffusion stage engine.
     """
 
-    # RFC #3035: user-input fields default to ``None`` so ``OmniEngineArgs.create()``
-    # / ``from_cli_args()`` callers can distinguish "caller set this" from
-    # "caller didn't touch it". Internal flags (``omni``, ``has_sampling_extra_args``)
-    # keep concrete defaults because they're not user-input.
-    stage_id: int = 0  # per-stage identifier; 0 is meaningful for single-stage
-    model_stage: str | None = None  # was "thinker"; per-model default set by pipeline.py
+    stage_id: int = 0
+    model_stage: str | None = None
     model_arch: str | None = None
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     subtalker_sampling_params: dict[str, Any] | None = None
-    async_chunk: bool | None = None  # was False; merge layer handles None ⇒ yaml/dataclass
+    async_chunk: bool | None = None
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     worker_type: str | None = None
     task_type: str | None = None
-    worker_cls: str | None = None  # was bare None — type hint corrected
-    enable_sleep_mode: bool | None = None  # was False
-    omni: bool = False  # internal: "is this an Omni invocation?" — keep concrete
+    worker_cls: str | None = None
+    enable_sleep_mode: bool | None = None
+    omni: bool = False
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -172,9 +168,9 @@ class OmniEngineArgs(EngineArgs):
     omni_master_port: int | None = None
     stage_configs_path: str | None = None
     output_modalities: list[str] | None = None
-    log_stats: bool | None = None  # was False; consumers handle None ⇒ off
+    log_stats: bool | None = None
     custom_pipeline_args: dict[str, Any] | None = None
-    has_sampling_extra_args: bool = False  # internal — keep concrete
+    has_sampling_extra_args: bool = False
 
     def __post_init__(self) -> None:
         if self.worker_cls is None:
@@ -189,10 +185,6 @@ class OmniEngineArgs(EngineArgs):
     def from_cli_args(cls, args: argparse.Namespace) -> "OmniEngineArgs":
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         engine_args = cls(**{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)})
-        # Track which fields the namespace explicitly set (post-nullification,
-        # un-typed flags arrive as None on ``args`` and we record only
-        # the typed ones). Callers passing this instance via ``engine_args=``
-        # benefit from the same RFC #3035 None-guard semantics.
         engine_args._explicit_fields = frozenset(
             attr for attr in attrs if hasattr(args, attr) and getattr(args, attr) is not None
         )
@@ -200,39 +192,21 @@ class OmniEngineArgs(EngineArgs):
 
     @classmethod
     def create(cls, **explicit: Any) -> "OmniEngineArgs":
-        """Construct an ``OmniEngineArgs`` recording which fields the caller set.
+        """Constructor that records caller-set fields.
 
-        Use this instead of the bare constructor when you intend to pass the
-        instance via ``Omni(..., engine_args=ea)``. Fields not passed to
-        ``create`` stay at their dataclass default but are not recorded as
-        explicit, so the merge layer treats them as fall-through (matching
-        RFC #3035 sentinel-default semantics).
-
-        Example::
-
-            ea = OmniEngineArgs.create(model="x", gpu_memory_utilization=0.5)
-            omni = Omni(model="x", engine_args=ea)
-            # → only gpu_memory_utilization=0.5 reaches the merge layer as
-            #   caller-explicit; everything else is treated as None.
+        Prefer this over the bare constructor when passing via
+        ``Omni(..., engine_args=ea)`` — only recorded fields reach the merge
+        layer as caller-explicit.
         """
         ea = cls(**explicit)
         ea._explicit_fields = frozenset(explicit.keys())
         return ea
 
     def explicit_kwargs(self) -> dict[str, Any]:
-        """Return the dict of fields the caller explicitly set.
-
-        For instances built via ``OmniEngineArgs.create(...)`` or
-        ``OmniEngineArgs.from_cli_args(args)`` (with nullified parser),
-        this returns only the explicit subset. For instances built via the
-        bare constructor (legacy), returns every non-None field — matches
-        pre-RFC behavior.
-        """
+        """Caller-set fields, or all non-None fields for bare-constructor
+        instances (legacy fallback)."""
         explicit = getattr(self, "_explicit_fields", None)
         if explicit is None:
-            # Legacy constructor — no tracking. Surface every non-None field
-            # to preserve pre-RFC behavior. Callers wanting RFC #3035
-            # semantics should switch to ``OmniEngineArgs.create(...)``.
             return {
                 f.name: getattr(self, f.name) for f in dataclasses.fields(self) if getattr(self, f.name) is not None
             }
@@ -648,68 +622,26 @@ def orchestrator_args_from_argparse(args: Any) -> OrchestratorArgs:
     return OrchestratorArgs(**kwargs)
 
 
-# ============================================================================
-# Sentinel-default precedence (RFC #3035)
-# ============================================================================
-#
-# Stage-level engine flags (gpu_memory_utilization, max_num_seqs, dtype, ...)
-# must default to ``None`` after the parser is built. The merge layer's
-# existing ``if value is None: continue`` guard then becomes the entire
-# precedence rule:
-#
-#     caller-typed value  >  deploy YAML  >  StageDeployConfig dataclass
-#
-# vLLM's ``make_arg_parser`` ships real parser defaults for inherited
-# EngineArgs fields. ``nullify_stage_engine_defaults`` walks the built
-# parser and resets ``action.default = None`` for every action that isn't
-# server-level, preserving the visible default in the help text.
-#
-# Server-level flags (--host, --port, --api-key, ssl_*, ...) bypass the
-# stage merge layer and need real defaults so uvicorn/FastAPI start cleanly.
-
-
 def nullify_stage_engine_defaults(parser: argparse.ArgumentParser) -> None:
-    """Set ``action.default = None`` for every stage-level engine flag.
+    """Reset stage-level engine flag defaults to ``None`` so un-typed flags
+    arrive at the merge layer as ``None``. Real defaults are appended to
+    each action's help as ``(default: X)``. Idempotent.
 
-    Call this AFTER ``make_arg_parser`` has populated the parser with
-    inherited vLLM defaults and AFTER any vllm-omni-specific flags are
-    added. Idempotent.
-
-    Server-level flags (host, port, api_key, ssl_*, etc.) keep their real
-    defaults because they bypass the stage merge layer.
-
-    Real default values are appended to ``action.help`` as ``(default: X)``
-    so ``--help`` output stays informative even though the parser stores
-    ``None``.
-
-    Boolean flags using ``store_true`` / ``store_false`` actions are also
-    nullified — the parser still recognizes the flag and sets True/False
-    when typed, but absent flags become ``None`` instead of False/True.
+    Server-level flags (host, port, api_key, ssl_*) and orchestrator-only
+    fields are exempt — they bypass the stage merge layer.
     """
     server_dests = derive_server_dests_from_vllm_parser()
+    orch_only = orchestrator_field_names() - SHARED_FIELDS
 
     for action in parser._actions:
-        # Skip help, positionals, server-level flags, and the version action
         if action.dest in ("help", "version") or not action.option_strings:
             continue
-        if action.dest in server_dests:
+        if action.dest in server_dests or action.dest in orch_only:
             continue
-        # Skip orchestrator-only fields that argparse_args_from_argparse
-        # consumes directly — they don't go through the stage merge layer.
-        if action.dest in orchestrator_field_names() and action.dest not in SHARED_FIELDS:
-            continue
-
-        # Don't double-process if already None
         if action.default is None or action.default is argparse.SUPPRESS:
             continue
-
-        # Preserve real default in help text for visibility
-        real_default = action.default
         if action.help and "(default:" not in action.help and "%(default)" not in action.help:
-            action.help = f"{action.help} (default: {real_default})"
-
+            action.help = f"{action.help} (default: {action.default})"
         action.default = None
 
-    # Mark so ``Omni.from_cli_args`` doesn't re-nullify (idempotent anyway,
-    # but skips a typed-key derivation pass).
     parser._omni_nullified = True  # type: ignore[attr-defined]

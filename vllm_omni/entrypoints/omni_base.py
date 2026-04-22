@@ -96,31 +96,12 @@ class OmniBase(PDDisaggregationMixin):
         parser: argparse.ArgumentParser | None = None,
         **overrides: Any,
     ) -> OmniBase:
-        """Construct an ``Omni`` / ``AsyncOmni`` from an ``argparse.Namespace``.
-
-        Per RFC #3035, un-typed CLI flags should arrive at the merge layer as
-        ``None`` so the None-guard becomes the entire precedence rule. The
-        ``vllm serve`` path nullifies stage-level parser defaults via
-        ``nullify_stage_engine_defaults`` before parsing, so ``vars(args)``
-        already carries None for un-typed flags.
-
-        For non-vllm-serve callers (offline scripts that build their own
-        argparse parser), pass ``parser=`` and we detect typed keys via
-        ``sys.argv`` and null out everything else — same end-state as
-        pre-parse nullification, achieved post-parse.
-
-        Example::
-
-            parser = FlexibleArgumentParser()
-            OmniEngineArgs.add_cli_args(parser)
-            args = parser.parse_args()
-            omni = Omni.from_cli_args(args, parser=parser)   # auto-nullifies
+        """Build from an argparse namespace. If ``parser`` is passed and not
+        already nullified, un-typed engine fields are reset to ``None`` so the
+        merge layer's None-guard handles precedence.
         """
         kwargs: dict[str, Any] = {k: v for k, v in vars(args).items() if not k.startswith("_")}
 
-        # Auto-nullify un-typed engine fields when the caller passes a parser
-        # they built themselves (not via vllm serve). Skipped if the parser
-        # has been pre-nullified via ``nullify_stage_engine_defaults``.
         if parser is not None and not getattr(parser, "_omni_nullified", False):
             from vllm_omni.engine.arg_utils import (
                 derive_server_dests_from_vllm_parser,
@@ -129,14 +110,11 @@ class OmniBase(PDDisaggregationMixin):
             from vllm_omni.entrypoints.utils import detect_explicit_cli_keys
 
             typed = detect_explicit_cli_keys(sys.argv[1:], parser) or set()
-            shared = orchestrator_field_names() & {"model", "stage_id", "log_stats", "stage_configs_path"}
+            orch = orchestrator_field_names()
             server_dests = derive_server_dests_from_vllm_parser()
+            shared = orch & {"model", "stage_id", "log_stats", "stage_configs_path"}
             for key in list(kwargs.keys()):
-                if key in typed or key in server_dests or key in shared:
-                    continue
-                # Orchestrator-only fields keep their values; merge layer
-                # consumes them through OrchestratorArgs, not the None-guard.
-                if key in orchestrator_field_names():
+                if key in typed or key in server_dests or key in shared or key in orch:
                     continue
                 kwargs[key] = None
 
@@ -150,23 +128,15 @@ class OmniBase(PDDisaggregationMixin):
     ) -> None:
         engine_args: OmniEngineArgs | None = kwargs.pop("engine_args", None)
 
-        # RFC #3035: when ``engine_args=`` is passed, fold only the caller-
-        # explicit fields into kwargs so the merge layer's None-guard treats
-        # un-set fields as fall-through. Built via ``OmniEngineArgs.create()``
-        # or ``from_cli_args()`` ⇒ explicit set is real. Bare constructor
-        # legacy callers fall through to all-non-None semantics (warned).
         if engine_args is not None:
-            explicit = engine_args.explicit_kwargs()
-            for key, value in explicit.items():
+            for key, value in engine_args.explicit_kwargs().items():
                 kwargs.setdefault(key, value)
             if not hasattr(engine_args, "_explicit_fields"):
                 import warnings as _warnings
 
                 _warnings.warn(
-                    "Passing engine_args=OmniEngineArgs(...) built via the bare "
-                    "constructor cannot distinguish caller-set fields from dataclass "
-                    "defaults. Use OmniEngineArgs.create(**explicit) instead "
-                    "(RFC #3035).",
+                    "Bare OmniEngineArgs(...) cannot distinguish caller-set from "
+                    "dataclass defaults. Use OmniEngineArgs.create(**explicit).",
                     DeprecationWarning,
                     stacklevel=2,
                 )

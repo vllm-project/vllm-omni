@@ -1388,10 +1388,6 @@ class AsyncOmniEngine:
         stage_configs_path = kwargs.get("stage_configs_path", None)
         deploy_config_path = kwargs.pop("deploy_config", None)
         stage_overrides_json = kwargs.pop("stage_overrides", None)
-        # RFC #3035: parser-level nullification means un-typed flags arrive
-        # as None; the merge layer's None-guard is now the entire precedence
-        # rule. Discard any legacy ``_cli_explicit_keys`` kwarg from
-        # pre-RFC callers.
         kwargs.pop("_cli_explicit_keys", None)
         explicit_stage_configs = kwargs.pop("stage_configs", None)
         if explicit_stage_configs is not None:

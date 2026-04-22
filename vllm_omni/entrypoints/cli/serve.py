@@ -93,10 +93,6 @@ class OmniServeCommand(CLISubcommand):
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
 
-        # RFC #3035: parser defaults are nullified for stage-level flags in
-        # subparser_init, so un-typed flags reach the merge layer as None.
-        # No need to compute an explicit-key set anymore.
-
         if args.headless:
             run_headless(args)
         else:
@@ -483,9 +479,6 @@ class OmniServeCommand(CLISubcommand):
         # Stash via type(self) so the docs hook (which execs this function in a
         # sandboxed globals dict via ``DummySelf``) doesn't fail on a NameError.
         type(self)._parser = serve_parser
-        # RFC #3035: nullify stage-level engine flag defaults so un-typed CLI
-        # values arrive as None and the merge layer's None-guard becomes the
-        # entire precedence rule. Real defaults stay visible in --help.
         from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
         nullify_stage_engine_defaults(serve_parser)
@@ -544,9 +537,6 @@ def run_headless(args: argparse.Namespace) -> None:
         raise ValueError("headless mode requires worker_backend=multi_process")
 
     args_dict = vars(args).copy()
-    # RFC #3035: parser defaults are nullified for stage-level flags, so
-    # un-typed flags arrive as None and get filtered by the merge layer's
-    # None-guard. No more explicit-key set required.
     args_dict.pop("_cli_explicit_keys", None)
     config_path, stage_configs = load_and_resolve_stage_configs(
         model,

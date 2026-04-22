@@ -353,9 +353,7 @@ def test_ambiguous_field_non_strict_routes_to_orchestrator(caplog):
     assert any("both OrchestratorArgs" in r.message for r in caplog.records)
 
 
-# ============================================================================
-# RFC #3035 — sentinel-default precedence invariants
-# ============================================================================
+# Sentinel-default precedence invariants (#3035)
 
 
 def test_nullify_stage_engine_defaults_resets_inherited_defaults():
@@ -448,10 +446,8 @@ def test_help_text_preserves_default_after_nullify():
 
 
 def test_omniengineargs_user_input_fields_default_to_none():
-    """RFC #3035: user-input fields on ``OmniEngineArgs`` default to ``None``
-    so callers using ``OmniEngineArgs.create(**explicit)`` can distinguish
-    set from unset. Internal flags (``omni``, ``has_sampling_extra_args``)
-    are exempt — they're not user-facing config."""
+    """User-input fields default to None so ``OmniEngineArgs.create()`` can
+    distinguish set from unset. Internal flags are exempt."""
     try:
         from vllm_omni.engine.arg_utils import OmniEngineArgs
     except Exception as exc:
@@ -491,8 +487,7 @@ def test_omniengineargs_user_input_fields_default_to_none():
 
     assert not offenders, (
         f"OmniEngineArgs fields with non-None defaults: {offenders}. "
-        f"User-input fields must default to None per RFC #3035 so "
-        f"OmniEngineArgs.create() can track explicit-vs-unset."
+        f"User-input fields must default to None for explicit-vs-unset tracking."
     )
 
 
