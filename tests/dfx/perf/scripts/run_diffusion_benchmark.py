@@ -32,6 +32,8 @@ from typing import Any, cast
 import psutil
 import pytest
 
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 os.environ.setdefault("DIFFUSION_ATTENTION_BACKEND", "FLASH_ATTN")
@@ -662,8 +664,7 @@ def assert_result(result: dict[str, Any], params: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 # Test entry point
 # ---------------------------------------------------------------------------
-
-
+@pytest.mark.benchmark
 @pytest.mark.parametrize(
     "diffusion_server",
     server_params,
