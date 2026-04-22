@@ -23,7 +23,7 @@ from tests.helpers.media import (
     generate_synthetic_audio,
 )
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
