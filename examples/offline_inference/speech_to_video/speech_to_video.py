@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import os
 import time
 from pathlib import Path
 
@@ -164,6 +165,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
+    parser.add_argument(
+        "--cache-backend",
+        type=str,
+        default=None,
+        choices=["cache_dit"],
+        help="Cache backend for acceleration. Default: None.",
+    )
+    parser.add_argument(
+        "--enable-cache-dit-summary",
+        action="store_true",
+        help="Enable cache-dit summary logging after diffusion forward passes.",
+    )
     return parser.parse_args()
 
 
@@ -176,6 +189,22 @@ def main():
 
     image = PIL.Image.open(args.image).convert("RGB")
 
+    # Cache-dit config
+    cache_config = None
+    if args.cache_backend == "cache_dit":
+        cache_config = {
+            "Fn_compute_blocks": 1,
+            "Bn_compute_blocks": 0,
+            "max_warmup_steps": 4,
+            "max_cached_steps": 20,
+            "residual_diff_threshold": 0.24,
+            "max_continuous_cached_steps": 3,
+            "enable_taylorseer": False,
+            "taylorseer_order": 1,
+            "scm_steps_mask_policy": None,
+            "scm_steps_policy": "dynamic",
+        }
+
     parallel_config = DiffusionParallelConfig(
         tensor_parallel_size=args.tensor_parallel_size,
         cfg_parallel_size=args.cfg_parallel_size,
@@ -183,6 +212,17 @@ def main():
         ring_degree=args.ring_degree,
         ulysses_degree=args.ulysses_degree,
     )
+
+    # Check if profiling is requested via environment variable
+    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+    profiler_config = None
+    if profiler_enabled:
+        from vllm.config import ProfilerConfig
+        profiler_config = ProfilerConfig(
+            profiler="torch",
+            torch_profiler_dir=os.getenv("VLLM_TORCH_PROFILER_DIR"),
+        )
+
     omni = Omni(
         model=args.model,
         model_class_name="WanS2VPipeline",
@@ -194,6 +234,10 @@ def main():
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
+        cache_backend=args.cache_backend,
+        cache_config=cache_config,
+        enable_cache_dit_summary=args.enable_cache_dit_summary,
+        profiler_config=profiler_config,
     )
 
     # Print generation configuration
@@ -214,7 +258,8 @@ def main():
     print(f"{'=' * 60}\n")
 
     # Start profiling if enabled
-    if args.enable_diffusion_pipeline_profiler:
+    if profiler_enabled:
+        print("[Profiler] Starting profiling...")
         omni.start_profile()
 
     generation_start = time.perf_counter()
@@ -245,8 +290,19 @@ def main():
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
 
     # Stop profiling if enabled
-    if args.enable_diffusion_pipeline_profiler:
-        omni.stop_profile()
+    if profiler_enabled:
+        print("\n[Profiler] Stopping profiler and collecting results...")
+        profile_results = omni.stop_profile()
+        if profile_results and isinstance(profile_results, list):
+            print("\n" + "=" * 60)
+            print("PROFILING RESULTS:")
+            for i, result in enumerate(profile_results):
+                print(f"\nStage {i}:")
+                if result:
+                    print(f"  {result}")
+            print("=" * 60)
+        else:
+            print("[Profiler] No valid profiling data returned.")
 
     # Extract output from result
     output = OmniRequestOutput.unwrap_result(result)
