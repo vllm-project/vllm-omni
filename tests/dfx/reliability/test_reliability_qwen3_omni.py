@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import errno
-import http.client
 import json
 import os
 import time
@@ -14,7 +13,6 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import pytest
-import requests
 import torch
 
 from tests.dfx.conftest import (
@@ -25,11 +23,14 @@ from tests.dfx.conftest import (
     wait_chat_request_ready,
 )
 from tests.dfx.reliability.helpers import (
+    extract_openai_error_contract_from_bytes,
     force_remove_container,
+    get_health_raw,
     inject_gpu_oom,
     list_remote_process_pids_by_pattern,
     make_process_kill_fault_injector,
     post_chat_completions_raw,
+    post_json_raw,
     start_runtime_teardown_container_server,
     stop_gpu_oom_hogs,
 )
@@ -198,130 +199,6 @@ def _looks_like_server_unreachable(exc: BaseException) -> bool:
     return "connection refused" in msg or "actively refused" in msg
 
 
-def _get_health_raw(host: str, port: int, *, timeout_sec: int = 20) -> tuple[int, bytes]:
-    """GET /health with stdlib HTTP client; returns (status, body)."""
-    conn = http.client.HTTPConnection(host, port, timeout=timeout_sec)
-    try:
-        conn.request("GET", "/health")
-        resp = conn.getresponse()
-        return resp.status, resp.read()
-    finally:
-        conn.close()
-
-
-def _post_json_raw(
-    host: str,
-    port: int,
-    path: str,
-    payload: dict[str, Any],
-    *,
-    timeout_sec: int = 30,
-) -> tuple[int, bytes]:
-    """POST JSON to one endpoint; returns (status, body)."""
-    return (
-        post_chat_completions_raw(
-            host,
-            port,
-            json.dumps(payload),
-            content_type="application/json",
-            timeout_sec=timeout_sec,
-        )
-        if path == "/v1/chat/completions"
-        else _post_json_raw_http_client(
-            host,
-            port,
-            path,
-            payload,
-            timeout_sec=timeout_sec,
-        )
-    )
-
-
-def _post_json_raw_http_client(
-    host: str,
-    port: int,
-    path: str,
-    payload: dict[str, Any],
-    *,
-    timeout_sec: int = 30,
-) -> tuple[int, bytes]:
-    conn = http.client.HTTPConnection(host, port, timeout=timeout_sec)
-    try:
-        body = json.dumps(payload).encode("utf-8")
-        conn.request("POST", path, body=body, headers={"Content-Type": "application/json"})
-        resp = conn.getresponse()
-        return resp.status, resp.read()
-    finally:
-        conn.close()
-
-
-def _extract_error_contract(response_body: bytes) -> dict[str, Any] | None:
-    """Best-effort parse OpenAI-style error response."""
-    try:
-        payload = json.loads(response_body.decode("utf-8", errors="replace"))
-    except Exception:  # noqa: BLE001
-        return None
-    if not isinstance(payload, dict):
-        return None
-    error_obj = payload.get("error")
-    if not isinstance(error_obj, dict):
-        return None
-    if not isinstance(error_obj.get("message"), str):
-        return None
-    return error_obj
-
-
-def _create_video_job_with_invalid_lora(host: str, port: int, *, timeout_sec: int = 30) -> tuple[int, dict[str, Any]]:
-    """Create one video job expected to fail due to malformed lora payload."""
-    url = f"http://{host}:{port}/v1/videos"
-    response = requests.post(
-        url,
-        data={
-            "prompt": "qwen async failure mapping",
-            "lora": '{"name": "bad-lora"}',
-        },
-        headers={"Accept": "application/json"},
-        timeout=timeout_sec,
-    )
-    payload = response.json() if response.content else {}
-    return response.status_code, payload
-
-
-def _poll_video_job_status(
-    host: str,
-    port: int,
-    video_id: str,
-    *,
-    timeout_sec: int = 180,
-    interval_sec: float = 1.0,
-) -> tuple[int, dict[str, Any]]:
-    """Poll /v1/videos/{id} until completed/failed and return latest status+payload."""
-    url = f"http://{host}:{port}/v1/videos/{video_id}"
-    deadline = time.monotonic() + timeout_sec
-    last_status = 0
-    last_payload: dict[str, Any] = {}
-    while time.monotonic() < deadline:
-        response = requests.get(
-            url,
-            headers={"Accept": "application/json"},
-            timeout=20,
-        )
-        last_status = response.status_code
-        try:
-            payload = response.json()
-        except Exception:  # noqa: BLE001
-            payload = {"raw": response.text}
-        if isinstance(payload, dict):
-            last_payload = payload
-            if payload.get("status") in {"completed", "failed"}:
-                return last_status, payload
-        time.sleep(interval_sec)
-    raise TimeoutError(
-        f"video job {video_id} did not reach terminal status within {timeout_sec}s; "
-        f"last_status={last_status}, last_payload={json.dumps(last_payload)[:500]}"
-    )
-
-
 QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, DEPLOY_CONFIGS_DIR)
 
 
@@ -483,7 +360,7 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
     health_final_body = b""
     while time.monotonic() < deadline:
         try:
-            status, body = _get_health_raw(host, port, timeout_sec=5)
+            status, body = get_health_raw(host, port, timeout_sec=5)
             last_observation = f"http={status}, body={body[:200]!r}"
             health_final_status, health_final_body = status, body
             if status == 503:
@@ -507,7 +384,7 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
     ff_exc: BaseException | None = None
     start = time.monotonic()
     try:
-        ff_status, ff_body = _post_json_raw(host, port, "/v1/chat/completions", payload, timeout_sec=20)
+        ff_status, ff_body = post_json_raw(host, port, "/v1/chat/completions", payload, timeout_sec=20)
         elapsed = time.monotonic() - start
         assert elapsed < 15, f"[process_kill fast_fail] request did not fail fast after fault: {elapsed:.2f}s"
         assert ff_status >= 500, (
@@ -598,7 +475,7 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
     host = omni_server_function.host
     port = omni_server_function.port
     try:
-        chat_status, chat_body = _post_json_raw(
+        chat_status, chat_body = post_json_raw(
             host,
             port,
             "/v1/chat/completions",
@@ -611,7 +488,7 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
             timeout_sec=25,
         )
         # Minimal Qwen3-TTS shape (no ref_*): tests/e2e/online_serving/test_qwen3_tts_customvoice.py
-        speech_status, speech_body = _post_json_raw(
+        speech_status, speech_body = post_json_raw(
             host,
             port,
             "/v1/audio/speech",
@@ -630,8 +507,8 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
 
     # Under OOM pressure both chat and speech should surface runtime-class (5xx)
     # failures instead of request-validation-class (4xx) errors.
-    chat_error = _extract_error_contract(chat_body)
-    speech_error = _extract_error_contract(speech_body)
+    chat_error = extract_openai_error_contract_from_bytes(chat_body)
+    speech_error = extract_openai_error_contract_from_bytes(speech_body)
     print(chat_status, chat_error, speech_status, speech_error)
 
     assert chat_status >= 500, f"expected chat error under OOM, got status={chat_status}"
@@ -690,7 +567,7 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
     try:
         try:
             print(f"[oom-recover] fault-phase request start timeout={mix_chat_timeout_sec}s")
-            fault_status, fault_body = _post_json_raw(
+            fault_status, fault_body = post_json_raw(
                 host,
                 port,
                 "/v1/chat/completions",
@@ -713,7 +590,7 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
                 f"status={fault_status}, body_prefix={fault_body[:500]!r}"
             )
             if fault_status >= 400:
-                err = _extract_error_contract(fault_body)
+                err = extract_openai_error_contract_from_bytes(fault_body)
                 if err is None:
                     assert _fault_keywords_match_response(status=fault_status, body=fault_body), (
                         "non-2xx without OpenAI-style error object should still mention fault hints in body; "
@@ -739,7 +616,7 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
     last_health_exc: BaseException | None = None
     while time.monotonic() < recovery_deadline:
         try:
-            status, _ = _get_health_raw(host, port, timeout_sec=5)
+            status, _ = get_health_raw(host, port, timeout_sec=5)
             unreachable_streak = 0
             if status in (200, 503):
                 terminal_health = status
@@ -779,7 +656,7 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
         assert terminal_health is not None
         if terminal_health == 200:
             print(f"[oom-recover] recovery-phase mix request start timeout={mix_chat_timeout_sec}s")
-            post_mix_status, post_mix_body = _post_json_raw(
+            post_mix_status, post_mix_body = post_json_raw(
                 host,
                 port,
                 "/v1/chat/completions",
@@ -792,7 +669,7 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
             )
         else:
             print("[oom-recover] terminal health=503, send lightweight probe request")
-            request_status, _ = _post_json_raw(host, port, "/v1/chat/completions", probe_payload, timeout_sec=20)
+            request_status, _ = post_json_raw(host, port, "/v1/chat/completions", probe_payload, timeout_sec=20)
             print(f"[oom-recover] lightweight probe done status={request_status}")
     except Exception:
         post_mix_status = None
@@ -805,7 +682,7 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
             "health recovered but repeated mix multimodal request did not return HTTP 200; "
             f"status={post_mix_status}, body_prefix={post_mix_body[:600]!r}"
         )
-        recover_err = _extract_error_contract(post_mix_body)
+        recover_err = extract_openai_error_contract_from_bytes(post_mix_body)
         assert recover_err is None, f"unexpected error object after recovery: {recover_err!r}"
     else:
         assert request_status is None or request_status >= 500, (

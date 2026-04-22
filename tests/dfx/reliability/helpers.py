@@ -28,6 +28,7 @@ from uuid import uuid4
 
 import psutil
 import pytest
+import requests
 
 FaultVariant = str
 logger = logging.getLogger(__name__)
@@ -92,6 +93,136 @@ def post_chat_completions_raw(
         return resp.status, data
     finally:
         conn.close()
+
+
+def get_health_raw(host: str, port: int, *, timeout_sec: int = 20) -> tuple[int, bytes]:
+    """GET /health with stdlib HTTP client; returns (status, body)."""
+    conn = http.client.HTTPConnection(host, port, timeout=timeout_sec)
+    try:
+        conn.request("GET", "/health")
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
+def post_json_raw_http_client(
+    host: str,
+    port: int,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    timeout_sec: int = 30,
+) -> tuple[int, bytes]:
+    """POST JSON to one endpoint with stdlib HTTP client; returns (status, body)."""
+    conn = http.client.HTTPConnection(host, port, timeout=timeout_sec)
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        conn.request("POST", path, body=body, headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
+def post_json_raw(
+    host: str,
+    port: int,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    timeout_sec: int = 30,
+) -> tuple[int, bytes]:
+    """POST JSON to one endpoint; returns (status, body)."""
+    return (
+        post_chat_completions_raw(
+            host,
+            port,
+            json.dumps(payload),
+            content_type="application/json",
+            timeout_sec=timeout_sec,
+        )
+        if path == "/v1/chat/completions"
+        else post_json_raw_http_client(
+            host,
+            port,
+            path,
+            payload,
+            timeout_sec=timeout_sec,
+        )
+    )
+
+
+def extract_openai_error_contract_from_bytes(response_body: bytes) -> dict[str, Any] | None:
+    """Best-effort parse OpenAI-style error object from raw response bytes."""
+    try:
+        payload = json.loads(response_body.decode("utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001
+        return None
+    return extract_openai_error_contract_from_payload(payload)
+
+
+def extract_openai_error_contract_from_payload(payload: Any) -> dict[str, Any] | None:
+    """Best-effort parse OpenAI-style error object from decoded JSON payload."""
+    if not isinstance(payload, dict):
+        return None
+    error_obj = payload.get("error")
+    if not isinstance(error_obj, dict):
+        return None
+    if not isinstance(error_obj.get("message"), str):
+        return None
+    return error_obj
+
+
+def create_video_job_with_invalid_lora(host: str, port: int, *, timeout_sec: int = 30) -> tuple[int, dict[str, Any]]:
+    """Create one video job expected to fail due to malformed lora payload."""
+    url = f"http://{host}:{port}/v1/videos"
+    response = requests.post(
+        url,
+        data={
+            "prompt": "qwen async failure mapping",
+            "lora": '{"name": "bad-lora"}',
+        },
+        headers={"Accept": "application/json"},
+        timeout=timeout_sec,
+    )
+    payload = response.json() if response.content else {}
+    return response.status_code, payload
+
+
+def poll_video_job_status(
+    host: str,
+    port: int,
+    video_id: str,
+    *,
+    timeout_sec: int = 180,
+    interval_sec: float = 1.0,
+) -> tuple[int, dict[str, Any]]:
+    """Poll /v1/videos/{id} until completed/failed and return latest status+payload."""
+    url = f"http://{host}:{port}/v1/videos/{video_id}"
+    deadline = time.monotonic() + timeout_sec
+    last_status = 0
+    last_payload: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        response = requests.get(
+            url,
+            headers={"Accept": "application/json"},
+            timeout=20,
+        )
+        last_status = response.status_code
+        try:
+            payload = response.json()
+        except Exception:  # noqa: BLE001
+            payload = {"raw": response.text}
+        if isinstance(payload, dict):
+            last_payload = payload
+            if payload.get("status") in {"completed", "failed"}:
+                return last_status, payload
+        time.sleep(interval_sec)
+    raise TimeoutError(
+        f"video job {video_id} did not reach terminal status within {timeout_sec}s; "
+        f"last_status={last_status}, last_payload={json.dumps(last_payload)[:500]}"
+    )
 
 
 def inject_abnormal_input_faults(
