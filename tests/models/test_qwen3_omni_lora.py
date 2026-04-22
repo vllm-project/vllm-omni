@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import pytest
-from vllm.model_executor.models.interfaces import SupportsLoRA
+from vllm.model_executor.models.interfaces import supports_lora
 
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerForConditionalGeneration,
@@ -19,9 +19,7 @@ class TestQwen3OmniThinkerLoRADeclaration:
 
     def test_supports_lora_interface(self):
         """Thinker class must be recognized as SupportsLoRA."""
-        assert issubclass(
-            Qwen3OmniMoeThinkerForConditionalGeneration, SupportsLoRA
-        )
+        assert supports_lora(Qwen3OmniMoeThinkerForConditionalGeneration)
 
     def test_packed_modules_mapping_has_qkv(self):
         """Language model's fused QKV must be declared."""
