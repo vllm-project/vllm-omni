@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any
 
 import torch
+from PIL import Image
 from pydantic import model_validator
 from typing_extensions import Self
 from vllm.config.utils import config
@@ -17,6 +18,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
 
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.quantization import build_quant_config
 
@@ -351,6 +353,8 @@ class DiffusionCacheConfig:
 @dataclass
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
+    stage_id: int = 0
+
     model: str | None = None
 
     model_class_name: str | None = None
@@ -480,8 +484,10 @@ class OmniDiffusionConfig:
     # Scheduler flow_shift for Wan2.2 (12.0 for 480p, 5.0 for 720p)
     flow_shift: float | None = None
 
-    # support multi images input
+    # Support multi-image inputs and expose any model-specific request limit
+    # through a generic config field so serving code stays model-agnostic.
     supports_multimodal_inputs: bool = False
+    max_multimodal_image_inputs: int | None = None
 
     log_level: str = "info"
 
@@ -504,6 +510,8 @@ class OmniDiffusionConfig:
     # Step mode settings
     step_execution: bool = False
 
+    # sleep mode
+    enable_sleep_mode: bool = False
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
 
@@ -663,7 +671,54 @@ class OmniDiffusionConfig:
             )
 
     def update_multimodal_support(self) -> None:
-        self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
+        # Resolve serving-visible multimodal behavior from shared metadata
+        # instead of importing concrete pipeline modules into the config layer.
+        metadata = get_diffusion_model_metadata(self.model_class_name)
+        self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
+        self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
+
+    def enrich_config(self) -> None:
+        """Load model metadata from HuggingFace and populate config fields.
+
+        Diffusers-style models expose ``model_index.json`` with ``_class_name``.
+        Non-diffusers models (e.g. Bagel, NextStep) only have ``config.json``,
+        so we fall back to reading that and mapping model_type manually.
+        """
+        from vllm.transformers_utils.config import get_hf_file_to_dict
+
+        try:
+            config_dict = get_hf_file_to_dict("model_index.json", self.model)
+            if config_dict is not None:
+                if self.model_class_name is None:
+                    self.model_class_name = config_dict.get("_class_name", None)
+                self.update_multimodal_support()
+
+                tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model)
+                self.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+            else:
+                raise FileNotFoundError("model_index.json not found")
+        except (AttributeError, OSError, ValueError, FileNotFoundError):
+            cfg = get_hf_file_to_dict("config.json", self.model)
+            if cfg is None:
+                raise ValueError(f"Could not find config.json or model_index.json for model {self.model}")
+
+            self.tf_model_config = TransformerConfig.from_dict(cfg)
+            model_type = cfg.get("model_type")
+            architectures = cfg.get("architectures") or []
+
+            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                self.model_class_name = "BagelPipeline"
+                self.tf_model_config = TransformerConfig()
+                self.update_multimodal_support()
+            elif model_type == "nextstep":
+                if self.model_class_name is None:
+                    self.model_class_name = "NextStep11Pipeline"
+                self.tf_model_config = TransformerConfig()
+                self.update_multimodal_support()
+            elif architectures and len(architectures) == 1:
+                self.model_class_name = architectures[0]
+            else:
+                raise
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
@@ -701,10 +756,12 @@ class DiffusionOutput:
     Final output (after pipeline completion)
     """
 
-    output: torch.Tensor | None = None
-    trajectory_timesteps: list[torch.Tensor] | None = None
-    trajectory_latents: torch.Tensor | None = None
-    trajectory_decoded: list[torch.Tensor] | None = None
+    # Fields may be replaced with SHM handle dicts by ipc.pack_diffusion_output_shm
+    output: torch.Tensor | dict | None = None
+    trajectory_timesteps: torch.Tensor | dict | None = None
+    trajectory_latents: torch.Tensor | dict | None = None
+    trajectory_log_probs: torch.Tensor | dict | None = None
+    trajectory_decoded: list[Image.Image] | None = None
     error: str | None = None
     aborted: bool = False
     abort_message: str | None = None
@@ -742,6 +799,44 @@ class AttentionBackendEnum(enum.Enum):
 
     def __str__(self):
         return self.name.lower()
+
+
+@dataclass
+class OmniACK:
+    """
+    Handshake payload from Workers to Orchestrator.
+    """
+
+    task_id: str
+    status: str
+    stage_id: int | None = None
+    rank: int | None = None
+    freed_bytes: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
+    """
+    Additional telemetry such as:
+    - max_contiguous_block: for fragmentation analysis.
+    - cuda_graph_recalled: boolean if graphs were successfully destroyed/rebuilt.
+    - latency_ms: time taken for the D2H/H2D transfer.
+    """
+    error_msg: str | None = None
+
+
+@dataclass
+class OmniSleepTask:
+    """Structured sleep instruction."""
+
+    task_id: str
+    level: int = 2
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class OmniWakeTask:
+    """Structured wake-up instruction."""
+
+    task_id: str
+    tags: list[str] | None = None
 
 
 # Special message broadcast via scheduler queues to signal worker shutdown.

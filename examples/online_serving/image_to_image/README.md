@@ -314,6 +314,7 @@ count, use `size` and `n` rather than `height`, `width`, or
 | `seed`                   | int   | None    | Random seed (reproducible)            |
 | `negative_prompt`        | str   | None    | Negative prompt                       |
 | `num_outputs_per_prompt` | int   | 1       | Number of images to generate          |
+| `strength`               | float | 0.6     | **Z-Image only** - Denoising start timestep for I2I. Range: [0.0, 1.0]. Lower preserves more of original image. |
 | `layers`                 | int   | 4       | Number of layers (Qwen-Image-Layered) |
 | `resolution`             | int   | 640     | Resolution, 640 or 1024 (Qwen-Image-Layered) |
 

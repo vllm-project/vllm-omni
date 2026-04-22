@@ -1,8 +1,8 @@
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI, WebSocket
+from pytest_mock import MockerFixture
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -13,19 +13,26 @@ from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpee
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _build_test_app(speech_service=None, *, idle_timeout=30.0, config_timeout=10.0):
+def _build_test_app(
+    speech_service=None,
+    *,
+    idle_timeout=30.0,
+    config_timeout=10.0,
+    mocker: MockerFixture | None = None,
+):
     if speech_service is None:
-        speech_service = MagicMock(spec=OmniOpenAIServingSpeech)
-        speech_service._generate_audio_bytes = AsyncMock(return_value=(b"RIFF" + b"\x00" * 32, "audio/wav"))
-        speech_service._prepare_speech_generation = AsyncMock(return_value=("req-1", object(), {}))
+        assert mocker is not None
+        speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
+        speech_service._generate_audio_bytes = mocker.AsyncMock(return_value=(b"RIFF" + b"\x00" * 32, "audio/wav"))
+        speech_service._prepare_speech_generation = mocker.AsyncMock(return_value=("req-1", object(), {}))
 
         async def mock_generate_pcm_chunks(_generator, _request_id):
             for chunk in (b"\x01\x02", b"\x03\x04\x05"):
                 yield chunk
 
         speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
-        speech_service.engine_client = MagicMock()
-        speech_service.engine_client.abort = AsyncMock()
+        speech_service.engine_client = mocker.MagicMock()
+        speech_service.engine_client.abort = mocker.AsyncMock()
 
     handler = OmniStreamingSpeechHandler(
         speech_service=speech_service,
@@ -42,8 +49,8 @@ def _build_test_app(speech_service=None, *, idle_timeout=30.0, config_timeout=10
 
 
 class TestStreamingSpeechWebSocket:
-    def test_non_streaming_single_frame(self):
-        app, speech_service = _build_test_app()
+    def test_non_streaming_single_frame(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
@@ -68,13 +75,13 @@ class TestStreamingSpeechWebSocket:
 
         assert speech_service._generate_audio_bytes.await_count == 1
 
-    def test_streaming_multiple_binary_frames(self):
+    def test_streaming_multiple_binary_frames(self, mocker: MockerFixture):
         captured_requests = []
 
-        speech_service = MagicMock(spec=OmniOpenAIServingSpeech)
-        speech_service._generate_audio_bytes = AsyncMock(return_value=(b"", "audio/wav"))
-        speech_service.engine_client = MagicMock()
-        speech_service.engine_client.abort = AsyncMock()
+        speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
+        speech_service._generate_audio_bytes = mocker.AsyncMock(return_value=(b"", "audio/wav"))
+        speech_service.engine_client = mocker.MagicMock()
+        speech_service.engine_client.abort = mocker.AsyncMock()
 
         async def mock_prepare_speech_generation(request):
             captured_requests.append(request)
@@ -123,8 +130,8 @@ class TestStreamingSpeechWebSocket:
         assert captured_requests[0].initial_codec_chunk_frames == 12
         assert speech_service._generate_audio_bytes.await_count == 0
 
-    def test_flush_on_input_done(self):
-        app, _ = _build_test_app()
+    def test_flush_on_input_done(self, mocker: MockerFixture):
+        app, _ = _build_test_app(mocker=mocker)
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
@@ -142,8 +149,8 @@ class TestStreamingSpeechWebSocket:
                 }
                 assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
 
-    def test_invalid_streaming_config(self):
-        app, _ = _build_test_app()
+    def test_invalid_streaming_config(self, mocker: MockerFixture):
+        app, _ = _build_test_app(mocker=mocker)
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
@@ -159,8 +166,8 @@ class TestStreamingSpeechWebSocket:
                 assert error["type"] == "error"
                 assert "response_format='pcm'" in error["message"]
 
-    def test_empty_input_text_emits_no_audio(self):
-        app, speech_service = _build_test_app()
+    def test_empty_input_text_emits_no_audio(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
@@ -172,8 +179,8 @@ class TestStreamingSpeechWebSocket:
 
         assert speech_service._generate_audio_bytes.await_count == 0
 
-    def test_multiple_sentences_increment_indices(self):
-        app, _ = _build_test_app()
+    def test_multiple_sentences_increment_indices(self, mocker: MockerFixture):
+        app, _ = _build_test_app(mocker=mocker)
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
@@ -203,8 +210,8 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json({"type": "input.done"})
                 assert ws.receive_json() == {"type": "session.done", "total_sentences": 2}
 
-    def test_unknown_message_type_keeps_session_open(self):
-        app, _ = _build_test_app()
+    def test_unknown_message_type_keeps_session_open(self, mocker: MockerFixture):
+        app, _ = _build_test_app(mocker=mocker)
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
@@ -227,21 +234,21 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json({"type": "input.done"})
                 assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
 
-    def test_config_timeout_closes_session(self):
-        app, _ = _build_test_app(config_timeout=0.01)
+    def test_config_timeout_closes_session(self, mocker: MockerFixture):
+        app, _ = _build_test_app(config_timeout=0.01, mocker=mocker)
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
                 error = ws.receive_json()
                 assert error == {"type": "error", "message": "Timeout waiting for session.config"}
 
-    def test_generation_error_marks_audio_done(self):
-        speech_service = MagicMock(spec=OmniOpenAIServingSpeech)
-        speech_service._generate_audio_bytes = AsyncMock(side_effect=RuntimeError("boom"))
-        speech_service._prepare_speech_generation = AsyncMock(return_value=("req-err", object(), {}))
-        speech_service._generate_pcm_chunks = AsyncMock()
-        speech_service.engine_client = MagicMock()
-        speech_service.engine_client.abort = AsyncMock()
+    def test_generation_error_marks_audio_done(self, mocker: MockerFixture):
+        speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
+        speech_service._generate_audio_bytes = mocker.AsyncMock(side_effect=RuntimeError("boom"))
+        speech_service._prepare_speech_generation = mocker.AsyncMock(return_value=("req-err", object(), {}))
+        speech_service._generate_pcm_chunks = mocker.AsyncMock()
+        speech_service.engine_client = mocker.MagicMock()
+        speech_service.engine_client.abort = mocker.AsyncMock()
         app, _ = _build_test_app(speech_service)
 
         with TestClient(app) as client:
@@ -256,12 +263,12 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json({"type": "input.done"})
                 assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
 
-    def test_streaming_generation_error_marks_audio_done(self):
-        speech_service = MagicMock(spec=OmniOpenAIServingSpeech)
-        speech_service._generate_audio_bytes = AsyncMock(return_value=(b"", "audio/wav"))
-        speech_service._prepare_speech_generation = AsyncMock(return_value=("req-stream-err", object(), {}))
-        speech_service.engine_client = MagicMock()
-        speech_service.engine_client.abort = AsyncMock()
+    def test_streaming_generation_error_marks_audio_done(self, mocker: MockerFixture):
+        speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
+        speech_service._generate_audio_bytes = mocker.AsyncMock(return_value=(b"", "audio/wav"))
+        speech_service._prepare_speech_generation = mocker.AsyncMock(return_value=("req-stream-err", object(), {}))
+        speech_service.engine_client = mocker.MagicMock()
+        speech_service.engine_client.abort = mocker.AsyncMock()
 
         async def mock_generate_pcm_chunks(_generator, _request_id):
             yield b"\x01\x02"
@@ -298,8 +305,8 @@ class TestStreamingSpeechWebSocket:
                 ws.send_json({"type": "input.done"})
                 assert ws.receive_json() == {"type": "session.done", "total_sentences": 1}
 
-    def test_invalid_input_text_type_returns_validation_error(self):
-        app, speech_service = _build_test_app()
+    def test_invalid_input_text_type_returns_validation_error(self, mocker: MockerFixture):
+        app, speech_service = _build_test_app(mocker=mocker)
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
@@ -316,9 +323,9 @@ class TestStreamingSpeechWebSocket:
 
         assert speech_service._generate_audio_bytes.await_count == 0
 
-    def test_input_text_message_too_large(self, monkeypatch):
+    def test_input_text_message_too_large(self, monkeypatch, mocker: MockerFixture):
         monkeypatch.setattr(streaming_speech_module, "_MAX_INPUT_TEXT_MESSAGE_SIZE", 32)
-        app, speech_service = _build_test_app()
+        app, speech_service = _build_test_app(mocker=mocker)
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
@@ -335,9 +342,9 @@ class TestStreamingSpeechWebSocket:
 
         assert speech_service._generate_audio_bytes.await_count == 0
 
-    def test_session_config_message_too_large(self, monkeypatch):
+    def test_session_config_message_too_large(self, monkeypatch, mocker: MockerFixture):
         monkeypatch.setattr(streaming_speech_module, "_MAX_CONFIG_MESSAGE_SIZE", 64)
-        app, _ = _build_test_app()
+        app, _ = _build_test_app(mocker=mocker)
 
         with TestClient(app) as client:
             with client.websocket_connect("/v1/audio/speech/stream") as ws:
@@ -348,12 +355,12 @@ class TestStreamingSpeechWebSocket:
                     "message": "session.config message too large",
                 }
 
-    def test_disconnect_aborts_streaming_request(self):
-        speech_service = MagicMock(spec=OmniOpenAIServingSpeech)
-        speech_service._generate_audio_bytes = AsyncMock(return_value=(b"", "audio/wav"))
-        speech_service._prepare_speech_generation = AsyncMock(return_value=("req-abort", object(), {}))
-        speech_service.engine_client = MagicMock()
-        speech_service.engine_client.abort = AsyncMock()
+    def test_disconnect_aborts_streaming_request(self, mocker: MockerFixture):
+        speech_service = mocker.MagicMock(spec=OmniOpenAIServingSpeech)
+        speech_service._generate_audio_bytes = mocker.AsyncMock(return_value=(b"", "audio/wav"))
+        speech_service._prepare_speech_generation = mocker.AsyncMock(return_value=("req-abort", object(), {}))
+        speech_service.engine_client = mocker.MagicMock()
+        speech_service.engine_client.abort = mocker.AsyncMock()
 
         async def mock_generate_pcm_chunks(_generator, _request_id):
             yield b"\x01\x02"
@@ -361,11 +368,11 @@ class TestStreamingSpeechWebSocket:
         speech_service._generate_pcm_chunks = mock_generate_pcm_chunks
         handler = OmniStreamingSpeechHandler(speech_service=speech_service)
 
-        websocket = MagicMock()
-        websocket.send_json = AsyncMock(side_effect=[None, WebSocketDisconnect()])
-        websocket.send_bytes = AsyncMock(side_effect=WebSocketDisconnect())
+        websocket = mocker.MagicMock()
+        websocket.send_json = mocker.AsyncMock(side_effect=[None, WebSocketDisconnect()])
+        websocket.send_bytes = mocker.AsyncMock(side_effect=WebSocketDisconnect())
 
-        config = MagicMock()
+        config = mocker.MagicMock()
         config.model = None
         config.voice = "Vivian"
         config.task_type = None
@@ -385,3 +392,18 @@ class TestStreamingSpeechWebSocket:
 
         speech_service.engine_client.abort.assert_awaited_once_with("req-abort")
         assert websocket.send_json.await_count == 2
+
+
+class TestGeneratePcmChunksContract:
+    """Guard: _generate_pcm_chunks must exist on OmniOpenAIServingSpeech.
+
+    The WebSocket handler calls speech_service._generate_pcm_chunks()
+    at runtime. If the method is removed, all WS TTS streaming breaks
+    with an AttributeError. This test catches that at CI time.
+    """
+
+    def test_generate_pcm_chunks_defined(self):
+        assert hasattr(OmniOpenAIServingSpeech, "_generate_pcm_chunks")
+        assert asyncio.iscoroutinefunction(OmniOpenAIServingSpeech._generate_pcm_chunks) or callable(
+            OmniOpenAIServingSpeech._generate_pcm_chunks
+        )

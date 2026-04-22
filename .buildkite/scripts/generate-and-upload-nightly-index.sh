@@ -19,7 +19,7 @@ has_new_python=$($PYTHON -c "print(1 if __import__('sys').version_info >= (3,12)
 if [[ "$has_new_python" -eq 0 ]]; then
     # use new python from docker
     docker pull python:3-slim
-    PYTHON="docker run --rm -v $(pwd):/app -w /app python:3-slim python3"
+    PYTHON="docker run --rm --user $(id -u):$(id -g) -v $(pwd):/app -w /app python:3-slim python3"
 fi
 
 echo "Using python interpreter: $PYTHON"
@@ -36,7 +36,7 @@ mkdir -p "$INDICES_OUTPUT_DIR"
 
 # HACK: we do not need regex module here, but it is required by pre-commit hook
 # To avoid any external dependency, we simply replace it back to the stdlib re module
-sed -i 's/import regex as re/import re/g' .buildkite/scripts/generate-nightly-index.py
+sed -i.bak 's/import regex as re/import re/g' .buildkite/scripts/generate-nightly-index.py && rm -f .buildkite/scripts/generate-nightly-index.py.bak
 
 # Generate indices -- the version is just the commit hash (not omni/{commit})
 # because relative paths are computed between the index and wheel directories,
@@ -73,15 +73,16 @@ echo "Pure version (without variant): $pure_version"
 
 # re-generate and copy to /omni/{version}/ only if it does not have "dev" in the version
 if [[ "$version" != *"dev"* ]]; then
-    echo "Re-generating indices for /omni/$pure_version/"
+    s3_version="v$pure_version"
+    echo "Re-generating indices for /omni/$s3_version/"
     rm -rf "${INDICES_OUTPUT_DIR:?}"
     mkdir -p "$INDICES_OUTPUT_DIR"
     # wheel-dir is overridden to be the commit directory, so that the indices point to the correct wheel path
     $PYTHON .buildkite/scripts/generate-nightly-index.py \
-        --version "$pure_version" \
+        --version "$s3_version" \
         --wheel-dir "$BUILDKITE_COMMIT" \
         --current-objects "$obj_json" \
         --output-dir "$INDICES_OUTPUT_DIR" \
         --comment "version $pure_version"
-    aws s3 cp --recursive "$INDICES_OUTPUT_DIR/" "s3://$BUCKET/omni/$pure_version/"
+    aws s3 cp --recursive "$INDICES_OUTPUT_DIR/" "s3://$BUCKET/omni/$s3_version/"
 fi

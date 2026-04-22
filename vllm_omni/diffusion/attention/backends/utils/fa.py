@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Adapted from https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_flash_attention_utils.py
+from functools import lru_cache
+
 import torch
 import torch.nn.functional as F
 
@@ -32,12 +34,16 @@ if current_omni_platform.is_rocm():
         pass
 elif current_omni_platform.is_xpu():
     try:
-        from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func  # noqa: F401
+        from vllm._xpu_ops import xpu_ops  # noqa: F401
+
+        flash_attn_varlen_func = xpu_ops.flash_attn_varlen_func
     except (ImportError, ModuleNotFoundError):
         pass
 elif current_omni_platform.is_musa():
-    # XXX (MUSA): Add MUSA-specific Flash Attention when available
-    pass
+    try:
+        from mate import flash_attn_varlen_func  # noqa: F401
+    except (ImportError, ModuleNotFoundError):
+        pass
 else:
     # CUDA: try FA3 -> FA2 fallback chain
     # Try FA3 from fa3-fwd PyPI package
@@ -72,6 +78,12 @@ else:
 # If no FA backend available, SDPA backend will be selected at the platform level
 # flash_attn_func and flash_attn_varlen_func will be None
 HAS_FLASH_ATTN = flash_attn_func is not None or flash_attn_varlen_func is not None
+
+
+@lru_cache(maxsize=1)
+def is_mate_available() -> bool:
+    """Check if MATE (MUSA Flash Attention) is available."""
+    return current_omni_platform.is_musa() and flash_attn_varlen_func is not None
 
 
 def _index_first_axis(tensor, indices):

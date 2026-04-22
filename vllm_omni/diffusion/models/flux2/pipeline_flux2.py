@@ -25,10 +25,14 @@ from transformers import AutoProcessor, Mistral3ForConditionalGeneration, Pixtra
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux2 import Flux2Transformer2DModel
 from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -331,7 +335,7 @@ def retrieve_latents(encoder_output: torch.Tensor, generator: torch.Generator = 
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class Flux2Pipeline(nn.Module, SupportImageInput):
+class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin):
     """Flux2 pipeline for text-to-image generation."""
 
     _callback_tensor_inputs = ["latents", "prompt_embeds"]
@@ -389,6 +393,10 @@ class Flux2Pipeline(nn.Module, SupportImageInput):
         self._guidance_scale = None
         self._attention_kwargs = None
         self._num_timesteps = None
+
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
         self._current_timestep = None
         self._interrupt = False
 
@@ -848,6 +856,21 @@ class Flux2Pipeline(nn.Module, SupportImageInput):
     def interrupt(self):
         return self._interrupt
 
+    def check_cfg_parallel_validity(self, true_cfg_scale: float, has_neg_prompt: bool):
+        if get_classifier_free_guidance_world_size() == 1:
+            return True
+
+        if true_cfg_scale <= 1:
+            logger.warning("CFG parallel is NOT working correctly when true_cfg_scale <= 1.")
+            return False
+
+        if not has_neg_prompt:
+            logger.warning(
+                "CFG parallel is NOT working correctly when there is no negative prompt or negative prompt embeddings."
+            )
+            return False
+        return True
+
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -915,6 +938,14 @@ class Flux2Pipeline(nn.Module, SupportImageInput):
             # And `torch.stack` automatically raises an exception for us
             prompt_embeds = torch.stack(req_prompt_embeds)  # type: ignore # intentionally expect TypeError
 
+        req_negative_prompt_embeds = [
+            p.get("negative_prompt_embeds") if not isinstance(p, str) else None for p in req.prompts
+        ]
+        if all(p is not None for p in req_negative_prompt_embeds):
+            negative_prompt_embeds = torch.stack(req_negative_prompt_embeds)  # type: ignore # intentionally expect TypeError
+
+        req_negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
+
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
             prompt=prompt,
@@ -951,6 +982,22 @@ class Flux2Pipeline(nn.Module, SupportImageInput):
             max_sequence_length=max_sequence_length,
             text_encoder_out_layers=text_encoder_out_layers,
         )
+
+        has_neg_prompt = negative_prompt_embeds is not None or any(req_negative_prompt)
+        do_true_cfg = self.guidance_scale > 1 and has_neg_prompt
+
+        self.check_cfg_parallel_validity(self.guidance_scale, has_neg_prompt)
+        negative_text_ids = None
+        if do_true_cfg:
+            negative_prompt = req_negative_prompt
+            negative_prompt_embeds, negative_text_ids = self.encode_prompt(
+                prompt=negative_prompt,
+                prompt_embeds=negative_prompt_embeds,
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                text_encoder_out_layers=text_encoder_out_layers,
+            )
 
         # 4. process images
         if image is not None and not isinstance(image, list):
@@ -1023,52 +1070,74 @@ class Flux2Pipeline(nn.Module, SupportImageInput):
             guidance_tensor = torch.full([1], self.guidance_scale, device=device, dtype=torch.float32)
             guidance_tensor = guidance_tensor.expand(latents.shape[0])
 
+        # For editing pipelines, we need to slice the output to remove condition latents
+        output_slice = latents.size(1) if image_latents is not None else None
+
         # 7. Denoising loop
         # We set the index here to remove DtoH sync, helpful especially during compilation.
         # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
         self.scheduler.set_begin_index(0)
-        for i, t in enumerate(timesteps):
-            if self.interrupt:
-                continue
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
 
-            self._current_timestep = t
-            timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                self._current_timestep = t
+                timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
-            latent_model_input = latents.to(self.transformer.dtype)
-            latent_image_ids = latent_ids
+                latent_model_input = latents.to(self.transformer.dtype)
+                latent_image_ids = latent_ids
 
-            if image_latents is not None:
-                latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
-                latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
+                if image_latents is not None:
+                    latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
+                    latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
-            noise_pred = self.transformer(
-                hidden_states=latent_model_input,  # (B, image_seq_len, C)
-                timestep=timestep / 1000,
-                guidance=guidance_tensor,
-                encoder_hidden_states=prompt_embeds,
-                txt_ids=text_ids,  # B, text_seq_len, 4
-                img_ids=latent_image_ids,  # B, image_seq_len, 4
-                joint_attention_kwargs=self.attention_kwargs,
-                return_dict=False,
-            )[0]
+                positive_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep / 1000,
+                    "guidance": guidance_tensor,
+                    "encoder_hidden_states": prompt_embeds,
+                    "txt_ids": text_ids,
+                    "img_ids": latent_image_ids,
+                    "joint_attention_kwargs": self.attention_kwargs,
+                    "return_dict": False,
+                }
+                if do_true_cfg:
+                    negative_kwargs = {
+                        "hidden_states": latent_model_input,
+                        "timestep": timestep / 1000,
+                        "guidance": guidance_tensor,
+                        "encoder_hidden_states": negative_prompt_embeds,
+                        "txt_ids": negative_text_ids,
+                        "img_ids": latent_image_ids,
+                        "joint_attention_kwargs": self.attention_kwargs,
+                        "return_dict": False,
+                    }
+                else:
+                    negative_kwargs = None
 
-            noise_pred = noise_pred[:, : latents.size(1) :]
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=do_true_cfg,
+                    true_cfg_scale=self.guidance_scale,
+                    positive_kwargs=positive_kwargs,
+                    negative_kwargs=negative_kwargs,
+                    cfg_normalize=False,
+                    output_slice=output_slice,
+                )
 
-            # compute the previous noisy sample x_t -> x_t-1
-            latents_dtype = latents.dtype
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
+                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
-            if latents.dtype != latents_dtype and torch.backends.mps.is_available():
-                latents = latents.to(latents_dtype)
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
-            if callback_on_step_end is not None:
-                callback_kwargs = {}
-                for k in callback_on_step_end_tensor_inputs:
-                    callback_kwargs[k] = locals()[k]
-                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
-                latents = callback_outputs.pop("latents", latents)
-                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                pbar.update()
 
         self._current_timestep = None
 

@@ -71,7 +71,7 @@ def run_tts_generation(args) -> None:
     payload = {
         "model": args.model,
         "input": args.text,
-        "speaker": args.speaker,
+        "voice": args.speaker,
         "response_format": args.response_format,
     }
 

@@ -12,12 +12,11 @@ import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
-from pathlib import Path
-
 import pytest
 
-from tests.conftest import OmniServerParams
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServerParams
+from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 
@@ -27,8 +26,8 @@ REF_TEXT = "希望你以后能够做的比我还好呦。"
 
 
 def get_stage_config(name: str = "cosyvoice3.yaml"):
-    """Get the stage config path from vllm_omni model_executor stage_configs."""
-    return str(Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / name)
+    """Get the deploy config path for CosyVoice3."""
+    return get_deploy_config_path(name)
 
 
 def get_prompt(prompt_type="zh"):
@@ -44,14 +43,24 @@ tts_server_params = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=get_stage_config(),
-            server_args=["--trust-remote-code", "--disable-log-stats"],
+            server_args=["--trust-remote-code", "--disable-log-stats", "--no-async-chunk"],
         ),
         id="cosyvoice3",
     )
 ]
 
+tts_async_chunk_server_params = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_stage_config(),
+            server_args=["--trust-remote-code", "--disable-log-stats"],
+        ),
+        id="cosyvoice3_async_chunk",
+    )
+]
 
-@pytest.mark.advanced_model
+
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
@@ -76,16 +85,16 @@ def test_voice_clone_zh_001(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
+@pytest.mark.parametrize("omni_server", tts_async_chunk_server_params, indirect=True)
 def test_voice_clone_zh_002(omni_server, openai_client) -> None:
     """
-    Test voice cloning TTS with Chinese text via OpenAI API.
-    Deploy Setting: default yaml
+    Test voice cloning TTS with Chinese text via async_chunk streaming.
+    Deploy Setting: cosyvoice3.yaml with default ``async_chunk: true``
     Input Modal: text + ref_audio + ref_text
-    Output Modal: audio
+    Output Modal: audio (streamed)
     Input Setting: stream=True
     Datasets: single request
     """
@@ -100,7 +109,7 @@ def test_voice_clone_zh_002(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)

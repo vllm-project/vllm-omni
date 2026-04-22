@@ -69,6 +69,20 @@ def test_default_stage_config_propagates_ulysses_mode():
     assert parallel_config.ulysses_mode == "advanced_uaa"
 
 
+def test_default_stage_config_includes_default_sampling_params():
+    """Ensure default sampling params survive the default diffusion-stage builder."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "default_sampling_params": '{"0": {"generator_device":"cpu", "guidance_scale":7.5}}',
+        }
+    )[0]
+
+    assert stage_cfg["default_sampling_params"] == {
+        "generator_device": "cpu",
+        "guidance_scale": 7.5,
+    }
+
+
 def test_serve_cli_accepts_ulysses_mode():
     """Ensure diffusion serve CLI exposes ulysses_mode and wires it to parallel_config."""
     parser = FlexibleArgumentParser()
@@ -93,3 +107,24 @@ def test_serve_cli_accepts_ulysses_mode():
     assert args.ulysses_mode == "advanced_uaa"
     assert parallel_config.ulysses_degree == 4
     assert parallel_config.ulysses_mode == "advanced_uaa"
+
+
+def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
+    """Ensure diffusion serve CLI exposes the profiler switch."""
+    parser = FlexibleArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            "--omni",
+            "--enable-diffusion-pipeline-profiler",
+        ]
+    )
+
+    stage_cfg = _create_default_diffusion_stage_cfg(args)[0]
+
+    assert args.enable_diffusion_pipeline_profiler is True
+    assert stage_cfg["engine_args"]["enable_diffusion_pipeline_profiler"] is True

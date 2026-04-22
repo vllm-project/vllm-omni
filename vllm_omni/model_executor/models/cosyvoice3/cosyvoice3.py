@@ -2,18 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from functools import partial
+from threading import Lock
 
-import numpy as np
 import torch
 import torch.nn as nn
 from transformers.feature_extraction_utils import BatchFeature
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
+from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import MultiModalDataDict, MultiModalFieldConfig, MultiModalKwargsItems
+from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
@@ -25,6 +28,9 @@ from vllm.multimodal.processing import (
     PromptUpdate,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
 from vllm_omni.model_executor.models.cosyvoice3.utils import (
@@ -266,6 +272,8 @@ class CosyVoice3Model(
     supports_multimodal_raw_input_only = True
     supports_multimodal = True
     requires_raw_input_tokens = True
+    prefer_model_sampler = True
+    _sampling_eps = 1e-5
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -304,6 +312,8 @@ class CosyVoice3Model(
             self.code2wav = CosyVoice3Code2Wav(self.config)
             self.model = self.code2wav.flow_model
             self.hift = self.code2wav.hift
+            # Keep additional information synchronized for async_chunk updates.
+            self.enable_update_additional_information = True
 
             # Expose streaming parameters
             self.token_overlap_len = self.code2wav.token_overlap_len
@@ -312,6 +322,9 @@ class CosyVoice3Model(
             self.mel_cache_len = self.code2wav.mel_cache_len
             self.source_cache_len = self.code2wav.source_cache_len
             self.speech_window = self.code2wav.speech_window
+            self._stream_audio_cache_by_req: dict[str, torch.Tensor] = {}
+            self._stream_audio_cache_lock = Lock()
+            self._stream_vocoder_cache_by_req: dict[str, dict[str, torch.Tensor]] = {}
         else:
             raise ValueError(f"Model stage not supported {self.model_stage}")
 
@@ -330,19 +343,277 @@ class CosyVoice3Model(
         # Use parent's cache config - critical for PagedAttention to work correctly
         return parent_config.with_hf_config(qwen_hf_config, architectures=["Qwen2Model"])
 
+    @staticmethod
+    def _as_tensor(value: object) -> torch.Tensor | None:
+        """Extract tensor payload from runtime info fields."""
+        if isinstance(value, list):
+            if not value:
+                return None
+            value = value[0]
+        if isinstance(value, torch.Tensor):
+            return value
+        return None
+
+    @staticmethod
+    def _as_str(value: object) -> str | None:
+        """Extract string payload from runtime info fields."""
+        if isinstance(value, list):
+            if not value:
+                return None
+            value = value[0]
+        if value is None:
+            return None
+        return str(value)
+
+    @staticmethod
+    def _as_bool(value: object) -> bool:
+        """Extract boolean payload from runtime info fields."""
+        if isinstance(value, list):
+            if not value:
+                return False
+            value = value[0]
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return False
+            return bool(value.reshape(-1)[0].item())
+        if value is None:
+            return False
+        return bool(value)
+
+    @staticmethod
+    def _cross_fade_audio(audio: torch.Tensor, prev_tail: torch.Tensor) -> torch.Tensor:
+        """Blend previous chunk tail into current chunk head using a Hamming window.
+
+        This mirrors upstream CosyVoice's `fade_in_out(...)` semantics:
+        update the current head in-place using a 2*overlap window, then
+        concatenate the unchanged remainder.
+        """
+        if audio.numel() == 0 or prev_tail.numel() == 0:
+            return audio
+        overlap = min(int(audio.numel()), int(prev_tail.numel()))
+        if overlap <= 0:
+            return audio
+        window = torch.hamming_window(2 * overlap, periodic=False, dtype=audio.dtype, device=audio.device)
+        fade_in = window[:overlap]
+        fade_out = window[overlap:]
+        blended = audio[:overlap] * fade_in + prev_tail[-overlap:].to(device=audio.device, dtype=audio.dtype) * fade_out
+        if overlap == int(audio.numel()):
+            return blended
+        return torch.cat([blended, audio[overlap:]], dim=0)
+
+    def _stitch_stream_audio(self, req_id: str | None, audio: torch.Tensor, stream_finished: bool) -> torch.Tensor:
+        """Pass-through stitching for async_chunk.
+
+        Chunk overlap is already removed in mel domain via token_offset_tokens.
+        Applying an additional waveform-domain fade/cache step introduces either
+        duplicated overlap (if no tail trim) or duration shrink (if tail trim).
+        """
+        if req_id is not None and stream_finished and hasattr(self, "_stream_audio_cache_by_req"):
+            with self._stream_audio_cache_lock:
+                self._stream_audio_cache_by_req.pop(req_id, None)
+                if hasattr(self, "_stream_vocoder_cache_by_req"):
+                    self._stream_vocoder_cache_by_req.pop(req_id, None)
+        return audio
+
+    @staticmethod
+    def _split_request_ids(ids: torch.Tensor, seq_token_counts: list[int] | None = None) -> list[torch.Tensor]:
+        """Split concatenated input_ids into per-request segments."""
+        if seq_token_counts is not None:
+            boundaries = [0]
+            for count in seq_token_counts:
+                boundaries.append(boundaries[-1] + int(count))
+            total = ids.numel()
+            return [ids[boundaries[i] : min(boundaries[i + 1], total)] for i in range(len(seq_token_counts))]
+
+        if is_forward_context_available():
+            slices = get_forward_context().ubatch_slices
+            if slices is not None and len(slices) > 1 and not any(hasattr(s, "token_slice") for s in slices):
+                boundaries = [0]
+                for s in slices:
+                    boundaries.append(boundaries[-1] + int(s))
+                return [ids[boundaries[i] : boundaries[i + 1]] for i in range(len(boundaries) - 1)]
+
+        return [ids]
+
+    def _sanitize_codec_tokens(self, req_ids: torch.Tensor) -> torch.Tensor:
+        """Filter non-code tokens before feeding flow token embedding."""
+        vocab_size = int(self.code2wav.input_embedding.num_embeddings)
+        valid_mask = (req_ids >= 0) & (req_ids < vocab_size)
+        return req_ids[valid_mask]
+
+    @staticmethod
+    def _req_scalar(param: torch.Tensor | None, req_idx: int, default: float | int) -> float | int:
+        if param is None or param.numel() == 0:
+            return default
+        index = min(req_idx, int(param.numel()) - 1)
+        value = param.reshape(-1)[index].item()
+        if isinstance(default, int):
+            return int(value)
+        return float(value)
+
+    @staticmethod
+    def _multinomial_sample(probs: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
+        return torch.multinomial(probs, 1, replacement=True, generator=generator).reshape(())
+
+    @classmethod
+    def _nucleus_sample_one(
+        cls,
+        weighted_scores: torch.Tensor,
+        *,
+        top_p: float,
+        top_k: int,
+        generator: torch.Generator | None,
+    ) -> int:
+        probs = weighted_scores.softmax(dim=0)
+        sorted_prob, sorted_idx = probs.sort(descending=True, stable=True)
+        kept_probs: list[torch.Tensor] = []
+        kept_indices: list[torch.Tensor] = []
+        cum_prob = 0.0
+        max_keep = len(sorted_idx) if top_k <= 0 else min(int(top_k), len(sorted_idx))
+        for i in range(len(sorted_idx)):
+            if cum_prob < top_p and len(kept_probs) < max_keep:
+                cum_prob += float(sorted_prob[i].item())
+                kept_probs.append(sorted_prob[i])
+                kept_indices.append(sorted_idx[i])
+            else:
+                break
+
+        if not kept_probs:
+            return int(sorted_idx[0].item())
+
+        sample_probs = torch.stack(kept_probs)
+        sample_idx = cls._multinomial_sample(sample_probs, generator=generator)
+        return int(torch.stack(kept_indices)[int(sample_idx.item())].item())
+
+    @classmethod
+    def _ras_sample_one(
+        cls,
+        weighted_scores: torch.Tensor,
+        decoded_tokens: Sequence[int],
+        *,
+        top_p: float,
+        top_k: int,
+        win_size: int,
+        tau_r: float,
+        generator: torch.Generator | None,
+    ) -> int:
+        top_id = cls._nucleus_sample_one(
+            weighted_scores,
+            top_p=top_p,
+            top_k=top_k,
+            generator=generator,
+        )
+        if win_size > 0 and decoded_tokens:
+            recent = torch.as_tensor(
+                list(decoded_tokens[-win_size:]),
+                device=weighted_scores.device,
+                dtype=torch.long,
+            )
+            rep_num = int((recent == top_id).sum().item())
+            if rep_num >= win_size * tau_r:
+                weighted_scores = weighted_scores.clone()
+                weighted_scores[top_id] = float("-inf")
+                fallback_probs = weighted_scores.softmax(dim=0)
+                top_id = int(cls._multinomial_sample(fallback_probs, generator=generator).item())
+        return top_id
+
+    def _cosyvoice3_ras_enabled(self, sampling_metadata: SamplingMetadata) -> bool:
+        if self.model_stage != "cosyvoice3_talker":
+            return False
+        if sampling_metadata.max_num_logprobs is not None:
+            return False
+        if sampling_metadata.temperature is None:
+            return False
+        if bool(sampling_metadata.bad_words_token_ids):
+            return False
+        if torch.any(sampling_metadata.frequency_penalties != 0):
+            return False
+        if torch.any(sampling_metadata.presence_penalties != 0):
+            return False
+        return True
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> SamplerOutput | None:
+        if logits is None or logits.numel() == 0:
+            return None
+        if self.model_stage != "cosyvoice3_talker":
+            return None
+
+        sampler = getattr(self, "_talker_sampler", None)
+        if sampler is None:
+            sampler = Sampler()
+            self._talker_sampler = sampler
+
+        if not self._cosyvoice3_ras_enabled(sampling_metadata):
+            return sampler(logits=logits, sampling_metadata=sampling_metadata)
+
+        logits = logits.to(torch.float32)
+        sampling_for_processors = replace(sampling_metadata, no_penalties=True)
+        logits = sampler.apply_logits_processors(logits, sampling_for_processors, predict_bonus_token=False)
+
+        sampling_cfg = dict(self.config.llm.get("sampling", {}))
+        default_top_p = float(sampling_cfg.get("top_p", 0.8))
+        default_top_k = int(sampling_cfg.get("top_k", 25))
+        win_size = int(sampling_cfg.get("win_size", 10))
+        tau_r = float(sampling_cfg.get("tau_r", 0.1))
+
+        sampled_ids: list[int] = []
+        for req_idx in range(int(logits.shape[0])):
+            row_logits = logits[req_idx]
+
+            temperature = float(self._req_scalar(sampling_metadata.temperature, req_idx, 1.0))
+            if temperature < self._sampling_eps:
+                sampled_ids.append(int(torch.argmax(row_logits).item()))
+                continue
+
+            top_p = float(self._req_scalar(sampling_metadata.top_p, req_idx, default_top_p))
+            top_k = int(self._req_scalar(sampling_metadata.top_k, req_idx, default_top_k))
+            generator = sampling_metadata.generators.get(req_idx)
+            weighted_scores = torch.log_softmax(row_logits / max(temperature, self._sampling_eps), dim=0)
+            decoded_tokens = (
+                sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
+            )
+            sampled_ids.append(
+                self._ras_sample_one(
+                    weighted_scores,
+                    decoded_tokens,
+                    top_p=top_p,
+                    top_k=top_k,
+                    win_size=win_size,
+                    tau_r=tau_r,
+                    generator=generator,
+                )
+            )
+
+        sampled = torch.tensor(sampled_ids, device=logits.device, dtype=torch.int32)
+        return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
+
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
         if self.model_stage == "cosyvoice3_talker":
             logits = self.model.llm_decoder(hidden_states)
+            # The decoder outputs speech_token_size + 200 logits.  The official
+            # CosyVoice3 treats ALL tokens >= speech_token_size (the last 200)
+            # as stop signals.  Merge their probabilities into a single EOS
+            # token (6562) via logsumexp so that vLLM's stop_token_ids=[6562]
+            # fires with the correct aggregate stop probability.
+            speech_token_size = self.config.llm["speech_token_size"]
+            eos_idx = self.config.llm["eos_token_id"]
+            stop_logits = logits[..., speech_token_size:]  # last 200
+            merged_stop = torch.logsumexp(stop_logits, dim=-1, keepdim=True)
+            logits[..., speech_token_size:] = float("-inf")  # mask all
+            logits[..., eos_idx] = merged_stop.squeeze(-1)  # restore merged
+            # Pad to full vocab_size for vLLM token handling.
             vocab_size = self.config.vocab_size
             pad_size = vocab_size - logits.size(-1)
-            pad_shape = logits.shape[:-1] + (pad_size,)
-            pad = logits.new_full(pad_shape, float("-inf"))
-            eos_token_val = logits[..., self.config.llm["eos_token_id"]].clone()
-            logits[..., -200:] = float("-inf")
-            logits[..., self.config.llm["eos_token_id"]] = eos_token_val
-            logits = torch.cat([logits, pad], dim=-1)
+            if pad_size > 0:
+                pad_shape = logits.shape[:-1] + (pad_size,)
+                pad = logits.new_full(pad_shape, float("-inf"))
+                logits = torch.cat([logits, pad], dim=-1)
             return logits
         else:
             raise RuntimeError(f"compute_logits is only valid for {self.model_stage}.")
@@ -379,6 +650,7 @@ class CosyVoice3Model(
             hidden = int(self.config.hidden_size)
             return torch.zeros(
                 (input_ids.shape[0], hidden),
+                device=input_ids.device,
             )
         else:
             raise RuntimeError(f"embed_input_ids is not valid for {self.model_stage}.")
@@ -411,28 +683,116 @@ class CosyVoice3Model(
 
             return OmniOutput(text_hidden_states=hidden_states, multimodal_outputs=multimodal_outputs)
         elif self.model_stage == "cosyvoice3_code2wav":
-            runtime_info = kwargs.get("runtime_additional_information", [])
-            if not runtime_info:
-                length = 30 * 24000
-                audio = np.zeros((length,))
-                return OmniOutput(text_hidden_states=None, multimodal_outputs={"audio": audio})
+            runtime_info = kwargs.get("model_intermediate_buffer")
+            if runtime_info is None:
+                runtime_info = kwargs.get("runtime_additional_information", [])
+            if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
+                logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
 
-            # Remove the last eos token and add batch dimension
-            token = input_ids[..., :-1].unsqueeze(0)
+            seq_token_counts = kwargs.get("seq_token_counts")
+            flat_ids = input_ids.reshape(-1).to(dtype=torch.long)
+            request_ids_list = self._split_request_ids(flat_ids, seq_token_counts)
 
-            # Generate audio using code2wav
-            tts_speech = self.code2wav(
-                token=token,
-                prompt_token=runtime_info[0]["speech_token"][:1],
-                prompt_feat=runtime_info[0]["speech_feat"][:1],
-                embedding=runtime_info[0]["embedding"][:1],
-                n_timesteps=10,
-            )
+            num_reqs = max(1, len(request_ids_list))
+            sample_rate = torch.tensor(int(self.config.sample_rate), dtype=torch.int32)
+            empty_audio = torch.zeros((0,), dtype=torch.float32, device=input_ids.device)
+            audios: list[torch.Tensor] = [empty_audio] * num_reqs
+            srs: list[torch.Tensor] = [sample_rate] * num_reqs
+            if not isinstance(runtime_info, list):
+                runtime_info = []
 
-            return OmniOutput(
-                text_hidden_states=None,
-                multimodal_outputs={"audio": tts_speech, "sr": 22050},
-            )
+            for idx, req_ids in enumerate(request_ids_list):
+                info = runtime_info[idx] if idx < len(runtime_info) and isinstance(runtime_info[idx], dict) else {}
+                req_id = self._as_str(info.get("req_id")) if info else None
+                stream_finished = self._as_bool(info.get("stream_finished")) if info else False
+                speech_token = self._as_tensor(info.get("speech_token")) if info else None
+                speech_feat = self._as_tensor(info.get("speech_feat")) if info else None
+                embedding = self._as_tensor(info.get("embedding")) if info else None
+                if speech_token is None or speech_feat is None or embedding is None:
+                    if stream_finished and req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
+                        with self._stream_audio_cache_lock:
+                            self._stream_vocoder_cache_by_req.pop(req_id, None)
+                    audios[idx] = self._stitch_stream_audio(req_id, empty_audio, stream_finished)
+                    if (
+                        req_ids.numel() > 0
+                        and info
+                        and ("token_offset" in info or "left_context_size" in info or "generated_len" in info)
+                    ):
+                        info_keys = ",".join(sorted(info.keys())) if info else ""
+                        logger.warning_once(
+                            "CosyVoice3 code2wav missing prompt conditioning for non-empty codec tokens: "
+                            "raw_len=%d info_keys=%s",
+                            int(req_ids.numel()),
+                            info_keys,
+                        )
+                    continue
+
+                token = self._sanitize_codec_tokens(req_ids)
+                if token.numel() == 0:
+                    audios[idx] = self._stitch_stream_audio(req_id, empty_audio, stream_finished)
+                    if req_ids.numel() > 0:
+                        logger.warning_once(
+                            "CosyVoice3 code2wav received no valid codec tokens after filtering: "
+                            "raw_len=%d raw_range=[%d,%d] vocab_size=%d",
+                            req_ids.numel(),
+                            int(req_ids.min().item()),
+                            int(req_ids.max().item()),
+                            int(self.code2wav.input_embedding.num_embeddings),
+                        )
+                    continue
+
+                # `generated_len` is injected for many models by the generic
+                # runner, so only explicit chunk-routing fields should switch
+                # code2wav into the streaming path.
+                uses_streaming_decode = bool(info) and (
+                    "stream_finished" in info or "token_offset" in info or "left_context_size" in info
+                )
+                if uses_streaming_decode:
+                    token_offset = 0
+                    try:
+                        if info and "token_offset" in info:
+                            token_offset = max(0, int(info.get("token_offset", 0)))
+                        elif info:
+                            token_offset = max(0, int(info.get("left_context_size", 0)))
+                    except (TypeError, ValueError):
+                        token_offset = 0
+
+                    cache_state = None
+                    if req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
+                        with self._stream_audio_cache_lock:
+                            cache_state = self._stream_vocoder_cache_by_req.get(req_id)
+
+                    tts_speech, new_cache_state = self.code2wav.forward_streaming(
+                        token=token.unsqueeze(0),
+                        prompt_token=speech_token[:1],
+                        prompt_feat=speech_feat[:1],
+                        embedding=embedding[:1],
+                        cache_state=cache_state,
+                        n_timesteps=10,
+                        token_offset_tokens=token_offset,
+                        finalize=stream_finished,
+                    )
+
+                    if req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
+                        with self._stream_audio_cache_lock:
+                            if new_cache_state is None or stream_finished:
+                                self._stream_vocoder_cache_by_req.pop(req_id, None)
+                            else:
+                                self._stream_vocoder_cache_by_req[req_id] = new_cache_state
+                else:
+                    tts_speech = self.code2wav.forward(
+                        token=token.unsqueeze(0),
+                        prompt_token=speech_token[:1],
+                        prompt_feat=speech_feat[:1],
+                        embedding=embedding[:1],
+                        n_timesteps=10,
+                    )
+
+                audio = tts_speech.reshape(-1).to(dtype=torch.float32)
+
+                audios[idx] = self._stitch_stream_audio(req_id, audio, stream_finished)
+
+            return OmniOutput(text_hidden_states=None, multimodal_outputs={"audio": audios, "sr": srs})
         else:
             raise ValueError(f"Unsupported model_stage: {self.model_stage}")
 

@@ -7,7 +7,7 @@ Install dependencies:
 uv pip install -e .
 ```
 
-> **Note:** This includes required libraries such as `librosa`, `soundfile`,
+> **Note:** This includes required libraries such as `soundfile`,
 > `onnxruntime`, `x-transformers`, and `einops` via
 > `requirements/common.txt` and platform-specific requirements files.
 
@@ -58,7 +58,14 @@ Key components live in `vllm_omni/model_executor/models/cosyvoice3/cosyvoice3.py
     - Stage 0 uses `CosyVoice3LM` and outputs speech tokens + conditioning features.
     - Stage 1 runs the flow model (DiT-based CFM) and HiFiGAN to synthesize waveform.
 
-Stage wiring is configured in `vllm_omni/model_executor/stage_configs/cosyvoice3.yaml`.
+Pipeline topology lives in `vllm_omni/model_executor/models/cosyvoice3/pipeline.py`;
+runtime tunables (batch size, memory limits, sampling) live in
+`vllm_omni/deploy/cosyvoice3.yaml`. The deploy config auto-loads by
+HF `model_type` and defaults to `async_chunk: true` (shared-memory
+streaming). Pass `--no-async-chunk` on `vllm serve` to switch to the
+legacy sync path where stage 1 runs `text2flow` over the full
+speech-token sequence.
 
 - Stage 0 emits latent speech tokens.
-- Stage 1 consumes them via `custom_process_input_func` and outputs audio.
+- Stage 1 consumes them via `sync_process_input_func` (sync mode) or the
+  shared-memory connector (async-chunk mode) and outputs audio.

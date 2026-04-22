@@ -174,7 +174,7 @@ class CausalConditionalCFM(ConditionalCFM):
         super().__init__(in_channels, cfm_params, n_spks, spk_emb_dim, estimator)
 
     @torch.inference_mode()
-    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None):
+    def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, streaming: bool = False):
         """Forward diffusion
 
         Args:
@@ -277,7 +277,9 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
         prompt_feat,
         prompt_feat_len,
         embedding,
-        finalize,
+        streaming: bool = True,
+        finalize: bool = False,
+        n_timesteps: int = 10,
     ):
         assert token.shape[0] == 1
         # xvec projection
@@ -314,7 +316,8 @@ class CausalMaskedDiffWithDiT(torch.nn.Module):
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=10,
+            n_timesteps=max(1, int(n_timesteps)),
+            streaming=streaming,
         )
 
         feat = feat[:, :, mel_len1:]

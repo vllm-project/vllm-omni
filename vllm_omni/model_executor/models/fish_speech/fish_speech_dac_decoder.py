@@ -141,6 +141,13 @@ class FishSpeechDACDecoder(nn.Module):
         self._bake_weight_norm(codec)
         self._cache_attention_masks(codec)
 
+        # Decode path only uses quantizer.decode() + decoder; prune
+        # encode-only components before moving to device to avoid
+        # unnecessary GPU allocation.
+        codec.encoder = None
+        codec.quantizer.pre_module = None
+        codec.quantizer.downsample = None
+
         device = self.vllm_config.device_config.device
         codec = codec.to(device=device, dtype=torch.float32)
         codec.eval()

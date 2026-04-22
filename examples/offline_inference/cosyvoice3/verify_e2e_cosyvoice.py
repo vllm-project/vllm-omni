@@ -2,34 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import argparse
 import os
-from pathlib import Path
 
-import librosa
 import numpy as np
 import soundfile as sf
 from vllm import SamplingParams
 from vllm.assets.audio import AudioAsset
+from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.model_executor.models.cosyvoice3.utils import extract_text_token
-
-
-def _ensure_mel_filters_asset() -> None:
-    repo_root = Path(__file__).resolve().parents[3]
-    filters_path = repo_root / "vllm_omni" / "model_executor" / "models" / "cosyvoice3" / "assets" / "mel_filters.npz"
-    if filters_path.exists():
-        return
-
-    source_url = "https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/mel_filters.npz"
-    raise FileNotFoundError(
-        "Missing CosyVoice3 mel filter asset:\n"
-        f"  {filters_path}\n"
-        "Download it with:\n"
-        f"  mkdir -p {filters_path.parent} && "
-        f"curl -L {source_url} -o {filters_path}"
-    )
 
 
 def run_e2e():
@@ -41,7 +24,13 @@ def run_e2e():
         required=True,
         help="Path to CosyVoice3 model directory (e.g., pretrained_models/Fun-CosyVoice3-0.5B/).",
     )
-    parser.add_argument("--stage-config", type=str, default="vllm_omni/model_executor/stage_configs/cosyvoice3.yaml")
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help="Override the deploy config path. If unset, auto-loads "
+        "vllm_omni/deploy/cosyvoice3.yaml based on the HF model_type.",
+    )
     parser.add_argument("--prompt", type=str, default="Hello, this is a test of the CosyVoice system capability.")
     parser.add_argument(
         "--prompt-text",
@@ -56,23 +45,18 @@ def run_e2e():
         help="Path to tokenizer directory (e.g., <model_path>/CosyVoice-BlankEN).",
     )
     args = parser.parse_args()
-    _ensure_mel_filters_asset()
     # Ensure tokenizer directory exists
     if not os.path.exists(args.tokenizer):
         raise FileNotFoundError(f"{args.tokenizer} does not exist!")
 
-    # Ensure stage config exists
-    if not os.path.exists(args.stage_config):
-        raise FileNotFoundError(f"{args.stage_config} does not exist!")
+    if args.deploy_config is not None and not os.path.exists(args.deploy_config):
+        raise FileNotFoundError(f"{args.deploy_config} does not exist!")
 
     print(f"Initializing cosyvoice E2E with model={args.model}")
 
-    # Initialize Omni
-    # This spins up the engine(s) based on the stage config
-    # We pass trust_remote_code=True same as Qwen examples
     omni = Omni(
         model=args.model,
-        stage_configs_path=args.stage_config,
+        deploy_config=args.deploy_config,
         trust_remote_code=True,
         tokenizer=args.tokenizer,
         log_stats=True,
@@ -85,7 +69,7 @@ def run_e2e():
         if not os.path.exists(args.audio_path):
             raise FileNotFoundError(f"Audio file not found: {args.audio_path}")
         # Load at native sample rate
-        audio_signal, sr = librosa.load(args.audio_path, sr=None)
+        audio_signal, sr = load_audio(args.audio_path, sr=None)
 
         # Validate sample rate before processing (similar to original CosyVoice)
         min_sr = 16000

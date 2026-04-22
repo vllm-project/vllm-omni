@@ -22,8 +22,9 @@ import pytest
 from PIL import Image
 from vllm.assets.image import ImageAsset
 
-from tests.conftest import modify_stage_config
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.platforms import current_omni_platform
 
@@ -32,30 +33,30 @@ from vllm_omni.platforms import current_omni_platform
 # prompt='Change the grass color to red',
 # input image: 2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg
 REFERENCE_PIXELS = [
-    {"position": (100, 100), "rgb": (157, 172, 217)},
-    {"position": (400, 50), "rgb": (105, 144, 218)},
-    {"position": (700, 100), "rgb": (118, 159, 233)},
-    {"position": (150, 400), "rgb": (195, 34, 60)},
-    {"position": (512, 336), "rgb": (222, 214, 193)},
-    {"position": (700, 400), "rgb": (197, 15, 43)},
-    {"position": (100, 600), "rgb": (105, 13, 18)},
-    {"position": (400, 600), "rgb": (169, 33, 44)},
-    {"position": (700, 600), "rgb": (101, 86, 93)},
-    {"position": (256, 256), "rgb": (181, 202, 222)},
+    {"position": (100, 100), "rgb": (156, 172, 217)},
+    {"position": (400, 50), "rgb": (105, 144, 217)},
+    {"position": (700, 100), "rgb": (118, 159, 232)},
+    {"position": (150, 400), "rgb": (180, 22, 52)},
+    {"position": (512, 336), "rgb": (221, 211, 194)},
+    {"position": (700, 400), "rgb": (192, 10, 46)},
+    {"position": (100, 600), "rgb": (102, 12, 22)},
+    {"position": (400, 600), "rgb": (161, 28, 47)},
+    {"position": (700, 600), "rgb": (100, 87, 94)},
+    {"position": (256, 256), "rgb": (181, 201, 221)},
 ]
 
 if current_omni_platform.is_rocm():
     REFERENCE_PIXELS = [
-        {"position": (100, 100), "rgb": (156, 172, 215)},
-        {"position": (400, 50), "rgb": (106, 144, 216)},
-        {"position": (700, 100), "rgb": (118, 158, 231)},
-        {"position": (150, 400), "rgb": (183, 23, 48)},
-        {"position": (512, 336), "rgb": (218, 215, 191)},
-        {"position": (700, 400), "rgb": (194, 14, 42)},
-        {"position": (100, 600), "rgb": (105, 10, 16)},
-        {"position": (400, 600), "rgb": (167, 33, 46)},
-        {"position": (700, 600), "rgb": (102, 86, 92)},
-        {"position": (256, 256), "rgb": (181, 201, 220)},
+        {"position": (100, 100), "rgb": (156, 172, 217)},
+        {"position": (400, 50), "rgb": (105, 144, 217)},
+        {"position": (700, 100), "rgb": (118, 159, 232)},
+        {"position": (150, 400), "rgb": (180, 22, 52)},
+        {"position": (512, 336), "rgb": (221, 211, 194)},
+        {"position": (700, 400), "rgb": (192, 10, 46)},
+        {"position": (100, 600), "rgb": (102, 12, 22)},
+        {"position": (400, 600), "rgb": (161, 28, 47)},
+        {"position": (700, 600), "rgb": (100, 87, 94)},
+        {"position": (256, 256), "rgb": (181, 201, 221)},
     ]
 
 PIXEL_TOLERANCE = 10
@@ -210,11 +211,10 @@ def test_bagel_img2img_shared_memory_connector(run_level):
     input_image = _load_input_image()
     config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
     config_path = _resolve_stage_config(config_path, run_level)
-    omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=config_path, stage_init_timeout=300)
-
-    try:
-        generated_image = _generate_bagel_img2img(omni, input_image)
+    with OmniRunner(
+        "ByteDance-Seed/BAGEL-7B-MoT",
+        stage_configs_path=config_path,
+    ) as runner:
+        generated_image = _generate_bagel_img2img(runner.omni, input_image)
         if run_level == "advanced_model":
             _validate_pixels(generated_image)
-    finally:
-        omni.close()

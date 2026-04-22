@@ -1,6 +1,21 @@
+# Document 1: Buildkite loads only this block on first parse. The next step resolves docs-only skip-ci
+# from git diff, then uploads document 2. When docs-only skip applies, image-build still runs if nightly-test
+# / main NIGHTLY so upload-nightly is not skipped together with test-ready/test-merge.
+#
+# Document 2: appended after `---`; same file, read by upload_pipeline_with_skip_ci.sh (not evaluated as a second pipeline by Buildkite).
+steps:
+  - label: ":github: Resolve skip-ci & upload pipeline"
+    key: upload-ci-pipeline
+    commands:
+      - "bash .buildkite/scripts/upload_pipeline_with_skip_ci.sh"
+    agents:
+      queue: "cpu_queue_premerge"
+
+---
 steps:
   - label: ":docker: Build image"
     key: image-build
+    if: __IMAGE_BUILD_IF__
     commands:
       - "aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws/q9t5s3a7"
       - "docker build --progress=plain --file docker/Dockerfile.ci -t vllm-omni-ci ."
@@ -13,7 +28,7 @@ steps:
   - label: "Upload Ready Pipeline"
     depends_on: image-build
     key: upload-ready-pipeline
-    if: build.branch != "main" && build.pull_request.labels includes "ready"
+    if: __UPLOAD_READY_IF__
     commands:
       - buildkite-agent pipeline upload .buildkite/test-ready.yml
     agents:
@@ -23,17 +38,25 @@ steps:
   - label: "Upload Merge Pipeline"
     depends_on: image-build
     key: upload-merge-pipeline
-    if: build.branch == "main" && build.env("NIGHTLY") != "1"
+    if: __UPLOAD_MERGE_IF__
     commands:
       - buildkite-agent pipeline upload .buildkite/test-merge.yml
     agents:
       queue: "cpu_queue_premerge"
 
-  # L4 Test — main+NIGHTLY=1 (scheduled), or PR with label nightly-test (e.g. add label then Rebuild)
+  # L4 Test — main+NIGHTLY=1 (scheduled), or PR with specific label (e.g. add label then Rebuild)
   - label: "Upload Nightly Pipeline"
     depends_on: image-build
     key: upload-nightly-pipeline
-    if: '(build.branch == "main" && build.env("NIGHTLY") == "1") || (build.branch != "main" && build.pull_request.labels includes "nightly-test")'
+    if: >-
+      (build.branch == "main" && build.env("NIGHTLY") == "1") ||
+      (build.branch != "main" && (
+        build.pull_request.labels includes "nightly-test" ||
+        build.pull_request.labels includes "omni-test" ||
+        build.pull_request.labels includes "tts-test" ||
+        build.pull_request.labels includes "diffusion-x2iat-test" ||
+        build.pull_request.labels includes "diffusion-x2v-test"
+      ))
     commands:
       - buildkite-agent pipeline upload .buildkite/test-nightly.yml
     agents:

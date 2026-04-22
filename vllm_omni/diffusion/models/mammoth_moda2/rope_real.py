@@ -18,6 +18,8 @@ from diffusers.models.embeddings import get_1d_rotary_pos_embed as _get_1d_rotar
 from einops import repeat
 from torch import nn
 
+from vllm_omni.platforms import current_omni_platform
+
 
 def apply_real_rotary_emb(x: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor) -> torch.Tensor:
     """
@@ -119,7 +121,7 @@ class RotaryPosEmbedReal(nn.Module):
         axes_dim: tuple[int, int, int], axes_lens: tuple[int, int, int], theta: int
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
         freqs_real = []
-        freqs_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+        freqs_dtype = torch.float64 if current_omni_platform.supports_float64() else torch.float32
         for i, (d, e) in enumerate(zip(axes_dim, axes_lens)):
             cos_emb, sin_emb = get_1d_rotary_pos_embed_real(d, e, theta=theta, freqs_dtype=freqs_dtype)
             freqs_real.append((cos_emb, sin_emb))
