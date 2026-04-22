@@ -1353,6 +1353,7 @@ class Wan22Pipeline(
             true_cfg_scale=current_guidance_scale,
             positive_kwargs=positive_kwargs,
             negative_kwargs=negative_kwargs,
+            chunk_idx=state.current_chunk_idx,
         )
 
     def step_scheduler(
@@ -1368,7 +1369,12 @@ class Wan22Pipeline(
         do_true_cfg = current_guidance_scale > 1.0 and state.negative_prompt_embeds is not None
 
         state.latents = self.scheduler_step_maybe_with_pp_and_cfg(
-            noise_pred, t, state.latents, do_true_cfg, per_request_scheduler=state.scheduler
+            noise_pred,
+            t,
+            state.latents,
+            do_true_cfg,
+            per_request_scheduler=state.scheduler,
+            chunk_idx=state.current_chunk_idx,
         )
         state.step_index += 1
 
@@ -1381,8 +1387,8 @@ class Wan22Pipeline(
         self.sync_pp_send()
         self._current_timestep = None
 
-        if current_omni_platform.is_available():
-            current_omni_platform.empty_cache()
+        # if current_omni_platform.is_available():
+        #     current_omni_platform.empty_cache()
 
         # I2V: blend final latents with condition
         latent_condition = state.extra.get("latent_condition")

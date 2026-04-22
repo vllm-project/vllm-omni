@@ -545,12 +545,16 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
-                if is_new_request:
-                    self.pipeline.prepare_encode(state)
-
                 pp_group = get_pp_group()
                 pp_rank = pp_group.rank_in_group
                 task = assignment[pp_rank]
+
+                if is_new_request:
+                    pp_group.reset_buffer()
+                    if current_omni_platform.is_available():
+                        current_omni_platform.empty_cache()
+                        
+                    self.pipeline.prepare_encode(state)
 
                 if pp_group.is_first_rank:
                     denoised_chunks = state.extra.pop("denoised_chunks", [])

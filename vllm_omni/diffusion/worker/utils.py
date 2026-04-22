@@ -60,6 +60,9 @@ class DiffusionRequestState:
     # ── Per-request scheduler instance (set once by prepare_encode) ──
     scheduler: Any | None = None
 
+    # Active chunk index while inside a ``use_chunk`` context (None otherwise).
+    current_chunk_idx: int | None = None
+
     # ── CFG config (set once by prepare_encode) ──
     do_true_cfg: bool = False
     guidance: torch.Tensor | None = None
@@ -125,9 +128,11 @@ class DiffusionRequestState:
         saved_latents = self.latents
         saved_step_index = self.step_index
         saved_scheduler = self.scheduler
+        saved_chunk_idx = self.current_chunk_idx
         self.latents = chunk.latents
         self.step_index = chunk.step_index
         self.scheduler = chunk.scheduler
+        self.current_chunk_idx = chunk.idx
         try:
             yield
         finally:
@@ -137,6 +142,7 @@ class DiffusionRequestState:
             self.latents = saved_latents
             self.step_index = saved_step_index
             self.scheduler = saved_scheduler
+            self.current_chunk_idx = saved_chunk_idx
 
 
 @dataclass
