@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import io
 import json
 import math
@@ -1767,16 +1768,33 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         audio_response: AudioResponse = self.create_audio(audio_obj)
         return audio_response.audio_data, audio_response.media_type
 
+    def _build_diffusion_sampling_params_list(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> list[Any]:
+        """Copy diffusion defaults and apply request-level overrides."""
+        defaults = self._diffusion_engine.default_sampling_params_list
+        if request.num_step is None:
+            return defaults
+        params_list = [copy.copy(p) for p in defaults]
+        for params in params_list:
+            if hasattr(params, "num_inference_steps"):
+                params.num_inference_steps = request.num_step
+        return params_list
+
     async def _create_diffusion_speech(
         self,
         request: OpenAICreateSpeechRequest,
-    ) -> Response:
+    ) -> Response | StreamingResponse:
         """Handle speech generation for pure diffusion TTS models (e.g. OmniVoice)."""
         from vllm_omni.outputs import OmniRequestOutput
 
         try:
             if not request.input or not request.input.strip():
                 raise ValueError("Input text cannot be empty")
+
+            if request.stream:
+                return self._create_diffusion_speech_streaming(request)
 
             request_id = f"speech-{random_uuid()}"
             prompt: dict[str, Any] = {"input": request.input}
@@ -1800,7 +1818,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             generator = self._diffusion_engine.generate(
                 prompt=prompt,
                 request_id=request_id,
-                sampling_params_list=self._diffusion_engine.default_sampling_params_list,
+                sampling_params_list=self._build_diffusion_sampling_params_list(request),
                 output_modalities=["audio"],
             )
 
@@ -1848,6 +1866,105 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             logger.exception("Diffusion speech generation failed: %s", e)
             return self._diffusion_error_response(f"Speech generation failed: {e}")
+
+    def _create_diffusion_speech_streaming(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> StreamingResponse:
+        """Stream diffusion TTS sentence by sentence."""
+        from vllm_omni.entrypoints.openai.text_splitter import SPLIT_SENTENCE, SentenceSplitter
+
+        response_format = (request.response_format or "wav").lower()
+        media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
+        sampling_params_list = self._build_diffusion_sampling_params_list(request)
+
+        async def _stream():
+            splitter = SentenceSplitter(boundary_re=SPLIT_SENTENCE)
+            sentences = splitter.add_text(request.input)
+            remainder = splitter.flush()
+            if remainder:
+                sentences.append(remainder)
+            if not sentences:
+                sentences = [request.input.strip()]
+
+            ref_audio_data = None
+            if request.ref_audio:
+                wav, sr = await self._resolve_ref_audio(request.ref_audio)
+                ref_audio_data = (np.asarray(wav, dtype=np.float32), sr)
+
+            first_chunk = True
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+
+                prompt: dict[str, Any] = {"input": sentence}
+                if ref_audio_data is not None:
+                    prompt["ref_audio"] = ref_audio_data
+                if request.ref_text:
+                    prompt["ref_text"] = request.ref_text
+                if request.language:
+                    prompt["lang"] = request.language
+                if request.instructions:
+                    prompt["instruct"] = request.instructions
+
+                request_id = f"speech-{random_uuid()}"
+                try:
+                    generator = self._diffusion_engine.generate(
+                        prompt=prompt,
+                        request_id=request_id,
+                        sampling_params_list=sampling_params_list,
+                        output_modalities=["audio"],
+                    )
+
+                    final_output: OmniRequestOutput | None = None
+                    async for res in generator:
+                        final_output = res
+
+                    if final_output is None:
+                        logger.warning("No output for sentence %r, skipping", sentence)
+                        continue
+
+                    audio_output, audio_key = self._extract_audio_output(final_output)
+                    if audio_key is None:
+                        logger.warning("No audio key in output for sentence %r", sentence)
+                        continue
+
+                    audio_tensor = audio_output[audio_key]
+                    sr_raw = audio_output.get("sr", 24000)
+                    sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+                    sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+
+                    if isinstance(audio_tensor, list):
+                        non_empty = [chunk for chunk in audio_tensor if chunk.numel() > 0]
+                        audio_tensor = torch.cat(non_empty, dim=-1) if non_empty else torch.zeros((0,))
+                    if hasattr(audio_tensor, "float"):
+                        audio_tensor = audio_tensor.float().detach().cpu().numpy()
+                    if audio_tensor.ndim > 1:
+                        audio_tensor = audio_tensor.squeeze()
+
+                    if response_format == "wav" and first_chunk:
+                        yield _create_wav_header(sample_rate=sample_rate)
+                        first_chunk = False
+
+                    audio_obj = CreateAudio(
+                        audio_tensor=audio_tensor,
+                        sample_rate=sample_rate,
+                        response_format="pcm",
+                        speed=1.0,
+                        stream_format="audio",
+                        base64_encode=False,
+                    )
+                    yield self.create_audio(audio_obj).audio_data
+
+                except asyncio.CancelledError:
+                    logger.info("Streaming diffusion TTS request %s cancelled", request_id)
+                    return
+                except Exception as e:
+                    logger.exception("Sentence generation failed for %r: %s", sentence, e)
+                    continue
+
+        return StreamingResponse(_stream(), media_type=media_type)
 
     @staticmethod
     def _diffusion_error_response(message: str) -> Response:

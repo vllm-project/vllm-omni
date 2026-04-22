@@ -78,6 +78,16 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args."),
     )
+    num_step: int | None = Field(
+        default=None,
+        ge=1,
+        le=64,
+        description=(
+            "Number of diffusion denoising steps for masked-diffusion TTS (e.g. OmniVoice). "
+            "Lower values reduce latency at mild quality cost. "
+            "Defaults to the model's configured value when unset."
+        ),
+    )
 
     @field_validator("stream_format")
     @classmethod

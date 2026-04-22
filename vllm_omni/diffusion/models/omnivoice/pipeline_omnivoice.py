@@ -219,13 +219,16 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         batch_attn_mask[0, :, :cond_len, :cond_len] = True
         batch_attn_mask[1, :, :uncond_len, :uncond_len] = True
 
-        # Run 32-step iterative unmasking
+        # Allow per-request diffusion-step override while preserving model defaults.
+        num_step = req.sampling_params.num_inference_steps or self.num_step
+
+        # Run iterative unmasking
         tokens = self.generator(
             input_ids=batch_input_ids,
             audio_mask=batch_audio_mask,
             attention_mask=batch_attn_mask,
             target_lens=[target_len],
-            num_step=self.num_step,
+            num_step=num_step,
             guidance_scale=self.guidance_scale,
             t_shift=self.t_shift,
             layer_penalty_factor=self.layer_penalty_factor,
