@@ -17,6 +17,8 @@ from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+
 EDIT_PROMPT = "Transform this modern image into a cinematic animation style with vibrant colors and soft lighting."
 NEGATIVE_PROMPT = "blurry, low quality, distorted, oversaturated"
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
@@ -50,8 +52,6 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases("meituan-longcat/LongCat-Image-Edit"),
