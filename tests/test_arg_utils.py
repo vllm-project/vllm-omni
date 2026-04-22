@@ -445,3 +445,88 @@ def test_help_text_preserves_default_after_nullify():
     action = next(a for a in parser._actions if a.dest == "example_flag")
     assert action.default is None
     assert "(default: 42)" in action.help
+
+
+def test_omniengineargs_user_input_fields_default_to_none():
+    """RFC #3035: user-input fields on ``OmniEngineArgs`` default to ``None``
+    so callers using ``OmniEngineArgs.create(**explicit)`` can distinguish
+    set from unset. Internal flags (``omni``, ``has_sampling_extra_args``)
+    are exempt — they're not user-facing config."""
+    try:
+        from vllm_omni.engine.arg_utils import OmniEngineArgs
+    except Exception as exc:
+        pytest.skip(f"OmniEngineArgs not importable: {exc}")
+
+    INTERNAL = {"omni", "has_sampling_extra_args", "stage_id"}
+    # default_factory fields (e.g. dict) and inherited EngineArgs fields
+    # are out of scope for this invariant.
+    OWN_FIELDS = {
+        "model_stage",
+        "model_arch",
+        "engine_output_type",
+        "hf_config_name",
+        "custom_process_next_stage_input_func",
+        "subtalker_sampling_params",
+        "async_chunk",
+        "omni_kv_config",
+        "quantization_config",
+        "worker_type",
+        "task_type",
+        "worker_cls",
+        "enable_sleep_mode",
+        "omni_master_address",
+        "omni_master_port",
+        "stage_configs_path",
+        "output_modalities",
+        "log_stats",
+        "custom_pipeline_args",
+    }
+
+    offenders: list[tuple[str, object]] = []
+    for f in fields(OmniEngineArgs):
+        if f.name not in OWN_FIELDS:
+            continue
+        if f.default is not dataclasses.MISSING and f.default is not None:
+            offenders.append((f.name, f.default))
+
+    assert not offenders, (
+        f"OmniEngineArgs fields with non-None defaults: {offenders}. "
+        f"User-input fields must default to None per RFC #3035 so "
+        f"OmniEngineArgs.create() can track explicit-vs-unset."
+    )
+
+
+def test_omniengineargs_create_factory_tracks_explicit_fields():
+    """``OmniEngineArgs.create(**explicit)`` records which fields the caller
+    set in ``_explicit_fields``; ``explicit_kwargs()`` returns only those."""
+    try:
+        from vllm_omni.engine.arg_utils import OmniEngineArgs
+    except Exception as exc:
+        pytest.skip(f"OmniEngineArgs not importable: {exc}")
+
+    ea = OmniEngineArgs.create(model="x", gpu_memory_utilization=0.5)
+    assert ea._explicit_fields == frozenset({"model", "gpu_memory_utilization"})
+    explicit = ea.explicit_kwargs()
+    assert explicit == {"model": "x", "gpu_memory_utilization": 0.5}
+
+
+def test_omniengineargs_bare_constructor_warns_when_passed_to_omnibase():
+    """Bare ``OmniEngineArgs(...)`` cannot distinguish caller-set from
+    dataclass-default. Passing such an instance via ``engine_args=`` triggers
+    a DeprecationWarning."""
+    try:
+        from vllm_omni.engine.arg_utils import OmniEngineArgs
+    except Exception as exc:
+        pytest.skip(f"OmniEngineArgs not importable: {exc}")
+
+    ea = OmniEngineArgs(model="x")
+    # Bare constructor doesn't set _explicit_fields
+    assert not hasattr(ea, "_explicit_fields")
+
+    # explicit_kwargs() falls back to all-non-None for legacy
+    explicit = ea.explicit_kwargs()
+    assert "model" in explicit
+
+
+# dataclasses already imported via ``from dataclasses import dataclass, fields``
+import dataclasses  # noqa: E402  -- needed for MISSING sentinel above
