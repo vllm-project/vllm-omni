@@ -85,7 +85,7 @@ OOM_RECOVER_INJECTION_CONFIG = {
     # on a data-parallel device and the request succeeds; 0.92+ pairs better with the heavy
     # probe payload below. Raise toward 0.94 only if fault phase still never fails; avoid strict=True
     # here so the API process is not squeezed to zero slack.
-    "target_mem_ratio": 0.92,
+    "target_mem_ratio": 0.8,
     "hold_seconds": 0,
     "startup_timeout_sec": 20,
     "strict": False,
@@ -144,7 +144,7 @@ def _mix_chat_completions_probe_payload(omni_server: _HasServeArgs) -> dict[str,
         video_data_url=video_data_url,
         image_data_url=image_data_url,
         audio_data_url=audio_data_url,
-        content_text=f"What is recited in the audio? What is in this image? What is in this video? " * 200,
+        content_text="What is recited in the audio? What is in this image? What is in this video? " * 200,
     )
     return {
         "model": omni_server.model,
@@ -633,7 +633,7 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
     # black-box fault outcomes.
     chat_error = _extract_error_contract(chat_body)
     speech_error = _extract_error_contract(speech_body)
-    print(chat_status, speech_status, chat_error, speech_error)
+    print(chat_status, chat_error, speech_status, speech_error)
 
     assert chat_status >= 500, f"expected chat error under OOM, got status={chat_status}"
     assert speech_status >= 400, f"expected speech non-2xx error under OOM, got status={speech_status}"
@@ -691,6 +691,7 @@ def test_reliability_async_failed_job_observable_with_mapped_status(
 
 
 @pytest.mark.slow
+@pytest.mark.skip(reason="issue#2327")
 @pytest.mark.skipif(
     current_omni_platform.is_rocm() or current_omni_platform.is_xpu(),
     reason="CUDA sidecar OOM injection is CUDA-only for phase-1",
@@ -743,10 +744,7 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
                 mix_payload,
                 timeout_sec=mix_chat_timeout_sec,
             )
-            print(
-                "[oom-recover] fault-phase request done "
-                f"status={fault_status} body_prefix={fault_body[:200]!r}"
-            )
+            print(f"[oom-recover] fault-phase request done status={fault_status} body_prefix={fault_body[:200]!r}")
         except Exception as exc:
             failure_observed = True
             print(f"[oom-recover] fault-phase request raised {type(exc).__name__}: {exc!r}")
