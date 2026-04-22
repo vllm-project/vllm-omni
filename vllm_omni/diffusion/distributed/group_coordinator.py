@@ -723,6 +723,45 @@ class PipelineGroupCoordinator(GroupCoordinator):
                 self.skip_device_group = skip_device_group
         assert self.skip_device_group is not None
 
+        self._warmup_nccl_comms()
+
+    def _warmup_nccl_comms(self) -> None:
+        """Force eager ncclCommInit on every P2P group while all ranks are
+        synchronized at __init__. Otherwise the first real P2P op would
+        trigger a collective comm-init that blocks the early-arriving
+        rank — breaks temporal-PP where one rank deliberately runs ahead.
+        """
+        if self.world_size == 1:
+            return
+
+        dummy = torch.zeros(1, device=self.device, dtype=torch.uint8)
+
+        if self.world_size == 2:
+            for group_idx in (0, 1):
+                group = self.device_groups[group_idx]
+                if self.rank_in_group == group_idx:
+                    op = torch.distributed.P2POp(torch.distributed.isend, dummy, self.next_rank, group)
+                else:
+                    op = torch.distributed.P2POp(torch.distributed.irecv, dummy, self.prev_rank, group)
+                for req in torch.distributed.batch_isend_irecv([op]):
+                    req.wait()
+        else:
+            for req in torch.distributed.batch_isend_irecv(
+                [
+                    torch.distributed.P2POp(torch.distributed.isend, dummy, self.next_rank, self.device_group),
+                    torch.distributed.P2POp(torch.distributed.irecv, dummy, self.prev_rank, self.device_group),
+                ]
+            ):
+                req.wait()
+
+        for req in torch.distributed.batch_isend_irecv(
+            [
+                torch.distributed.P2POp(torch.distributed.isend, dummy, self.skip_rank, self.skip_device_group),
+                torch.distributed.P2POp(torch.distributed.irecv, dummy, self.skip_rank, self.skip_device_group),
+            ]
+        ):
+            req.wait()
+
     def reset_buffer(self):
         self.recv_tasks_queue = []
         self.receiving_tasks = []
