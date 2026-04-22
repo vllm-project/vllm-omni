@@ -15,10 +15,11 @@ native vLLM-Omni MiniCPM pipeline. It uses the official
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import io
 import json
-import hashlib
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Final
@@ -489,7 +490,9 @@ def _install_streaming_trace_hooks(
 
                 dump_dir = thinker_tensor_root / f"chunk_{int(chunk_state['chunk_index']):04d}"
                 tensor_summaries = {
-                    "yield_chunk_token_ids": _write_tensor_dump(dump_dir / "yield_chunk_token_ids.pt", yield_chunk_token_ids),
+                    "yield_chunk_token_ids": _write_tensor_dump(
+                        dump_dir / "yield_chunk_token_ids.pt", yield_chunk_token_ids
+                    ),
                     "last_hidden_states": _write_tensor_dump(dump_dir / "last_hidden_states.pt", hidden_states_tensor),
                     "llm_embeds": _write_tensor_dump(dump_dir / "llm_embeds.pt", llm_embeds),
                     "hidden_embeds": _write_tensor_dump(dump_dir / "hidden_embeds.pt", hidden_embeds),
@@ -615,6 +618,111 @@ def _load_local_ref_audio(ref_audio_path: str) -> dict[str, Any]:
     return {
         "wav": wav_np.tolist(),
         "sr": int(sr),
+    }
+
+
+def _load_local_talker_codec_jsonl(codec_jsonl_path: str) -> dict[str, Any]:
+    path = Path(codec_jsonl_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Talker codec jsonl not found: {path}")
+
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not rows:
+        raise ValueError(f"Talker codec jsonl is empty: {path}")
+
+    rows = sorted(rows, key=lambda row: int(row.get("chunk_index", 0)))
+    token_ids: list[int] = []
+    for row in rows:
+        audio_token_ids = row.get("audio_token_ids", [])
+        if not isinstance(audio_token_ids, list):
+            raise ValueError(f"Expected 'audio_token_ids' list in {path}, got {type(audio_token_ids)}")
+        token_ids.extend(int(token_id) for token_id in audio_token_ids)
+
+    return {
+        "path": str(path),
+        "rows": rows,
+        "token_ids": token_ids,
+    }
+
+
+def _canonicalize_ref_audio_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if payload is None:
+        return None
+
+    wav = np.asarray(payload["wav"], dtype=np.float32)
+    if wav.ndim == 0:
+        raise ValueError("Reference audio payload is empty.")
+    if wav.ndim > 1:
+        wav = wav.mean(axis=-1)
+    wav = wav.reshape(-1)
+    if wav.size == 0:
+        raise ValueError("Reference audio payload is empty.")
+
+    return {
+        "wav": wav.tolist(),
+        "sr": int(payload["sr"]),
+    }
+
+
+def _write_code2wav_prompt_wav(ref_audio: dict[str, Any] | None, target_sr: int) -> str:
+    if ref_audio is None:
+        wav_np = np.zeros((target_sr,), dtype=np.float32)
+        sr = target_sr
+    else:
+        canonical = _canonicalize_ref_audio_payload(ref_audio)
+        assert canonical is not None
+        wav_np = np.asarray(canonical["wav"], dtype=np.float32).reshape(-1)
+        sr = int(canonical["sr"])
+        if sr != target_sr:
+            import librosa
+
+            wav_np = librosa.resample(y=wav_np, orig_sr=sr, target_sr=target_sr)
+            sr = target_sr
+
+    with tempfile.NamedTemporaryFile(prefix="minicpm_ref_", suffix=".wav", delete=False) as f:
+        prompt_wav_path = f.name
+    sf.write(prompt_wav_path, wav_np, sr)
+    return prompt_wav_path
+
+
+def _decode_code2wav_one(
+    token2wav: Any,
+    token_ids: list[int],
+    *,
+    ref_audio: dict[str, Any] | None,
+    audio_eos_token_id: int,
+    audio_prompt_sample_rate: int,
+    output_sample_rate: int,
+) -> tuple[np.ndarray, int]:
+    trimmed_token_ids = list(token_ids)
+    while trimmed_token_ids and trimmed_token_ids[-1] == int(audio_eos_token_id):
+        trimmed_token_ids.pop()
+
+    if not trimmed_token_ids:
+        return np.zeros((0,), dtype=np.float32), int(output_sample_rate)
+
+    prompt_wav_path = _write_code2wav_prompt_wav(ref_audio, int(audio_prompt_sample_rate))
+    try:
+        token2wav.cache = None
+        wav_bytes = token2wav(trimmed_token_ids, prompt_wav_path)
+    finally:
+        Path(prompt_wav_path).unlink(missing_ok=True)
+
+    waveform, sample_rate = sf.read(io.BytesIO(wav_bytes))
+    waveform_np = np.asarray(waveform, dtype=np.float32)
+    if waveform_np.ndim > 1:
+        waveform_np = waveform_np.mean(axis=-1)
+    return waveform_np.reshape(-1), int(sample_rate)
+
+
+def _save_code2wav_output(path: Path, waveform: np.ndarray, sample_rate: int) -> dict[str, Any]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(path, waveform, sample_rate, format="WAV", subtype="PCM_16")
+    return {
+        "remote_path": str(path.relative_to(REMOTE_OUTPUT_DIR)),
+        "num_samples": int(waveform.shape[0]),
+        "sample_rate": int(sample_rate),
+        "duration_sec": float(waveform.shape[0] / max(int(sample_rate), 1)),
     }
 
 
@@ -1211,6 +1319,62 @@ def run_hf_smoke(
 @app.function(
     image=image,
     gpu=GPU_REQUEST,
+    timeout=30 * MINUTES,
+    volumes={
+        HF_CACHE_DIR: hf_cache_volume,
+        str(REMOTE_OUTPUT_DIR): output_volume,
+    },
+)
+def replay_hf_code2wav_from_token_ids(
+    token_ids: list[int],
+    ref_audio_payload: dict[str, Any] | None = None,
+    output_name: str | None = None,
+    audio_eos_token_id: int = 6561,
+    audio_prompt_sample_rate: int = 16000,
+    output_sample_rate: int = 24000,
+    n_timesteps: int = 10,
+) -> dict[str, Any]:
+    from stepaudio2 import Token2wav
+
+    snapshot_path = _download_model()
+    hf_cache_volume.commit()
+    _patch_minicpm_audio_io()
+
+    token2wav_assets_dir = Path(snapshot_path) / "assets" / "token2wav"
+    token2wav = Token2wav(
+        str(token2wav_assets_dir),
+        float16=False,
+        n_timesteps=int(n_timesteps),
+    )
+
+    remote_output_name = output_name or f"{uuid.uuid4().hex}.wav"
+    waveform, sample_rate = _decode_code2wav_one(
+        token2wav,
+        [int(token_id) for token_id in token_ids],
+        ref_audio=_canonicalize_ref_audio_payload(ref_audio_payload),
+        audio_eos_token_id=int(audio_eos_token_id),
+        audio_prompt_sample_rate=int(audio_prompt_sample_rate),
+        output_sample_rate=int(output_sample_rate),
+    )
+    output_path = REMOTE_OUTPUT_DIR / remote_output_name
+    output_info = _save_code2wav_output(output_path, waveform, sample_rate)
+    output_volume.commit()
+    return {
+        "snapshot_path": snapshot_path,
+        "assets_dir": str(token2wav_assets_dir),
+        "token_count": len(token_ids),
+        "audio_eos_token_id": int(audio_eos_token_id),
+        "audio_prompt_sample_rate": int(audio_prompt_sample_rate),
+        "output_sample_rate": int(output_sample_rate),
+        "n_timesteps": int(n_timesteps),
+        "used_ref_audio": ref_audio_payload is not None,
+        "output": output_info,
+    }
+
+
+@app.function(
+    image=image,
+    gpu=GPU_REQUEST,
     timeout=20 * MINUTES,
     volumes={
         HF_CACHE_DIR: hf_cache_volume,
@@ -1335,6 +1499,11 @@ def main(
     replay_inputs_embeds_path: str = "",
     replay_position_ids_path: str = "",
     replay_output_json: str = "",
+    replay_codec_jsonl_path: str = "",
+    replay_codec_audio_eos_token_id: int = 6561,
+    replay_codec_audio_prompt_sample_rate: int = 16000,
+    replay_codec_output_sample_rate: int = 24000,
+    replay_codec_n_timesteps: int = 10,
 ) -> None:
     snapshot_path = preload_model.remote()
     print(f"Model cached at: {snapshot_path}")
@@ -1356,6 +1525,29 @@ def main(
             output_json_path.write_text(replay_json, encoding="utf-8")
             print(f"Saved replay JSON to: {output_json_path}")
         print(replay_json)
+        return
+
+    if replay_codec_jsonl_path:
+        codec_payload = _load_local_talker_codec_jsonl(replay_codec_jsonl_path)
+        remote_output_name = f"{uuid.uuid4().hex}_{Path(output).name}"
+        result = replay_hf_code2wav_from_token_ids.remote(
+            token_ids=codec_payload["token_ids"],
+            ref_audio_payload=_load_local_ref_audio(ref_audio_path) if ref_audio_path else None,
+            output_name=remote_output_name,
+            audio_eos_token_id=int(replay_codec_audio_eos_token_id),
+            audio_prompt_sample_rate=int(replay_codec_audio_prompt_sample_rate),
+            output_sample_rate=int(replay_codec_output_sample_rate),
+            n_timesteps=int(replay_codec_n_timesteps),
+        )
+        wav_bytes = b"".join(output_volume.read_file(result["output"]["remote_path"]))
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(wav_bytes)
+        result["codec_jsonl_path"] = codec_payload["path"]
+        result["codec_chunk_count"] = len(codec_payload["rows"])
+        result["local_output_path"] = str(output_path.resolve())
+        print(json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True))
+        print(f"Saved code2wav replay audio to: {output_path}")
         return
 
     ref_audio_payload: dict[str, Any] | None = None

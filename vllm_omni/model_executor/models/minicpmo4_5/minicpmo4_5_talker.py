@@ -33,6 +33,11 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.model_executor.models.minicpmo4_5.minicpmo4_5_tts_generator import (
+    MiniCPMO4_5PoppedToken,
+    MiniCPMO4_5TTSStreamingGenerator,
+)
+
 logger = init_logger(__name__)
 E2E_ARTIFACT_DIR_ENV = "MINICPMO45_E2E_OUTPUT_DIR"
 
@@ -256,8 +261,10 @@ class _MiniCPMOAsyncTalkerState:
     debug_pending_emitted_condition_shapes: list[list[int] | None] = field(default_factory=list)
     debug_pending_emitted_text_finished: list[bool] = field(default_factory=list)
     debug_decode_step_index: int = 0
+    debug_timeline_event_index: int = 0
     sampling_generator: torch.Generator | None = None
     sampling_generator_device: str | None = None
+    tts_generator: MiniCPMO4_5TTSStreamingGenerator | None = None
 
 
 class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
@@ -374,11 +381,11 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         )
         self._async_sampling_top_p = _coerce_float(
             os.environ.get("MINICPMO45_ASYNC_TALKER_TOP_P", connector_extra.get("async_talker_top_p")),
-            default=1.0,
+            default=0.8,
         )
         self._async_sampling_top_k = _coerce_int(
             os.environ.get("MINICPMO45_ASYNC_TALKER_TOP_K", connector_extra.get("async_talker_top_k")),
-            default=50,
+            default=100,
         )
         self._async_sampling_min_p = _coerce_float(
             os.environ.get("MINICPMO45_ASYNC_TALKER_MIN_P", connector_extra.get("async_talker_min_p")),
@@ -389,7 +396,7 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
                 "MINICPMO45_ASYNC_TALKER_REPETITION_PENALTY",
                 connector_extra.get("async_talker_repetition_penalty"),
             ),
-            default=1.05,
+            default=1.02,
         )
         self._async_sampling_seed = _coerce_optional_int(
             os.environ.get("MINICPMO45_ASYNC_TALKER_SEED", connector_extra.get("async_talker_seed")),
@@ -593,6 +600,57 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
     def _reset_async_stream_state(self) -> None:
         self._async_stream_state = None
 
+    def _ensure_async_tts_generator(
+        self,
+        state: _MiniCPMOAsyncTalkerState,
+    ) -> MiniCPMO4_5TTSStreamingGenerator:
+        if state.tts_generator is not None:
+            return state.tts_generator
+
+        if not self._async_chunk_enabled or self._async_hf_model is None:
+            raise RuntimeError("MiniCPM async TTS generator requires async chunk mode with a private HF backbone.")
+        if not self._async_backbone_synced:
+            self._sync_async_backbone_from_vllm()
+
+        def _condition_event_logger(payload: dict[str, Any]) -> None:
+            self._append_async_debug_event(
+                state,
+                file_name="talker_condition_events.jsonl",
+                payload=payload,
+            )
+
+        def _decode_step_logger(payload: dict[str, Any]) -> None:
+            self._append_async_debug_event(
+                state,
+                file_name="talker_decode_steps.jsonl",
+                payload=payload,
+            )
+
+        def _decode_tensor_dumper(**kwargs: Any) -> str | None:
+            return self._dump_async_decode_step_tensors(state, **kwargs)
+
+        state.tts_generator = MiniCPMO4_5TTSStreamingGenerator(
+            tts_model=self._async_hf_model,
+            emb_text=self.emb_text,
+            emb_code=self.emb_code[0],
+            head_code=self.head_code[0],
+            text_eos_token_id=self.text_eos_token_id,
+            audio_bos_token_id=self.audio_bos_token_id,
+            eos_token_id=self._async_eos_token_id,
+            num_audio_tokens=int(self.config.num_audio_tokens),
+            chunk_size=int(self._async_codec_chunk_frames),
+            do_sample=bool(self._async_sampling_do_sample),
+            temperature=float(self._async_sampling_temperature),
+            sampling_seed=self._async_sampling_seed,
+            logits_processors=self._async_logits_processors,
+            logits_warpers=self._async_logits_warpers,
+            debug_top_logprobs=int(self._async_debug_top_logprobs),
+            condition_event_logger=_condition_event_logger,
+            decode_step_logger=_decode_step_logger,
+            decode_tensor_dumper=_decode_tensor_dumper,
+        )
+        return state.tts_generator
+
     def _rebuild_async_sampling_controls(self) -> None:
         self._async_logits_processors = (
             [RepetitionPenaltyLogitsProcessor(self._async_sampling_repetition_penalty)]
@@ -619,7 +677,40 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         request_dir = _async_debug_request_dir(state.request_id)
         if request_dir is None:
             return
+        if file_name == "talker_condition_events.jsonl":
+            payload = {"timeline_index": int(state.debug_timeline_event_index), **payload}
+            state.debug_timeline_event_index += 1
         _append_jsonl(request_dir / file_name, payload)
+
+    @staticmethod
+    def _shape_list(tensor: Any) -> list[int] | None:
+        if not isinstance(tensor, torch.Tensor):
+            return None
+        return [int(dim) for dim in tensor.shape]
+
+    def _async_timeline_state_payload(
+        self,
+        state: _MiniCPMOAsyncTalkerState,
+    ) -> dict[str, Any]:
+        if state.tts_generator is not None:
+            return state.tts_generator.snapshot()
+        return {
+            "pending_condition_queue_size": int(len(state.pending_condition_chunks)),
+            "pending_audio_token_buffer_size": int(len(state.pending_audio_token_ids)),
+            "current_condition_index": state.current_condition_index,
+            "current_condition_shape": (
+                None if state.current_condition_shape is None else list(state.current_condition_shape)
+            ),
+            "current_condition_text_finished": bool(state.current_condition_text_finished),
+            "last_generated_token_id": (
+                None if state.last_generated_token is None else int(state.last_generated_token.reshape(-1)[0].item())
+            ),
+            "all_generated_token_count": int(sum(int(tok.shape[1]) for tok in state.all_generated_tokens)),
+            "text_finished": bool(state.text_finished),
+            "stream_finished": bool(state.stream_finished),
+            "text_start_pos": int(state.text_start_pos),
+            "cache_length": int(self._async_cache_length(state.past_key_values)),
+        }
 
     def _get_async_sampling_generator(
         self,
@@ -697,6 +788,9 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         raw_logits: torch.Tensor,
         sampling_logits: torch.Tensor,
         probs: torch.Tensor,
+        condition_index: int | None = None,
+        condition_shape: list[int] | None = None,
+        condition_text_finished: bool | None = None,
     ) -> str | None:
         request_dir = _async_debug_request_dir(state.request_id)
         if request_dir is None:
@@ -716,9 +810,13 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
             {
                 "step_index": int(step_index),
                 "input_kind": input_kind,
-                "condition_index": state.current_condition_index,
-                "condition_shape": state.current_condition_shape,
-                "condition_text_finished": bool(state.current_condition_text_finished),
+                "condition_index": state.current_condition_index if condition_index is None else condition_index,
+                "condition_shape": state.current_condition_shape if condition_shape is None else condition_shape,
+                "condition_text_finished": (
+                    bool(state.current_condition_text_finished)
+                    if condition_text_finished is None
+                    else bool(condition_text_finished)
+                ),
                 "tensor_summaries": tensor_summaries,
             },
         )
@@ -995,14 +1093,6 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         condition_shape = (
             [1, int(condition.shape[0]), int(condition.shape[1])] if condition.ndim == 2 else list(condition.shape)
         )
-        state.pending_condition_chunks.append(
-            _MiniCPMOAsyncConditionChunk(
-                index=condition_index,
-                tensor=condition,
-                text_finished=finished,
-            )
-        )
-        state.all_conditions.append(condition)
         state.last_ingested_chunk_id = chunk_id
         state.text_finished = finished
         dump_dir_rel = self._dump_async_condition_components(
@@ -1021,12 +1111,24 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
                 "event": "enqueue",
                 "condition_index": condition_index,
                 "condition_shape": condition_shape,
-                "pending_condition_queue_size": int(len(state.pending_condition_chunks)),
-                "pending_audio_token_buffer_size": int(len(state.pending_audio_token_ids)),
+                "pending_condition_queue_size": int(
+                    len(state.pending_condition_chunks) + (1 if state.tts_generator is None else 0)
+                ),
+                "pending_audio_token_buffer_size": int(
+                    len(state.pending_audio_token_ids)
+                    if state.tts_generator is None
+                    else state.tts_generator.snapshot()["pending_audio_token_buffer_size"]
+                ),
                 "text_finished": bool(finished),
                 "async_tts_chunk_id": chunk_id,
                 "condition_dump_dir": dump_dir_rel,
             },
+        )
+        generator = self._ensure_async_tts_generator(state)
+        generator.enqueue_condition(
+            condition,
+            condition_index=condition_index,
+            text_finished=finished,
         )
 
     def _forward_async_hf_chunk(
@@ -1095,11 +1197,11 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
             "seed": self._async_sampling_seed,
             "generated_token_count_before": int(0 if generated is None else generated.shape[1]),
             "generated_token_tail": (
-                []
-                if generated is None or generated.numel() == 0
-                else [int(tok) for tok in generated[0, -16:].tolist()]
+                [] if generated is None or generated.numel() == 0 else [int(tok) for tok in generated[0, -16:].tolist()]
             ),
-            "raw_top_tokens": _topk_logits_summary(raw_logits, torch.softmax(raw_logits, dim=-1), self._async_debug_top_logprobs),
+            "raw_top_tokens": _topk_logits_summary(
+                raw_logits, torch.softmax(raw_logits, dim=-1), self._async_debug_top_logprobs
+            ),
             "sample_top_tokens": _topk_logits_summary(sampling_logits, probs, self._async_debug_top_logprobs),
             "greedy_token_id": int(greedy_token.reshape(-1)[0].item()),
             "sampled_token_id": int(next_token.reshape(-1)[0].item()),
@@ -1118,6 +1220,7 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         self,
         *,
         min_tokens: int,
+        caller: str = "unknown",
     ) -> None:
         if not self._async_chunk_enabled:
             return
@@ -1129,6 +1232,18 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         target = max(int(min_tokens), int(self._async_codec_chunk_frames), int(self._async_max_prefetch_tokens))
         device = self.emb_text.weight.device
         dtype = self.emb_text.weight.dtype
+        buffer_size_before = int(len(state.pending_audio_token_ids))
+        self._append_async_debug_event(
+            state,
+            file_name="talker_condition_events.jsonl",
+            payload={
+                "event": "top_up_begin",
+                "caller": caller,
+                "min_tokens": int(min_tokens),
+                "target_buffer_size": int(target),
+                **self._async_timeline_state_payload(state),
+            },
+        )
 
         safety_steps = 0
         while len(state.pending_audio_token_ids) < target and not state.stream_finished:
@@ -1180,9 +1295,8 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
             next_token, sample_trace, sample_tensors = self._sample_async_next_token(state, hidden_states[:, -1:, :])
             token_id = int(next_token.reshape(-1)[0].item())
             decode_tensor_dump_dir: str | None = None
-            if (
-                self._async_debug_dump_decode_tensor_steps < 0
-                or step_index < int(self._async_debug_dump_decode_tensor_steps)
+            if self._async_debug_dump_decode_tensor_steps < 0 or step_index < int(
+                self._async_debug_dump_decode_tensor_steps
             ):
                 decode_tensor_dump_dir = self._dump_async_decode_step_tensors(
                     state,
@@ -1231,6 +1345,19 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
                 state.stream_finished = True
                 break
 
+        self._append_async_debug_event(
+            state,
+            file_name="talker_condition_events.jsonl",
+            payload={
+                "event": "top_up_end",
+                "caller": caller,
+                "min_tokens": int(min_tokens),
+                "target_buffer_size": int(target),
+                "generated_token_count": int(len(state.pending_audio_token_ids) - buffer_size_before),
+                **self._async_timeline_state_payload(state),
+            },
+        )
+
     def preprocess_decode_async_chunk(
         self,
         input_ids: torch.Tensor,
@@ -1238,10 +1365,24 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         **info_dict: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         self._maybe_enqueue_async_condition_chunk(info_dict, is_prefill=False)
-        self._top_up_async_token_buffer(min_tokens=1)
 
         audio_embeds = self.embed_input_ids(input_ids.reshape(-1)).reshape(input_ids.shape[0], -1)
-        return input_ids, audio_embeds.to(device=input_ids.device, dtype=self.emb_text.weight.dtype), {}
+        output_embeds = audio_embeds.to(device=input_ids.device, dtype=self.emb_text.weight.dtype)
+        state = self._async_stream_state
+        if state is not None:
+            self._append_async_debug_event(
+                state,
+                file_name="talker_condition_events.jsonl",
+                payload={
+                    "event": "preprocess_decode_async_chunk",
+                    "input_ids_shape": self._shape_list(input_ids),
+                    "input_embeds_shape": self._shape_list(input_embeds),
+                    "output_embeds_shape": self._shape_list(output_embeds),
+                    "async_tts_chunk_id": info_dict.get("async_tts_chunk_id"),
+                    **self._async_timeline_state_payload(state),
+                },
+            )
+        return input_ids, output_embeds, {}
 
     def preprocess(
         self,
@@ -1316,9 +1457,26 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
 
             if is_async_chunk:
                 self._maybe_enqueue_async_condition_chunk(info_dict, is_prefill=is_first_prefill)
-                self._top_up_async_token_buffer(min_tokens=1)
 
             prompt_slice = take.to(device=dev, dtype=self.emb_text.weight.dtype, non_blocking=True)
+            state = self._async_stream_state
+            if is_async_chunk and state is not None:
+                self._append_async_debug_event(
+                    state,
+                    file_name="talker_condition_events.jsonl",
+                    payload={
+                        "event": "preprocess_prefill",
+                        "span_len": int(span_len),
+                        "is_first_prefill": bool(is_first_prefill),
+                        "input_ids_shape": self._shape_list(input_ids),
+                        "prompt_slice_shape": self._shape_list(prompt_slice),
+                        "prompt_total_len": int(total_prompt_len),
+                        "prefill_offset_start": int(offset),
+                        "prefill_offset_end": int(offset + span_len),
+                        "async_tts_chunk_id": info_dict.get("async_tts_chunk_id"),
+                        **self._async_timeline_state_payload(state),
+                    },
+                )
             return input_ids.clone(), prompt_slice, update_dict
 
         if bool(getattr(self.vllm_config.model_config, "async_chunk", False)):
@@ -1336,35 +1494,52 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         inputs_embeds: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor | IntermediateTensors:
-        return self.model(
+        outputs = self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             inputs_embeds=inputs_embeds,
         )
+        state = self._async_stream_state
+        if self._async_chunk_enabled and state is not None:
+            payload: dict[str, Any] = {
+                "event": "forward",
+                "input_ids_shape": self._shape_list(input_ids),
+                "positions_shape": self._shape_list(positions),
+                "inputs_embeds_shape": self._shape_list(inputs_embeds),
+                "has_intermediate_tensors": bool(intermediate_tensors is not None),
+                **self._async_timeline_state_payload(state),
+            }
+            if isinstance(outputs, torch.Tensor):
+                payload["output_shape"] = self._shape_list(outputs)
+            else:
+                payload["output_type"] = type(outputs).__name__
+            self._append_async_debug_event(
+                state,
+                file_name="talker_condition_events.jsonl",
+                payload=payload,
+            )
+        return outputs
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._async_chunk_enabled and self._async_stream_state is not None:
-            self._top_up_async_token_buffer(min_tokens=1)
             state = self._async_stream_state
-            if state is None or not state.pending_audio_token_ids:
-                raise RuntimeError("MiniCPM async talker private decoder has no buffered audio token to emit.")
-            token_id = int(state.pending_audio_token_ids.pop(0))
-            condition_index = (
-                state.pending_audio_token_condition_indices.pop(0)
-                if state.pending_audio_token_condition_indices
-                else None
-            )
-            condition_shape = (
-                state.pending_audio_token_condition_shapes.pop(0)
-                if state.pending_audio_token_condition_shapes
-                else None
-            )
-            text_finished = (
-                state.pending_audio_token_text_finished.pop(0)
-                if state.pending_audio_token_text_finished
-                else bool(state.current_condition_text_finished)
-            )
+            if state is not None:
+                self._append_async_debug_event(
+                    state,
+                    file_name="talker_condition_events.jsonl",
+                    payload={
+                        "event": "compute_logits_begin",
+                        "hidden_states_shape": self._shape_list(hidden_states),
+                        **self._async_timeline_state_payload(state),
+                    },
+                )
+            generator = self._ensure_async_tts_generator(state)
+            popped: MiniCPMO4_5PoppedToken = generator.pop_token()
+            token_id = int(popped.token_id)
+            condition_index = popped.condition_index
+            condition_shape = None if popped.condition_shape is None else list(popped.condition_shape)
+            text_finished = bool(popped.text_finished)
             self._record_async_emitted_audio_token(
                 state,
                 token_id=token_id,
@@ -1379,7 +1554,22 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
                 dtype=torch.float32,
             )
             logits[:, token_id] = 0.0
-            if token_id == self._async_eos_token_id:
+            self._append_async_debug_event(
+                state,
+                file_name="talker_condition_events.jsonl",
+                payload={
+                    "event": "compute_logits_emit",
+                    "hidden_states_shape": self._shape_list(hidden_states),
+                    "logits_shape": self._shape_list(logits),
+                    "emitted_token_id": int(token_id),
+                    "emitted_condition_index": condition_index,
+                    "emitted_condition_shape": condition_shape,
+                    "emitted_text_finished": bool(text_finished),
+                    "will_reset_stream_state": bool(popped.is_eos),
+                    **self._async_timeline_state_payload(state),
+                },
+            )
+            if popped.is_eos:
                 self._reset_async_stream_state()
             return logits
         return self.head_code[0](hidden_states)
