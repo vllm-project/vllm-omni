@@ -390,14 +390,33 @@ def test_reliability_fault_process_kill_request_failure(
     indirect=True,
 )
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_process_kill_new_request_fast_fail(
+def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
     omni_server_after_fault_function,
 ) -> None:
-    """Black-box: requests after fatal fault should fail quickly (no long blocking)."""
+    """Black-box: after worker SIGKILL, /health→503, chat fails fast, concurrent chat does not hang."""
     host = omni_server_after_fault_function.host
     port = omni_server_after_fault_function.port
+    model = omni_server_after_fault_function.model
+
+    deadline = time.monotonic() + 20.0
+    last_observation = ""
+    saw_503 = False
+    while time.monotonic() < deadline:
+        try:
+            status, body = _get_health_raw(host, port, timeout_sec=5)
+            last_observation = f"http={status}, body={body[:200]!r}"
+            if status == 503:
+                saw_503 = True
+                break
+        except Exception as exc:  # noqa: BLE001
+            last_observation = f"exception={exc!r}"
+        time.sleep(0.5)
+    assert saw_503, (
+        f"[process_kill health] expected /health to become 503 after fault injection, got {last_observation}"
+    )
+
     payload = {
-        "model": omni_server_after_fault_function.model,
+        "model": model,
         "messages": [{"role": "user", "content": "Say hello in one short sentence."}],
         "stream": False,
         "modalities": ["text"],
@@ -406,78 +425,18 @@ def test_reliability_fault_process_kill_new_request_fast_fail(
     try:
         status, body = _post_json_raw(host, port, "/v1/chat/completions", payload, timeout_sec=20)
         elapsed = time.monotonic() - start
-        assert elapsed < 15, f"request did not fail fast after fault: {elapsed:.2f}s"
-        assert status >= 500, f"expected server-side failure after fault, got status={status}, body={body[:200]!r}"
+        assert elapsed < 15, f"[process_kill fast_fail] request did not fail fast after fault: {elapsed:.2f}s"
+        assert status >= 500, (
+            f"[process_kill fast_fail] expected server-side failure after fault, "
+            f"got status={status}, body={body[:200]!r}"
+        )
     except Exception:
         elapsed = time.monotonic() - start
-        assert elapsed < 15, f"request exception was too slow after fault: {elapsed:.2f}s"
+        assert elapsed < 15, f"[process_kill fast_fail] request exception was too slow after fault: {elapsed:.2f}s"
 
-
-@pytest.mark.slow
-@pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
-@pytest.mark.parametrize(
-    "fault_injector",
-    [
-        pytest.param(
-            make_process_kill_fault_injector(
-                grep_patterns="VLLM::Worker",
-                signal_name="SIGKILL",
-                limit=1,
-                post_kill_wait_seconds=2.0,
-            ),
-            id="runtime_process_chain",
-        ),
-    ],
-    indirect=True,
-)
-@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_process_kill_health_unhealthy(
-    omni_server_after_fault_function,
-) -> None:
-    """Black-box: after runtime process kill, /health should report unhealthy."""
-    host = omni_server_after_fault_function.host
-    port = omni_server_after_fault_function.port
-    deadline = time.monotonic() + 20.0
-    last_observation = ""
-    while time.monotonic() < deadline:
-        try:
-            status, body = _get_health_raw(host, port, timeout_sec=5)
-            last_observation = f"http={status}, body={body[:200]!r}"
-            if status == 503:
-                return
-        except Exception as exc:  # noqa: BLE001
-            last_observation = f"exception={exc!r}"
-        time.sleep(0.5)
-    pytest.fail(f"expected /health to become 503 after fault injection, got {last_observation}")
-
-
-@pytest.mark.slow
-@pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
-@pytest.mark.parametrize(
-    "fault_injector",
-    [
-        pytest.param(
-            make_process_kill_fault_injector(
-                grep_patterns="VLLM::Worker",
-                signal_name="SIGKILL",
-                limit=1,
-                post_kill_wait_seconds=2.0,
-            ),
-            id="runtime_process_chain",
-        ),
-    ],
-    indirect=True,
-)
-@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_process_kill_concurrent_requests_no_hang(
-    omni_server_after_fault_function,
-) -> None:
-    """Black-box: concurrent requests should finish within timeout after fault."""
-    host = omni_server_after_fault_function.host
-    port = omni_server_after_fault_function.port
-    payload = json.dumps(
+    payload_json = json.dumps(
         {
-            "model": omni_server_after_fault_function.model,
+            "model": model,
             "messages": [{"role": "user", "content": "What is the capital of China? Answer in one word."}],
             "stream": False,
             "modalities": ["text"],
@@ -490,7 +449,7 @@ def test_reliability_fault_process_kill_concurrent_requests_no_hang(
                 post_chat_completions_raw,
                 host,
                 port,
-                payload,
+                payload_json,
                 timeout_sec=20,
             )
             for _ in range(4)
@@ -502,8 +461,8 @@ def test_reliability_fault_process_kill_concurrent_requests_no_hang(
         )
 
     elapsed = time.monotonic() - start
-    assert not pending, f"some fault-time requests hung: pending={len(pending)}"
-    assert elapsed < 30, f"fault-time request convergence is too slow: {elapsed:.2f}s"
+    assert not pending, f"[process_kill concurrent] some fault-time requests hung: pending={len(pending)}"
+    assert elapsed < 30, f"[process_kill concurrent] fault-time request convergence is too slow: {elapsed:.2f}s"
 
     fault_observed = False
     for future in done:
@@ -513,7 +472,9 @@ def test_reliability_fault_process_kill_concurrent_requests_no_hang(
                 fault_observed = True
         except Exception:
             fault_observed = True
-    assert fault_observed, "expected at least one request to fail after process-kill fault injection"
+    assert fault_observed, (
+        "[process_kill concurrent] expected at least one request to fail after process-kill fault injection"
+    )
 
 
 @pytest.mark.slow
@@ -552,6 +513,7 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
             },
             timeout_sec=25,
         )
+        # Minimal Qwen3-TTS shape (no ref_*): tests/e2e/online_serving/test_qwen3_tts_customvoice.py
         speech_status, speech_body = _post_json_raw(
             host,
             port,
@@ -559,8 +521,10 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
             {
                 "model": omni_server_function.model,
                 "input": "hello reliability test",
-                "voice": "alloy",
+                "stream": False,
                 "response_format": "wav",
+                "task_type": "CustomVoice",
+                "voice": "vivian",
             },
             timeout_sec=25,
         )
@@ -570,11 +534,13 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
     # Chat is expected to enter runtime-pressure path (5xx). Speech may return
     # request-level validation (4xx) or runtime failure (5xx), both valid as
     # black-box fault outcomes.
+    chat_error = _extract_error_contract(chat_body)
+    speech_error = _extract_error_contract(speech_body)
+    print(chat_status, speech_status, chat_error, speech_error)
+
     assert chat_status >= 500, f"expected chat error under OOM, got status={chat_status}"
     assert speech_status >= 400, f"expected speech non-2xx error under OOM, got status={speech_status}"
 
-    chat_error = _extract_error_contract(chat_body)
-    speech_error = _extract_error_contract(speech_body)
     assert chat_error is not None, f"chat error payload not OpenAI-compatible: {chat_body[:300]!r}"
     assert speech_error is not None, f"speech error payload not OpenAI-compatible: {speech_body[:300]!r}"
     assert "code" in chat_error, f"chat error lacks code field: {chat_error!r}"
