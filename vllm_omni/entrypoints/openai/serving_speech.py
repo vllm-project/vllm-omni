@@ -1158,7 +1158,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         - Cumulative mode (list): Engine returns growing list of chunks;
         we emit only the new tail on each iteration.
         - Per-step mode (tensor): Engine returns single tensor per iteration;
-        we emit it directly.
+        we emit it directly unless a finished output consolidates previously
+        streamed list chunks into one full waveform tensor, in which case we
+        emit only the not-yet-sent tail.
 
         Args:
             generator: Async generator from the engine
@@ -1169,8 +1171,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             Raw audio bytes for each chunk (with WAV header for first chunk if wav format)
         """
         prev_count = 0
+        emitted_samples = 0
         sample_rate_val = 24000
         first_chunk = True
+        saw_cumulative_list = False
 
         try:
             async for res in generator:
@@ -1188,8 +1192,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     # Cumulative mode: each update grows the list; emit only new tail.
                     new_chunks = audio_val[prev_count:]
                     prev_count = len(audio_val)
+                    saw_cumulative_list = True
                 else:
-                    # Per-step mode: each update is a single tensor; emit directly.
+                    # Per-step mode: each update is a single tensor. Most steps
+                    # are deltas, but the finished output may be the full
+                    # concatenated waveform after upstream consolidation.
                     if audio_val is not None:
                         new_chunks = [audio_val]
                         prev_count += 1
@@ -1202,6 +1209,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
                     if chunk_np.ndim > 1:
                         chunk_np = chunk_np.squeeze()
+
+                    if saw_cumulative_list and not isinstance(audio_val, list) and self._is_finished_output(res):
+                        chunk_np = chunk_np.reshape(-1)
+                        if emitted_samples >= chunk_np.shape[0]:
+                            continue
+                        chunk_np = chunk_np[emitted_samples:]
+
+                    if chunk_np.size == 0:
+                        continue
                     # For WAV format, emit header before first audio chunk
                     if response_format == "wav" and first_chunk:
                         # Assert that sample rate has been set from chunk metadata (not just default)
@@ -1223,12 +1239,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         base64_encode=False,
                     )
                     yield self.create_audio(audio_obj).audio_data
+                    emitted_samples += int(chunk_np.reshape(-1).shape[0])
         except asyncio.CancelledError:
             logger.info("Streaming request %s cancelled by client", request_id)
             raise
         except Exception as e:
             logger.exception("Streaming speech generation failed for %s: %s", request_id, e)
             raise
+
+    @staticmethod
+    def _is_finished_output(res) -> bool:
+        """Return True when the engine result marks request completion."""
+        finished = getattr(res, "finished", None)
+        if finished is not None:
+            return bool(finished)
+        request_output = getattr(res, "request_output", None)
+        request_finished = getattr(request_output, "finished", None) if request_output is not None else None
+        return bool(request_finished)
 
     @staticmethod
     def _extract_audio_output(res) -> tuple[dict | None, str | None]:

@@ -1514,6 +1514,116 @@ class TestStreamingResponse:
         assert response.status_code == 200
         assert "audio/wav" in response.headers["content-type"]
 
+    def test_generate_audio_chunks_skips_duplicate_full_waveform_final_output(self, mocker: MockerFixture):
+        """Finished full-waveform tensors should contribute only the unseen tail."""
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.default_sampling_params_list = [{}]
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        speech_server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+
+        def fake_create_audio(audio_obj):
+            tensor = np.asarray(audio_obj.audio_tensor, dtype=np.float32).reshape(-1)
+            return SimpleNamespace(audio_data=tensor.tobytes())
+
+        speech_server.create_audio = fake_create_audio
+
+        chunk1 = torch.tensor([0.1, 0.2], dtype=torch.float32)
+        chunk2 = torch.tensor([0.3, 0.4], dtype=torch.float32)
+        chunk3 = torch.tensor([0.5, 0.6], dtype=torch.float32)
+        full_audio = torch.cat([chunk1, chunk2, chunk3], dim=0)
+
+        class MockRequestOutput:
+            def __init__(self, audio, finished: bool):
+                self.multimodal_output = {"audio": audio}
+                self.finished = finished
+
+        outputs = [
+            SimpleNamespace(request_output=MockRequestOutput([chunk1], finished=False), finished=False),
+            SimpleNamespace(request_output=MockRequestOutput([chunk1, chunk2], finished=False), finished=False),
+            SimpleNamespace(request_output=MockRequestOutput(full_audio, finished=True), finished=True),
+        ]
+
+        async def fake_generator():
+            for output in outputs:
+                yield output
+
+        async def collect_chunks():
+            chunks = []
+            async for chunk in speech_server._generate_audio_chunks(
+                fake_generator(), request_id="stream-dup-test", response_format="pcm"
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        streamed_chunks = asyncio.run(collect_chunks())
+        streamed_audio = np.frombuffer(b"".join(streamed_chunks), dtype=np.float32)
+        expected_audio = np.concatenate([chunk1.numpy(), chunk2.numpy(), chunk3.numpy()])
+
+        assert np.array_equal(streamed_audio, expected_audio)
+
+    def test_generate_audio_chunks_handles_tensor_to_list_transition_before_final_tensor(self, mocker: MockerFixture):
+        """Switching from per-step tensors to cumulative lists should not re-emit earlier chunks."""
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.default_sampling_params_list = [{}]
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        speech_server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+
+        def fake_create_audio(audio_obj):
+            tensor = np.asarray(audio_obj.audio_tensor, dtype=np.float32).reshape(-1)
+            return SimpleNamespace(audio_data=tensor.tobytes())
+
+        speech_server.create_audio = fake_create_audio
+
+        chunk1 = torch.tensor([0.1, 0.2], dtype=torch.float32)
+        chunk2 = torch.tensor([0.3, 0.4], dtype=torch.float32)
+        chunk3 = torch.tensor([0.5, 0.6], dtype=torch.float32)
+        chunk4 = torch.tensor([0.7, 0.8], dtype=torch.float32)
+        full_audio = torch.cat([chunk1, chunk2, chunk3, chunk4], dim=0)
+
+        class MockRequestOutput:
+            def __init__(self, audio, finished: bool):
+                self.multimodal_output = {"audio": audio}
+                self.finished = finished
+
+        outputs = [
+            SimpleNamespace(request_output=MockRequestOutput(chunk1, finished=False), finished=False),
+            SimpleNamespace(request_output=MockRequestOutput(chunk2, finished=False), finished=False),
+            SimpleNamespace(request_output=MockRequestOutput([chunk1, chunk2, chunk3], finished=False), finished=False),
+            SimpleNamespace(request_output=MockRequestOutput(full_audio, finished=True), finished=True),
+        ]
+
+        async def fake_generator():
+            for output in outputs:
+                yield output
+
+        async def collect_chunks():
+            chunks = []
+            async for chunk in speech_server._generate_audio_chunks(
+                fake_generator(), request_id="stream-transition-test", response_format="pcm"
+            ):
+                chunks.append(chunk)
+            return chunks
+
+        streamed_chunks = asyncio.run(collect_chunks())
+        streamed_audio = np.frombuffer(b"".join(streamed_chunks), dtype=np.float32)
+        expected_audio = np.concatenate([chunk1.numpy(), chunk2.numpy(), chunk3.numpy(), chunk4.numpy()])
+
+        assert np.array_equal(streamed_audio, expected_audio)
+
 
 class TestSpeechBatchAPI:
     """Tests for the /v1/audio/speech/batch endpoint."""
