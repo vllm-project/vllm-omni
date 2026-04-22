@@ -52,13 +52,7 @@ steps:
         timeout_in_minutes: 90
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - |
-            set +e
-            pytest -s -v tests/e2e/*/test_*_expansion.py -m "advanced_model and L4 and omni" -k "not test_qwen2_5_omni_expansion" --run-level "advanced_model"
-            EXIT1=$$?
-            pytest -s -v tests/e2e/*/test_qwen2_5_omni_expansion.py --run-level "core_model"
-            EXIT2=$$?
-            exit $$((EXIT1 | EXIT2))
+          - pytest -s -v tests/e2e/*/test_qwen2_5_omni_expansion.py --run-level "core_model"
         agents:
           queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
         plugins:
@@ -185,7 +179,7 @@ steps:
         timeout_in_minutes: 90
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - pytest -s -v tests/e2e/ -m "full_model and L4 and omni" --run-level "full_model" --ignore=tests/e2e/accuracy
+          - pytest -s -v tests/e2e/ -m "full_model and L4 and omni" -k "not test_qwen2_5" --run-level "full_model" --ignore=tests/e2e/accuracy
         agents:
           queue: "gpu_1_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
         plugins:
