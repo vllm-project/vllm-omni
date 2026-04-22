@@ -1606,6 +1606,11 @@ class AsyncOmniEngine:
                     continue
                 if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
                     cfg.engine_args = OmegaConf.create({})
+                additional_config = kwargs.get("additional_config")
+                if additional_config is not None:
+                    current_additional_config = getattr(cfg.engine_args, "additional_config", None)
+                    if current_additional_config in (None, {}):
+                        cfg.engine_args.additional_config = additional_config
                 if kwargs.get("lora_path") is not None:
                     if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
                         cfg.engine_args.lora_path = kwargs["lora_path"]
@@ -1652,7 +1657,7 @@ class AsyncOmniEngine:
                     if not hasattr(cfg.engine_args, "quantization") or cfg.engine_args.quantization is None:
                         cfg.engine_args.quantization = quantization
             except Exception as e:
-                logger.warning("Failed to inject LoRA config for stage: %s", e)
+                logger.warning("Failed to inject diffusion config overrides for stage: %s", e)
 
         return config_path, stage_configs
 
