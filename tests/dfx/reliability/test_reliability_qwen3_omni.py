@@ -80,7 +80,12 @@ OOM_INJECTION_CONFIG = {
 # memory and stop, then rely on a heavy multimodal forward to hit OOM.
 OOM_RECOVER_INJECTION_CONFIG = {
     "device": _default_oom_device_spec(),
-    "target_mem_ratio": 0.88,
+    # ``strict=False`` stops at this fraction of *initial* free memory per GPU (see helpers sidecar).
+    # On multi-GPU hosts a mild ratio plus a small e2e-style mix can still leave several GB free
+    # on a data-parallel device and the request succeeds; 0.92+ pairs better with the heavy
+    # probe payload below. Raise toward 0.94 only if fault phase still never fails; avoid strict=True
+    # here so the API process is not squeezed to zero slack.
+    "target_mem_ratio": 0.92,
     "hold_seconds": 0,
     "startup_timeout_sec": 20,
     "strict": False,
@@ -124,19 +129,22 @@ def _get_mix_prompt() -> str:
 
 
 def _mix_chat_completions_probe_payload(omni_server: _HasServeArgs) -> dict[str, Any]:
-    """Heavy multimodal ``/v1/chat/completions`` body (same media shape as expansion ``test_mix_to_text_audio_001``).
+    """Heavy multimodal ``/v1/chat/completions`` body for OOM recover tests.
 
-    Uses ``stream=True`` like that e2e case; reliability checks use raw HTTP status + JSON body.
+    Uses the same synthetic sizes as ``test_reliability_fault_gpu_oom_chat_large_payload_failure``
+    (large vision tensors + long text), not the light expansion mix (224² / 5s audio): under
+    ``strict=False`` sidecars, a small mix often still completes on a GPU that retains multi-GB
+    free after the hog stops at ``target_mem_ratio``.
     """
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
-    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(1280, 720, 161)['base64']}"
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
+    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(20, 1)['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=_get_system_prompt(),
         video_data_url=video_data_url,
         image_data_url=image_data_url,
         audio_data_url=audio_data_url,
-        content_text="What is recited in the audio? What is in this image? What is in this video?",
+        content_text=f"What is recited in the audio? What is in this image? What is in this video? " * 200,
     )
     return {
         "model": omni_server.model,
@@ -151,7 +159,18 @@ def _fault_keywords_match_response(*, status: int, body: bytes) -> bool:
     if status >= 400:
         return True
     text = body.decode("utf-8", errors="replace").lower()
-    return any(key in text for key in FAULT_ERROR_KEYWORDS)
+    # Avoid matching bare ``"500"`` / ``"503"`` in successful streamed bodies (base64/SSE noise).
+    body_fault_hints = (
+        "the request failed",
+        "oom",
+        "out of memory",
+        "cuda",
+        "orchestrator",
+        "timeout",
+        "connection refused",
+        "connection reset",
+    )
+    return any(key in text for key in body_fault_hints)
 
 
 def _stage_config_path_from_omni_server(omni_server: _HasServeArgs) -> str | None:
