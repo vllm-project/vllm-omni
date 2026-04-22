@@ -195,7 +195,7 @@ def _md5(tensor: torch.Tensor) -> str:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.cpu
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 class TestBasicConnector:
     """Verify connector initialization, put, cleanup, and health check."""
 
@@ -255,7 +255,7 @@ class TestBasicConnector:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.cpu
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 class TestEndToEnd:
     """E2E RDMA transfer: tensor, bytes, object, zero-copy, large payload, mixed types."""
 
@@ -448,7 +448,7 @@ class TestEndToEnd:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.cpu
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 class TestLifecycle:
     """Close, context manager, double-close safety."""
 
@@ -524,7 +524,7 @@ class TestGPUPool:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.cpu
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 class TestStressCorrectness:
     """
     Slow but high-value regression tests: concurrent put+get with data
