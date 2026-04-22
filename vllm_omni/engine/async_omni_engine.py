@@ -1319,6 +1319,12 @@ class AsyncOmniEngine:
         if "dtype" in normalized_kwargs:
             stage_engine_args["dtype"] = normalized_kwargs["dtype"]
 
+        # New split fields for diffusers adapter kwargs.
+        if kwargs.get("diffusers_load_kwargs") is not None:
+            stage_engine_args["diffusers_load_kwargs"] = kwargs["diffusers_load_kwargs"]
+        if kwargs.get("diffusers_call_kwargs") is not None:
+            stage_engine_args["diffusers_call_kwargs"] = kwargs["diffusers_call_kwargs"]
+
         default_stage_cfg = [
             {
                 "stage_id": 0,
