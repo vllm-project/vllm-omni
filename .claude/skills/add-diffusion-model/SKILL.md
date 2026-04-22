@@ -282,10 +282,11 @@ For Omni or custom models, create:
 
 Required updates:
 1. `docs/user_guide/diffusion/parallelism_acceleration.md` — parallelism support table
-2. `docs/user_guide/diffusion/teacache.md` — if TeaCache supported
-3. `docs/user_guide/diffusion/cache_dit_acceleration.md` — if Cache-DiT supported
-4. `examples/offline_inference/xxx/README.md` — offline example docs
-5. `examples/online_serve/xxx/README.md` — online serve docs
+2. `docs/user_guide/diffusion/cpu_offload_diffusion.md` — if CPU offload supported (add to supported models table)
+3. `docs/user_guide/diffusion/teacache.md` — if TeaCache supported
+4. `docs/user_guide/diffusion/cache_dit_acceleration.md` — if Cache-DiT supported
+5. `examples/offline_inference/xxx/README.md` — offline example docs
+6. `examples/online_serve/xxx/README.md` — online serve docs
 
 ### Step 8: Add E2E Tests (Recommended)
 
@@ -511,6 +512,37 @@ class YourTransformer(nn.Module):
 After adding parallelism support, update:
 1. `docs/user_guide/diffusion/parallelism_acceleration.md` — add your model to the support table
 2. Record which parallelism methods are supported (USP, Ring, CFG, TP, HSDP, VAE-Patch)
+
+### Step 11: Add CPU Offload Support
+
+Implement `SupportsModuleOffload` on your pipeline class to enable
+`--enable-cpu-offload` and `--enable-layerwise-offload`. The protocol
+declares which submodules the offloader should manage:
+
+```python
+from typing import ClassVar
+from vllm_omni.diffusion.models.interface import SupportsModuleOffload
+
+class YourPipeline(nn.Module, SupportsModuleOffload):
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    _resident_modules: ClassVar[list[str]] = []  # optional
+```
+
+- `_dit_modules`: denoising submodules (kept on GPU during diffusion loop)
+- `_encoder_modules`: encoder/vision submodules (offloaded to CPU during diffusion loop)
+- `_vae_modules`: VAE(s) (handled by both sequential and layerwise backends)
+- `_resident_modules`: additional modules to pin on GPU during layerwise
+  offloading (e.g. embedders, connectors). Only used by the layerwise
+  backend. Optional — defaults to `[]`.
+
+All attribute names support dotted paths for nested submodules
+(e.g. `"pipe.transformer"`, `"bagel.time_embedder"`).
+
+Pipelines without `SupportsModuleOffload` fall back to scanning
+well-known attribute names (`transformer`, `text_encoder`, `vae`,
+etc.), which fails for non-standard names.
 
 ---
 
