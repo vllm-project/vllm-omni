@@ -298,6 +298,12 @@ def parse_args() -> Namespace:
         default=None,
         help="Voice to use instead of audio file.",
     )
+    parser.add_argument(
+        "--cfg-alpha",
+        type=float,
+        default=None,
+        help="CFG alpha for flow-matching guidance (default: use value from stage config, typically 1.2).",
+    )
     return parser.parse_args()
 
 
@@ -349,8 +355,13 @@ def main(args: Any) -> None:
 
     inputs = compose_request(model_name, text_chunk, audio_prompt_file, args)
 
+    extra_args = {}
+    if args.cfg_alpha is not None:
+        extra_args["cfg_alpha"] = args.cfg_alpha
+
     sampling_params = SamplingParams(
         max_tokens=max_num_tokens,
+        extra_args=extra_args if extra_args else None,
     )
     sampling_params_list = [
         sampling_params,

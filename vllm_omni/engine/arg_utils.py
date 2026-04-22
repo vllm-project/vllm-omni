@@ -170,6 +170,7 @@ class OmniEngineArgs(EngineArgs):
     output_modalities: list[str] | None = None
     log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
+    has_sampling_extra_args: bool = False
 
     def __post_init__(self) -> None:
         if self.worker_cls is None:
@@ -326,6 +327,7 @@ class OmniEngineArgs(EngineArgs):
             subtalker_sampling_params=self.subtalker_sampling_params,
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,
+            has_sampling_extra_args=self.has_sampling_extra_args,
         )
         return omni_config
 

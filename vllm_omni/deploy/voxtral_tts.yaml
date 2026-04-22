@@ -36,6 +36,8 @@ stages:
       max_tokens: 2048
       seed: 42
       repetition_penalty: 1.1
+      extra_args:
+        cfg_alpha: 1.2
     tokenizer_mode: mistral
     config_format: mistral
     load_format: mistral
