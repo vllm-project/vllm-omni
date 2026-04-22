@@ -155,9 +155,9 @@ class DistributedVaeExecutor:
         return result
 
     def _sync_final_result(self, rank0_result, output_ndim, output_device, output_dtype):
-        shape_tensor = torch.empty((output_ndim,), device=output_device, dtype=torch.int64)
+        shape_tensor = torch.empty((output_ndim,), device=output_device, dtype=self._meta_dtype)
         if self.rank == 0:
-            shape_tensor.copy_(torch.tensor(tuple(rank0_result.shape), device=output_device, dtype=torch.int64))
+            shape_tensor.copy_(torch.tensor(tuple(rank0_result.shape), device=output_device, dtype=self._meta_dtype))
         dist.broadcast(shape_tensor, src=0, group=self.group)
 
         if self.rank != 0:
