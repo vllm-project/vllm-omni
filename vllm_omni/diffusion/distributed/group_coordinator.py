@@ -705,6 +705,8 @@ class PipelineGroupCoordinator(GroupCoordinator):
         # NCCL; subsequent calls only post async tensor sends/recvs.
         self.dict_schema_cache: dict[str, dict[int, list[tuple[str, Any]]]] = {}
         self.dict_recv_buffer: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
+
+        self.dict_schema_keepalive: list[torch.Tensor] = []
         self.recv_dict_tasks_queue: list[tuple[str, int]] = []
         self.receiving_dict_tasks: list[
             tuple[dict[str, Any], list[torch.distributed.Work], str, int]
@@ -730,6 +732,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
         self.dict_schema_cache = {}
         self.dict_recv_buffer = {}
+        self.dict_schema_keepalive = []
         self.recv_dict_tasks_queue = []
         self.receiving_dict_tasks = []
 
@@ -897,70 +900,37 @@ class PipelineGroupCoordinator(GroupCoordinator):
             recv_prev_shape = recv_prev_shape_tensor
         return torch.Size(recv_prev_shape)
 
-    def _communicate_dict_schema(
-        self, send_metadata: list[tuple[str, Any]] | None = None, recv: bool = False
-    ) -> list[tuple[str, Any]] | None:
+    def _isend_dict_schema(
+        self, send_metadata: list[tuple[str, Any]]
+    ) -> tuple[list[torch.distributed.Work], list[torch.Tensor]]:
+        """Non-blocking schema send. Returns (handles, keepalive_tensors).
+        Caller must keep the tensors alive until the handles complete.
+        """
         send_group = (
             self.device_groups[self.rank_in_group % 2] if self.world_size == 2 else self.device_group
         )
+        payload_bytes = pickle.dumps(send_metadata)
+        payload_array = bytearray(payload_bytes)
+        payload_tensor = torch.frombuffer(payload_array, dtype=torch.uint8).to(self.device)
+        send_size_tensor = torch.tensor(
+            [payload_tensor.numel()], device=self.device, dtype=torch.int64
+        )
+        h_size = torch.distributed.isend(send_size_tensor, dst=self.next_rank, group=send_group)
+        h_bytes = torch.distributed.isend(payload_tensor, dst=self.next_rank, group=send_group)
+        return [h_size, h_bytes], [send_size_tensor, payload_tensor]
+
+    def _recv_dict_schema(self) -> list[tuple[str, Any]]:
+        """Blocking schema recv - must wait because the size value is
+        needed before allocating the payload buffer.
+        """
         recv_group = (
             self.device_groups[(self.rank_in_group + 1) % 2] if self.world_size == 2 else self.device_group
         )
-
-        # Phase 1: exchange payload sizes.
-        payload_tensor: torch.Tensor | None = None
-        recv_size_tensor: torch.Tensor | None = None
-        ops: list[torch.distributed.P2POp] = []
-        if recv:
-            recv_size_tensor = torch.empty(1, device=self.device, dtype=torch.int64)
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_size_tensor, self.prev_rank, recv_group
-                )
-            )
-        if send_metadata is not None:
-            payload_bytes = pickle.dumps(send_metadata)
-            payload_array = bytearray(payload_bytes)
-            payload_tensor = torch.frombuffer(payload_array, dtype=torch.uint8).to(self.device)
-            send_size_tensor = torch.tensor(
-                [payload_tensor.numel()], device=self.device, dtype=torch.int64
-            )
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend, send_size_tensor, self.next_rank, send_group
-                )
-            )
-        if ops:
-            for req in torch.distributed.batch_isend_irecv(ops):
-                req.wait()
-        current_omni_platform.synchronize()
-
-        # Phase 2: exchange pickled bytes.
-        recv_payload: torch.Tensor | None = None
-        ops = []
-        if recv:
-            assert recv_size_tensor is not None
-            recv_payload = torch.empty(int(recv_size_tensor.item()), device=self.device, dtype=torch.uint8)
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_payload, self.prev_rank, recv_group
-                )
-            )
-        if payload_tensor is not None:
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend, payload_tensor, self.next_rank, send_group
-                )
-            )
-        if ops:
-            for req in torch.distributed.batch_isend_irecv(ops):
-                req.wait()
-        current_omni_platform.synchronize()
-
-        if recv:
-            assert recv_payload is not None
-            return pickle.loads(recv_payload.cpu().numpy().tobytes())
-        return None
+        recv_size_tensor = torch.empty(1, device=self.device, dtype=torch.int64)
+        torch.distributed.recv(recv_size_tensor, src=self.prev_rank, group=recv_group)
+        recv_payload = torch.empty(int(recv_size_tensor.item()), device=self.device, dtype=torch.uint8)
+        torch.distributed.recv(recv_payload, src=self.prev_rank, group=recv_group)
+        return pickle.loads(recv_payload.cpu().numpy().tobytes())
 
     def pipeline_send(self, tensor: torch.Tensor, name: str = "latent", segment_idx: int = -1) -> None:
         tensor = tensor.contiguous()
@@ -998,11 +968,13 @@ class PipelineGroupCoordinator(GroupCoordinator):
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
 
         cache = self.dict_schema_cache.setdefault(name, {})
+        handles: list[torch.distributed.Work] = []
         if segment_idx not in cache:
-            self._communicate_dict_schema(send_metadata=metadata_list)
+            schema_handles, keepalive = self._isend_dict_schema(metadata_list)
+            handles.extend(schema_handles)
+            self.dict_schema_keepalive.extend(keepalive)
             cache[segment_idx] = metadata_list
 
-        handles: list[torch.distributed.Work] = []
         for tensor in tensor_list:
             if tensor.numel() == 0:
                 continue
@@ -1026,8 +998,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         """
         cache = self.dict_schema_cache.setdefault(name, {})
         if segment_idx not in cache:
-            metadata_list = self._communicate_dict_schema(recv=True)
-            assert metadata_list is not None
+            metadata_list = self._recv_dict_schema()
             cache[segment_idx] = metadata_list
             buffers: dict[str, torch.Tensor] = {}
             for key, value in metadata_list:
