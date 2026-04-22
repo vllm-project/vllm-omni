@@ -108,6 +108,8 @@ class OrchestratorRequestState:
 
     # Metrics: timestamp when request was submitted to each stage
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
+    input_preprocess_time_ms: float = 0.0
+    build_add_request_message_time_ms: float = 0.0
     mm_processor_kwargs: dict | None = None
     mm_features: list | None = None
 
@@ -419,6 +421,8 @@ class Orchestrator:
                     "metrics": stage_metrics,
                     "finished": finished and stage_id == req_state.final_stage_id,
                     "stage_submit_ts": submit_ts,
+                    "input_preprocess_time_ms": req_state.input_preprocess_time_ms,
+                    "build_add_request_message_time_ms": req_state.build_add_request_message_time_ms,
                 }
             )
         elif stage_metrics is not None:
@@ -877,6 +881,8 @@ class Orchestrator:
             prompt=original_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            input_preprocess_time_ms=float(msg.get("input_preprocess_time_ms", 0.0)),
+            build_add_request_message_time_ms=float(msg.get("build_add_request_message_time_ms", 0.0)),
             mm_features=getattr(prompt, "mm_features", None),  # Save mm_features for PD
         )
         req_state.streaming.enabled = is_streaming

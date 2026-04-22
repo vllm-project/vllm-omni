@@ -175,12 +175,12 @@ class DiffusionEngine:
 
         step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
         logger.info(
-            "DiffusionEngine.step breakdown: preprocess=%.2f ms, "
-            "add_req_and_wait=%.2f ms, postprocess=%.2f ms, total=%.2f ms",
+            "[StageTiming stage=%s diffusion] total=%.2fs preprocess=%.2fms exec=%.2fs postprocess=%.2fms",
+            self.od_config.stage_id,
+            step_total_ms / 1000.0,
             preprocess_time * 1000,
-            exec_total_time * 1000,
+            exec_total_time,
             postprocess_time * 1000,
-            step_total_ms,
         )
 
         # Convert to OmniRequestOutput format

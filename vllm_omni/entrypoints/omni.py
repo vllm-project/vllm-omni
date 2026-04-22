@@ -128,6 +128,7 @@ class Omni(OmniBase):
                     wall_start_ts,
                     final_stage_id,
                 )
+                metrics.stage_labels = dict(self._stage_labels)
                 req_state = ClientRequestState(req_id)
                 req_state.metrics = metrics
                 self.request_states[req_id] = req_state

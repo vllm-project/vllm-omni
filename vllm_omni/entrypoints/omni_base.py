@@ -174,6 +174,7 @@ class OmniBase(PDDisaggregationMixin):
         self._stage_meta_list = [
             types.SimpleNamespace(**self.engine.get_stage_metadata(i)) for i in range(self.engine.num_stages)
         ]
+        self._stage_labels = self.build_stage_labels()
 
         logger.info(
             "[%s] Initialized with %s stages for model %s",
@@ -247,8 +248,12 @@ class OmniBase(PDDisaggregationMixin):
         try:
             if req_state is None or req_state.metrics is None:
                 return
+            timing_line = req_state.metrics.format_request_timing_line(request_id)
+            if timing_line is not None and self.num_stages > 1:
+                logger.info("%s", timing_line)
             summary = req_state.metrics.build_and_log_summary()
-            logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
+            if summary:
+                logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
         except Exception:
             logger.exception(
                 "[%s] Failed to build/log summary for req=%s",
@@ -264,6 +269,18 @@ class OmniBase(PDDisaggregationMixin):
             self.output_modalities,
             self._stage_meta_list,
         )
+
+    def build_stage_labels(self) -> dict[int, str]:
+        stage_labels: dict[int, str] = {}
+        for idx, stage_meta in enumerate(self._stage_meta_list):
+            stage_type = getattr(stage_meta, "stage_type", None)
+            model_stage = getattr(stage_meta, "model_stage", None)
+            if stage_type == "diffusion":
+                stage_name = "diffusion"
+            else:
+                stage_name = model_stage or stage_type or f"stage_{idx}"
+            stage_labels[idx] = f"{idx}:{stage_name}"
+        return stage_labels
 
     def _process_stage_metrics_message(self, msg: dict[str, Any]) -> None:
         req_id = msg.get("request_id")
@@ -377,6 +394,12 @@ class OmniBase(PDDisaggregationMixin):
         metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, now)
 
         _m = result.get("metrics")
+        input_preprocess_time_ms = result.get("input_preprocess_time_ms")
+        if input_preprocess_time_ms is not None:
+            metrics.input_preprocess_time_ms = float(input_preprocess_time_ms)
+        build_add_request_message_time_ms = result.get("build_add_request_message_time_ms")
+        if build_add_request_message_time_ms is not None:
+            metrics.build_add_request_message_time_ms = float(build_add_request_message_time_ms)
         if finished and _m is not None:
             metrics.on_stage_metrics(stage_id, req_id, _m)
 

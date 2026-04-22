@@ -1009,6 +1009,7 @@ class AsyncOmniEngine:
         message_type: str = "add_request",
     ) -> dict[str, Any]:
         """Build an add_request message after stage-0 preprocessing."""
+        build_add_request_message_start = time.perf_counter()
         effective_sampling_params_list = (
             list(sampling_params_list) if sampling_params_list is not None else list(self.default_sampling_params_list)
         )
@@ -1074,6 +1075,7 @@ class AsyncOmniEngine:
             )
             prompt = request
 
+        build_add_request_message_time_ms = (time.perf_counter() - build_add_request_message_start) * 1000.0
         return {
             "type": message_type,
             "request_id": request_id,
@@ -1081,6 +1083,8 @@ class AsyncOmniEngine:
             "original_prompt": original_prompt,
             "sampling_params_list": effective_sampling_params_list,
             "final_stage_id": final_stage_id,
+            "input_preprocess_time_ms": build_add_request_message_time_ms,
+            "build_add_request_message_time_ms": build_add_request_message_time_ms,
         }
 
     def _enqueue_cfg_companions(

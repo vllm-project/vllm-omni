@@ -119,10 +119,14 @@ class OrchestratorAggregator:
         log_stats: bool,
         wall_start_ts: float,
         final_stage_id_for_e2e: dict[str, int] | int,
+        stage_labels: dict[int, str] | None = None,
     ) -> None:
         self.num_stages = int(num_stages)
         self.log_stats = bool(log_stats)
         self.final_stage_id_for_e2e = final_stage_id_for_e2e
+        self.stage_labels = dict(stage_labels or {})
+        self.input_preprocess_time_ms = 0.0
+        self.build_add_request_message_time_ms = 0.0
         self.init_run_state(wall_start_ts)
         self.stage_events: dict[str, list[StageRequestStats]] = {}
         self.transfer_events: dict[
@@ -147,6 +151,57 @@ class OrchestratorAggregator:
         self.diffusion_metrics: defaultdict[str, defaultdict[str, float]] = defaultdict(
             lambda: defaultdict(float)
         )  # {request_id: {diffusion_metrics_key: accumulated_metrics_data}}
+
+    def format_stage_label(self, stage_id: int | None) -> str:
+        if stage_id is None:
+            return "?"
+        return self.stage_labels.get(stage_id, str(stage_id))
+
+    def get_request_timing_fields(self, request_id: str) -> tuple[str, float, float, float] | None:
+        rid = str(request_id)
+        e2e_evt = next((evt for evt in self.e2e_events if evt.request_id == rid), None)
+        if e2e_evt is None:
+            return None
+        engine_pipeline_time_ms = float(e2e_evt.e2e_total_ms)
+        input_preprocess_time_ms = float(self.input_preprocess_time_ms)
+        return (
+            rid,
+            engine_pipeline_time_ms,
+            input_preprocess_time_ms,
+            engine_pipeline_time_ms + input_preprocess_time_ms,
+        )
+
+    def format_request_timing_line(self, request_id: str) -> str | None:
+        timing_fields = self.get_request_timing_fields(request_id)
+        if timing_fields is None:
+            return None
+        rid, engine_pipeline_time_ms, input_preprocess_time_ms, request_wall_time_ms = timing_fields
+
+        def format_seconds(time_ms: float) -> str:
+            return f"{time_ms / 1000.0:.2f}s"
+
+        stages = ",".join(
+            f"{self.format_stage_label(evt.stage_id)}={format_seconds(float(evt.stage_gen_time_ms))}"
+            for evt in sorted(
+                self.stage_events.get(rid, []),
+                key=lambda evt: evt.stage_id if evt.stage_id is not None else -1,
+            )
+        )
+        transfers = ",".join(
+            f"{evt.from_stage}->{evt.to_stage}={evt.total_time_ms:.2f}ms"
+            for evt in sorted(
+                (evt for evt in self.transfer_events.values() if evt.request_id == rid and evt.total_time_ms > 0.0),
+                key=lambda evt: (evt.from_stage, evt.to_stage),
+            )
+        )
+        transfers_fragment = f" transfers=[{transfers}]" if transfers else ""
+        return (
+            f"[OmniTiming] req={rid} "
+            f"total={format_seconds(request_wall_time_ms)} "
+            f"preprocess={format_seconds(input_preprocess_time_ms)} "
+            f"engine={format_seconds(engine_pipeline_time_ms)} "
+            f"stages=[{stages}]{transfers_fragment}"
+        )
 
     def _get_or_create_transfer_event(
         self,
@@ -482,6 +537,10 @@ class OrchestratorAggregator:
 
         overall_summary = {
             "e2e_requests": int(self.e2e_count),
+            "request_wall_time_ms": float(self.e2e_total_ms + self.input_preprocess_time_ms),
+            "input_preprocess_time_ms": float(self.input_preprocess_time_ms),
+            "build_add_request_message_time_ms": float(self.build_add_request_message_time_ms),
+            "engine_pipeline_time_ms": float(self.e2e_total_ms),
             "e2e_wall_time_ms": float(wall_time_ms),
             "e2e_total_tokens": int(self.e2e_total_tokens),
             "e2e_avg_time_per_request_ms": float(e2e_avg_req),
@@ -515,6 +574,17 @@ class OrchestratorAggregator:
             e2e_evt = next((e for e in self.e2e_events if e.request_id == rid), None)
             if e2e_evt:
                 e2e_data = _build_row(e2e_evt, E2E_FIELDS)
+                timing_fields = self.get_request_timing_fields(rid)
+                if timing_fields is not None:
+                    _, engine_pipeline_time_ms, input_preprocess_time_ms, request_wall_time_ms = timing_fields
+                    e2e_data.update(
+                        {
+                            "engine_pipeline_time_ms": engine_pipeline_time_ms,
+                            "input_preprocess_time_ms": input_preprocess_time_ms,
+                            "build_add_request_message_time_ms": float(self.build_add_request_message_time_ms),
+                            "request_wall_time_ms": request_wall_time_ms,
+                        }
+                    )
                 result_e2e_table.append({"request_id": rid, **e2e_data})
 
                 # filter out all-zero fields for logging
@@ -551,7 +621,11 @@ class OrchestratorAggregator:
             # then remove diffusion_metrics from the table
             stage_rows = []
             for evt in stage_evts:
-                row = {"stage_id": evt.stage_id, **_build_row(evt, local_stage_fields)}
+                row = {
+                    "stage_id": evt.stage_id,
+                    "stage": self.format_stage_label(evt.stage_id),
+                    **_build_row(evt, local_stage_fields),
+                }
                 if evt.diffusion_metrics:
                     row.update(evt.diffusion_metrics)
                 row.pop("diffusion_metrics", None)  # Remove the dict itself
@@ -564,7 +638,7 @@ class OrchestratorAggregator:
                 all_value_fields = set()
                 for row in stage_rows:
                     for k in row.keys():
-                        if k != "stage_id":
+                        if k not in {"stage_id", "stage"}:
                             all_value_fields.add(k)
                 value_fields_list = []
                 for field in sorted(all_value_fields):
@@ -583,7 +657,7 @@ class OrchestratorAggregator:
                         _format_table(
                             f"StageRequestStats [request_id={rid}]",
                             stage_rows,
-                            column_key="stage_id",
+                            column_key="stage",
                             value_fields=value_fields_list,
                         ),
                     )

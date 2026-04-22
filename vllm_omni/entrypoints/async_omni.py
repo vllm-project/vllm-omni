@@ -290,6 +290,7 @@ class AsyncOmni(EngineClient, OmniBase):
                 wall_start_ts,
                 final_stage_id_for_e2e,
             )
+            metrics.stage_labels = dict(self._stage_labels)
             req_state = ClientRequestState(request_id)
             req_state.metrics = metrics
             self.request_states[request_id] = req_state
@@ -304,11 +305,12 @@ class AsyncOmni(EngineClient, OmniBase):
             # Add request(s) to stage 0. For streaming inputs, submit
             # chunks incrementally through streaming_update.
             if isinstance(prompt, AsyncGenerator):
-                input_stream_task = await self._add_streaming_input_request(
+                input_stream_task = await self.add_streaming_input_request(
                     request_id=request_id,
                     input_stream=prompt,
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id_for_e2e,
+                    req_start_ts=req_start_ts,
                 )
             else:
                 await self.engine.add_request_async(
@@ -317,9 +319,9 @@ class AsyncOmni(EngineClient, OmniBase):
                     sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id_for_e2e,
                 )
-            submit_ts = time.time()
-            req_state.metrics.stage_first_ts[0] = submit_ts
-            req_start_ts[request_id] = submit_ts
+                submit_ts = time.time()
+                req_state.metrics.stage_first_ts[0] = submit_ts
+                req_start_ts[request_id] = submit_ts
 
             # Process results based on mode
             # Both sequential and async_chunk modes read the same message stream
@@ -349,20 +351,21 @@ class AsyncOmni(EngineClient, OmniBase):
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
 
-    async def _add_streaming_input_request(
+    async def add_streaming_input_request(
         self,
         *,
         request_id: str,
         input_stream: AsyncGenerator[StreamingInput, None],
         sampling_params_list: Sequence[OmniSamplingParams],
         final_stage_id: int,
+        req_start_ts: dict[str, float],
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
         if not sampling_params_list:
             raise ValueError("sampling_params_list cannot be empty for streaming input")
         # only check thinker's sampling params now
         stage0_params = sampling_params_list[0]
-        self._validate_streaming_input_sampling_params(stage0_params)
+        self.validate_streaming_input_sampling_params(stage0_params)
 
         req_state = self.request_states[request_id]
 
@@ -372,13 +375,18 @@ class AsyncOmni(EngineClient, OmniBase):
 
         has_submitted_first_chunk = False
 
+        def mark_stage0_submit() -> None:
+            submit_ts = time.time()
+            req_state.metrics.stage_first_ts[0] = submit_ts
+            req_start_ts[request_id] = submit_ts
+
         async def handle_inputs() -> None:
             nonlocal has_submitted_first_chunk
             cancelled = False
             try:
                 async for chunk in input_stream:
                     chunk_params = getattr(chunk, "sampling_params", None) or stage0_params
-                    self._validate_streaming_input_sampling_params(chunk_params)
+                    self.validate_streaming_input_sampling_params(chunk_params)
                     chunk_sampling_params_list = list(sampling_params_list)
                     chunk_sampling_params_list[0] = chunk_params
                     chunk_prompt = chunk.prompt
@@ -393,6 +401,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_stage_id=final_stage_id,
                             resumable=True,
                         )
+                        mark_stage0_submit()
                         has_submitted_first_chunk = True
                     else:
                         await self.engine.add_streaming_update_async(
@@ -433,13 +442,14 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_stage_id=final_stage_id,
                             resumable=False,
                         )
+                        mark_stage0_submit()
 
         input_stream_task = asyncio.create_task(handle_inputs())
         req_state.input_stream_task = input_stream_task
         return input_stream_task
 
     @staticmethod
-    def _validate_streaming_input_sampling_params(params: OmniSamplingParams) -> None:
+    def validate_streaming_input_sampling_params(params: OmniSamplingParams) -> None:
         if (
             not isinstance(params, SamplingParams)
             or params.n > 1

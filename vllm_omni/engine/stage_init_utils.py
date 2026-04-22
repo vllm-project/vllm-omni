@@ -280,6 +280,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     stage_id: int = stage_config.stage_id
     stage_type: Literal["llm", "diffusion"] = getattr(stage_config, "stage_type", "llm")
     engine_args = stage_config.engine_args
+    model_stage = getattr(engine_args, "model_stage", None)
 
     if current_omni_platform.is_rocm():
         if engine_args.get("attention_backend") is None:
@@ -333,12 +334,11 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             final_output_type=final_output_type,
             default_sampling_params=default_sampling_params,
             custom_process_input_func=custom_process_input_func,
-            model_stage=None,
+            model_stage=model_stage,
             runtime_cfg=runtime_cfg,
             cfg_kv_collect_func=cfg_kv_collect_func,
         )
 
-    model_stage = getattr(engine_args, "model_stage", None)
     engine_output_type = getattr(engine_args, "engine_output_type", None)
     is_comprehension = getattr(stage_config, "is_comprehension", False)
     requires_multimodal_data = getattr(runtime_cfg, "requires_multimodal_data", False)
@@ -755,6 +755,7 @@ def finalize_initialized_stages(
             "final_output": stage_client.final_output,
             "final_output_type": stage_client.final_output_type,
             "stage_type": stage_client.stage_type,
+            "model_stage": getattr(stage_client, "model_stage", None),
         }
         for stage_client in initialized_stage_clients
     ]
