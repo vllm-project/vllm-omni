@@ -74,6 +74,17 @@ OOM_INJECTION_CONFIG = {
     "startup_timeout_sec": 20,
     "strict": True,
 }
+# Post-fault recovery probe: keep the API process alive on the same GPU.
+# ``strict=True`` sidecars keep allocating until CUDA refuses, which often
+# evicts/kills the server; here we only take a fraction of *initial* free
+# memory and stop, then rely on a heavy multimodal forward to hit OOM.
+OOM_RECOVER_INJECTION_CONFIG = {
+    "device": _default_oom_device_spec(),
+    "target_mem_ratio": 0.88,
+    "hold_seconds": 0,
+    "startup_timeout_sec": 20,
+    "strict": False,
+}
 FAULT_ERROR_KEYWORDS = (
     "the request failed",
     "oom",
@@ -89,6 +100,7 @@ RUNTIME_WORKER_PATTERN = "VLLM::Worker"
 
 
 class _HasServeArgs(Protocol):
+    model: str
     serve_args: list[str]
 
 
@@ -109,6 +121,37 @@ def _get_system_prompt() -> dict:
 
 def _get_mix_prompt() -> str:
     return "What is recited in the audio? What is in this image? Describe the video briefly."
+
+
+def _mix_chat_completions_probe_payload(omni_server: _HasServeArgs) -> dict[str, Any]:
+    """Heavy multimodal ``/v1/chat/completions`` body (same media shape as expansion ``test_mix_to_text_audio_001``).
+
+    Uses ``stream=True`` like that e2e case; reliability checks use raw HTTP status + JSON body.
+    """
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=_get_system_prompt(),
+        video_data_url=video_data_url,
+        image_data_url=image_data_url,
+        audio_data_url=audio_data_url,
+        content_text="What is recited in the audio? What is in this image? What is in this video?",
+    )
+    return {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "modalities": ["text", "audio"],
+    }
+
+
+def _fault_keywords_match_response(*, status: int, body: bytes) -> bool:
+    """True when HTTP status or body text looks like an expected fault / OOM class outcome."""
+    if status >= 400:
+        return True
+    text = body.decode("utf-8", errors="replace").lower()
+    return any(key in text for key in FAULT_ERROR_KEYWORDS)
 
 
 def _stage_config_path_from_omni_server(omni_server: _HasServeArgs) -> str | None:
@@ -637,47 +680,74 @@ def test_reliability_async_failed_job_observable_with_mapped_status(
 def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
     omni_server_function,
 ) -> None:
-    """Black-box: after removing OOM pressure, service reaches a terminal state.
+    """Black-box: under bounded GPU pressure, a heavy mix chat fails; after hog stops, the same request succeeds.
 
-    Terminal state may be recovered (health=200) or explicitly unrecovered
-    (health=503), but must not hang indefinitely.
+    Uses a milder sidecar than ``OOM_INJECTION_CONFIG`` (``strict=False`` and a capped
+    ``target_mem_ratio``) so the serving process stays alive: pressure should starve
+    the multimodal forward pass, not exhaust the whole device allocator.
+
+    Fault and recovery phases use raw ``/v1/chat/completions`` HTTP so tests can assert
+    on status codes and JSON error payloads (or fault keywords in streamed bodies).
     """
     device_spec = resolve_oom_device_spec(
-        OOM_INJECTION_CONFIG,
+        OOM_RECOVER_INJECTION_CONFIG,
         _stage_config_path_from_omni_server(omni_server_function),
     )
     handle = inject_gpu_oom(
         device=device_spec,
-        target_mem_ratio=OOM_INJECTION_CONFIG["target_mem_ratio"],
-        hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
-        startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
-        strict=OOM_INJECTION_CONFIG["strict"],
+        target_mem_ratio=OOM_RECOVER_INJECTION_CONFIG["target_mem_ratio"],
+        hold_seconds=OOM_RECOVER_INJECTION_CONFIG["hold_seconds"],
+        startup_timeout_sec=OOM_RECOVER_INJECTION_CONFIG["startup_timeout_sec"],
+        strict=OOM_RECOVER_INJECTION_CONFIG["strict"],
     )
     host = omni_server_function.host
     port = omni_server_function.port
-    payload = {
-        "model": omni_server_function.model,
-        "messages": [{"role": "user", "content": "Tell me one short sentence about Beijing."}],
-        "stream": False,
-        "modalities": ["text"],
-    }
+    mix_payload = _mix_chat_completions_probe_payload(omni_server_function)
+    mix_chat_timeout_sec = 180
 
     failure_observed = False
+    fault_status: int | None = None
+    fault_body = b""
     try:
-        for _ in range(3):
-            try:
-                status, _ = _post_json_raw(host, port, "/v1/chat/completions", payload, timeout_sec=20)
-                if status >= 500:
-                    failure_observed = True
-                    break
-            except Exception:
-                failure_observed = True
-                break
-            time.sleep(1.0)
+        try:
+            fault_status, fault_body = _post_json_raw(
+                host,
+                port,
+                "/v1/chat/completions",
+                mix_payload,
+                timeout_sec=mix_chat_timeout_sec,
+            )
+        except Exception as exc:
+            failure_observed = True
+            assert_fault_exception(exc, FAULT_ERROR_KEYWORDS)
+        else:
+            assert fault_status is not None
+            failure_observed = fault_status != 200 or _fault_keywords_match_response(
+                status=fault_status,
+                body=fault_body,
+            )
+            assert failure_observed, (
+                "expected mix multimodal request failure while OOM pressure is active; "
+                f"status={fault_status}, body_prefix={fault_body[:500]!r}"
+            )
+            if fault_status >= 400:
+                err = _extract_error_contract(fault_body)
+                if err is None:
+                    assert _fault_keywords_match_response(status=fault_status, body=fault_body), (
+                        "non-2xx without OpenAI-style error object should still mention fault hints in body; "
+                        f"status={fault_status}, body_prefix={fault_body[:500]!r}"
+                    )
+                else:
+                    assert isinstance(err.get("message"), str) and err["message"].strip(), (
+                        f"structured error should carry a non-empty message: {err!r}"
+                    )
+            else:
+                assert _fault_keywords_match_response(status=fault_status, body=fault_body), (
+                    "HTTP 200 under pressure should still surface fault hints in the response body; "
+                    f"body_prefix={fault_body[:500]!r}"
+                )
     finally:
         stop_gpu_oom_hogs(handle)
-
-    assert failure_observed, "expected at least one request failure while OOM pressure is active"
 
     recovery_deadline = time.monotonic() + 90.0
     terminal_health: int | None = None
@@ -710,23 +780,41 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
             f"last_health_exc={last_health_exc!r}"
         )
 
-    request_payload = {
+    probe_payload = {
         "model": omni_server_function.model,
         "messages": [{"role": "user", "content": "What is the capital of China? Answer in one word."}],
         "stream": False,
         "modalities": ["text"],
     }
     start = time.monotonic()
+    post_mix_status: int | None = None
+    post_mix_body = b""
+    request_status: int | None = None
     try:
-        request_status, _ = _post_json_raw(host, port, "/v1/chat/completions", request_payload, timeout_sec=20)
+        assert terminal_health is not None
+        if terminal_health == 200:
+            post_mix_status, post_mix_body = _post_json_raw(
+                host,
+                port,
+                "/v1/chat/completions",
+                mix_payload,
+                timeout_sec=mix_chat_timeout_sec,
+            )
+        else:
+            request_status, _ = _post_json_raw(host, port, "/v1/chat/completions", probe_payload, timeout_sec=20)
     except Exception:
+        post_mix_status = None
         request_status = None
     elapsed = time.monotonic() - start
-    assert elapsed < 20, f"post-fault request should not hang after OOM removal: {elapsed:.2f}s"
+    assert elapsed < 200, f"post-fault request should not hang after OOM removal: {elapsed:.2f}s"
 
-    assert terminal_health is not None
     if terminal_health == 200:
-        assert request_status == 200, f"health recovered but request did not succeed: status={request_status}"
+        assert post_mix_status == 200, (
+            "health recovered but repeated mix multimodal request did not return HTTP 200; "
+            f"status={post_mix_status}, body_prefix={post_mix_body[:600]!r}"
+        )
+        recover_err = _extract_error_contract(post_mix_body)
+        assert recover_err is None, f"unexpected error object after recovery: {recover_err!r}"
     else:
         assert request_status is None or request_status >= 500, (
             "unhealthy terminal state should fail fast on requests, "
