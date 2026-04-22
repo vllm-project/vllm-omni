@@ -80,7 +80,7 @@ Key arguments:
 > ℹ️ If you encounter OOM errors, try using `--vae-use-slicing` and `--vae-use-tiling` to reduce memory usage.
 
 For Wan2.2 LightX2V-converted local Diffusers directories and related LoRA
-assets, see the [LoRA guide](../../diffusion/lora.md#wan22-lightx2v-offline-assembly).
+assets, see the [LoRA guide](https://github.com/vllm-project/vllm-omni/tree/main/docs/user_guide/diffusion/lora.md#wan22-lightx2v-offline-assembly).
 
 ## Example materials
 

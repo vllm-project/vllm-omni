@@ -97,6 +97,12 @@ with open("output.png", "wb") as f:
     f.write(base64.b64decode(b64_data))
 ```
 
+!!! note
+    The OpenAI SDK's `extra_body` keyword argument merges parameters into the
+    top-level request body automatically. When using curl or Python `requests`,
+    wrap generation parameters inside a literal `"extra_body"` key in the JSON
+    instead (as shown in the curl example above).
+
 ### Method 3: Using Python Client Script
 
 ```bash
@@ -104,15 +110,6 @@ python openai_chat_client.py --prompt "A beautiful landscape painting" --output 
 ```
 
 ### Method 4: Using Gradio Demo
-
-!!! note "Gradio is an optional dependency"
-    The Gradio demo requires the `[demo]` extras. Install them first:
-
-    ```bash
-    pip install 'vllm-omni[demo]'
-    ```
-
-    Or, if installing from source: `pip install -e '.[demo]'`
 
 ```bash
 python gradio_demo.py
@@ -186,7 +183,7 @@ lora_adapter/
 
 ### Generation with Parameters
 
-Wrap generation parameters inside `extra_body` in the request JSON:
+Use `extra_body` to pass generation parameters:
 
 ```json
 {
@@ -202,21 +199,6 @@ Wrap generation parameters inside `extra_body` in the request JSON:
   }
 }
 ```
-
-!!! tip "Using the OpenAI SDK"
-    When using the OpenAI Python SDK, pass these parameters via the `extra_body`
-    keyword argument. The SDK merges them into the top-level request body automatically:
-
-    ```python
-    client.chat.completions.create(
-        model="Qwen/Qwen-Image",
-        messages=[...],
-        extra_body={"height": 1024, "width": 1024, "num_inference_steps": 50},
-    )
-    ```
-
-    For details on how generation parameters are handled across different clients, see the
-    [Diffusion Chat API guide](../../../../serving/diffusion_chat_api.md).
 
 ### Multimodal Input (Text + Structured Content)
 
@@ -236,12 +218,11 @@ Wrap generation parameters inside `extra_body` in the request JSON:
 ## Generation Parameters
 
 When using `/v1/chat/completions`, pass these inside `extra_body` in the curl
-JSON, or via the `extra_body` keyword argument in the OpenAI Python SDK (see the
-[Diffusion Chat API guide](../../../../serving/diffusion_chat_api.md)).
-When using the dedicated [`/v1/images/generations`](../../../../serving/image_generation_api.md)
-endpoint, pass the supported generation controls as top-level JSON fields
-directly. For image dimensions and count, use `size` and `n` rather than
-`height`, `width`, or `num_outputs_per_prompt`.
+JSON, or via the `extra_body` keyword argument in the OpenAI Python SDK.
+When using the dedicated `/v1/images/generations` endpoint, pass the supported
+generation controls as top-level JSON fields directly. For image dimensions and
+count, use `size` and `n` rather than `height`, `width`, or
+`num_outputs_per_prompt`.
 
 | Parameter                | Type  | Default | Description                    |
 | ------------------------ | ----- | ------- | ------------------------------ |
@@ -253,6 +234,8 @@ directly. For image dimensions and count, use `size` and `n` rather than
 | `seed`                   | int   | None    | Random seed (reproducible)     |
 | `negative_prompt`        | str   | None    | Negative prompt                |
 | `num_outputs_per_prompt` | int   | 1       | Number of images to generate   |
+| `use_system_prompt` | str | None | System prompt preset: `en_unified`, `en_vanilla`, `en_recaption`, `en_think_recaption`, `dynamic`, `None`, or custom text string. Only for HunyuanImage-3.0. |
+| `system_prompt` | str | None | Custom system prompt text. Only used when `use_system_prompt` is set to `custom`. Only for HunyuanImage-3.0. |
 
 ## Response Format
 

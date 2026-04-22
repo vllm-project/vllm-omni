@@ -69,11 +69,7 @@ cat <<EOF > request.json
 }
 EOF
 
-curl -s http://localhost:8092/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d @request.json \
-  | jq -r '.choices[0].message.content[0].image_url.url' \
-  | cut -d',' -f2 | base64 -d > output.png
+curl -s http://localhost:8092/v1/chat/completions   -H "Content-Type: application/json"   -d @request.json | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2 | base64 -d > output.png
 ```
 
 ### Method 2: Using OpenAI Python SDK
@@ -111,6 +107,12 @@ with open("output.png", "wb") as f:
     f.write(base64.b64decode(b64_data))
 ```
 
+!!! note
+    The OpenAI SDK's `extra_body` keyword argument merges parameters into the
+    top-level request body automatically. When using curl or Python `requests`,
+    wrap generation parameters inside a literal `"extra_body"` key in the JSON
+    instead (as shown in the curl example above).
+
 ### Method 3: Using Python Client Script
 
 ```bash
@@ -121,15 +123,6 @@ python openai_chat_client.py --input input1.png input2.png --prompt "Combine the
 ```
 
 ### Method 4: Using Gradio Demo
-
-!!! note "Gradio is an optional dependency"
-    The Gradio demo requires the `[demo]` extras. Install them first:
-
-    ```bash
-    pip install 'vllm-omni[demo]'
-    ```
-
-    Or, if installing from source: `pip install -e '.[demo]'`
 
 ```bash
 python gradio_demo.py
@@ -172,7 +165,7 @@ python gradio_demo.py
 
 ### Image Editing with Parameters
 
-Wrap generation parameters inside `extra_body` in the request JSON:
+Use `extra_body` to pass generation parameters:
 
 ```json
 {
@@ -195,21 +188,6 @@ Wrap generation parameters inside `extra_body` in the request JSON:
 }
 ```
 
-!!! tip "Using the OpenAI SDK"
-    When using the OpenAI Python SDK, pass these parameters via the `extra_body`
-    keyword argument. The SDK merges them into the top-level request body automatically:
-
-    ```python
-    client.chat.completions.create(
-        model="Qwen/Qwen-Image-Edit",
-        messages=[...],
-        extra_body={"num_inference_steps": 50, "guidance_scale": 7.5, "seed": 42},
-    )
-    ```
-
-    For details on how generation parameters are handled across different clients, see the
-    [Diffusion Chat API guide](../../../../serving/diffusion_chat_api.md).
-
 ### Layered Image Generation (Qwen-Image-Layered)
 
 Qwen-Image-Layered generates multiple decomposed layers from a reference image and a text prompt.
@@ -219,112 +197,75 @@ Start the server with:
 vllm serve Qwen/Qwen-Image-Layered --omni --port 8093
 ```
 
-=== "curl"
+**Using curl**
 
-    ```bash
-    IMG_B64=$(base64 -w0 input.png)
+```bash
+IMG_B64=$(base64 -w0 input.png)
 
-    curl -sS http://localhost:8093/v1/chat/completions \
-      -H "Content-Type: application/json" \
-      -d "$(jq -n --arg img "$IMG_B64" '{
-        messages: [{
-          role: "user",
-          content: [
-            {type: "image_url", image_url: {url: ("data:image/png;base64," + $img)}},
-            {type: "text", text: "a rabbit"}
-          ]
-        }],
-        extra_body: {
-          num_inference_steps: 50,
-          cfg_scale: 4.0,
-          seed: 0,
-          layers: 4,
-          resolution: 640
-        }
-      }')" \
-      | jq -r '.choices[0].message.content[] | .image_url.url | split(",")[1]' \
-      | while IFS= read -r b64; do
-          ((i++)); echo "$b64" | base64 -d > "layer_${i}.png"
-        done
-    ```
-
-=== "OpenAI SDK"
-
-    ```python
-    import base64
-    from openai import OpenAI
-
-    client = OpenAI(base_url="http://localhost:8093/v1", api_key="none")
-
-    with open("input.png", "rb") as f:
-        img_b64 = base64.b64encode(f.read()).decode()
-
-    response = client.chat.completions.create(
-        model="Qwen/Qwen-Image-Layered",
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {
-                    "url": f"data:image/png;base64,{img_b64}"
-                }},
-                {"type": "text", "text": "a rabbit"},
-            ],
-        }],
-        extra_body={
-            "num_inference_steps": 50,
-            "cfg_scale": 4.0,
-            "seed": 0,
-            "layers": 4,
-            "resolution": 640,
-        },
-    )
-
-    for i, item in enumerate(response.choices[0].message.content):
-        _, b64_data = item.image_url.url.split(",", 1)
-        with open(f"layer_{i}.png", "wb") as f:
-            f.write(base64.b64decode(b64_data))
-    ```
-
-=== "Python requests"
-
-    ```python
-    import base64
-    import requests
-
-    with open("input.png", "rb") as f:
-        img_b64 = base64.b64encode(f.read()).decode()
-
-    payload = {
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {
-                    "url": f"data:image/png;base64,{img_b64}"
-                }},
-                {"type": "text", "text": "a rabbit"},
-            ],
-        }],
-        "extra_body": {
-            "num_inference_steps": 50,
-            "cfg_scale": 4.0,
-            "seed": 0,
-            "layers": 4,
-            "resolution": 640,
-        },
+curl -sS http://localhost:8093/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg img "$IMG_B64" '{
+    messages: [{
+      role: "user",
+      content: [
+        {type: "image_url", image_url: {url: ("data:image/png;base64," + $img)}},
+        {type: "text", text: "a rabbit"}
+      ]
+    }],
+    extra_body: {
+      num_inference_steps: 50,
+      cfg_scale: 4.0,
+      seed: 0,
+      layers: 4,
+      resolution: 640
     }
+  }')" \
+  | jq -r '.choices[0].message.content[] | .image_url.url | split(",")[1]' \
+  | while IFS= read -r b64; do
+      ((i++)); echo "$b64" | base64 -d > "layer_${i}.png"
+    done
+```
 
-    resp = requests.post(
-        "http://localhost:8093/v1/chat/completions",
-        json=payload,
-        timeout=600,
-    )
-    data = resp.json()
+**Using Python**
 
-    for i, item in enumerate(data["choices"][0]["message"]["content"]):
-        _, b64_data = item["image_url"]["url"].split(",", 1)
-        with open(f"layer_{i}.png", "wb") as f:
-            f.write(base64.b64decode(b64_data))
-    ```
+```python
+import base64
+import requests
+
+with open("input.png", "rb") as f:
+    img_b64 = base64.b64encode(f.read()).decode()
+
+payload = {
+    "messages": [{
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {
+                "url": f"data:image/png;base64,{img_b64}"
+            }},
+            {"type": "text", "text": "a rabbit"},
+        ],
+    }],
+    "extra_body": {
+        "num_inference_steps": 50,
+        "cfg_scale": 4.0,
+        "seed": 0,
+        "layers": 4,
+        "resolution": 640,
+    },
+}
+
+resp = requests.post(
+    "http://localhost:8093/v1/chat/completions",
+    json=payload,
+    timeout=600,
+)
+data = resp.json()
+
+for i, item in enumerate(data["choices"][0]["message"]["content"]):
+    _, b64_data = item["image_url"]["url"].split(",", 1)
+    with open(f"layer_{i}.png", "wb") as f:
+        f.write(base64.b64decode(b64_data))
+```
 
 The response contains multiple images in `choices[0].message.content` — one per generated layer.
 
@@ -360,12 +301,11 @@ Provide multiple images in `content` (order matters):
 ## Generation Parameters
 
 When using `/v1/chat/completions`, pass these inside `extra_body` in the curl
-JSON, or via the `extra_body` keyword argument in the OpenAI Python SDK (see the
-[Diffusion Chat API guide](../../../../serving/diffusion_chat_api.md)).
-When using the dedicated [`/v1/images/edits`](../../../../serving/image_edit_api.md)
-endpoint, pass the supported generation controls as top-level form fields
-directly. For image dimensions and count, use `size` and `n` rather than
-`height`, `width`, or `num_outputs_per_prompt`.
+JSON, or via the `extra_body` keyword argument in the OpenAI Python SDK.
+When using the dedicated `/v1/images/edits` endpoint, pass the supported
+generation controls as top-level form fields directly. For image dimensions and
+count, use `size` and `n` rather than `height`, `width`, or
+`num_outputs_per_prompt`.
 
 | Parameter                | Type  | Default | Description                           |
 | ------------------------ | ----- | ------- | ------------------------------------- |
@@ -377,6 +317,7 @@ directly. For image dimensions and count, use `size` and `n` rather than
 | `seed`                   | int   | None    | Random seed (reproducible)            |
 | `negative_prompt`        | str   | None    | Negative prompt                       |
 | `num_outputs_per_prompt` | int   | 1       | Number of images to generate          |
+| `strength`               | float | 0.6     | **Z-Image only** - Denoising start timestep for I2I. Range: [0.0, 1.0]. Lower preserves more of original image. |
 | `layers`                 | int   | 4       | Number of layers (Qwen-Image-Layered) |
 | `resolution`             | int   | 640     | Resolution, 640 or 1024 (Qwen-Image-Layered) |
 

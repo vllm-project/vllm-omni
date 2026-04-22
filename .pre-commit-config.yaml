@@ -54,14 +54,14 @@ repos:
       verbose: true
       stages: [commit-msg]
 
-    # Keep `suggestion` last
-    - id: suggestion
-      name: Suggestion
-      entry: bash -c 'echo "To bypass all the pre-commit hooks, add --no-verify to git commit. To skip a specific hook, prefix the commit command with SKIP=<hook-id>."'
-      language: system
-      verbose: true
+    - id: sync-example-docs
+      name: Sync example documentation
+      entry: python tools/pre_commit/sync_example_docs.py
+      language: python
+      files: ^(examples/|docs/user_guide/examples/)
       pass_filenames: false
-    # Insert new entries above the `suggestion` entry
+      # Required by generate_examples.py, which is imported at runtime
+      additional_dependencies: [regex, pyyaml]
 
     - id: check-pickle-imports
       name: Prevent new pickle/cloudpickle imports
@@ -69,3 +69,11 @@ repos:
       language: python
       types: [python]
       additional_dependencies: [regex]
+
+    # Keep `suggestion` last
+    - id: suggestion
+      name: Suggestion
+      entry: bash -c 'echo "To bypass all the pre-commit hooks, add --no-verify to git commit. To skip a specific hook, prefix the commit command with SKIP=<hook-id>."'
+      language: system
+      verbose: true
+      pass_filenames: false

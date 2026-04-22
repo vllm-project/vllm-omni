@@ -19,15 +19,6 @@ Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/
 
 ## Gradio Demo
 
-!!! note "Gradio is an optional dependency"
-    The Gradio demo requires the `[demo]` extras. Install them first:
-
-    ```bash
-    pip install 'vllm-omni[demo]'
-    ```
-
-    Or, if installing from source: `pip install -e '.[demo]'`
-
 Two interactive Gradio demos are available, both supporting all 3 task types:
 
 | Demo     | File                     | Transport    | Streaming Quality                                  |
@@ -55,30 +46,23 @@ Then open http://localhost:7860 in your browser.
 
 ### Launch the Server
 
+The default deploy config is located at `vllm_omni/deploy/qwen3_tts.yaml` and is loaded automatically by the model registry — no `--deploy-config` flag needed for default use. Platform-specific deltas (NPU, ROCm, XPU) are merged in automatically from the `platforms:` block of the same YAML based on the detected runtime.
+
 ```bash
 # CustomVoice model (predefined speakers)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
-    --port 8091 \
-    --trust-remote-code \
-    --enforce-eager
+    --port 8091
 
 # VoiceDesign model
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
-    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
-    --port 8091 \
-    --trust-remote-code \
-    --enforce-eager
+    --port 8091
 
 # Base model (voice cloning)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
-    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
-    --port 8091 \
-    --trust-remote-code \
-    --enforce-eager
+    --port 8091
 ```
 
 If you have custom stage configs file, launch the server with command below
@@ -86,10 +70,24 @@ If you have custom stage configs file, launch the server with command below
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --stage-configs-path /path/to/stage_configs_file \
     --omni \
-    --port 8091 \
-    --trust-remote-code \
-    --enforce-eager
+    --port 8091
 ```
+
+#### Sync vs async-chunk mode
+
+Qwen3-TTS supports both **chunked streaming** (default, lower latency) and
+**synchronous end-to-end** modes from the same deploy YAML. The bundled
+`qwen3_tts.yaml` ships with `async_chunk: true`; flip with `--no-async-chunk`
+and the pipeline automatically dispatches to the end-to-end codec processor:
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8091 \
+    --no-async-chunk
+```
+
+No variant YAML or extra flag is needed — the `StagePipelineConfig` on each
+stage declares both processor functions and the runtime picks based on the
+`async_chunk:` bool.
 
 Alternatively, use the convenience script:
 ```bash
@@ -111,14 +109,16 @@ cd examples/online_serving/qwen3_tts
 ```bash
 # CustomVoice: Use predefined speaker
 python openai_speech_client.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --text "你好，我是通义千问" \
-    --speaker vivian \
+    --voice vivian \
     --language Chinese
 
 # CustomVoice with style instruction
 python openai_speech_client.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --text "今天天气真好" \
-    --speaker ryan \
+    --voice ryan \
     --instructions "用开心的语气说"
 
 # VoiceDesign: Describe the voice style
@@ -143,7 +143,7 @@ The Python client supports the following command-line arguments:
 - `--model` (or `-m`): Model name/path (default: `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`)
 - `--task-type` (or `-t`): TTS task type. Options: `CustomVoice`, `VoiceDesign`, `Base`
 - `--text`: Text to synthesize (required)
-- `--speaker`: Speaker name (default: `vivian`). Options: `vivian`, `ryan`, `aiden`, etc.
+- `--voice`: Speaker/voice name (default: `vivian`). Options: `vivian`, `ryan`, `aiden`, etc.
 - `--language`: Language. Options: `Auto`, `Chinese`, `English`, `Japanese`, `Korean`, `German`, `French`, `Russian`, `Portuguese`, `Spanish`, `Italian`
 - `--instructions`: Voice style/emotion instructions
 - `--ref-audio`: Reference audio file path or URL for voice cloning (Base task). Local paths are automatically base64-encoded by the client before sending to the server.
@@ -229,15 +229,11 @@ List all available voices/speakers from the loaded model, including both built-i
       "consent": "user_consent_id",
       "created_at": 1738660000,
       "file_size": 1024000,
-      "mime_type": "audio/wav",
-      "ref_text": "The exact transcript of the audio sample.",
-      "speaker_description": "warm narrator"
+      "mime_type": "audio/wav"
     }
   ]
 }
 ```
-
-Fields `ref_text` and `speaker_description` are omitted per-entry when not provided at upload time.
 
 #### POST /v1/audio/voices
 
@@ -248,7 +244,7 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 - `consent` (required): Consent recording ID
 - `name` (required): Name for the new voice
 - `ref_text` (optional): Transcript of the audio. Enables in-context voice cloning (higher quality).
-- `speaker_description` (optional): Free-form description of the voice (e.g. "warm narrator", "energetic presenter"). Stored as metadata.
+- `speaker_description` (optional): Free-form description of the voice (e.g. "warm narrator", "energetic presenter").
 
 **Response Example:**
 ```json
@@ -270,7 +266,7 @@ Fields `ref_text` and `speaker_description` are omitted when not provided at upl
 
 **Usage Example:**
 ```bash
-curl -X POST http://localhost:8091/v1/audio/voices \
+curl -X POST http://localhost:8000/v1/audio/voices \
   -F "audio_sample=@/path/to/voice_sample.wav" \
   -F "consent=user_consent_id" \
   -F "name=custom_voice_1" \
@@ -309,12 +305,6 @@ This endpoint follows the [OpenAI Audio Speech API](https://platform.openai.com/
 ### Response
 
 Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/wav`).
-
-### Voice and language (summary)
-
-- **Speaker**: Use the `voice` request field to select the speaker (e.g., `vivian`, `ryan`, `aiden`). List available speakers with `GET /v1/audio/voices`.
-- **Language**: Use the `language` field for the codec language tag (`Auto`, `Chinese`, `English`, etc.). Default is `Auto` for automatic detection.
-- **CustomVoice**: Requires a valid `voice` from the model’s speaker set. **VoiceDesign**: Use `instructions` to describe the voice. **Base**: Use `ref_audio` and `ref_text` for voice cloning.
 
 ## Parameters
 
@@ -407,6 +397,54 @@ Server -> Client:
 {"type": "session.done", "total_sentences": 1}
 ```
 
+## Choosing an Execution Backend: Uniproc vs Multiprocessing
+
+Qwen3-TTS stage configs support two execution backends controlled by the
+`distributed_executor_backend` engine arg. The performance tradeoff between
+them is **both hardware- and task-dependent**, so there is no single best
+default (see [#2603](https://github.com/vllm-project/vllm-omni/issues/2603),
+[#2604](https://github.com/vllm-project/vllm-omni/pull/2604) for the full
+investigation).
+
+| Backend | Stage config setting | Behaviour |
+| ------- | -------------------- | --------- |
+| **Uniproc** (default, world_size=1) | `distributed_executor_backend` omitted | Both stages run inside the orchestrator process. Avoids IPC serialisation, D2H copies, and msgpack overhead between stages. |
+| **Multiprocessing** | `distributed_executor_backend: "mp"` | Each stage runs in its own subprocess. The Talker can continue decoding while Code2Wav runs the vocoder in parallel, improving pipeline utilisation under concurrency. |
+
+> **Note:** When `distributed_executor_backend` is omitted and `world_size=1`,
+> vLLM [automatically uses the uniproc executor](https://github.com/vllm-project/vllm/blob/main/vllm/config/parallel.py#L825).
+> When `world_size > 1`, it defaults to `mp`.
+
+### When uniproc wins
+
+The uniproc path eliminates inter-process data transfer (D2H copies,
+msgpack serialisation/deserialisation, tensor detaching). This matters most
+when per-request processing is heavy relative to autoregressive decode.
+
+The Base cloning task involves reference-audio encoding on every request, making IPC
+overhead a larger fraction of total cost. Qwen3-Omni shows a similar pattern.
+
+### When multiprocessing (`mp`) wins
+
+For lighter per-request workloads, process-level parallelism between the
+Talker and Code2Wav stages dominates.
+
+CustomVoice is lighter per-request (no reference audio encoding), so the
+process-level parallelism of `mp` outweighs its serialisation cost at
+concurrency ≥ 4.
+
+### How to switch
+
+To use the uniproc executor on a single-GPU setup, pass the
+`qwen3_tts_uniproc.yaml` stage config:
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --omni \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts_uniproc.yaml \
+    --port 8091
+```
+
 ## Limitations
 
 - **Single request**: Batch processing is not yet optimized for online serving.
@@ -421,13 +459,13 @@ Server -> Client:
 
 ## Example materials
 
+??? abstract "batch_speech_client.py"
+    ``````py
+    --8<-- "examples/online_serving/qwen3_tts/batch_speech_client.py"
+    ``````
 ??? abstract "gradio_demo.py"
     ``````py
     --8<-- "examples/online_serving/qwen3_tts/gradio_demo.py"
-    ``````
-??? abstract "gradio_fastrtc_demo.py"
-    ``````py
-    --8<-- "examples/online_serving/qwen3_tts/gradio_fastrtc_demo.py"
     ``````
 ??? abstract "openai_speech_client.py"
     ``````py
@@ -440,6 +478,10 @@ Server -> Client:
 ??? abstract "run_server.sh"
     ``````sh
     --8<-- "examples/online_serving/qwen3_tts/run_server.sh"
+    ``````
+??? abstract "speaker_embedding_interpolation.py"
+    ``````py
+    --8<-- "examples/online_serving/qwen3_tts/speaker_embedding_interpolation.py"
     ``````
 ??? abstract "streaming_speech_client.py"
     ``````py

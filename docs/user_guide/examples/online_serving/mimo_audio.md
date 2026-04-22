@@ -7,6 +7,9 @@ Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serv
 
 Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/README.md)
 
+> ⚠️ **Important (audio generation)**  
+> For **audio generation** (TTS, responses that include synthesized audio, etc.), install **`flash-attn`** for your **CUDA** and **PyTorch** stack. Without it on GPU, **output audio may be noise-only or unusable**. See the [FlashAttention](https://github.com/Dao-AILab/flash-attention) repository for compatible builds.
+
 ## Run examples (MiMo-Audio)
 
 ### Launch the Server

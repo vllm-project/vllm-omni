@@ -14,7 +14,7 @@ PLEASE FILL IN THE PR DESCRIPTION HERE ENSURING ALL CHECKLIST ITEMS (AT THE BOTT
 - [ ] The purpose of the PR, such as "Fix some issue (link existing issues this PR will resolve)".
 - [ ] The test plan. Please provide the test scripts & test commands. Please state the reasons if your codes don't require additional test scripts. For test file guidelines, please check the [test style doc](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/ci/tests_style/)
 - [ ] The test results. Please paste the results comparison before and after, or the e2e results.
-- [ ] (Optional) The necessary documentation update, such as updating `supported_models.md` and `examples` for a new model. **Please run `mkdocs serve` to sync the documentation editions to `./docs`.**
+- [ ] (Optional) The necessary documentation update, such as updating `supported_models.md` and `examples` for a new model. **A pre-commit hook automatically syncs `examples/` changes to `docs/user_guide/examples/`.** Run `mkdocs serve` to preview the full docs site locally.
 - [ ] (Optional) Release notes update. If your change is user-facing, please update the release notes draft.
 </details>
 
