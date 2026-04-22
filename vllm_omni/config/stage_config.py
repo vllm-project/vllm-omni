@@ -545,6 +545,39 @@ def _merge_platforms(
     return merged
 
 
+def _merge_pd_stage_role_lists(
+    base_stages: list[dict[str, Any]] | None,
+    overlay_stages: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Merge PD ``stages:`` by ``role`` (prefill/decode)."""
+    by_role: dict[str, dict[str, Any]] = {s["role"]: s for s in (base_stages or []) if "role" in s}
+    passthrough: list[dict[str, Any]] = [s for s in (base_stages or []) if "role" not in s]
+    for overlay_stage in overlay_stages or []:
+        role = overlay_stage.get("role")
+        if role is not None and role in by_role:
+            by_role[role] = _deep_merge_stage(by_role[role], overlay_stage)
+        elif role is not None:
+            by_role[role] = overlay_stage
+        else:
+            passthrough.append(overlay_stage)
+    return [*by_role.values(), *passthrough]
+
+
+def _merge_pd_disaggregation(
+    base: dict[str, Any] | None,
+    overlay: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Deep-merge two ``pd_disaggregation:`` blocks."""
+    if not base and not overlay:
+        return None
+    base = base or {}
+    overlay = overlay or {}
+    merged = {**base, **{k: v for k, v in overlay.items() if k not in ("stages", "stage_overrides")}}
+    merged["stages"] = _merge_pd_stage_role_lists(base.get("stages"), overlay.get("stages"))
+    merged["stage_overrides"] = _merge_stage_lists(base.get("stage_overrides"), overlay.get("stage_overrides"))
+    return merged
+
+
 def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     """Load a deploy YAML with optional ``base_config`` inheritance."""
     raw_dict = to_dict(load_yaml_config(path))
@@ -557,16 +590,27 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     base_path = Path(path).parent / base_path
     base_dict = resolve_deploy_yaml(base_path)
 
-    # Merge top-level scalars: overlay wins. ``stages:`` and ``platforms:``
-    # are deep-merged below so an overlay can layer on top of the base.
+    # Merge top-level scalars: overlay wins. ``stages:``, ``platforms:``, and
+    # ``pd_disaggregation:`` are deep-merged below so an overlay can layer on
+    # top of the base without restating every nested field.
     merged = {
         **base_dict,
-        **{k: v for k, v in raw_dict.items() if k not in ("stages", "platforms")},
+        **{
+            k: v
+            for k, v in raw_dict.items()
+            if k not in ("stages", "platforms", "pd_disaggregation", "pd_separation")
+        },
     }
     merged["stages"] = _merge_stage_lists(base_dict.get("stages"), raw_dict.get("stages"))
     merged_platforms = _merge_platforms(base_dict.get("platforms"), raw_dict.get("platforms"))
     if merged_platforms is not None:
         merged["platforms"] = merged_platforms
+    merged_pd = _merge_pd_disaggregation(
+        base_dict.get("pd_disaggregation", base_dict.get("pd_separation")),
+        raw_dict.get("pd_disaggregation", raw_dict.get("pd_separation")),
+    )
+    if merged_pd is not None:
+        merged["pd_disaggregation"] = merged_pd
 
     return merged
 
@@ -702,16 +746,36 @@ def _pd_role_override(pd_cfg: dict[str, Any], role: str) -> dict[str, Any]:
     return {}
 
 
+def _pd_stage_override(pd_cfg: dict[str, Any], stage_id: int) -> dict[str, Any]:
+    """Return PD-only deploy overrides for one original stage_id."""
+    stage_cfg = pd_cfg.get(f"stage_{stage_id}")
+    if isinstance(stage_cfg, dict):
+        return dict(stage_cfg)
+
+    stage_overrides = pd_cfg.get("stage_overrides")
+    if isinstance(stage_overrides, dict):
+        for key in (stage_id, str(stage_id)):
+            entry = stage_overrides.get(key)
+            if isinstance(entry, dict):
+                return dict(entry)
+
+    for entry in stage_overrides or []:
+        if entry.get("stage_id") == stage_id:
+            return dict(entry)
+    return {}
+
+
 def _make_pd_stage_deploy(
     base: StageDeployConfig,
     *,
     stage_id: int,
-    role_override: dict[str, Any],
+    stage_override: dict[str, Any],
     target_stage_id: int,
 ) -> StageDeployConfig:
-    """Build one split stage's deploy config from the original base stage."""
-    override = dict(role_override)
+    """Build one PD-mode stage deploy config from the original base stage."""
+    override = dict(stage_override)
     override.pop("role", None)
+    override.pop("stage_id", None)
     override_engine_extras = dict(override.pop("engine_extras", {}) or {})
 
     return dataclasses.replace(
@@ -824,7 +888,7 @@ def _apply_pd_disaggregation(
                 _make_pd_stage_deploy(
                     target_deploy,
                     stage_id=target_stage_id,
-                    role_override=prefill_override,
+                    stage_override=prefill_override,
                     target_stage_id=target_stage_id,
                 )
             )
@@ -832,18 +896,18 @@ def _apply_pd_disaggregation(
                 _make_pd_stage_deploy(
                     target_deploy,
                     stage_id=target_stage_id + 1,
-                    role_override=decode_override,
+                    stage_override=decode_override,
                     target_stage_id=target_stage_id,
                 )
             )
             continue
 
         new_deploy_stages.append(
-            dataclasses.replace(
+            _make_pd_stage_deploy(
                 stage,
                 stage_id=_remap_split_stage_id(stage.stage_id, target_stage_id),
-                output_connectors=_remap_stage_connectors(stage.output_connectors, target_stage_id),
-                input_connectors=_remap_stage_connectors(stage.input_connectors, target_stage_id),
+                stage_override=_pd_stage_override(pd_cfg, stage.stage_id),
+                target_stage_id=target_stage_id,
             )
         )
 

@@ -61,9 +61,13 @@ stages:
       repetition_penalty: 1.1
 
 pd_disaggregation:
-  enabled: false
+  enabled: true
   target_stage_id: 0
   async_chunk: false
+  # PD mode uses the common 3-GPU layout:
+  #   GPU 0 -> thinker prefill
+  #   GPU 1 -> thinker decode
+  #   GPU 2 -> talker + code2wav
   stages:
     - role: prefill
       max_num_seqs: 16
@@ -89,6 +93,11 @@ pd_disaggregation:
           kv_parallel_size: 2
           kv_connector_extra_config:
             mooncake_bootstrap_port: 25202
+  stage_overrides:
+    - stage_id: 1
+      devices: "2"
+    - stage_id: 2
+      devices: "2"
 
 platforms:
   npu:

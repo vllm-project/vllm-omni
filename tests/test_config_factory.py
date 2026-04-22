@@ -891,6 +891,10 @@ class TestDeployConfigLoading:
         assert stages[1].input_sources == [0]
         assert stages[2].input_sources == [1]
         assert stages[3].input_sources == [2]
+        assert stages[0].yaml_runtime["devices"] == "0"
+        assert stages[1].yaml_runtime["devices"] == "1"
+        assert stages[2].yaml_runtime["devices"] == "2"
+        assert stages[3].yaml_runtime["devices"] == "2"
         assert stages[0].yaml_engine_args.get("async_chunk") is not True
         assert stages[1].yaml_engine_args.get("custom_process_next_stage_input_func") is None
         assert stages[0].yaml_engine_args["kv_transfer_config"]["kv_role"] == "kv_producer"
@@ -923,6 +927,8 @@ class TestDeployConfigLoading:
         assert len(stages) == 4
         assert stages[0].yaml_extras["is_prefill_only"] is True
         assert stages[1].yaml_extras["is_decode_only"] is True
+        assert stages[2].yaml_runtime["devices"] == "2"
+        assert stages[3].yaml_runtime["devices"] == "2"
         assert stages[0].runtime_overrides["max_num_seqs"] == 8
         assert stages[1].runtime_overrides["max_num_seqs"] == 32
 

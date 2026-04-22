@@ -1119,6 +1119,12 @@ class TestPDYAMLConfig:
         assert stages[1].is_comprehension is True
         assert 0 in stages[1].input_sources
 
+        # Common 3-GPU PD layout
+        assert stages[0].yaml_runtime["devices"] == "0"
+        assert stages[1].yaml_runtime["devices"] == "1"
+        assert stages[2].yaml_runtime["devices"] == "2"
+        assert stages[3].yaml_runtime["devices"] == "2"
+
         # KV transfer configs
         assert stages[0].yaml_engine_args["kv_transfer_config"]["kv_role"] == "kv_producer"
         assert stages[1].yaml_engine_args["kv_transfer_config"]["kv_role"] == "kv_consumer"
