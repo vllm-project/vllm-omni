@@ -618,6 +618,27 @@ class GroupCoordinator:
             self.cpu_group = None
 
 
+class PipelineRecvDictHandle:
+
+    __slots__ = ("_pp_group", "_name", "_segment_idx", "_resolved")
+
+    def __init__(self, pp_group: "PipelineGroupCoordinator", name: str, segment_idx: int):
+        self._pp_group = pp_group
+        self._name = name
+        self._segment_idx = segment_idx
+        self._resolved: dict[str, Any] | None = None
+
+    def resolve(self) -> dict[str, Any]:
+        if self._resolved is None:
+            tensor_dict, handles, _ = self._pp_group.pipeline_irecv_tensor_dict(
+                name=self._name, segment_idx=self._segment_idx
+            )
+            for h in handles:
+                h.wait()
+            self._resolved = tensor_dict
+        return self._resolved
+
+
 class PipelineGroupCoordinator(GroupCoordinator):
     """
     available attributes:
@@ -707,10 +728,6 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.dict_recv_buffer: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
 
         self.dict_schema_keepalive: list[torch.Tensor] = []
-        self.recv_dict_tasks_queue: list[tuple[str, int]] = []
-        self.receiving_dict_tasks: list[
-            tuple[dict[str, Any], list[torch.distributed.Work], str, int]
-        ] = []
 
         self.skip_tensor_recv_buffer_set: bool = False
         self.recv_skip_tasks_queue: list[int | tuple[str, int]] = []
@@ -772,8 +789,6 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.dict_schema_cache = {}
         self.dict_recv_buffer = {}
         self.dict_schema_keepalive = []
-        self.recv_dict_tasks_queue = []
-        self.receiving_dict_tasks = []
 
         self.recv_skip_tasks_queue = []
         self.receiving_skip_tasks = []
@@ -1099,6 +1114,11 @@ class PipelineGroupCoordinator(GroupCoordinator):
         receiving_task[0].wait()
         assert receiving_task[1] == name and receiving_task[2] == idx, "Received tensor does not match the requested"
         return self.recv_buffer[name][idx]
+
+    def add_pipeline_recv_dict_task(
+        self, name: str = "dict", segment_idx: int = -1
+    ) -> PipelineRecvDictHandle:
+        return PipelineRecvDictHandle(self, name, segment_idx)
 
     def _pipeline_irecv(self, tensor: torch.tensor):
         # batch_isend_irecv (not plain irecv) — plain P2P on size-2 PG

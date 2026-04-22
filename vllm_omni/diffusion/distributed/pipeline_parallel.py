@@ -5,8 +5,9 @@ from functools import wraps
 from typing import Any
 
 import torch
-from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
+from vllm.sequence import IntermediateTensors
 
+from vllm_omni.diffusion.distributed.group_coordinator import PipelineRecvDictHandle
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -18,44 +19,23 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 
 
 class AsyncLatents:
-    """Transparent async wrapper returned by scheduler_step on rank 0.
+    """Lazy-resolve wrapper around a ``PipelineRecvDictHandle`` for latents."""
 
-    Wraps a pending ``irecv_tensor_dict`` and defers ``handle.wait()`` until the
-    underlying tensor is actually consumed — either via attribute access
-    (e.g. ``latents.to(dtype)``, ``latents.shape``) or via a torch operation
-    (e.g. ``mask * latents``).  This keeps the first PP rank non-blocking after
-    posting the receive, matching the async philosophy used everywhere else in
-    the PP communication layer.
-    """
+    __slots__ = ("_handle", "_key", "_tensor")
 
-    __slots__ = ("_tensor_dict", "_handles", "_postproc", "_tensor")
-
-    def __init__(
-        self,
-        tensor_dict: dict[str, torch.Tensor],
-        handles: list[torch.distributed.Work],
-        postproc: list,
-    ):
-        self._tensor_dict = tensor_dict
-        self._handles = handles
-        self._postproc = postproc
+    def __init__(self, handle: PipelineRecvDictHandle, key: str = "latents"):
+        self._handle = handle
+        self._key = key
         self._tensor: torch.Tensor | None = None
 
     def _resolve(self) -> torch.Tensor:
-        if self._tensor is not None:
-            return self._tensor
-        for h in self._handles:
-            h.wait()
-        for fn in self._postproc:
-            fn()
-        self._tensor = self._tensor_dict["latents"]
+        if self._tensor is None:
+            self._tensor = self._handle.resolve()[self._key]
         return self._tensor
 
-    # Attribute access (e.g. .shape, .to(), .dtype) delegates to the resolved tensor.
     def __getattr__(self, name: str):
         return getattr(self._resolve(), name)
 
-    # Torch function protocol: any torch op involving an AsyncLatents resolves it first.
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
@@ -64,12 +44,33 @@ class AsyncLatents:
             if isinstance(x, AsyncLatents):
                 return x._resolve()
             if isinstance(x, (list, tuple)):
-                return type(x)(_unwrap(item) for item in x)  # type(x) return the class of x to preserve its type
+                return type(x)(_unwrap(item) for item in x)
             return x
 
         args = tuple(_unwrap(a) for a in args)
         kwargs = {k: _unwrap(v) for k, v in kwargs.items()}
         return func(*args, **kwargs)
+
+
+class AsyncIntermediateTensors:
+    """Lazy-resolve wrapper around a ``PipelineRecvDictHandle`` for an IT."""
+
+    __slots__ = ("_handle", "_resolved")
+
+    def __init__(self, handle: PipelineRecvDictHandle):
+        self._handle = handle
+        self._resolved: IntermediateTensors | None = None
+
+    def _resolve(self) -> IntermediateTensors:
+        if self._resolved is None:
+            self._resolved = IntermediateTensors(self._handle.resolve())
+        return self._resolved
+
+    def __getitem__(self, key: str):
+        return self._resolve()[key]
+
+    def __getattr__(self, name: str):
+        return getattr(self._resolve(), name)
 
 
 class PipelineParallelMixin:
@@ -217,14 +218,12 @@ class PipelineParallelMixin:
             # Sequential CFG (or no CFG): this PP pipeline handles all branches.
             all_kwargs = [positive_kwargs] + ([negative_kwargs] if do_true_cfg else [])
 
-        # Non-first ranks receive intermediate tensors asynchronously
         n = len(all_kwargs)
         its: list[AsyncIntermediateTensors | None] = [None] * n
         if not pp_group.is_first_rank:
             for i in range(n):
-                its[i] = AsyncIntermediateTensors(
-                    *pp_group.pipeline_irecv_tensor_dict(name="intermediate", segment_idx=i)
-                )
+                handle = pp_group.add_pipeline_recv_dict_task(name="intermediate", segment_idx=i)
+                its[i] = AsyncIntermediateTensors(handle)
 
         if not pp_group.is_last_rank:
             # First / middle rank: run partial forwards and propagate ITs downstream.
@@ -289,5 +288,6 @@ class PipelineParallelMixin:
             latents = super().scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg, per_request_scheduler)
             self._pp_send_work = pp_group.pipeline_isend_tensor_dict({"latents": latents}, name="latents")
         elif pp_group.is_first_rank:
-            latents = AsyncLatents(*pp_group.pipeline_irecv_tensor_dict(name="latents"))
+            handle = pp_group.add_pipeline_recv_dict_task(name="latents")
+            latents = AsyncLatents(handle)
         return latents
