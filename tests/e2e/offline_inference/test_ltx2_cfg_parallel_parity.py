@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 T2V_EXAMPLE = REPO_ROOT / "examples" / "offline_inference" / "text_to_video" / "text_to_video.py"

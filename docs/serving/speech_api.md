@@ -15,28 +15,17 @@ Each server instance runs a single model (specified at startup via `vllm serve <
 ```bash
 # Qwen3-TTS: CustomVoice model (predefined speakers)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
     --enforce-eager
 
 # Fish Speech S2 Pro
-vllm-omni serve fishaudio/s2-pro \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/fish_speech_s2_pro.yaml \
-    --omni \
-    --port 8091 \
-    --trust-remote-code \
-    --enforce-eager \
-    --gpu-memory-utilization 0.9
+vllm serve fishaudio/s2-pro --omni --port 8091
 
 # Voxtral TTS
-vllm serve mistralai/Voxtral-4B-TTS-2603 \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
-    --omni \
-    --port 8091 \
-    --trust-remote-code \
-    --enforce-eager
+vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8091
 ```
 
 ### Generate Speech
@@ -300,7 +289,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 ```bash
 # Start server with VoiceDesign model first
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
@@ -322,7 +311,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 ```bash
 # Start server with Base model first
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
@@ -517,15 +506,16 @@ for result in response.json()["results"]:
 
 All items are fanned out to `generate()` concurrently. The engine's stage worker automatically batches them up to the configured `max_batch_size` and queues the rest — no client-side throttling needed.
 
-For best throughput, use a batch-optimized stage config with `max_batch_size > 1`:
+For best throughput, set both stages' `max_num_seqs` to ≥4 via `--stage-overrides`:
 
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts_batch.yaml \
-    --omni --port 8091 --trust-remote-code --enforce-eager
+    --omni --port 8091 --trust-remote-code --enforce-eager \
+    --stage-overrides '{"0":{"max_num_seqs":4,"gpu_memory_utilization":0.2},
+                        "1":{"max_num_seqs":4,"gpu_memory_utilization":0.2}}'
 ```
 
-The default `qwen3_tts.yaml` uses `max_batch_size: 1` (single request). The `qwen3_tts_batch.yaml` config sets `max_batch_size: 4` for ~4x throughput.
+The bundled `qwen3_tts.yaml` uses `max_num_seqs: 1` (single request) on both stages. Bumping to 4 yields roughly 4× throughput on the talker and lets stage 1 batch chunks across in-flight requests.
 
 ## Supported Models
 
@@ -617,7 +607,7 @@ Enable debug logging:
 
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \

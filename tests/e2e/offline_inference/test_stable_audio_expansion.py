@@ -15,12 +15,14 @@ import numpy as np
 import pytest
 import torch
 
-from tests.conftest import assert_audio_valid
-from tests.utils import hardware_test
+from tests.helpers.assertions import assert_audio_valid
+from tests.helpers.mark import hardware_test
 from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
+
+pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
 _SAMPLE_RATE = 44100
 _CLIP_DURATION_S = 2.0
@@ -72,8 +74,6 @@ def generate_stable_audio_short_clip(
     return audio
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.cache
 @hardware_test(res={"cuda": "L4", "xpu": "B60"})
 def test_stable_audio_quantization_and_teacache() -> None:

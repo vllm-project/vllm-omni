@@ -27,22 +27,21 @@ Usage:
 """
 
 import os
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
 from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
 
-from tests.conftest import OmniRunner
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
 

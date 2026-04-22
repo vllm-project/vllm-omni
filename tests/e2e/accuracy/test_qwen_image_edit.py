@@ -10,13 +10,13 @@ from diffusers import QwenImageEditPipeline, QwenImageEditPlusPipeline
 from PIL import Image
 
 from benchmarks.accuracy.common import decode_base64_image, pil_to_png_bytes
-from tests.conftest import (
-    OmniServer,
-    _run_post_test_cleanup,
-    _run_pre_test_cleanup,
-)
-from tests.e2e.accuracy.utils import assert_similarity, model_output_dir
-from tests.utils import hardware_test
+from tests.e2e.accuracy.helpers import assert_similarity, model_output_dir
+from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServer
+
+pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+
 
 SINGLE_MODEL = "Qwen/Qwen-Image-Edit"
 MULTIPLE_MODEL = "Qwen/Qwen-Image-Edit-2509"
@@ -77,7 +77,7 @@ def _run_diffusers_image_edit(
     input_images: list[Image.Image],
     output_path: Path,
 ) -> Image.Image:
-    _run_pre_test_cleanup(enable_force=True)
+    run_pre_test_cleanup(enable_force=True)
     pipe: QwenImageEditPipeline | QwenImageEditPlusPipeline | None = None
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
@@ -110,7 +110,7 @@ def _run_diffusers_image_edit(
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        _run_post_test_cleanup(enable_force=True)
+        run_post_test_cleanup(enable_force=True)
 
 
 def _vllm_omni_output_single_image(
@@ -172,9 +172,7 @@ def _diffusers_output_multiple_image(
     )
 
 
-@pytest.mark.advanced_model
 @pytest.mark.benchmark
-@pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_qwen_image_edit_single_matches_diffusers(
     accuracy_artifact_root: Path,
@@ -199,9 +197,7 @@ def test_qwen_image_edit_single_matches_diffusers(
     )
 
 
-@pytest.mark.advanced_model
 @pytest.mark.benchmark
-@pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skip(
     reason="Skipping as the second image seems to be ignored by the API. Will come back to this later after #2772 is merged."

@@ -13,10 +13,10 @@ Please refer to [README.md](../../../README.md)
 ```bash
 export MIMO_AUDIO_TOKENIZER_PATH="XiaomiMiMo/MiMo-Audio-Tokenizer"
 
-vllm-omni serve XiaomiMiMo/MiMo-Audio-7B-Instruct --omni \
---served-model-name "MiMo-Audio-7B-Instruct"  \
---port 18091 --stage-configs-path ./vllm_omni/model_executor/stage_configs/mimo_audio.yaml \
---chat-template ./examples/online_serving/mimo_audio/chat_template.jinja
+vllm serve XiaomiMiMo/MiMo-Audio-7B-Instruct --omni \
+    --served-model-name "MiMo-Audio-7B-Instruct" \
+    --port 18091 \
+    --chat-template ./examples/online_serving/mimo_audio/chat_template.jinja
 ```
 > ⚠️ **Important**  
 > **MiMo-Audio is not compatible with the default chat template.**  

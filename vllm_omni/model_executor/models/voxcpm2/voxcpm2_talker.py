@@ -13,12 +13,12 @@ from __future__ import annotations
 import copy
 import dataclasses
 import logging
+import math
 import os
 import time
 from collections.abc import Iterable
 from typing import Any
 
-import librosa
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -29,6 +29,7 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     maybe_prefix,
 )
+from vllm.multimodal.audio import AudioResampler
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -39,6 +40,11 @@ from .voxcpm2_import_utils import import_voxcpm2_core
 logger = init_logger(__name__)
 
 _ENABLE_PROFILING = os.environ.get("VOXCPM2_PROFILE", "0") == "1"
+
+# Lower bound for the _active_states leak-warn threshold.  The effective
+# threshold is max(_ACTIVE_STATE_LEAK_WARN_MIN, 4 * max_batch_size) so small
+# deployments still get a usable floor instead of a tiny noisy one.
+_ACTIVE_STATE_LEAK_WARN_MIN = 512
 
 
 def is_cjk_char(c: str) -> bool:
@@ -80,6 +86,44 @@ def split_multichar_chinese(token_ids: list[int], split_map: dict[int, list[int]
     return result
 
 
+def build_voxcpm2_prompt(
+    hf_config: Any,
+    tokenizer: Any,
+    split_map: dict[int, list[int]],
+    text: str,
+    ref_audio: Any | None = None,
+    ref_sr: int | None = None,
+    ref_text: str | None = None,
+) -> dict[str, Any]:
+    """Build a VoxCPM2 prefill prompt whose ``prompt_token_ids`` length matches
+    the talker-side prefill length.
+
+    Used by both online serving (``serving_speech._build_voxcpm2_prompt``) and
+    the offline example, so the talker-side length assertion never fires.
+    """
+    ids = split_multichar_chinese(tokenizer.encode(text, add_special_tokens=True), split_map)
+    bos = tokenizer.bos_token_id
+    if ids and ids[0] == bos:
+        ids = ids[1:]
+    prefill_len = len(ids) + 1  # + audio_start
+    additional: dict[str, Any] = {"text_token_ids": [ids]}
+    if ref_audio is not None:
+        vae = hf_config.audio_vae_config
+        patch_samples = hf_config.patch_size * math.prod(vae["encoder_rates"])
+        ref_len = math.ceil(math.ceil(len(ref_audio) * vae["sample_rate"] / ref_sr) / patch_samples)
+        if ref_text is not None:
+            additional["prompt_audio"] = [[ref_audio, ref_sr]]
+            additional["prompt_text"] = [ref_text]
+            ref_ids = split_multichar_chinese(tokenizer.encode(ref_text, add_special_tokens=True), split_map)
+            if ref_ids and ref_ids[0] == bos:
+                ref_ids = ref_ids[1:]
+            prefill_len += ref_len + len(ref_ids)
+        else:
+            additional["reference_audio"] = [[ref_audio, ref_sr]]
+            prefill_len += ref_len + 2  # ref_start / ref_end
+    return {"prompt_token_ids": [1] * prefill_len, "additional_information": additional}
+
+
 def _encode_raw_audio(
     tts: nn.Module,
     samples: list[float] | torch.Tensor,
@@ -101,7 +145,8 @@ def _encode_raw_audio(
     encode_sr = tts._encode_sample_rate
     if sr != encode_sr:
         audio_np = audio.squeeze(0).numpy()
-        audio_np = librosa.resample(audio_np, orig_sr=sr, target_sr=encode_sr)
+        resampler = AudioResampler(target_sr=encode_sr)
+        audio_np = resampler.resample(audio_np, orig_sr=sr)
         audio = torch.from_numpy(audio_np).unsqueeze(0)
 
     patch_len = tts.patch_size * tts.chunk_size
@@ -401,6 +446,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._results_queue: list[tuple[str, torch.Tensor | None]] = []
         self._audio_queue: list[tuple[str, Any]] = []
         self._deferred_cleanup_ids: set[str] = set()
+        self._active_state_warn_threshold = max(_ACTIVE_STATE_LEAK_WARN_MIN, 4 * self._max_batch_size)
+        # one-shot by design: fires at most once per process to avoid log spam.
+        self._active_state_warned = False
 
     @property
     def tts(self) -> nn.Module:
@@ -410,9 +458,20 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     # -------------------- request state management --------------------
 
     def _get_or_create_state(self, request_id: str) -> _RequestState:
-        if request_id not in self._active_states:
-            self._active_states[request_id] = _RequestState(request_id=request_id)
-        return self._active_states[request_id]
+        state = self._active_states.get(request_id)
+        if state is None:
+            state = _RequestState(request_id=request_id)
+            self._active_states[request_id] = state
+            if len(self._active_states) > self._active_state_warn_threshold and not self._active_state_warned:
+                logger.warning(
+                    "VoxCPM2: _active_states size=%d exceeds threshold %d "
+                    "(max_batch_size=%d); possible cleanup path leak",
+                    len(self._active_states),
+                    self._active_state_warn_threshold,
+                    self._max_batch_size,
+                )
+                self._active_state_warned = True
+        return state
 
     def _switch_to_request(self, request_id: str) -> _RequestState:
         if request_id != self._current_request_id:
@@ -793,19 +852,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         tts_len = text_mask.shape[1]
         scaffold_len = base_lm_out.shape[0]
-
-        if scaffold_len < tts_len:
-            # Voice clone / continuation: scaffold only processed vllm tokens.
-            # Pad to match TTS sequence length (extra positions are masked out).
-            pad = torch.zeros(
-                tts_len - scaffold_len,
-                base_lm_out.shape[-1],
-                device=base_lm_out.device,
-                dtype=base_lm_out.dtype,
-            )
-            enc_out = torch.cat([base_lm_out, pad], dim=0).unsqueeze(0)
-        else:
-            enc_out = base_lm_out.unsqueeze(0)
+        assert scaffold_len == tts_len, (
+            f"voxcpm2 prefill length mismatch: scaffold_len={scaffold_len} tts_len={tts_len}; "
+            "caller must pad prompt_token_ids to the full prefill length "
+            "(see serving_speech._build_voxcpm2_prompt or the offline example)."
+        )
+        enc_out = base_lm_out.unsqueeze(0)
 
         prefix_feat_cond = (
             feat[:, -1, ...]
@@ -1055,15 +1107,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         is_prefill = span_len > 1
 
         if is_prefill:
-            # Evict stale states
-            pending_ids = {rid for rid, *_ in self._pending_requests}
-            pending_ids.add(req_id)
-            if self._current_request_id:
-                pending_ids.add(self._current_request_id)
-            for rid in [r for r, s in self._active_states.items() if r not in pending_ids and s.prefill_completed]:
-                self._cleanup_request(rid)
-
-            token_ids = input_ids.tolist()
+            # Do not evict state here: _pending_requests is a per-step prefix,
+            # not the full batch. Cleanup is driven by on_requests_finished ->
+            # _flush_deferred_cleanup (fed by vLLM scheduler._free_request via
+            # gpu_ar_model_runner.py).
+            real = info_dict.get("text_token_ids")
+            token_ids = input_ids.tolist() if real is None else real[0]
             # Fail-fast: unsplit multichar Chinese IDs in input_ids means the
             # serving layer didn't pre-split.  Silent fixup here would cause
             # input_ids/embeds length mismatch (scheduler slot count is fixed).

@@ -3,23 +3,23 @@
         "test_name": "test_qwen3_omni",
         "server_params": {
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-            "stage_config_name": "qwen3_omni.yaml"
+            "extra_cli_args": ["--no-async-chunk"]
         },
         "benchmark_params": [
             {
                 "dataset_name": "random",
                 "backend": "openai-chat-omni",
                 "endpoint": "/v1/chat/completions",
-                "num_prompts": [4, 16, 40],
-                "max_concurrency": [1, 4, 10],
+                "num_prompts": [4, 16, 32, 64, 128],
+                "max_concurrency": [1, 4, 8, 16, 32],
                 "random_input_len": 2500,
                 "random_output_len": 900,
                 "ignore_eos": true,
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": [1000, 3000, 5000],
-                    "mean_audio_ttfp_ms": [30000, 60000, 90000],
-                    "mean_audio_rtf": [0.35, 0.45, 0.55]
+                    "mean_ttft_ms": [1000, 3000, 5000, 7000, 9000],
+                    "mean_audio_ttfp_ms": [30000, 60000, 90000, 120000, 150000],
+                    "mean_audio_rtf": [0.35, 0.45, 0.55, 0.65, 0.75]
                 }
             },
             {
@@ -52,7 +52,7 @@
                 "backend": "openai-chat-omni",
                 "endpoint": "/v1/chat/completions",
                 "num_prompts": [40],
-                "request_rate": [0.3],
+                "request_rate": [0.5],
                 "random_input_len": 100,
                 "random_output_len": 100,
                 "random_range_ratio": 0.0,
@@ -69,9 +69,9 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": [4000],
-                    "mean_audio_ttfp_ms": [13000],
-                    "mean_audio_rtf": [0.35]
+                    "mean_ttft_ms": [6000],
+                    "mean_audio_ttfp_ms": [15000],
+                    "mean_audio_rtf": [0.45]
                 }
             },
             {
@@ -79,7 +79,7 @@
                 "backend": "openai-chat-omni",
                 "endpoint": "/v1/chat/completions",
                 "num_prompts": [100],
-                "request_rate": [0.5],
+                "request_rate": [1.0],
                 "random_input_len": 100,
                 "random_output_len": 100,
                 "random_range_ratio": 0.0,
@@ -98,9 +98,9 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": [6000],
-                    "mean_audio_ttfp_ms": [15000],
-                    "mean_audio_rtf": [0.45]
+                    "mean_ttft_ms": [12000],
+                    "mean_audio_ttfp_ms": [18000],
+                    "mean_audio_rtf": [0.9]
                 }
             }
         ]
@@ -109,41 +109,23 @@
         "test_name": "test_qwen3_omni_chunk",
         "server_params": {
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-            "stage_config_name": "qwen3_omni.yaml",
-            "update": {
-                "async_chunk": true,
-                "stage_args": {
-                    "0": {
-                        "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
-                    },
-                    "1": {
-                        "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk"
-                    }
-                }
-            },
-            "delete": {
-                "stage_args": {
-                    "2": [
-                        "custom_process_input_func"
-                    ]
-                }
-            }
+            "extra_cli_args": ["--async-chunk"]
         },
         "benchmark_params": [
             {
                 "dataset_name": "random",
                 "backend": "openai-chat-omni",
                 "endpoint": "/v1/chat/completions",
-                "num_prompts": [4, 16, 40],
-                "max_concurrency": [1, 4, 10],
+                "num_prompts": [4, 16, 32, 64],
+                "max_concurrency": [1, 4, 8, 16],
                 "random_input_len": 2500,
                 "random_output_len": 900,
                 "ignore_eos": true,
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": [1000, 3000, 5000],
-                    "mean_audio_ttfp_ms": [1000, 3000, 5000],
-                    "mean_audio_rtf": [0.2, 0.35, 0.6]
+                    "mean_ttft_ms": [1000, 3000, 5000, 7000],
+                    "mean_audio_ttfp_ms": [1000, 3000, 5000, 7000],
+                    "mean_audio_rtf": [0.2, 0.35, 0.6, 0.85]
                 }
             },
             {
@@ -176,7 +158,7 @@
                 "backend": "openai-chat-omni",
                 "endpoint": "/v1/chat/completions",
                 "num_prompts": [40],
-                "request_rate": [0.3],
+                "request_rate": [0.5],
                 "random_input_len": 100,
                 "random_output_len": 100,
                 "random_range_ratio": 0.0,
@@ -193,9 +175,9 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": [4000],
-                    "mean_audio_ttfp_ms": [4000],
-                    "mean_audio_rtf": [0.4]
+                    "mean_ttft_ms": [6000],
+                    "mean_audio_ttfp_ms": [6000],
+                    "mean_audio_rtf": [0.7]
                 }
             },
             {
@@ -203,7 +185,7 @@
                 "backend": "openai-chat-omni",
                 "endpoint": "/v1/chat/completions",
                 "num_prompts": [100],
-                "request_rate": [0.5],
+                "request_rate": [1.0],
                 "random_input_len": 100,
                 "random_output_len": 100,
                 "random_range_ratio": 0.0,
@@ -222,17 +204,17 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": [6000],
-                    "mean_audio_ttfp_ms": [6000],
-                    "mean_audio_rtf": [0.7]
+                    "mean_ttft_ms": [12000],
+                    "mean_audio_ttfp_ms": [12000],
+                    "mean_audio_rtf": [1.0]
                 }
             },
             {
                 "dataset_name": "random",
                 "backend": "openai-chat-omni",
                 "endpoint": "/v1/chat/completions",
-                "num_prompts": [4, 16, 40],
-                "max_concurrency": [1, 4, 10],
+                "num_prompts": [4, 16, 32, 64, 128],
+                "max_concurrency": [1, 4, 8, 16, 32],
                 "random_input_len": 2500,
                 "random_output_len": 900,
                 "ignore_eos": true,
@@ -241,7 +223,7 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el",
                 "baseline": {
-                    "mean_ttft_ms": [1000, 3000, 5000]
+                    "mean_ttft_ms": [1000, 3000, 5000, 7000, 9000]
                 }
             },
             {
@@ -275,7 +257,7 @@
                 "backend": "openai-chat-omni",
                 "endpoint": "/v1/chat/completions",
                 "num_prompts": [40],
-                "request_rate": [0.3],
+                "request_rate": [0.5],
                 "random_input_len": 100,
                 "random_output_len": 100,
                 "random_range_ratio": 0.0,
@@ -295,7 +277,7 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el",
                 "baseline": {
-                    "mean_ttft_ms": [4000]
+                    "mean_ttft_ms": [6000]
                 }
             },
             {
@@ -303,7 +285,7 @@
                 "backend": "openai-chat-omni",
                 "endpoint": "/v1/chat/completions",
                 "num_prompts": [100],
-                "request_rate": [0.5],
+                "request_rate": [1.0],
                 "random_input_len": 100,
                 "random_output_len": 100,
                 "random_range_ratio": 0.0,

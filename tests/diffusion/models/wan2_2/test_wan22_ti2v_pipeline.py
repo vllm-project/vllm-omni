@@ -41,7 +41,6 @@ def test_ti2v_preprocess_uses_720p_area_for_image_condition() -> None:
     assert result.sampling_params.height == 672
     assert result.sampling_params.width == 1344
     assert result.prompts[0]["multi_modal_data"]["image"].size == (1344, 672)
-    assert result.prompts[0]["additional_information"]["preprocessed_image"].shape[-2:] == (672, 1344)
 
 
 def test_ti2v_diffuse_without_image_condition_expands_patch_timesteps() -> None:

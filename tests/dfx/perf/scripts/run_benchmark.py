@@ -8,7 +8,6 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import OmniServer
 from tests.dfx.conftest import (
     create_benchmark_indices,
     create_test_parameter_mapping,
@@ -16,6 +15,10 @@ from tests.dfx.conftest import (
     get_benchmark_params_for_server,
     load_configs,
 )
+from tests.helpers.runtime import OmniServer
+
+pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
@@ -48,8 +51,8 @@ BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
 OMNI_RESULT_TEMPLATE_PATH = Path(__file__).parent / "result_omni_template.json"
 
 
-STAGE_CONFIGS_DIR = Path(__file__).parent.parent / "stage_configs"
-test_params = create_unique_server_params(BENCHMARK_CONFIGS, STAGE_CONFIGS_DIR)
+DEPLOY_CONFIGS_DIR = Path(__file__).parent.parent / "deploy"
+test_params = create_unique_server_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR)
 server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS)
 
 _omni_server_lock = threading.Lock()
@@ -62,13 +65,19 @@ def omni_server(request):
     Multi-stage initialization can take 10-20+ minutes.
     """
     with _omni_server_lock:
-        test_name, model, stage_config_path = request.param
+        test_name, model, stage_config_path, stage_overrides, extra_cli_args = request.param
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
         server_args = ["--stage-init-timeout", "600", "--init-timeout", "900"]
+        # --deploy-config and --stage-overrides compose at the CLI (see vllm_omni/entrypoints/utils.py):
+        # deploy-config sets the base; stage-overrides are applied on top. Both can be set.
         if stage_config_path:
-            server_args = ["--stage-configs-path", stage_config_path] + server_args
+            server_args = ["--deploy-config", stage_config_path] + server_args
+        if stage_overrides:
+            server_args = ["--stage-overrides", stage_overrides] + server_args
+        if extra_cli_args:
+            server_args = list(extra_cli_args) + server_args
         with OmniServer(model, server_args) as server:
             server.test_name = test_name
             print("OmniServer started successfully")
@@ -287,6 +296,7 @@ def assert_result(
                 print(f"ERROR: Test results exceeded baseline: {metric_name}: {current_value} < {baseline_value}")
 
 
+@pytest.mark.benchmark
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.parametrize("benchmark_params", benchmark_indices, indirect=True)
 def test_performance_benchmark(omni_server, benchmark_params):

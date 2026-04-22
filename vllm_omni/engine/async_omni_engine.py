@@ -33,6 +33,7 @@ from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm_omni.config.stage_config import strip_parent_engine_args
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.diffusion.stage_diffusion_proc import (
@@ -92,6 +93,29 @@ if TYPE_CHECKING:
     from vllm_omni.engine.arg_utils import OmniEngineArgs
 
 logger = init_logger(__name__)
+
+_STARTUP_POLL_INTERVAL_S = 1.0
+
+
+# ============================================================================
+# Parent-EngineArgs field-routing contracts (consumed by
+# AsyncOmniEngine._strip_parent_engine_args when ``stage_configs_path`` is set).
+# ============================================================================
+
+# Fields that must survive the "equal to default → strip" filter because
+# diffusion stages need them even when equal to vllm's default value
+# (e.g. colocate worker setup relies on worker_extension_cls being forwarded).
+_PARENT_ARGS_KEEP: frozenset[str] = frozenset({"worker_extension_cls"})
+
+# Omni orchestrator-level fields consumed by ``_resolve_stage_configs`` that
+# must never leak into per-stage EngineArgs (``stage_configs_path`` would
+# trigger the ``create_model_config`` guard).
+_PARENT_ARGS_STRIP: frozenset[str] = frozenset({"stage_configs_path"})
+
+# Fields always populated by callers (via ``from_cli_args`` / ``asdict``) so
+# their presence as an override is never a surprise — suppress the
+# "override ignored" warning for these.
+_PARENT_ARGS_NO_WARN: frozenset[str] = frozenset({"model"})
 
 
 def _patch_generation_config_if_needed(model_config: Any) -> None:
@@ -319,22 +343,7 @@ class AsyncOmniEngine:
             name="orchestrator",
         )
         self.orchestrator_thread.start()
-
-        # Wait for stage/runtime initialization result from orchestrator thread.
-        try:
-            startup_future.result(timeout=startup_timeout)
-        except concurrent.futures.TimeoutError as e:
-            try:
-                self.shutdown()
-            except Exception:
-                logger.exception("[AsyncOmniEngine] Failed to cleanup after orchestrator startup timeout")
-            raise TimeoutError(f"Orchestrator did not become ready within {startup_timeout}s") from e
-        except Exception:
-            try:
-                self.shutdown()
-            except Exception:
-                logger.exception("[AsyncOmniEngine] Failed to cleanup after orchestrator startup failure")
-            raise
+        self._wait_for_orchestrator_init(startup_future, startup_timeout)
 
         # Stage runtime fields are assigned directly on self by the bootstrap thread.
         self._weak_finalizer = weakref.finalize(
@@ -771,6 +780,7 @@ class AsyncOmniEngine:
                                 else:
                                     use_inline = True if self.num_stages == 1 else False
                                     stage_clients[stage_idx] = initialize_diffusion_stage(
+                                        configured_stage_id,
                                         self.model,
                                         stage_cfg,
                                         metadata,
@@ -923,13 +933,17 @@ class AsyncOmniEngine:
             loop.run_until_complete(_run_orchestrator())
         except Exception as e:
             if not startup_future.done():
-                startup_future.set_exception(RuntimeError(f"Orchestrator initialization failed: {e}"))
+                wrapped = RuntimeError(f"Orchestrator initialization failed: {e}")
+                wrapped.__cause__ = e
+                startup_future.set_exception(wrapped)
             logger.exception("[AsyncOmniEngine] Orchestrator thread crashed")
+            error_text = str(e) or "Orchestrator thread crashed"
             try:
+                error_msg = {"type": "error", "error": error_text, "fatal": True}
                 if self.output_queue is not None:
-                    self.output_queue.sync_q.put_nowait({"type": "error", "error": "Orchestrator thread crashed"})
+                    self.output_queue.sync_q.put_nowait(error_msg)
                 if self.rpc_output_queue is not None:
-                    self.rpc_output_queue.sync_q.put_nowait({"type": "error", "error": "Orchestrator thread crashed"})
+                    self.rpc_output_queue.sync_q.put_nowait(error_msg)
             except Exception:
                 pass
             raise
@@ -948,6 +962,31 @@ class AsyncOmniEngine:
             finally:
                 asyncio.set_event_loop(None)
                 loop.close()
+
+    def _wait_for_orchestrator_init(self, startup_future: concurrent.futures.Future, startup_timeout: int) -> None:
+        """
+        Wait for orchestrator startup future to return ready. Raises exception on any failures to the init process.
+        """
+        deadline = time.monotonic() + startup_timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._try_shutdown("[AsyncOmniEngine] Failed to cleanup after orchestrator startup timeout")
+                raise TimeoutError(f"Orchestrator did not become ready within {startup_timeout}s")
+            try:
+                startup_future.result(
+                    timeout=min(remaining, _STARTUP_POLL_INTERVAL_S),
+                )
+                break
+            except concurrent.futures.TimeoutError:
+                if not self.orchestrator_thread.is_alive():
+                    self._try_shutdown("[AsyncOmniEngine] Failed to cleanup after orchestrator startup failure")
+                    if startup_future.done():
+                        startup_future.result()  # re-raises the real exception
+                    raise RuntimeError("Orchestrator thread died during startup")
+            except Exception:
+                self._try_shutdown("[AsyncOmniEngine] Failed to cleanup after orchestrator startup failure")
+                raise
 
     # ---- request helpers ----
 
@@ -1280,6 +1319,12 @@ class AsyncOmniEngine:
         if "dtype" in normalized_kwargs:
             stage_engine_args["dtype"] = normalized_kwargs["dtype"]
 
+        # New split fields for diffusers adapter kwargs.
+        if kwargs.get("diffusers_load_kwargs") is not None:
+            stage_engine_args["diffusers_load_kwargs"] = kwargs["diffusers_load_kwargs"]
+        if kwargs.get("diffusers_call_kwargs") is not None:
+            stage_engine_args["diffusers_call_kwargs"] = kwargs["diffusers_call_kwargs"]
+
         default_stage_cfg = [
             {
                 "stage_id": 0,
@@ -1310,45 +1355,17 @@ class AsyncOmniEngine:
 
         Logs a warning for any parent field whose value differs from the
         dataclass default, so users know their explicit overrides are ignored.
+        See the module-level ``_PARENT_ARGS_*`` constants for the routing
+        contracts this method enforces.
         """
-        # worker_extension_cls is a parent field but must pass through to
-        # diffusion stages for colocate worker setup.
-        _keep = {"worker_extension_cls"}
-        # Orchestrator-level OmniEngineArgs fields that are consumed by
-        # _resolve_stage_configs and must not leak into per-stage configs
-        # (stage_configs_path would trigger the create_model_config guard).
-        _strip_omni = {"stage_configs_path"}
-        # Fields that are always set by callers (via from_cli_args / asdict)
-        # and would always appear as overridden — suppress from the warning
-        # so it only surfaces genuinely surprising overrides.
-        _no_warn = {"model"}
-
         parent_fields: dict[str, dataclasses.Field] = {f.name: f for f in dataclasses.fields(EngineArgs)}
-        overridden: list[str] = []
-        result: dict[str, Any] = {}
-        for k, v in kwargs.items():
-            if k in _strip_omni:
-                continue
-            if k not in parent_fields or k in _keep:
-                result[k] = v
-                continue
-            # Detect explicitly-set values that differ from the default.
-            # Values may have been through asdict() which converts dataclass
-            # defaults to dicts, so normalise before comparing.
-            field = parent_fields[k]
-            if field.default is not dataclasses.MISSING:
-                default = field.default
-            elif field.default_factory is not dataclasses.MISSING:
-                default = field.default_factory()
-            else:
-                default = dataclasses.MISSING
-            if default is dataclasses.MISSING or v is None:
-                continue
-            # Normalise dataclass defaults to dicts for comparison
-            if dataclasses.is_dataclass(default) and not isinstance(default, type):
-                default = dataclasses.asdict(default)
-            if v != default and k not in _no_warn:
-                overridden.append(k)
+        result, overridden = strip_parent_engine_args(
+            kwargs,
+            parent_fields=parent_fields,
+            keep_keys=_PARENT_ARGS_KEEP,
+            strip_keys=_PARENT_ARGS_STRIP,
+            no_warn_keys=_PARENT_ARGS_NO_WARN,
+        )
 
         if overridden:
             logger.warning(
@@ -1363,6 +1380,12 @@ class AsyncOmniEngine:
         """Resolve stage configs and inject defaults shared by orchestrator/headless."""
 
         stage_configs_path = kwargs.get("stage_configs_path", None)
+        deploy_config_path = kwargs.pop("deploy_config", None)
+        stage_overrides_json = kwargs.pop("stage_overrides", None)
+        # Set of CLI keys the user actually typed; ``None`` means we have no
+        # parser-level info (e.g. programmatic Omni() call) and the lower
+        # layers should treat all kwargs as explicit.
+        cli_explicit_keys = kwargs.pop("_cli_explicit_keys", None)
         explicit_stage_configs = kwargs.pop("stage_configs", None)
         if explicit_stage_configs is not None:
             logger.warning(
@@ -1375,18 +1398,38 @@ class AsyncOmniEngine:
         else:
             base_kwargs = kwargs
 
-        # Use the legacy config loading path (load_and_resolve_stage_configs).
-        # StageConfigFactory wiring will be done in config refactor [2/N].
+        # Parse --stage-overrides JSON string if provided
+        stage_overrides = None
+        if stage_overrides_json:
+            if isinstance(stage_overrides_json, str):
+                try:
+                    stage_overrides = json.loads(stage_overrides_json)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"--stage-overrides is not valid JSON: {exc}. Got: {stage_overrides_json!r}"
+                    ) from exc
+            else:
+                stage_overrides = stage_overrides_json
+
         config_path, stage_configs = load_and_resolve_stage_configs(
             model,
             stage_configs_path,
             base_kwargs,
             default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
+            deploy_config_path=deploy_config_path,
+            stage_overrides=stage_overrides,
+            cli_explicit_keys=cli_explicit_keys,
         )
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
         for cfg in stage_configs:
             try:
+                if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
+                    cfg.engine_args = OmegaConf.create({})
+                global_sleep_mode = kwargs.get("enable_sleep_mode")
+                if global_sleep_mode is not None:
+                    if not hasattr(cfg.engine_args, "enable_sleep_mode") or cfg.engine_args.enable_sleep_mode is None:
+                        cfg.engine_args.enable_sleep_mode = global_sleep_mode
                 if getattr(cfg, "stage_type", None) != "diffusion":
                     continue
                 if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
@@ -1708,3 +1751,9 @@ class AsyncOmniEngine:
             except Exception:
                 logger.exception("[AsyncOmniEngine] Failed to stop OmniMasterServer during shutdown")
             self._omni_master_server = None
+
+    def _try_shutdown(self, *args, **kwargs) -> None:
+        try:
+            self.shutdown()
+        except Exception:
+            logger.exception(*args, **kwargs)

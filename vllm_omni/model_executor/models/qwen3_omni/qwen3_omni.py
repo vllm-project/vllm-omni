@@ -180,6 +180,11 @@ class Qwen3OmniMoeForConditionalGeneration(
                 "trailing_text_hidden",
                 "tts_pad_embed_projected",
             }
+            # Keys that need to be accumulated across streaming inputs
+            self.streaming_accumulated_keys: set[str] = {
+                "thinker_prefill_embeddings",
+                "thinker_hidden_states",
+            }
 
         elif self.model_stage == "code2wav":
             self.enable_update_additional_information = True
@@ -684,6 +689,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         input_embeds: torch.Tensor,
         last_talker_hidden: torch.Tensor,
         text_step: torch.Tensor,
+        **kwargs: Any,
     ):
         # TODO(Peiqi): not support intermediate_tensors now
         input_ids = safe_tensor_reshape(input_ids, (input_ids.shape[0], -1))

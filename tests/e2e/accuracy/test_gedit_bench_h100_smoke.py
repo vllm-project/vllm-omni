@@ -7,13 +7,13 @@ import pytest
 
 from benchmarks.accuracy.image_to_image.gedit_bench import GROUPS
 from benchmarks.accuracy.image_to_image.gedit_bench import main as gedit_main
-from tests.e2e.accuracy.conftest import infer_model_label, reset_artifact_dir
-from tests.utils import hardware_test
+from tests.e2e.accuracy.helpers import infer_model_label, reset_artifact_dir
+from tests.helpers.mark import hardware_test
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 
-@pytest.mark.advanced_model
 @pytest.mark.benchmark
-@pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_gedit_bench_h100_smoke(
     gedit_accuracy_servers,

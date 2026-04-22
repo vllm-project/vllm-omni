@@ -152,8 +152,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         if supports_mrope(self.get_model()):
             # Model implements SupportsMRoPE interface
             # Pass all extracted metadata; models use what they need via **kwargs
-            req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
-                req_state.prompt_token_ids,
+            sp_extra_args = getattr(req_state.sampling_params, "extra_args", {}) if req_state.sampling_params else {}
+            target_h = sp_extra_args.get("target_h") if isinstance(sp_extra_args, dict) else None
+            target_w = sp_extra_args.get("target_w") if isinstance(sp_extra_args, dict) else None
+            kwargs = dict(
                 mm_features=req_state.mm_features,
                 hf_config=self.model_config.hf_config,
                 image_grid_thw=image_grid_thw,
@@ -161,6 +163,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                 second_per_grid_ts=second_per_grid_ts,
                 audio_feature_lengths=audio_feature_lengths,
                 use_audio_in_video=use_audio_in_video,
+            )
+            if target_h is not None:
+                kwargs["target_h"] = target_h
+            if target_w is not None:
+                kwargs["target_w"] = target_w
+            req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
+                req_state.prompt_token_ids,
+                **kwargs,
             )
         else:
             req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(
@@ -308,6 +318,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
             if req_id in self.requests:
+                self._update_streaming_input_additional_info(new_req_data, req_id)
                 req_state = self._update_streaming_request(req_id, new_req_data)
                 reqs_to_add.append(req_state)
                 continue
@@ -1027,6 +1038,15 @@ class OmniGPUModelRunner(GPUModelRunner):
             import traceback
 
             traceback.print_exc()
+
+        if getattr(self.model_config, "has_sampling_extra_args", False):
+            extra_args_list: list[dict] = []
+            for req_id in self.input_batch.req_ids:
+                req = self.requests[req_id]
+                sp = req.sampling_params if req else None
+                extra_args_list.append(sp.extra_args if sp and sp.extra_args else {})
+            model_kwargs_extra["sampling_extra_args"] = extra_args_list
+
         return model_kwargs_extra
 
     def _process_additional_information_updates(
@@ -1344,10 +1364,22 @@ class OmniGPUModelRunner(GPUModelRunner):
         req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
         last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
         text_step = self.text_step.gpu[:num_tokens_padded]
+        subtalker_params = getattr(self.vllm_config.model_config, "subtalker_sampling_params", None)
+        if not isinstance(subtalker_params, dict):
+            subtalker_params = {}
         with set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
-            req_embeds, code_predictor_codes = self.talker_mtp(req_input_ids, req_embeds, last_talker_hidden, text_step)
+            req_embeds, code_predictor_codes = self.talker_mtp(
+                req_input_ids,
+                req_embeds,
+                last_talker_hidden,
+                text_step,
+                do_sample=subtalker_params.get("do_sample"),
+                temperature=subtalker_params.get("temperature"),
+                top_k=subtalker_params.get("top_k"),
+                top_p=subtalker_params.get("top_p"),
+            )
         # code_predictor_codes stays on GPU here; _update_intermediate_buffer
         # keeps it device-resident when the key is in gpu_resident_buffer_keys.
         # D2H is deferred to sample_tokens where hidden_states.to("cpu") already
@@ -1414,3 +1446,30 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _merge_additional_information_update(self, req_id, upd):
         logger.warning_once("_merge_additional_information_update is deprecated, use _update_intermediate_buffer")
         return self._update_intermediate_buffer(req_id, upd)
+
+    def _update_streaming_input_additional_info(self, new_req_data, req_id):
+        # For streaming input prefill case only. Update buffer from last segment input
+        cached_additional_info = self.model_intermediate_buffer.get(req_id, {})
+        if cached_additional_info:
+            payload_info = getattr(new_req_data, "additional_information", None)
+            inc_info = deserialize_additional_information(payload_info)
+            if isinstance(inc_info, dict) and inc_info:
+                merged_info = dict(cached_additional_info)
+                for key, value in inc_info.items():
+                    accumulated_keys: set[str] = set()
+                    if hasattr(self, "model") and hasattr(self.model, "streaming_accumulated_keys"):
+                        accumulated_keys = self.model.streaming_accumulated_keys
+                    if key in accumulated_keys and isinstance(value, torch.Tensor):
+                        inc_tensor = value.detach().to("cpu").contiguous()
+                        old_tensor = merged_info.get(key)
+                        if old_tensor is None:
+                            merged_info[key] = inc_tensor
+                        else:
+                            merged_info[key] = torch.cat((old_tensor, inc_tensor), dim=0)
+                        continue
+
+                    # Default for other keys: latest value.
+                    merged_info[key] = value
+                merged_info["num_processed_tokens"] = 0
+                self.model_intermediate_buffer[req_id] = merged_info
+                setattr(self.requests[req_id], "additional_information_cpu", merged_info)

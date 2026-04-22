@@ -3,19 +3,13 @@ E2E Online tests for Qwen3-Omni model with video input and audio output.
 """
 
 import os
-from pathlib import Path
 
 import pytest
 
-from tests.conftest import (
-    OmniServerParams,
-    dummy_messages_from_mix_data,
-    generate_synthetic_audio,
-    generate_synthetic_image,
-    generate_synthetic_video,
-    modify_stage_config,
-)
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.platforms import current_omni_platform
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -23,32 +17,24 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
-QWEN3_OMNI_CONFIG_PATH = str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
-QWEN3_OMNI_XPU_CONFIG_PATH = str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen3_omni_ci.yaml")
 
-_STAGE_CONFIGS_DIR = Path(__file__).parent.parent / "stage_configs"
-_PD_SEP_CONFIG = str(_STAGE_CONFIGS_DIR / "qwen3_omni_moe_pd_ci.yaml")
+# Set VLLM_TEST_PD_MODE=1 to test PD disaggregation (follow-up — deploy overlay not yet migrated).
+_USE_PD = os.environ.get("VLLM_TEST_PD_MODE", "0") == "1"
+
+_CI_DEPLOY = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 
 
 def get_chunk_config(config_path: str | None = None):
-    """Load qwen3_omni_ci.yaml with async_chunk modifications for streaming mode."""
+    """Load the qwen3_omni CI deploy yaml with async_chunk modifications for streaming mode."""
     if config_path is None:
-        config_path = str(_STAGE_CONFIGS_DIR / "qwen3_omni_ci.yaml")
-    return modify_stage_config(
-        config_path,
-        updates={
-            "async_chunk": True,
-            "stage_args": {
-                0: {
-                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
-                },
-                1: {
-                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_async_chunk"
-                },
-            },
-        },
-        deletes={"stage_args": {2: ["custom_process_input_func"]}},
-    )
+        config_path = _CI_DEPLOY
+    # TODO: remove this workaround once legacy `stage_args` path is deleted.
+    # The pipeline (qwen3_omni/pipeline.py) already wires
+    # thinker2talker_async_chunk / talker2code2wav_async_chunk on stage 0/1,
+    # so only async_chunk needs flipping. Writing nested `engine_args:` into
+    # the new-schema overlay trips _parse_stage_deploy's legacy branch and
+    # drops flat fields (load_format, max_num_seqs, ...).
+    return modify_stage_config(config_path, updates={"async_chunk": True})
 
 
 def get_prefix_caching_config(config_path: str):
@@ -64,21 +50,16 @@ def get_prefix_caching_config(config_path: str):
     return path
 
 
-# Set VLLM_TEST_PD_MODE=1 to test PD disaggregation, default tests async_chunk mode.
-_USE_PD = os.environ.get("VLLM_TEST_PD_MODE", "0") == "1"
-
-# Stage configs for H100/CUDA, ROCm MI325, and XPU platforms
-if current_omni_platform.is_rocm():
-    rocm_config = str(_STAGE_CONFIGS_DIR / "rocm" / "qwen3_omni_ci.yaml")
-    stage_configs = [rocm_config]
-    prefix_caching_stage_configs = [get_prefix_caching_config(rocm_config)]
-elif current_omni_platform.is_xpu():
-    xpu_config = str(_STAGE_CONFIGS_DIR / "xpu" / "qwen3_omni_ci.yaml")
-    stage_configs = [xpu_config]
-    prefix_caching_stage_configs = [get_prefix_caching_config(xpu_config)]
-else:
-    stage_configs = [_PD_SEP_CONFIG if _USE_PD else get_chunk_config(QWEN3_OMNI_CONFIG_PATH)]
-    prefix_caching_stage_configs = [get_prefix_caching_config(QWEN3_OMNI_CONFIG_PATH)]
+# Platform-specific overrides live inside the new deploy yaml's ``platforms:``
+# section, so a single ``_CI_DEPLOY`` path serves CUDA, ROCm, and XPU.
+# TODO: re-add VLLM_TEST_PD_MODE branch once the PD-disaggregation deploy
+# overlay has been migrated to the new schema (previously used the deleted
+# ``qwen3_omni_moe_pd_ci.yaml`` stage-configs file).
+if current_omni_platform.is_xpu():
+    stage_configs = [_CI_DEPLOY]
+else:  # CUDA + ROCm MI325 share the same deploy config
+    stage_configs = [get_chunk_config()]
+prefix_caching_stage_configs = [get_prefix_caching_config(_CI_DEPLOY)]
 
 # Create parameter combinations for model and stage config
 test_params = [

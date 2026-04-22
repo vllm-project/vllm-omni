@@ -231,8 +231,7 @@ vllm_omni/                                    tests/
                                                │   ├── test_qwen3_omni_expansion.py
                                                │   ├── test_mimo_audio.py
                                                │   ├── test_image_gen_edit.py
-                                               │   ├── test_images_generations_lora.py
-                                               │   └── stage_configs/
+                                               │   └── test_images_generations_lora.py
                                                └── offline_inference/                  ✅
                                                    ├── test_qwen2_5_omni.py
                                                    ├── test_qwen3_omni.py
@@ -248,11 +247,12 @@ vllm_omni/                                    tests/
                                                    ├── test_diffusion_layerwise_offload.py
                                                    ├── test_diffusion_lora.py
                                                    ├── test_sequence_parallel.py
-                                                   └── stage_configs/
-                                                       ├── qwen2_5_omni_ci.yaml
-                                                       ├── qwen3_omni_ci.yaml
-                                                       ├── bagel_*.yaml
-                                                       └── npu/, rocm/, etc.
+                                                   └── stage_configs/                  (legacy schema, still
+                                                       ├── bagel_*.yaml                 present for unmigrated
+                                                       └── npu/, rocm/, etc.            models)
+
+# Migrated models (qwen3_omni_moe, qwen2_5_omni, qwen3_tts) live under
+# vllm_omni/deploy/ instead — see docs/configuration/stage_configs.md.
 ```
 
 
@@ -418,13 +418,13 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 
     **Explanation**:
 
-    @pytest.mark.advanced_model: Marks the test as L3 or L4 level, indicating that this test case performs deep validation, using real models for performance, integration, and accuracy testing. This forms a "basic-advanced" correspondence with the core_model mark at the L2 level.
+    @pytest.mark.advanced_model: Marks the test as L3 merge level, indicating deep validation with real models. @pytest.mark.full_model: Marks L4 nightly-only suites (e.g. `test_*_expansion.py`, doc examples).
 
     @pytest.mark.core_model: Marks the test as L1 or L2 level, indicating that this test case validates the basic functionality of the core model. It uses mock weights and only checks if the relevant interface functions correctly.
 
     @pytest.mark.parametrize: A parameterization decorator that allows abstracting test data into parameters, enabling reuse of the same test logic across different data configurations. indirect=True indicates that parameters will be passed to the fixture for processing.
 
-    **Notes**: If you believe the test case only needs to execute basic run logic at the PR-level CI, you can mark it only with @pytest.mark.core_model. If you believe it only needs to execute deep validation run logic at the merge or nightly level, you can mark it only with @pytest.mark.advanced_model. If you believe the test case needs to accommodate both basic run and deep validation test logic, you should mark it with both @pytest.mark.core_model and @pytest.mark.advanced_model.
+    **Notes**: If you believe the test case only needs to execute basic run logic at the PR-level CI, you can mark it only with @pytest.mark.core_model. If you believe it only needs to execute deep validation at merge (L3), use @pytest.mark.advanced_model. For L4 nightly-only expansion and doc-example tests, use @pytest.mark.full_model with `--run-level full_model`. If the test case needs both basic run and deep validation, mark with @pytest.mark.core_model and the appropriate L3/L4 marker (`advanced_model` and/or `full_model`).
 
     **2.4.2 Test Function Definition and Documentation**
 
@@ -516,9 +516,11 @@ L3 level testing executes after code is merged into the main branch. Its core pu
 
     **Single Request**: The comment clearly states this is a single-request completion test. For concurrent testing, it can be extended to multiple requests using request_num = n.
 
-    **Implicit Validation**: The `send_omni_request` and `send_diffusion_request` methods internally includes validation logic dynamically selected based on the --run-level parameter: core_model performs basic validation, while advanced_model performs deep validation.
+    **Implicit Validation**: The `send_omni_request` and `send_diffusion_request` methods internally includes validation logic dynamically selected based on the --run-level parameter: core_model performs basic validation, while advanced_model and full_model perform deep validation.
 
--   ***Run Command***: `pytest -s -v /tests/e2e/online_serving/test_{model_name}.py -m advanced_model --run-level=advanced_model`
+-   ***Run Command (L3 merge)***: `pytest -s -v /tests/e2e/online_serving/test_{model_name}.py -m advanced_model --run-level=advanced_model`
+
+-   ***Run Command (L4 nightly expansion)***: `pytest -s -v /tests/e2e/online_serving/test_{model_name}_expansion.py -m full_model --run-level=full_model`
 
 ## Chapter 3: L4 Level Testing - Full Functionality, Performance, and Documentation Testing
 

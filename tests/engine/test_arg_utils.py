@@ -39,21 +39,28 @@ def test_default_stage_id_is_concrete_int():
     assert cfg.stage_id == 0
 
 
-def test_multimodal_kwarg_overrides():
+def test_multimodal_kwarg_overrides(mocker):
     """Ensure that overrides in the multimodal config are preserved."""
-    # Get a different value than the default for a multimodal field
     sig = inspect.signature(OmniEngineArgs)
     default_mm_cache = sig.parameters["mm_processor_cache_gb"].default
     override_val = default_mm_cache + 1
 
-    # NOTE: This needs to be a model that resolves to supports_multimodal=True
-    # in vLLM, otherwise we won't have an MM config
+    fake_model_config = SimpleNamespace(
+        multimodal_config=SimpleNamespace(mm_processor_cache_gb=override_val),
+    )
+
+    def _fake_parent_create_model_config(self):
+        assert self.mm_processor_cache_gb == override_val
+        return fake_model_config
+
+    mocker.patch.object(EngineArgs, "create_model_config", _fake_parent_create_model_config)
+    mocker.patch.object(OmniModelConfig, "from_vllm_model_config", side_effect=lambda model_config, **_: model_config)
+
     cfg = OmniEngineArgs(
         model="Qwen/Qwen2-VL-2B-Instruct",
         mm_processor_cache_gb=override_val,
     ).create_model_config()
 
-    # Ensure that the override was applied correctly
     assert cfg.multimodal_config is not None
     assert cfg.multimodal_config.mm_processor_cache_gb == override_val
 
@@ -130,6 +137,41 @@ def test_from_cli_args_picks_up_stage_configs_path():
     args = OmniEngineArgs.from_cli_args(ns)
     assert args.stage_configs_path == "/some/path.yaml"
     assert args.custom_pipeline_args is None
+
+
+def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
+    """Ensure Code2Wav mirrors stage max_model_len into nested HF overrides.
+
+    Qwen3-TTS Code2Wav is a pure decoder stage whose runtime max_model_len can
+    legitimately exceed the base checkpoint's default text max length. Recent
+    vLLM validates these values during ModelConfig creation, so we inject
+    ``talker_config.max_position_embeddings`` before delegating to vLLM.
+    """
+    captured: dict[str, object] = {}
+    baseline_config = Mock()
+
+    def fake_create_model_config(self):
+        captured["hf_overrides"] = self.hf_overrides
+        return baseline_config
+
+    monkeypatch.setattr(EngineArgs, "create_model_config", fake_create_model_config)
+    monkeypatch.setattr(
+        OmniModelConfig,
+        "from_vllm_model_config",
+        classmethod(lambda cls, model_config, **omni_kwargs: model_config),
+    )
+
+    OmniEngineArgs(
+        model_arch="Qwen3TTSCode2Wav",
+        max_model_len=65536,
+    ).create_model_config()
+
+    assert captured["hf_overrides"] == {
+        "architectures": ["Qwen3TTSCode2Wav"],
+        "talker_config": {
+            "max_position_embeddings": 65536,
+        },
+    }
 
 
 def test_stage_specific_text_config_override():

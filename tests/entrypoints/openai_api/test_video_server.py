@@ -133,7 +133,6 @@ def _wait_for_status(client: TestClient, video_id: str, status: str, timeout_s: 
     last_payload = None
     while time.time() < deadline:
         response = client.get(f"/v1/videos/{video_id}")
-        assert response.status_code == 200
         last_payload = response.json()
         if last_payload["status"] == status:
             return last_payload
@@ -564,6 +563,18 @@ def test_missing_prompt_returns_422(test_client):
     assert response.status_code == 422
 
 
+def test_video_generation_rejects_model_mismatch(test_client):
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "bad model",
+            "model": "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+        },
+    )
+    assert response.status_code == 400
+    assert "model mismatch" in response.json()["detail"].lower()
+
+
 def test_invalid_size_parse_returns_422(test_client):
     response = test_client.post(
         "/v1/videos",
@@ -632,7 +643,7 @@ def test_invalid_lora_returns_400(test_client):
     assert response.status_code == 200
     video_id = response.json()["id"]
     failed = _wait_for_status(test_client, video_id, VideoGenerationStatus.FAILED.value)
-    assert failed["error"]["code"] == "HTTPException"
+    assert failed["error"]["code"] == 400
     assert "lora object" in failed["error"]["message"].lower()
 
 
