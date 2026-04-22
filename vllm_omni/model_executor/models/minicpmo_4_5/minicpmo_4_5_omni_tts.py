@@ -24,6 +24,36 @@ from vllm.model_executor.models.interfaces import SupportsPP
 logger = logging.getLogger(__name__)
 
 
+def _install_torchaudio_soundfile_shim() -> None:
+    """Monkey-patch torchaudio.load to use soundfile instead of the default
+    torchcodec backend, which requires libtorchcodec/ffmpeg shared libs that
+    may be missing on the deployment machine."""
+    try:
+        import torchaudio
+        if getattr(torchaudio, "_soundfile_shim_installed", False):
+            return
+        _orig_load = torchaudio.load
+
+        def _patched_load(uri, *args, **kwargs):
+            try:
+                return _orig_load(uri, *args, **kwargs)
+            except Exception:
+                import soundfile as _sf
+                import numpy as _np
+                data, sr = _sf.read(uri, dtype="float32", always_2d=True)
+                wav = torch.from_numpy(_np.ascontiguousarray(data.T))
+                return wav, sr
+
+        torchaudio.load = _patched_load
+        torchaudio._soundfile_shim_installed = True
+        logger.info("Installed torchaudio.load soundfile shim")
+    except Exception as _e:
+        logger.warning("Could not install torchaudio shim: %s", _e)
+
+
+_install_torchaudio_soundfile_shim()
+
+
 class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     """MiniCPM-o 4.5 Talker: MiniCPMTTS + Token2wav in a single forward pass."""
 

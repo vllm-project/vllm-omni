@@ -7,6 +7,7 @@ This is a non-autoregressive model that doesn't require sampling or logits compu
 from __future__ import annotations
 
 import gc
+import inspect
 import logging
 from copy import copy
 
@@ -281,7 +282,14 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             ),
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(
-                sccot clear_kv_metadata
+                scheduler_output,
+                **(
+                    {"defer_finalize": not clear_kv_metadata}
+                    if "defer_finalize" in inspect.signature(
+                        self.maybe_get_kv_connector_output
+                    ).parameters
+                    else {"clear_metadata": clear_kv_metadata}
+                ),
             ) as kv_connector_output,
         ):
             outputs = self._run_generation_model(

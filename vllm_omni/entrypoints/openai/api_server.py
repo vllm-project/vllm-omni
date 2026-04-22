@@ -635,14 +635,16 @@ async def omni_init_app_state(
                 default_chat_template_kwargs=args.default_chat_template_kwargs,
                 log_error_stack=args.log_error_stack,
             )
-    except ModuleNotFoundError as e:
+    except (ModuleNotFoundError, ImportError) as e:
         logger.warning("OpenAIServingRender not available (%s); chat/completion may fail.", e)
 
     if "generate" in supported_tasks and openai_serving_render is None:
-        raise RuntimeError(
-            "vLLM 0.18+ requires a renderer and model_config to build OpenAIServingRender "
-            "(io_processor is optional when no IO processor plugin is configured). "
-            "Ensure stage-0 input_processor / vllm_config are initialized."
+        # vLLM 0.17.x doesn't expose OpenAIServingRender; the chat/completion serving
+        # classes consume ``self.renderer`` directly. Downgrade the strict check to a
+        # warning so servers can still initialize against 0.17.x installations.
+        logger.warning(
+            "OpenAIServingRender is unavailable in the installed vLLM (likely <0.18); "
+            "falling back to renderer-backed chat/completion handlers."
         )
 
     state.openai_serving_responses = (

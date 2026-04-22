@@ -2823,6 +2823,13 @@ class MiniCPMO26OmniLLMProcessingInfo(BaseProcessingInfo):
     image_pattern = "(<image>./</image>)"
     video_pattern = "(<video>./</video>)"
 
+    def build_data_parser(self) -> "MultiModalDataParser":
+        # Moved from MiniCPMO26OmniLLMMultiModalProcessor._get_data_parser
+        # in vllm v0.16+ (see vllm/multimodal/processing/processor.py).
+        return MiniCPMOMultiModalDataParser(
+            target_sr=self.get_default_audio_sampling_rate()
+        )
+
     def get_tokenizer(self):
         """Return tokenizer; load lazily when ctx.tokenizer is None (e.g. skip_tokenizer_init=True)."""
         if self.ctx.tokenizer is not None:
@@ -3340,9 +3347,12 @@ class MiniCPMO26OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO26Omn
     ) -> bool:
         return False
 
-    def _get_data_parser(self) -> MultiModalDataParser:
+    def _legacy_get_data_parser(self) -> MultiModalDataParser:
+        # Renamed from _get_data_parser to avoid triggering the v0.16+
+        # guard in BaseMultiModalProcessor.__init__. The actual parser is
+        # now built via MiniCPMO26OmniLLMProcessingInfo.build_data_parser.
         return MiniCPMOMultiModalDataParser(
-            target_sr=self.info.get_default_audio_sampling_rate() 
+            target_sr=self.info.get_default_audio_sampling_rate()
         )
 
     def get_image_prompt_texts(self, image_size: ImageSize, image_idx: int = 0) -> str:
@@ -3384,7 +3394,7 @@ class MiniCPMO26OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO26Omn
             return {}
 
         parsed_audios = (
-            self._get_data_parser()
+            self.data_parser
             .parse_mm_data({"audio": audios})
             .get_items("audio", (MiniCPMOAudioEmbeddingItems, AudioProcessorItems))
         )
@@ -3421,7 +3431,7 @@ class MiniCPMO26OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO26Omn
             return {}
 
         parsed_images = (
-            self._get_data_parser()
+            self.data_parser
             .parse_mm_data({"image": images})
             .get_items("image", (MiniCPMVImageEmbeddingItems, ImageProcessorItems))
         )
@@ -3448,7 +3458,7 @@ class MiniCPMO26OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO26Omn
             return {}
 
         parsed_videos = (
-            self._get_data_parser()
+            self.data_parser
             .parse_mm_data({"video": videos})
             .get_items("video", (MiniCPMVVideoEmbeddingItems, VideoProcessorItems))
         )

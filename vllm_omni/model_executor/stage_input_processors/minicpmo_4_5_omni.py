@@ -94,9 +94,11 @@ def llm2tts(
             "prompt_token_ids": list(prompt_token_ids),
             "llm_output_token_ids": list(llm_output_ids) if not isinstance(llm_output_ids, list) else llm_output_ids,
             "llm_output_text": [thinker_text],
-            "tts_token_ids": tts_token_ids_slice,
-            "tts_hidden_states": tts_hidden_slice,
         }
+        if tts_token_ids_slice is not None:
+            additional_information["tts_token_ids"] = tts_token_ids_slice
+        if tts_hidden_slice is not None:
+            additional_information["tts_hidden_states"] = tts_hidden_slice
 
         # Minimal prompt token IDs: the talker's AR framework needs *some* tokens
         # to do a single prefill step. We use [BOS, PAD, EOS] as a dummy.
@@ -152,12 +154,41 @@ def tts2t2w(
         output = tts_output.outputs[0]
 
         mel_spec = None
+        waveform = None
         if hasattr(output, "multimodal_output") and isinstance(output.multimodal_output, dict):
+            import torch as _torch
             mel_spec = output.multimodal_output.get("mel_spec")
-            if mel_spec is None:
-                import torch as _torch
-                latent = output.multimodal_output.get("latent")
-                if isinstance(latent, _torch.Tensor) and latent.dim() >= 2 and 100 in latent.shape:
+            waveform = output.multimodal_output.get("model_outputs")
+            # The 4.5 talker already runs DVAE+Vocos internally and produces a
+            # 1-D waveform tensor; it is stored under `model_outputs` which the
+            # output_processor renames to the stage's `engine_output_type`
+            # (e.g. "latent"). Recover it here.
+            latent = output.multimodal_output.get("latent")
+            import logging as _logging
+            _log = _logging.getLogger(__name__)
+            if latent is not None:
+                if isinstance(latent, _torch.Tensor):
+                    _log.info("tts2t2w: latent tensor shape=%s dtype=%s numel=%d",
+                              tuple(latent.shape), latent.dtype, latent.numel())
+                elif isinstance(latent, list):
+                    _log.info("tts2t2w: latent is list len=%d type0=%s shape0=%s",
+                              len(latent),
+                              type(latent[0]).__name__ if latent else None,
+                              tuple(latent[0].shape) if latent and isinstance(latent[0], _torch.Tensor) else None)
+                else:
+                    _log.info("tts2t2w: latent type=%s", type(latent).__name__)
+            if isinstance(latent, list) and latent:
+                cand = latent[0]
+                if isinstance(cand, _torch.Tensor):
+                    latent = cand
+            if isinstance(latent, _torch.Tensor):
+                if latent.dim() == 1 and latent.numel() > 1000:
+                    if waveform is None:
+                        waveform = latent
+                elif latent.dim() == 2 and 1 in latent.shape and latent.numel() > 1000:
+                    if waveform is None:
+                        waveform = latent.reshape(-1)
+                elif latent.dim() >= 2 and 100 in latent.shape and mel_spec is None:
                     mel_spec = latent
 
         if mel_spec is None and waveform is None:
@@ -171,9 +202,6 @@ def tts2t2w(
             )
 
         additional_information = {}
-        waveform = None
-        if hasattr(output, "multimodal_output") and isinstance(output.multimodal_output, dict):
-            waveform = output.multimodal_output.get("model_outputs")
         if waveform is not None:
             additional_information["waveform"] = waveform
         elif mel_spec is not None:

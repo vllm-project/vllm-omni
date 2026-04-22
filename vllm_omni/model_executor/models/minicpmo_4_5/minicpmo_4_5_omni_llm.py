@@ -2867,6 +2867,13 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
     def get_default_audio_sampling_rate(self) -> int:
         return 16000
 
+    def get_data_parser(self) -> MultiModalDataParser:
+        # vLLM >=0.16 expects ``BaseProcessingInfo.get_data_parser`` to construct
+        # the per-model multi-modal data parser.
+        return MiniCPMOMultiModalDataParser(
+            target_sr=self.get_default_audio_sampling_rate()
+        )
+
     def get_chunk_length(self) -> int:
         return self.get_hf_config().audio_chunk_length
     
@@ -3345,11 +3352,6 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
     ) -> bool:
         return False
 
-    def _get_data_parser(self) -> MultiModalDataParser:
-        return MiniCPMOMultiModalDataParser(
-            target_sr=self.info.get_default_audio_sampling_rate() 
-        )
-
     def get_image_prompt_texts(self, image_size: ImageSize, image_idx: int = 0) -> str:
         return self.info.get_slice_image_placeholder(
             image_size,
@@ -3389,7 +3391,7 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
             return {}
 
         parsed_audios = (
-            self._get_data_parser()
+            self.data_parser
             .parse_mm_data({"audio": audios})
             .get_items("audio", (MiniCPMOAudioEmbeddingItems, AudioProcessorItems))
         )
@@ -3426,7 +3428,7 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
             return {}
 
         parsed_images = (
-            self._get_data_parser()
+            self.data_parser
             .parse_mm_data({"image": images})
             .get_items("image", (MiniCPMVImageEmbeddingItems, ImageProcessorItems))
         )
@@ -3453,7 +3455,7 @@ class MiniCPMO45OmniLLMMultiModalProcessor(BaseMultiModalProcessor[MiniCPMO45Omn
             return {}
 
         parsed_videos = (
-            self._get_data_parser()
+            self.data_parser
             .parse_mm_data({"video": videos})
             .get_items("video", (MiniCPMVVideoEmbeddingItems, VideoProcessorItems))
         )

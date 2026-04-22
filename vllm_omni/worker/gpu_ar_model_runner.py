@@ -6,6 +6,7 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+import inspect
 from copy import copy
 from typing import Any, NamedTuple
 
@@ -292,7 +293,14 @@ class GPUARModelRunner(OmniGPUModelRunner):
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
-                scheduler_output, defer_finalize=not clear_kv_metadata
+                scheduler_output,
+                **(
+                    {"defer_finalize": not clear_kv_metadata}
+                    if "defer_finalize" in inspect.signature(
+                        self.maybe_get_kv_connector_output
+                    ).parameters
+                    else {"clear_metadata": clear_kv_metadata}
+                ),
             ) as kv_connector_output,
         ):
             model_output = self._model_forward(

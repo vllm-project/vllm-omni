@@ -187,6 +187,17 @@ class MiniCPMO26OmniForConditionalGeneration(
                 input_ids.shape[0], hs,
                 device=input_ids.device, dtype=torch.bfloat16,
             )
+        if self.model_stage == "tts":
+            # Talker (ConditionalChatTTS) is driven by runtime_additional_information
+            # (text_hidden_states from stage 0), not by these input embeddings.
+            # The model-runner's inputs_embeds buffer is sized from
+            # hf_text_config (== tts_config for this stage), so match that.
+            tts_cfg = getattr(self.config, "tts_config", None)
+            hs = getattr(tts_cfg, "hidden_size", 768) if tts_cfg else 768
+            return torch.zeros(
+                input_ids.shape[0], hs,
+                device=input_ids.device, dtype=torch.bfloat16,
+            )
         return self.model.get_input_embeddings(input_ids, multimodal_embeddings)
 
     def embed_input_ids(
@@ -196,7 +207,10 @@ class MiniCPMO26OmniForConditionalGeneration(
         *,
         is_multimodal=None,
     ) -> torch.Tensor:
-        if self.model_stage in ("talker", "code2wav"):
+        # Stage names are "llm" | "tts" | "t2w" (see stage_configs/minicpmo.yaml).
+        # Non-thinker stages don't need the language-model embedding table; just
+        # pass through so the caller can provide inputs_embeds/latents directly.
+        if self.model_stage in ("tts", "t2w"):
             return self.get_input_embeddings(input_ids)
         return super().embed_input_ids(
             input_ids, multimodal_embeddings, is_multimodal=is_multimodal
