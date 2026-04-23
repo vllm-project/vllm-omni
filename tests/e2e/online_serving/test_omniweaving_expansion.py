@@ -1,10 +1,14 @@
 import pytest
+import torch
 
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+pytestmark = [pytest.mark.diffusion, pytest.mark.gpu]
+
 
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA GPU for OmniWeaving E2E test.")
 def test_omniweaving_t2v_expansion(tensor_parallel_size):
     """
     E2E test to verify OmniWeaving T2V generation works correctly
@@ -26,7 +30,11 @@ def test_omniweaving_t2v_expansion(tensor_parallel_size):
         seed=42,
     )
 
-    outputs = omni.generate(prompts=["A simple test prompt for CI."], sampling_params=sampling_params)
+    prompt = {
+        "prompt": "A simple test prompt for CI.",
+        "negative_prompt": "blurry, distorted",
+    }
+    outputs = omni.generate(prompts=prompt, sampling_params_list=sampling_params)
 
     assert outputs is not None, "Output should not be None"
     assert len(outputs) > 0, "Output list should not be empty"
@@ -36,6 +44,7 @@ def test_omniweaving_t2v_expansion(tensor_parallel_size):
 
 
 @pytest.mark.parametrize("tensor_parallel_size", [1])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Need CUDA GPU for OmniWeaving E2E test.")
 def test_omniweaving_cfg_parallel(tensor_parallel_size):
     """
     E2E test to verify CFG Parallelism works for OmniWeaving.
@@ -56,7 +65,11 @@ def test_omniweaving_cfg_parallel(tensor_parallel_size):
         num_frames=5,
     )
 
-    outputs = omni.generate(prompts=["Testing CFG parallel generation."], sampling_params=sampling_params)
+    prompt = {
+        "prompt": "Testing CFG parallel generation.",
+        "negative_prompt": "blurry, low quality",
+    }
+    outputs = omni.generate(prompts=prompt, sampling_params_list=sampling_params)
 
     assert outputs is not None
     assert len(outputs) > 0
