@@ -29,6 +29,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo
 from vllm_omni.entrypoints.openai.storage import LocalStorageManager
 from vllm_omni.entrypoints.openai.stores import AsyncDictStore, TaskRegistry
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -60,6 +61,7 @@ class MockVideoResult:
 class FakeAsyncOmni:
     def __init__(self):
         self.stage_configs = [SimpleNamespace(stage_type="diffusion")]
+        self.default_sampling_params_list = [OmniDiffusionSamplingParams()]
         self.captured_prompt = None
         self.captured_sampling_params_list = None
 
@@ -440,6 +442,87 @@ def test_frame_interpolation_params_pass_to_diffusion_sampling_params(test_clien
     assert captured.frame_interpolation_exp == 2
     assert captured.frame_interpolation_scale == 0.5
     assert captured.frame_interpolation_model_path == "local-rife"
+
+
+def test_default_sampling_params_apply_to_video_requests(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.default_sampling_params_list = [
+        OmniDiffusionSamplingParams(
+            num_inference_steps=4,
+            guidance_scale=7.5,
+            generator_device="cpu",
+            enable_frame_interpolation=True,
+            frame_interpolation_exp=2,
+            frame_interpolation_scale=0.5,
+            frame_interpolation_model_path="default-rife",
+        )
+    ]
+
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "default param pass-through",
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    captured = engine.captured_sampling_params_list[0]
+    assert captured.num_inference_steps == 4
+    assert captured.guidance_scale == 7.5
+    assert captured.generator_device == "cpu"
+    assert captured.enable_frame_interpolation is True
+    assert captured.frame_interpolation_exp == 2
+    assert captured.frame_interpolation_scale == 0.5
+    assert captured.frame_interpolation_model_path == "default-rife"
+
+
+def test_request_params_override_default_video_sampling_params(test_client, mocker: MockerFixture):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.default_sampling_params_list = [
+        OmniDiffusionSamplingParams(
+            num_inference_steps=4,
+            guidance_scale=7.5,
+            enable_frame_interpolation=True,
+            frame_interpolation_exp=2,
+            frame_interpolation_scale=0.5,
+            frame_interpolation_model_path="default-rife",
+        )
+    ]
+
+    response = test_client.post(
+        "/v1/videos",
+        data={
+            "prompt": "explicit override",
+            "num_inference_steps": "8",
+            "enable_frame_interpolation": "false",
+            "frame_interpolation_exp": "1",
+            "frame_interpolation_scale": "1.0",
+            "frame_interpolation_model_path": "custom-rife",
+        },
+    )
+
+    assert response.status_code == 200
+    video_id = response.json()["id"]
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
+
+    captured = engine.captured_sampling_params_list[0]
+    assert captured.num_inference_steps == 8
+    assert captured.guidance_scale == 7.5
+    assert captured.enable_frame_interpolation is False
+    assert captured.frame_interpolation_exp == 1
+    assert captured.frame_interpolation_scale == 1.0
+    assert captured.frame_interpolation_model_path == "custom-rife"
 
 
 def test_worker_fps_multiplier_is_applied_to_async_encoding(test_client, mocker: MockerFixture):
@@ -1147,6 +1230,39 @@ def test_sync_frame_interpolation_params_pass_to_sampling_params(test_client, mo
     assert captured.frame_interpolation_model_path == "local-rife"
     _, kwargs = encode_mock.call_args
     assert kwargs["fps"] == 8
+
+
+def test_sync_default_sampling_params_apply_to_video_requests(test_client, mocker: MockerFixture):
+    _mock_encode_video_bytes(mocker)
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.default_sampling_params_list = [
+        OmniDiffusionSamplingParams(
+            num_inference_steps=4,
+            guidance_scale=7.5,
+            enable_frame_interpolation=True,
+            frame_interpolation_exp=2,
+            frame_interpolation_scale=0.5,
+            frame_interpolation_model_path="default-rife",
+        )
+    ]
+
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "sync default param pass-through",
+            "fps": "8",
+        },
+    )
+
+    assert response.status_code == 200
+    engine = test_client.app.state.openai_serving_video._engine_client
+    captured = engine.captured_sampling_params_list[0]
+    assert captured.num_inference_steps == 4
+    assert captured.guidance_scale == 7.5
+    assert captured.enable_frame_interpolation is True
+    assert captured.frame_interpolation_exp == 2
+    assert captured.frame_interpolation_scale == 0.5
+    assert captured.frame_interpolation_model_path == "default-rife"
 
 
 def test_worker_fps_multiplier_is_applied_to_sync_encoding(test_client, mocker: MockerFixture):
