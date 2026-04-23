@@ -23,7 +23,7 @@ steps:
   mirror_hardwares: [amdproduction]
   grade: Blocking
   commands:
-    - timeout 30m pytest -s -v tests/e2e/offline_inference/test_t2i_model.py -m "core_model and diffusion" --run-level "core_model"
+    - timeout 30m pytest -s -v tests/e2e/offline_inference/test_z_image.py -m "core_model and diffusion" --run-level "core_model"
 
 - label: "Diffusion Batching Test"
   agent_pool: mi325_1

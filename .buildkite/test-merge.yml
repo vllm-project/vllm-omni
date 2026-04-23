@@ -55,26 +55,6 @@ steps:
               volumes:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
-  - group: ":card_index_dividers:  Diffusion Test"
-    depends_on: upload-merge-pipeline
-    steps:
-      - label: "Diffusion Model Test"
-        timeout_in_minutes: 30
-        commands:
-          - pytest -s -v tests/e2e/offline_inference/test_t2i_model.py -m "advanced_model and diffusion" --run-level "advanced_model"
-        agents:
-          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
-        plugins:
-          - docker#v5.2.0:
-              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-              always-pull: true
-              propagate-environment: true
-              environment:
-                - "HF_HOME=/fsx/hf_cache"
-                - "HF_TOKEN"
-              volumes:
-                - "/fsx/hf_cache:/fsx/hf_cache"
-
       - label: "Diffusion · LoRA Test"
         timeout_in_minutes: 30
         commands:
@@ -595,7 +575,23 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
-
+      - label: "Diffusion · Z Image Test"
+        timeout_in_minutes: 30
+        commands:
+          - export VLLM_TEST_CLEAN_GPU_MEMORY=1
+          - pytest -s -v tests/e2e/{offline_inference,online_serving}/test_z_image.py -m "advanced_model and diffusion" --run-level "advanced_model"
+        agents:
+          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
 
       - label: "Omni · Sleep Mode Test"
         timeout_in_minutes: 30

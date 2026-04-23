@@ -9,15 +9,6 @@ steps:
     - export VLLM_ROCM_USE_AITER=0
     - "timeout 20m pytest -v -s -m 'core_model and cpu' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
 
-- label: "Diffusion Model Test"
-  agent_pool: mi325_2
-  depends_on: amd-build
-  mirror_hardwares: [amdproduction]
-  grade: Blocking
-  commands:
-    - export GPU_ARCHS=gfx942
-    - timeout 20m pytest -s -v tests/e2e/offline_inference/test_t2i_model.py -m "advanced_model and diffusion" --run-level "advanced_model"
-
 - label: "Diffusion Images API LoRA E2E"
   agent_pool: mi325_1
   depends_on: amd-build
