@@ -8,7 +8,7 @@ steps:
   grade: Blocking
   commands:
     - export GPU_ARCHS=gfx942
-    - pytest -s -v tests/e2e/offline_inference/test_t2i_model.py
+    - pytest -s -v tests/e2e/offline_inference/test_z_image.py
 
 - label: "Diffusion Images API LoRA E2E"
   timeout_in_minutes: 30

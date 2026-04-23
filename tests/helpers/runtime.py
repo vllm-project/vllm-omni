@@ -1350,8 +1350,10 @@ class OmniRunnerHandler:
         else:
             extra_body = asdict(sampling_params)
             request_config["extra_body"] = extra_body
-        negative_prompt = extra_body.get("negative_prompt") or request_config.get("negative_prompt")
+        if not extra_body:
+            logger.warning("No sampling params provided in request_config, will skip output assertion")
 
+        negative_prompt = extra_body.get("negative_prompt") or request_config.get("negative_prompt")
         videos = request_config.get("videos")
         images = request_config.get("images")
         audios = request_config.get("audios")
