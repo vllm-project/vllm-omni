@@ -17,21 +17,16 @@ import torch
 
 from tests.dfx.conftest import (
     assert_fault_exception,
-    assert_no_extra_worker_processes,
     create_reliability_omni_server_params,
     resolve_oom_device_spec,
-    wait_chat_request_ready,
 )
 from tests.dfx.reliability.helpers import (
     extract_openai_error_contract_from_bytes,
-    force_remove_container,
     get_health_raw,
     inject_gpu_oom,
-    list_remote_process_pids_by_pattern,
     make_process_kill_fault_injector,
     post_chat_completions_raw,
     post_json_raw,
-    start_runtime_teardown_container_server,
     stop_gpu_oom_hogs,
 )
 from tests.helpers.mark import hardware_test
@@ -677,52 +672,3 @@ def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
             "unhealthy terminal state should fail fast on requests, "
             f"got health={terminal_health}, request_status={request_status}"
         )
-
-
-@pytest.mark.slow
-@pytest.mark.skipif(os.name == "nt", reason="runtime-teardown helper is POSIX-only")
-@pytest.mark.skip(reason="Temporarily disabled runtime teardown scenario.")
-@pytest.mark.parametrize("runtime_params", [QWEN_PARAMS[0]], ids=["runtime_teardown_container_kill"])
-def test_reliability_fault_runtime_teardown_container_kill_no_orphan_worker(runtime_params, model_prefix) -> None:
-    baseline_worker_pids = set(list_remote_process_pids_by_pattern(RUNTIME_WORKER_PATTERN))
-    model = model_prefix + runtime_params.model
-    serve_args = list(runtime_params.server_args or [])
-    if "--stage-init-timeout" not in serve_args:
-        serve_args = ["--stage-init-timeout", "120", *serve_args]
-    if runtime_params.stage_config_path is not None:
-        serve_args += ["--stage-configs-path", runtime_params.stage_config_path]
-
-    handle = None
-    try:
-        handle = start_runtime_teardown_container_server(
-            model=model,
-            serve_args=serve_args,
-        )
-        wait_chat_request_ready(handle.host, handle.port, model=model)
-
-        force_remove_container(handle.container_name)
-
-        payload = json.dumps(
-            {
-                "model": model,
-                "messages": [{"role": "user", "content": "What is the capital of China? Answer in one word."}],
-                "stream": False,
-                "modalities": ["text"],
-            }
-        )
-        request_failed = False
-        try:
-            status, body = post_chat_completions_raw(handle.host, handle.port, payload)
-            if status >= 500:
-                request_failed = True
-            else:
-                pytest.fail(f"expected request failure after container teardown, got http={status} body={body[:200]!r}")
-        except Exception:
-            request_failed = True
-        assert request_failed, "expected request failure after container teardown"
-
-        assert_no_extra_worker_processes(baseline_worker_pids, RUNTIME_WORKER_PATTERN)
-    finally:
-        keep_on_failure = os.getenv("RUNTIME_TEARDOWN_KEEP_CONTAINER_ON_FAILURE", "0").strip() == "1"
-        if handle is not None and not keep_on_failure:
-            force_remove_container(handle.container_name)
