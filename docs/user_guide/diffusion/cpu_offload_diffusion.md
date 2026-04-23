@@ -36,6 +36,45 @@ m = Omni(model="Wan-AI/Wan2.2-T2V-A14B-Diffusers", enable_cpu_offload=True)
 vllm-omni serve diffusion Wan-AI/Wan2.2-T2V-A14B-Diffusers --enable-cpu-offload
 ```
 
+### To Support a Model
+
+Implement the `SupportsModuleOffload` protocol to declare which
+submodules participate in offloading:
+
+```python
+from typing import ClassVar
+from vllm_omni.diffusion.models.interface import SupportsModuleOffload
+
+class MyPipeline(nn.Module, SupportsModuleOffload):
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "vision_model"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    _resident_modules: ClassVar[list[str]] = []  # optional
+
+    def __init__(self):
+        super().__init__()
+        self.transformer = ...     # DiT — stays on GPU during denoising
+        self.text_encoder = ...    # Encoder — offloaded to CPU during denoising
+        self.vision_model = ...    # Encoder — offloaded to CPU during denoising
+        self.vae = ...             # VAE — always on GPU
+```
+
+- `_dit_modules`: attribute names of denoising submodules (kept on GPU
+  during the diffusion loop).
+- `_encoder_modules`: attribute names of encoder/vision submodules
+  (offloaded to CPU during the diffusion loop).
+- `_vae_modules`: attribute names of VAE(s) (always kept on GPU, not
+  part of the mutual exclusion hooks).
+- `_resident_modules`: attribute names of small submodules that must
+  stay on GPU during layerwise offloading (e.g. embedders, connectors).
+  Optional — defaults to `[]`.
+
+All attribute names support dotted paths for nested submodules
+(e.g. `"pipe.transformer"`, `"bagel.time_embedder"`).
+
+Both DiT and encoder lists are needed because the offload hooks use
+mutual exclusion: when one group runs, the other moves to CPU.
+
 ### Limitations
 - Cold start latency increases
 - Adds overhead from CPU-GPU transfers between encoder and denoising phases
@@ -116,11 +155,19 @@ class Flux2Transformer2DModel(nn.Module):
 
 **Module Discovery**
 
-The offloader automatically discovers pipeline components:
+The offloader discovers pipeline components in two ways:
 
-- **DiT modules**: `transformer`, `transformer_2`, `dit`
-- **Encoders**: `text_encoder`, `text_encoder_2`, `text_encoder_3`, `image_encoder`
-- **VAE**: `vae`
+1. **Protocol-based** (preferred): If the pipeline implements
+    `SupportsModuleOffload`, its `_dit_modules`, `_encoder_modules`,
+    `_vae_modules`, and `_resident_modules` class variables are used
+    directly.  All attribute names support dotted paths (e.g.
+    `"pipe.transformer"`, `"bagel.time_embedder"`) for nested submodules.
+
+2. **Fallback attribute scan**: Otherwise, the offloader scans for
+    well-known attribute names:
+    - **DiT modules**: `transformer`, `transformer_2`, `dit`, `sr_dit`, `language_model`, `transformer_blocks`, `model`
+    - **Encoders**: `text_encoder`, `text_encoder_2`, `text_encoder_3`, `image_encoder`
+    - **VAE**: `vae`, `audio_vae`
 
 **Hook System**
 

@@ -181,6 +181,7 @@ class Orchestrator:
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
         self._fatal_error: str | None = None
+        self._fatal_error_stage_id: int | None = None
 
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
@@ -331,6 +332,7 @@ class Orchestrator:
                         e,
                     )
                     self._fatal_error = str(e)
+                    self._fatal_error_stage_id = stage_id
                     for req_id, req_state in list(self.request_states.items()):
                         if stage_id in req_state.stage_submit_ts:
                             await self.output_async_queue.put(
@@ -339,6 +341,7 @@ class Orchestrator:
                                     "error": str(e),
                                     "fatal": True,
                                     "request_id": req_id,
+                                    "stage_id": stage_id,
                                 }
                             )
                             self.request_states.pop(req_id, None)
@@ -1135,6 +1138,7 @@ class Orchestrator:
                         "error": self._fatal_error,
                         "fatal": True,
                         "request_id": req_id,
+                        "stage_id": self._fatal_error_stage_id,
                     }
                 )
                 notified.add(req_id)
@@ -1150,6 +1154,7 @@ class Orchestrator:
                         "error": self._fatal_error,
                         "fatal": True,
                         "request_id": req_id,
+                        "stage_id": self._fatal_error_stage_id,
                     }
                 )
             self.request_states.pop(req_id, None)

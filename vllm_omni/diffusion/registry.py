@@ -208,6 +208,11 @@ _DIFFUSION_MODELS = {
         "pipeline_omnivoice",
         "OmniVoicePipeline",
     ),
+    "DiffusersAdapterPipeline": (
+        "diffusers_adapter",
+        "pipeline_diffusers_adapter",
+        "DiffusersAdapterPipeline",
+    ),
 }
 
 
