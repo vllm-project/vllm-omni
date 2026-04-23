@@ -1,6 +1,9 @@
 # ruff: noqa: E402, I001
+import argparse
 import math
+import os
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -39,6 +42,64 @@ from benchmarks.accuracy.text_to_image.gbench import (
     summarize_generated_records as summarize_gebench_generated_records,
     summarize_gebench_results,
 )
+from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import seed_tts_bench_argv
+from tests.e2e.accuracy.qwen3_omni.run_qwen_omni_acc_benchmark import sync_dataset_env_from_ns
+from vllm_omni.benchmarks.data_modules.seed_tts_dataset import resolve_seed_tts_root
+
+
+def test_seed_tts_bench_argv_preserves_hf_repo_id_from_env(monkeypatch):
+    monkeypatch.setenv("VLLM_SEED_TTS_DATASET_PATH", "zhaochenyang20/seed-tts-eval")
+    monkeypatch.delenv("VLLM_SEED_TTS_REPO", raising=False)
+
+    argv = seed_tts_bench_argv(locale="en")
+
+    dataset_idx = argv.index("--dataset-path")
+    assert argv[dataset_idx + 1] == "zhaochenyang20/seed-tts-eval"
+
+
+def test_sync_dataset_env_preserves_seed_tts_hf_repo_id(monkeypatch):
+    ns = argparse.Namespace(
+        daily_omni_repo=None,
+        daily_omni_qa_json=None,
+        daily_omni_video_dir=None,
+        seed_tts_dataset_path="zhaochenyang20/seed-tts-eval",
+        seed_tts_root=None,
+    )
+
+    monkeypatch.delenv("VLLM_SEED_TTS_DATASET_PATH", raising=False)
+    sync_dataset_env_from_ns(ns)
+
+    assert os.environ["VLLM_SEED_TTS_DATASET_PATH"] == "zhaochenyang20/seed-tts-eval"
+
+
+def test_resolve_seed_tts_root_downloads_only_requested_locale(monkeypatch, tmp_path: Path):
+    downloaded_root = tmp_path / "seed_tts_cache"
+    (downloaded_root / "zh" / "prompt-wavs").mkdir(parents=True)
+    (downloaded_root / "zh" / "meta.lst").write_text("", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_snapshot_download(*, repo_id, repo_type, allow_patterns):
+        captured["repo_id"] = repo_id
+        captured["repo_type"] = repo_type
+        captured["allow_patterns"] = allow_patterns
+        return str(downloaded_root)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        types.SimpleNamespace(snapshot_download=fake_snapshot_download),
+    )
+
+    resolved = resolve_seed_tts_root(
+        "zhaochenyang20/seed-tts-eval",
+        explicit_root=None,
+        locale="zh",
+    )
+
+    assert resolved == downloaded_root.resolve()
+    assert captured["repo_id"] == "zhaochenyang20/seed-tts-eval"
+    assert captured["repo_type"] == "dataset"
+    assert captured["allow_patterns"] == ["zh/**"]
 
 
 def test_summarize_gebench_generated_records_groups_by_type():
