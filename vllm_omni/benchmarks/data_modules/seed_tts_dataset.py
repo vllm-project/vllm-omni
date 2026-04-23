@@ -94,7 +94,7 @@ def _load_meta_rows(meta_file: Path) -> list[_SeedTTSRow]:
     return rows
 
 
-def resolve_seed_tts_root(dataset_path: str | None, *, explicit_root: str | None) -> Path:
+def resolve_seed_tts_root(dataset_path: str | None, *, explicit_root: str | None, locale: str = "en") -> Path:
     """Return directory containing ``{locale}/meta.lst`` and ``{locale}/prompt-wavs/``."""
     if explicit_root:
         root = Path(explicit_root).expanduser().resolve()
@@ -117,7 +117,14 @@ def resolve_seed_tts_root(dataset_path: str | None, *, explicit_root: str | None
             "Install huggingface_hub to download Seed-TTS from the Hub, or clone the dataset "
             "locally and pass --dataset-path / --seed-tts-root to that directory."
         ) from e
-    cache = snapshot_download(repo_id=repo_id, repo_type="dataset")
+    # Download only the requested locale subtree instead of the whole dataset
+    # repo. This avoids large, flaky nightly downloads when we only need e.g.
+    # ``en/meta.lst`` + ``en/prompt-wavs/**``.
+    cache = snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        allow_patterns=[f"{locale}/**"],
+    )
     return Path(cache).resolve()
 
 
@@ -172,7 +179,7 @@ class SeedTTSDataset(BenchmarkDataset):
             disable_shuffle=disable_shuffle,
             **kwargs,
         )
-        self._root = resolve_seed_tts_root(self.dataset_path, explicit_root=self._explicit_root)
+        self._root = resolve_seed_tts_root(self.dataset_path, explicit_root=self._explicit_root, locale=self.locale)
         self._rows: list[_SeedTTSRow] = []
         self.load_data()
 

@@ -203,6 +203,13 @@ class OmniBagelDataParser(MultiModalDataParser):
 class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingInfo]):
     IMG2IMG_PLACEHOLDER = "<|fim_middle|>"
 
+    @staticmethod
+    def _mm_kwargs_for_bagel_img2img_hf(mm_kwargs: Mapping[str, object]) -> dict[str, object]:
+        # OpenAI / GLM-style serving may pass target_h/target_w for output grid sizing.
+        # BagelProcessor does not accept these in img2img mode; strip here so callers
+        # (e.g. serving_chat) can stay model-agnostic.
+        return {k: v for k, v in mm_kwargs.items() if k not in ("target_h", "target_w")}
+
     def _cached_apply_hf_processor(self, inputs, timing_ctx):
         # img2img: prompt text must be modified based on mm data presence,
         # so text and mm data cannot be tokenized separately — bypass cache.
@@ -248,7 +255,7 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
             if "images" in img2img_data:
                 del img2img_data["images"]
             img2img_data["images"] = img2img_data.pop("pixel_values_img2img")
-            kwargs_img2img = dict(mm_kwargs)
+            kwargs_img2img = self._mm_kwargs_for_bagel_img2img_hf(mm_kwargs)
             kwargs_img2img["is_img2img"] = True
             out_img2img = super()._call_hf_processor(prompt, img2img_data, kwargs_img2img, tok_kwargs)
             if "pixel_values" in out_img2img:
@@ -262,7 +269,7 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
         elif has_img2img:
             mm_data = dict(mm_data)
             mm_data["images"] = mm_data.pop("pixel_values_img2img")
-            mm_kwargs = dict(mm_kwargs)
+            mm_kwargs = self._mm_kwargs_for_bagel_img2img_hf(mm_kwargs)
             mm_kwargs["is_img2img"] = True
             outputs = super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
             if "pixel_values" in outputs:

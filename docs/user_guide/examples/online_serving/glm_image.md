@@ -104,9 +104,9 @@ guides.
 
 When using `/v1/chat/completions`, pass these inside `extra_body` in the curl
 JSON, or via the `extra_body` keyword argument in the OpenAI Python SDK (see the
-[Diffusion Chat API guide](../../../../serving/diffusion_chat_api.md)).
-When using the dedicated [`/v1/images/generations`](../../../../serving/image_generation_api.md)
-or [`/v1/images/edits`](../../../../serving/image_edit_api.md) endpoints, pass
+[Diffusion Chat API guide](../../../serving/diffusion_chat_api.md)).
+When using the dedicated [`/v1/images/generations`](../../../serving/image_generation_api.md)
+or [`/v1/images/edits`](../../../serving/image_edit_api.md) endpoints, pass
 the supported generation controls as top-level fields directly. For image
 dimensions and count, use `size` and `n` rather than `height` or `width`.
 

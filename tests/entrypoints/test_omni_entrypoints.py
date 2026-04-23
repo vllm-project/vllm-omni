@@ -14,6 +14,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -335,6 +336,18 @@ def _enqueue_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> 
     )
 
 
+def _enqueue_fatal_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    engine.output_q.put_nowait(
+        {
+            "type": "error",
+            "fatal": True,
+            "request_id": msg["request_id"],
+            "stage_id": 2,
+            "error": "engine dead",
+        }
+    )
+
+
 @pytest.mark.asyncio
 async def test_get_supported_tasks_returns_engine_supported_tasks():
     omni = object.__new__(AsyncOmni)
@@ -546,17 +559,21 @@ async def test_async_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.asyncio
-async def test_async_omni_propagates_engine_error(monkeypatch: pytest.MonkeyPatch):
-    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META, on_add_request=_enqueue_error_message)
+async def test_async_omni_propagates_fatal_error_context(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META, on_add_request=_enqueue_fatal_error_message)
     _patch_engine(monkeypatch, engine)
 
     app = AsyncOmni("dummy-model")
     try:
-        with pytest.raises(RuntimeError, match="engine boom"):
+        with pytest.raises(EngineDeadError, match="engine dead") as exc_info:
             async for _ in app.generate(prompt="hello", request_id="req-1"):
                 pass
     finally:
         app.shutdown()
+
+    assert isinstance(exc_info.value, OmniEngineDeadError)
+    assert str(exc_info.value) == "engine dead"
+    assert getattr(exc_info.value, "error_stage_id") == 2
 
 
 def test_omni_generate_py_generator_yields_final_outputs_for_each_request(monkeypatch: pytest.MonkeyPatch):

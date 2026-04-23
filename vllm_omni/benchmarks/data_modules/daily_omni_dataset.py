@@ -9,7 +9,9 @@ Supports loading QA metadata from:
 - Local JSON file (``qa_json_path``): recommended for offline/air-gapped environments
 - HuggingFace datasets (``dataset_path``): legacy online mode
 
-The videos must be separately downloaded and extracted from Videos.tar.
+Video/audio files normally come from extracted ``Videos.tar``. When ``--daily-omni-video-dir``
+is not set, the first request that needs on-disk media downloads that archive from the Hugging Face
+dataset repo (``huggingface_hub``) and caches it under ``HF_HOME``.
 
 Why ``BenchmarkDataset`` instead of ``HuggingFaceDataset``?
     vLLM's ``HuggingFaceDataset`` is a thin wrapper whose ``__init__`` always ends by calling
@@ -52,6 +54,9 @@ Usage:
 import base64
 import json
 import logging
+import os
+import shutil
+import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -71,6 +76,103 @@ except ImportError:
     load_dataset = None
 
 logger = logging.getLogger(__name__)
+
+
+def _daily_omni_hf_cache_root() -> Path:
+    return Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")).expanduser().resolve()
+
+
+def _daily_omni_tar_fingerprint(tar_path: Path) -> str:
+    st = tar_path.stat()
+    return f"v1:{st.st_size}:{int(st.st_mtime_ns)}"
+
+
+def _daily_omni_find_videos_root_in_extract(tmp: Path) -> Path:
+    """Return directory whose children are ``video_id`` folders with ``*_video.mp4``."""
+    videos = tmp / "Videos"
+    if videos.is_dir():
+        return videos
+    for child in sorted(tmp.iterdir()):
+        if child.is_dir() and not child.name.startswith("."):
+            probe = child / f"{child.name}_video.mp4"
+            if probe.is_file():
+                return tmp
+    raise RuntimeError(
+        f"Unrecognized layout after extracting Daily-Omni Videos.tar under {tmp} "
+        "(expected top-level 'Videos/' or per-video_id subdirs)."
+    )
+
+
+def ensure_daily_omni_hub_videos_dir(repo_id: str) -> Path:
+    """Download ``Videos.tar`` from the Hugging Face dataset repo and return the ``Videos`` root.
+
+    The returned path matches ``--daily-omni-video-dir`` (directory containing ``{{video_id}}/``).
+
+    Cached under ``HF_HOME`` / ``vllm_omni/daily_omni_media/<repo>``. Reuses extraction when the
+    tarball fingerprint matches.
+
+    Raises:
+        ImportError: if ``huggingface_hub`` is not installed.
+        FileNotFoundError / RuntimeError: if the archive is missing or malformed.
+    """
+    rid = (repo_id or "").strip()
+    if not rid:
+        raise ValueError("repo_id is required to download Daily-Omni Videos.tar")
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as e:
+        raise ImportError(
+            "Daily-Omni Hub media download requires huggingface_hub. "
+            "Install it (e.g. with vLLM) or provide --daily-omni-video-dir with a local extract."
+        ) from e
+
+    safe = rid.replace("/", "__").replace("\\", "_")
+    staging_root = _daily_omni_hf_cache_root() / "vllm_omni" / "daily_omni_media" / safe
+    videos_dir = staging_root / "Videos"
+    marker = staging_root / ".videos_extracted"
+
+    tar_path: Path | None = None
+    for fname in ("Videos.tar", "videos.tar"):
+        try:
+            tar_path = Path(hf_hub_download(repo_id=rid, filename=fname, repo_type="dataset"))
+            break
+        except Exception:
+            continue
+    if tar_path is None or not tar_path.is_file():
+        raise FileNotFoundError(
+            f"Could not download Videos.tar from Hugging Face dataset {rid!r} (tried Videos.tar / videos.tar)."
+        )
+
+    fp = _daily_omni_tar_fingerprint(tar_path)
+    if marker.is_file() and videos_dir.is_dir():
+        try:
+            if marker.read_text(encoding="utf-8").strip() == fp:
+                next(videos_dir.iterdir())
+                logger.info("Reusing cached Daily-Omni Videos extract at %s", videos_dir)
+                return videos_dir
+        except (OSError, StopIteration):
+            shutil.rmtree(videos_dir, ignore_errors=True)
+            marker.unlink(missing_ok=True)
+
+    staging_root.mkdir(parents=True, exist_ok=True)
+    work = staging_root / "_extract_work"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    try:
+        logger.info("Extracting Daily-Omni Videos.tar from %s (repo=%s)", tar_path, rid)
+        with tarfile.open(tar_path, "r:*") as tf:
+            tf.extractall(path=work, filter="data")
+        found = _daily_omni_find_videos_root_in_extract(work)
+        if videos_dir.exists():
+            shutil.rmtree(videos_dir, ignore_errors=True)
+        shutil.move(str(found), str(videos_dir))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    marker.write_text(fp, encoding="utf-8")
+    logger.info("Daily-Omni Hub media ready at %s", videos_dir)
+    return videos_dir
 
 
 class _ListDatasetIterator:
@@ -142,7 +244,10 @@ class DailyOmniDataset(BenchmarkDataset):
     - Local JSON file (``qa_json_path``): recommended for offline/air-gapped environments
     - HuggingFace datasets (``dataset_path``): legacy online mode
 
-    The videos must be separately downloaded and extracted from Videos.tar.
+    Video/audio files normally come from extracted ``Videos.tar``. When ``video_dir`` is not set,
+    the first sample that needs on-disk media downloads that archive from the Hugging Face dataset
+    repo (env ``VLLM_DAILY_OMNI_MEDIA_REPO`` overrides the repo id; else ``dataset_path`` or
+    :data:`DEFAULT_HF_DATASET_ID`).
 
     Args:
         qa_json_path: Path to local qa.json file (offline mode, preferred). When provided,
@@ -151,7 +256,8 @@ class DailyOmniDataset(BenchmarkDataset):
             ``qa_json_path`` is not provided (legacy online mode).
         dataset_split: Dataset split to use (default: "train"). Used only in online mode.
         random_seed: Random seed for shuffling
-        video_dir: Directory containing extracted video files (default: None)
+        video_dir: Directory containing extracted video files (default: None; may be filled lazily
+            from Hub — see above).
         input_mode: Which modalities to send, matching upstream Daily-Omni ``--input_mode``:
             ``all`` — video + WAV (default; official audio-visual protocol);
             ``visual`` — video only;
@@ -308,13 +414,14 @@ class DailyOmniDataset(BenchmarkDataset):
                 "Install with: pip install datasets, or use local JSON mode instead."
             )
 
-        ds = load_dataset(
-            self.dataset_path,
-            name=self.dataset_subset,
-            split=self.dataset_split,
-            streaming=self._hf_streaming,
-            trust_remote_code=self.trust_remote_code,
-        )
+        load_kw: dict[str, Any] = {
+            "split": self.dataset_split,
+            "streaming": self._hf_streaming,
+            "trust_remote_code": self.trust_remote_code,
+        }
+        if self.dataset_subset is not None:
+            load_kw["name"] = self.dataset_subset
+        ds = load_dataset(self.dataset_path, **load_kw)
         if not getattr(self, "disable_shuffle", False):
             ds = ds.shuffle(seed=self.random_seed)
         self.data = ds
@@ -569,6 +676,17 @@ class DailyOmniDataset(BenchmarkDataset):
             "audio_url": {"url": path.as_uri()},
         }
 
+    def _lazy_ensure_hub_media_dir(self) -> None:
+        """If ``video_dir`` was not configured, download and extract ``Videos.tar`` once from HF."""
+        if self.video_dir is not None:
+            return
+        repo = os.environ.get("VLLM_DAILY_OMNI_MEDIA_REPO", "").strip()
+        if not repo:
+            repo = (self.dataset_path or "").strip()
+        if not repo:
+            repo = self.DEFAULT_HF_DATASET_ID
+        self.video_dir = ensure_daily_omni_hub_videos_dir(repo)
+
     def _get_video_content(
         self,
         video_id: str,
@@ -588,6 +706,8 @@ class DailyOmniDataset(BenchmarkDataset):
             if not url.startswith(("http://", "https://", "file://")):
                 url = f"https://{url.lstrip('/')}"
             return {"type": "video_url", "video_url": {"url": url}}
+
+        self._lazy_ensure_hub_media_dir()
 
         if self.video_dir and video_id:
             video_path = self._resolve_local_video_path(video_id)
@@ -615,7 +735,13 @@ class DailyOmniDataset(BenchmarkDataset):
         return None
 
     def _get_audio_content(self, video_id: str) -> dict[str, Any] | None:
-        """Resolve extracted WAV for OpenAI-style ``audio_url`` (local files only)."""
+        """Resolve extracted WAV for OpenAI-style ``audio_url`` (local files under ``video_dir``).
+
+        Uses the same tree as video (``{video_id}/{video_id}_audio.wav``), including after lazy
+        Hub ``Videos.tar`` extraction when ``video_dir`` was unset.
+        """
+        self._lazy_ensure_hub_media_dir()
+
         if not self.video_dir or not video_id:
             logger.warning(
                 "Daily-Omni input_mode %r requires --daily-omni-video-dir with %s",
