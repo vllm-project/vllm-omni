@@ -15,7 +15,6 @@ import os
 from collections.abc import Iterable
 from typing import Any
 
-import librosa
 import numpy as np
 import PIL.Image
 import torch
@@ -24,6 +23,7 @@ from torch import nn
 from torchvision import transforms
 from transformers import AutoTokenizer, UMT5Config, UMT5EncoderModel, Wav2Vec2ForCTC, Wav2Vec2Processor
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
@@ -794,7 +794,7 @@ class Wan22S2VPipeline(
             audio_input = audio_path.astype(np.float32)
             sample_rate = 16000
         else:
-            audio_input, sample_rate = librosa.load(audio_path, sr=16000)
+            audio_input, sample_rate = load_audio(audio_path, sr=16000, mono=True)
         input_values = self.audio_processor(audio_input, sampling_rate=sample_rate, return_tensors="pt").input_values
         # Match dtype of audio model weights (may be bfloat16 in bundled checkpoints)
         audio_model_dtype = next(self.audio_model.parameters()).dtype
@@ -1169,7 +1169,7 @@ class Wan22S2VPipeline(
             raw_audio_waveform = audio_path.astype(np.float32)
             raw_audio_sr = 16000
         else:
-            raw_audio_waveform, raw_audio_sr = librosa.load(audio_path, sr=None)
+            raw_audio_waveform, raw_audio_sr = load_audio(audio_path, sr=None, mono=True)
 
         # ---- 3. Reference image encoding ----
         ref_latents = self.encode_ref_image(image, height, width, device=device).to(dtype=dtype)
