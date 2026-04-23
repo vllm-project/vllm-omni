@@ -817,7 +817,10 @@ def _apply_pd_disaggregation(
     target_stage_id = int(pd_cfg.get("target_stage_id", 0))
     target_stage = pipeline.get_stage(target_stage_id)
     if target_stage is None:
-        raise ValueError(f"PD disaggregation target stage {target_stage_id} not found in pipeline {pipeline.model_type!r}")
+        raise ValueError(
+            f"PD disaggregation target stage {target_stage_id} "
+            f"not found in pipeline {pipeline.model_type!r}"
+        )
     if target_stage.execution_type != StageExecutionType.LLM_AR:
         raise ValueError(
             f"PD disaggregation only supports LLM_AR stages; stage {target_stage_id} "
