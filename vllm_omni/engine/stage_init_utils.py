@@ -14,7 +14,7 @@ import multiprocessing as mp
 import os
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from vllm.logger import init_logger
@@ -29,6 +29,7 @@ from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization.inc_config import OmniINCConfig
 
 logger = init_logger(__name__)
 
@@ -458,6 +459,11 @@ def build_vllm_config(
         headless=headless,
     )
     executor_class = Executor.get_class(vllm_config)
+
+    # Upgrade vanilla INCConfig to OmniINCConfig for multi-stage models.
+    upgraded = OmniINCConfig.maybe_upgrade(vllm_config.quant_config)
+    if upgraded is not vllm_config.quant_config:
+        vllm_config = replace(vllm_config, quant_config=upgraded)
 
     return vllm_config, executor_class
 

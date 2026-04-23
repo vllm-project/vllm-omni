@@ -169,6 +169,12 @@ class StagePipelineConfig:
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
     omni_kv_config: dict[str, Any] | None = None
+    # Model subdirectory indirections: for multi-component HF repos where the
+    # stage's config/tokenizer lives in a subdirectory (e.g. GLM-Image's AR
+    # config is in ``vision_language_encoder/``).  Consumed at stage-init time
+    # by ``stage_init_utils._resolve_model_tokenizer_paths``.
+    model_subdir: str | None = None
+    tokenizer_subdir: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -185,6 +191,11 @@ class PipelineConfig:
     # matches ``hf_config.architectures[*]`` against this tuple to route
     # to the correct pipeline. Leave empty for models with unique model_type.
     hf_architectures: tuple[str, ...] = ()
+    # Diffusers pipeline class name: for models that ship a ``model_index.json``
+    # (no root ``config.json``), the ``_class_name`` field is matched against
+    # this value to auto-detect the pipeline.  Only needed for diffusers-style
+    # multi-component repos (e.g. GLM-Image).  ``None`` = not a diffusers model.
+    diffusers_class_name: str | None = None
 
     def get_stage(self, stage_id: int) -> StagePipelineConfig | None:
         """Look up a stage by its ID."""
@@ -702,6 +713,13 @@ def _build_engine_args(
         engine_args["engine_output_type"] = ps.engine_output_type
     if next_stage_proc:
         engine_args["custom_process_next_stage_input_func"] = next_stage_proc
+    # Subdirectory indirections from StagePipelineConfig (structural, not
+    # deployment knobs).  Deploy YAML ``engine_extras`` can still override
+    # these per-stage if needed.
+    if ps.model_subdir:
+        engine_args["model_subdir"] = ps.model_subdir
+    if ps.tokenizer_subdir:
+        engine_args["tokenizer_subdir"] = ps.tokenizer_subdir
 
     # Pipeline-wide top-level DeployConfig settings, applied to every stage.
     for name in _PIPELINE_WIDE_ENGINE_FIELDS:
@@ -1377,6 +1395,27 @@ class StageConfigFactory:
                     return config_dict["architecture"], None
         except Exception as e:
             logger.debug(f"Failed to auto-detect model type for {model}: {e}")
+
+        # Fallback for diffusers-style models: check model_index.json.
+        # Some models (e.g. GLM-Image) have no root config.json but ship a
+        # model_index.json with _class_name that maps to a pipeline key via
+        # PipelineConfig.diffusers_class_name.
+        try:
+            from vllm.transformers_utils.config import get_hf_file_to_dict
+
+            model_index = get_hf_file_to_dict("model_index.json", model, revision=None)
+            if model_index and "_class_name" in model_index:
+                class_name = model_index["_class_name"]
+                for pipeline_cfg in _PIPELINE_REGISTRY.values():
+                    if pipeline_cfg.diffusers_class_name == class_name:
+                        logger.info(
+                            "Detected pipeline %r from model_index.json (_class_name=%r)",
+                            pipeline_cfg.model_type,
+                            class_name,
+                        )
+                        return pipeline_cfg.model_type, None
+        except Exception:
+            pass
 
         # Final fallback: some models (e.g. CosyVoice3) ship an empty
         # config.json and rely on naming conventions. Match the model path

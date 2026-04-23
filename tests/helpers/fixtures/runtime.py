@@ -36,7 +36,7 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
         model = model_prefix + params.model
         port = params.port
         stage_config_path = params.stage_config_path
-        if run_level == "advanced_model" and stage_config_path is not None:
+        if run_level in {"advanced_model", "full_model"} and stage_config_path is not None:
             with open(stage_config_path, encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
             # Strip ``load_format: dummy`` (CI overlay default) so advanced_model

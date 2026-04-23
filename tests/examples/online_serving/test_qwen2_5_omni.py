@@ -4,9 +4,6 @@ See examples/online_serving/qwen2_5_omni/README.md
 """
 
 import os
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
 from pathlib import Path
 
 import pytest
@@ -21,7 +18,9 @@ from tests.helpers.media import convert_audio_file_to_text, cosine_similarity_te
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.example]
+pytestmark = [pytest.mark.full_model, pytest.mark.example, pytest.mark.omni]
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 models = ["Qwen/Qwen2.5-Omni-7B"]
 
@@ -40,8 +39,6 @@ test_params = [
 common_args = ["python", os.path.join(example_dir, "openai_chat_completion_client_for_multimodal_generation.py")]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_send_multimodal_request_001(omni_server) -> None:
@@ -77,8 +74,6 @@ def test_send_multimodal_request_001(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_send_multimodal_request_002(omni_server) -> None:
@@ -114,8 +109,6 @@ def test_send_multimodal_request_002(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_send_multimodal_request_003(omni_server) -> None:
@@ -141,8 +134,6 @@ def test_send_multimodal_request_003(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_modality_control_001(omni_server) -> None:
@@ -171,8 +162,6 @@ def test_modality_control_001(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_modality_control_002(omni_server) -> None:
@@ -200,8 +189,6 @@ def test_modality_control_002(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_modality_control_003(omni_server) -> None:
@@ -238,8 +225,6 @@ def test_modality_control_003(omni_server) -> None:
     # TODO: Verify the E2E latency after confirmation baseline.
 
 
-@pytest.mark.advanced_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_stream_001(omni_server) -> None:

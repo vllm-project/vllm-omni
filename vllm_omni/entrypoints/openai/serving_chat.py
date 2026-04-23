@@ -1636,7 +1636,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logger.warning(f"Unsupported final output type: {omni_outputs.final_output_type}")
                 continue
             if omni_outputs.metrics:
-                response_metrics = omni_outputs.metrics
+                response_metrics = dict(omni_outputs.metrics)
+            if omni_outputs.final_output_type == "image":
+                # Expose diffusion profiler metrics on the top-level response for benchmarks / clients.
+                if response_metrics is None:
+                    response_metrics = {}
+                response_metrics.setdefault("stage_durations", omni_outputs.stage_durations or {})
+                response_metrics.setdefault("peak_memory_mb", float(omni_outputs.peak_memory_mb or 0.0))
             choices.extend(choices_data)
 
         response = OmniChatCompletionResponse(
