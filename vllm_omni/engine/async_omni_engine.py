@@ -1657,7 +1657,7 @@ class AsyncOmniEngine:
                     if not hasattr(cfg.engine_args, "quantization") or cfg.engine_args.quantization is None:
                         cfg.engine_args.quantization = quantization
             except Exception as e:
-                logger.warning("Failed to inject diffusion config overrides for stage: %s", e)
+                logger.warning("Failed to inject LoRA config for stage: %s", e)
 
         return config_path, stage_configs
 
