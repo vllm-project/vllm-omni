@@ -5,11 +5,12 @@ Serve VoxCPM2 TTS via the OpenAI-compatible `/v1/audio/speech` endpoint.
 ## Start the Server
 
 ```bash
-python -m vllm_omni.entrypoints.openai.api_server \
-    --model openbmb/VoxCPM2 \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/voxcpm2.yaml \
-    --host 0.0.0.0 --port 8000
+vllm serve openbmb/VoxCPM2 --omni --host 0.0.0.0 --port 8000
 ```
+
+The deploy config is auto-loaded from `vllm_omni/deploy/voxcpm2.yaml`. Pass
+`--deploy-config <path>` to override, or `--stage-N-<field> <value>` (e.g.
+`--stage-0-max-num-seqs 8`) for per-stage runtime overrides.
 
 ## Zero-shot Synthesis
 

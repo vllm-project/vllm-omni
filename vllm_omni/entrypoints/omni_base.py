@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import huggingface_hub
 from vllm.logger import init_logger
-from vllm.v1.engine.exceptions import EngineDeadError
+from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
@@ -26,6 +26,23 @@ if TYPE_CHECKING:
     from vllm_omni.engine.arg_utils import OmniEngineArgs
 
 logger = init_logger(__name__)
+
+
+class OmniEngineDeadError(EngineDeadError):
+    _DEFAULT_MESSAGE = EngineDeadError().args[0]
+    error_stage_id: int | None
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        error_stage_id: int | None = None,
+        suppress_context: bool = False,
+    ) -> None:
+        resolved_message = message or self._DEFAULT_MESSAGE
+        Exception.__init__(self, resolved_message)
+        self.__suppress_context__ = suppress_context
+        self.error_stage_id = error_stage_id
 
 
 def _weak_shutdown_engine(engine: AsyncOmniEngine) -> None:
@@ -198,9 +215,33 @@ class OmniBase(PDDisaggregationMixin):
     def is_running(self) -> bool:
         return self.engine.is_alive()
 
+    @property
+    def errored(self) -> bool:
+        """Whether the engine is in a non-recoverable error state.
+
+        True when the orchestrator thread is dead **or** any stage client
+        has been marked dead (e.g. diffusion worker OOM / process death).
+
+        Checks both ``_engine_dead`` (StageDiffusionClient) and
+        ``resources.engine_dead`` (StageEngineCoreClient / AsyncMPClient)
+        since the two client types store the flag differently.
+        """
+        if not self.engine.is_alive():
+            return True
+        for stage_client in self.engine.stage_clients:
+            if getattr(stage_client, "_engine_dead", False):
+                return True
+            resources = getattr(stage_client, "resources", None)
+            if resources is not None and getattr(resources, "engine_dead", False):
+                return True
+        return False
+
     def check_health(self) -> None:
         if not self.engine.is_alive():
             raise EngineDeadError("Orchestrator process is not alive")
+        for stage_client in self.engine.stage_clients:
+            if hasattr(stage_client, "check_health"):
+                stage_client.check_health()
 
     def resolve_sampling_params_list(
         self,
@@ -271,7 +312,14 @@ class OmniBase(PDDisaggregationMixin):
             return True, None, None, None
 
         if msg_type == "error":
-            raise RuntimeError(msg.get("error", "Orchestrator returned an error message"))
+            error_text = msg.get("error", "Orchestrator returned an error message")
+            stage_id = msg.get("stage_id")
+            if msg.get("fatal"):
+                raise OmniEngineDeadError(
+                    error_text,
+                    error_stage_id=stage_id,
+                )
+            raise RuntimeError(error_text)
 
         if msg_type != "output":
             logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, msg_type)
@@ -299,6 +347,37 @@ class OmniBase(PDDisaggregationMixin):
         req_state.stage_id = stage_id
 
         return False, req_id, stage_id, req_state
+
+    def _check_engine_output_error(
+        self,
+        result: dict[str, Any],
+        request_id: str,
+        stage_id: int,
+    ) -> None:
+        """Raise if ``engine_outputs`` carries an error field.
+
+        Raises :class:`EngineDeadError` when ``self.errored`` indicates the
+        engine is unrecoverable, otherwise raises :class:`EngineGenerateError`
+        (recoverable, single-request failure).
+        """
+        engine_outputs = result.get("engine_outputs")
+        error_text = getattr(engine_outputs, "error", None)
+        if error_text is None:
+            return
+        logger.error(
+            "[%s] Stage error for req=%s stage-%s: %s",
+            self.__class__.__name__,
+            request_id,
+            stage_id,
+            error_text,
+        )
+        # NOTE: O(n_stages) check for every error.
+        if self.errored:
+            raise OmniEngineDeadError(
+                error_text,
+                error_stage_id=stage_id,
+            )
+        raise EngineGenerateError(error_text)
 
     def _process_single_result(
         self,

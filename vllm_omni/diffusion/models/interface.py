@@ -58,6 +58,27 @@ class SupportsStepExecution(Protocol):
         """Decode output after denoise loop."""
 
 
+@runtime_checkable
+class SupportsModuleOffload(Protocol):
+    """Declares which submodules participate in CPU offload.
+
+    All attribute names support dotted paths for nested submodules
+    (e.g. ``"pipe.transformer"``).
+
+    Attributes:
+        _dit_modules: Denoising submodules (on GPU during diffusion).
+        _encoder_modules: Encoder submodules (offloaded during diffusion).
+        _vae_modules: VAE(s) (always on GPU).
+        _resident_modules: Extra modules pinned on GPU during layerwise
+            offloading.  Optional, defaults to ``[]``.
+    """
+
+    _dit_modules: ClassVar[list[str]]
+    _encoder_modules: ClassVar[list[str]]
+    _vae_modules: ClassVar[list[str]]
+    _resident_modules: ClassVar[list[str]] = []
+
+
 def supports_step_execution(pipeline: object) -> bool:
     """Return whether `pipeline` implements :class:`SupportsStepExecution`."""
 

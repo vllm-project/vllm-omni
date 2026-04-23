@@ -6,6 +6,7 @@ from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
     CodePredictorWrapper,
     CodePredictorWrapperConfig,
 )
+from vllm_omni.platforms import current_omni_platform
 
 
 class Qwen3OmniMoeTalkerCodePredictor(CodePredictorWrapper):
@@ -17,7 +18,7 @@ class Qwen3OmniMoeTalkerCodePredictor(CodePredictorWrapper):
             vllm_config=vllm_config,
             cp_config=cp_config,
             wrapper_config=CodePredictorWrapperConfig(
-                use_cuda_graphs=False,
+                use_cuda_graphs=current_omni_platform.is_npu(),
                 use_parallel_embedding=True,
                 use_projection=False,
                 return_proj_buf=True,

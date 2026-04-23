@@ -415,6 +415,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         # In-memory LRU cache for voice extraction artifacts (Base voice clone).
         self._voice_cache = VoiceEmbeddingCache()
+        raw_subtalker_sampling = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
+        self._subtalker_sampling_params: dict[str, Any] = (
+            dict(raw_subtalker_sampling) if isinstance(raw_subtalker_sampling, Mapping) else {}
+        )
 
     # -------------------- vLLM required hooks --------------------
 
@@ -1638,6 +1642,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         input_embeds: torch.Tensor,
         last_talker_hidden: torch.Tensor,
         text_step: torch.Tensor,
+        do_sample: bool | None = None,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """GPU fast-path used by OmniGPUModelRunner to predict residual codebooks (1..Q-1).
         Returns (inputs_embeds, audio_codes) for the current step."""
@@ -1656,15 +1664,24 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             audio_codes = input_ids.reshape(bsz, 1)
             return (last_id_hidden + text_step).reshape(bsz, -1), audio_codes
 
-        # Predict residual codes (1..Q-1) with HF reference sampling params.
+        subtalker_params = self._subtalker_sampling_params
+        if do_sample is None:
+            do_sample = bool(subtalker_params.get("do_sample", True))
+        if temperature is None:
+            temperature = float(subtalker_params.get("temperature", 0.9))
+        if top_k is None:
+            top_k = int(subtalker_params.get("top_k", 50))
+        if top_p is None:
+            top_p = float(subtalker_params.get("top_p", 1.0))
+
         audio_codes = self.code_predictor(
             layer0_code=input_ids.reshape(bsz, 1),
             layer0_embed=last_id_hidden,
             last_talker_hidden=past_hidden,
-            do_sample=True,
-            temperature=0.9,
-            top_k=50,
-            top_p=1.0,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
         )  # [B, Q]
 
         # Map invalid layer-0 ids (e.g. EOS) to PAD=0 so SpeechTokenizer sees only real codes.
