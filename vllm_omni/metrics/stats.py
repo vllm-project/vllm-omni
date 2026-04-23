@@ -199,6 +199,30 @@ class OrchestratorAggregator:
             f"stages=[{stages}]{transfers_fragment}"
         )
 
+    def build_timing_composition(self, summary: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "step": "input_preprocess",
+                "time_ms": summary["input_preprocess_time_ms"],
+                "scope": "InputProcessor.process_inputs",
+            },
+            {
+                "step": "engine_pipeline",
+                "time_ms": summary["engine_pipeline_time_ms"],
+                "scope": "stage pipeline",
+            },
+            {
+                "step": "request_wall",
+                "time_ms": summary["request_wall_time_ms"],
+                "scope": "input_preprocess + engine_pipeline",
+            },
+            {
+                "step": "request_message_build",
+                "time_ms": summary["build_add_request_message_time_ms"],
+                "scope": "full _build_add_request_message",
+            },
+        ]
+
     def _get_or_create_transfer_event(
         self,
         from_stage: int,
@@ -557,6 +581,15 @@ class OrchestratorAggregator:
             logger.info(
                 "\n%s",
                 _format_table("Overall Summary", overall_summary, overall_fields),
+            )
+            logger.info(
+                "\n%s",
+                _format_table(
+                    "Omni Timing Composition",
+                    self.build_timing_composition(overall_summary),
+                    value_fields=["time_ms", "scope"],
+                    column_key="step",
+                ),
             )
 
         all_request_ids = sorted(set(self.stage_events.keys()) | {e.request_id for e in self.e2e_events})
