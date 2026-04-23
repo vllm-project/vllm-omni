@@ -5,10 +5,10 @@ from __future__ import annotations
 import importlib
 
 _CLASS_TO_MODULE: dict[str, str] = {
-    "OmniMistralConfigParser": "vllm_omni.transformers_utils.parsers.voxtral_tts",
+    "VoxtralTTSConfigParser": "vllm_omni.transformers_utils.parsers.voxtral_tts",
 }
 
-__all__ = ["OmniMistralConfigParser"]
+__all__ = ["VoxtralTTSConfigParser"]
 
 
 def __getattr__(name: str):

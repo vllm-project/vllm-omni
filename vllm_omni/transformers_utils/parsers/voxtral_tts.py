@@ -73,7 +73,7 @@ def _parse_voxtral_tts(config_dict: dict) -> tuple[dict, PretrainedConfig]:
     return config_dict, config
 
 
-class OmniMistralConfigParser(MistralConfigParser):
+class VoxtralTTSConfigParser(MistralConfigParser):
     """Mistral parser that also recognizes Voxtral-TTS checkpoints."""
 
     def parse(
@@ -101,6 +101,6 @@ class OmniMistralConfigParser(MistralConfigParser):
 # Replace the default "mistral" slot directly.
 # Any non-Voxtral-TTS Mistral ckpt still goes through
 # the upstream code path via super().parse().
-_CONFIG_FORMAT_TO_CONFIG_PARSER["mistral"] = OmniMistralConfigParser
+_CONFIG_FORMAT_TO_CONFIG_PARSER["mistral"] = VoxtralTTSConfigParser
 
-__all__ = ["OmniMistralConfigParser"]
+__all__ = ["VoxtralTTSConfigParser"]
