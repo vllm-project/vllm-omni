@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import time
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -95,7 +96,7 @@ class OmniOpenAIServingVideo:
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
 
-        gen_params = OmniDiffusionSamplingParams()
+        gen_params = self._resolve_default_sampling_params()
 
         input_image = None if reference_image is None else reference_image.data
         vp = request.resolve_video_params()
@@ -113,22 +114,27 @@ class OmniOpenAIServingVideo:
         if vp.fps is not None:
             gen_params.fps = vp.fps
             gen_params.frame_rate = float(vp.fps)
-        gen_params.enable_frame_interpolation = request.enable_frame_interpolation
-        gen_params.frame_interpolation_exp = request.frame_interpolation_exp
-        gen_params.frame_interpolation_scale = request.frame_interpolation_scale
-        gen_params.frame_interpolation_model_path = request.frame_interpolation_model_path
+        provided_fields = request.model_fields_set
+        if "enable_frame_interpolation" in provided_fields:
+            gen_params.enable_frame_interpolation = request.enable_frame_interpolation
+        if "frame_interpolation_exp" in provided_fields:
+            gen_params.frame_interpolation_exp = request.frame_interpolation_exp
+        if "frame_interpolation_scale" in provided_fields:
+            gen_params.frame_interpolation_scale = request.frame_interpolation_scale
+        if "frame_interpolation_model_path" in provided_fields:
+            gen_params.frame_interpolation_model_path = request.frame_interpolation_model_path
 
-        if request.num_inference_steps is not None:
+        if "num_inference_steps" in provided_fields and request.num_inference_steps is not None:
             gen_params.num_inference_steps = request.num_inference_steps
-        if request.guidance_scale is not None:
+        if "guidance_scale" in provided_fields and request.guidance_scale is not None:
             gen_params.guidance_scale = request.guidance_scale
-        if request.guidance_scale_2 is not None:
+        if "guidance_scale_2" in provided_fields and request.guidance_scale_2 is not None:
             gen_params.guidance_scale_2 = request.guidance_scale_2
-        if request.true_cfg_scale is not None:
+        if "true_cfg_scale" in provided_fields and request.true_cfg_scale is not None:
             gen_params.true_cfg_scale = request.true_cfg_scale
-        if request.seed is not None:
+        if "seed" in provided_fields and request.seed is not None:
             gen_params.seed = request.seed
-        if request.boundary_ratio is not None:
+        if "boundary_ratio" in provided_fields and request.boundary_ratio is not None:
             gen_params.boundary_ratio = request.boundary_ratio
 
         logger.info(
@@ -136,7 +142,7 @@ class OmniOpenAIServingVideo:
             request.boundary_ratio,
             gen_params.boundary_ratio,
         )
-        if request.flow_shift is not None:
+        if "flow_shift" in provided_fields and request.flow_shift is not None:
             gen_params.extra_args["flow_shift"] = request.flow_shift
 
         # Apply model-specific extra parameters
@@ -262,6 +268,17 @@ class OmniOpenAIServingVideo:
                 if multiplier is not None:
                     return int(multiplier)
         return 1
+
+    def _resolve_default_sampling_params(self) -> OmniDiffusionSamplingParams:
+        default_sampling_params_list = getattr(self._engine_client, "default_sampling_params_list", None)
+        if default_sampling_params_list:
+            for params in default_sampling_params_list:
+                if isinstance(params, OmniDiffusionSamplingParams):
+                    # Requests mutate sampling params in-place, including
+                    # nested dict fields like extra_args. Deep-copy the stage
+                    # defaults so one request cannot leak state into another.
+                    return copy.deepcopy(params)
+        return OmniDiffusionSamplingParams()
 
     @staticmethod
     def _apply_lora(lora_body: Any, gen_params: OmniDiffusionSamplingParams) -> None:
