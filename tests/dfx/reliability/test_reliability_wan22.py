@@ -125,7 +125,7 @@ def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server_funct
     [
         pytest.param(
             make_process_kill_fault_injector(
-                grep_patterns="vllm_omni.entrypoints.cli.main",
+                grep_patterns="multiprocessing.spawn",
                 signal_name="SIGKILL",
                 limit=1,
                 post_kill_wait_seconds=2.0,
@@ -171,7 +171,7 @@ def test_reliability_fault_process_kill_video_request_failure(
     [
         pytest.param(
             make_process_kill_fault_injector(
-                grep_patterns="vllm_omni.entrypoints.cli.main",
+                grep_patterns="multiprocessing.spawn",
                 signal_name="SIGKILL",
                 limit=1,
                 post_kill_wait_seconds=2.0,
