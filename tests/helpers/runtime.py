@@ -122,7 +122,7 @@ class OmniServerParams(NamedTuple):
     stage_init_timeout: int | None = None  # None: fixture supplies default (600 s)
 
 
-def run_omni_server_fixture(
+def run_omni_server(
     request: Any,
     run_level: str,
     model_prefix: str,

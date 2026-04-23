@@ -26,9 +26,9 @@ def omni_server_function(
     run_level: str,
     model_prefix: str,
 ) -> Generator[OmniServer, Any, None]:
-    from tests.helpers.runtime import run_omni_server_fixture
+    from tests.helpers.runtime import run_omni_server
 
-    yield from run_omni_server_fixture(request, run_level, model_prefix, omni_fixture_lock)
+    yield from run_omni_server(request, run_level, model_prefix, omni_fixture_lock)
 
 
 @pytest.fixture(scope="module")
@@ -39,9 +39,9 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
     The ``use_stage_cli`` flag on ``OmniServerParams`` routes the setup through the
     stage-CLI harness while still reusing the same fixture grouping semantics.
     """
-    from tests.helpers.runtime import run_omni_server_fixture
+    from tests.helpers.runtime import run_omni_server
 
-    yield from run_omni_server_fixture(request, run_level, model_prefix, omni_fixture_lock)
+    yield from run_omni_server(request, run_level, model_prefix, omni_fixture_lock)
 
 
 @pytest.fixture
