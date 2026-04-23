@@ -186,7 +186,10 @@ def test_reliability_fault_process_kill_video_health_fast_fail_and_concurrent(
     omni_server_after_fault_function,
     openai_client_function,
 ) -> None:
-    """Black-box: after runtime process kill, /health→503, new /v1/videos fails fast, concurrent requests don't hang."""
+    """Black-box: after process kill, /v1/videos fails fast and concurrent calls don't hang.
+
+    /health→503 is checked last; if it never appears, ``pytest.skip`` (``[process_kill health]``).
+    """
     host = omni_server_after_fault_function.host
     port = omni_server_after_fault_function.port
     url = f"http://{host}:{port}/v1/videos"
@@ -207,30 +210,7 @@ def test_reliability_fault_process_kill_video_health_fast_fail_and_concurrent(
         "stream": False,
     }
 
-    # Phase-1: require /health→503 after kill; stacks that never surface 503 are skipped
-    # for later phases (filtered in CI via skip reason prefix).
-    deadline = time.monotonic() + 20.0
-    last_observation = ""
-    saw_503 = False
-    health_final_status: int | None = None
-    health_final_body = b""
-    while time.monotonic() < deadline:
-        try:
-            status, body = get_health_raw(host, port, timeout_sec=5)
-            last_observation = f"http={status}, body={body[:200]!r}"
-            health_final_status, health_final_body = status, body
-            if status == 503:
-                saw_503 = True
-                break
-        except Exception as exc:  # noqa: BLE001
-            last_observation = f"exception={exc!r}"
-        time.sleep(0.5)
-    if not saw_503:
-        pytest.skip(
-            f"[process_kill health] /health did not reach 503 within deadline; last_observation={last_observation}"
-        )
-
-    # Phase-2: one new /v1/videos request should fail fast.
+    # Phase-1: one new /v1/videos request should fail fast.
     payload = {
         "prompt": "fast-fail check",
         "width": "512",
@@ -257,7 +237,7 @@ def test_reliability_fault_process_kill_video_health_fast_fail_and_concurrent(
         elapsed = time.monotonic() - start
         assert elapsed < 15, f"[process_kill fast_fail] /v1/videos exception was too slow after fault: {elapsed:.2f}s"
 
-    # Phase-3: concurrent requests should converge and at least one should fail.
+    # Phase-2: concurrent requests should converge and at least one should fail.
     start = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
         futures = [
@@ -283,8 +263,30 @@ def test_reliability_fault_process_kill_video_health_fast_fail_and_concurrent(
             fault_observed = True
             conc_debug.append(repr(exc))
             assert_fault_exception(exc, PROCESS_KILL_ERROR_KEYWORDS)
-    print(health_final_status, health_final_body[:200], conc_debug)
-    assert fault_observed, "[process_kill concurrent] expected at least one /v1/videos request to fail after fault"
+    assert fault_observed, (
+        "[process_kill concurrent] expected at least one /v1/videos request to fail after fault; "
+        f"conc_debug={conc_debug}"
+    )
+
+    # Phase-3: /health→503 after fault; skip only this checkpoint (grep ``[process_kill health]``).
+    deadline = time.monotonic() + 20.0
+    last_observation = ""
+    saw_503 = False
+    while time.monotonic() < deadline:
+        try:
+            status, body = get_health_raw(host, port, timeout_sec=5)
+            last_observation = f"http={status}, body={body[:200]!r}"
+            if status == 503:
+                saw_503 = True
+                break
+        except Exception as exc:  # noqa: BLE001
+            last_observation = f"exception={exc!r}"
+        time.sleep(0.5)
+    if not saw_503:
+        pytest.skip(
+            "[process_kill health] /health did not reach 503 within deadline; "
+            f"request-path phases passed; last_observation={last_observation}"
+        )
 
 
 @pytest.mark.slow
