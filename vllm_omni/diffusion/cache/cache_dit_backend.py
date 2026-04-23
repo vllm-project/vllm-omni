@@ -1337,6 +1337,8 @@ CUSTOM_DIT_ENABLERS.update(
         "LTX2ImageToVideoPipeline": enable_cache_for_ltx2,
         "LTX2TwoStagesPipeline": enable_cache_for_ltx2,
         "LTX2ImageToVideoTwoStagesPipeline": enable_cache_for_ltx2,
+        "LTX23Pipeline": enable_cache_for_ltx2,
+        "LTX23ImageToVideoPipeline": enable_cache_for_ltx2,
         "BagelPipeline": enable_cache_for_bagel,
         "GlmImagePipeline": enable_cache_for_glm_image,
         "Flux2Pipeline": enable_cache_for_flux2,

@@ -36,6 +36,8 @@ th {
 | `LTX2ImageToVideoPipeline` | LTX-2-I2V | `Lightricks/LTX-2` | ✅︎ | ✅︎ | | |
 | `LTX2TwoStagesPipeline` | LTX-2-T2V | `rootonchair/LTX-2-19b-distilled` | ✅︎ | ✅︎ | | |
 | `LTX2ImageToVideoTwoStagesPipeline` | LTX-2-I2V | `rootonchair/LTX-2-19b-distilled` | ✅︎ | ✅︎ | | |
+| `LTX23Pipeline` | LTX-2.3-T2V | `dg845/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | |
+| `LTX23ImageToVideoPipeline` | LTX-2.3-I2V | `dg845/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | |
 | `HeliosPipeline`, `HeliosPyramidPipeline` | Helios | `BestWishYsh/Helios-Base`, `BestWishYsh/Helios-Mid`, `BestWishYsh/Helios-Distilled` | ✅︎ | ✅︎ | ✅︎ | |
 | `MagiHumanPipeline` | MagiHuman | `SII-GAIR/daVinci-MagiHuman-Base-1080p` | ✅︎ | ✅︎ | | |
 | `OvisImagePipeline` | Ovis-Image | `OvisAI/Ovis-Image` | ✅︎ | ✅︎ | | ✅︎ |
