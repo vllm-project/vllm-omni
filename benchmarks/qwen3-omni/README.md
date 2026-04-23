@@ -16,7 +16,7 @@ tar -xf seedtts_testset.tar
 
 # Copy metadata and extract top-100 prompts
 cp seedtts_testset/en/meta.lst meta.lst
-python extract_prompts.py -i meta.lst -o top100.txt -n 100
+python extract_tts_prompts.py -i meta.lst -o top100.txt -n 100
 
 # (Optional) clean up to save space
 rm -rf seedtts_testset seedtts_testset.tar meta.lst
