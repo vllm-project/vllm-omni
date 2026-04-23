@@ -188,7 +188,7 @@ def test_reliability_fault_process_kill_video_health_fast_fail_and_concurrent(
 ) -> None:
     """Black-box: after process kill, /v1/videos fails fast and concurrent calls don't hang.
 
-    /health→503 is checked last; if it never appears, ``pytest.skip`` (``[process_kill health]``).
+    /health→503 is checked last: optional ``pytest.skip`` then ``assert`` (drop the ``if`` to harden).
     """
     host = omni_server_after_fault_function.host
     port = omni_server_after_fault_function.port
@@ -268,25 +268,26 @@ def test_reliability_fault_process_kill_video_health_fast_fail_and_concurrent(
         f"conc_debug={conc_debug}"
     )
 
-    # Phase-3: /health→503 after fault; skip only this checkpoint (grep ``[process_kill health]``).
+    # Phase-3: /health→503 after fault. Optional skip today; remove the ``if`` later to harden.
     deadline = time.monotonic() + 20.0
     last_observation = ""
-    saw_503 = False
+    final_health_status: int | None = None
     while time.monotonic() < deadline:
         try:
             status, body = get_health_raw(host, port, timeout_sec=5)
             last_observation = f"http={status}, body={body[:200]!r}"
+            final_health_status = status
             if status == 503:
-                saw_503 = True
                 break
         except Exception as exc:  # noqa: BLE001
             last_observation = f"exception={exc!r}"
         time.sleep(0.5)
-    if not saw_503:
-        pytest.skip(
-            "[process_kill health] /health did not reach 503 within deadline; "
-            f"request-path phases passed; last_observation={last_observation}"
-        )
+    if final_health_status != 503:
+        pytest.skip("issue#3050")
+    assert final_health_status == 503, (
+        "[process_kill health] expected /health 503 after fatal fault, "
+        f"got status={final_health_status}, last_observation={last_observation}"
+    )
 
 
 @pytest.mark.slow
