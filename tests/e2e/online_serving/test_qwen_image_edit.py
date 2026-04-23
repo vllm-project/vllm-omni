@@ -84,7 +84,6 @@ def test_single_image_to_image_001(omni_server: OmniServer, openai_client: OpenA
 
 
 @pytest.mark.advanced_model
-@pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
