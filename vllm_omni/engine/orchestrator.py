@@ -571,14 +571,11 @@ class Orchestrator:
         decode_kv_params.update(kv_prefill_params)
 
         missing = [
-            key
-            for key in ("transfer_id", "remote_bootstrap_addr", "remote_engine_id")
-            if not decode_kv_params.get(key)
+            key for key in ("transfer_id", "remote_bootstrap_addr", "remote_engine_id") if not decode_kv_params.get(key)
         ]
         if missing:
             raise RuntimeError(
-                "[Orchestrator][PD] Missing decode kv_transfer_params fields for "
-                f"req={req_id}: {', '.join(missing)}"
+                f"[Orchestrator][PD] Missing decode kv_transfer_params fields for req={req_id}: {', '.join(missing)}"
             )
 
         # Ensure these flags are set correctly after any overlay.

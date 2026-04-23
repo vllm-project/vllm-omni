@@ -863,7 +863,7 @@ class TestDeployConfigLoading:
             "  stages:\n"
             "    - role: prefill\n"
             "      max_num_seqs: 16\n"
-            "      devices: \"0\"\n"
+            '      devices: "0"\n'
             "      engine_extras:\n"
             "        kv_transfer_config:\n"
             "          kv_connector: MooncakeConnector\n"
@@ -872,7 +872,7 @@ class TestDeployConfigLoading:
             "          kv_parallel_size: 2\n"
             "    - role: decode\n"
             "      max_num_seqs: 64\n"
-            "      devices: \"1\"\n"
+            '      devices: "1"\n'
             "      engine_extras:\n"
             "        kv_transfer_config:\n"
             "          kv_connector: MooncakeConnector\n"

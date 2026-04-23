@@ -595,11 +595,7 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     # top of the base without restating every nested field.
     merged = {
         **base_dict,
-        **{
-            k: v
-            for k, v in raw_dict.items()
-            if k not in ("stages", "platforms", "pd_disaggregation", "pd_separation")
-        },
+        **{k: v for k, v in raw_dict.items() if k not in ("stages", "platforms", "pd_disaggregation", "pd_separation")},
     }
     merged["stages"] = _merge_stage_lists(base_dict.get("stages"), raw_dict.get("stages"))
     merged_platforms = _merge_platforms(base_dict.get("platforms"), raw_dict.get("platforms"))
@@ -821,10 +817,7 @@ def _apply_pd_disaggregation(
     target_stage_id = int(pd_cfg.get("target_stage_id", 0))
     target_stage = pipeline.get_stage(target_stage_id)
     if target_stage is None:
-        raise ValueError(
-            f"PD disaggregation target stage {target_stage_id} "
-            f"not found in pipeline {pipeline.model_type!r}"
-        )
+        raise ValueError(f"PD disaggregation target stage {target_stage_id} not found in pipeline {pipeline.model_type!r}")
     if target_stage.execution_type != StageExecutionType.LLM_AR:
         raise ValueError(
             f"PD disaggregation only supports LLM_AR stages; stage {target_stage_id} "
