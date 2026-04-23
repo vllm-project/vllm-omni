@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -38,6 +38,7 @@ from tests.helpers.media import (
     decode_b64_image,
 )
 from vllm_omni.config.stage_config import resolve_deploy_yaml
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -1297,6 +1298,19 @@ class OmniRunnerHandler:
             print(f"Error: {result.error_message}")
         return result
 
+    def _process_diffusion_output(self, outputs: list[OmniRequestOutput]) -> DiffusionResponse:
+        result = DiffusionResponse()
+        output = outputs[0]
+        if isinstance(output.images[0], list):
+            # Returning frames of images as a video
+            result.videos = output.images
+        else:
+            # Returning actual images
+            result.images = output.images
+        # [TODO] Add audio processing when tests are introduced
+        result.success = True
+        return result
+
     def send_omni_request(self, request_config: dict[str, Any] | None = None) -> OmniResponse:
         if request_config is None:
             request_config = {}
@@ -1310,6 +1324,60 @@ class OmniRunnerHandler:
         )
         response = self._process_omni_output(outputs)
         assert_omni_response(response, request_config, run_level="core_model")
+        return response
+
+    def send_diffusion_request(self, request_config: dict[str, Any]) -> DiffusionResponse:
+        prompt = request_config.get("prompt")
+        if prompt is None:
+            prompts = request_config.get("prompts")
+            if not prompts:
+                raise ValueError("request_config must contain a prompt")
+            if len(prompts) > 1:
+                raise ValueError(
+                    "In the current internal data structure, "
+                    "only one prompt is supported for diffusion requests. "
+                    "Because one prompt can contain multiple images or videos, "
+                    "the current internal data structure is ambiguous when multiple prompts are provided."
+                )
+            prompt = prompts[0]
+
+        # Sync previous `extra_body` field with sampling params object
+        sampling_params: OmniDiffusionSamplingParams | None = request_config.get("sampling_params")
+        if sampling_params is None:
+            extra_body = request_config.get("extra_body", {})
+            if extra_body:
+                sampling_params = OmniDiffusionSamplingParams(**extra_body)
+        else:
+            extra_body = asdict(sampling_params)
+            request_config["extra_body"] = extra_body
+        negative_prompt = extra_body.get("negative_prompt") or request_config.get("negative_prompt")
+
+        videos = request_config.get("videos")
+        images = request_config.get("images")
+        audios = request_config.get("audios")
+        modalities = request_config.get("modalities")  # only used by limited models. Do not add default value here
+
+        prompt_object = OmniTextPrompt(prompt=prompt)
+        if negative_prompt:
+            prompt_object["negative_prompt"] = negative_prompt
+        if videos is not None or images is not None or audios is not None:
+            prompt_object["multi_modal_data"] = {}
+            if videos is not None:
+                prompt_object["multi_modal_data"]["video"] = videos
+            if images is not None:
+                prompt_object["multi_modal_data"]["image"] = images
+            if audios is not None:
+                prompt_object["multi_modal_data"]["audio"] = audios
+        if modalities:
+            prompt_object["modalities"] = modalities  # pyright: ignore[reportGeneralTypeIssues]
+
+        start_time = time.perf_counter()
+        response = self.runner.generate([prompt_object], [sampling_params] if sampling_params else None)
+        end_time = time.perf_counter()
+
+        response = self._process_diffusion_output(response)
+        response.e2e_latency = end_time - start_time
+        assert_diffusion_response(response, request_config, run_level="core_model")
         return response
 
     def send_audio_speech_request(self, request_config: dict[str, Any]) -> OmniResponse:
