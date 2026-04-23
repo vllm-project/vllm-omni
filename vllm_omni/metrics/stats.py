@@ -570,12 +570,19 @@ class OrchestratorAggregator:
         for idx, wall_time in enumerate(stage_wall_time_ms):
             overall_summary[f"e2e_stage_{idx}_wall_time_ms"] = wall_time
 
+        timing_summary_fields = {
+            "request_wall_time_ms",
+            "input_preprocess_time_ms",
+            "build_add_request_message_time_ms",
+            "engine_pipeline_time_ms",
+        }
+
         # Print overall summary
         # filter out all-zero fields for logging
         overall_fields = []
         for k in OVERALL_FIELDS or list(overall_summary.keys()):
             v = overall_summary.get(k, None)
-            if v not in (0, 0.0, 0.000, None, ""):
+            if k in timing_summary_fields or v not in (0, 0.0, 0.000, None, ""):
                 overall_fields.append(k)
         if overall_fields:
             logger.info(
