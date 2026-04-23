@@ -92,7 +92,9 @@ python end2end.py --modality text2img \
 
 ### Additional Config
 
-You can pass diffusion worker `additional_config` from the offline example as a JSON object:
+You can pass diffusion worker `additional_config` from the offline example as a JSON object.
+This maps to the upstream vLLM `VllmConfig.additional_config` platform extension field:
+https://docs.vllm.ai/en/stable/api/vllm/config/#vllm.config.VllmConfig.additional_config
 
 ```bash
 python end2end.py --modality text2img \
