@@ -460,10 +460,48 @@ SHARED_FIELDS: frozenset[str] = frozenset(
     }
 )
 
+_DEPLOY_ENGINE_ARG_OVERRIDE_FIELDS: frozenset[str] = frozenset(
+    {
+        # Capacity / scheduling.
+        "async_scheduling",
+        "max_model_len",
+        "max_num_batched_tokens",
+        "max_num_seqs",
+        # Memory / parallelism.
+        "data_parallel_size",
+        "gpu_memory_utilization",
+        "pipeline_parallel_size",
+        "tensor_parallel_size",
+        # Execution / loading.
+        "enforce_eager",
+        "distributed_executor_backend",
+        "dtype",
+        "quantization",
+        "trust_remote_code",
+        # Caching / chunking.
+        "async_chunk",
+        "enable_prefix_caching",
+        "enable_chunked_prefill",
+        # Model-specific engine extras.
+        "subtalker_sampling_params",
+    }
+)
+
+_DEPLOY_RUNTIME_OVERRIDE_FIELDS: frozenset[str] = frozenset(
+    {
+        "devices",
+    }
+)
+
 
 def orchestrator_field_names() -> frozenset[str]:
     """Return the names of every field on OrchestratorArgs."""
     return frozenset(f.name for f in fields(OrchestratorArgs))
+
+
+def deploy_override_field_names() -> frozenset[str]:
+    """Return kwargs whose parser defaults must not override deploy YAML."""
+    return _DEPLOY_ENGINE_ARG_OVERRIDE_FIELDS | _DEPLOY_RUNTIME_OVERRIDE_FIELDS
 
 
 def internal_blacklist_keys() -> frozenset[str]:
@@ -617,15 +655,14 @@ def orchestrator_args_from_argparse(args: Any) -> OrchestratorArgs:
 
 def nullify_stage_engine_defaults(parser: argparse.ArgumentParser) -> None:
     """Reset stage-level engine flag defaults to ``None``; preserve real
-    default in help text. Server- and orchestrator-only flags are exempt.
+    default in help text. Only deploy-YAML override fields are touched.
     Idempotent."""
-    server_dests = derive_server_dests_from_vllm_parser()
-    orch_only = orchestrator_field_names() - SHARED_FIELDS
+    override_dests = deploy_override_field_names()
 
     for action in parser._actions:
         if action.dest in ("help", "version") or not action.option_strings:
             continue
-        if action.dest in server_dests or action.dest in orch_only:
+        if action.dest not in override_dests:
             continue
         if action.default is None or action.default is argparse.SUPPRESS:
             continue

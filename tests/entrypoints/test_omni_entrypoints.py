@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import queue
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -164,6 +165,31 @@ class FakeAsyncOmniEngine:
 def _patch_engine(monkeypatch: pytest.MonkeyPatch, engine: FakeAsyncOmniEngine) -> None:
     monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", lambda *args, **kwargs: engine)
     monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
+
+
+def test_from_cli_args_only_nulls_untyped_override_fields(monkeypatch: pytest.MonkeyPatch):
+    from vllm_omni.entrypoints.omni import Omni
+
+    captured: dict[str, Any] = {}
+
+    def fake_engine(*args: Any, **kwargs: Any) -> FakeAsyncOmniEngine:
+        captured.update(kwargs)
+        return FakeAsyncOmniEngine()
+
+    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", fake_engine)
+    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
+    monkeypatch.setattr("sys.argv", ["prog"])
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--hsdp-shard-size", type=int, default=-1)
+    args = parser.parse_args([])
+    args.model = "fake-model"
+
+    Omni.from_cli_args(args, parser=parser)
+
+    assert captured["gpu_memory_utilization"] is None
+    assert captured["hsdp_shard_size"] == -1
 
 
 def _make_base():

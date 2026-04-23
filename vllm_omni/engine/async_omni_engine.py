@@ -279,13 +279,16 @@ class AsyncOmniEngine:
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
-        # Merge typed engine_args fields into kwargs; explicit kwargs take priority.
+        # Merge tracked engine_args fields into kwargs; explicit kwargs take priority.
         if engine_args is not None:
-            ea_dict = {
-                f.name: getattr(engine_args, f.name)
-                for f in dataclasses.fields(engine_args)
-                if not f.name.startswith("_")
-            }
+            if not hasattr(engine_args, "_explicit_fields"):
+                raise TypeError(
+                    "engine_args=OmniEngineArgs(...) is ambiguous under "
+                    "sentinel-default precedence. Use "
+                    "OmniEngineArgs.create(**explicit) or pass explicit kwargs "
+                    "directly."
+                )
+            ea_dict = engine_args.explicit_kwargs()
             # Remove model since it is passed as a positional arg already.
             ea_dict.pop("model", None)
             kwargs = {**ea_dict, **kwargs}

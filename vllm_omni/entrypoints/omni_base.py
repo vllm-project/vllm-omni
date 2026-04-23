@@ -102,18 +102,14 @@ class OmniBase(PDDisaggregationMixin):
 
         if parser is not None and not getattr(parser, "_omni_nullified", False):
             from vllm_omni.engine.arg_utils import (
-                derive_server_dests_from_vllm_parser,
-                orchestrator_field_names,
+                deploy_override_field_names,
             )
             from vllm_omni.entrypoints.utils import detect_explicit_cli_keys
 
-            keep = (
-                (detect_explicit_cli_keys(sys.argv[1:], parser) or set())
-                | derive_server_dests_from_vllm_parser()
-                | orchestrator_field_names()
-            )
+            explicit = detect_explicit_cli_keys(sys.argv[1:], parser) or set()
+            override_dests = deploy_override_field_names()
             for key in list(kwargs):
-                if key not in keep:
+                if key in override_dests and key not in explicit:
                     kwargs[key] = None
 
         kwargs.update(overrides)
@@ -125,19 +121,6 @@ class OmniBase(PDDisaggregationMixin):
         **kwargs: Any,
     ) -> None:
         engine_args: OmniEngineArgs | None = kwargs.pop("engine_args", None)
-
-        if engine_args is not None:
-            for key, value in engine_args.explicit_kwargs().items():
-                kwargs.setdefault(key, value)
-            if not hasattr(engine_args, "_explicit_fields"):
-                import warnings as _warnings
-
-                _warnings.warn(
-                    "Bare OmniEngineArgs(...) cannot distinguish caller-set from "
-                    "dataclass defaults. Use OmniEngineArgs.create(**explicit).",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
 
         stage_init_timeout = kwargs.pop("stage_init_timeout", 300)
         init_timeout = kwargs.pop("init_timeout", 600)

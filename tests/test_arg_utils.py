@@ -370,49 +370,40 @@ def test_nullify_stage_engine_defaults_resets_inherited_defaults():
     import argparse
 
     from vllm_omni.engine.arg_utils import (
-        derive_server_dests_from_vllm_parser,
+        deploy_override_field_names,
         nullify_stage_engine_defaults,
     )
 
     parser = _build_full_serve_parser()
     nullify_stage_engine_defaults(parser)
 
-    server_dests = derive_server_dests_from_vllm_parser()
-    engine_dests = {f.name for f in fields(_FakeEngineArgs)}
+    override_dests = deploy_override_field_names()
     offenders = [
         (a.dest, a.default)
         for a in parser._actions
         if a.dest not in ("help", "version")
         and a.option_strings
-        and a.dest not in server_dests
-        and a.dest in engine_dests
+        and a.dest in override_dests
         and a.default is not None
         and a.default is not argparse.SUPPRESS
     ]
     assert not offenders, f"Stage flags with non-None defaults after nullify: {offenders}"
 
 
-def test_server_flags_keep_real_defaults_after_nullify():
+def test_non_override_flags_keep_real_defaults_after_nullify():
     import argparse
 
-    from vllm_omni.engine.arg_utils import (
-        derive_server_dests_from_vllm_parser,
-        nullify_stage_engine_defaults,
-    )
+    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
-    parser = _build_full_serve_parser()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hsdp-shard-size", type=int, default=-1, help="HSDP shard size.")
+    parser.add_argument("--max-num-seqs", type=int, default=64, help="Max num seqs.")
     nullify_stage_engine_defaults(parser)
 
-    server_dests = derive_server_dests_from_vllm_parser()
-    if not server_dests:
-        pytest.skip("server dest derivation returned empty set")
-
-    kept = [
-        a
-        for a in parser._actions
-        if a.dest in server_dests and a.default is not None and a.default is not argparse.SUPPRESS
-    ]
-    assert kept, "Server flags lost their defaults — nullify over-reach"
+    hsdp = next(a for a in parser._actions if a.dest == "hsdp_shard_size")
+    max_num_seqs = next(a for a in parser._actions if a.dest == "max_num_seqs")
+    assert hsdp.default == -1
+    assert max_num_seqs.default is None
 
 
 def test_help_text_preserves_default_after_nullify():
@@ -422,10 +413,10 @@ def test_help_text_preserves_default_after_nullify():
     from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--example-flag", type=int, default=42, help="Example knob.")
+    parser.add_argument("--max-num-seqs", type=int, default=42, help="Example knob.")
     nullify_stage_engine_defaults(parser)
 
-    action = next(a for a in parser._actions if a.dest == "example_flag")
+    action = next(a for a in parser._actions if a.dest == "max_num_seqs")
     assert action.default is None
     assert "(default: 42)" in action.help
 
