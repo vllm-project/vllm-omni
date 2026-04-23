@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-End-to-end test for BAGEL LoRA support (Stage 1 / DiT).
+Expanded end-to-end test for BAGEL in offline mode.
+
+This test file primarily covers end-to-end tests for LoRA support (Stage 1 / DiT).
 
 Validates that LoRA adapters are correctly loaded, applied with controllable
 scale, and cleanly deactivated.  Uses a synthetic rank-1 adapter targeting the
@@ -147,12 +149,11 @@ def _make_file_lora_request(adapter_dir: Path) -> LoRARequest:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_bagel_lora_scale_and_deactivation(run_level, tmp_path):
-    """Validate LoRA effect, bounded perturbation, and clean deactivation."""
+    """Validate LoRA effect, bounded perturbation, and clean deactivation with BAGEL model."""
     config_path = _resolve_stage_config(BAGEL_STAGE_CONFIG, run_level)
     with OmniRunner(MODEL, stage_configs_path=config_path) as runner:
         omni = runner.omni
