@@ -18,6 +18,8 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
+pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 
 # Official CosyVoice zero-shot prompt audio and its transcript
@@ -61,8 +63,6 @@ tts_async_chunk_server_params = [
 ]
 
 
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_voice_clone_zh_001(omni_server, openai_client) -> None:
@@ -85,8 +85,6 @@ def test_voice_clone_zh_001(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config)
 
 
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_async_chunk_server_params, indirect=True)
 def test_voice_clone_zh_002(omni_server, openai_client) -> None:
@@ -109,8 +107,6 @@ def test_voice_clone_zh_002(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config)
 
 
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_voice_clone_en_001(omni_server, openai_client) -> None:

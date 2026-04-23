@@ -6,8 +6,6 @@ import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
-from pathlib import Path
-
 import pytest
 
 from tests.helpers.mark import hardware_test
@@ -16,7 +14,9 @@ from tests.helpers.media import (
     generate_synthetic_image,
     generate_synthetic_video,
 )
-from tests.helpers.stage_config import modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+
+pytestmark = [pytest.mark.core_model, pytest.mark.omni]
 
 models = ["Jonathan1909/Ming-flash-omni-2.0"]
 
@@ -37,7 +37,7 @@ def build_prompt(user_text: str) -> str:
 
 def get_eager_config():
     path = modify_stage_config(
-        str(Path(__file__).parent.parent / "stage_configs" / "bailingmm_moe_v2_lite_ci.yaml"),
+        get_deploy_config_path("bailingmm_moe_v2_lite_ci.yaml"),
         updates={
             "stage_args": {
                 0: {
@@ -53,8 +53,6 @@ stage_configs = [get_eager_config()]
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
 
 
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_text_to_text(omni_runner, omni_runner_handler) -> None:
@@ -69,8 +67,6 @@ def test_text_to_text(omni_runner, omni_runner_handler) -> None:
     omni_runner_handler.send_omni_request(request_config)
 
 
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_image_to_text(omni_runner, omni_runner_handler) -> None:
@@ -86,8 +82,6 @@ def test_image_to_text(omni_runner, omni_runner_handler) -> None:
     omni_runner_handler.send_omni_request(request_config)
 
 
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_audio_to_text(omni_runner, omni_runner_handler) -> None:
@@ -105,8 +99,6 @@ def test_audio_to_text(omni_runner, omni_runner_handler) -> None:
     omni_runner_handler.send_omni_request(request_config)
 
 
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_video_to_text(omni_runner, omni_runner_handler) -> None:
@@ -122,8 +114,6 @@ def test_video_to_text(omni_runner, omni_runner_handler) -> None:
     omni_runner_handler.send_omni_request(request_config)
 
 
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_mixed_to_text(omni_runner, omni_runner_handler) -> None:

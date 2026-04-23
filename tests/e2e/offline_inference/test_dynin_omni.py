@@ -4,7 +4,7 @@
 E2E offline smoke tests for Dynin-Omni.
 
 - model: "snu-aidas/Dynin-Omni"
-- stage config: tests/e2e/stage_configs/dynin_omni_ci.yaml
+- stage config: vllm_omni/deploy/dynin_omni_ci.yaml
 """
 
 from __future__ import annotations
@@ -19,13 +19,14 @@ import torch
 from transformers import AutoTokenizer
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_DYNIN_CONFIG_PATH: Path | None = None
-_DEFAULT_STAGE_CONFIG_PATH = _REPO_ROOT / "tests" / "e2e" / "stage_configs" / "dynin_omni_ci.yaml"
+_DEFAULT_STAGE_CONFIG_PATH = Path(get_deploy_config_path("dynin_omni_ci.yaml"))
 
 models = ["snu-aidas/Dynin-Omni"]
 stage_configs = [str(_DEFAULT_STAGE_CONFIG_PATH)]

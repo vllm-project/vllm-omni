@@ -25,6 +25,7 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 models = ["Tongyi-MAI/Z-Image-Turbo"]
 
 
+@pytest.mark.advanced_model
 @pytest.mark.parametrize("model_name", models)
 def test_diffusion_model(model_name: str, tmp_path: Path):
     def _extract_images(outputs: list[OmniRequestOutput]):

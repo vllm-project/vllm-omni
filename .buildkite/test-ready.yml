@@ -139,6 +139,22 @@ steps:
               volumes:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
+      - label: "Diffusion · Model Test"
+        commands:
+          - timeout 15m pytest -sv tests/diffusion/models/ -m 'core_model and cuda' --run-level "core_model"
+        agents:
+          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
       - label: "Diffusion · Other Test"
         commands:
           - timeout 15m pytest -sv tests/diffusion/*.py -m 'core_model and cuda' --run-level "core_model"
@@ -162,6 +178,50 @@ steps:
       - |
         timeout 15m bash -c '
                   pytest -sv tests/engine/ tests/model_executor/ -m 'core_model and cuda' --run-level "core_model"
+        '
+    agents:
+      queue: "gpu_1_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          shm-size: "8gb"
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+
+  - label: "Distributed Test"
+    depends_on: upload-ready-pipeline
+    commands:
+      - |
+        timeout 15m bash -c '
+                  pytest -sv tests/distributed/ -m 'core_model and cuda' --run-level "core_model"
+        '
+    agents:
+      queue: "gpu_1_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          shm-size: "8gb"
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
+
+  - label: "Entrypoints Test"
+    depends_on: upload-ready-pipeline
+    commands:
+      - |
+        timeout 15m bash -c '
+                  pytest -sv tests/entrypoints/ -m 'core_model and cuda' --run-level "core_model"
         '
     agents:
       queue: "gpu_1_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU

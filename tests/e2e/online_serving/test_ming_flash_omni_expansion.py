@@ -6,7 +6,6 @@ Tests multimodal understanding via OpenAI-compatible API.
 """
 
 import os
-from pathlib import Path
 
 import pytest
 
@@ -17,17 +16,19 @@ from tests.helpers.media import (
     generate_synthetic_video,
 )
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
-from tests.helpers.stage_config import modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
+
+pytestmark = [pytest.mark.omni, pytest.mark.full_model]
 
 models = ["Jonathan1909/Ming-flash-omni-2.0"]
 
 
 def get_eager_config():
     path = modify_stage_config(
-        str(Path(__file__).parent.parent / "stage_configs" / "bailingmm_moe_v2_lite_ci.yaml"),
+        get_deploy_config_path("bailingmm_moe_v2_lite_ci.yaml"),
         updates={
             "stage_args": {
                 0: {
@@ -75,8 +76,6 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, openai_client) -> None:
@@ -102,8 +101,6 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_stream_001(omni_server, openai_client) -> None:
@@ -129,8 +126,6 @@ def test_text_to_text_stream_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_image_to_text_001(omni_server, openai_client) -> None:
@@ -157,8 +152,6 @@ def test_image_to_text_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_audio_to_text_001(omni_server, openai_client) -> None:
@@ -185,8 +178,6 @@ def test_audio_to_text_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_video_to_text_001(omni_server, openai_client) -> None:
@@ -213,9 +204,6 @@ def test_video_to_text_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_mix_to_text_001(omni_server, openai_client) -> None:

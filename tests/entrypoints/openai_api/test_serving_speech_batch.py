@@ -297,7 +297,7 @@ class TestSpeechBatchValidation:
 
 def _make_batch2_stage_config() -> str:
     """Create a temporary stage config with max_batch_size=2 for both stages."""
-    src = Path(get_stage_config("qwen3_tts_batch.yaml"))
+    src = Path(get_stage_config("qwen3_tts.yaml"))
     with open(src) as f:
         cfg = yaml.safe_load(f)
 
