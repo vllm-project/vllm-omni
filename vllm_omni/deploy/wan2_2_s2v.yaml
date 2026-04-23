@@ -1,0 +1,37 @@
+# Wan2.2 Speech-to-Video deploy: Single-stage diffusion model.
+# Verified on 4x Intel XPU with tensor-parallel-size=4 and vae-patch-parallel-size=4.
+#
+# Fields omitted from a stage fall back to StageDeployConfig dataclass
+# defaults (see vllm_omni/config/stage_config.py). Pipeline-wide settings
+# (trust_remote_code, distributed_executor_backend, etc.) use DeployConfig
+# defaults unless overridden here.
+async_chunk: false
+
+stages:
+  # Stage 0: Diffusion (DiT + VAE)
+  # Receives audio and reference image, performs denoising + VAE decode.
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    devices: "0"
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 5
+      guidance_scale: 3.5
+      height: 448
+      width: 832
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        gpu_memory_utilization: 0.8
+        devices: "0,1,2,3"
+
+  xpu:
+    stages:
+      - stage_id: 0
+        gpu_memory_utilization: 0.9
+        enforce_eager: true
+        devices: "0,1,2,3"

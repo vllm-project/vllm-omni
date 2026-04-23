@@ -599,7 +599,7 @@ class AudioCrossAttention(nn.Module):
             causal=False,
         )
 
-    def forward(self, x, context, context_lens=None):
+    def forward(self, x: torch.Tensor, context: torch.Tensor, context_lens: list[int] | None = None) -> torch.Tensor:
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
@@ -692,7 +692,9 @@ class SimpleSelfAttention(nn.Module):
             causal=False,
         )
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(
+        self, x: torch.Tensor, seq_lens: list[int], grid_sizes: list[tuple[int, int, int]], freqs: torch.Tensor
+    ) -> torch.Tensor:
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
         q = self.norm_q(self.q(x)).view(b, s, n, d)
@@ -713,7 +715,9 @@ class SimpleSelfAttention(nn.Module):
 
 
 class SwinSelfAttention(SimpleSelfAttention):
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(
+        self, x: torch.Tensor, seq_lens: list[int], grid_sizes: list[tuple[int, int, int]], freqs: torch.Tensor
+    ) -> torch.Tensor:
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         if b != 1:
             raise ValueError(
@@ -757,7 +761,9 @@ class SwinSelfAttention(SimpleSelfAttention):
 
 
 class CausalSelfAttention(SimpleSelfAttention):
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(
+        self, x: torch.Tensor, seq_lens: list[int], grid_sizes: list[tuple[int, int, int]], freqs: torch.Tensor
+    ) -> torch.Tensor:
         shifting = 3
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         if b != 1:
@@ -854,7 +860,9 @@ class MotionerAttentionBlock(nn.Module):
         self.norm2 = FP32LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim))
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(
+        self, x: torch.Tensor, seq_lens: list[int], grid_sizes: list[tuple[int, int, int]], freqs: torch.Tensor
+    ) -> torch.Tensor:
         y = self.self_attn(self.norm1(x).type_as(x), seq_lens, grid_sizes, freqs)
         x = x + y
         y = self.ffn(self.norm2(x).type_as(x))
@@ -869,7 +877,7 @@ class MotionerHead(nn.Module):
         self.norm = FP32LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.head = nn.Linear(dim, out_dim)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.head(self.norm(x))
         return x
 
@@ -954,7 +962,7 @@ class MotionerTransformers(nn.Module):
             token_freqs = token_freqs * 0.01
             self.token_freqs = torch.nn.Parameter(token_freqs)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x[0].shape[1] contains motion frames count, but not used directly here
         device = self.patch_embedding.weight.device
         freqs = self.freqs
@@ -1061,7 +1069,7 @@ class FramePackMotioner(nn.Module):
         )
         self.drop_mode = drop_mode
 
-    def forward(self, motion_latents, add_last_motion=2):
+    def forward(self, motion_latents: torch.Tensor, add_last_motion: int = 2) -> torch.Tensor:
         mot = []
         mot_remb = []
         for m in motion_latents:
