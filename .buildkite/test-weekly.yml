@@ -5,11 +5,12 @@ env:
 
 steps:
   - label: "Reliability Test"
+    timeout_in_minutes: 180
     key: weekly-dfx-reliability
     depends_on: upload-weekly-pipeline
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
     commands:
-      - timeout 120m pytest -s -v tests/dfx/reliability/ -m "slow"
+      - pytest -s -v tests/dfx/reliability/ -m "slow"
     agents:
       queue: "mithril-h100-pool"
     plugins:
