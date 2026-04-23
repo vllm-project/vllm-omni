@@ -736,20 +736,33 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         extra_body = getattr(request, "extra_body", {}) or {}
         height, width = self._resolve_height_width_from_extra_body(extra_body)
 
+        # Fall back to the diffusion stage's default h/w when the user didn't
+        # specify them, so the compute works for the bare-curl request shape
+        # (no extra_body). Implicit gate: only fires when a stage in the
+        # pipeline declares height/width in its sampling params (e.g. GLM-Image
+        # stage-1 yaml); LLM-only / audio pipelines have neither and are skipped.
+        if height is None or width is None:
+            for dp in self.engine_client.default_sampling_params_list or []:
+                stage_h = getattr(dp, "height", None)
+                stage_w = getattr(dp, "width", None)
+                if stage_h is not None and stage_w is not None:
+                    if height is None:
+                        height = stage_h
+                    if width is None:
+                        width = stage_w
+                    break
+
         # Best-effort mode detection from user messages.
         # i2i requests include at least one reference image in message content.
         _, reference_images = self._extract_diffusion_prompt_and_images_from_messages(request.messages)
-        ref_image_count = len(reference_images)
-        is_img2img = ref_image_count > 0
+        is_img2img = len(reference_images) > 0
 
         if height is not None and width is not None:
             try:
                 from vllm_omni.model_executor.stage_input_processors.glm_image import compute_max_tokens
 
-                max_tokens = getattr(explicit_fields, "max_tokens", None)
-                if max_tokens is None:
-                    max_tokens = compute_max_tokens(int(height), int(width), is_i2i=is_img2img)
-                params.max_tokens = max_tokens
+                if "max_tokens" not in explicit_fields:
+                    params.max_tokens = compute_max_tokens(int(height), int(width), is_i2i=is_img2img)
                 # Keep target size in stage-0 sampling params so runner/model can
                 # build deterministic M-RoPE grids for t2i (no MM features).
                 extra_args = dict(getattr(params, "extra_args", {}) or {})
@@ -757,15 +770,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 extra_args["target_w"] = int(width)
                 params.extra_args = extra_args
             except (ImportError, ValueError, TypeError) as e:
-                logger.warning(f"Failed to compute max_tokens: {e}, using default if available")
-        else:
-            logger.info(
-                "[SamplingParams] Skip dynamic max_tokens (height=%s, width=%s, mode=%s, ref_images=%s)",
-                height,
-                width,
-                "i2i" if is_img2img else "t2i",
-                ref_image_count,
-            )
+                logger.warning("Failed to compute max_tokens: %s", e)
 
         return params
 
