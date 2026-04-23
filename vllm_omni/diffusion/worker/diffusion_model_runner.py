@@ -551,9 +551,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
                 if is_new_request:
                     pp_group.reset_buffer()
-                    if current_omni_platform.is_available():
-                        current_omni_platform.empty_cache()
-                        
+                    self.pipeline.set_pp_recv_dict_buffers(state)
                     self.pipeline.prepare_encode(state)
 
                 if pp_group.is_first_rank:

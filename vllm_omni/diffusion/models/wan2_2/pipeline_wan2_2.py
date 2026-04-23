@@ -1311,6 +1311,33 @@ class Wan22Pipeline(
 
         return state
 
+    def set_pp_recv_dict_buffers(self, state: DiffusionRequestState) -> None:
+        from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
+
+        pp_group = get_pp_group()
+        if pp_group.world_size == 1:
+            return
+
+        latents_template = {"latents": state.latents}
+
+        # Intermediate tensor: [batch, seq_len, inner_dim] after patch_embed + flatten.
+        batch = state.latents.shape[0]
+        num_frames = state.latents.shape[2]
+        height = state.latents.shape[3]
+        width = state.latents.shape[4]
+        p_t, p_h, p_w = self.transformer_config.patch_size
+        seq_len = (num_frames // p_t) * (height // p_h) * (width // p_w)
+        inner_dim = self.transformer_config.num_attention_heads * self.transformer_config.attention_head_dim
+        dtype = (self.transformer or self.transformer_2).dtype
+        it_template = {
+            "hidden_states": torch.empty(batch, seq_len, inner_dim, dtype=dtype, device=self.device)
+        }
+
+        cfg_branches = 2 if state.do_true_cfg else 1
+        pp_group.set_recv_dict_buffer("latents", -1, latents_template)
+        for seg in range(cfg_branches):
+            pp_group.set_recv_dict_buffer("intermediate", seg, it_template)
+
     def denoise_step(
         self,
         state: DiffusionRequestState,
@@ -1353,7 +1380,7 @@ class Wan22Pipeline(
             true_cfg_scale=current_guidance_scale,
             positive_kwargs=positive_kwargs,
             negative_kwargs=negative_kwargs,
-            chunk_idx=state.current_chunk_idx,
+            buf_idx=state.step_index % 2,
         )
 
     def step_scheduler(
@@ -1374,7 +1401,8 @@ class Wan22Pipeline(
             state.latents,
             do_true_cfg,
             per_request_scheduler=state.scheduler,
-            chunk_idx=state.current_chunk_idx,
+            buf_idx=state.step_index % 2,
+            is_last_step=state.step_index == state.total_steps - 1,
         )
         state.step_index += 1
 

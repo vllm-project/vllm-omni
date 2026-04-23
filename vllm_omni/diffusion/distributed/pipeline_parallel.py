@@ -5,9 +5,8 @@ from functools import wraps
 from typing import Any
 
 import torch
-from vllm.sequence import IntermediateTensors
+from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
-from vllm_omni.diffusion.distributed.group_coordinator import PipelineRecvDictHandle
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -19,23 +18,44 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 
 
 class AsyncLatents:
-    """Lazy-resolve wrapper around a ``PipelineRecvDictHandle`` for latents."""
+    """Transparent async wrapper returned by scheduler_step on rank 0.
 
-    __slots__ = ("_handle", "_key", "_tensor")
+    Wraps a pending ``irecv_tensor_dict`` and defers ``handle.wait()`` until the
+    underlying tensor is actually consumed — either via attribute access
+    (e.g. ``latents.to(dtype)``, ``latents.shape``) or via a torch operation
+    (e.g. ``mask * latents``).  This keeps the first PP rank non-blocking after
+    posting the receive, matching the async philosophy used everywhere else in
+    the PP communication layer.
+    """
 
-    def __init__(self, handle: PipelineRecvDictHandle, key: str = "latents"):
-        self._handle = handle
-        self._key = key
+    __slots__ = ("_tensor_dict", "_handles", "_postproc", "_tensor")
+
+    def __init__(
+        self,
+        tensor_dict: dict[str, torch.Tensor],
+        handles: list[torch.distributed.Work],
+        postproc: list,
+    ):
+        self._tensor_dict = tensor_dict
+        self._handles = handles
+        self._postproc = postproc
         self._tensor: torch.Tensor | None = None
 
     def _resolve(self) -> torch.Tensor:
-        if self._tensor is None:
-            self._tensor = self._handle.resolve()[self._key]
+        if self._tensor is not None:
+            return self._tensor
+        for h in self._handles:
+            h.wait()
+        for fn in self._postproc:
+            fn()
+        self._tensor = self._tensor_dict["latents"]
         return self._tensor
 
+    # Attribute access (e.g. .shape, .to(), .dtype) delegates to the resolved tensor.
     def __getattr__(self, name: str):
         return getattr(self._resolve(), name)
 
+    # Torch function protocol: any torch op involving an AsyncLatents resolves it first.
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
@@ -44,33 +64,12 @@ class AsyncLatents:
             if isinstance(x, AsyncLatents):
                 return x._resolve()
             if isinstance(x, (list, tuple)):
-                return type(x)(_unwrap(item) for item in x)
+                return type(x)(_unwrap(item) for item in x)  # type(x) return the class of x to preserve its type
             return x
 
         args = tuple(_unwrap(a) for a in args)
         kwargs = {k: _unwrap(v) for k, v in kwargs.items()}
         return func(*args, **kwargs)
-
-
-class AsyncIntermediateTensors:
-    """Lazy-resolve wrapper around a ``PipelineRecvDictHandle`` for an IT."""
-
-    __slots__ = ("_handle", "_resolved")
-
-    def __init__(self, handle: PipelineRecvDictHandle):
-        self._handle = handle
-        self._resolved: IntermediateTensors | None = None
-
-    def _resolve(self) -> IntermediateTensors:
-        if self._resolved is None:
-            self._resolved = IntermediateTensors(self._handle.resolve())
-        return self._resolved
-
-    def __getitem__(self, key: str):
-        return self._resolve()[key]
-
-    def __getattr__(self, name: str):
-        return getattr(self._resolve(), name)
 
 
 class PipelineParallelMixin:
@@ -164,6 +163,19 @@ class PipelineParallelMixin:
     def _pp_send_work(self, work: list[torch.distributed.Work]) -> None:
         self._pp_send_work_list = work
 
+    @property
+    def _preposted_its(self) -> list[AsyncIntermediateTensors] | None:
+        """Pre-posted IT recvs for the next micro-step (None if not primed)."""
+        return getattr(self, "_preposted_its_list", None)
+
+    @_preposted_its.setter
+    def _preposted_its(self, value: list[AsyncIntermediateTensors] | None) -> None:
+        self._preposted_its_list = value
+
+    def set_pp_recv_dict_buffers(self, state: Any) -> None:
+        """Override to pre-register PP dict channels for a new request."""
+        return None
+
     def _sync_pp_send(self) -> None:
         """
         Wait on all pending non-blocking PP sends.
@@ -185,7 +197,7 @@ class PipelineParallelMixin:
         negative_kwargs: dict[str, Any] | None,
         cfg_normalize: bool = True,
         output_slice: int | None = None,
-        chunk_idx: int | None = None,
+        buf_idx: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
         """
         Drop-in replacement for predict_noise_maybe_with_cfg that also handles PP.
@@ -221,18 +233,26 @@ class PipelineParallelMixin:
 
         n = len(all_kwargs)
         its: list[AsyncIntermediateTensors | None] = [None] * n
-        it_name = f"{chunk_idx}_intermediate" if chunk_idx is not None else "intermediate"
         if not pp_group.is_first_rank:
-            for i in range(n):
-                handle = pp_group.add_pipeline_recv_dict_task(name=it_name, segment_idx=i)
-                its[i] = AsyncIntermediateTensors(handle)
+            # Use recvs pre-posted by the previous step's scheduler_step
+            preposted = self._preposted_its
+            if preposted is not None and len(preposted) == n:
+                its = preposted
+                self._preposted_its = None
+            else:
+                for i in range(n):
+                    its[i] = AsyncIntermediateTensors(
+                        *pp_group.pipeline_irecv_tensor_dict(
+                            name="intermediate", segment_idx=i, buf_idx=buf_idx
+                        )
+                    )
 
         if not pp_group.is_last_rank:
             # First / middle rank: run partial forwards and propagate ITs downstream.
             for i, (kwargs, it) in enumerate(zip(all_kwargs, its)):
                 result = self.predict_noise(**kwargs, intermediate_tensors=it)
                 self._pp_send_work.extend(
-                    pp_group.pipeline_isend_tensor_dict(result.tensors, name=it_name, segment_idx=i)
+                    pp_group.pipeline_isend_tensor_dict(result.tensors, name="intermediate", segment_idx=i)
                 )
             return None
 
@@ -267,7 +287,8 @@ class PipelineParallelMixin:
         latents: torch.Tensor | tuple[torch.Tensor, ...],
         do_true_cfg: bool,
         per_request_scheduler: Any | None = None,
-        chunk_idx: int | None = None,
+        buf_idx: int = 0,
+        is_last_step: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ...] | AsyncLatents:
         """
         Drop-in replacement for scheduler_step_maybe_with_cfg that also handles PP.
@@ -286,11 +307,22 @@ class PipelineParallelMixin:
             )
 
         pp_group = get_pp_group()
-        latents_name = f"{chunk_idx}_latents" if chunk_idx is not None else "latents"
         if pp_group.is_last_rank:
             latents = super().scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg, per_request_scheduler)
-            self._pp_send_work = pp_group.pipeline_isend_tensor_dict({"latents": latents}, name=latents_name)
+            self._pp_send_work = pp_group.pipeline_isend_tensor_dict({"latents": latents}, name="latents")
         elif pp_group.is_first_rank:
-            handle = pp_group.add_pipeline_recv_dict_task(name=latents_name)
-            latents = AsyncLatents(handle)
+            latents = AsyncLatents(*pp_group.pipeline_irecv_tensor_dict(name="latents", buf_idx=buf_idx))
+
+        if not pp_group.is_first_rank and not is_last_step:
+            cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
+            n = 1 if cfg_parallel_ready else (2 if do_true_cfg else 1)
+            next_buf_idx = (buf_idx + 1) % 2
+            self._preposted_its = [
+                AsyncIntermediateTensors(
+                    *pp_group.pipeline_irecv_tensor_dict(
+                        name="intermediate", segment_idx=i, buf_idx=next_buf_idx
+                    )
+                )
+                for i in range(n)
+            ]
         return latents

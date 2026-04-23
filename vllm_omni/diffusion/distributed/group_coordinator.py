@@ -5,6 +5,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import pickle
 from collections import namedtuple
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -618,27 +619,6 @@ class GroupCoordinator:
             self.cpu_group = None
 
 
-class PipelineRecvDictHandle:
-
-    __slots__ = ("_pp_group", "_name", "_segment_idx", "_resolved")
-
-    def __init__(self, pp_group: "PipelineGroupCoordinator", name: str, segment_idx: int):
-        self._pp_group = pp_group
-        self._name = name
-        self._segment_idx = segment_idx
-        self._resolved: dict[str, Any] | None = None
-
-    def resolve(self) -> dict[str, Any]:
-        if self._resolved is None:
-            tensor_dict, handles, _ = self._pp_group.pipeline_irecv_tensor_dict(
-                name=self._name, segment_idx=self._segment_idx
-            )
-            for h in handles:
-                h.wait()
-            self._resolved = tensor_dict
-        return self._resolved
-
-
 class PipelineGroupCoordinator(GroupCoordinator):
     """
     available attributes:
@@ -722,10 +702,11 @@ class PipelineGroupCoordinator(GroupCoordinator):
 
         # Cached dict schema and pre-allocated recv buffers for
         # `pipeline_isend_tensor_dict` / `pipeline_irecv_tensor_dict`.
-        # The pickled schema is exchanged once per (name, segment_idx) over
-        # NCCL; subsequent calls only post async tensor sends/recvs.
-        self.dict_schema_cache: dict[str, dict[int, list[tuple[str, Any]]]] = {}
-        self.dict_recv_buffer: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
+        # Keyed by (name, segment_idx). Recv buffer leaf is a length-2 list
+        # for double buffering. Caller picks the slot via buf_idx.
+        self.dict_schema_cache: dict[tuple[str, int], list[tuple[str, Any]]] = {}
+        self.dict_recv_buffer: dict[tuple[str, int], list[dict[str, torch.Tensor]]] = {}
+        self._comms_stream: Any = None # Dedicated comms stream for PP P2P. None on CPU.
 
         self.dict_schema_keepalive: list[torch.Tensor] = []
 
@@ -793,6 +774,32 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self.recv_skip_tasks_queue = []
         self.receiving_skip_tasks = []
         self.skip_tensor_recv_buffer = {}
+
+    @property
+    def comms_stream(self):
+        """Dedicated stream for PP P2P comms."""
+        if self._comms_stream is None and self.device.type != "cpu":
+            mod = getattr(torch, self.device.type, None)
+            if mod is not None and hasattr(mod, "Stream"):
+                self._comms_stream = mod.Stream(device=self.device)
+        return self._comms_stream
+
+    def _comms_stream_ctx(self):
+        """Context manager that makes ``comms_stream`` the current stream."""
+        stream = self.comms_stream
+        if stream is None:
+            return nullcontext()
+        return getattr(torch, self.device.type).stream(stream)
+
+    def _record_compute_event(self):
+        """Record an event on the default (compute) stream for later
+        ``comms_stream.wait_event``."""
+        if self.comms_stream is None:
+            return None
+        mod = getattr(torch, self.device.type)
+        ev = mod.Event()
+        ev.record(mod.current_stream(self.device))
+        return ev
 
     def set_config(self, dtype: torch.dtype):
         self.dtype = dtype
@@ -1019,80 +1026,111 @@ class PipelineGroupCoordinator(GroupCoordinator):
         self._pipeline_irecv(self.recv_buffer[name][idx]).wait()
         return self.recv_buffer[name][idx]
 
+    def set_recv_dict_buffer(
+        self,
+        name: str,
+        segment_idx: int,
+        template_dict: dict[str, torch.Tensor | Any],
+    ) -> None:
+        """Pre-populate schema cache + a double-buffer pair (indices 0/1) for
+        (name, segment_idx).
+        """
+        metadata_list, _ = _split_tensor_dict(template_dict)
+        key = (name, segment_idx)
+        self.dict_schema_cache[key] = metadata_list
+        buffer_pair: list[dict[str, torch.Tensor]] = []
+        for _ in range(2):
+            buffers: dict[str, torch.Tensor] = {}
+            for key_, value in metadata_list:
+                if isinstance(value, TensorMetadata):
+                    if torch.Size(value.size).numel() == 0:
+                        continue
+                    device = self.device if value.device == "cuda" else torch.device(value.device)
+                    buffers[key_] = torch.empty(value.size, dtype=value.dtype, device=device)
+            buffer_pair.append(buffers)
+        self.dict_recv_buffer[key] = buffer_pair
+
     def pipeline_isend_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any],
         name: str = "dict",
         segment_idx: int = -1,
     ) -> list[torch.distributed.Work]:
-        """Async tensor-dict send. Schema (keys, scalars, per-tensor
-        dtype/shape) is exchanged once per (name, segment_idx) over NCCL;
-        steady state posts only per-tensor isend ops. Schema must be
-        stable across calls; mismatching shapes will fail at NCCL recv.
-        """
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
 
-        cache = self.dict_schema_cache.setdefault(name, {})
+        key = (name, segment_idx)
         handles: list[torch.distributed.Work] = []
-        if segment_idx not in cache:
+        if key not in self.dict_schema_cache:
             schema_handles, keepalive = self._isend_dict_schema(metadata_list)
             handles.extend(schema_handles)
             self.dict_schema_keepalive.extend(keepalive)
-            cache[segment_idx] = metadata_list
+            self.dict_schema_cache[key] = metadata_list
 
-        for tensor in tensor_list:
-            if tensor.numel() == 0:
-                continue
-            tensor = tensor.contiguous()
-            handle = self._pipeline_isend(tensor)
-            if tensor.is_cuda:
-                tensor.record_stream(torch.cuda.current_stream(tensor.device))
-            handles.append(handle)
+        compute_done = self._record_compute_event()
+        comms = self.comms_stream
+        with self._comms_stream_ctx():
+            if comms is not None and compute_done is not None:
+                comms.wait_event(compute_done)
+            for tensor in tensor_list:
+                if tensor.numel() == 0:
+                    continue
+                tensor = tensor.contiguous()
+                if tensor.is_cuda and comms is not None:
+                    tensor.record_stream(comms)
+                handles.append(self._pipeline_isend(tensor))
         return handles
 
     def pipeline_irecv_tensor_dict(
         self,
         name: str = "dict",
         segment_idx: int = -1,
+        buf_idx: int = 0,
     ) -> tuple[dict[str, torch.Tensor | Any], list[torch.distributed.Work], list]:
-        """Async tensor-dict recv. Returns ``(tensor_dict, handles, [])``
-        matching ``GroupCoordinator.irecv_tensor_dict``. First call
-        discovers schema over NCCL and pre-allocates persistent buffers;
-        the returned dict aliases those buffers, so the caller must
-        consume before the next recv on the same (name, segment_idx).
+        """Async tensor-dict recv into the ``buf_idx`` slot (0 or 1) of the
+        double-buffer pair for (name, segment_idx). Caller picks the slot
+        — typically ``micro_step % 2`` — so consecutive recvs alternate and
+        the previous result stays readable until its consumer is done.
+        Posts irecvs on ``comms_stream``.
         """
-        cache = self.dict_schema_cache.setdefault(name, {})
-        if segment_idx not in cache:
+        key = (name, segment_idx)
+        if key not in self.dict_schema_cache:
             metadata_list = self._recv_dict_schema()
-            cache[segment_idx] = metadata_list
-            buffers: dict[str, torch.Tensor] = {}
-            for key, value in metadata_list:
-                if isinstance(value, TensorMetadata):
-                    if torch.Size(value.size).numel() == 0:
-                        continue
-                    device = self.device if value.device == "cuda" else torch.device(value.device)
-                    buffers[key] = torch.empty(value.size, dtype=value.dtype, device=device)
-            self.dict_recv_buffer.setdefault(name, {})[segment_idx] = buffers
+            self.dict_schema_cache[key] = metadata_list
+            buffer_pair: list[dict[str, torch.Tensor]] = []
+            for _ in range(2):
+                buffers: dict[str, torch.Tensor] = {}
+                for k, value in metadata_list:
+                    if isinstance(value, TensorMetadata):
+                        if torch.Size(value.size).numel() == 0:
+                            continue
+                        device = self.device if value.device == "cuda" else torch.device(value.device)
+                        buffers[k] = torch.empty(value.size, dtype=value.dtype, device=device)
+                buffer_pair.append(buffers)
+            self.dict_recv_buffer[key] = buffer_pair
 
-        metadata_list = cache[segment_idx]
-        buffers = self.dict_recv_buffer[name][segment_idx]
+        metadata_list = self.dict_schema_cache[key]
+        buffers = self.dict_recv_buffer[key][buf_idx]
+        comms = self.comms_stream
 
         tensor_dict: dict[str, Any] = {}
         handles: list[torch.distributed.Work] = []
-        for key, value in metadata_list:
-            if isinstance(value, TensorMetadata):
-                if torch.Size(value.size).numel() == 0:
-                    _update_nested_dict(
-                        tensor_dict,
-                        key,
-                        torch.empty(value.size, dtype=value.dtype, device=self.device),
-                    )
-                    continue
-                tensor = buffers[key]
-                handles.append(self._pipeline_irecv(tensor))
-                _update_nested_dict(tensor_dict, key, tensor)
-            else:
-                _update_nested_dict(tensor_dict, key, value)
+        with self._comms_stream_ctx():
+            for k, value in metadata_list:
+                if isinstance(value, TensorMetadata):
+                    if torch.Size(value.size).numel() == 0:
+                        _update_nested_dict(
+                            tensor_dict,
+                            k,
+                            torch.empty(value.size, dtype=value.dtype, device=self.device),
+                        )
+                        continue
+                    tensor = buffers[k]
+                    if tensor.is_cuda and comms is not None:
+                        tensor.record_stream(comms)
+                    handles.append(self._pipeline_irecv(tensor))
+                    _update_nested_dict(tensor_dict, k, tensor)
+                else:
+                    _update_nested_dict(tensor_dict, k, value)
 
         return tensor_dict, handles, []
 
@@ -1114,11 +1152,6 @@ class PipelineGroupCoordinator(GroupCoordinator):
         receiving_task[0].wait()
         assert receiving_task[1] == name and receiving_task[2] == idx, "Received tensor does not match the requested"
         return self.recv_buffer[name][idx]
-
-    def add_pipeline_recv_dict_task(
-        self, name: str = "dict", segment_idx: int = -1
-    ) -> PipelineRecvDictHandle:
-        return PipelineRecvDictHandle(self, name, segment_idx)
 
     def _pipeline_irecv(self, tensor: torch.tensor):
         # batch_isend_irecv (not plain irecv) — plain P2P on size-2 PG
