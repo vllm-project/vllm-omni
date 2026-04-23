@@ -41,7 +41,7 @@ elif current_omni_platform.is_xpu():
         pass
 elif current_omni_platform.is_musa():
     try:
-        from mate import flash_attn_varlen_func  # noqa: F401
+        from flash_attn_interface import flash_attn_func, flash_attn_varlen_func  # noqa: F401
     except (ImportError, ModuleNotFoundError):
         pass
 else:
@@ -82,8 +82,8 @@ HAS_FLASH_ATTN = flash_attn_func is not None or flash_attn_varlen_func is not No
 
 @lru_cache(maxsize=1)
 def is_mate_available() -> bool:
-    """Check if MATE (MUSA Flash Attention) is available."""
-    return current_omni_platform.is_musa() and flash_attn_varlen_func is not None
+    """Check if MATE (MUSA AI Tensor Engine) is available."""
+    return current_omni_platform.is_musa() and flash_attn_func is not None or flash_attn_varlen_func is not None
 
 
 def _index_first_axis(tensor, indices):

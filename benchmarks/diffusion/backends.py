@@ -122,6 +122,18 @@ async def async_request_chat_completions(
                                     output.peak_memory_mb = first_item.get("peak_memory_mb", 0.0)
                 except (IndexError, TypeError, AttributeError):
                     pass
+
+                if (not output.stage_durations or output.peak_memory_mb == 0.0) and isinstance(
+                    resp_json.get("metrics"), dict
+                ):
+                    m = resp_json["metrics"]
+                    if not output.stage_durations and isinstance(m.get("stage_durations"), dict):
+                        output.stage_durations = m.get("stage_durations") or {}
+                    if output.peak_memory_mb == 0.0 and m.get("peak_memory_mb") is not None:
+                        try:
+                            output.peak_memory_mb = float(m.get("peak_memory_mb") or 0.0)
+                        except (TypeError, ValueError):
+                            pass
             else:
                 output.error = f"HTTP {response.status}: {await response.text()}"
                 output.success = False
