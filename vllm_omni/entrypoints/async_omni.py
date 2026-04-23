@@ -271,6 +271,16 @@ class AsyncOmni(EngineClient, OmniBase):
             # Start final output dispatcher on the first call to generate()
             self._final_output_handler()
 
+            # If only a bare sampling_params is provided (e.g. from /v1/completions),
+            # inject it as the stage-0 params so logprobs/other fields are not lost.
+            if sampling_params_list is None and sampling_params is not None:
+                if self.num_stages == 1:
+                    sampling_params_list = [sampling_params]
+                else:
+                    default = list(self.default_sampling_params_list)
+                    default[0] = sampling_params
+                    sampling_params_list = default
+
             # Expand sampling params for PD disaggregation (user may provide N-1 params)
             if (
                 sampling_params_list is not None
