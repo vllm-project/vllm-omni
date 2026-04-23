@@ -14,7 +14,6 @@
 # limitations under the License.
 import math
 import operator
-import os
 from functools import cache
 from itertools import accumulate
 
@@ -24,6 +23,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from vllm_omni.diffusion.attention.backends.utils.fa import HAS_FLASH_ATTN, flash_attn_varlen_func
+from vllm_omni.model_executor.models.whisper_utils import Conv1d, Linear, sinusoids
+from vllm_omni.utils.audio import mel_filter_bank
 
 N_FFT = 400
 HOP_LENGTH = 160
@@ -31,21 +32,8 @@ HOP_LENGTH = 160
 
 @cache
 def mel_filters(device, n_mels: int) -> torch.Tensor:
-    """
-    load the mel filterbank matrix for projecting STFT into a Mel spectrogram.
-    Allows decoupling librosa dependency; saved using:
-
-        np.savez_compressed(
-            "mel_filters.npz",
-            mel_80=librosa.filters.mel(sr=16000, n_fft=400, n_mels=80),
-            mel_128=librosa.filters.mel(sr=16000, n_fft=400, n_mels=128),
-        )
-    """
-    assert n_mels in {80, 128}, f"Unsupported n_mels: {n_mels}"
-
-    filters_path = os.path.join(os.path.dirname(__file__), "assets", "mel_filters.npz")
-    with np.load(filters_path, allow_pickle=False) as f:
-        return torch.from_numpy(f[f"mel_{n_mels}"]).to(device)
+    """Compute mel filterbank matrix for projecting STFT into a Mel spectrogram."""
+    return mel_filter_bank(sr=16000, n_fft=N_FFT, n_mels=n_mels).to(device)
 
 
 def log_mel_spectrogram(
@@ -113,30 +101,6 @@ def get_mel_audio(audio, padding=False, audio_vq_ds_rate=1, n_mels=128):
     else:
         mel = log_mel_spectrogram(audio, n_mels=n_mels)  # [F,T]
     return mel
-
-
-def sinusoids(length, channels, max_timescale=10000):
-    """Returns sinusoids for positional embedding"""
-    assert channels % 2 == 0
-    log_timescale_increment = np.log(max_timescale) / (channels // 2 - 1)
-    inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2))
-    scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
-    return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
-
-
-class Conv1d(nn.Conv1d):
-    def _conv_forward(self, x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
-        return super()._conv_forward(x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype))
-
-
-class ConvTranspose1d(nn.ConvTranspose1d):
-    def _conv_forward(self, x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
-        return super()._conv_forward(x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype))
-
-
-class Linear(nn.Linear):
-    def forward(self, x: Tensor) -> Tensor:
-        return F.linear(x, self.weight.to(x.dtype), None if self.bias is None else self.bias.to(x.dtype))
 
 
 class MultiHeadAttention(nn.Module):

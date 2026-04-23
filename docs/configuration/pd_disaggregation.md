@@ -11,7 +11,7 @@ deployment-specific values usually change per environment:
 - connector backend and connector ports
 - connector IPs or bootstrap addresses
 
-Start from the [default Qwen3-Omni stage config](gh-file:vllm_omni/model_executor/stage_configs/qwen3_omni_moe.yaml)
+Start from the [default Qwen3-Omni stage config](gh-file:vllm_omni/deploy/qwen3_omni_moe.yaml)
 and copy it to your own file, for example `qwen3_omni_pd.yaml`. Then apply the
 changes below.
 
@@ -145,19 +145,13 @@ Compared with the default Qwen3-Omni config:
 ```yaml
 runtime:
   enabled: true
-  defaults:
-    window_size: -1
-    max_inflight: 1
   edges:
     - from: 0
       to: 1
-      window_size: -1
     - from: 1
       to: 2
-      window_size: -1
     - from: 2
       to: 3
-      window_size: -1
 ```
 
 ## 4. Launch with your custom config

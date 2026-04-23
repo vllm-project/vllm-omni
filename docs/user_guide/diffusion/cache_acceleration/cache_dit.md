@@ -283,3 +283,10 @@ Using Cache-DiT acceleration:
 
 1. ✅ **Enable Cache-DiT** - Set `cache_backend="cache_dit"` to get 1.5x-3x speedup with optimized defaults
 2. ✅ **(Optional) Customize** - Adjust `cache_config` parameters for specific speed/quality trade-offs
+
+---
+
+## Additional Resources
+
+- [Cache-DiT documentation](https://cache-dit.readthedocs.io/en/latest/)
+- [Cache-DiT API reference](https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/)

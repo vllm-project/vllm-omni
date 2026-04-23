@@ -64,6 +64,17 @@ _MODEL_COEFFICIENTS = {
         -1.04182570e01,
         6.78098549e-01,
     ],
+    # Flux2 transformer coefficients
+    # Copied from Qwen-Image, need to be tuned specifically for Flux2 in future
+    "Flux2Transformer2DModel": [
+        -4.50000000e02,
+        2.80000000e02,
+        -4.50000000e01,
+        3.20000000e00,
+        -2.00000000e-02,
+    ],
+    # LongCat Image transformer coefficients
+    "LongCatImageTransformer2DModel": [652.5980, -424.1615, 84.5526, -4.5923, 0.1694],
 }
 
 

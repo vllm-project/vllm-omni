@@ -1,8 +1,8 @@
 import math
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 _MAX_EMBEDDING_DIM = 8192
 
@@ -10,8 +10,12 @@ _MAX_EMBEDDING_DIM = 8192
 class OpenAICreateSpeechRequest(BaseModel):
     input: str
     model: str | None = None
+    # Accept both "voice" (OpenAI convention) and "speaker" (model/internal
+    # convention) as input keys.  Intentionally global — all TTS backends
+    # (Qwen3-TTS, Voxtral, Fish Speech) use this field for the speaker name.
     voice: str | None = Field(
         default=None,
+        validation_alias=AliasChoices("voice", "speaker"),
         description="Speaker/voice to use. For Qwen3-TTS: vivian, ryan, aiden, etc.",
     )
     instructions: str | None = Field(
@@ -69,6 +73,10 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         ge=0,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
+    )
+    extra_params: dict[str, Any] | None = Field(
+        default=None,
+        description=("Optional model-specific parameters passed directly to the model's extra_args."),
     )
 
     @field_validator("stream_format")

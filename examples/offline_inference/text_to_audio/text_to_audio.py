@@ -11,6 +11,7 @@ Usage:
     python text_to_audio.py --prompt "The sound of a dog barking"
     python text_to_audio.py --prompt "A piano playing a gentle melody" --audio-length 10.0
     python text_to_audio.py --prompt "Thunder and rain sounds" --negative-prompt "Low quality"
+    python text_to_audio.py --prompt "A soft synth pad" --cache-backend tea_cache
 """
 
 import argparse
@@ -20,6 +21,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -91,9 +93,43 @@ def parse_args() -> argparse.Namespace:
         help="Sample rate for output audio (Stable Audio uses 44100 Hz).",
     )
     parser.add_argument(
+        "--cache-backend",
+        type=str,
+        default=None,
+        choices=["tea_cache"],
+        help=(
+            "Cache backend to use for acceleration. "
+            "Stable Audio currently supports 'tea_cache'. "
+            "Default: None (no cache acceleration)."
+        ),
+    )
+    parser.add_argument(
+        "--tea-cache-rel-l1-thresh",
+        type=float,
+        default=0.2,
+        help="[tea_cache] Threshold for accumulated relative L1 distance.",
+    )
+    parser.add_argument(
         "--enable-diffusion-pipeline-profiler",
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
+    )
+    parser.add_argument(
+        "--use-hsdp",
+        action="store_true",
+        help="Enable HSDP for Stable Audio DiT weight sharding.",
+    )
+    parser.add_argument(
+        "--hsdp-shard-size",
+        type=int,
+        default=1,
+        help="Number of GPUs to shard Stable Audio DiT weights across when HSDP is enabled.",
+    )
+    parser.add_argument(
+        "--hsdp-replicate-size",
+        type=int,
+        default=1,
+        help="Number of HSDP replica groups. Default 1 means pure sharding.",
     )
     return parser.parse_args()
 
@@ -124,6 +160,11 @@ def save_audio(audio_data: np.ndarray, output_path: str, sample_rate: int = 4410
 def main():
     args = parse_args()
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    cache_config = None
+    if args.cache_backend == "tea_cache":
+        cache_config = {
+            "rel_l1_thresh": args.tea_cache_rel_l1_thresh,
+        }
 
     print(f"\n{'=' * 60}")
     print("Stable Audio Open - Text-to-Audio Generation")
@@ -134,12 +175,26 @@ def main():
     print(f"  Audio length: {args.audio_length}s")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Guidance scale: {args.guidance_scale}")
+    print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    if args.use_hsdp:
+        print(f"  HSDP: enabled (shard_size={args.hsdp_shard_size}, replicate_size={args.hsdp_replicate_size})")
+    else:
+        print("  HSDP: disabled")
     print(f"  Seed: {args.seed}")
     print(f"{'=' * 60}\n")
+
+    parallel_config = DiffusionParallelConfig(
+        use_hsdp=args.use_hsdp,
+        hsdp_shard_size=args.hsdp_shard_size,
+        hsdp_replicate_size=args.hsdp_replicate_size,
+    )
 
     # Initialize Omni with Stable Audio model
     omni = Omni(
         model=args.model,
+        parallel_config=parallel_config,
+        cache_backend=args.cache_backend,
+        cache_config=cache_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 

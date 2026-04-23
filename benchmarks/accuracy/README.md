@@ -23,5 +23,5 @@ Test guidance:
 - Local static/self-checks live in `tests/benchmarks/test_accuracy_bench_utils.py`.
 - End-to-end generation/evaluation should be validated in a remote GPU
   environment. In the current repo marker system there is `L4` but no `L5`
-  marker, so benchmark smoke tests should be wired as `advanced_model +
-  benchmark + L4` when GPU capacity is available.
+  marker, so benchmark smoke tests should be wired as `full_model +
+  benchmark + L4` for nightly when GPU capacity is available.

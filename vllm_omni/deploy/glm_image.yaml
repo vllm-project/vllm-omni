@@ -1,0 +1,38 @@
+# GLM-Image deploy: AR (stage 0) + Diffusion (stage 1).
+# Topology declared in vllm_omni/model_executor/models/glm_image/pipeline.py.
+#
+# Fields omitted from a stage fall back to StageDeployConfig dataclass
+# defaults (see vllm_omni/config/stage_config.py). Pipeline-wide settings
+# (trust_remote_code, distributed_executor_backend, etc.) use DeployConfig
+# defaults unless overridden here.
+async_chunk: false
+
+stages:
+  # Stage 0: AR Model (GlmImageForConditionalGeneration)
+  # Generates prior_token_ids for conditioning the diffusion process.
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.6
+    enforce_eager: false
+    max_num_batched_tokens: 32768
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.9
+      top_p: 0.75
+      top_k: 16512
+      stop_token_ids: [16385]
+      seed: 42
+      detokenize: false
+
+  # Stage 1: Diffusion (DiT + VAE)
+  # Receives prior_token_ids from AR, performs denoising + VAE decode.
+  - stage_id: 1
+    max_num_seqs: 1
+    enforce_eager: true
+    devices: "1"
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 50
+      guidance_scale: 1.5
+      height: 1024
+      width: 1024

@@ -13,8 +13,8 @@ import importlib
 import multiprocessing as mp
 import os
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from vllm.logger import init_logger
@@ -23,11 +23,13 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.executor import Executor
 
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization.inc_config import OmniINCConfig
 
 logger = init_logger(__name__)
 
@@ -75,6 +77,14 @@ def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> s
     return model
 
 
+def terminate_alive_proc(proc, timeout=5):
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=timeout)
+        if proc.is_alive():
+            proc.kill()
+
+
 def resolve_worker_cls(engine_args: dict[str, Any]) -> None:
     """Resolve worker_cls from worker_type for non-diffusion stages."""
     worker_type = engine_args.get("worker_type", None)
@@ -91,6 +101,144 @@ def resolve_worker_cls(engine_args: dict[str, Any]) -> None:
         engine_args["worker_cls"] = current_omni_platform.get_omni_generation_worker_cls()
     else:
         raise ValueError(f"Unknown worker_type: {worker_type}")
+
+
+def _get_attr_or_item(obj: Any, key: str, default: Any = None) -> Any:
+    """Read *key* from *obj* regardless of whether it's a dict or object."""
+    if hasattr(obj, "get"):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _tp_size_for_stage(stage_configs: Sequence[Any], stage_id: Any) -> int | None:
+    """Resolve tensor_parallel_size for *stage_id* from the loaded stage configs."""
+    id_strs = {str(stage_id)}
+    try:
+        id_strs.add(str(int(stage_id)))
+    except (TypeError, ValueError):
+        pass
+
+    for stage_cfg in stage_configs:
+        if str(getattr(stage_cfg, "stage_id", None)) not in id_strs:
+            continue
+        engine_args = getattr(stage_cfg, "engine_args", None)
+        if engine_args is None:
+            return 1
+        parallel_config = _get_attr_or_item(engine_args, "parallel_config")
+        if parallel_config is not None:
+            tp = _get_attr_or_item(parallel_config, "tensor_parallel_size", 1)
+        else:
+            tp = _get_attr_or_item(engine_args, "tensor_parallel_size", 1)
+        try:
+            return max(1, int(tp))
+        except (TypeError, ValueError):
+            return 1
+    return None
+
+
+def _inject_inferred_kv_tp_topology(
+    omni_kv: Any,
+    stage_id: int,
+    stage_configs: Sequence[Any],
+    engine_input_source: Sequence[int] | None = None,
+) -> None:
+    """Infer adjacent-stage TP topology and inject it into omni_kv_config.
+
+    This keeps heterogeneous TP working without requiring user-authored
+    rank_mapping blocks in config files.
+    """
+    if omni_kv is None:
+        return
+
+    if hasattr(omni_kv, "get"):
+        need_send = bool(omni_kv.get("need_send_cache", False))
+        need_recv = bool(omni_kv.get("need_recv_cache", False))
+        omni_from_stage = omni_kv.get("omni_from_stage")
+        omni_to_stage = omni_kv.get("omni_to_stage")
+        rank_mapping = omni_kv.get("rank_mapping")
+    else:
+        need_send = bool(getattr(omni_kv, "need_send_cache", False))
+        need_recv = bool(getattr(omni_kv, "need_recv_cache", False))
+        omni_from_stage = getattr(omni_kv, "omni_from_stage", None)
+        omni_to_stage = getattr(omni_kv, "omni_to_stage", None)
+        rank_mapping = getattr(omni_kv, "rank_mapping", None)
+
+    if not need_send and not need_recv:
+        return
+
+    current_tp = _tp_size_for_stage(stage_configs, stage_id)
+    if current_tp is None:
+        return
+
+    peer_stage_id = None
+    from_tp = None
+    to_tp = None
+    if str(omni_from_stage) == str(stage_id):
+        peer_stage_id = omni_to_stage
+        from_tp = current_tp
+        to_tp = _tp_size_for_stage(stage_configs, peer_stage_id)
+    elif str(omni_to_stage) == str(stage_id):
+        peer_stage_id = omni_from_stage
+        from_tp = _tp_size_for_stage(stage_configs, peer_stage_id)
+        to_tp = current_tp
+    elif need_recv and engine_input_source:
+        peer_stage_id = engine_input_source[0]
+        from_tp = _tp_size_for_stage(stage_configs, peer_stage_id)
+        to_tp = current_tp
+
+    if from_tp is None or to_tp is None:
+        return
+
+    if not isinstance(rank_mapping, dict):
+        rank_mapping = {}
+    rank_mapping.setdefault("from_tp", int(from_tp))
+    rank_mapping.setdefault("to_tp", int(to_tp))
+
+    if hasattr(omni_kv, "__setitem__"):
+        omni_kv["rank_mapping"] = rank_mapping
+    else:
+        setattr(omni_kv, "rank_mapping", rank_mapping)
+
+
+def inject_kv_stage_info(stage_cfg: Any, stage_id: int, stage_configs: Sequence[Any] | None = None) -> None:
+    """Inject stage_id, engine_input_source, and inferred TP topology into omni_kv_config.
+
+    When *stage_configs* is provided, also infers from_tp/to_tp for
+    heterogeneous TP topologies so the KV transfer manager can compute
+    rank mappings automatically.
+    """
+    try:
+        engine_args = stage_cfg.engine_args
+        if hasattr(engine_args, "get"):
+            omni_kv = engine_args.get("omni_kv_config", None)
+        else:
+            omni_kv = getattr(engine_args, "omni_kv_config", None)
+
+        if omni_kv is None:
+            return
+
+        if hasattr(omni_kv, "setdefault"):
+            omni_kv.setdefault("stage_id", stage_id)
+        elif hasattr(omni_kv, "__setitem__"):
+            if "stage_id" not in omni_kv:
+                omni_kv["stage_id"] = stage_id
+
+        engine_input_source = getattr(stage_cfg, "engine_input_source", None)
+        if engine_input_source is not None:
+            if hasattr(omni_kv, "setdefault"):
+                omni_kv.setdefault("engine_input_source", list(engine_input_source))
+            elif hasattr(omni_kv, "__setitem__") and "engine_input_source" not in omni_kv:
+                omni_kv["engine_input_source"] = list(engine_input_source)
+
+        if stage_configs:
+            _inject_inferred_kv_tp_topology(
+                omni_kv,
+                stage_id=stage_id,
+                stage_configs=stage_configs,
+                engine_input_source=engine_input_source,
+            )
+    except Exception as e:
+        logger.debug("Failed to inject stage info into omni_kv_config: %s", e)
 
 
 @dataclass
@@ -121,9 +269,10 @@ class StartedLlmStage:
     metadata: Any
     vllm_config: Any
     executor_class: type
-    engine_manager: Any
-    coordinator: Any
     addresses: Any
+    proc: Any = None
+    engine_manager: Any = None
+    coordinator: Any = None
 
 
 def extract_stage_metadata(stage_config: Any) -> StageMetadata:
@@ -131,6 +280,20 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     stage_id: int = stage_config.stage_id
     stage_type: Literal["llm", "diffusion"] = getattr(stage_config, "stage_type", "llm")
     engine_args = stage_config.engine_args
+
+    if current_omni_platform.is_rocm():
+        if engine_args.get("attention_backend") is None:
+            from vllm._aiter_ops import rocm_aiter_ops
+
+            if rocm_aiter_ops.is_enabled():
+                engine_args["attention_backend"] = "ROCM_AITER_FA"
+            # Before vLLM v0.19.0, the default attention backend is TRITON_ATTN for ROCm.
+            # Since vLLM v0.19.0, the default attention backend is ROCM_ATTN for ROCm.
+            # However, the compatibility of ROCM_ATTN with Omni is not guaranteed.
+            # Therefore, we still use TRITON_ATTN as the default attention backend,
+            # when the selected_backend is not specified.
+            engine_args["attention_backend"] = "TRITON_ATTN"
+
     runtime_cfg = getattr(stage_config, "runtime", {})
     engine_input_source: list[int] = getattr(stage_config, "engine_input_source", [])
     final_output: bool = getattr(stage_config, "final_output", False)
@@ -141,8 +304,9 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     default_sampling_params: OmniSamplingParams = SPClass(**default_sp)
 
     custom_process_input_func: Callable | None = None
-    if hasattr(stage_config, "custom_process_input_func"):
-        mod_path, fn_name = stage_config.custom_process_input_func.rsplit(".", 1)
+    _cpif_path = getattr(stage_config, "custom_process_input_func", None)
+    if _cpif_path:
+        mod_path, fn_name = _cpif_path.rsplit(".", 1)
         custom_process_input_func = getattr(importlib.import_module(mod_path), fn_name)
 
     prompt_expand_func: Callable | None = None
@@ -248,6 +412,10 @@ def build_engine_args_dict(
     if stage_type != "diffusion":
         resolve_worker_cls(engine_args_dict)
 
+    # Check whether the stage's default_sampling_params defines extra_args.
+    default_sp = _to_dict(getattr(stage_config, "default_sampling_params", {}))
+    engine_args_dict["has_sampling_extra_args"] = bool(default_sp.get("extra_args"))
+
     return engine_args_dict
 
 
@@ -256,6 +424,7 @@ def build_vllm_config(
     model: str,
     stage_connector_spec: dict[str, Any] | None = None,
     engine_args_dict: dict[str, Any] | None = None,
+    headless: bool = False,
 ) -> tuple[Any, type]:
     """Build engine args, then create VllmConfig and executor_class.
 
@@ -271,8 +440,30 @@ def build_vllm_config(
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
-    vllm_config = omni_engine_args.create_engine_config(usage_context=UsageContext.LLM_CLASS)
+
+    # Multi-stage pipelines (qwen3_tts code2wav, etc.) set max_model_len
+    # larger than HF max_position_embeddings by design. vLLM's validator
+    # rejects that without the env flag.
+    if filtered_engine_args_dict.get("max_model_len") is not None and not os.environ.get(
+        "VLLM_ALLOW_LONG_MAX_MODEL_LEN"
+    ):
+        os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+        logger.debug(
+            "Auto-set VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 for stage %s (max_model_len=%s).",
+            stage_config.stage_id,
+            filtered_engine_args_dict["max_model_len"],
+        )
+
+    vllm_config = omni_engine_args.create_engine_config(
+        usage_context=UsageContext.LLM_CLASS,
+        headless=headless,
+    )
     executor_class = Executor.get_class(vllm_config)
+
+    # Upgrade vanilla INCConfig to OmniINCConfig for multi-stage models.
+    upgraded = OmniINCConfig.maybe_upgrade(vllm_config.quant_config)
+    if upgraded is not vllm_config.quant_config:
+        vllm_config = replace(vllm_config, quant_config=upgraded)
 
     return vllm_config, executor_class
 
@@ -280,7 +471,7 @@ def build_vllm_config(
 def acquire_device_locks(
     stage_id: int,
     engine_args_dict: dict[str, Any],
-    stage_init_timeout: int = 300,
+    stage_init_timeout: int,
 ) -> list[int]:
     """Acquire exclusive file locks on devices needed by this stage.
 
@@ -329,7 +520,13 @@ def acquire_device_locks(
             num_devices = current_omni_platform.get_device_count()
             physical_devices = list(range(num_devices))
 
-        num_devices_to_lock = min(num_devices_per_stage, len(physical_devices))
+        if len(physical_devices) < num_devices_per_stage:
+            raise RuntimeError(
+                f"Stage {stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
+                f"but only {len(physical_devices)} device(s) are available: {physical_devices}"
+            )
+
+        num_devices_to_lock = num_devices_per_stage
         devices_to_lock = sorted(physical_devices[:num_devices_to_lock])
 
         logger.debug(
@@ -432,11 +629,45 @@ def get_stage_connector_spec(
     return {}
 
 
-def initialize_diffusion_stage(
+def build_diffusion_config(
     model: str,
     stage_cfg: Any,
     metadata: StageMetadata,
+) -> Any:
+    """Build diffusion config for a stage."""
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    engine_args_dict = build_engine_args_dict(stage_cfg, model)
+    od_config = OmniDiffusionConfig.from_kwargs(**engine_args_dict)
+
+    num_devices_per_stage = od_config.parallel_config.world_size
+    device_control_env = current_omni_platform.device_control_env_var
+    visible_devices_str = os.environ.get(device_control_env) if device_control_env else None
+    if visible_devices_str:
+        physical_devices = [device.strip() for device in visible_devices_str.split(",") if device.strip()]
+    else:
+        physical_devices = list(range(current_omni_platform.get_device_count()))
+
+    if len(physical_devices) < num_devices_per_stage:
+        raise ValueError(
+            f"Stage {metadata.stage_id} requires {num_devices_per_stage} device(s) based on parallel_config, "
+            f"but {len(physical_devices)} device(s) are available: {physical_devices}"
+        )
+
+    od_config.num_gpus = num_devices_per_stage
+    if metadata.cfg_kv_collect_func is not None:
+        od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func
+    return od_config
+
+
+def initialize_diffusion_stage(
+    stage_id: int,
+    model: str,
+    stage_cfg: Any,
+    metadata: StageMetadata,
+    stage_init_timeout: int,
     batch_size: int = 1,
+    use_inline: bool = False,
 ) -> Any:
     """Build a diffusion stage client.
 
@@ -444,40 +675,69 @@ def initialize_diffusion_stage(
         model: Model name or path.
         stage_cfg: Stage configuration.
         metadata: Extracted stage metadata.
+        stage_init_timeout: Timeout in seconds for stage initialization handshake
         batch_size: Maximum number of requests to batch together in the
             diffusion engine.  Passed through to ``StageDiffusionClient``
-            and ultimately to ``AsyncOmniDiffusion``.
+            and ultimately to ``AsyncOmni``.
+        use_inline: If True, uses the inline diffusion client instead of subprocess.
     """
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+    from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
+    engine_args = _to_dict(stage_cfg.engine_args)
+    engine_args.pop("stage_id", None)
     od_config = OmniDiffusionConfig.from_kwargs(
+        stage_id=stage_id,
         model=model,
-        **_to_dict(stage_cfg.engine_args),
+        **engine_args,
     )
     if metadata.cfg_kv_collect_func is not None:
         od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func
-    return StageDiffusionClient(model, od_config, metadata, batch_size=batch_size)
+    od_config = build_diffusion_config(model, stage_cfg, metadata)
+    return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
 
 
-def close_started_llm_stage(started: StartedLlmStage) -> None:
-    """Close managers owned by a launched stage that never attached."""
-    resources = (
-        ("engine manager", started.engine_manager),
-        ("coordinator", started.coordinator),
-    )
-    for resource_name, resource in resources:
-        if resource is None:
-            continue
+def _shutdown_or_close_resource(resource: Any, resource_name: str, stage_id: int) -> None:
+    """vLLM CoreEngineProcManager / coordinators use ``shutdown()``, not ``close()``."""
+    if resource is None:
+        return
+    shutdown = getattr(resource, "shutdown", None)
+    if callable(shutdown):
         try:
-            resource.close()
+            shutdown()
+        except Exception as cleanup_error:
+            logger.warning(
+                "[stage_init] Failed to shutdown launched %s for stage %s: %s",
+                resource_name,
+                stage_id,
+                cleanup_error,
+            )
+        return
+    close = getattr(resource, "close", None)
+    if callable(close):
+        try:
+            close()
         except Exception as cleanup_error:
             logger.warning(
                 "[stage_init] Failed to close launched %s for stage %s: %s",
                 resource_name,
+                stage_id,
+                cleanup_error,
+            )
+
+
+def close_started_llm_stage(started: StartedLlmStage) -> None:
+    """Release resources owned by a launched stage that never attached."""
+    if started.proc is not None:
+        try:
+            terminate_alive_proc(started.proc)
+        except Exception as cleanup_error:
+            logger.warning(
+                "[stage_init] Failed to terminate process for stage %s: %s",
                 started.stage_id,
                 cleanup_error,
             )
+    _shutdown_or_close_resource(started.engine_manager, "engine manager", started.stage_id)
+    _shutdown_or_close_resource(started.coordinator, "coordinator", started.stage_id)
 
 
 def finalize_initialized_stages(

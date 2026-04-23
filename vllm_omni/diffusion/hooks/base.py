@@ -8,6 +8,7 @@ and modifying model forward passes without invasive changes to model code.
 
 from __future__ import annotations
 
+import functools
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -94,10 +95,9 @@ class ModelHook:
         return output
 
     def new_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> Any:
-        """Override the module's forward pass completely.
-
-        The default implementation calls pre_forward, then the original forward,
-        then post_forward. Override this method for more complex behavior.
+        """Override the module's forward pass. This should be overridden for more complex
+        cases, e.g., TeaCache. If this method is overridden in a subclass, it will be called
+        instead of self.module._omni_original_forward when executing the hooks.
 
         Args:
             module: The module being called.
@@ -105,11 +105,9 @@ class ModelHook:
             **kwargs: Keyword arguments to forward.
 
         Returns:
-            The output of the forward pass.
+            The output of the replacement for the forward pass.
         """
-        args, kwargs = self.pre_forward(module, *args, **kwargs)
-        output = module._omni_original_forward(*args, **kwargs)  # type: ignore[attr-defined]
-        return self.post_forward(module, output)
+        raise NotImplementedError("By default, hooks do not implement new_forward")
 
     def reset_state(self, module: nn.Module) -> nn.Module:
         """Reset any state associated with this hook.
@@ -136,6 +134,21 @@ class _WrappedForward:
         return registry.dispatch(*args, **kwargs)
 
 
+def sort_hooks_after_call(func):
+    """Calls the method on the hook registry, then sorts the hooks.
+
+    This should be added to methods that mutate add or remove hooks.
+    """
+
+    @functools.wraps(func)
+    def wrapper(self: HookRegistry, *args, **kwargs):
+        res = func(self, *args, **kwargs)
+        self.update_sorted_hooks()
+        return res
+
+    return wrapper
+
+
 class HookRegistry:
     """Registry of hooks attached to a module.
 
@@ -146,6 +159,10 @@ class HookRegistry:
     def __init__(self, module: nn.Module):
         self.module = module
         self._hooks: dict[str, ModelHook] = {}
+        # Hooks sorted by execution order
+        self._sorted_hooks: list[ModelHook] = []
+        # Hooks overriding new_forward (if any)
+        self._new_fwd_impl_hook: ModelHook | None = None
 
     @classmethod
     def get_or_create(cls, module: nn.Module) -> HookRegistry:
@@ -173,6 +190,14 @@ class HookRegistry:
 
         return registry
 
+    def update_sorted_hooks(self):
+        """Sort hooks by name, which dictates pre/post process order."""
+        sorted_hooks = [self._hooks[k] for k in sorted(self._hooks) if self._hooks[k] != self._new_fwd_impl_hook]
+        if self._new_fwd_impl_hook is not None:
+            sorted_hooks.append(self._new_fwd_impl_hook)
+        self._sorted_hooks = sorted_hooks
+
+    @sort_hooks_after_call
     def register_hook(self, name: str, hook: ModelHook) -> None:
         """Register a hook with the given name.
 
@@ -182,7 +207,14 @@ class HookRegistry:
         """
         hook.initialize_hook(self.module)
         self._hooks[name] = hook
+        # We can only have one hook that overrides new_forward,
+        # since we don't currently have a mechanism for combining them.
+        if type(hook).new_forward is not ModelHook.new_forward:
+            if self._new_fwd_impl_hook is not None:
+                raise RuntimeError("Cannot have multiple hooks that override forward active simultaneously")
+            self._new_fwd_impl_hook = hook
 
+    @sort_hooks_after_call
     def remove_hook(self, name: str) -> None:
         """Remove a hook by name.
 
@@ -190,6 +222,9 @@ class HookRegistry:
             name: The name of the hook to remove.
         """
         if name in self._hooks:
+            # clear the forward hook if it's the one to delete
+            if self._new_fwd_impl_hook is self._hooks[name]:
+                self._new_fwd_impl_hook = None
             del self._hooks[name]
 
     def get_hook(self, name: str) -> ModelHook | None:
@@ -206,8 +241,18 @@ class HookRegistry:
     def dispatch(self, *args: Any, **kwargs: Any) -> Any:
         """Dispatch a forward call through registered hooks.
 
-        Currently supports a single active hook. Multiple hooks are called
-        in sorted order by name, with each hook's output passed to the next.
+        Multiple hooks may be used with the caveat that only one hook
+        may override new_forward. While it is assumed that pre/post process
+        on hooks are composable, the execution flow is as follows for determinism:
+
+        - Run preprocess on all hooks in their sorted order; hooks are sorted alphabetically,
+          except for the hook overriding forward (`self._new_fwd_impl_hook`), which is last
+          if it exists.
+
+        - If `self._new_fwd_impl_hook` isn't None, call its forward. Otherwise call the
+          original model forward.
+
+        - Run post process on all hooks in the reverse sorted order.
 
         Args:
             *args: Positional arguments to forward.
@@ -219,24 +264,19 @@ class HookRegistry:
         if not self._hooks:
             return self.module._omni_original_forward(*args, **kwargs)  # type: ignore[attr-defined]
 
-        # For single hook case, call directly
-        if len(self._hooks) == 1:
-            hook = next(iter(self._hooks.values()))
-            return hook.new_forward(self.module, *args, **kwargs)
-
-        # For multiple hooks, chain them in sorted order
-        # Each hook can modify args/kwargs via pre_forward
-        sorted_hooks = sorted(self._hooks.items(), key=lambda x: x[0])
-
-        # Apply all pre_forward hooks
-        for _, hook in sorted_hooks:
+        # Apply all pre_forward hooks; if _new_fwd_impl_hook is set, it's last
+        for hook in self._sorted_hooks:
             args, kwargs = hook.pre_forward(self.module, *args, **kwargs)
 
-        # Call original forward
-        output = self.module._omni_original_forward(*args, **kwargs)  # type: ignore[attr-defined]
+        # If we have a hook that overrides new_forward, call it directly
+        if self._new_fwd_impl_hook is not None:
+            output = self._new_fwd_impl_hook.new_forward(self.module, *args, **kwargs)
+        # Otherwise just call the original forward.
+        else:
+            output = self.module._omni_original_forward(*args, **kwargs)  # type: ignore[attr-defined]
 
-        # Apply all post_forward hooks in reverse order
-        for _, hook in reversed(sorted_hooks):
+        # Apply all post_forward hooks in reverse order; if _new_fwd_impl_hook is set, it's first
+        for hook in reversed(self._sorted_hooks):
             output = hook.post_forward(self.module, output)
 
         return output

@@ -8,7 +8,6 @@ from typing import Any
 
 import pytest
 
-from tests.conftest import OmniServer
 from tests.dfx.conftest import (
     create_benchmark_indices,
     create_test_parameter_mapping,
@@ -16,17 +15,44 @@ from tests.dfx.conftest import (
     get_benchmark_params_for_server,
     load_configs,
 )
+from tests.helpers.runtime import OmniServer
+
+pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 
-CONFIG_FILE_PATH = str(Path(__file__).parent.parent / "tests" / "test.json")
+def _get_config_file_from_argv() -> str | None:
+    """Read ``--test-config-file`` from ``sys.argv`` at import time so parametrization can use it."""
+    import sys
+
+    for i, arg in enumerate(sys.argv):
+        if arg == "--test-config-file" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if arg.startswith("--test-config-file="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+_PERF_TESTS_DIR = Path(__file__).resolve().parent.parent / "tests"
+_DEFAULT_CONFIG_FILE = str(_PERF_TESTS_DIR / "test_qwen_omni.json")
+
+CONFIG_FILE_PATH = _get_config_file_from_argv()
+if CONFIG_FILE_PATH is None:
+    print(
+        "No --test-config-file in argv, using default: tests/dfx/perf/tests/test_qwen_omni.json "
+        "(override with e.g. --test-config-file tests/dfx/perf/tests/test_tts.json)"
+    )
+    CONFIG_FILE_PATH = _DEFAULT_CONFIG_FILE
+
 BENCHMARK_CONFIGS = load_configs(CONFIG_FILE_PATH)
+OMNI_RESULT_TEMPLATE_PATH = Path(__file__).parent / "result_omni_template.json"
 
 
-STAGE_CONFIGS_DIR = Path(__file__).parent.parent / "stage_configs"
-test_params = create_unique_server_params(BENCHMARK_CONFIGS, STAGE_CONFIGS_DIR)
+DEPLOY_CONFIGS_DIR = Path(__file__).parent.parent / "deploy"
+test_params = create_unique_server_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR)
 server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS)
 
 _omni_server_lock = threading.Lock()
@@ -39,13 +65,19 @@ def omni_server(request):
     Multi-stage initialization can take 10-20+ minutes.
     """
     with _omni_server_lock:
-        test_name, model, stage_config_path = request.param
+        test_name, model, stage_config_path, stage_overrides, extra_cli_args = request.param
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
-        server_args = ["--stage-init-timeout", "120"]
+        server_args = ["--stage-init-timeout", "600", "--init-timeout", "900"]
+        # --deploy-config and --stage-overrides compose at the CLI (see vllm_omni/entrypoints/utils.py):
+        # deploy-config sets the base; stage-overrides are applied on top. Both can be set.
         if stage_config_path:
-            server_args = ["--stage-configs-path", stage_config_path] + server_args
+            server_args = ["--deploy-config", stage_config_path] + server_args
+        if stage_overrides:
+            server_args = ["--stage-overrides", stage_overrides] + server_args
+        if extra_cli_args:
+            server_args = list(extra_cli_args) + server_args
         with OmniServer(model, server_args) as server:
             server.test_name = test_name
             print("OmniServer started successfully")
@@ -55,16 +87,41 @@ def omni_server(request):
         print("OmniServer stopped")
 
 
+def _safe_filename_token(value: Any | None, *, default: str = "na") -> str:
+    """Make a single path segment safe for result filenames on common filesystems."""
+    if value is None:
+        return default
+    s = str(value).strip()
+    for bad in ("/", "\\", ":", "*", "?", '"', "<", ">", "|"):
+        s = s.replace(bad, "_")
+    return s if s else default
+
+
 def run_benchmark(
     args: list,
     test_name: str,
     flow,
     dataset_name: str,
     num_prompt,
+    *,
+    baseline_config: dict[str, Any] | None = None,
+    sweep_index: int | None = None,
+    request_rate: Any | None = None,
+    max_concurrency: Any | None = None,
+    random_input_len: Any | None = None,
+    random_output_len: Any | None = None,
 ) -> Any:
-    """Run a single benchmark iteration and return the parsed result JSON."""
+    """Run a single benchmark iteration and return the parsed result JSON.
+
+    After ``vllm bench`` writes the JSON, ``result["baseline"]`` holds the same
+    per-metric resolved thresholds as ``assert_result`` (via ``_baseline_thresholds_for_step``).
+    When ``random_input_len`` / ``random_output_len`` are set, they are also written into the result JSON;
+    omitted keys when not configured.
+    """
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
-    result_filename = f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_{current_dt}.json"
+    ri = _safe_filename_token(random_input_len)
+    ro = _safe_filename_token(random_output_len)
+    result_filename = f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_in{ri}_out{ro}_{current_dt}.json"
     if "--result-filename" in args:
         print(f"The result file will be overwritten by {result_filename}")
     command = (
@@ -94,8 +151,34 @@ def run_benchmark(
     else:
         result_dir = "./"
 
-    with open(os.path.join(result_dir, result_filename), encoding="utf-8") as f:
-        result = json.load(f)
+    result_path = os.path.join(result_dir, result_filename)
+    if not os.path.exists(result_path):
+        with open(OMNI_RESULT_TEMPLATE_PATH, encoding="utf-8") as f:
+            template_result: dict[str, Any] = json.load(f)
+        Path(result_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(template_result, f, ensure_ascii=False, indent=2)
+        print(f"Benchmark result file not generated, fallback to template: {result_path}")
+        result = template_result
+    else:
+        with open(result_path, encoding="utf-8") as f:
+            result = json.load(f)
+
+    if baseline_config:
+        result["baseline"] = _baseline_thresholds_for_step(
+            baseline_config,
+            sweep_index=sweep_index,
+            request_rate=request_rate,
+            max_concurrency=max_concurrency,
+        )
+    else:
+        result["baseline"] = {}
+    if random_input_len is not None:
+        result["random_input_len"] = random_input_len
+    if random_output_len is not None:
+        result["random_output_len"] = random_output_len
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
     return result
 
 
@@ -165,6 +248,25 @@ def _resolve_baseline_value(
     return baseline_raw
 
 
+def _baseline_thresholds_for_step(
+    baseline_data: dict[str, Any],
+    *,
+    sweep_index: int | None = None,
+    max_concurrency: Any = None,
+    request_rate: Any = None,
+) -> dict[str, Any]:
+    """Resolve ``test.json`` ``baseline`` block to one threshold per metric (same as ``assert_result``)."""
+    return {
+        metric_name: _resolve_baseline_value(
+            baseline_raw,
+            sweep_index=sweep_index,
+            max_concurrency=max_concurrency,
+            request_rate=request_rate,
+        )
+        for metric_name, baseline_raw in baseline_data.items()
+    }
+
+
 def assert_result(
     result,
     params,
@@ -194,6 +296,7 @@ def assert_result(
                 print(f"ERROR: Test results exceeded baseline: {metric_name}: {current_value} < {baseline_value}")
 
 
+@pytest.mark.benchmark
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.parametrize("benchmark_params", benchmark_indices, indirect=True)
 def test_performance_benchmark(omni_server, benchmark_params):
@@ -255,6 +358,12 @@ def test_performance_benchmark(omni_server, benchmark_params):
             flow=qps,
             dataset_name=dataset_name,
             num_prompt=num_prompt,
+            baseline_config=params.get("baseline"),
+            sweep_index=i,
+            request_rate=qps,
+            max_concurrency=None,
+            random_input_len=params.get("random_input_len"),
+            random_output_len=params.get("random_output_len"),
         )
         assert_result(
             result,
@@ -273,6 +382,12 @@ def test_performance_benchmark(omni_server, benchmark_params):
             flow=concurrency,
             dataset_name=dataset_name,
             num_prompt=num_prompt,
+            baseline_config=params.get("baseline"),
+            sweep_index=i,
+            request_rate=None,
+            max_concurrency=concurrency,
+            random_input_len=params.get("random_input_len"),
+            random_output_len=params.get("random_output_len"),
         )
         assert_result(
             result,

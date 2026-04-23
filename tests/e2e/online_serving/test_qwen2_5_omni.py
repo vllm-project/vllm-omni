@@ -3,20 +3,13 @@ E2E Online tests for Qwen2.5-Omni model with video input and audio output.
 """
 
 import os
-from pathlib import Path
 
 import pytest
 
-from tests.conftest import (
-    OmniServerParams,
-    dummy_messages_from_mix_data,
-    generate_synthetic_audio,
-    generate_synthetic_image,
-    generate_synthetic_video,
-    modify_stage_config,
-)
-from tests.utils import hardware_test
-from vllm_omni.platforms import current_omni_platform
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
@@ -24,20 +17,9 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 models = ["Qwen/Qwen2.5-Omni-7B"]
 
-
-def get_config():
-    path = modify_stage_config(
-        str(Path(__file__).parent.parent / "stage_configs" / "qwen2_5_omni_ci.yaml"),
-    )
-    return path
-
-
-# CI stage config for 2xH100-80G GPUs or AMD GPU MI325
-if current_omni_platform.is_rocm():
-    # ROCm stage config optimized for MI325 GPU
-    stage_configs = [str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen2_5_omni_ci.yaml")]
-else:
-    stage_configs = [get_config()]
+# Single CI deploy YAML; rocm/xpu deltas are picked automatically via the
+# platforms: section in vllm_omni/deploy/ci/qwen2_5_omni.yaml.
+stage_configs = [modify_stage_config(get_deploy_config_path("ci/qwen2_5_omni.yaml"))]
 
 # Create parameter combinations for model and stage config
 test_params = [

@@ -73,7 +73,6 @@ vllm_omni/                                    tests/
 │   └── arg_utils.py                            │   └── test_arg_utils.py               ⬜
 │
 ├── entrypoints/                        →     ├── entrypoints/
-│   ├── async_omni_diffusion.py                 │   ├── test_async_omni_diffusion_config.py  ✅
 │   ├── stage_utils.py                          │   ├── test_stage_utils.py            ✅
 │   ├── cli/                                     │   ├── cli/                           (benchmarks/test_serve_cli.py covers CLI serve)
 │   │   └── ...                                  │   │   └── test_*.py                  ⬜
@@ -136,8 +135,7 @@ vllm_omni/                                    tests/
                                                │   ├── test_qwen3_omni_expansion.py
                                                │   ├── test_mimo_audio.py
                                                │   ├── test_image_gen_edit.py
-                                               │   ├── test_images_generations_lora.py
-                                               │   └── stage_configs/
+                                               │   └── test_images_generations_lora.py
                                                └── offline_inference/                  ✅
                                                    ├── test_qwen2_5_omni.py
                                                    ├── test_qwen3_omni.py
@@ -148,17 +146,18 @@ vllm_omni/                                    tests/
                                                    ├── test_zimage_tensor_parallel.py
                                                    ├── test_cache_dit.py
                                                    ├── test_teacache.py
-                                                   ├── test_stable_audio_model.py
+                                                   ├── test_stable_audio_expansion.py
                                                    ├── test_diffusion_cpu_offload.py
                                                    ├── test_diffusion_layerwise_offload.py
                                                    ├── test_diffusion_lora.py
                                                    ├── test_sequence_parallel.py
                                                    ├── test_qwen_image_edit_expansion.py
-                                                   └── stage_configs/
-                                                       ├── qwen2_5_omni_ci.yaml
-                                                       ├── qwen3_omni_ci.yaml
-                                                       ├── bagel_*.yaml
+                                                   └── stage_configs/                  (legacy schema, still present
+                                                       ├── bagel_*.yaml                 for unmigrated models)
                                                        └── npu/, rocm/, etc.
+
+# Migrated models (qwen3_omni_moe, qwen2_5_omni, qwen3_tts) live under
+# vllm_omni/deploy/ instead — see docs/configuration/stage_configs.md.
 examples/                                     tests
 │                                             └── examples
 ├── online_serving/                     →         ├── online_serving/
@@ -222,14 +221,13 @@ from pathlib import Path
 import openai
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    convert_audio_to_text,
+from tests.helpers.media import (
+    convert_audio_bytes_to_text,
     cosine_similarity_text,
-    dummy_messages_from_mix_data,
     generate_synthetic_video,
-    merge_base64_and_convert_to_text,
 )
+from tests.helpers.runtime import OmniServer, dummy_messages_from_mix_data
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.platforms import current_omni_platform
 
 # Edit: model name and stage config path
@@ -237,7 +235,7 @@ models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
 #If you use the default configuration file, you can directly use the following address.
 def get_default_config():
-    return str(Path(__file__).parent.parent / "stage_configs" / "qwen3_omni_ci.yaml")
+    return get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 
 #If you need to modify the configuration file, you can use modify_stage_config.
 def get_chunk_config():
@@ -406,7 +404,7 @@ def test_mix_to_text_audio_001(client: openai.OpenAI, omni_server, request) -> N
     # PURPOSE: Verify text and audio outputs convey the same information
     # CUSTOMIZATION: Adjust similarity threshold (0.9) based on accuracy requirements
     assert audio_data is not None, "No audio output is generated"
-    audio_content = merge_base64_and_convert_to_text(audio_data)
+    audio_content = convert_audio_bytes_to_text(audio_data)
     print(f"text content is: {text_content}")
     print(f"audio content is: {audio_content}")
     similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
@@ -429,7 +427,7 @@ from pathlib import Path
 import pytest
 from vllm.assets.video import VideoAsset
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 from ..multi_stages.conftest import OmniRunner
 
 # Optional: set process start method for workers

@@ -2,46 +2,39 @@
 E2E tests for Qwen2.5-Omni model with mixed modality inputs, audio and text output.
 """
 
-from pathlib import Path
-
 import pytest
 
-from tests.conftest import (
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import (
     generate_synthetic_audio,
     generate_synthetic_image,
     generate_synthetic_video,
-    modify_stage_config,
 )
-from tests.utils import hardware_test
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen2.5-Omni-7B"]
 
+# Single CI deploy YAML; rocm/xpu deltas are picked automatically via the
+# platforms: section. NPU still uses the legacy per-platform YAML until it
+# also migrates to the new schema.
+_CI_DEPLOY = get_deploy_config_path("ci/qwen2_5_omni.yaml")
+
 
 def get_cuda_graph_config():
-    path = modify_stage_config(
-        str(Path(__file__).parent.parent / "stage_configs" / "qwen2_5_omni_ci.yaml"),
+    return modify_stage_config(
+        _CI_DEPLOY,
         updates={
-            "stage_args": {
-                0: {
-                    "engine_args.enforce_eager": "true",
-                },
-                1: {"engine_args.enforce_eager": "true"},
+            "stages": {
+                0: {"enforce_eager": True},
+                1: {"enforce_eager": True},
             },
         },
     )
-    return path
 
 
-# CI stage config optimized for 24GB GPU (L4/RTX3090) or NPU
-if current_omni_platform.is_npu():
-    stage_config = str(Path(__file__).parent / "stage_configs" / "npu" / "qwen2_5_omni_ci.yaml")
-elif current_omni_platform.is_rocm():
-    # ROCm stage config optimized for MI325 GPU
-    stage_config = str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen2_5_omni_ci.yaml")
-elif current_omni_platform.is_xpu():
-    # Intel XPU stage config optimized for B60 GPU
-    stage_config = str(Path(__file__).parent.parent / "stage_configs" / "xpu" / "qwen2_5_omni_ci.yaml")
+if current_omni_platform.is_rocm() or current_omni_platform.is_xpu() or current_omni_platform.is_npu():
+    stage_config = _CI_DEPLOY
 else:
     stage_config = get_cuda_graph_config()
 

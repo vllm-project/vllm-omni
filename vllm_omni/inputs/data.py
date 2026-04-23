@@ -16,7 +16,7 @@ except ImportError:
 
 
 import torch
-from vllm.inputs.data import EmbedsPrompt, TextPrompt, TokenInputs, TokensPrompt
+from vllm.inputs import EmbedsPrompt, TextPrompt, TokensInput, TokensPrompt
 
 
 class OmniTextPrompt(TextPrompt):
@@ -59,10 +59,10 @@ class OmniTokensPrompt(TokensPrompt):
     additional_information: NotRequired[dict[str, Any]]
 
 
-class OmniTokenInputs(TokenInputs):
+class OmniTokenInputs(TokensInput):
     """Token inputs with optional embeddings and additional information.
 
-    Extends TokenInputs to support prompt embeddings and additional
+    Extends TokensInput to support prompt embeddings and additional
     information payloads for direct transfer between pipeline stages.
 
     Attributes:
@@ -227,6 +227,10 @@ class OmniDiffusionSamplingParams:
     frame_rate: float | None = None  # Floating-point rate used by the diffusion model when it differs from `fps`.
     height_not_provided: bool = False
     width_not_provided: bool = False
+    enable_frame_interpolation: bool = False
+    frame_interpolation_exp: int = 1
+    frame_interpolation_scale: float = 1.0
+    frame_interpolation_model_path: str | None = None
 
     # Timesteps
     timesteps: torch.Tensor | None = None
@@ -241,6 +245,7 @@ class OmniDiffusionSamplingParams:
     guidance_scale_provided: bool = False
     guidance_scale_2: float | None = None
     guidance_rescale: float = 0.0
+    strength: float | None = None  # I2I: Z-Image specific now, uses to control denoising start timestep
     decode_timestep: float | list[float] | None = None
     decode_noise_scale: float | list[float] | None = None
     eta: float = 0.0
@@ -262,6 +267,10 @@ class OmniDiffusionSamplingParams:
     cfg_text_kv_metadata: dict[str, Any] | None = None
     cfg_img_kv_metadata: dict[str, Any] | None = None
     cfg_kv_request_ids: dict[str, str] | None = None
+    cfg_active_branch: str | None = None
+    cfg_branch_roles: list[str] | None = None
+    cfg_branch_past_key_values: dict[str, Any] | None = None
+    cfg_branch_kv_metadata: dict[str, dict[str, Any]] | None = None
 
     # Component modules
     modules: dict[str, Any] = field(default_factory=dict)

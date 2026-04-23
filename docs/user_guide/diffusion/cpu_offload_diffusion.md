@@ -36,6 +36,45 @@ m = Omni(model="Wan-AI/Wan2.2-T2V-A14B-Diffusers", enable_cpu_offload=True)
 vllm-omni serve diffusion Wan-AI/Wan2.2-T2V-A14B-Diffusers --enable-cpu-offload
 ```
 
+### To Support a Model
+
+Implement the `SupportsModuleOffload` protocol to declare which
+submodules participate in offloading:
+
+```python
+from typing import ClassVar
+from vllm_omni.diffusion.models.interface import SupportsModuleOffload
+
+class MyPipeline(nn.Module, SupportsModuleOffload):
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["text_encoder", "vision_model"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
+    _resident_modules: ClassVar[list[str]] = []  # optional
+
+    def __init__(self):
+        super().__init__()
+        self.transformer = ...     # DiT — stays on GPU during denoising
+        self.text_encoder = ...    # Encoder — offloaded to CPU during denoising
+        self.vision_model = ...    # Encoder — offloaded to CPU during denoising
+        self.vae = ...             # VAE — always on GPU
+```
+
+- `_dit_modules`: attribute names of denoising submodules (kept on GPU
+  during the diffusion loop).
+- `_encoder_modules`: attribute names of encoder/vision submodules
+  (offloaded to CPU during the diffusion loop).
+- `_vae_modules`: attribute names of VAE(s) (always kept on GPU, not
+  part of the mutual exclusion hooks).
+- `_resident_modules`: attribute names of small submodules that must
+  stay on GPU during layerwise offloading (e.g. embedders, connectors).
+  Optional — defaults to `[]`.
+
+All attribute names support dotted paths for nested submodules
+(e.g. `"pipe.transformer"`, `"bagel.time_embedder"`).
+
+Both DiT and encoder lists are needed because the offload hooks use
+mutual exclusion: when one group runs, the other moves to CPU.
+
 ### Limitations
 - Cold start latency increases
 - Adds overhead from CPU-GPU transfers between encoder and denoising phases
@@ -91,10 +130,17 @@ Models must define the blocks attribute name for layerwise offloading:
 
 ```python
 class WanTransformer3DModel(nn.Module):
-    _layerwise_offload_blocks_attr = "blocks"  # Attribute name containing transformer blocks
+    _layerwise_offload_blocks_attrs = ["blocks"]  # Attribute names containing transformer blocks
 
     def __init__(self):
         self.blocks = nn.ModuleList([...])  # Transformer blocks
+```
+
+For models with multiple block types:
+
+```python
+class Flux2Transformer2DModel(nn.Module):
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 ```
 
 ### Limitations
@@ -109,11 +155,19 @@ class WanTransformer3DModel(nn.Module):
 
 **Module Discovery**
 
-The offloader automatically discovers pipeline components:
+The offloader discovers pipeline components in two ways:
 
-- **DiT modules**: `transformer`, `transformer_2`, `dit`
-- **Encoders**: `text_encoder`, `text_encoder_2`, `text_encoder_3`, `image_encoder`
-- **VAE**: `vae`
+1. **Protocol-based** (preferred): If the pipeline implements
+    `SupportsModuleOffload`, its `_dit_modules`, `_encoder_modules`,
+    `_vae_modules`, and `_resident_modules` class variables are used
+    directly.  All attribute names support dotted paths (e.g.
+    `"pipe.transformer"`, `"bagel.time_embedder"`) for nested submodules.
+
+2. **Fallback attribute scan**: Otherwise, the offloader scans for
+    well-known attribute names:
+    - **DiT modules**: `transformer`, `transformer_2`, `dit`, `sr_dit`, `language_model`, `transformer_blocks`, `model`
+    - **Encoders**: `text_encoder`, `text_encoder_2`, `text_encoder_3`, `image_encoder`
+    - **VAE**: `vae`, `audio_vae`
 
 **Hook System**
 
@@ -132,12 +186,16 @@ Factory function `get_offload_backend()` selects the appropriate backend based o
 
 ## Supported Models
 
-| Architecture | Example Models | DiT Class | Model-Level Offload | Layerwise Offload | Blocks Attr (Layerwise specific) |
-|--------------|----------------|-----------|---------------------|-------------------|-------------|
-| Wan22Pipeline | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
-| Wan22I2VPipeline | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
+| Architecture | Example Models | DiT Class | Model-Level Offload | Layerwise Offload | Blocks Attrs (Layerwise specific) |
+|--------------|----------------|-----------|---------------------|-------------------|-----------------------------------|
+| LongCatImagePipeline | `meituan-longcat/LongCat-Image` | `LongCatImageTransformer2DModel` | - | ✓ | `"transformer_blocks"`, `"single_transformer_blocks"` |
+| NextStep11Pipeline | `stepfun-ai/NextStep-1.1` | `NextStepModel` | - | ✓ | `"layers"` |
+| OvisImagePipeline | `AIDC-AI/Ovis-Image-7B` | `OvisImageTransformer2DModel` | - | ✓ | `"transformer"` |
 | QwenImagePipeline | `Qwen/Qwen-Image` | `QwenImageTransformer2DModel` | ✓ | ✓ | `"transformer_blocks"` |
+| StableDiffusion3Pipeline | `stabilityai/stable-diffusion-3.5-medium` | `SD3Transformer2DModel` | - | ✓ | `"transformer_blocks"` |
+| Wan22I2VPipeline | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
+| Wan22Pipeline | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
 
 **Notes:**
 - Model-Level Offloading is expected to be supported by all common diffusion models (DiT and encoders) naturally
-- Layerwise Offloading requires DiT class to define `_layerwise_offload_blocks_attr` pointing to transformer blocks
+- Layerwise Offloading requires DiT class to define `_layerwise_offload_blocks_attrs` pointing to transformer blocks

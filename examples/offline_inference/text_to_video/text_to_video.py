@@ -56,8 +56,13 @@ def parse_args() -> argparse.Namespace:
         "Examples: Wan-AI/Wan2.2-T2V-A14B-Diffusers, "
         "hunyuanvideo-community/HunyuanVideo-1.5-480p_t2v",
     )
+    parser.add_argument(
+        "--model-class-name",
+        default=None,
+        help="Override model class name (e.g., LTX2TwoStagesVideoPipeline).",
+    )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
-    parser.add_argument("--negative-prompt", default="", help="Negative prompt (Wan2.2 only).")
+    parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--guidance-scale", type=float, default=None, help="CFG scale. Default: model-specific.")
     parser.add_argument(
@@ -155,7 +160,7 @@ def parse_args() -> argparse.Namespace:
         "--audio-sample-rate",
         type=int,
         default=24000,
-        help="Sample rate for audio output when saved (default: 24000 for LTX2).",
+        help="Sample rate for audio output when saved (default: 24000).",
     )
     parser.add_argument(
         "--vae-patch-parallel-size",
@@ -185,6 +190,7 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
+    model_class_name = args.model_class_name
 
     preset = _detect_preset(args.model)
     for key, default_val in preset.items():
@@ -229,6 +235,7 @@ def main():
         enable_cpu_offload=args.enable_cpu_offload,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
+        model_class_name=model_class_name,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
@@ -423,17 +430,8 @@ def main():
 
     video_array = _ensure_frame_list(video_array)
 
-    use_ltx2_export = False
-    if args.model and "ltx" in str(args.model).lower():
-        use_ltx2_export = True
     if audio is not None:
-        use_ltx2_export = True
-
-    if use_ltx2_export:
-        try:
-            from diffusers.pipelines.ltx2.export_utils import encode_video
-        except ImportError:
-            raise ImportError("diffusers is required for LTX2 encode_video.")
+        from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 
         if isinstance(video_array, list):
             frames_np = np.stack(video_array, axis=0)
@@ -442,28 +440,24 @@ def main():
         else:
             frames_np = np.asarray(video_array)
 
-        frames_u8 = (frames_np * 255).round().clip(0, 255).astype("uint8")
-        video_tensor = torch.from_numpy(frames_u8)
+        frames_u8 = (np.clip(frames_np, 0.0, 1.0) * 255).round().clip(0, 255).astype("uint8")
 
-        audio_out = None
-        if audio is not None:
-            if isinstance(audio, list):
-                audio = audio[0] if audio else None
-            if isinstance(audio, np.ndarray):
-                audio = torch.from_numpy(audio)
-            if isinstance(audio, torch.Tensor):
-                audio_out = audio
-                if audio_out.dim() > 1:
-                    audio_out = audio_out[0]
-                audio_out = audio_out.float().cpu()
+        audio_np = audio
+        if isinstance(audio_np, list):
+            audio_np = audio_np[0] if audio_np else None
+        if isinstance(audio_np, torch.Tensor):
+            audio_np = audio_np.detach().cpu().float().numpy()
+        if isinstance(audio_np, np.ndarray):
+            audio_np = np.squeeze(audio_np).astype(np.float32)
 
-        encode_video(
-            video_tensor,
-            fps=args.fps,
-            audio=audio_out,
-            audio_sample_rate=args.audio_sample_rate if audio_out is not None else None,
-            output_path=str(output_path),
+        video_bytes = mux_video_audio_bytes(
+            frames_u8,
+            audio_np,
+            fps=float(args.fps),
+            audio_sample_rate=args.audio_sample_rate,
         )
+        with open(str(output_path), "wb") as f:
+            f.write(video_bytes)
     else:
         export_to_video(video_array, str(output_path), fps=args.fps)
     print(f"Saved generated video to {output_path}")
