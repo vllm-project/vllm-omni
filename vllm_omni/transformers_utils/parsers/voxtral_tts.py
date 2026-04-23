@@ -20,12 +20,7 @@ _VOXTRAL_TTS_MODEL_TYPE = "voxtral_tts"
 
 
 def _is_voxtral_tts_params(config_dict: dict) -> bool:
-    """Return True if the Mistral params.json describes a Voxtral-TTS model.
-
-    Voxtral-TTS checkpoints expose ``model_type: "voxtral_tts"`` at the top level
-    of params.json and typically omit ``architectures`` — so matching on either
-    field is required to route reliably.
-    """
+    """Return True if the Mistral params.json describes a Voxtral-TTS model"""
     if config_dict.get("model_type") == _VOXTRAL_TTS_MODEL_TYPE:
         return True
     architectures = set(config_dict.get("architectures") or [])
