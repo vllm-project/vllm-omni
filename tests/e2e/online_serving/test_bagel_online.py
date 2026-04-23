@@ -118,6 +118,8 @@ def test_bagel_img2img_online(omni_server, openai_client) -> None:
         "messages": _build_img2img_messages(IMG2IMG_PROMPT, image_b64),
         "modalities": ["image"],
         "extra_body": {
+            "height": 512,
+            "width": 512,
             "num_inference_steps": 2,
             "guidance_scale": 0.0,
             "seed": 42,
