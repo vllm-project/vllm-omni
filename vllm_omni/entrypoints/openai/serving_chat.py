@@ -766,8 +766,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             try:
                 from vllm_omni.model_executor.stage_input_processors.glm_image import compute_max_tokens
 
-                if "max_tokens" not in explicit_fields:
-                    params.max_tokens = compute_max_tokens(int(height), int(width), is_i2i=is_img2img)
+                max_tokens = getattr(explicit_fields, "max_tokens", None)
+                if max_tokens is None:
+                    max_tokens = compute_max_tokens(int(height), int(width), is_i2i=is_img2img)
+                params.max_tokens = max_tokens
                 # Keep target size in stage-0 sampling params so runner/model can
                 # build deterministic M-RoPE grids for t2i (no MM features).
                 extra_args = dict(getattr(params, "extra_args", {}) or {})
