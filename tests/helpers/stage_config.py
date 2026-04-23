@@ -273,7 +273,6 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "max_num_seqs": 1,
                 "gpu_memory_utilization": 0.9,
                 "skip_mm_profiling": True,
-                "load_format": "dummy",
                 "default_sampling_params": {"max_tokens": 128},
             },
             {
@@ -283,7 +282,6 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "max_num_seqs": 1,
                 "gpu_memory_utilization": 0.4,
                 "skip_mm_profiling": True,
-                "load_format": "dummy",
                 "default_sampling_params": {"max_tokens": 4096},
             },
             {
@@ -292,7 +290,6 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "gpu_memory_utilization": 0.5,
                 "max_num_batched_tokens": 8192,
                 "max_model_len": 8192,
-                "load_format": "dummy",
                 "devices": "2",
                 "default_sampling_params": {"max_tokens": 8192},
             },
@@ -334,7 +331,6 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "max_num_seqs": 5,
                 "max_model_len": 32768,
                 "mm_processor_cache_gb": 0,
-                "load_format": "dummy",
                 "default_sampling_params": {"max_tokens": 150, "ignore_eos": False},
             },
             {
@@ -342,14 +338,12 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "gpu_memory_utilization": 0.5,
                 "max_num_seqs": 5,
                 "max_model_len": 32768,
-                "load_format": "dummy",
                 "default_sampling_params": {"max_tokens": 1000},
             },
             {
                 "stage_id": 2,
                 "max_num_seqs": 5,
                 "max_num_batched_tokens": 100000,
-                "load_format": "dummy",
                 "default_sampling_params": {"max_tokens": 2000},
             },
         ],
@@ -425,7 +419,6 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "max_model_len": 16384,
                 "skip_mm_profiling": True,
                 "mm_processor_cache_gb": 0,
-                "load_format": "dummy",
                 "devices": "0",
                 "default_sampling_params": {
                     "temperature": 0.0,

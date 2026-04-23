@@ -36,21 +36,20 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
         model = model_prefix + params.model
         port = params.port
         stage_config_path = params.stage_config_path
-        if run_level in {"advanced_model", "full_model"} and stage_config_path is not None:
+        if run_level == "core_model" and stage_config_path is not None:
             with open(stage_config_path, encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
-            # Strip ``load_format: dummy`` (CI overlay default) so advanced_model
-            # tests use real weights. New schema (``stages:``) writes the field
-            # flat at stage level; legacy schema (``stage_args:``) nests it as
+            # New schema (``stages:``) writes ``load_format`` flat at stage level;
+            # legacy schema (``stage_args:``) nests it as
             # ``engine_args.load_format``. Handle both.
             new_schema_stages = cfg.get("stages")
             stage_key = "stages" if new_schema_stages is not None else "stage_args"
-            delete_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
+            update_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
             stage_entries = cfg.get(stage_key, [])
             stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
             stage_config_path = modify_stage_config(
                 stage_config_path,
-                deletes={stage_key: {stage_id: [delete_path] for stage_id in stage_ids}},
+                updates={stage_key: {stage_id: {update_path: "dummy"} for stage_id in stage_ids}},
             )
 
         server_args = params.server_args or []
