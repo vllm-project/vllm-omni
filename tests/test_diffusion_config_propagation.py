@@ -111,6 +111,7 @@ class TestCreateDefaultDiffusion:
         assert ea["enforce_eager"] is True
         assert ea["lora_path"] == "/tmp/lora"
 
+
 def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
     od_config = OmniDiffusionConfig(model="Qwen/Qwen-Image-Edit-2511", model_class_name="QwenImageEditPlusPipeline")
 

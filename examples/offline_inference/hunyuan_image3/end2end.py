@@ -139,9 +139,7 @@ def parse_additional_config(raw_value: str | None) -> dict | None:
     if additional_config is None:
         return None
     if not isinstance(additional_config, dict):
-        raise ValueError(
-            f"--additional-config must decode to a JSON object, got {type(additional_config).__name__}"
-        )
+        raise ValueError(f"--additional-config must decode to a JSON object, got {type(additional_config).__name__}")
     return additional_config
 
 

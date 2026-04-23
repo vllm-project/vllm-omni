@@ -594,9 +594,7 @@ class OmniDiffusionConfig:
         elif isinstance(self.additional_config, Mapping):
             self.additional_config = dict(self.additional_config)
         else:
-            raise TypeError(
-                f"additional_config must be a mapping or None, got {type(self.additional_config)!r}"
-            )
+            raise TypeError(f"additional_config must be a mapping or None, got {type(self.additional_config)!r}")
 
         # Convert parallel_config dict/DictConfig to DiffusionParallelConfig
         # Use Mapping to handle both plain dicts and OmegaConf DictConfig
