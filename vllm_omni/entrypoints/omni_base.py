@@ -28,6 +28,23 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class OmniEngineDeadError(EngineDeadError):
+    _DEFAULT_MESSAGE = EngineDeadError().args[0]
+    error_stage_id: int | None
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        error_stage_id: int | None = None,
+        suppress_context: bool = False,
+    ) -> None:
+        resolved_message = message or self._DEFAULT_MESSAGE
+        Exception.__init__(self, resolved_message)
+        self.__suppress_context__ = suppress_context
+        self.error_stage_id = error_stage_id
+
+
 def _weak_shutdown_engine(engine: AsyncOmniEngine) -> None:
     """Best-effort engine cleanup for GC finalization."""
     try:
@@ -296,8 +313,12 @@ class OmniBase(PDDisaggregationMixin):
 
         if msg_type == "error":
             error_text = msg.get("error", "Orchestrator returned an error message")
+            stage_id = msg.get("stage_id")
             if msg.get("fatal"):
-                raise EngineDeadError(error_text)
+                raise OmniEngineDeadError(
+                    error_text,
+                    error_stage_id=stage_id,
+                )
             raise RuntimeError(error_text)
 
         if msg_type != "output":
@@ -352,7 +373,10 @@ class OmniBase(PDDisaggregationMixin):
         )
         # NOTE: O(n_stages) check for every error.
         if self.errored:
-            raise EngineDeadError(error_text)
+            raise OmniEngineDeadError(
+                error_text,
+                error_stage_id=stage_id,
+            )
         raise EngineGenerateError(error_text)
 
     def _process_single_result(
