@@ -1277,7 +1277,7 @@ class OmniRunnerHandler:
     def __init__(self, omni_runner):
         self.runner = omni_runner
 
-    def _process_output(self, outputs: list[Any]) -> OmniResponse:
+    def _process_omni_output(self, outputs: list[Any]) -> OmniResponse:
         result = OmniResponse()
         try:
             text_content = None
@@ -1307,7 +1307,7 @@ class OmniRunnerHandler:
         outputs = self.runner.generate_multimodal(
             prompts=prompts, videos=videos, images=images, audios=audios, modalities=modalities
         )
-        response = self._process_output(outputs)
+        response = self._process_omni_output(outputs)
         assert_omni_response(response, request_config, run_level="core_model")
         return response
 
