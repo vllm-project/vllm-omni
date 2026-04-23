@@ -4,11 +4,11 @@ Shared by Qwen3-Omni and Qwen3-TTS talker models.
 
 * SDPA attention (F.scaled_dot_product_attention) with native GQA support
 * HF-compatible numerics (float32 RMSNorm, float32 RoPE, separate linear layers)
-* Per-call embedding buffer to avoid cross-request aliasing
-* Pre-allocated position_ids (read-only, safe to persist)
-* torch.compile (epilogue_fusion=False) on inner transformer by default
-* Optional manual CUDA graph capture per batch-size bucket
-* Inline sampling (top-k + top-p) -- no custom op overhead
+* ``@support_torch_compile`` on the wrapper so the (projection + transformer)
+  block gets captured by vLLM's cudagraph dispatcher; the AR loop + sampling
+  live outside the compiled region and call ``self(...)`` per step.
+* Persistent scratch buffers sized to ``max_num_batched_tokens`` provide the
+  stable addresses required across cudagraph replays.
 """
 
 from __future__ import annotations
@@ -19,12 +19,12 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.config.vllm import set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-
-from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -67,6 +67,22 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
+
+
+# Gumbel-max categorical draw: argmax(logits + Gumbel(0, 1)). Equivalent in
+# distribution to softmax+multinomial, but cudagraph-safe (only uniform_ / log /
+# argmax) and avoids the device-side assert that ``torch.multinomial`` raises on
+# all-zero probability rows during warmup.
+
+
+def _gumbel_sample(logits: torch.Tensor) -> torch.Tensor:
+    u = torch.empty_like(logits).uniform_(1e-20, 1.0 - 1e-20)
+    return (logits - torch.log(-torch.log(u))).argmax(dim=-1)
+
+
+def _multinomial_sample(logits: torch.Tensor) -> torch.Tensor:
+    probs = F.softmax(logits, dim=-1)
+    return torch.multinomial(probs, 1).squeeze(-1)
 
 
 class _RotaryEmbedding(nn.Module):
@@ -303,32 +319,34 @@ class CodePredictorBaseModel(nn.Module):
 class CodePredictorWrapperConfig:
     """Controls behavioral differences between model-specific code predictors."""
 
-    use_cuda_graphs: bool = False
     use_parallel_embedding: bool = False
     use_projection: bool = False
     return_proj_buf: bool = False
     sampling_mode: str = "stored"
+    # Use Gumbel-max for the categorical draw (cudagraph-safe, warmup-safe).
+    # Set to False to fall back to softmax+multinomial.
+    use_gumbel: bool = True
 
 
 # ===================================================================
-#  Code Predictor Wrapper (optimized re-prefill, persistent buffers)
+#  Code Predictor Wrapper (torch.compile + vLLM cudagraph dispatch)
 # ===================================================================
 
 
+# ``dynamic_arg_dims`` is explicit because this module uses PEP 563
+# (``from __future__ import annotations``), which defeats annotation-based
+# inference in ``@support_torch_compile``.
+@support_torch_compile(dynamic_arg_dims={"inputs_embeds": 0, "position_ids": 0})
 class CodePredictorWrapper(nn.Module):
     """Optimized code predictor -- re-prefill approach, no KV cache.
 
     Each AR step forwards the full growing sequence (len 2 -> num_code_groups+1)
-    through the transformer.  The extra O(T^2) FLOPs are negligible for
+    through the transformer. The extra O(T^2) FLOPs are negligible for
     short sequences, and this avoids all KV-cache management overhead.
 
-    Optimizations:
-      1. Per-call embedding buffer -- avoids cross-request aliasing.
-      2. Pre-allocated position_ids -- no torch.arange per step.
-      3. Cached module references -- bypass ModuleList indexing.
-      4. torch.compile on inner transformer.
-      5. Inline sampling (top-k + top-p) -- no custom op overhead.
-      6. Optional manual CUDA graph capture per batch-size bucket.
+    ``forward(inputs_embeds, position_ids)`` is the compiled/captured region
+    (projection + transformer + norm). ``generate(...)`` owns the AR loop and
+    sampling, calling ``self(...)`` per step to hit the compiled path.
     """
 
     def __init__(
@@ -348,11 +366,11 @@ class CodePredictorWrapper(nn.Module):
 
         self._num_groups = int(cp_config.num_code_groups)
         self._cp_hidden = int(cp_config.hidden_size)
+        self._max_seq = self._num_groups + 1
 
         # For Omni backward compat (accessed by the talker)
         self.num_code_groups = self._num_groups
 
-        # Determine embedding dimension
         _talker_hidden = int(talker_hidden_size) if talker_hidden_size is not None else self._cp_hidden
 
         self.model = CodePredictorBaseModel(
@@ -376,131 +394,67 @@ class CodePredictorWrapper(nn.Module):
         self._top_k: int = 50
         self._top_p: float = 0.8
 
-        # Lazily initialised state
-        self._proj_buf: torch.Tensor | None = None
-        self._model_dtype: torch.dtype | None = None
-        self._compiled_model_fwd = None
-        self._bucket_sizes: list[int] = []
-        self._bucket_pos_ids: dict[int, torch.Tensor] = {}
+        # Persistent scratch buffers sized to max_num_batched_tokens so
+        # addresses stay stable across cudagraph replays. forward()/generate()
+        # slice ``[:B]`` out of these.
+        # NOTE: real runtime + cudagraph capture never push B above
+        # max_num_seqs (predictor only sees decode positions, each request
+        # contributes 1 decode token, and _get_decode_idxs bisects into
+        # cudagraph_capture_sizes). The only path that needs the full
+        # max_num_batched_tokens extent is the profile dummy run
+        # (is_profile=True, attn_metadata=None -> pure-decode fallback in
+        # the talker). If profile is reworked to cap B at max_num_seqs,
+        # this buffer can be shrunk to max_num_seqs.
+        max_num_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
+        dtype = vllm_config.model_config.dtype
+        self.register_buffer(
+            "_cp_inputs_embeds",
+            torch.zeros(max_num_tokens, self._max_seq, _talker_hidden, dtype=dtype),
+            persistent=False,
+        )
+        pos_row = torch.arange(self._max_seq, dtype=torch.long)
+        self.register_buffer(
+            "_cp_position_ids",
+            pos_row.unsqueeze(0).expand(max_num_tokens, -1).contiguous(),
+            persistent=False,
+        )
+
+        # Cached on first generate() call so weights/dtype are finalized.
         self._lm_heads_list: list[nn.Module] | None = None
         self._codec_embeds_list: list[nn.Module] | None = None
-        self._cuda_graphs: dict[int, tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
 
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
 
     def set_sampling_params(self, top_k: int = 50, top_p: float = 0.8) -> None:
-        """Configure sampling parameters to maintain consistency with previous implementation."""
+        """Configure sampling parameters for ``stored`` sampling mode."""
         self._top_k = top_k
         self._top_p = top_p
         logger.debug("Sampling parameters updated: top_k=%d, top_p=%.2f", top_k, top_p)
 
     # ------------------------------------------------------------------
-    #  Lazy-init helpers
+    #  Compiled region: projection + inner transformer
     # ------------------------------------------------------------------
 
-    def _ensure_buffers(self, device: torch.device, dtype: torch.dtype, bsz: int) -> None:
-        """Ensure the projection buffer can hold at least *bsz* rows."""
-        max_seq = self._num_groups + 1
-        if (
-            self._proj_buf is not None
-            and self._proj_buf.device == device
-            and self._proj_buf.dtype == dtype
-            and self._proj_buf.shape[0] >= bsz
-        ):
-            return
-        self._proj_buf = torch.zeros(bsz, max_seq, self._cp_hidden, dtype=dtype, device=device)
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compiled region: projection + inner transformer.
 
-    def _setup_compile(self) -> None:
-        """Lazily set up torch.compile with optional CUDA graph capture."""
-        if self._compiled_model_fwd is not None:
-            return
-
-        # Cache model parameter dtype so forward() doesn't need to query it
-        # on every call.  Also ensures warmup buffers match model precision
-        # even when upstream modules produce a different dtype (#2385).
-        self._model_dtype = next(self.model.parameters()).dtype
-        self._lm_heads_list = list(self.lm_head)
-        self._codec_embeds_list = list(self.model.codec_embedding)
-
-        if not current_omni_platform.supports_torch_inductor():
-            logger.warning_once("code_predictor: torch.compile disabled")
-            self._compiled_model_fwd = self.model.forward
-            return
-
-        # torch.compile fuses RMSNorm/RoPE in ways that lose float32
-        # precision, compounding across AR steps. Use epilogue_fusion=False
-        # to disable the problematic fusions while still getting kernel
-        # fusion benefits for the linear layers and SDPA.
-        self._compiled_model_fwd = torch.compile(
-            self.model.forward,
-            dynamic=False,
-            options={"epilogue_fusion": False},
-        )
-        self._warmup_buckets()
-
-        if self._wrapper_config.use_cuda_graphs:
-            self._capture_cuda_graphs()
-            logger.info("code_predictor: torch.compile (no epilogue fusion) + CUDA graphs")
-        else:
-            logger.info("code_predictor: torch.compile (dynamic=False, no epilogue fusion)")
-
-    def _padded_bsz(self, bsz: int) -> int:
-        """Round batch size up to nearest power-of-2 bucket."""
-        for bucket in self._bucket_sizes:
-            if bsz <= bucket:
-                return bucket
-        return bsz
-
-    def _warmup_buckets(self) -> None:
-        """Warmup power-of-2 batch-size buckets to front-load Inductor compilation."""
-        max_bsz = self._vllm_config.scheduler_config.max_num_seqs
-        bucket_sizes = [1 << i for i in range(max_bsz.bit_length()) if (1 << i) <= max_bsz]
-        if max_bsz not in bucket_sizes:
-            bucket_sizes.append(max_bsz)
-        self._bucket_sizes = sorted(bucket_sizes)
-
-        max_seq = self._num_groups + 1
-        device = next(self.model.parameters()).device
-
-        # Ensure proj_buf matches model parameter dtype to avoid dtype
-        # mismatch during warmup compilation (see #2385).
-        self._ensure_buffers(device, self._model_dtype, max(self._bucket_sizes))
-        proj_buf = self._proj_buf
-
-        for bsz in self._bucket_sizes:
-            pos_ids = torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1).contiguous()
-            self._bucket_pos_ids[bsz] = pos_ids
-            for _ in range(3):
-                self._compiled_model_fwd(proj_buf[:bsz, :max_seq, :], pos_ids)
-        logger.info("code_predictor: warmup done for buckets %s", self._bucket_sizes)
-
-    def _capture_cuda_graphs(self) -> None:
-        """Capture a CUDA graph per bucket using vLLM's global graph pool."""
-        from vllm.platforms import current_platform
-
-        pool = current_platform.get_global_graph_pool()
-        max_seq = self._num_groups + 1
-        proj_buf = self._proj_buf
-
-        for bsz in self._bucket_sizes:
-            static_input = proj_buf[:bsz, :max_seq, :]
-            pos_ids = self._bucket_pos_ids[bsz]
-
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, pool=pool):
-                static_output = self._compiled_model_fwd(static_input, pos_ids)
-
-            self._cuda_graphs[bsz] = (g, static_output)
-
-        logger.info("code_predictor: captured CUDA graphs for buckets %s", self._bucket_sizes)
+        ``inputs_embeds``: ``[B, max_seq, talker_hidden]``;
+        ``position_ids``: ``[B, max_seq]``. Returns ``[B, max_seq, cp_hidden]``.
+        """
+        projected = self.small_to_mtp_projection(inputs_embeds)
+        return self.model(projected, position_ids)
 
     # ------------------------------------------------------------------
-    #  Forward -- re-prefill + inline sampling
+    #  Non-compiled AR loop + sampling
     # ------------------------------------------------------------------
 
     @torch.inference_mode()
-    def forward(
+    def generate(
         self,
         layer0_code: torch.Tensor,
         layer0_embed: torch.Tensor,
@@ -510,45 +464,33 @@ class CodePredictorWrapper(nn.Module):
         top_k: int = 50,
         top_p: float = 1.0,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Predict residual codebooks 1..G-1 autoregressively via re-prefill."""
+        """Predict residual codebooks 1..G-1 autoregressively via re-prefill.
+
+        Returns ``codes`` (``[B, num_groups]``) or ``(codes, inputs_embeds_buf)``
+        depending on ``return_proj_buf``.
+        """
         bsz = int(layer0_code.shape[0])
         num_groups = self._num_groups
         device = layer0_code.device
 
-        # _setup_compile caches _model_dtype on first call; use it for buffers
-        # so they always match model weight precision (#2385).
-        self._setup_compile()
-        dtype = self._model_dtype
-
-        padded_bsz = self._padded_bsz(bsz)
-        self._ensure_buffers(device, dtype, padded_bsz)
-
-        proj_buf = self._proj_buf
-        max_seq = num_groups + 1
-        projection = self.small_to_mtp_projection
-        model_fwd = self._compiled_model_fwd
+        if self._lm_heads_list is None:
+            self._lm_heads_list = list(self.lm_head)
+        if self._codec_embeds_list is None:
+            self._codec_embeds_list = list(self.model.codec_embedding)
         lm_heads = self._lm_heads_list
         codec_embeds = self._codec_embeds_list
 
-        # Zero the padded region of the buffer
-        proj_buf[:padded_bsz].zero_()
+        inputs_buf = self._cp_inputs_embeds[:bsz]
+        pos_ids = self._cp_position_ids[:bsz]
+        buf_dtype = inputs_buf.dtype
 
-        # Fill buffer positions 0 (talker hidden) & 1 (layer0 embed)
-        proj_buf[:bsz, 0, :] = projection(last_talker_hidden.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
-        proj_buf[:bsz, 1, :] = projection(layer0_embed.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
+        # Zero the active slice (persistent buffer may carry stale rows).
+        inputs_buf.zero_()
+        inputs_buf[:, 0, :] = last_talker_hidden.reshape(bsz, -1).to(buf_dtype)
+        inputs_buf[:, 1, :] = layer0_embed.reshape(bsz, -1).to(buf_dtype)
 
-        # Get pre-computed pos_ids for this bucket
-        full_pos_ids = self._bucket_pos_ids.get(padded_bsz)
-        if full_pos_ids is None:
-            full_pos_ids = (
-                torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(padded_bsz, -1).contiguous()
-            )
-
-        # Use captured CUDA graph if available, otherwise call compiled fn.
-        cuda_graph_entry = self._cuda_graphs.get(padded_bsz)
-
-        # Prepare sampling parameters
         stored_mode = self._wrapper_config.sampling_mode == "stored"
+        use_gumbel = self._wrapper_config.use_gumbel
         if stored_mode:
             s_top_k = self._top_k
             s_top_p = self._top_p
@@ -560,7 +502,11 @@ class CodePredictorWrapper(nn.Module):
                     "top_p sampling is not implemented for the vLLM-native code predictor; please set top_p=1.0."
                 )
 
-        # Output codes -- shape depends on return mode
+        def _draw(filtered_logits: torch.Tensor) -> torch.Tensor:
+            if use_gumbel:
+                return _gumbel_sample(filtered_logits).unsqueeze(-1)
+            return _multinomial_sample(filtered_logits).unsqueeze(-1)
+
         if self._wrapper_config.return_proj_buf:
             all_codes = torch.empty(bsz, num_groups, 1, dtype=torch.int64, device=device)
             all_codes[:, 0] = layer0_code.reshape(bsz, -1)[:, :1]
@@ -568,20 +514,11 @@ class CodePredictorWrapper(nn.Module):
             all_codes = torch.empty(bsz, num_groups, dtype=torch.long, device=device)
             all_codes[:, 0] = layer0_code.reshape(bsz)
 
-        # Autoregressive loop: predict layers 1..G-1
         for step in range(1, num_groups):
-            # Run transformer (CUDA graph replay or compiled forward)
-            if cuda_graph_entry is not None:
-                cuda_graph_entry[0].replay()
-                hidden_out = cuda_graph_entry[1]
-            else:
-                hidden_out = model_fwd(proj_buf[:padded_bsz, :max_seq, :], full_pos_ids)
+            hidden_out = self(inputs_buf, pos_ids)
+            logits = lm_heads[step - 1](hidden_out[:, step, :])
 
-            logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
-
-            # Sample next code
             if stored_mode:
-                # "stored" mode: top-k -> top-p -> softmax -> multinomial
                 if s_top_k > 0:
                     topk_vals, _ = logits.topk(s_top_k, dim=-1)
                     logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
@@ -592,33 +529,27 @@ class CodePredictorWrapper(nn.Module):
                     remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
                     sorted_logits[remove_mask] = float("-inf")
                     logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
-                probs = F.softmax(logits, dim=-1)
-                code = torch.multinomial(probs, num_samples=1)
+                code = _draw(logits)
+            elif use_sampling:
+                scaled = logits * inv_temperature
+                if top_k > 0:
+                    topk_vals, _ = scaled.topk(top_k, dim=-1)
+                    scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
+                code = _draw(scaled)
             else:
-                # "per_call" mode: temperature-scaled + top-k
-                if use_sampling:
-                    scaled = logits * inv_temperature
-                    if top_k > 0:
-                        topk_vals, _ = scaled.topk(top_k, dim=-1)
-                        scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                    probs = F.softmax(scaled, dim=-1)
-                    code = torch.multinomial(probs, num_samples=1)
-                else:
-                    code = logits.argmax(dim=-1, keepdim=True)
+                code = logits.argmax(dim=-1, keepdim=True)
 
-            # Store code
             if self._wrapper_config.return_proj_buf:
                 all_codes[:, step] = code
             else:
                 all_codes[:, step] = code.reshape(bsz)
 
-            # Embed predicted code -> project -> next buffer position
             if step < num_groups - 1 or self._wrapper_config.return_proj_buf:
-                new_embed = codec_embeds[step - 1](code)
-                proj_buf[:bsz, step + 1, :] = projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
+                new_embed = codec_embeds[step - 1](code.reshape(bsz))
+                inputs_buf[:, step + 1, :] = new_embed.to(buf_dtype)
 
         if self._wrapper_config.return_proj_buf:
-            return all_codes, proj_buf[:bsz].clone()
+            return all_codes, inputs_buf.clone()
         return all_codes
 
     # ------------------------------------------------------------------
@@ -626,29 +557,31 @@ class CodePredictorWrapper(nn.Module):
     # ------------------------------------------------------------------
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights directly (no fused projection remapping needed)."""
-        loaded: set[str] = set()
-        model_weights: list[tuple[str, torch.Tensor]] = []
-        other_weights: list[tuple[str, torch.Tensor]] = []
+        # Wrapped in set_current_vllm_config so VocabParallelEmbedding weight
+        # loaders (Qwen3-Omni subclass) can read TP metadata.
+        with set_current_vllm_config(self._vllm_config):
+            loaded: set[str] = set()
+            model_weights: list[tuple[str, torch.Tensor]] = []
+            other_weights: list[tuple[str, torch.Tensor]] = []
 
-        for name, w in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if name.startswith("model."):
-                model_weights.append((name[len("model.") :], w))
-            else:
-                other_weights.append((name, w))
+            for name, w in weights:
+                if "rotary_emb.inv_freq" in name:
+                    continue
+                if name.startswith("model."):
+                    model_weights.append((name[len("model.") :], w))
+                else:
+                    other_weights.append((name, w))
 
-        loaded_model = self.model.load_weights(model_weights)
-        loaded |= {f"model.{n}" for n in loaded_model}
+            loaded_model = self.model.load_weights(model_weights)
+            loaded |= {f"model.{n}" for n in loaded_model}
 
-        params = dict(self.named_parameters(remove_duplicate=False))
-        for name, w in other_weights:
-            param = params.get(name)
-            if param is None:
-                continue
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, w)
-            loaded.add(name)
+            params = dict(self.named_parameters(remove_duplicate=False))
+            for name, w in other_weights:
+                param = params.get(name)
+                if param is None:
+                    continue
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, w)
+                loaded.add(name)
 
-        return loaded
+            return loaded

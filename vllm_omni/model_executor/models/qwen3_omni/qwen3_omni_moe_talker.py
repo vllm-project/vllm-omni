@@ -192,7 +192,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             layer0_code = input_ids[:, pos : pos + 1]
             layer0_embed = embed_fn(layer0_code)
 
-            pos_all_layers, proj_buf = self.code_predictor(
+            pos_all_layers, proj_buf = self.code_predictor.generate(
                 layer0_code,
                 layer0_embed,
                 last_talker_hidden,

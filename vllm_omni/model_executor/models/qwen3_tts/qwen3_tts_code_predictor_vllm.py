@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-
-import torch
 from vllm.config import VllmConfig
-from vllm.config.vllm import set_current_vllm_config
 
 from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
     CodePredictorBaseModel,
@@ -21,7 +17,11 @@ Qwen3TTSTalkerCodePredictorModelVLLM = CodePredictorBaseModel
 
 
 class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapper):
-    """Qwen3-TTS code predictor (CUDA graphs, per-call sampling, projection)."""
+    """Qwen3-TTS code predictor (per-call sampling, talker->cp projection).
+
+    Inherits the torch.compile + vLLM cudagraph dispatch machinery from the
+    base ``CodePredictorWrapper``.
+    """
 
     def __init__(
         self,
@@ -35,7 +35,6 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
             vllm_config=vllm_config,
             cp_config=config,
             wrapper_config=CodePredictorWrapperConfig(
-                use_cuda_graphs=True,
                 use_parallel_embedding=False,
                 use_projection=(config.hidden_size != talker_config.hidden_size),
                 return_proj_buf=False,
@@ -46,9 +45,3 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         )
         # Store talker_config for backward compat (accessed by some callers)
         self.talker_config = talker_config
-        self._vllm_config = vllm_config
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights with vllm config context (required for VocabParallelEmbedding)."""
-        with set_current_vllm_config(self._vllm_config):
-            return super().load_weights(weights)

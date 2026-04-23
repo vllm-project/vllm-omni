@@ -1016,15 +1016,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 per_req_runtime_info.append({})
         return per_req_runtime_info
 
-    def _compute_request_token_spans(self, num_scheduled_tokens_np) -> list[tuple[int, int]]:
-        """Compute (start, end) token spans for each request within the flattened step sequence."""
-        req_token_spans: list[tuple[int, int]] = []
-        for req_index in range(len(self.input_batch.req_ids)):
-            start_offset = int(self.query_start_loc.cpu[req_index])
-            sched_tokens = int(num_scheduled_tokens_np[req_index])
-            req_token_spans.append((start_offset, start_offset + sched_tokens))
-        return req_token_spans
-
     def _build_model_kwargs_extra(self) -> dict:
         """Build extra keyword arguments passed to the model for this step."""
         model_kwargs_extra: dict[str, object] = {}
@@ -1292,7 +1283,11 @@ class OmniGPUModelRunner(GPUModelRunner):
                 req_infos["request_id"] = req_id
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                    input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
+                    input_ids=input_ids[s:e],
+                    input_embeds=embed_slice,
+                    start_offset=s,
+                    end_offset=e,
+                    **req_infos,
                 )
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(

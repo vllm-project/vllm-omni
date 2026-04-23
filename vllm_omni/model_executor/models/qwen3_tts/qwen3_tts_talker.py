@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-import dataclasses
+import bisect
 import io
 import os
 from collections.abc import Callable, Iterable, Mapping
@@ -16,8 +16,11 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 from transformers.activations import ACT2FN
 from transformers.utils.hub import cached_file
-from vllm.config import VllmConfig
+from vllm.compilation.backends import set_model_tag
+from vllm.compilation.decorators import ignore_torch_compile, support_torch_compile
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
@@ -297,9 +300,44 @@ def mel_spectrogram(
 # ---------------------------------------------------------------------------
 
 
+_CODE_PREDICTOR_SAMPLE_KWARGS: dict[str, Any] = {
+    "do_sample": True,
+    "temperature": 0.9,
+    "top_k": 50,
+    "top_p": 1.0,
+}
+
+
+# ``@ignore_torch_compile`` skips compilation of the outer forward() but still
+# lets vLLM descend into the ``set_model_tag``-wrapped submodules below: the
+# Qwen3 backbone ("talker") and the code predictor ("code_predictor") each get
+# their own piecewise cudagraph. ``dynamic_arg_dims`` is explicit because the
+# file uses PEP 563 (``from __future__ import annotations``).
+@ignore_torch_compile
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
 class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     """vLLM-AR talker: step-wise layer-0 codec decoding.
-    Predicts residual codebooks (1..Q-1) into `audio_codes` and streams text via `tailing_text_hidden`."""
+
+    forward() runs the residual code predictor (groups 1..Q-1) for all decode
+    positions in the current batch and fuses the resulting codebook + text-step
+    embeddings into ``inputs_embeds`` before dispatching the Qwen3 backbone.
+    Prefill positions are left untouched (preprocess() populates prompt embeds).
+    Mixed prefill+decode batches are handled by ``_get_decode_idxs()``, which
+    pads the decode-token index up to the next cudagraph capture bucket.
+
+    preprocess() writes ``last_talker_hidden`` / ``text_step`` into model-owned
+    flat buffers at the request's flat-token offset; forward() reads those rows
+    at decode positions and writes sampled codes into ``_audio_codes_buf`` at
+    the same offsets. make_omni_output() uses the per-request ``_talker_span``
+    values emitted by preprocess() to slice the flat buffers for the runner.
+    """
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -339,13 +377,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
-        # Used by OmniGPUModelRunner for the GPU-side MTP fast-path.
-        self.mtp_hidden_size = int(self.talker_config.hidden_size)
-        # OmniGPUModelRunner will store talker_mtp output under this key in
-        # per-request additional_information.
-        self.talker_mtp_output_key = "audio_codes"
 
-        self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+        # Tag the Qwen3 backbone as "talker" so vLLM's cudagraph dispatcher
+        # keys its piecewise graph separately from the code_predictor's.
+        with set_model_tag("talker"):
+            self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
 
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -374,17 +410,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Keep it optional to avoid strict weight-loading failures.
         self.speaker_encoder: Qwen3TTSSpeakerEncoder | None = None
 
-        # Code predictor uses an isolated vLLM config so its KV cache doesn't
-        # pollute the main engine's static_forward_context (shallow-copy shares
-        # the dict by reference — must assign a fresh one).
-        predictor_compilation = dataclasses.replace(vllm_config.compilation_config)
-        predictor_compilation.static_forward_context = {}
-        self._code_predictor_vllm_config = dataclasses.replace(vllm_config, compilation_config=predictor_compilation)
-        from vllm.config.vllm import set_current_vllm_config as _set_cfg
-
-        with _set_cfg(self._code_predictor_vllm_config):
+        # Code predictor runs as its own compilation region so vLLM can
+        # capture a dedicated piecewise cudagraph for it. ``set_model_tag``
+        # tags the submodule so the cudagraph dispatcher keys it separately
+        # from the Qwen3 backbone.
+        with set_model_tag("code_predictor"):
             self.code_predictor = Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(
-                vllm_config=self._code_predictor_vllm_config,
+                vllm_config=vllm_config,
                 config=self.talker_config.code_predictor_config,
                 talker_config=self.talker_config,
                 prefix="code_predictor",
@@ -400,10 +432,33 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             codec_mask[self._codec_eos_token_id] = True
         self.register_buffer("_codec_allowed_mask", codec_mask, persistent=False)
 
+        # Model-owned flat scratch buffers for the in-forward code predictor.
+        # Rows are indexed by the flat-token offset assigned by the runner;
+        # preprocess() writes per-request slices, forward() reads decode rows.
+        # Addresses must stay stable across cudagraph replays.
+        max_num_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
+        hidden = int(self.talker_config.hidden_size)
+        num_code_groups = int(self.talker_config.num_code_groups)
+        dtype = vllm_config.model_config.dtype
+        self.register_buffer(
+            "_last_talker_hidden_buf",
+            torch.zeros(max_num_tokens, hidden, dtype=dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_text_step_buf",
+            torch.zeros(max_num_tokens, hidden, dtype=dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_audio_codes_buf",
+            torch.zeros(max_num_tokens, num_code_groups, dtype=torch.long),
+            persistent=False,
+        )
+
         # Keys that should stay on GPU in model_intermediate_buffer to avoid
         # CPU-to-GPU round-trips on every decode step.
         self.gpu_resident_buffer_keys: set[str] = {
-            "audio_codes",
             "last_talker_hidden",
             "tts_pad_embed",
             "tailing_text_hidden",
@@ -421,6 +476,62 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    def _get_decode_idxs(self) -> tuple[torch.Tensor | None, int]:
+        """Return ``(decode_idx, num_req)`` for the current forward step.
+
+        Returns ``(None, 0)`` if the predictor should run on every token
+        (profile/dummy runs and pure-decode batches). Otherwise ``decode_idx``
+        points at decode-token rows, padded up to the next cudagraph capture
+        size so the predictor sees a static batch dim.
+        """
+        ctx = get_forward_context()
+        attn_metadata = ctx.attn_metadata
+        if attn_metadata is None:
+            return None, 0
+
+        if isinstance(attn_metadata, dict):
+            any_layer_meta = next(iter(attn_metadata.values()))
+        else:
+            any_layer_meta = attn_metadata
+
+        if any_layer_meta.max_query_len == 1:
+            return None, 0
+
+        start_loc = any_layer_meta.query_start_loc
+        tokens_per_req = start_loc[1:] - start_loc[:-1]
+        is_decode = tokens_per_req == 1
+        decode_token_indices = start_loc[:-1][is_decode]
+
+        num_requests = int(decode_token_indices.shape[0])
+        padded = num_requests
+        compilation_config = self.vllm_config.compilation_config
+        if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            sizes = compilation_config.cudagraph_capture_sizes
+            if sizes:
+                idx = bisect.bisect_left(sizes, num_requests)
+                if idx < len(sizes):
+                    padded = sizes[idx]
+        if padded != num_requests:
+            decode_token_indices = F.pad(decode_token_indices, (0, padded - num_requests))
+        return decode_token_indices, num_requests
+
+    def _fuse_decode_inputs_embeds(
+        self,
+        layer0_embed: torch.Tensor,
+        audio_codes: torch.Tensor,
+        text_step: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sum layer-0 + residual codec embeddings + text-step into the final
+        ``inputs_embeds`` expected by the talker backbone. Returns ``[B, H]``."""
+        bsz = int(layer0_embed.shape[0])
+        max_steps = int(self.talker_config.num_code_groups) - 1
+        residual_ids_t = audio_codes[:, 1:]
+        embeds: list[torch.Tensor] = [layer0_embed.reshape(bsz, 1, -1)]
+        for i in range(max_steps):
+            embeds.append(self.code_predictor.get_input_embeddings()[i](residual_ids_t[:, i : i + 1]))
+        summed = torch.cat(embeds, dim=1).sum(1)
+        return (summed + text_step).to(layer0_embed.dtype)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -429,7 +540,83 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor | IntermediateTensors:
+        # Run the code predictor for decode positions (prefill rows of
+        # inputs_embeds already carry prompt_embeds from preprocess()).
+        self._run_code_predictor_in_forward(input_ids, inputs_embeds)
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+
+    def _run_code_predictor_in_forward(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+    ) -> None:
+        """Run the code predictor at decode positions, write sampled codes into
+        ``_audio_codes_buf`` and the fused inputs_embeds back into ``inputs_embeds``."""
+        num_tokens = int(inputs_embeds.shape[0])
+        if num_tokens == 0:
+            return
+
+        # Prefill rows stay zero; decode rows get overwritten below.
+        self._audio_codes_buf[:num_tokens].zero_()
+
+        decode_idx, num_req = self._get_decode_idxs()
+
+        if decode_idx is None:
+            # Dummy/profile or pure-decode batch: every row is a decode token.
+            bsz = num_tokens
+            layer0_code = input_ids.reshape(bsz, 1).to(dtype=torch.long)
+            layer0_embed = inputs_embeds.reshape(bsz, -1)
+            past_hidden = self._last_talker_hidden_buf[:bsz].reshape(bsz, 1, -1)
+            text_step = self._text_step_buf[:bsz].reshape(bsz, 1, -1)
+            audio_codes = self.code_predictor.generate(
+                layer0_code=layer0_code,
+                layer0_embed=layer0_embed.reshape(bsz, 1, -1),
+                last_talker_hidden=past_hidden,
+                **_CODE_PREDICTOR_SAMPLE_KWARGS,
+            ).to(dtype=torch.long)
+            self._audio_codes_buf[:bsz] = audio_codes
+            fused = self._fuse_decode_inputs_embeds(
+                layer0_embed=layer0_embed,
+                audio_codes=audio_codes,
+                text_step=text_step.reshape(bsz, -1),
+            )
+            inputs_embeds.copy_(fused)
+            return
+
+        if num_req == 0:
+            # Mixed batch with zero decode tokens (all prefill).
+            return
+
+        # Mixed batch: override the batch descriptor so the code predictor's
+        # cudagraph dispatcher picks the bucket for the sliced decode size
+        # (the outer talker graph keeps its own full-batch descriptor).
+        bsz = int(decode_idx.shape[0])
+        layer0_code = input_ids[decode_idx].reshape(bsz, 1).to(dtype=torch.long)
+        layer0_embed = inputs_embeds[decode_idx].reshape(bsz, 1, -1)
+        past_hidden = self._last_talker_hidden_buf[decode_idx].reshape(bsz, 1, -1)
+        text_step = self._text_step_buf[decode_idx].reshape(bsz, 1, -1)
+
+        ctx = get_forward_context()
+        orig_batch_descriptor = ctx.batch_descriptor
+        ctx.batch_descriptor = BatchDescriptor(num_tokens=bsz)
+        try:
+            audio_codes = self.code_predictor.generate(
+                layer0_code=layer0_code,
+                layer0_embed=layer0_embed,
+                last_talker_hidden=past_hidden,
+                **_CODE_PREDICTOR_SAMPLE_KWARGS,
+            ).to(dtype=torch.long)
+        finally:
+            ctx.batch_descriptor = orig_batch_descriptor
+
+        valid = decode_idx[:num_req]
+        self._audio_codes_buf[valid] = audio_codes[:num_req]
+        fused = self._fuse_decode_inputs_embeds(
+            layer0_embed=layer0_embed[:num_req].reshape(num_req, -1),
+            audio_codes=audio_codes[:num_req],
+            text_step=text_step[:num_req].reshape(num_req, -1),
+        )
+        inputs_embeds[valid] = fused
 
     def compute_logits(
         self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None
@@ -458,27 +645,29 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
 
-        hidden = model_outputs
         info_dicts = kwargs.get("model_intermediate_buffer")
         if info_dicts is None:
             info_dicts = kwargs.get("runtime_additional_information") or []
         if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
             logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
-        audio_codes_list: list[torch.Tensor] = []
+
+        device = self._audio_codes_buf.device
+        codec_streaming_list: list[torch.Tensor] = []
         ref_code_len_list: list[torch.Tensor] = []
         ref_code_tensor: torch.Tensor | None = None
-        codec_streaming_list: list[torch.Tensor] = []
+        total_span = 0
         for info in info_dicts:
             if not isinstance(info, dict):
                 continue
-            ac = info.get("audio_codes")
-            if isinstance(ac, torch.Tensor):
-                audio_codes_list.append(ac)
-                cs = info.get("codec_streaming")
-                if isinstance(cs, bool):
-                    codec_streaming_list.append(
-                        torch.full((int(ac.shape[0]),), int(cs), dtype=torch.int8, device=ac.device)
-                    )
+            span = int(info.get("_talker_span", 0) or 0)
+            if span <= 0:
+                continue
+            total_span += span
+            cs = info.get("codec_streaming")
+            if isinstance(cs, bool):
+                codec_streaming_list.append(
+                    torch.full((span,), int(cs), dtype=torch.int8, device=device)
+                )
             ref_code = info.get("ref_code")
             if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
                 ref_code_tensor = ref_code
@@ -495,25 +684,22 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 ref_len_val = int(ref_len[0])
             else:
                 ref_len_val = int(ref_len)
-            if isinstance(ac, torch.Tensor):
-                # Emit ref_code_len per-token span for runner slicing (consumer takes the last value).
-                ref_code_len_list.append(
-                    torch.full((int(ac.shape[0]),), ref_len_val, dtype=torch.int32, device=ac.device)
-                )
+            # Emit ref_code_len per-token span for runner slicing (consumer takes the last value).
+            ref_code_len_list.append(
+                torch.full((span,), ref_len_val, dtype=torch.int32, device=device)
+            )
 
-        if not audio_codes_list:
-            return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
+        if total_span <= 0:
+            return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs={})
 
-        audio_codes = torch.cat(audio_codes_list, dim=0)
-        span_len = int(audio_codes.shape[0])
-        hidden = hidden[:span_len]
-        mm: dict[str, torch.Tensor] = {"audio_codes": audio_codes}
+        hidden = model_outputs[:total_span]
+        mm: dict[str, Any] = {"audio_codes": self._audio_codes_buf[:total_span]}
         if ref_code_len_list:
-            mm["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:span_len]
+            mm["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:total_span]
         if ref_code_tensor is not None:
             mm["ref_code"] = [ref_code_tensor]
         if codec_streaming_list:
-            mm["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:span_len]
+            mm["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:total_span]
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
 
     # -------------------- preprocess / postprocess --------------------
@@ -522,6 +708,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self,
         input_ids: torch.Tensor,
         input_embeds: torch.Tensor | None,
+        *,
+        start_offset: int,
+        end_offset: int,
         **info_dict: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         # Metadata may be passed flattened or under `additional_information`; normalize to flattened keys.
@@ -575,6 +764,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     "tts_pad_embed": tts_pad_embed.detach(),
                     "talker_prefill_offset": 0,
                     "codec_streaming": codec_streaming,
+                    "_talker_span": span_len,
                 }
                 if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
                     info_update["ref_code"] = ref_code.detach().to("cpu").contiguous()
@@ -609,21 +799,17 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
                 info_update = {"talker_prefill_offset": int(offset + span_len)}
                 info_update["codec_streaming"] = codec_streaming
+                info_update["_talker_span"] = span_len
 
             # When inputs_embeds is set, token ids are ignored by the model but must stay in-vocab for vLLM bookkeeping.
             input_ids_out = input_ids.clone()
             input_ids_out[:] = int(self.talker_config.codec_pad_id)
-
-            zeros = torch.zeros(
-                (prompt_embeds.shape[0], int(self.talker_config.num_code_groups)),
-                device=input_ids.device,
-                dtype=torch.long,
-            )
-            info_update["audio_codes"] = zeros
             return input_ids_out, prompt_embeds, info_update
 
-        # Decode: span_len == 1
-        # Pop one text-step vector from tailing_text_hidden queue.
+        # Decode: span_len == 1. Pop one text-step vector from tailing_text_hidden
+        # and poke the code-predictor inputs (last_talker_hidden, text_step) into
+        # the model-owned flat buffers at this request's flat-token offset;
+        # forward() reads them at decode positions.
         # These tensors stay on GPU via gpu_resident_buffer_keys - .to() is a no-op.
         tts_pad_embed_buf = info_dict.get("tts_pad_embed")
         if not isinstance(tts_pad_embed_buf, torch.Tensor):
@@ -643,7 +829,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             raise RuntimeError("Missing `last_talker_hidden` in additional_information; postprocess must run.")
         past_hidden = last_hidden.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
 
-        # Use OmniGPUModelRunner talker_mtp fast-path for residual codebooks and per-step inputs_embeds update.
+        # Write predictor inputs into the model-owned flat buffers at this
+        # request's flat-token offset. forward() zeros _audio_codes_buf itself.
+        self._last_talker_hidden_buf[start_offset : start_offset + 1].copy_(past_hidden)
+        self._text_step_buf[start_offset : start_offset + 1].copy_(text_step)
+
+        # Layer-0 codec embedding; forward() fuses in the residual codebook
+        # embeddings and the text-step vector at decode positions.
         last_id_hidden = self.embed_input_ids(input_ids.reshape(1, 1).to(torch.long)).to(
             device=input_ids.device, dtype=torch.bfloat16
         )
@@ -651,8 +843,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         info_update = {
             "tailing_text_hidden": new_tail,
-            "mtp_inputs": (past_hidden, text_step),
             "codec_streaming": codec_streaming,
+            "_talker_span": span_len,
         }
         return input_ids, inputs_embeds_out, info_update
 
@@ -1628,55 +1820,3 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             loaded |= loader.load_weights(speaker_weights, mapper=self.hf_to_vllm_mapper)
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
         return loaded
-
-    # -------------------- GPU-side MTP fast-path --------------------
-
-    @torch.inference_mode()
-    def talker_mtp(
-        self,
-        input_ids: torch.Tensor,
-        input_embeds: torch.Tensor,
-        last_talker_hidden: torch.Tensor,
-        text_step: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """GPU fast-path used by OmniGPUModelRunner to predict residual codebooks (1..Q-1).
-        Returns (inputs_embeds, audio_codes) for the current step."""
-        bsz = int(input_ids.shape[0])
-        q = int(self.talker_config.num_code_groups)
-        dev = input_embeds.device
-
-        input_ids = input_ids.reshape(bsz, 1).to(dtype=torch.long, device=dev)
-        last_id_hidden = input_embeds.reshape(bsz, 1, -1).to(dtype=torch.bfloat16, device=dev)
-        past_hidden = last_talker_hidden.reshape(bsz, 1, -1).to(dtype=torch.bfloat16, device=dev)
-        text_step = text_step.reshape(bsz, 1, -1).to(dtype=torch.bfloat16, device=dev)
-
-        # Residual predictor runs fixed-length (Q-1) steps via the vLLM-native code_predictor.
-        max_steps = q - 1
-        if max_steps <= 0:
-            audio_codes = input_ids.reshape(bsz, 1)
-            return (last_id_hidden + text_step).reshape(bsz, -1), audio_codes
-
-        # Predict residual codes (1..Q-1) with HF reference sampling params.
-        audio_codes = self.code_predictor(
-            layer0_code=input_ids.reshape(bsz, 1),
-            layer0_embed=last_id_hidden,
-            last_talker_hidden=past_hidden,
-            do_sample=True,
-            temperature=0.9,
-            top_k=50,
-            top_p=1.0,
-        )  # [B, Q]
-
-        # Map invalid layer-0 ids (e.g. EOS) to PAD=0 so SpeechTokenizer sees only real codes.
-        layer0 = audio_codes[:, :1]
-        invalid0 = (layer0 < 0) | (layer0 >= int(self._codebook_vocab_size))
-        audio_codes = torch.where(invalid0.expand_as(audio_codes), torch.zeros_like(audio_codes), audio_codes)
-
-        # Sum embeddings of all code groups, then add the current text step.
-        residual_ids_t = audio_codes[:, 1:]
-        embeds: list[torch.Tensor] = [last_id_hidden]
-        for i in range(max_steps):
-            embeds.append(self.code_predictor.get_input_embeddings()[i](residual_ids_t[:, i : i + 1]))
-        summed = torch.cat(embeds, dim=1).sum(1, keepdim=True)  # [B,1,H]
-        inputs_embeds_out = (summed + text_step).reshape(bsz, -1)
-        return inputs_embeds_out, audio_codes.to(dtype=torch.long)

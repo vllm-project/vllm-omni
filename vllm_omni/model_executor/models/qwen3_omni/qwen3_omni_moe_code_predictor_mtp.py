@@ -9,7 +9,7 @@ from vllm_omni.model_executor.models.common.qwen3_code_predictor import (
 
 
 class Qwen3OmniMoeTalkerCodePredictor(CodePredictorWrapper):
-    """Qwen3-Omni code predictor (no CUDA graphs, VocabParallelEmbedding)."""
+    """Qwen3-Omni code predictor (VocabParallelEmbedding, stored sampling)."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         cp_config = vllm_config.model_config.hf_config.code_predictor_config
@@ -17,7 +17,6 @@ class Qwen3OmniMoeTalkerCodePredictor(CodePredictorWrapper):
             vllm_config=vllm_config,
             cp_config=cp_config,
             wrapper_config=CodePredictorWrapperConfig(
-                use_cuda_graphs=False,
                 use_parallel_embedding=True,
                 use_projection=False,
                 return_proj_buf=True,

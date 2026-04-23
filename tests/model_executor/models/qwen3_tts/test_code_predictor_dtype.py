@@ -308,13 +308,11 @@ class TestCodePredictorWrapperConfig:
         """Qwen3-Omni uses correct wrapper config."""
         _, _, _, _, code_predictor_wrapper_config = loaded_target_classes
         config = code_predictor_wrapper_config(
-            use_cuda_graphs=False,
             use_parallel_embedding=True,
             use_projection=False,
             return_proj_buf=True,
             sampling_mode="stored",
         )
-        assert config.use_cuda_graphs is False
         assert config.use_parallel_embedding is True
         assert config.return_proj_buf is True
         assert config.sampling_mode == "stored"
@@ -323,13 +321,11 @@ class TestCodePredictorWrapperConfig:
         """Qwen3-TTS uses correct wrapper config."""
         _, _, _, _, code_predictor_wrapper_config = loaded_target_classes
         config = code_predictor_wrapper_config(
-            use_cuda_graphs=True,
             use_parallel_embedding=False,
             use_projection=True,
             return_proj_buf=False,
             sampling_mode="per_call",
         )
-        assert config.use_cuda_graphs is True
         assert config.use_parallel_embedding is False
         assert config.return_proj_buf is False
         assert config.sampling_mode == "per_call"
