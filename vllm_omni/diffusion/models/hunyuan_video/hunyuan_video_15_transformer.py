@@ -16,7 +16,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous, AdaLayerNormZero
 from torch import nn
 from vllm.logger import init_logger
-from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
