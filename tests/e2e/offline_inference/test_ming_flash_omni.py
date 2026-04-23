@@ -37,6 +37,21 @@ def build_prompt(user_text: str) -> str:
 
 def get_eager_config():
     path = modify_stage_config(
+        str(Path(__file__).parent.parent / "stage_configs" / "bailingmm_moe_v2_lite_thinker_only_ci.yaml"),
+        updates={
+            "stage_args": {
+                0: {
+                    "engine_args.enforce_eager": "true",
+                },
+            },
+        },
+    )
+    return path
+
+
+def get_eager_tts_config():
+    """Thinker+talker CI config with enforce_eager on the thinker stage."""
+    path = modify_stage_config(
         str(Path(__file__).parent.parent / "stage_configs" / "bailingmm_moe_v2_lite_ci.yaml"),
         updates={
             "stage_args": {
@@ -49,8 +64,13 @@ def get_eager_config():
     return path
 
 
+# Thinker-only config — used by text-output tests.
 stage_configs = [get_eager_config()]
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
+
+# Thinker+talker config — used by audio-output tests.
+stage_configs_tts = [get_eager_tts_config()]
+test_params_tts = [(model, stage_config) for model in models for stage_config in stage_configs_tts]
 
 
 @pytest.mark.core_model
@@ -138,5 +158,38 @@ def test_mixed_to_text(omni_runner, omni_runner_handler) -> None:
         audio = audio.squeeze()
     prompt = build_prompt(f"{IMAGE_TOKEN}{AUDIO_TOKEN}Describe the image and transcribe the audio.")
     request_config = {"prompts": prompt, "images": image, "audios": audio, "modalities": ["text"]}
+
+    omni_runner_handler.send_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@pytest.mark.parametrize("omni_runner", test_params_tts, indirect=True)
+def test_text_to_audio(omni_runner, omni_runner_handler) -> None:
+    """
+    Test text input with audio output via the thinker+talker pipeline.
+    Input Modal: text
+    Output Modal: audio
+    """
+    prompt = build_prompt("请简单介绍一下北京。")
+    request_config = {"prompts": prompt, "modalities": ["audio"]}
+
+    omni_runner_handler.send_request(request_config)
+
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@pytest.mark.parametrize("omni_runner", test_params_tts, indirect=True)
+def test_image_to_audio(omni_runner, omni_runner_handler) -> None:
+    """
+    Test image + text input with audio output via the thinker+talker pipeline.
+    Input Modal: image + text
+    Output Modal: audio
+    """
+    image = generate_synthetic_image(224, 224)["np_array"]
+    prompt = build_prompt(f"{IMAGE_TOKEN}Describe this image briefly.")
+    request_config = {"prompts": prompt, "images": image, "modalities": ["audio"]}
 
     omni_runner_handler.send_request(request_config)
