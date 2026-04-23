@@ -12,7 +12,7 @@ NEGATIVE_PROMPT = "low quality, blurry, watermark, text"
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 1, "rocm": 1, "xpu": 2})
-@pytest.mark.parametrize("omni_runner_handler", [(MODEL, None)], indirect=True)
+@pytest.mark.parametrize("omni_runner", [(MODEL, None)], indirect=True)
 def test_text_to_video_001(omni_runner_handler: OmniRunnerHandler):
     sampling = OmniDiffusionSamplingParams(
         height=512,
