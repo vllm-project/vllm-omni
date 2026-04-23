@@ -72,6 +72,8 @@ At load time:
 | Model | HF Checkpoint | Scheme | Group Size | Backend |
 |-------|--------------|--------|------------|---------|
 | FLUX.1-dev | `vllm-project-org/FLUX.1-dev-AutoRound-w4a16` | W4A16 | 128 | GPTQ-Marlin |
+| Qwen2.5-Omni-7B | `Intel/Qwen2.5-Omni-7B-int4-AutoRound` | W4A16 | 128 | GPTQ-Marlin |
+| Qwen3-Omni-30B-A3B-Instruct | `Intel/Qwen3-Omni-30B-A3B-Instruct-int4-AutoRound` | W4A16 | 128 | GPTQ-Marlin |
 
 ## Creating a Quantized Checkpoint
 

@@ -1,7 +1,7 @@
 """Seed-TTS WER aligned with Bytedance ``seed-tts-eval`` / ``run_wer.py``.
 
 Matches the published protocol (see Hugging Face dataset card and
-https://github.com/BytedanceSpeech/seed-tts-eval):
+https://github.com/zhaochenyang20/seed-tts-eval):
 
 - **EN**: ``openai/whisper-large-v3`` via ``transformers``, audio resampled to **16 kHz**
   (same as ``run_wer.py``).
@@ -489,7 +489,7 @@ def compute_seed_tts_wer_metrics(
     sim_failed = 0
     sim_skipped_no_ref = 0
     utmos_failed = 0
-    utmos_on = _eval_submetric_enabled("SEED_TTS_UTMOS_EVAL", default=True)
+    utmos_on = _eval_submetric_enabled("SEED_TTS_UTMOS_EVAL", default=False)
 
     for req, out in zip(input_requests, outputs, strict=True):
         assert isinstance(req, SeedTTSSampleRequest)
@@ -622,7 +622,7 @@ def compute_seed_tts_wer_metrics(
         errs.append(wer)
         sim_v: float | None = None
 
-        if _eval_submetric_enabled("SEED_TTS_SIM_EVAL", default=True):
+        if _eval_submetric_enabled("SEED_TTS_SIM_EVAL", default=False):
             ref_path = getattr(req, "seed_tts_ref_wav_path", "") or ""
             if ref_path and os.path.isfile(ref_path):
                 try:

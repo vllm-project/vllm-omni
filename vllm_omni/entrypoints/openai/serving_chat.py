@@ -32,6 +32,7 @@ from vllm.entrypoints.chat_utils import (
     get_history_tool_calls_cnt,
     make_tool_call_id,
 )
+from vllm.entrypoints.launcher import terminate_if_errored
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
@@ -80,6 +81,7 @@ from vllm.tokenizers.mistral import (
 from vllm.tool_parsers import ToolParser
 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 from vllm.utils.collection_utils import as_list
+from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
@@ -435,6 +437,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tokenizer,
                 request_metadata,
                 reasoning_parser,
+                raw_request=raw_request,
             )
 
         try:
@@ -555,6 +558,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
                 engine_prompt["additional_information"] = {}
             engine_prompt["additional_information"]["language"] = [language.strip()]
+
+        # Style instruction — used by Ming-flash-omni instruct TTS path
+        # (ming_task="instruct").  For the omni speech path the thinker2talker
+        # bridge drops this field to match upstream omni_audio_generation
+        # which hardcodes instruction=None.
+        instructions = getattr(request, "instructions", None)
+        if instructions is not None and isinstance(instructions, str) and instructions.strip():
+            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
+                engine_prompt["additional_information"] = {}
+            engine_prompt["additional_information"]["instruction"] = instructions.strip()
 
         return conversation, [engine_prompt]
 
@@ -825,6 +838,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         tokenizer: AnyTokenizer,
         request_metadata: RequestResponseMetadata,
         reasoning_parser: ReasoningParser | None = None,
+        raw_request: Request | None = None,
     ):
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
@@ -1537,6 +1551,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         delta=False,
                     )
 
+        except EngineDeadError as e:
+            logger.error(
+                "EngineDeadError during streaming for request %s: %s",
+                request_id,
+                e,
+            )
+            data = self.create_streaming_error_response(e)
+            yield f"data: {data}\n\n"
+            # Actively signal shutdown instead of waiting for the watchdog
+            # (5s polling interval).
+            if raw_request is not None:
+                terminate_if_errored(
+                    server=raw_request.app.state.server,
+                    engine=self.engine_client,
+                )
         except Exception as e:
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
@@ -1617,7 +1646,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logger.warning(f"Unsupported final output type: {omni_outputs.final_output_type}")
                 continue
             if omni_outputs.metrics:
-                response_metrics = omni_outputs.metrics
+                response_metrics = dict(omni_outputs.metrics)
+            if omni_outputs.final_output_type == "image":
+                # Expose diffusion profiler metrics on the top-level response for benchmarks / clients.
+                if response_metrics is None:
+                    response_metrics = {}
+                response_metrics.setdefault("stage_durations", omni_outputs.stage_durations or {})
+                response_metrics.setdefault("peak_memory_mb", float(omni_outputs.peak_memory_mb or 0.0))
             choices.extend(choices_data)
 
         response = OmniChatCompletionResponse(
@@ -1911,7 +1946,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         final_res = omni_outputs.request_output
         # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
         # Reference: examples/offline_inference/qwen3_omni/end2end.py line 421
-        audio_data = final_res.outputs[0].multimodal_output.get("audio")
+        mm_output = final_res.outputs[0].multimodal_output
+        audio_data = mm_output.get("audio")
         if isinstance(audio_data, list):
             if stream:
                 audio_tensor = audio_data[-1]
@@ -1925,9 +1961,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if audio_tensor.ndim > 1:
             audio_tensor = audio_tensor.flatten()
 
+        # Prefer the talker-reported sample rate when present. Qwen3-Omni
+        # omits "sr" and runs at 24kHz; Ming-flash-omni surfaces a 44.1kHz
+        # AudioVAE rate via multimodal_output["sr"].
+        sr_raw = mm_output.get("sr")
+        if sr_raw is None:
+            sample_rate = 24000
+        elif hasattr(sr_raw, "item"):
+            sample_rate = int(sr_raw.item())
+        else:
+            sample_rate = int(sr_raw)
+
         audio_obj = CreateAudio(
             audio_tensor=audio_tensor,
-            sample_rate=24000,
+            sample_rate=sample_rate,
             response_format="wav",
             speed=1.0,
             stream_format="audio",

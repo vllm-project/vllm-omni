@@ -375,6 +375,31 @@ class TestStageResolutionHelpers:
         }
         assert overridden == ["tensor_parallel_size"]
 
+    def test_strip_parent_engine_args_keeps_allowed_media_access_controls(self):
+        from dataclasses import fields as dc_fields
+
+        from vllm.engine.arg_utils import EngineArgs
+
+        parent_fields = {f.name: f for f in dc_fields(EngineArgs)}
+        filtered, overridden = strip_parent_engine_args(
+            {
+                "model": "some/model",
+                "stage_configs_path": "/tmp/stages.yaml",
+                "allowed_local_media_path": "/data/qwentts",
+                "allowed_media_domains": ["example.com"],
+            },
+            parent_fields=parent_fields,
+            keep_keys={"allowed_local_media_path", "allowed_media_domains"},
+            strip_keys={"stage_configs_path"},
+            no_warn_keys={"model"},
+        )
+
+        assert filtered == {
+            "allowed_local_media_path": "/data/qwentts",
+            "allowed_media_domains": ["example.com"],
+        }
+        assert overridden == []
+
 
 class TestPipelineYamlParsing:
     """Tests for pipeline YAML file parsing (@ZJY0516)."""
@@ -939,6 +964,36 @@ class TestQwen3TTSPipeline:
         assert stages[0].yaml_engine_args["model_arch"] == "Qwen3TTSTalkerForConditionalGeneration"
         # Stage 1 uses its per-stage override
         assert stages[1].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
+
+    def test_subtalker_sampling_params_deep_merge_preserves_base_keys(self):
+        """Verify subtalker sampling params participate in stage deep-merge."""
+        from vllm_omni.config.stage_config import _deep_merge_stage
+
+        base = {
+            "stage_id": 0,
+            "subtalker_sampling_params": {
+                "do_sample": True,
+                "temperature": 0.9,
+                "top_k": 50,
+                "top_p": 1.0,
+            },
+        }
+        overlay = {
+            "stage_id": 0,
+            "subtalker_sampling_params": {
+                "temperature": 0.7,
+                "top_k": 32,
+            },
+        }
+
+        merged = _deep_merge_stage(base, overlay)
+
+        assert merged["subtalker_sampling_params"] == {
+            "do_sample": True,
+            "temperature": 0.7,
+            "top_k": 32,
+            "top_p": 1.0,
+        }
 
 
 class TestBaseConfigInheritance:
