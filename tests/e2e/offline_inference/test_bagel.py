@@ -68,7 +68,6 @@ def _extract_text(omni_outputs: list) -> str:
     return ""
 
 
-@pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
@@ -99,7 +98,6 @@ def test_bagel_text2text(run_level):
             )
 
 
-@pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
