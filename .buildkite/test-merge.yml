@@ -78,7 +78,7 @@ steps:
       - label: "Diffusion · LoRA Test"
         timeout_in_minutes: 30
         commands:
-          - pytest -sv tests/diffusion/lora/ -m 'advanced_model' --run-level "advanced_model"
+          - pytest -sv tests/diffusion/lora/ -m 'advanced_model and cuda' --run-level "advanced_model"
         agents:
           queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:
@@ -96,7 +96,7 @@ steps:
         timeout_in_minutes: 20
         commands:
           # Single pytest session for one combined summary at end of log.
-          - pytest -sv tests/diffusion/offloader -m 'advanced_model' --run-level "advanced_model"
+          - pytest -sv tests/diffusion/offloader -m 'advanced_model and cuda' --run-level "advanced_model"
         agents:
           queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:
@@ -113,7 +113,7 @@ steps:
       - label: "Diffusion · Cache Test"
         timeout_in_minutes: 15
         commands:
-          - pytest -sv tests/diffusion/cache -m 'advanced_model' --run-level "advanced_model"
+          - pytest -sv tests/diffusion/cache -m 'advanced_model and cuda' --run-level "advanced_model"
         agents:
           queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:
@@ -130,7 +130,7 @@ steps:
       - label: "Diffusion · Distributed Test"
         timeout_in_minutes: 25
         commands:
-          - pytest -sv tests/diffusion/distributed -m 'advanced_model' --run-level "advanced_model"
+          - pytest -sv tests/diffusion/distributed -m 'advanced_model and cuda' --run-level "advanced_model"
         agents:
           queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
         plugins:
@@ -148,7 +148,7 @@ steps:
       - label: "Diffusion · Worker Test"
         timeout_in_minutes: 20
         commands:
-          - pytest -sv tests/diffusion/test_diffusion_worker.py -m "advanced_model" --run-level "advanced_model"
+          - pytest -sv tests/diffusion/test_diffusion_worker.py -m "advanced_model and cuda" --run-level "advanced_model"
         agents:
           queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
         plugins:
@@ -213,7 +213,7 @@ steps:
     commands:
       - |
         timeout 15m bash -c '
-                pytest -s -v tests/engine -m 'advanced_model' --run-level "advanced_model"
+                pytest -s -v tests/engine -m 'advanced_model and cuda' --run-level "advanced_model"
         '
     agents:
       queue: "gpu_1_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
@@ -234,7 +234,7 @@ steps:
     depends_on: upload-merge-pipeline
     commands:
       - export VLLM_TEST_CLEAN_GPU_MEMORY="1"
-      - pytest -s -v tests/entrypoints/ -m "advanced_model" --run-level "advanced_model"
+      - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda" --run-level "advanced_model"
     agents:
       queue: "mithril-h100-pool"
     plugins:

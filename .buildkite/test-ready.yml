@@ -110,7 +110,7 @@ steps:
     steps:
       - label: "Diffusion · Offloader Test"
         commands:
-          - timeout 10m pytest -s -v tests/diffusion/offloader -m "core_model and not cpu" --run-level "core_model"
+          - timeout 10m pytest -s -v tests/diffusion/offloader -m "core_model and cuda" --run-level "core_model"
         agents:
           queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:
@@ -126,7 +126,7 @@ steps:
 
       - label: "Diffusion · Cache Test"
         commands:
-          - timeout 15m pytest -sv tests/diffusion/cache -m 'core_model and not cpu' --run-level "core_model"
+          - timeout 15m pytest -sv tests/diffusion/cache -m 'core_model and cuda' --run-level "core_model"
         agents:
           queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:
@@ -142,7 +142,7 @@ steps:
 
       - label: "Diffusion · Distributed Test"
         commands:
-          - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and not cpu' --run-level "core_model"
+          - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda' --run-level "core_model"
         agents:
           queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
         plugins:
@@ -159,7 +159,7 @@ steps:
 
       - label: "Diffusion · Quantization Test"
         commands:
-          - timeout 15m pytest -sv tests/diffusion/quantization -m 'core_model and not cpu' --run-level "core_model"
+          - timeout 15m pytest -sv tests/diffusion/quantization -m 'core_model and cuda' --run-level "core_model"
         agents:
           queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:
@@ -175,7 +175,7 @@ steps:
 
       - label: "Diffusion · Other Test"
         commands:
-          - timeout 15m pytest -sv tests/diffusion/ -ignore tests/diffusion/*/ -m 'core_model and not cpu' --run-level "core_model"
+          - timeout 15m pytest -sv tests/diffusion/ -ignore tests/diffusion/*/ -m 'core_model and cuda' --run-level "core_model"
         agents:
           queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:
@@ -192,7 +192,7 @@ steps:
   - label: "Entrypoints Test"
     depends_on: upload-ready-pipeline
     commands:
-      - timeout 15m pytest -sv tests/entrypoints -m 'core_model and not cpu' --run-level "core_model"
+      - timeout 15m pytest -sv tests/entrypoints -m 'core_model and cuda' --run-level "core_model"
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
@@ -210,7 +210,7 @@ steps:
   - label: "Model Executor Test"
     depends_on: upload-ready-pipeline
     commands:
-      - timeout 15m pytest -sv tests/model_executor -m 'core_model and not cpu' --run-level "core_model"
+      - timeout 15m pytest -sv tests/model_executor -m 'core_model and cuda' --run-level "core_model"
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
@@ -228,7 +228,7 @@ steps:
   - label: "Profile&Worker Test"
     depends_on: upload-ready-pipeline
     commands:
-      - timeout 15m pytest -sv tests/profile tests/worker -m 'core_model and not cpu' --run-level "core_model"
+      - timeout 15m pytest -sv tests/profile tests/worker -m 'core_model and cuda' --run-level "core_model"
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
@@ -246,7 +246,7 @@ steps:
   - label: "Benchmark&Comfyui Test"
     depends_on: upload-ready-pipeline
     commands:
-      - timeout 15m pytest -sv tests/benchmark tests/comfyui -m 'core_model and not cpu' --run-level "core_model"
+      - timeout 15m pytest -sv tests/benchmark tests/comfyui -m 'core_model and cuda' --run-level "core_model"
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
@@ -264,7 +264,7 @@ steps:
   - label: "Other Test"
     depends_on: upload-ready-pipeline
     commands:
-      - timeout 15m pytest -sv tests/ -ignore tests/*/ -m 'core_model and not cpu' --run-level "core_model"
+      - timeout 15m pytest -sv tests/ -ignore tests/*/ -m 'core_model and cuda' --run-level "core_model"
     agents:
       queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
     plugins:
@@ -283,7 +283,7 @@ steps:
     commands:
       - |
         timeout 15m bash -c '
-                pytest -sv tests/engine/ -m 'core_model and not cpu' --run-level "core_model"
+                  pytest -sv tests/engine/ -m 'core_model and cuda' --run-level "core_model"
         '
     agents:
       queue: "gpu_1_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
