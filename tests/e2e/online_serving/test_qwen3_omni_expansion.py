@@ -84,6 +84,7 @@ test_params = [
             model=model,
             stage_config_path=get_async_chunk_config(default_path),
             use_stage_cli=True,
+            server_args=["--async-chunk"],
         ),
         id="async_chunk",
     ),
