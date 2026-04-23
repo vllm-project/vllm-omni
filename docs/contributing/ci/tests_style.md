@@ -141,7 +141,7 @@ vllm_omni/                                    tests/
                                                    ├── test_qwen3_omni.py
                                                    ├── test_bagel_text2img.py
                                                    ├── test_t2i_model.py
-                                                   ├── test_t2v_model.py
+                                                   ├── test_wan22.py
                                                    ├── test_ovis_image.py
                                                    ├── test_zimage_tensor_parallel.py
                                                    ├── test_cache_dit.py

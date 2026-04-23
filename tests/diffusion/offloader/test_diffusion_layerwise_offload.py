@@ -34,7 +34,7 @@ def run_inference(
     ) as runner:
         current_omni_platform.reset_peak_memory_stats()
 
-        # Refer to tests/e2e/offline_inference/test_t2v_model.py
+        # Refer to tests/e2e/offline_inference/test_wan22.py
         # Use minimal settings for testing
         height = 480
         width = 640
