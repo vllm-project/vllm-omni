@@ -356,7 +356,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # multimodal processor path. Without it, the preprocessor
                 # falls back to plain _tokenize_prompt and AR-based image-gen
                 # models like GLM-Image never see their image-generation
-                # scaffold (vllm-omni issue #3034).
+                # scaffold.
                 mm_processor_kwargs: dict[str, Any] = {}
                 if height is not None:
                     mm_processor_kwargs["target_h"] = height

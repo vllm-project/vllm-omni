@@ -64,7 +64,7 @@ class OmniInputPreprocessor(InputPreprocessor):
             # Presence — not truthiness. An explicitly-set empty dict still
             # signals "route through the multimodal processor" (needed for
             # AR-based image-gen where the HF processor supplies its own
-            # defaults and scaffold, see vllm-omni issue #3034).
+            # defaults and scaffold).
             inputs = self._process_multimodal(
                 prompt_text,
                 {},
