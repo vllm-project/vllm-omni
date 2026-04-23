@@ -17,6 +17,9 @@ from tests.dfx.conftest import (
 )
 from tests.helpers.runtime import OmniServer
 
+pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+
+
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
@@ -293,6 +296,7 @@ def assert_result(
                 print(f"ERROR: Test results exceeded baseline: {metric_name}: {current_value} < {baseline_value}")
 
 
+@pytest.mark.benchmark
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.parametrize("benchmark_params", benchmark_indices, indirect=True)
 def test_performance_benchmark(omni_server, benchmark_params):

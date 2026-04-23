@@ -16,6 +16,8 @@ from PIL import Image, ImageDraw
 
 from tests.helpers.runtime import OmniServer, OmniServerParams
 
+pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+
 MODEL = "black-forest-labs/FLUX.2-klein-4B"
 
 _HEIGHT = 512
@@ -66,8 +68,6 @@ def _send_edit_request(host: str, port: int, model: str, image_b64: str, mask_b6
         return response.json()
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
 def test_flux2_klein_inpaint_basic(omni_server: OmniServer):
     input_image_b64 = _image_to_base64_jpeg(Image.new("RGB", (_WIDTH, _HEIGHT), (128, 128, 128)))
@@ -92,8 +92,6 @@ def test_flux2_klein_inpaint_basic(omni_server: OmniServer):
     assert img.size == (_WIDTH, _HEIGHT)
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
 def test_flux2_klein_inpaint_deterministic(omni_server: OmniServer):
     input_image_b64 = _image_to_base64_jpeg(Image.new("RGB", (_WIDTH, _HEIGHT), (128, 128, 128)))
@@ -137,8 +135,6 @@ def test_flux2_klein_inpaint_deterministic(omni_server: OmniServer):
     )
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
 def test_flux2_klein_inpaint_multiple_outputs(omni_server: OmniServer):
     input_image_b64 = _image_to_base64_jpeg(Image.new("RGB", (_WIDTH, _HEIGHT), (128, 128, 128)))

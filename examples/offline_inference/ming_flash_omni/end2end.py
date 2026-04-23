@@ -6,8 +6,8 @@ import os
 import time
 from typing import NamedTuple
 
-import librosa
 import numpy as np
+import soundfile as sf
 import vllm
 from PIL import Image
 from transformers import AutoProcessor
@@ -16,6 +16,7 @@ from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
+from vllm.multimodal.media.audio import load_audio
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 import vllm_omni
@@ -91,7 +92,7 @@ def get_audio_query(
     if audio_path:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_signal, sr = load_audio(audio_path, sr=sampling_rate)
         audio_data = (audio_signal.astype(np.float32), sr)
     else:
         audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
@@ -172,7 +173,7 @@ def get_mixed_modalities_query(
     if audio_path:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        sig, sr = librosa.load(audio_path, sr=sampling_rate)
+        sig, sr = load_audio(audio_path, sr=sampling_rate)
         audio_data = (sig.astype(np.float32), sr)
     else:
         audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
@@ -319,7 +320,16 @@ def main(args):
         seed=SEED,
         detokenize=True,
     )
-    sampling_params_list = [thinker_sampling_params]
+    # Talker (ming_tts) uses a custom generation loop (CFM + AudioVAE);
+    # vLLM sampling is a no-op here — max_tokens=1 just satisfies the scheduler.
+    talker_sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=1,
+    )
+    all_sampling_params = [thinker_sampling_params, talker_sampling_params]
+    # Match sampling params to the number of configured stages
+    # (thinker-only yaml → 1, thinker+talker yaml → 2).
+    sampling_params_list = all_sampling_params[: omni.num_stages]
 
     prompts = [query_result.inputs for _ in range(args.num_prompts)]
 
@@ -362,7 +372,19 @@ def main(args):
                 print(f"Failed to write output file {out_txt}: {e}")
 
         elif stage_outputs.final_output_type == "audio":
-            raise NotImplementedError("Add audio example after talker supported.")
+            request_id = output.request_id
+            mm = output.outputs[0].multimodal_output
+            if mm and "audio" in mm:
+                audio = mm["audio"]
+                sr_raw = mm.get("sr", 44100)
+                sample_rate = int(sr_raw.item() if hasattr(sr_raw, "item") else sr_raw)
+                audio_numpy = audio.float().squeeze().cpu().numpy()
+                output_wav = os.path.join(output_dir, f"{request_id}.wav")
+                sf.write(output_wav, audio_numpy, samplerate=sample_rate, format="WAV")
+                print(
+                    f"Request ID: {request_id}, audio saved to {output_wav} "
+                    f"({len(audio_numpy) / sample_rate:.2f}s, {sample_rate}Hz)"
+                )
 
         processed_count += 1
         if profiler_enabled and processed_count >= total_requests:

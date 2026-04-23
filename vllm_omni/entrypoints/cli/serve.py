@@ -139,6 +139,17 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable vLLM-Omni mode for multi-modal and diffusion models",
         )
+
+        try:
+            omni_config_group.add_argument(
+                "--enable-sleep-mode",
+                action="store_true",
+                default=False,
+                help="Enable GPU memory pool for sleep mode.",
+            )
+        except argparse.ArgumentError:
+            pass
+
         omni_config_group.add_argument(
             "--task-type",
             type=str,
@@ -255,6 +266,40 @@ class OmniServeCommand(CLISubcommand):
             type=str,
             default=None,
             help="Override the diffusion pipeline class name (e.g. LTX2ImageToVideoPipeline).",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-load-format",
+            dest="diffusion_load_format",
+            type=str,
+            default=None,
+            choices=["default", "custom_pipeline", "dummy", "diffusers"],
+            help=(
+                "How to load the diffusion pipeline: native/registry (default), "
+                "custom_pipeline, dummy, or diffusers for the HF diffusers adapter."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusers-load-kwargs",
+            dest="diffusers_load_kwargs",
+            type=json.loads,
+            default="{}",
+            help=(
+                "JSON object passed to DiffusionPipeline.from_pretrained()."
+                "It overrides corresponding parameters in the standard vLLM-Omni interface."
+                '(e.g. \'{"use_safetensors": true, "variant": "fp16"}\').'
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusers-call-kwargs",
+            dest="diffusers_call_kwargs",
+            type=json.loads,
+            default="{}",
+            help=(
+                "JSON object passed to pipeline.__call__(). "
+                "Useful for model-specific sampling parameters not covered by the vLLM-Omni interface."
+                "During request time, it is overridden by corresponding parameters in the vLLM-Omni interface."
+                '(e.g. \'{"num_inference_steps": 30, "guidance_scale": 7.5}\').'
+            ),
         )
         omni_config_group.add_argument(
             "--usp",

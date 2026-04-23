@@ -353,6 +353,8 @@ class DiffusionCacheConfig:
 @dataclass
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
+    stage_id: int = 0
+
     model: str | None = None
 
     model_class_name: str | None = None
@@ -450,7 +452,14 @@ class OmniDiffusionConfig:
     custom_pipeline_args: dict[str, Any] | None = None
 
     # Diffusion model loading format
-    diffusion_load_format: str = "default"  # "default", "custom_pipeline", "dummy"
+    # "default", "custom_pipeline", "dummy", "diffusers" (HF diffusers adapter)
+    diffusion_load_format: str = "default"
+
+    # Diffusers adapter kwargs
+    # kwargs forwarded to DiffusionPipeline.from_pretrained()
+    diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
+    # kwargs forwarded to pipeline.__call__()
+    diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
 
     # http server endpoint config, would be ignored in local mode
     host: str | None = None
@@ -508,6 +517,8 @@ class OmniDiffusionConfig:
     # Step mode settings
     step_execution: bool = False
 
+    # sleep mode
+    enable_sleep_mode: bool = False
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
 
@@ -644,6 +655,12 @@ class OmniDiffusionConfig:
         elif self.max_cpu_loras < 1:
             raise ValueError("max_cpu_loras must be >= 1 for diffusion LoRA")
 
+        if self.diffusion_load_format != "diffusers" and (self.diffusers_load_kwargs or self.diffusers_call_kwargs):
+            raise ValueError(
+                "diffusers_load_kwargs and diffusers_call_kwargs are only "
+                "valid together with diffusion_load_format=diffusers"
+            )
+
     def set_tf_model_config(self, tf_config: "TransformerConfig") -> None:
         """Assign `tf_model_config` and propagate quantization if detected.
 
@@ -682,6 +699,10 @@ class OmniDiffusionConfig:
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
 
+        # Default model_class_name for diffusers adapter
+        if self.model_class_name is None and self.diffusion_load_format == "diffusers":
+            self.model_class_name = "DiffusersAdapterPipeline"
+
         try:
             config_dict = get_hf_file_to_dict("model_index.json", self.model)
             if config_dict is not None:
@@ -689,32 +710,42 @@ class OmniDiffusionConfig:
                     self.model_class_name = config_dict.get("_class_name", None)
                 self.update_multimodal_support()
 
-                tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model)
-                self.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+                # Skip transformer config loading for diffusers adapter
+                # (non-DiT models don't have a separate transformer folder/config)
+                if self.diffusion_load_format == "diffusers":
+                    self.tf_model_config = TransformerConfig()
+                else:
+                    tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model)
+                    self.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
             else:
                 raise FileNotFoundError("model_index.json not found")
         except (AttributeError, OSError, ValueError, FileNotFoundError):
-            cfg = get_hf_file_to_dict("config.json", self.model)
-            if cfg is None:
-                raise ValueError(f"Could not find config.json or model_index.json for model {self.model}")
-
-            self.tf_model_config = TransformerConfig.from_dict(cfg)
-            model_type = cfg.get("model_type")
-            architectures = cfg.get("architectures") or []
-
-            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
-                self.model_class_name = "BagelPipeline"
+            # Skip transformer config loading for diffusers adapter
+            # (non-DiT models don't have a separate transformer folder/config)
+            if self.diffusion_load_format == "diffusers":
                 self.tf_model_config = TransformerConfig()
-                self.update_multimodal_support()
-            elif model_type == "nextstep":
-                if self.model_class_name is None:
-                    self.model_class_name = "NextStep11Pipeline"
-                self.tf_model_config = TransformerConfig()
-                self.update_multimodal_support()
-            elif architectures and len(architectures) == 1:
-                self.model_class_name = architectures[0]
             else:
-                raise
+                cfg = get_hf_file_to_dict("config.json", self.model)
+                if cfg is None:
+                    raise ValueError(f"Could not find config.json or model_index.json for model {self.model}")
+
+                self.tf_model_config = TransformerConfig.from_dict(cfg)
+                model_type = cfg.get("model_type")
+                architectures = cfg.get("architectures") or []
+
+                if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                    self.model_class_name = "BagelPipeline"
+                    self.tf_model_config = TransformerConfig()
+                    self.update_multimodal_support()
+                elif model_type == "nextstep":
+                    if self.model_class_name is None:
+                        self.model_class_name = "NextStep11Pipeline"
+                    self.tf_model_config = TransformerConfig()
+                    self.update_multimodal_support()
+                elif architectures and len(architectures) == 1:
+                    self.model_class_name = architectures[0]
+                else:
+                    raise
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":
@@ -738,6 +769,12 @@ class OmniDiffusionConfig:
         if "cache_backend" not in kwargs:
             cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
             kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
+
+        # Falsy-value check for not-None fields (convert potential None values in YAML config to empty containers)
+        if "diffusers_load_kwargs" in kwargs and kwargs["diffusers_load_kwargs"] is None:
+            kwargs["diffusers_load_kwargs"] = {}
+        if "diffusers_call_kwargs" in kwargs and kwargs["diffusers_call_kwargs"] is None:
+            kwargs["diffusers_call_kwargs"] = {}
 
         # Filter kwargs to only include valid fields
         valid_fields = {f.name for f in fields(cls)}
@@ -795,6 +832,44 @@ class AttentionBackendEnum(enum.Enum):
 
     def __str__(self):
         return self.name.lower()
+
+
+@dataclass
+class OmniACK:
+    """
+    Handshake payload from Workers to Orchestrator.
+    """
+
+    task_id: str
+    status: str
+    stage_id: int | None = None
+    rank: int | None = None
+    freed_bytes: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
+    """
+    Additional telemetry such as:
+    - max_contiguous_block: for fragmentation analysis.
+    - cuda_graph_recalled: boolean if graphs were successfully destroyed/rebuilt.
+    - latency_ms: time taken for the D2H/H2D transfer.
+    """
+    error_msg: str | None = None
+
+
+@dataclass
+class OmniSleepTask:
+    """Structured sleep instruction."""
+
+    task_id: str
+    level: int = 2
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class OmniWakeTask:
+    """Structured wake-up instruction."""
+
+    task_id: str
+    tags: list[str] | None = None
 
 
 # Special message broadcast via scheduler queues to signal worker shutdown.
