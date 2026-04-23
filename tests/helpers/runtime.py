@@ -38,6 +38,7 @@ from tests.helpers.media import (
     decode_b64_image,
 )
 from vllm_omni.config.stage_config import resolve_deploy_yaml
+from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -1194,7 +1195,7 @@ class OmniRunner:
         self,
         prompts: list[Any],
         sampling_params_list: list[Any] | None = None,
-    ) -> list[Any]:
+    ) -> list[OmniRequestOutput]:
         if sampling_params_list is None:
             sampling_params_list = self.get_default_sampling_params_list()
         return self.omni.generate(prompts, sampling_params_list)
@@ -1209,7 +1210,7 @@ class OmniRunner:
         videos: PromptVideoInput = None,
         mm_processor_kwargs: dict[str, Any] | None = None,
         modalities: list[str] | None = None,
-    ) -> list[Any]:
+    ) -> list[OmniRequestOutput]:
         omni_inputs = self.get_omni_inputs(
             prompts=prompts,
             system_prompt=system_prompt,
@@ -1274,10 +1275,10 @@ class OmniRunner:
 
 
 class OmniRunnerHandler:
-    def __init__(self, omni_runner):
+    def __init__(self, omni_runner: OmniRunner):
         self.runner = omni_runner
 
-    def _process_omni_output(self, outputs: list[Any]) -> OmniResponse:
+    def _process_omni_output(self, outputs: list[OmniRequestOutput]) -> OmniResponse:
         result = OmniResponse()
         try:
             text_content = None
