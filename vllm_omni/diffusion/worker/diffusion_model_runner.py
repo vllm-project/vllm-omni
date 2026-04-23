@@ -513,7 +513,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         chunks: dict[int, ChunkState] = state.extra.setdefault("chunks", {})
         chunk = chunks.get(chunk_idx)
         if chunk is not None:
-            return chunk, False
+            return chunk, chunk.step_index == 0
         chunk = ChunkState(idx=chunk_idx)
         chunks[chunk_idx] = chunk
         return chunk, True
@@ -548,39 +548,41 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 pp_group = get_pp_group()
                 pp_rank = pp_group.rank_in_group
                 task = assignment[pp_rank]
+                prev_task = assignment[pp_group.prev_rank]
 
                 if is_new_request:
                     pp_group.reset_buffer()
-                    self.pipeline.set_pp_recv_dict_buffers(state)
+                    self.pipeline.is_buffer_setup = False   
                     self.pipeline.prepare_encode(state)
 
-                if pp_group.is_first_rank:
-                    denoised_chunks = state.extra.pop("denoised_chunks", [])
+                if pp_group.is_first_rank: # TODO: race condition
+                    denoised_chunks = state.extra.get("denoised_chunks", [])
                     decoded_chunks = state.extra.setdefault("decoded_chunks", [])
+                    new_denoised_chunks = []
                     
-                    for chunk in denoised_chunks:
-                        with state.use_chunk(chunk):
-                            decoded_chunks.append(self.pipeline.post_decode(state))
+                    for chunk, steps_left in denoised_chunks:
+                        steps_left -= 1
+                        if steps_left == 0:
+                            with state.use_chunk(chunk):
+                                decoded_chunks.append(self.pipeline.post_decode(state))
+                        else:
+                            new_denoised_chunks.append((chunk, steps_left))
 
-                    if len(decoded_chunks) >= state.sampling.num_chunks:
-                        assert len(decoded_chunks) == state.sampling.num_chunks, (
-                            f"Expected {state.sampling.num_chunks} denoised chunks but got {len(decoded_chunks)}"
-                        )
-
+                    state.extra["denoised_chunks"] = new_denoised_chunks
+                    if len(decoded_chunks) == state.sampling.num_chunks:
                         output = RunnerOutput(
                             req_id=state.req_id,
                             step_index=state.step_index,
                             finished=True,
                             result=self._merge_chunk_outputs(decoded_chunks),
                         )
-
-                        self._update_states_after(state, finished=True)
-
+                        self._update_states_after(state, finished=True) # TODO: call properly on all ranks
                         return output
 
-
+                
                 if task is None:
                     return RunnerOutput(req_id=state.req_id)
+                
 
                 chunk, is_new_chunk = self._get_or_create_chunk(state, task.chunk_idx)
                 if is_new_chunk:
@@ -596,6 +598,8 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     chunk.scheduler = copy.deepcopy(state.scheduler)
 
                 with state.use_chunk(chunk):
+                    if not self.pipeline.is_buffer_setup:
+                        self.pipeline.set_pp_recv_dict_buffers(state)
                     noise_pred = self.pipeline.denoise_step(state)
                     if noise_pred is None and getattr(self.pipeline, "interrupt", False):
                         return RunnerOutput(
@@ -605,17 +609,25 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     self.pipeline.step_scheduler(state, noise_pred)
                     chunk_done = state.denoise_completed
 
+
+                # prefetch the chunk of the next micro-step
+                prev_chunk, _ = self._get_or_create_chunk(state, prev_task.chunk_idx) if prev_task is not None else (None, None)
+                if prev_chunk is not None:
+                    with state.use_chunk(prev_chunk):
+                        self.pipeline.prefetch_its(state)
+
+
                 output = RunnerOutput(
                     req_id=task.sched_req_id,
                     step_index=chunk.step_index,
                     chunk_idx=task.chunk_idx,
                 )
 
-                if chunk_done and pp_group.is_first_rank:
-                    state.extra.setdefault("denoised_chunks", []).append(chunk)
-
+                if chunk_done:
                     output.chunk_completed = True
                     state.extra["chunks"].pop(task.chunk_idx, None)
-
+                    if pp_group.is_first_rank:
+                        steps_left = pp_group.world_size 
+                        state.extra.setdefault("denoised_chunks", []).append((chunk, steps_left))
             
                 return output

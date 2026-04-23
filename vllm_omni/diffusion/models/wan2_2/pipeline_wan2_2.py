@@ -436,6 +436,8 @@ class Wan22Pipeline(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
 
+        self.is_buffer_setup = False
+
     def _create_transformer(self, config: dict) -> WanTransformer3DModel:
         """Create a transformer from a config dict. Respects od_config.quantization_config."""
         quant_config = getattr(self.od_config, "quantization_config", None)
@@ -1338,6 +1340,8 @@ class Wan22Pipeline(
         for seg in range(cfg_branches):
             pp_group.set_recv_dict_buffer("intermediate", seg, it_template)
 
+        self.is_buffer_setup = True
+
     def denoise_step(
         self,
         state: DiffusionRequestState,
@@ -1383,6 +1387,21 @@ class Wan22Pipeline(
             buf_idx=state.step_index % 2,
         )
 
+    def prefetch_its(self, state: DiffusionRequestState) -> None:
+        """Prefetch intermediate tensors for the next step."""
+        t = state.current_timestep
+        boundary_timestep = state.extra.get("boundary_timestep")
+        _, current_guidance_scale = self._select_model_for_timestep(t, boundary_timestep)
+        do_true_cfg = current_guidance_scale > 1.0 and state.negative_prompt_embeds is not None
+        buf_idx = state.step_index % 2
+        is_last_step = state.step_index == state.total_steps - 1
+
+        self.prefetch_its_maybe_with_pp_and_cfg(
+            do_true_cfg=do_true_cfg,
+            buf_idx=buf_idx,
+            is_last_step=is_last_step,
+        )
+
     def step_scheduler(
         self,
         state: DiffusionRequestState,
@@ -1394,6 +1413,8 @@ class Wan22Pipeline(
         boundary_timestep = state.extra.get("boundary_timestep")
         _, current_guidance_scale = self._select_model_for_timestep(t, boundary_timestep)
         do_true_cfg = current_guidance_scale > 1.0 and state.negative_prompt_embeds is not None
+        buf_idx = state.step_index % 2
+        is_last_step = state.step_index == state.total_steps - 1
 
         state.latents = self.scheduler_step_maybe_with_pp_and_cfg(
             noise_pred,
@@ -1401,8 +1422,8 @@ class Wan22Pipeline(
             state.latents,
             do_true_cfg,
             per_request_scheduler=state.scheduler,
-            buf_idx=state.step_index % 2,
-            is_last_step=state.step_index == state.total_steps - 1,
+            buf_idx=buf_idx,
+            is_last_step=is_last_step,
         )
         state.step_index += 1
 
