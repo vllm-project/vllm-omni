@@ -16,12 +16,6 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-def _int_dtype() -> torch.dtype:
-    # XPU/CCL corrupts int64 during gather/broadcast; use int32 instead
-    from vllm_omni.platforms import current_omni_platform
-    return torch.int32 if current_omni_platform.is_xpu() else torch.int64
-
-
 def _get_vae_spatial_scale_factor(vae: Any) -> int:
     try:
         block_out_channels = getattr(getattr(vae, "config", None), "block_out_channels", None)
@@ -134,7 +128,7 @@ def _distributed_tiled_decode(
             tile_id += 1
 
     # Gather per-rank tile counts.
-    count_tensor = torch.tensor([len(local_tiles)], device=z.device, dtype=_int_dtype())
+    count_tensor = torch.tensor([len(local_tiles)], device=z.device, dtype=torch.int64)
     if rank == 0:
         count_gather = [torch.empty_like(count_tensor) for _ in range(world_size)]
     else:
@@ -144,14 +138,14 @@ def _distributed_tiled_decode(
     if rank == 0:
         counts = [int(t.item()) for t in count_gather]  # type: ignore[arg-type]
         max_count = max(counts) if counts else 0
-    max_count_tensor = torch.tensor([max_count], device=z.device, dtype=_int_dtype())
+    max_count_tensor = torch.tensor([max_count], device=z.device, dtype=torch.int64)
     dist.broadcast(max_count_tensor, src=0, group=group)
     max_count = int(max_count_tensor.item())
 
     out_channels = _get_vae_out_channels(vae)
 
     # Prepare padded metadata + tiles for gather.
-    meta_tensor = torch.full((max_count, 3), -1, device=z.device, dtype=_int_dtype())
+    meta_tensor = torch.full((max_count, 3), -1, device=z.device, dtype=torch.int64)
     tile_tensor = torch.zeros(
         (max_count, z.shape[0], out_channels, tile_sample_min_size, tile_sample_min_size),
         device=z.device,
@@ -291,7 +285,7 @@ def _distributed_patch_decode(
         local_w = int(local_core.shape[-1]) if local_core.numel() else 0
 
     # Gather block shapes.
-    shape_tensor = torch.tensor([local_h, local_w], device=z.device, dtype=_int_dtype())
+    shape_tensor = torch.tensor([local_h, local_w], device=z.device, dtype=torch.int64)
     if rank == 0:
         shape_gather = [torch.empty_like(shape_tensor) for _ in range(world_size)]
     else:
@@ -305,7 +299,7 @@ def _distributed_patch_decode(
         max_h = max((h for h, _ in shapes), default=0)
         max_w = max((w for _, w in shapes), default=0)
 
-    max_hw_tensor = torch.tensor([max_h, max_w], device=z.device, dtype=_int_dtype())
+    max_hw_tensor = torch.tensor([max_h, max_w], device=z.device, dtype=torch.int64)
     dist.broadcast(max_hw_tensor, src=0, group=group)
     max_h = int(max_hw_tensor[0].item())
     max_w = int(max_hw_tensor[1].item())
@@ -432,9 +426,9 @@ class VaePatchParallelism:
         if rank == 0 and not decoded.is_contiguous():
             decoded = decoded.contiguous()
 
-        shape_tensor = torch.empty((4,), device=z.device, dtype=_int_dtype())
+        shape_tensor = torch.empty((4,), device=z.device, dtype=torch.int64)
         if rank == 0:
-            shape_tensor.copy_(torch.tensor(tuple(decoded.shape), device=z.device, dtype=_int_dtype()))
+            shape_tensor.copy_(torch.tensor(tuple(decoded.shape), device=z.device, dtype=torch.int64))
         dist.broadcast(shape_tensor, src=0, group=group)
 
         if rank != 0:
