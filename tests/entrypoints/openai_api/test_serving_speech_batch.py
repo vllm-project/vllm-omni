@@ -12,7 +12,6 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import base64
-import shutil
 import struct
 import tempfile
 import time
@@ -24,36 +23,22 @@ import yaml
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import convert_audio_file_to_text, cosine_similarity_text
-from tests.helpers.runtime import OmniServer
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.runtime import OmniServerParams
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
-STAGE_INIT_TIMEOUT_S = 120
 
 
-def get_stage_config(name: str = "qwen3_tts.yaml") -> str:
-    """Resolve a deploy config path under vllm_omni/deploy/."""
-    return get_deploy_config_path(name)
-
-
-@pytest.fixture(scope="module")
-def omni_server():
-    """Start vLLM-Omni server with CustomVoice model."""
-    stage_config_path = get_stage_config()
-
-    with OmniServer(
-        MODEL,
-        [
-            "--stage-configs-path",
-            stage_config_path,
-            "--stage-init-timeout",
-            str(STAGE_INIT_TIMEOUT_S),
-            "--trust-remote-code",
-            "--enforce-eager",
-            "--disable-log-stats",
-        ],
-    ) as server:
-        yield server
+default_server_params = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
+            server_args=["--trust-remote-code", "--enforce-eager", "--disable-log-stats"],
+        ),
+        id="qwen3-tts-batch-default",
+    )
+]
 
 
 def make_batch_request(
@@ -102,9 +87,10 @@ MIN_AUDIO_BYTES = 10000
 class TestSpeechBatchE2E:
     """E2E tests for /v1/audio/speech/batch endpoint."""
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_basic_two_items(self, omni_server) -> None:
         """Batch with two items returns two successful base64-encoded results."""
         items = [
@@ -135,9 +121,10 @@ class TestSpeechBatchE2E:
             assert verify_wav_bytes(audio_bytes), f"Item {i}: invalid WAV"
             assert len(audio_bytes) > MIN_AUDIO_BYTES, f"Item {i}: audio too small ({len(audio_bytes)} bytes)"
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_single_item(self, omni_server) -> None:
         """Batch with a single item works correctly."""
         items = [{"input": "Single item batch test."}]
@@ -156,9 +143,10 @@ class TestSpeechBatchE2E:
         assert len(data["results"]) == 1
         assert data["results"][0]["status"] == "success"
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_per_item_voice_override(self, omni_server) -> None:
         """Per-item voice overrides the batch-level default."""
         items = [
@@ -183,9 +171,10 @@ class TestSpeechBatchE2E:
             audio_bytes = base64.b64decode(result["audio_data"])
             assert verify_wav_bytes(audio_bytes)
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_multiple_languages(self, omni_server) -> None:
         """Batch items with different languages per item."""
         items = [
@@ -207,9 +196,10 @@ class TestSpeechBatchE2E:
             audio_bytes = base64.b64decode(result["audio_data"])
             assert len(audio_bytes) > MIN_AUDIO_BYTES
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_whisper_transcription(self, omni_server) -> None:
         """Whisper transcription of batch output matches input text."""
         input_text = "Good morning, welcome to the speech synthesis test."
@@ -241,9 +231,10 @@ class TestSpeechBatchE2E:
         finally:
             os.unlink(wav_path)
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_result_indices_ordered(self, omni_server) -> None:
         """Result indices match the input item order."""
         items = [
@@ -267,9 +258,10 @@ class TestSpeechBatchE2E:
 class TestSpeechBatchValidation:
     """Validation / error-handling tests for the batch endpoint."""
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_empty_items_rejected(self, omni_server) -> None:
         """Empty items list returns a 4xx error."""
         url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech/batch"
@@ -280,9 +272,10 @@ class TestSpeechBatchValidation:
 
         assert response.status_code in (400, 422)
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_exceeds_max_items(self, omni_server) -> None:
         """Batch exceeding 32 items returns 400 error."""
         items = [{"input": f"Item {i}"} for i in range(33)]
@@ -296,19 +289,27 @@ class TestSpeechBatchValidation:
 
 
 def _make_batch2_stage_config() -> str:
-    """Create a temporary stage config with max_batch_size=2 for both stages."""
-    src = Path(get_stage_config("qwen3_tts.yaml"))
-    with open(src) as f:
-        cfg = yaml.safe_load(f)
+    """Create a modified stage config with max_num_seqs=2 for all stages."""
+    base_config_path = get_deploy_config_path("qwen3_tts.yaml")
+    with open(base_config_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    stage_updates = {stage["stage_id"]: {"max_num_seqs": 2} for stage in cfg["stages"]}
+    return modify_stage_config(base_config_path, updates={"stages": stage_updates})
 
-    for stage in cfg["stage_args"]:
-        stage["runtime"]["max_batch_size"] = 2
 
-    tmp_dir = tempfile.mkdtemp(prefix="tts_batch2_")
-    dst = Path(tmp_dir) / "qwen3_tts_batch2.yaml"
-    with open(dst, "w") as f:
-        yaml.dump(cfg, f)
-    return str(dst), tmp_dir
+BATCH2_STAGE_CONFIG_PATH = _make_batch2_stage_config()
+
+
+batch2_server_params = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=BATCH2_STAGE_CONFIG_PATH,
+            server_args=["--trust-remote-code", "--enforce-eager", "--disable-log-stats"],
+        ),
+        id="qwen3-tts-batch-max2",
+    )
+]
 
 
 def make_single_request(
@@ -326,43 +327,22 @@ def make_single_request(
         return client.post(url, json=payload)
 
 
-@pytest.fixture(scope="module")
-def omni_server_batch2():
-    """Start vLLM-Omni server with max_batch_size=2 config."""
-    config_path, tmp_dir = _make_batch2_stage_config()
-
-    with OmniServer(
-        MODEL,
-        [
-            "--stage-configs-path",
-            config_path,
-            "--stage-init-timeout",
-            str(STAGE_INIT_TIMEOUT_S),
-            "--trust-remote-code",
-            "--enforce-eager",
-            "--disable-log-stats",
-        ],
-    ) as server:
-        yield server
-
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-
-
 class TestSpeechBatchSize2:
     """E2E tests with max_batch_size=2 to verify true batched inference."""
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_batch2_produces_valid_audio(self, omni_server_batch2) -> None:
+    @pytest.mark.parametrize("omni_server", batch2_server_params, indirect=True)
+    def test_batch2_produces_valid_audio(self, omni_server) -> None:
         """Batch of 2 items with batched engine produces valid audio."""
         items = [
             {"input": "Hello, this is the first sentence."},
             {"input": "And this is the second sentence."},
         ]
         response = make_batch_request(
-            host=omni_server_batch2.host,
-            port=omni_server_batch2.port,
+            host=omni_server.host,
+            port=omni_server.port,
             items=items,
         )
 
@@ -387,10 +367,11 @@ class TestSpeechBatchSize2:
 
         print(f"\nBatch audio saved to: {output_dir}")
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_batch2_vs_sequential_timing(self, omni_server_batch2) -> None:
+    @pytest.mark.parametrize("omni_server", batch2_server_params, indirect=True)
+    def test_batch2_vs_sequential_timing(self, omni_server) -> None:
         """Compare batch-of-2 vs 2 sequential single requests.
 
         With max_batch_size=2 the engine can process both items
@@ -400,8 +381,8 @@ class TestSpeechBatchSize2:
         text_a = "The quick brown fox jumps over the lazy dog."
         text_b = "A journey of a thousand miles begins with a single step."
 
-        host = omni_server_batch2.host
-        port = omni_server_batch2.port
+        host = omni_server.host
+        port = omni_server.port
 
         # --- Sequential: 2 single /v1/audio/speech calls ---
         t0 = time.perf_counter()

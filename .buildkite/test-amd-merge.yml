@@ -28,9 +28,9 @@ steps:
     - |
       timeout 20m bash -c '
         set +e
-        pytest -s -v tests/e2e/offline_inference/test_diffusion_cpu_offload.py
+        pytest -s -v tests/diffusion/offloader/test_diffusion_cpu_offload.py
         EXIT1=\$?
-        pytest -s -v tests/e2e/offline_inference/test_diffusion_layerwise_offload.py
+        pytest -s -v tests/diffusion/offloader/test_diffusion_layerwise_offload.py
         EXIT2=\$?
         exit \$((EXIT1 | EXIT2))
       '
@@ -65,7 +65,7 @@ steps:
   commands:
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - timeout 20m pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py
+    - timeout 20m pytest -s -v tests/diffusion/distributed/test_sequence_parallel.py
     - timeout 20m pytest -s -v tests/diffusion/distributed/test_ulysses_uaa_perf.py
 
 # merge-only tests
@@ -75,7 +75,7 @@ steps:
   mirror_hardwares: [amdproduction]
   grade: Blocking
   commands:
-    - pytest -s -v tests/e2e/offline_inference/test_zimage_parallelism.py
+    - pytest -s -v tests/diffusion/distributed/test_zimage_parallelism.py
 
 - label: "Diffusion GPU Worker Test"
   agent_pool: mi325_2
@@ -158,7 +158,7 @@ steps:
 #     - export VLLM_LOGGING_LEVEL=DEBUG
 #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
 #     - export VLLM_ROCM_USE_AITER_RMSNORM=0
-#     - timeout 30m pytest -s -v tests/e2e/offline_inference/test_bagel_text2img.py -m "advanced_model" --run-level "advanced_model" -k "shared_memory" -k "rocm"
+#     - timeout 30m pytest -s -v tests/e2e/offline_inference/test_bagel.py -m "advanced_model" --run-level "advanced_model" -k "shared_memory" -k "rocm"
 
 # - label: "Bagel Img2Img Model Test (2/3)"
 #   agent_pool: mi325_1
@@ -171,7 +171,7 @@ steps:
 #     - export VLLM_LOGGING_LEVEL=DEBUG
 #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
 #     - export VLLM_ROCM_USE_AITER_RMSNORM=0
-#     - timeout 30m pytest -s -v tests/e2e/offline_inference/test_bagel_img2img.py -m "advanced_model" --run-level "advanced_model" -k "rocm"
+#     - timeout 30m pytest -s -v tests/e2e/offline_inference/test_bagel.py -m "advanced_model" --run-level "advanced_model" -k "rocm"
 
 # - label: "Bagel Online Serving Test (3/3)"
 #   agent_pool: mi325_1
@@ -185,7 +185,7 @@ steps:
 #     - export VLLM_LOGGING_LEVEL=DEBUG
 #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
 #     - export VLLM_ROCM_USE_AITER_RMSNORM=0
-#     - timeout 40m pytest -s -v tests/e2e/online_serving/test_bagel_online.py -m "advanced_model" --run-level "advanced_model" -k "rocm"
+#     - timeout 40m pytest -s -v tests/e2e/online_serving/test_bagel.py -m "advanced_model" --run-level "advanced_model" -k "rocm"
 
 - label: "Voxtral-TTS E2E Test"
   agent_pool: mi325_1

@@ -18,12 +18,11 @@ import httpx
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServer
+from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL_BASE = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 MODEL_BASE_1_7B = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-STAGE_INIT_TIMEOUT_S = 120
 
 # A synthetic 1024-dim speaker embedding (all 0.1 — not a real voice, but
 # exercises the full code path through the talker's _build_prompt_embeds).
@@ -37,20 +36,27 @@ MIN_AUDIO_BYTES = 2000
 MAX_NEW_TOKENS = 256
 
 
-def get_stage_config() -> str:
-    return get_deploy_config_path("qwen3_tts.yaml")
+base_server_params = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL_BASE,
+            stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
+            server_args=["--trust-remote-code", "--enforce-eager", "--disable-log-stats"],
+        ),
+        id="qwen3-tts-0.6b-base",
+    )
+]
 
-
-def _server_args():
-    return [
-        "--stage-configs-path",
-        get_stage_config(),
-        "--stage-init-timeout",
-        str(STAGE_INIT_TIMEOUT_S),
-        "--trust-remote-code",
-        "--enforce-eager",
-        "--disable-log-stats",
-    ]
+base_1_7b_server_params = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL_BASE_1_7B,
+            stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
+            server_args=["--trust-remote-code", "--enforce-eager", "--disable-log-stats"],
+        ),
+        id="qwen3-tts-1.7b-base",
+    )
+]
 
 
 def verify_wav_audio(content: bytes) -> bool:
@@ -69,24 +75,18 @@ def assert_not_silence(pcm_bytes: bytes):
 # ── 0.6B-Base model tests ──
 
 
-@pytest.fixture(scope="module")
-def base_server():
-    """Start vLLM-Omni server with 0.6B-Base model."""
-    with OmniServer(MODEL_BASE, _server_args()) as server:
-        yield server
-
-
+@pytest.mark.parametrize("omni_server", base_server_params, indirect=True)
 class TestSpeakerEmbeddingBase:
     """Speaker embedding tests against the 0.6B-Base model (supports Base task)."""
 
     @pytest.mark.core_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_speaker_embedding_produces_audio(self, base_server) -> None:
+    def test_speaker_embedding_produces_audio(self, omni_server) -> None:
         """speaker_embedding with Base task produces valid WAV audio."""
-        url = f"http://{base_server.host}:{base_server.port}/v1/audio/speech"
+        url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech"
         payload = {
-            "model": MODEL_BASE,
+            "model": omni_server.model,
             "input": SYN_TEXT,
             "task_type": "Base",
             "speaker_embedding": DUMMY_EMBEDDING_1024,
@@ -105,11 +105,11 @@ class TestSpeakerEmbeddingBase:
     @pytest.mark.core_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_speaker_embedding_pcm_not_silence(self, base_server) -> None:
+    def test_speaker_embedding_pcm_not_silence(self, omni_server) -> None:
         """speaker_embedding PCM output contains real audio, not all-silence."""
-        url = f"http://{base_server.host}:{base_server.port}/v1/audio/speech"
+        url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech"
         payload = {
-            "model": MODEL_BASE,
+            "model": omni_server.model,
             "input": SYN_TEXT,
             "task_type": "Base",
             "speaker_embedding": DUMMY_EMBEDDING_1024,
@@ -127,11 +127,11 @@ class TestSpeakerEmbeddingBase:
     @pytest.mark.core_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_speaker_embedding_streaming(self, base_server) -> None:
+    def test_speaker_embedding_streaming(self, omni_server) -> None:
         """speaker_embedding works with streaming PCM output."""
-        url = f"http://{base_server.host}:{base_server.port}/v1/audio/speech"
+        url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech"
         payload = {
-            "model": MODEL_BASE,
+            "model": omni_server.model,
             "input": SYN_TEXT,
             "task_type": "Base",
             "speaker_embedding": DUMMY_EMBEDDING_1024,
@@ -151,11 +151,11 @@ class TestSpeakerEmbeddingBase:
     @pytest.mark.core_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_speaker_embedding_mutually_exclusive_with_ref_audio(self, base_server) -> None:
+    def test_speaker_embedding_mutually_exclusive_with_ref_audio(self, omni_server) -> None:
         """Sending both speaker_embedding and ref_audio returns 400."""
-        url = f"http://{base_server.host}:{base_server.port}/v1/audio/speech"
+        url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech"
         payload = {
-            "model": MODEL_BASE,
+            "model": omni_server.model,
             "input": SYN_TEXT,
             "task_type": "Base",
             "speaker_embedding": DUMMY_EMBEDDING_1024,
@@ -171,11 +171,11 @@ class TestSpeakerEmbeddingBase:
     @pytest.mark.core_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_speaker_embedding_empty_rejected(self, base_server) -> None:
+    def test_speaker_embedding_empty_rejected(self, omni_server) -> None:
         """Empty speaker_embedding list returns 400."""
-        url = f"http://{base_server.host}:{base_server.port}/v1/audio/speech"
+        url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech"
         payload = {
-            "model": MODEL_BASE,
+            "model": omni_server.model,
             "input": SYN_TEXT,
             "task_type": "Base",
             "speaker_embedding": [],
@@ -191,24 +191,18 @@ class TestSpeakerEmbeddingBase:
 # ── 1.7B-Base model tests (2048-dim embeddings) ──
 
 
-@pytest.fixture(scope="module")
-def base_1_7b_server():
-    """Start vLLM-Omni server with 1.7B-Base model."""
-    with OmniServer(MODEL_BASE_1_7B, _server_args()) as server:
-        yield server
-
-
+@pytest.mark.parametrize("omni_server", base_1_7b_server_params, indirect=True)
 class TestSpeakerEmbedding1_7B:
     """Speaker embedding tests against the 1.7B-Base model (2048-dim embeddings)."""
 
     @pytest.mark.core_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_2048_dim_embedding_produces_audio(self, base_1_7b_server) -> None:
+    def test_2048_dim_embedding_produces_audio(self, omni_server) -> None:
         """2048-dim speaker_embedding with 1.7B-Base model produces valid WAV audio."""
-        url = f"http://{base_1_7b_server.host}:{base_1_7b_server.port}/v1/audio/speech"
+        url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech"
         payload = {
-            "model": MODEL_BASE_1_7B,
+            "model": omni_server.model,
             "input": SYN_TEXT,
             "task_type": "Base",
             "speaker_embedding": DUMMY_EMBEDDING_2048,
@@ -227,11 +221,11 @@ class TestSpeakerEmbedding1_7B:
     @pytest.mark.core_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_1024_dim_on_1_7b_model_rejected_or_errors(self, base_1_7b_server) -> None:
+    def test_1024_dim_on_1_7b_model_rejected_or_errors(self, omni_server) -> None:
         """1024-dim embedding on a 1.7B model (expects 2048) should fail gracefully."""
-        url = f"http://{base_1_7b_server.host}:{base_1_7b_server.port}/v1/audio/speech"
+        url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech"
         payload = {
-            "model": MODEL_BASE_1_7B,
+            "model": omni_server.model,
             "input": SYN_TEXT,
             "task_type": "Base",
             "speaker_embedding": DUMMY_EMBEDDING_1024,

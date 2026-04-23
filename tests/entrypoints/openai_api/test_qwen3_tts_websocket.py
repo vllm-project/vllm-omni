@@ -12,41 +12,29 @@ import pytest
 import websockets
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServer
+from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
-STAGE_INIT_TIMEOUT_S = 120
 
 
-def get_stage_config() -> str:
-    return get_deploy_config_path("qwen3_tts.yaml")
+tts_ws_server_params = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
+            server_args=["--trust-remote-code", "--enforce-eager", "--disable-log-stats"],
+            env_dict={"VLLM_DISABLE_COMPILE_CACHE": "1"},
+        ),
+        id="qwen3-tts-ws-customvoice",
+    )
+]
 
 
-@pytest.fixture(scope="module")
-def omni_server():
-    stage_config_path = get_stage_config()
-
-    with OmniServer(
-        MODEL,
-        [
-            "--stage-configs-path",
-            stage_config_path,
-            "--stage-init-timeout",
-            str(STAGE_INIT_TIMEOUT_S),
-            "--trust-remote-code",
-            "--enforce-eager",
-            "--disable-log-stats",
-        ],
-        env_dict={"VLLM_DISABLE_COMPILE_CACHE": "1"},
-    ) as server:
-        yield server
-
-
-async def _run_ws_session(host: str, port: int) -> dict:
+async def _run_ws_session(host: str, port: int, model: str) -> dict:
     uri = f"ws://{host}:{port}/v1/audio/speech/stream"
     starts: list[dict] = []
     dones: list[dict] = []
@@ -58,7 +46,7 @@ async def _run_ws_session(host: str, port: int) -> dict:
             json.dumps(
                 {
                     "type": "session.config",
-                    "model": MODEL,
+                    "model": model,
                     "voice": "vivian",
                     "language": "English",
                     "response_format": "pcm",
@@ -113,11 +101,12 @@ async def _run_ws_session(host: str, port: int) -> dict:
 
 
 class TestQwen3TTSWebSocket:
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=4)
+    @pytest.mark.parametrize("omni_server", tts_ws_server_params, indirect=True)
     def test_streaming_pcm_output(self, omni_server) -> None:
-        result = asyncio.run(_run_ws_session(omni_server.host, omni_server.port))
+        result = asyncio.run(_run_ws_session(omni_server.host, omni_server.port, omni_server.model))
 
         starts = result["starts"]
         dones = result["dones"]

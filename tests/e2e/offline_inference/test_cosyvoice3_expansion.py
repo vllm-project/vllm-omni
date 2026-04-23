@@ -144,7 +144,7 @@ def _build_reference_inputs(prompt_audio: tuple[np.ndarray, int]) -> list[dict[s
     ]
 
 
-@pytest.mark.core_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("async_chunk", ASYNC_CHUNK_MODES)

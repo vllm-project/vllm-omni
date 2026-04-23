@@ -32,8 +32,8 @@ steps:
     - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/e2e/offline_inference/test_diffusion_cpu_offload.py
-    - pytest -s -v tests/e2e/offline_inference/test_diffusion_layerwise_offload.py
+    - pytest -s -v tests/diffusion/offloader/test_diffusion_cpu_offload.py
+    - pytest -s -v tests/diffusion/offloader/test_diffusion_layerwise_offload.py
 
 - label: "Diffusion Cache Backend Test"
   timeout_in_minutes: 15
@@ -57,7 +57,7 @@ steps:
     - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py -m core_model
+    - pytest -s -v tests/diffusion/distributed/test_sequence_parallel.py -m core_model
 
 - label: "Diffusion Tensor Parallelism Test"
   timeout_in_minutes: 20
@@ -67,7 +67,7 @@ steps:
     - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/e2e/offline_inference/test_zimage_parallelism.py
+    - pytest -s -v tests/diffusion/distributed/test_zimage_parallelism.py
 
 - label: "Diffusion GPU Worker Test"
   timeout_in_minutes: 20
