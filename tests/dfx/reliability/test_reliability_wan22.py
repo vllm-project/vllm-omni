@@ -227,8 +227,7 @@ def test_reliability_fault_process_kill_video_health_fast_fail_and_concurrent(
         time.sleep(0.5)
     if not saw_503:
         pytest.skip(
-            "[process_kill health] /health did not reach 503 within deadline; "
-            f"last_observation={last_observation}"
+            f"[process_kill health] /health did not reach 503 within deadline; last_observation={last_observation}"
         )
 
     # Phase-2: one new /v1/videos request should fail fast.
