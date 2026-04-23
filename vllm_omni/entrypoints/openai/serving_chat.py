@@ -759,7 +759,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Best-effort mode detection from user messages.
         # i2i requests include at least one reference image in message content.
         _, reference_images = self._extract_diffusion_prompt_and_images_from_messages(request.messages)
-        is_img2img = len(reference_images) > 0
+        ref_image_count = len(reference_images)
+        is_img2img = ref_image_count > 0
 
         if height is not None and width is not None:
             try:
