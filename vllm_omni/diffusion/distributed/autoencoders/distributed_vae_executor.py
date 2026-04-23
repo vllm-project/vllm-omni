@@ -10,7 +10,6 @@ import torch.distributed as dist
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
-from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -50,7 +49,6 @@ class DistributedVaeExecutor:
         self.world_size = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
         self.parallel_size = 1
-        self._meta_dtype = torch.int32 if current_omni_platform.is_xpu() else torch.int64
 
     def set_parallel_size(self, parallel_size: int):
         self.parallel_size = parallel_size
@@ -80,7 +78,7 @@ class DistributedVaeExecutor:
     def _pack_local_tiles(self, local_results, global_padding_shape, grid_spec, device, dtype):
         tile_tensor = torch.zeros(global_padding_shape, device=device, dtype=dtype)
         meta_tensor = torch.full(
-            (global_padding_shape[0], len(grid_spec.split_dims) + 1), -1, device=device, dtype=self._meta_dtype
+            (global_padding_shape[0], len(grid_spec.split_dims) + 1), -1, device=device, dtype=torch.int64
         )
         for idx, (tid, t_tensor) in enumerate(local_results):
             meta_tensor[idx, 0] = tid
