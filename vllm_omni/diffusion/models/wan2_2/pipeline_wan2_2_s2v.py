@@ -371,12 +371,12 @@ def _resolve_model_path(model: str) -> str:
     # - Audio encoder (wav2vec2) weights + config
     # - Model config files
     allow_patterns = [
-        "*.safetensors",                          # Transformer weights (sharded)
-        "*.safetensors.index.json",               # Weight shard index
-        "*.pth",                                  # VAE and T5 weights
-        "*.json",                                 # Config files (config.json, configuration.json)
-        "google/**",                              # T5 tokenizer/config directory
-        "wav2vec2-large-xlsr-53-english/**",      # Audio encoder directory
+        "*.safetensors",  # Transformer weights (sharded)
+        "*.safetensors.index.json",  # Weight shard index
+        "*.pth",  # VAE and T5 weights
+        "*.json",  # Config files (config.json, configuration.json)
+        "google/**",  # T5 tokenizer/config directory
+        "wav2vec2-large-xlsr-53-english/**",  # Audio encoder directory
     ]
     return download_weights_from_hf_specific(model, None, allow_patterns)
 
@@ -1295,10 +1295,8 @@ class Wan22S2VPipeline(
             if clip_video.numel() == 0:
                 # Non-rank0 received empty tensor from patch parallel decode
                 # Use the same broadcast mechanism as the VAE patch parallel code
-                from vllm.distributed import get_tensor_model_parallel_rank
                 import torch.distributed as dist
 
-                tp_rank = get_tensor_model_parallel_rank()
                 total_frames = decode_latents.shape[2]
 
                 # Create buffer for broadcast

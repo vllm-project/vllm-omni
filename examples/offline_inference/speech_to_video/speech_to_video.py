@@ -218,6 +218,7 @@ def main():
     profiler_config = None
     if profiler_enabled:
         from vllm.config import ProfilerConfig
+
         profiler_config = ProfilerConfig(
             profiler="torch",
             torch_profiler_dir=os.getenv("VLLM_TORCH_PROFILER_DIR"),
