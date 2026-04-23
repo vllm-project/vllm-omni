@@ -182,6 +182,13 @@ class OmniServeCommand(CLISubcommand):
             help="Override the deploy YAML's ``async_chunk:`` bool. Unset leaves the YAML value in force.",
         )
         omni_config_group.add_argument(
+            "--enable-pd-disaggregation",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Override the deploy YAML's ``pd_disaggregation.enabled:`` bool. "
+            "Use with --stage-overrides to tune the generated prefill/decode stages from CLI.",
+        )
+        omni_config_group.add_argument(
             "--stage-id",
             type=int,
             default=None,

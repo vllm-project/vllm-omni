@@ -436,7 +436,7 @@ class DeployConfig:
     pipeline: str | None = None
     # PD (Prefill-Decode) disaggregation configuration.
     # When enabled, dynamically splits the target stage into prefill and decode stages.
-    pd_separation: dict[str, Any] | None = None
+    pd_disaggregation: dict[str, Any] | None = None
 
     # === Pipeline-wide engine settings (applied uniformly to every stage) ===
     trust_remote_code: bool = True
@@ -584,7 +584,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "stages": stages,
         "platforms": raw_dict.get("platforms", None),
         "pipeline": raw_dict.get("pipeline", None),
-        "pd_separation": raw_dict.get("pd_separation", None),
+        "pd_disaggregation": raw_dict.get("pd_disaggregation", raw_dict.get("pd_separation", None)),
     }
     # Pipeline-wide engine settings: only set if explicitly present in YAML
     # so the DeployConfig dataclass defaults take effect otherwise.
@@ -691,7 +691,7 @@ def _remap_stage_connectors(
 
 
 def _pd_role_override(pd_cfg: dict[str, Any], role: str) -> dict[str, Any]:
-    """Return deploy overrides for a PD role from ``pd_separation`` config."""
+    """Return deploy overrides for a PD role from ``pd_disaggregation`` config."""
     role_cfg = pd_cfg.get(f"{role}_stage")
     if isinstance(role_cfg, dict):
         return dict(role_cfg)
@@ -742,35 +742,37 @@ def _make_pd_stage_deploy(
     )
 
 
-def _apply_pd_separation(
+def _apply_pd_disaggregation(
     pipeline: PipelineConfig,
     deploy: DeployConfig,
     cli_overrides: dict[str, Any] | None = None,
 ) -> tuple[PipelineConfig, DeployConfig]:
     """Optionally split one pipeline stage into prefill + decode stages."""
-    pd_cfg = deploy.pd_separation or {}
+    pd_cfg = dict(deploy.pd_disaggregation or {})
+    if cli_overrides is not None and cli_overrides.get("enable_pd_disaggregation") is not None:
+        pd_cfg["enabled"] = bool(cli_overrides["enable_pd_disaggregation"])
     if not pd_cfg.get("enabled", False):
         return pipeline, deploy
 
     target_stage_id = int(pd_cfg.get("target_stage_id", 0))
     target_stage = pipeline.get_stage(target_stage_id)
     if target_stage is None:
-        raise ValueError(f"PD separation target stage {target_stage_id} not found in pipeline {pipeline.model_type!r}")
+        raise ValueError(f"PD disaggregation target stage {target_stage_id} not found in pipeline {pipeline.model_type!r}")
     if target_stage.execution_type != StageExecutionType.LLM_AR:
         raise ValueError(
-            f"PD separation only supports LLM_AR stages; stage {target_stage_id} "
+            f"PD disaggregation only supports LLM_AR stages; stage {target_stage_id} "
             f"uses {target_stage.execution_type.value!r}"
         )
 
     deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
     target_deploy = deploy_by_id.get(target_stage_id)
     if target_deploy is None:
-        raise ValueError(f"PD separation target stage {target_stage_id} missing deploy settings")
+        raise ValueError(f"PD disaggregation target stage {target_stage_id} missing deploy settings")
 
     prefill_override = _pd_role_override(pd_cfg, "prefill")
     decode_override = _pd_role_override(pd_cfg, "decode")
     if not prefill_override or not decode_override:
-        raise ValueError("PD separation requires both prefill and decode role configs")
+        raise ValueError("PD disaggregation requires both prefill and decode role configs")
 
     prefill_stage = dataclasses.replace(
         target_stage,
@@ -855,7 +857,7 @@ def _apply_pd_separation(
             deploy,
             async_chunk=effective_async_chunk,
             stages=new_deploy_stages,
-            pd_separation=None,
+            pd_disaggregation=None,
         ),
     )
 
@@ -984,7 +986,7 @@ def merge_pipeline_deploy(
         cli_overrides = {}
 
     deploy = _apply_platform_overrides(deploy)
-    pipeline, deploy = _apply_pd_separation(pipeline, deploy, cli_overrides)
+    pipeline, deploy = _apply_pd_disaggregation(pipeline, deploy, cli_overrides)
     deploy_by_id = {s.stage_id: s for s in deploy.stages}
 
     # A pipeline supports async_chunk if any stage has either an explicit

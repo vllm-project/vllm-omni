@@ -1097,7 +1097,7 @@ class TestPDYAMLConfig:
         overlay = tmp_path / "qwen3_omni_pd_overlay.yaml"
         overlay.write_text(
             f"base_config: {base_path}\n"
-            "pd_separation:\n"
+            "pd_disaggregation:\n"
             "  enabled: true\n"
             "  async_chunk: false\n",
             encoding="utf-8",

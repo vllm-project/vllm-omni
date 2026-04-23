@@ -842,7 +842,7 @@ class TestDeployConfigLoading:
         assert s0.yaml_engine_args["engine_output_type"] == "latent"
         assert s0.yaml_extras["default_sampling_params"]["detokenize"] is True
 
-    def test_merge_pipeline_deploy_with_pd_separation(self, tmp_path):
+    def test_merge_pipeline_deploy_with_pd_disaggregation(self, tmp_path):
         from pathlib import Path
 
         import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
@@ -856,7 +856,7 @@ class TestDeployConfigLoading:
         overlay = tmp_path / "qwen3_omni_pd.yaml"
         overlay.write_text(
             f"base_config: {base}\n"
-            "pd_separation:\n"
+            "pd_disaggregation:\n"
             "  enabled: true\n"
             "  target_stage_id: 0\n"
             "  async_chunk: false\n"
@@ -897,6 +897,34 @@ class TestDeployConfigLoading:
         assert stages[1].yaml_engine_args["kv_transfer_config"]["kv_role"] == "kv_consumer"
         assert stages[2].yaml_extras["input_connectors"] == {"from_stage_1": "connector_of_shared_memory"}
         assert stages[3].yaml_extras["input_connectors"] == {"from_stage_2": "connector_of_shared_memory"}
+
+    def test_merge_pipeline_deploy_with_pd_disaggregation_cli_flag(self):
+        from pathlib import Path
+
+        import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
+        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+
+        pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe"]
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
+        if not deploy_path.exists():
+            pytest.skip("Deploy config not found")
+
+        deploy = load_deploy_config(deploy_path)
+        stages = merge_pipeline_deploy(
+            pipeline,
+            deploy,
+            cli_overrides={
+                "enable_pd_disaggregation": True,
+                "stage_0_max_num_seqs": 8,
+                "stage_1_max_num_seqs": 32,
+            },
+        )
+
+        assert len(stages) == 4
+        assert stages[0].yaml_extras["is_prefill_only"] is True
+        assert stages[1].yaml_extras["is_decode_only"] is True
+        assert stages[0].runtime_overrides["max_num_seqs"] == 8
+        assert stages[1].runtime_overrides["max_num_seqs"] == 32
 
 
 class TestQwen3OmniPipeline:
