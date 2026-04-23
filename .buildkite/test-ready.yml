@@ -215,13 +215,15 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
-      - label: "TTS · Qwen3-TTS CustomVoice Test"
+      - label: "Omni · VoxCPM2 Test"
+        timeout_in_minutes: 20
         commands:
           - |
             timeout 20m bash -c '
+              pip install voxcpm
               export VLLM_LOGGING_LEVEL=DEBUG
-              export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-              pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py -m "core_model" --run-level "core_model"
+              export VLLM_WORKER_MULTIPROC_METHOD=spawn
+              pytest -s -v tests/e2e/offline_inference/test_voxcpm2.py -m "core_model" --run-level "core_model"
             '
         agents:
           queue: "gpu_1_queue"
@@ -237,15 +239,13 @@ steps:
               volumes:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
-      - label: "Omni · VoxCPM2 Test"
-        timeout_in_minutes: 20
+      - label: "TTS · Qwen3-TTS CustomVoice Test"
         commands:
           - |
             timeout 20m bash -c '
-              pip install voxcpm
               export VLLM_LOGGING_LEVEL=DEBUG
-              export VLLM_WORKER_MULTIPROC_METHOD=spawn
-              pytest -s -v tests/e2e/offline_inference/test_voxcpm2.py -m "core_model" --run-level "core_model"
+              export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+              pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py -m "core_model" --run-level "core_model"
             '
         agents:
           queue: "gpu_1_queue"

@@ -27,7 +27,6 @@ Usage:
 """
 
 import os
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -35,6 +34,7 @@ import torch
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -101,7 +101,7 @@ def _generate_bagel_image(
 
     Returns (generated_image, peak_memory_gib).
     """
-    config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
+    config_path = get_deploy_config_path("bagel_sharedmemory_ci.yaml")
     omni_kwargs: dict[str, Any] = {
         "model": "ByteDance-Seed/BAGEL-7B-MoT",
         "stage_configs_path": config_path,

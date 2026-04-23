@@ -21,17 +21,16 @@ Equivalent to running:
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-from pathlib import Path
 
 import pytest
 from vllm.assets.image import ImageAsset
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
-from tests.helpers.stage_config import modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 MODEL_NAME = "ByteDance-Seed/BAGEL-7B-MoT"
-STAGE_CONFIG = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
+STAGE_CONFIG = get_deploy_config_path("bagel_sharedmemory_ci.yaml")
 
 REFERENCE_TEXT_TEXT2TEXT = "The capital of France is Paris."
 

@@ -21,7 +21,6 @@ import socket
 import subprocess
 import tempfile
 import time
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -29,7 +28,7 @@ from PIL import Image
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
-from tests.helpers.stage_config import modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.platforms import current_omni_platform
 
@@ -197,7 +196,7 @@ def _resolve_stage_config(config_path: str, run_level: str) -> str:
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_bagel_text2img_shared_memory_connector(run_level):
     """Test Bagel text2img with shared memory connector."""
-    config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
+    config_path = get_deploy_config_path("bagel_sharedmemory_ci.yaml")
     config_path = _resolve_stage_config(config_path, run_level)
     with OmniRunner(
         "ByteDance-Seed/BAGEL-7B-MoT",
@@ -287,7 +286,7 @@ def _load_mooncake_config(host: str, rpc_port: int, http_port: int) -> str:
     Returns:
         Path to the temporary config file with substituted values.
     """
-    config_path = str(Path(__file__).parent / "stage_configs" / "bagel_mooncake_ci.yaml")
+    config_path = get_deploy_config_path("bagel_mooncake_ci.yaml")
     with open(config_path) as f:
         config_content = f.read()
 

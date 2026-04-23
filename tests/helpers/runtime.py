@@ -868,52 +868,63 @@ class OpenAIClientHandler:
 
         return responses
 
-    def send_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[DiffusionResponse]:
+    def send_diffusion_request(
+        self, request_config: dict[str, Any] | list[dict[str, Any]], request_num: int = 1
+    ) -> list[DiffusionResponse]:
         """
         Send OpenAI requests for diffusion models.
         Args:
-            request_config: Request configuration dictionary containing parameters like model, messages
+            request_config: A single request configuration dict, or a list of
+                request configuration dicts (one request per element)
             request_num: Number of requests to send concurrently, defaults to 1 (single request)
         Returns:
             list[DiffusionResponse]: List of DiffusionResponse objects containing the response data
         """
         responses: list[DiffusionResponse] = []
-        stream = request_config.get("stream", False)
-        modalities = request_config.get("modalities", omit)  # Most diffusion models don't require modalities param
-        extra_body = request_config.get("extra_body", None)
-        if stream:
-            raise NotImplementedError("Streaming is not currently implemented for diffusion model e2e test")
-        if request_num == 1:
-            # Send single request
-            chat_completion = self.client.chat.completions.create(
-                model=request_config.get("model"),
-                messages=request_config.get("messages"),
-                extra_body=extra_body,
+
+        def _create_from_config(cfg: dict[str, Any]):
+            stream = cfg.get("stream", False)
+            if stream:
+                raise NotImplementedError("Streaming is not currently implemented for diffusion model e2e test")
+            modalities = cfg.get("modalities", omit)  # Most diffusion models don't require modalities param
+            return self.client.chat.completions.create(
+                model=cfg.get("model"),
+                messages=cfg.get("messages"),
+                extra_body=cfg.get("extra_body", None),
                 modalities=modalities,
             )
+
+        if isinstance(request_config, list):
+            if not request_config:
+                raise ValueError("request_config list must not be empty")
+            if request_num != 1:
+                raise ValueError("request_num is not supported when request_config is a list")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(request_config)) as executor:
+                futures = {executor.submit(_create_from_config, cfg): cfg for cfg in request_config}
+                for future in concurrent.futures.as_completed(futures):
+                    cfg = futures[future]
+                    chat_completion = future.result()
+                    response = self._process_diffusion_response(chat_completion)
+                    assert_diffusion_response(response, cfg, run_level=self.run_level)
+                    responses.append(response)
+            return responses
+
+        if request_num == 1:
+            # Send single request
+            chat_completion = _create_from_config(request_config)
             response = self._process_diffusion_response(chat_completion)
             assert_diffusion_response(response, request_config, run_level=self.run_level)
             responses.append(response)
-        else:
-            # Send concurrent requests
-            with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
-                futures = []
-                # Submit all request tasks
-                for _ in range(request_num):
-                    future = executor.submit(
-                        self.client.chat.completions.create,
-                        model=request_config.get("model"),
-                        messages=request_config.get("messages"),
-                        modalities=modalities,
-                        extra_body=extra_body,
-                    )
-                    futures.append(future)
-                # Process completed tasks
-                for future in concurrent.futures.as_completed(futures):
-                    chat_completion = future.result()
-                    response = self._process_diffusion_response(chat_completion)
-                    assert_diffusion_response(response, request_config, run_level=self.run_level)
-                    responses.append(response)
+            return responses
+
+        # Send concurrent requests for the same request_config
+        with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
+            futures = [executor.submit(_create_from_config, request_config) for _ in range(request_num)]
+            for future in concurrent.futures.as_completed(futures):
+                chat_completion = future.result()
+                response = self._process_diffusion_response(chat_completion)
+                assert_diffusion_response(response, request_config, run_level=self.run_level)
+                responses.append(response)
         return responses
 
     def send_video_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:

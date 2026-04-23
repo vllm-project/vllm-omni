@@ -35,13 +35,14 @@ from safetensors.torch import save_file
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
-from tests.helpers.stage_config import modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 
 MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
-BAGEL_STAGE_CONFIG = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
+BAGEL_STAGE_CONFIG = get_deploy_config_path("bagel_sharedmemory_ci.yaml")
+
 DEFAULT_PROMPT = "<|im_start|>A cute cat<|im_end|>"
 
 
