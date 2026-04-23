@@ -505,7 +505,7 @@ steps:
       - label: ":full_moon: Diffusion Batching Test"
         timeout_in_minutes: 20
         commands:
-          - pytest -s -v tests/e2e/offline_inference/test_qwen_image_diffusion_batching.py -m "diffusion" --run-level "full_model"
+          - pytest -s -v tests/diffusion/batching/test_diffusion_batching.py -m "diffusion" --run-level "full_model"
         agents:
           queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:
