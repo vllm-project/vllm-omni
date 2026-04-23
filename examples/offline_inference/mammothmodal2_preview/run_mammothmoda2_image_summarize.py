@@ -19,6 +19,7 @@ from vllm import SamplingParams
 from vllm.multimodal.image import convert_image_mode
 
 from vllm_omni import Omni
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
 DEFAULT_SYSTEM = "You are a helpful assistant."
 DEFAULT_QUESTION = "Please summarize the content of this image."
@@ -48,6 +49,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 
