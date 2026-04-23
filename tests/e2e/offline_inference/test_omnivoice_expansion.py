@@ -28,7 +28,7 @@ def get_stage_config():
     )
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_omnivoice_text_to_audio() -> None:

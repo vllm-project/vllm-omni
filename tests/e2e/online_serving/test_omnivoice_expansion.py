@@ -28,6 +28,8 @@ try:
 except ImportError:
     _HAS_VOICE_CLONE = False
 
+pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+
 MODEL = "k2-fsa/OmniVoice"
 
 STAGE_CONFIG = str(
@@ -83,8 +85,6 @@ def verify_wav_audio(content: bytes) -> bool:
 class TestOmniVoiceTTS:
     """E2E tests for OmniVoice TTS model."""
 
-    @pytest.mark.core_model
-    @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speech_auto_voice(self, omni_server) -> None:
         """Test auto voice TTS generation (text only, no reference audio)."""
@@ -140,8 +140,6 @@ def make_voice_clone_request(
 class TestOmniVoiceVoiceCloning:
     """E2E tests for OmniVoice voice cloning functionality."""
 
-    @pytest.mark.core_model
-    @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_voice_clone_ref_audio_only(self, omni_server) -> None:
         """Test voice cloning with ref_audio only (x_vector mode)."""
@@ -161,8 +159,6 @@ class TestOmniVoiceVoiceCloning:
             f"Audio too small ({len(response.content)} bytes), expected > {MIN_AUDIO_BYTES}"
         )
 
-    @pytest.mark.core_model
-    @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_voice_clone_ref_audio_and_text(self, omni_server) -> None:
         """Test voice cloning with ref_audio and ref_text (in-context mode)."""
@@ -184,8 +180,6 @@ class TestOmniVoiceVoiceCloning:
             f"Audio too small ({len(response.content)} bytes), expected > {MIN_AUDIO_BYTES}"
         )
 
-    @pytest.mark.core_model
-    @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_voice_clone_invalid_ref_audio_format(self, omni_server) -> None:
         """Test that invalid ref_audio format returns a clear error."""

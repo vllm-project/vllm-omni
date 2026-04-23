@@ -132,7 +132,7 @@ def test_resolve_voxcpm_model_dir_local_path(tmp_path: Path):
     assert resolve_voxcpm_model_dir(str(model_dir)) == model_dir
 
 
-@pytest.mark.core_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_voxcpm_zero_shot_001(voxcpm_model_path: str):

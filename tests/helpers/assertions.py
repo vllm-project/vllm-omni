@@ -5,7 +5,10 @@ import tempfile
 import threading
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from tests.helpers.runtime import DiffusionResponse
 
 import numpy as np
 import soundfile as sf
@@ -14,7 +17,6 @@ from PIL import Image
 from tests.helpers.media import (
     cosine_similarity_text,
 )
-from tests.helpers.runtime import DiffusionResponse
 
 _GENDER_PIPELINE = None
 _GENDER_PIPELINE_LOCK = threading.Lock()
@@ -30,7 +32,7 @@ _PRESET_VOICE_GENDER_MAP: dict[str, str] = {
 
 
 def assert_image_diffusion_response(
-    response: DiffusionResponse,
+    response: "DiffusionResponse",
     request_config: dict[str, Any],
     run_level: str = None,
 ) -> None:
@@ -69,7 +71,7 @@ def assert_image_diffusion_response(
 
 
 def assert_video_diffusion_response(
-    response: DiffusionResponse,
+    response: "DiffusionResponse",
     request_config: dict[str, Any],
     run_level: str = None,
 ) -> None:
@@ -110,7 +112,7 @@ def assert_video_diffusion_response(
 
 
 def assert_audio_diffusion_response(
-    response: DiffusionResponse,
+    response: "DiffusionResponse",
     request_config: dict[str, Any],
     run_level: str = None,
 ) -> None:
@@ -495,7 +497,7 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
         _assert_preset_voice_gender_from_audio(response.audio_bytes, request_config.get("voice"))
 
 
-def assert_diffusion_response(response: DiffusionResponse, request_config: dict[str, Any], run_level: str = None):
+def assert_diffusion_response(response: "DiffusionResponse", request_config: dict[str, Any], run_level: str = None):
     assert response.success, "The request failed."
     e2e_latency = getattr(response, "e2e_latency", None)
     if e2e_latency is not None:

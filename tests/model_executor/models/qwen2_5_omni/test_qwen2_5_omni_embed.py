@@ -8,15 +8,22 @@ Regression test for: https://github.com/vllm-project/vllm/issues/34506
   - Non-interleaved mixed modalities (audio + image + video) should correctly
     assign audio embeddings to audio positions, image to image, video to video.
   - Interleaved (use_audio_in_video) should also work correctly.
+
+Pure embedding helpers below are inlined from upstream
+``vllm.model_executor.models.qwen2_5_omni_thinker`` / ``interfaces`` / ``utils``
+so this module does not import ``qwen2_5_vl`` / ``conv`` (avoids duplicate
+``CustomOp`` registration when multiple vLLM copies are on ``sys.path``).
 """
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import Any
 
 import pytest
 import torch
 from pytest_mock import MockerFixture
-from vllm.model_executor.models.qwen2_5_omni_thinker import (
-    check_interleaved_audio_video,
-    merge_interleaved_embeddings,
-)
+from torch import Tensor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -25,6 +32,172 @@ AUDIO_TOKEN_ID = 1001
 IMAGE_TOKEN_ID = 1002
 VIDEO_TOKEN_ID = 1003
 TEXT_TOKEN_ID = 0
+
+
+# ---------------------------------------------------------------------------
+# Inlined embedding logic (no vLLM model graph import)
+# ---------------------------------------------------------------------------
+
+
+def check_interleaved_audio_video(
+    is_video: torch.Tensor,
+    is_audio: torch.Tensor,
+    num_video: int,
+    num_audio: int,
+) -> bool:
+    """Return True only for true audio-in-video interleaving (no text gaps in span)."""
+    if num_video == 0 or num_audio == 0:
+        return False
+
+    video_pos = is_video.nonzero(as_tuple=True)[0]
+    audio_pos = is_audio.nonzero(as_tuple=True)[0]
+
+    if not (video_pos[0].item() < audio_pos[-1].item() and audio_pos[0].item() < video_pos[-1].item()):
+        return False
+
+    combined_start = min(video_pos[0].item(), audio_pos[0].item())
+    combined_end = max(video_pos[-1].item(), audio_pos[-1].item())
+    total_in_range = combined_end - combined_start + 1
+    return (num_video + num_audio) == total_in_range
+
+
+def merge_interleaved_embeddings(
+    inputs_embeds: torch.Tensor,
+    multimodal_embeddings: Sequence[Tensor] | Tensor | tuple[Tensor, ...],
+    is_video: torch.Tensor,
+    is_audio: torch.Tensor,
+    is_multimodal: torch.Tensor,
+    num_video: int,
+    num_audio: int,
+) -> torch.Tensor:
+    """Scatter video/audio (and other) embeddings for interleaved audio-in-video."""
+    video_embeds: list[torch.Tensor] = []
+    audio_embeds: list[torch.Tensor] = []
+    other_embeds: list[torch.Tensor] = []
+    video_remaining = num_video
+    audio_remaining = num_audio
+
+    for emb in multimodal_embeddings:
+        n = emb.shape[0]
+        if video_remaining > 0 and n <= video_remaining:
+            video_embeds.append(emb)
+            video_remaining -= n
+        elif audio_remaining > 0 and n <= audio_remaining:
+            audio_embeds.append(emb)
+            audio_remaining -= n
+        else:
+            other_embeds.append(emb)
+
+    if video_embeds:
+        inputs_embeds[is_video] = torch.cat(video_embeds, dim=0)
+    if audio_embeds:
+        inputs_embeds[is_audio] = torch.cat(audio_embeds, dim=0)
+    if other_embeds:
+        other_mask = is_multimodal & ~is_video & ~is_audio
+        inputs_embeds[other_mask] = torch.cat(other_embeds, dim=0)
+
+    return inputs_embeds
+
+
+def _flatten_embeddings(embeddings: Sequence[Tensor] | Tensor | tuple[Tensor, ...]) -> Tensor:
+    """Match vLLM ``_flatten_embeddings`` (``vllm/model_executor/models/utils.py``)."""
+    if isinstance(embeddings, torch.Tensor):
+        return embeddings.flatten(0, -2)
+    return torch.cat(tuple(_flatten_embeddings(t) for t in embeddings))
+
+
+def merge_multimodal_embeddings(
+    inputs_embeds: torch.Tensor,
+    multimodal_embeddings: Sequence[Tensor] | Tensor | tuple[Tensor, ...],
+    is_multimodal: torch.Tensor,
+) -> torch.Tensor:
+    """In-place scatter of flattened multimodal embeddings (same contract as vLLM utils)."""
+    if len(multimodal_embeddings) == 0:
+        return inputs_embeds
+
+    mm_embeds_flat = _flatten_embeddings(multimodal_embeddings)
+    input_dtype = inputs_embeds.dtype
+    inputs_embeds[is_multimodal] = mm_embeds_flat.to(dtype=input_dtype)
+    return inputs_embeds
+
+
+def _embed_text_input_ids(
+    model: Any,
+    input_ids: Tensor,
+    embed_input_ids: Any,
+    *,
+    is_multimodal: Tensor | None,
+) -> Tensor:
+    if is_multimodal is not None and getattr(model, "_has_oov_mm_tokens", False):
+        in_vocab_ids = input_ids.masked_fill(
+            is_multimodal.to(device=input_ids.device, non_blocking=True),
+            0,
+        )
+        return embed_input_ids(in_vocab_ids)
+    return embed_input_ids(input_ids)
+
+
+def qwen25_omni_thinker_embed_input_ids(
+    model: Any,
+    input_ids: torch.Tensor,
+    multimodal_embeddings: Sequence[Tensor] | Tensor | tuple[Tensor, ...] | None = None,
+    *,
+    is_multimodal: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Same control flow as ``Qwen2_5OmniThinkerForConditionalGeneration.embed_input_ids`` (subset used in tests)."""
+    if multimodal_embeddings is None or is_multimodal is None:
+        return model.get_language_model().embed_input_ids(input_ids)
+
+    inputs_embeds = _embed_text_input_ids(
+        model,
+        input_ids,
+        model.get_language_model().embed_input_ids,
+        is_multimodal=is_multimodal,
+    )
+
+    if len(multimodal_embeddings) == 0:
+        return inputs_embeds
+
+    video_token_id = model.config.video_token_index
+    audio_token_id = model.config.audio_token_index
+
+    input_ids_cpu = input_ids.cpu()
+    is_video = is_multimodal & (input_ids_cpu == video_token_id)
+    is_audio = is_multimodal & (input_ids_cpu == audio_token_id)
+
+    num_video = is_video.sum().item()
+    num_audio = is_audio.sum().item()
+
+    if check_interleaved_audio_video(is_video, is_audio, num_video, num_audio):
+        inputs_embeds = _embed_text_input_ids(
+            model,
+            input_ids,
+            model.get_language_model().embed_input_ids,
+            is_multimodal=is_multimodal,
+        )
+        return merge_interleaved_embeddings(
+            inputs_embeds,
+            multimodal_embeddings,
+            is_video,
+            is_audio,
+            is_multimodal,
+            num_video,
+            num_audio,
+        )
+
+    inputs_embeds = _embed_text_input_ids(
+        model,
+        input_ids,
+        model.get_language_model().embed_input_ids,
+        is_multimodal=is_multimodal,
+    )
+    if is_multimodal is None:
+        raise ValueError("`embed_input_ids` requires `is_multimodal` when multimodal_embeddings is set.")
+    return merge_multimodal_embeddings(
+        inputs_embeds,
+        multimodal_embeddings,
+        is_multimodal,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -111,11 +284,7 @@ def make_mock_model(mocker: MockerFixture, hidden: int = 8):
     Return a minimal mock of Qwen2_5OmniThinkerForConditionalGeneration
     that has enough structure to run embed_input_ids.
     """
-    from vllm.model_executor.models.qwen2_5_omni_thinker import (
-        Qwen2_5OmniThinkerForConditionalGeneration,
-    )
-
-    model = mocker.Mock(spec=Qwen2_5OmniThinkerForConditionalGeneration)
+    model = mocker.Mock()
 
     # Config with token IDs
     cfg = mocker.Mock()
@@ -133,21 +302,7 @@ def make_mock_model(mocker: MockerFixture, hidden: int = 8):
     lang_model.embed_input_ids = fake_lm_embed
     model.get_language_model = mocker.Mock(return_value=lang_model)
 
-    from vllm.model_executor.models.interfaces import SupportsMultiModal
-
-    model._embed_text_input_ids = lambda *a, **kw: SupportsMultiModal._embed_text_input_ids(model, *a, **kw)
-
-    def fake_super_embed(ids, mm_embs=None, *, is_multimodal=None):
-        return SupportsMultiModal.embed_input_ids(
-            model,
-            ids,
-            mm_embs,
-            is_multimodal=is_multimodal,
-        )
-
-    model.embed_input_ids = lambda *a, **kw: Qwen2_5OmniThinkerForConditionalGeneration.embed_input_ids(model, *a, **kw)
-
-    model._super_embed_input_ids = fake_super_embed
+    model.embed_input_ids = lambda *a, **kw: qwen25_omni_thinker_embed_input_ids(model, *a, **kw)
 
     return model, hidden
 
