@@ -45,6 +45,12 @@ from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     estimate_fish_voice_clone_prompt_len_from_normalized,
     normalize_fish_voice_clone_texts,
 )
+from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
+    DEFAULT_PROMPT as MING_DEFAULT_PROMPT,
+)
+from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
+    create_instruction as ming_create_instruction,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -57,6 +63,7 @@ _COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
 _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
 _VOXCPM_TTS_MODEL_STAGES = {"latent_generator", "vae"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
+_MING_TTS_MODEL_STAGES = {"ming_tts"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -65,6 +72,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _OMNIVOICE_TTS_MODEL_STAGES
     | _VOXCPM_TTS_MODEL_STAGES
     | _VOXCPM2_TTS_MODEL_STAGES
+    | _MING_TTS_MODEL_STAGES
 )
 _TTS_LANGUAGES: set[str] = {
     "Auto",
@@ -313,6 +321,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 for stage in self.engine_client.stage_configs
             )
             return "voxcpm" if has_vae_stage or model_stage == "vae" else "voxcpm2"
+        if model_stage in _MING_TTS_MODEL_STAGES:
+            return "ming_flash_omni_tts"
         return None
 
     def _compute_max_instructions_length(self) -> int:
@@ -336,6 +346,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
+        if self._tts_model_type == "ming_flash_omni_tts":
+            # Ming-flash-omni drives speaker selection via the caption JSON
+            # (audio_sequence[0]["说话人"]) rather than a spk_id table, so there
+            # is no static speaker list to surface here.
+            return set()
         try:
             if self._tts_model_type == "voxcpm":
                 return set()
@@ -837,6 +852,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_voxcpm_request(request)
         if self._tts_model_type == "voxcpm2":
             return None  # VoxCPM2 accepts any text input
+        if self._tts_model_type == "ming_flash_omni_tts":
+            return self._validate_ming_tts_request(request)
         return self._validate_qwen_tts_request(request)
 
     def _voxcpm2_encode(self, text: str) -> list[int]:
@@ -857,6 +874,41 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         ids = self._voxcpm2_tokenizer.encode(text, add_special_tokens=True)
         return split_multichar_chinese(ids, self._voxcpm2_split_map)
+
+    def _validate_ming_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate Ming-flash-omni standalone-talker request parameters."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+        if request.instructions is not None:
+            if not isinstance(request.instructions, str):
+                return "instructions must be a string"
+            if len(request.instructions) > self._max_instructions_length:
+                return f"instructions exceeds max length {self._max_instructions_length}"
+
+        if request.task_type is not None:
+            return "'task_type' is not supported for Ming-flash-omni TTS"
+        if request.language is not None:
+            return "'language' is not supported for Ming-flash-omni TTS (language is inferred from input text)"
+        if request.x_vector_only_mode is not None:
+            return "'x_vector_only_mode' is not supported for Ming-flash-omni TTS"
+        if request.initial_codec_chunk_frames is not None:
+            return "'initial_codec_chunk_frames' is not supported for Ming-flash-omni TTS"
+
+        # Per-request voice cloning from raw audio is not yet wired up: Ming
+        # extracts spk_emb / prompt_wav_lat / prompt_wav_emb model-side via
+        # register_prompt_wav() at engine init. For ad-hoc cloning, callers
+        # should pre-compute speaker_embedding and pass it directly.
+        if request.ref_audio is not None:
+            return (
+                "'ref_audio' is not yet supported for Ming-flash-omni TTS; "
+                "use a preset 'voice' or 'speaker_embedding' instead"
+            )
+        if request.ref_text is not None:
+            return "'ref_text' is not yet supported for Ming-flash-omni TTS"
+
+        if request.max_new_tokens is not None and request.max_new_tokens <= 0:
+            return "'max_new_tokens' must be a positive integer"
+        return None
 
     def _validate_ref_audio_format(self, ref_audio: str) -> str | None:
         """Validate ref_audio is a supported URI format. Returns error or None."""
@@ -1520,6 +1572,52 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             },
         }
 
+    # ---- Ming-flash-omni standalone-talker (TTS) helpers ----
+
+    def _build_ming_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        # request.instructions accepts two forms:
+        # 1. Plain text: mapped to the caption's 风格 (style) field
+        # 2. JSON object: parsed and splatted into the caption. Unlocks
+        #       Unknown keys are dropped by `ming_create_instruction`.
+        caption_fields: dict[str, Any] = {}
+        if request.instructions:
+            stripped = request.instructions.strip()
+            if stripped.startswith("{"):
+                try:
+                    parsed = json.loads(stripped)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    caption_fields.update(parsed)
+                else:
+                    caption_fields["风格"] = request.instructions
+            else:
+                caption_fields["风格"] = request.instructions
+
+        has_spk_emb = request.speaker_embedding is not None
+
+        # TTS path applies ming task type `instruct`.
+        # voice_name enables talker-side voice preset resolution (e.g. "DB30").
+        additional_information: dict[str, Any] = {
+            "ming_task": "instruct",
+            "prompt": MING_DEFAULT_PROMPT,
+            "text": request.input,
+            "instruction": ming_create_instruction(caption_fields),
+            "voice_name": request.voice or None,
+            "use_zero_spk_emb": not has_spk_emb,
+            "max_decode_steps": request.max_new_tokens or _TTS_MAX_NEW_TOKENS_MAX,
+            "cfg": 2.0,
+            "sigma": 0.25,
+            "temperature": 0.0,
+        }
+        if has_spk_emb:
+            # Passed as plain float list
+            additional_information["spk_emb"] = list(request.speaker_embedding)
+        return {
+            "prompt_token_ids": [0],
+            "additional_information": additional_information,
+        }
+
     # ---- Common speech generation helpers ----
 
     async def _prepare_speech_generation(
@@ -1582,6 +1680,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             elif self._tts_model_type == "cosyvoice3":
                 prompt = await self._build_cosyvoice3_prompt(request)
                 tts_params = {}
+            elif self._tts_model_type == "ming_flash_omni_tts":
+                prompt = self._build_ming_prompt(request)
+                tts_params = {}
             else:
                 tts_params = self._build_tts_params(request)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
@@ -1629,6 +1730,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = "voxcpm"
         elif self._tts_model_type == "voxcpm2":
             model_type = "voxcpm2"
+        elif self._tts_model_type == "ming_flash_omni_tts":
+            model_type = "ming_flash_omni_tts"
         elif self._is_tts:
             model_type = tts_params.get("task_type", ["unknown"])[0]
         else:
