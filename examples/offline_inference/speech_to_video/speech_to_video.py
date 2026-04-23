@@ -177,6 +177,32 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable cache-dit summary logging after diffusion forward passes.",
     )
+    parser.add_argument(
+        "--profile-dir",
+        type=str,
+        default=None,
+        help="Enable torch profiler and save traces to this directory.",
+    )
+    parser.add_argument(
+        "--profile-record-shapes",
+        action="store_true",
+        help="Record tensor shapes in profiler (increases trace size).",
+    )
+    parser.add_argument(
+        "--profile-with-stack",
+        action="store_true",
+        help="Record stack traces in profiler (increases overhead).",
+    )
+    parser.add_argument(
+        "--profile-with-memory",
+        action="store_true",
+        help="Profile memory usage.",
+    )
+    parser.add_argument(
+        "--profile-with-flops",
+        action="store_true",
+        help="Estimate FLOPs for operations.",
+    )
     return parser.parse_args()
 
 
@@ -213,15 +239,20 @@ def main():
         ulysses_degree=args.ulysses_degree,
     )
 
-    # Check if profiling is requested via environment variable
-    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+    # Check if profiling is requested via CLI args or environment variable
+    profile_dir = args.profile_dir or os.getenv("VLLM_TORCH_PROFILER_DIR")
+    profiler_enabled = bool(profile_dir)
     profiler_config = None
     if profiler_enabled:
         from vllm.config import ProfilerConfig
 
         profiler_config = ProfilerConfig(
             profiler="torch",
-            torch_profiler_dir=os.getenv("VLLM_TORCH_PROFILER_DIR"),
+            torch_profiler_dir=profile_dir,
+            torch_profiler_record_shapes=args.profile_record_shapes,
+            torch_profiler_with_stack=args.profile_with_stack,
+            torch_profiler_with_memory=args.profile_with_memory,
+            torch_profiler_with_flops=args.profile_with_flops,
         )
 
     omni = Omni(

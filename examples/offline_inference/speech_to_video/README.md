@@ -88,6 +88,41 @@ python speech_to_video.py \
   --output s2v_output.mp4
 ```
 
+### Torch Profiler (Device-Level Profiling)
+
+For detailed GPU/XPU kernel-level profiling with Chrome trace visualization:
+
+```bash
+python speech_to_video.py \
+  --model Wan-AI/Wan2.2-S2V-14B \
+  --image "Five Hundred Miles.png" \
+  --audio "Five Hundred Miles.MP3" \
+  --prompt "A person singing" \
+  --height 448 --width 832 \
+  --num-inference-steps 1 \
+  --profile-dir /tmp/s2v_profile \
+  --profile-record-shapes \
+  --profile-with-memory \
+  ----profile-with-stack \
+  --output s2v_profiled.mp4
+```
+
+**Profiler Arguments:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `--profile-dir` | Enable torch profiler and save traces to this directory |
+| `--profile-record-shapes` | Record tensor shapes (increases trace size) |
+| `--profile-with-stack` | Record stack traces (increases overhead) |
+| `--profile-with-memory` | Profile memory usage |
+| `--profile-with-flops` | Estimate FLOPs for operations |
+
+**Output Files:**
+- `trace_rank*.json.gz` - Chrome trace (open in `chrome://tracing`)
+- `ops_rank*.xlsx` - Excel workbook with operation statistics
+
+> **Note:** Use `--num-inference-steps 1` for faster profiling. The trace captures one full denoising step with all transformer blocks and attention operations.
+
 ## How It Works
 
 The S2V pipeline processes in the following stages:
