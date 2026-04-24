@@ -6,6 +6,7 @@ from __future__ import annotations
 import functools
 from threading import Lock
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
@@ -15,6 +16,9 @@ from vllm.v1.sample.logits_processor.state import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
 
 
 @functools.lru_cache(maxsize=1)
