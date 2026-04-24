@@ -117,6 +117,7 @@ from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
+from vllm_omni.entrypoints.openai.serving_video_stream import OmniStreamingVideoHandler
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
@@ -606,6 +607,7 @@ async def omni_init_app_state(
             stage_configs=diffusion_stage_configs,
         )
         state.openai_streaming_speech = None
+        state.openai_streaming_video = None
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
@@ -906,6 +908,14 @@ async def omni_init_app_state(
 
     state.openai_streaming_speech = OmniStreamingSpeechHandler(
         speech_service=state.openai_serving_speech,
+    )
+    state.openai_streaming_video = (
+        OmniStreamingVideoHandler(
+            chat_service=state.openai_serving_chat,
+            engine_client=engine_client,
+        )
+        if state.openai_serving_chat is not None
+        else None
     )
     state.openai_serving_realtime = OpenAIServingRealtime(
         engine_client=engine_client,
@@ -1285,6 +1295,23 @@ async def streaming_speech(websocket: WebSocket):
             {
                 "type": "error",
                 "message": "Streaming speech is not available",
+            }
+        )
+        await websocket.close()
+        return
+    await handler.handle_session(websocket)
+
+
+@router.websocket("/v1/video/chat/stream")
+async def streaming_video_chat(websocket: WebSocket):
+    """WebSocket endpoint for streaming video input chat."""
+    handler = getattr(websocket.app.state, "openai_streaming_video", None)
+    if handler is None:
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": "Streaming video chat is not available",
             }
         )
         await websocket.close()
