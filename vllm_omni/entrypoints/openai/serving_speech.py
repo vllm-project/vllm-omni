@@ -490,8 +490,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # VoxCPM2 uses a text-prefix convention for style/voice instructions:
         # the native CLI wraps the instruction in parens and prepends it.
         # Mirror that here so `instructions` works through the OpenAI endpoint.
+        # Hi-Fi Cloning mode (ref_audio + ref_text) ignores instructions per
+        # canonical VoxCPM2 docs ("When Hi-Fi mode is enabled, the control
+        # instruction is ignored"); strip server-side so those requests do not
+        # get a surprise text prefix.
         text = request.input
-        if request.instructions:
+        if request.instructions and not request.ref_text:
             text = f"({request.instructions.strip()}){text}"
         prompt = build_voxcpm2_prompt(
             hf_config=self.engine_client.model_config.hf_config,
@@ -862,7 +866,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self._tts_model_type == "voxcpm":
             return self._validate_voxcpm_request(request)
         if self._tts_model_type == "voxcpm2":
-            return None  # VoxCPM2 accepts any text input
+            # Accept any text input, but cap `instructions` length for parity
+            # with qwen3_tts / voxtral / fish_tts (prevents blowing the prefill
+            # budget via an unbounded parenthetical prefix).
+            if request.instructions and len(request.instructions) > self._max_instructions_length:
+                return f"Instructions too long (max {self._max_instructions_length} characters)"
+            return None
         if self._tts_model_type == "ming_flash_omni_tts":
             return self._validate_ming_tts_request(request)
         return self._validate_qwen_tts_request(request)

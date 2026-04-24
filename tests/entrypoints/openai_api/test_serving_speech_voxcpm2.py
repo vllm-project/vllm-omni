@@ -13,7 +13,7 @@ from pytest_mock import MockerFixture
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.omni]
 
 
 @pytest.fixture
@@ -37,6 +37,10 @@ def voxcpm2_server(mocker: MockerFixture):
     )
     mock_engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=4096)]
     mock_engine_client.tts_batch_max_items = 32
+    # Explicit None so `_compute_max_instructions_length` skips the CLI-override
+    # branch (MagicMock attributes are truthy by default) and falls through to
+    # the `_TTS_MAX_INSTRUCTIONS_LENGTH = 500` default.
+    mock_engine_client.tts_max_instructions_length = None
     mock_engine_client.generate = mocker.MagicMock(return_value="generator")
     mock_engine_client.stage_configs = [
         SimpleNamespace(
@@ -139,28 +143,61 @@ class TestVoxCPM2Serving:
         assert mock_build_voxcpm2_prompt.call_args.kwargs["text"] == "(excited)hello"
         assert prompt["additional_information"]["cfg_value"] == 2.5
 
-    def test_build_prompt_with_ref_audio_resolves_and_passes_through(
+    def test_build_prompt_hifi_cloning_ref_audio_ref_text_cfg(
         self, voxcpm2_server, mock_build_voxcpm2_prompt, mocker: MockerFixture
     ):
-        """`ref_audio` + `ref_text` path still works with `instructions` prepended."""
+        """Hi-Fi Cloning (`ref_audio` + `ref_text`) resolves audio and threads cfg_value."""
         voxcpm2_server._resolve_ref_audio = AsyncMock(return_value=([0.1, -0.1, 0.2], 16000))
 
         request = OpenAICreateSpeechRequest(
             input="clone me",
             ref_audio="data:audio/wav;base64,QUJD",
             ref_text="reference transcript",
-            instructions="whisper",
             cfg_value=2.7,
         )
         prompt = asyncio.run(voxcpm2_server._build_voxcpm2_prompt(request))
 
         kwargs = mock_build_voxcpm2_prompt.call_args.kwargs
-        assert kwargs["text"] == "(whisper)clone me"
+        assert kwargs["text"] == "clone me"
         assert kwargs["ref_audio"] == [0.1, -0.1, 0.2]
         assert kwargs["ref_sr"] == 16000
         assert kwargs["ref_text"] == "reference transcript"
         assert prompt["additional_information"]["cfg_value"] == 2.7
         voxcpm2_server._resolve_ref_audio.assert_awaited_once_with("data:audio/wav;base64,QUJD")
+
+    def test_build_prompt_hifi_mode_ignores_instructions(
+        self, voxcpm2_server, mock_build_voxcpm2_prompt, mocker: MockerFixture
+    ):
+        """Hi-Fi Cloning (ref_audio + ref_text) strips `instructions` per canonical VoxCPM2 docs.
+
+        Upstream doc: "When Hi-Fi mode is enabled, the control instruction is ignored."
+        We drop the prepend server-side so Hi-Fi requests do not get a surprise text prefix.
+        """
+        voxcpm2_server._resolve_ref_audio = AsyncMock(return_value=([0.1, -0.1, 0.2], 16000))
+
+        request = OpenAICreateSpeechRequest(
+            input="hello",
+            ref_audio="data:audio/wav;base64,QUJD",
+            ref_text="reference transcript",
+            instructions="this should be ignored in Hi-Fi mode",
+        )
+        asyncio.run(voxcpm2_server._build_voxcpm2_prompt(request))
+
+        assert mock_build_voxcpm2_prompt.call_args.kwargs["text"] == "hello"
+
+    def test_validate_rejects_overlong_instructions(self, voxcpm2_server):
+        """Instructions longer than `_max_instructions_length` (500 default) are rejected."""
+        oversize = "x" * (voxcpm2_server._max_instructions_length + 1)
+        request = OpenAICreateSpeechRequest(input="hello", instructions=oversize)
+        error = voxcpm2_server._validate_tts_request(request)
+        assert error is not None
+        assert str(voxcpm2_server._max_instructions_length) in error
+
+    def test_validate_accepts_at_limit_instructions(self, voxcpm2_server):
+        """Instructions exactly at `_max_instructions_length` are accepted."""
+        at_limit = "x" * voxcpm2_server._max_instructions_length
+        request = OpenAICreateSpeechRequest(input="hello", instructions=at_limit)
+        assert voxcpm2_server._validate_tts_request(request) is None
 
     @pytest.mark.parametrize("cfg", [0.5, 1.5, 2.0, 2.7, 5.0, 10.0])
     def test_cfg_value_accepts_range(self, voxcpm2_server, mock_build_voxcpm2_prompt, cfg):
