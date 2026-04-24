@@ -17,12 +17,13 @@ import io
 import urllib.request
 from urllib.parse import urlparse
 
-import librosa
 import numpy as np
 import soundfile as sf
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoConfig, AutoFeatureExtractor, AutoModel
+from vllm.multimodal.audio import AudioResampler
+from vllm.multimodal.media.audio import load_audio as _load_audio_file
 
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
 from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
@@ -80,15 +81,20 @@ class Qwen3TTSTokenizer:
         """
         inst = cls()
 
-        AutoConfig.register("qwen3_tts_tokenizer_25hz", Qwen3TTSTokenizerV1Config)
-        AutoModel.register(Qwen3TTSTokenizerV1Config, Qwen3TTSTokenizerV1Model)
+        load_feature_extractor = bool(kwargs.pop("load_feature_extractor", True))
 
         AutoConfig.register("qwen3_tts_tokenizer_12hz", Qwen3TTSTokenizerV2Config)
         AutoModel.register(Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2Model)
 
-        inst.feature_extractor = AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
+        AutoConfig.register("qwen3_tts_tokenizer_25hz", Qwen3TTSTokenizerV1Config)
+        AutoModel.register(Qwen3TTSTokenizerV1Config, Qwen3TTSTokenizerV1Model)
+
         inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
         inst.config = inst.model.config
+
+        inst.feature_extractor = (
+            AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path) if load_feature_extractor else None
+        )
 
         inst.device = getattr(inst.model, "device", None)
         if inst.device is None:
@@ -149,13 +155,14 @@ class Qwen3TTSTokenizer:
             with io.BytesIO(wav_bytes) as f:
                 audio, sr = sf.read(f, dtype="float32", always_2d=False)
         else:
-            audio, sr = librosa.load(x, sr=None, mono=True)
+            audio, sr = _load_audio_file(x, sr=None, mono=True)
 
         if audio.ndim > 1:
             audio = np.mean(audio, axis=-1)
 
         if sr != target_sr:
-            audio = librosa.resample(y=audio, orig_sr=sr, target_sr=target_sr)
+            resampler = AudioResampler(target_sr=target_sr)
+            audio = resampler.resample(audio, orig_sr=sr)
 
         return audio.astype(np.float32)
 
@@ -203,7 +210,8 @@ class Qwen3TTSTokenizer:
             if a.ndim > 1:
                 a = np.mean(a, axis=-1)
             if int(sr) != target_sr:
-                a = librosa.resample(y=a.astype(np.float32), orig_sr=int(sr), target_sr=target_sr)
+                resampler = AudioResampler(target_sr=target_sr)
+                a = resampler.resample(a.astype(np.float32), orig_sr=int(sr))
             out.append(a.astype(np.float32))
         return out
 
@@ -212,12 +220,7 @@ class Qwen3TTSTokenizer:
         audios: AudioInput,
         sr: int | None = None,
         return_dict: bool = True,
-    ) -> (
-        Qwen3TTSTokenizerV1EncoderOutput
-        | Qwen3TTSTokenizerV2EncoderOutput
-        | tuple[list[torch.Tensor], list[torch.Tensor] | None, list[torch.Tensor] | None]
-        | tuple[list[torch.Tensor]]
-    ):
+    ) -> Qwen3TTSTokenizerV1EncoderOutput | Qwen3TTSTokenizerV2EncoderOutput | tuple:
         """
         Batch-encode audio into discrete codes (and optional conditioning, depending on 25Hz/12Hz).
 
@@ -328,7 +331,7 @@ class Qwen3TTSTokenizer:
         else:
             # List[Tensor/np]
             audio_codes_list = [_to_tensor(c, dtype=torch.long) for c in audio_codes_list]
-            audio_codes_padded = pad_sequence(audio_codes_list, batch_first=True, padding_value=0).to(self.device)
+            audio_codes_padded = pad_sequence(audio_codes_list, batch_first=True, padding_value=-1).to(self.device)
 
         with torch.inference_mode():
             if model_type == "qwen3_tts_tokenizer_25hz":

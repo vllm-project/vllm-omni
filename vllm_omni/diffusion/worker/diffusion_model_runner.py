@@ -10,6 +10,7 @@ model-related operations.
 
 from __future__ import annotations
 
+import copy
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
@@ -26,15 +27,20 @@ from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.offloader import get_offload_backend
+from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
+from vllm_omni.diffusion.worker.utils import DiffusionRequestState, RunnerOutput
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
 
 
-class DiffusionModelRunner:
+class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     """
     Model runner that handles model loading and execution for diffusion models.
 
@@ -64,8 +70,26 @@ class DiffusionModelRunner:
         self.cache_backend = None
         self.offload_backend = None
 
+        # Cache for per-request stepwise state.
+        self.state_cache: dict[str, DiffusionRequestState] = {}
+
         # Initialize KV cache manager for connector management
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
+
+    def _compile_transformer(self, attr_name: str) -> None:
+        """Compile a transformer attribute on the pipeline with torch.compile."""
+        model = getattr(self.pipeline, attr_name, None)
+        if model is None:
+            return
+        try:
+            setattr(self.pipeline, attr_name, regionally_compile(model, dynamic=True))
+            logger.info("Model runner: %s compiled with torch.compile.", attr_name)
+        except Exception as e:
+            logger.warning(
+                "Model runner: torch.compile for %s failed: %s. Using eager mode.",
+                attr_name,
+                e,
+            )
 
     def load_model(
         self,
@@ -101,7 +125,7 @@ class DiffusionModelRunner:
 
         # Load model within forward context
         load_config = LoadConfig()
-        model_loader = DiffusersPipelineLoader(load_config)
+        model_loader = DiffusersPipelineLoader(load_config, od_config=self.od_config)
         time_before_load = time.perf_counter()
 
         with get_memory_context():
@@ -111,6 +135,7 @@ class DiffusionModelRunner:
                     load_device=load_device,
                     load_format=load_format,
                     custom_pipeline_name=custom_pipeline_name,
+                    device=self.device,
                 )
         time_after_load = time.perf_counter()
 
@@ -121,6 +146,13 @@ class DiffusionModelRunner:
         )
         logger.info("Model runner: Model loaded successfully.")
 
+        if getattr(self.od_config, "step_execution", False) and not self.supports_step_mode():
+            raise ValueError(
+                "step_execution=True requires a pipeline implementing "
+                "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
+                f"{self.od_config.model_class_name} does not support that contract."
+            )
+
         # Apply CPU offloading
         self.offload_backend = get_offload_backend(self.od_config, device=self.device)
         if self.offload_backend is not None:
@@ -130,14 +162,8 @@ class DiffusionModelRunner:
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:
             if current_omni_platform.supports_torch_inductor():
-                try:
-                    self.pipeline.transformer = regionally_compile(
-                        self.pipeline.transformer,
-                        dynamic=True,
-                    )
-                    logger.info("Model runner: Model compiled with torch.compile.")
-                except Exception as e:
-                    logger.warning(f"Model runner: torch.compile failed with error: {e}. Using eager mode.")
+                self._compile_transformer("transformer")
+                self._compile_transformer("transformer_2")
             else:
                 logger.warning(
                     "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
@@ -148,7 +174,16 @@ class DiffusionModelRunner:
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
 
         if self.cache_backend is not None:
-            self.cache_backend.enable(self.pipeline)
+            if self.od_config.model_class_name in _NO_CACHE_ACCELERATION:
+                logger.warning(
+                    "Cache backend '%s' is not supported for %s; disabling cache acceleration.",
+                    self.od_config.cache_backend,
+                    self.od_config.model_class_name,
+                )
+                self.cache_backend = None
+                self.od_config.cache_backend = None
+            else:
+                self.cache_backend.enable(self.pipeline)
 
         logger.info("Model runner: Initialization complete.")
 
@@ -156,7 +191,33 @@ class DiffusionModelRunner:
         """Load weights into the pipeline."""
         return self.pipeline.load_weights(weights)
 
-    @torch.inference_mode()
+    def _record_peak_memory(self, output: DiffusionOutput) -> None:
+        """Record peak GPU memory for the current forward pass into output.
+
+        Must be called immediately after pipeline.forward(), with
+        reset_peak_memory_stats() called just before it, so the measurement
+        reflects this request only and not the global historical maximum.
+
+        Uses max_memory_reserved (CUDA memory pool high-water mark) rather than
+        max_memory_allocated so that allocator fragmentation is also visible.
+        See: https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.max_memory_reserved.html
+        """
+        peak_reserved_bytes = current_omni_platform.max_memory_reserved()
+        peak_allocated_bytes = current_omni_platform.max_memory_allocated()
+
+        output.peak_memory_mb = peak_reserved_bytes / (1024**2)
+        peak_reserved_gb = peak_reserved_bytes / (1024**3)
+        peak_allocated_gb = peak_allocated_bytes / (1024**3)
+        pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
+
+        logger.info(
+            "Peak GPU memory (this request): %.2f GB reserved, %.2f GB allocated, %.2f GB pool overhead (%.1f%%)",
+            peak_reserved_gb,
+            peak_allocated_gb,
+            pool_overhead_gb,
+            pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb > 0 else 0.0,
+        )
+
     def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
@@ -166,37 +227,173 @@ class DiffusionModelRunner:
 
         Returns:
             DiffusionOutput with generated results.
+
+        Note:
+            We use torch.no_grad() for HSDP because HSDP2's fully_shard requires access
+            to tensor version counters in pre_forward hooks, which inference tensors do
+            not track. For non-HSDP inference, we use torch.inference_mode() for better
+            performance.
         """
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
         if len(req.prompts) == 0:
             raise ValueError("Cannot execute model with empty request list")
 
-        # The manager handles the check for need_recv_cache internally
-        self.kv_transfer_manager.receive_kv_cache(req, target_device=getattr(self.pipeline, "device", None))
+        # Use no_grad() for HSDP compatibility, inference_mode() otherwise for better perf
+        use_hsdp = self.od_config.parallel_config.use_hsdp
+        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+        with grad_context:
+            # The manager handles the check for need_recv_cache internally
+            self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+                req,
+                cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                target_device=getattr(self.pipeline, "device", None),
+            )
 
-        if req.sampling_params.generator is None and req.sampling_params.seed is not None:
-            if req.sampling_params.generator_device is not None:
-                gen_device = req.sampling_params.generator_device
-            elif self.device.type == "cpu":
-                gen_device = "cpu"
-            else:
-                gen_device = self.device
-            req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
+            if req.sampling_params.generator is None and req.sampling_params.seed is not None:
+                if req.sampling_params.generator_device is not None:
+                    gen_device = req.sampling_params.generator_device
+                elif self.device.type == "cpu":
+                    gen_device = "cpu"
+                else:
+                    gen_device = self.device
+                req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
 
-        # Refresh cache context if needed
-        if (
-            not getattr(req, "skip_cache_refresh", False)
-            and self.cache_backend is not None
-            and self.cache_backend.is_enabled()
-        ):
-            self.cache_backend.refresh(self.pipeline, req.sampling_params.num_inference_steps)
+            # Refresh cache context if needed
+            if (
+                not getattr(req, "skip_cache_refresh", False)
+                and self.cache_backend is not None
+                and self.cache_backend.is_enabled()
+                and req.sampling_params.num_inference_steps is not None
+            ):
+                self.cache_backend.refresh(self.pipeline, req.sampling_params.num_inference_steps)
 
-        with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
-            with record_function("pipeline_forward"):
-                output = self.pipeline.forward(req)
+            is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+            if is_primary:
+                current_omni_platform.reset_peak_memory_stats()
+
+            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+                with record_function("pipeline_forward"):
+                    output = self.pipeline.forward(req)
+
+            if is_primary:
+                self._record_peak_memory(output)
 
             # NOTE:
-            if self.od_config.cache_backend == "cache_dit" and self.od_config.enable_cache_dit_summary:
+            if (
+                self.cache_backend is not None
+                and self.cache_backend.is_enabled()
+                and self.od_config.cache_backend == "cache_dit"
+                and self.od_config.enable_cache_dit_summary
+            ):
                 cache_summary(self.pipeline, details=True)
 
-        return output
+            return output
+
+    # ------------------------------------------------------------------
+    # Step-wise execution
+    # ------------------------------------------------------------------
+
+    def supports_step_mode(self) -> bool:
+        """Return whether current pipeline supports step execution."""
+        return self.pipeline is not None and supports_step_execution(self.pipeline)
+
+    def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[DiffusionRequestState, bool]:
+        """Step-before update: cleanup finished requests and get/create one running state."""
+        for req_id in scheduler_output.finished_req_ids:
+            self.state_cache.pop(req_id, None)
+
+        if scheduler_output.num_scheduled_reqs != 1:
+            raise ValueError(
+                "Step mode currently supports batch_size=1, "
+                f"but got {scheduler_output.num_scheduled_reqs} scheduled requests."
+            )
+
+        if scheduler_output.scheduled_new_reqs:
+            new_req_data = scheduler_output.scheduled_new_reqs[0]
+            req_id = new_req_data.sched_req_id
+            req = new_req_data.req
+            if req_id in self.state_cache:
+                raise ValueError(f"Received duplicate new-request payload for cached request {req_id}.")
+        else:
+            req_id = scheduler_output.scheduled_cached_reqs.sched_req_ids[0]
+            state = self.state_cache.get(req_id)
+            if state is None:
+                raise ValueError(f"Missing cached state for request {req_id}.")
+            return state, False
+
+        request_ids = req.request_ids or [req_id]
+        if len(request_ids) != len(req.prompts):
+            raise ValueError(
+                f"request_ids length ({len(request_ids)}) does not match prompts length ({len(req.prompts)})"
+            )
+
+        state = DiffusionRequestState(
+            req_id=req_id,
+            sampling=copy.deepcopy(req.sampling_params),
+            prompts=req.prompts,
+        )
+        self.state_cache[req_id] = state
+        return state, True
+
+    def _update_states_after(self, state: DiffusionRequestState, finished: bool) -> None:
+        """Step-after update: clear cached state for completed request."""
+        if finished:
+            self.state_cache.pop(state.req_id, None)
+
+    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+        """Execute one step for one scheduled request and return runner output."""
+        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        if not self.supports_step_mode():
+            raise ValueError("Current pipeline does not support step execution.")
+        # Stepwise mode only supports the basic state-driven denoise path for now.
+        # Request-mode extras such as cache backends, KV transfer, editing inputs,
+        # and similar features are not supported here yet.
+        if self.od_config.cache_backend not in (None, "none"):
+            raise ValueError("Step mode does not support cache_backend yet.")
+
+        use_hsdp = self.od_config.parallel_config.use_hsdp
+        grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
+        with grad_context:
+            state, is_new_request = self._update_states(scheduler_output)
+
+            if is_new_request:
+                # TODO: support kv manager recv
+                # TODO: support cache backend
+                if state.sampling.generator is None and state.sampling.seed is not None:
+                    if state.sampling.generator_device is not None:
+                        gen_device = state.sampling.generator_device
+                    elif self.device.type == "cpu":
+                        gen_device = "cpu"
+                    else:
+                        gen_device = self.device
+                    state.sampling.generator = torch.Generator(device=gen_device).manual_seed(state.sampling.seed)
+
+            with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
+                # step0/new request: encode
+                if is_new_request:
+                    self.pipeline.prepare_encode(state)
+
+                noise_pred = self.pipeline.denoise_step(state)
+                finished = False
+
+                # In CFG parallel mode, only rank 0 gets the actual noise_pred; non-rank-0 workers receive None.
+                # A true interrupt (all ranks return None) is detected by checking self.pipeline.interrupt.
+                if noise_pred is None and getattr(self.pipeline, "interrupt", False):
+                    finished = True
+                    result = DiffusionOutput(error="stepwise denoise interrupted")
+                else:
+                    self.pipeline.step_scheduler(state, noise_pred)
+                    finished = state.denoise_completed
+                    if finished:
+                        result = self.pipeline.post_decode(state)
+                    else:
+                        result = None
+
+                self._update_states_after(state, finished)
+
+                return RunnerOutput(
+                    req_id=state.req_id,
+                    step_index=state.step_index,
+                    finished=finished,
+                    result=result,
+                )

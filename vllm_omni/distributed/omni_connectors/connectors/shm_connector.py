@@ -3,7 +3,7 @@
 
 import fcntl
 import os
-import time
+from multiprocessing import shared_memory as shm_pkg
 from typing import Any
 
 from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
@@ -15,9 +15,13 @@ logger = get_connector_logger(__name__)
 
 
 class SharedMemoryConnector(OmniConnectorBase):
-    """
-    Connector that uses SharedMemory for large objects and inline data for small objects.
-    Acts as a unified replacement for the legacy IPC fallback logic.
+    """Key-addressed local shared-memory connector.
+
+    SHM is a local-only transport: it reads/writes POSIX shared memory
+    segments identified purely by *key*.  It does **not** understand
+    remote-transport metadata such as ``source_host`` / ``source_port``
+    (that is the RDMA connector's job).  When such metadata is passed in,
+    the connector silently falls back to key-based lookup.
     """
 
     def __init__(self, config: dict[str, Any]):
@@ -25,6 +29,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         self.stage_id = config.get("stage_id", -1)
         self.device = config.get("device", "cuda:0")
         self.threshold = int(config.get("shm_threshold_bytes", 65536))
+        self._pending_keys: set[str] = set()
         self._metrics = {
             "puts": 0,
             "gets": 0,
@@ -48,16 +53,18 @@ class SharedMemoryConnector(OmniConnectorBase):
             payload = self.serialize_obj(data)
             size = len(payload)
 
+            # Currently, we always use SHM.
             if True:
                 # Use Shared Memory
                 lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
-                with open(lock_file, "w") as lockf:
+                with open(lock_file, "wb+") as lockf:
                     fcntl.flock(lockf, fcntl.LOCK_EX)
                     meta = shm_write_bytes(payload, name=put_key)
                     fcntl.flock(lockf, fcntl.LOCK_UN)
 
                 # meta contains {'name': ..., 'size': ...}
                 metadata = {"shm": meta, "size": size}
+                self._pending_keys.add(put_key)
                 self._metrics["shm_writes"] += 1
             else:
                 # Inline - pass bytes directly to avoid double serialization of the object
@@ -75,6 +82,45 @@ class SharedMemoryConnector(OmniConnectorBase):
             logger.error(f"SharedMemoryConnector put failed for req {put_key}: {e}")
             return False, 0, None
 
+    def _get_data_with_lock(self, lock_file: str, shm_handle: dict):
+        obj = None
+        try:
+            with open(lock_file, "rb+") as lockf:
+                fcntl.flock(lockf, fcntl.LOCK_EX)
+                data_bytes = shm_read_bytes(shm_handle)
+                fcntl.flock(lockf, fcntl.LOCK_UN)
+            obj = self.deserialize_obj(data_bytes)
+            return obj, int(shm_handle.get("size", 0))
+        except Exception as e:
+            logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
+            return None
+        finally:
+            # If data has been received, delete lock_file.
+            if obj and os.path.exists(lock_file):
+                os.remove(lock_file)
+
+    def _get_by_key(self, get_key: str) -> tuple[Any, int] | None:
+        """Read a SHM segment addressed purely by *get_key*."""
+        shm = None
+        try:
+            shm = shm_pkg.SharedMemory(name=get_key)
+            if shm is None or shm.size == 0:
+                return None
+            lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
+            shm_handle = {"name": get_key, "size": shm.size}
+            result = self._get_data_with_lock(lock_file, shm_handle)
+            if result is not None:
+                self._pending_keys.discard(get_key)
+            return result
+        except FileNotFoundError:
+            return None
+        except Exception:
+            logger.debug("_get_by_key: unexpected error reading SHM segment %s", get_key, exc_info=True)
+            return None
+        finally:
+            if shm:
+                shm.close()
+
     def get(
         self,
         from_stage: str,
@@ -83,84 +129,82 @@ class SharedMemoryConnector(OmniConnectorBase):
         metadata=None,
     ) -> tuple[Any, int] | None:
         if metadata is not None:
-            # Some callers may wrap metadata by request id.
             if isinstance(metadata, dict) and get_key in metadata:
                 metadata = metadata.get(get_key)
 
             if not isinstance(metadata, dict):
-                return None
+                return self._get_by_key(get_key)
 
             if "inline_bytes" in metadata:
                 try:
                     obj = self.deserialize_obj(metadata["inline_bytes"])
+                    self._pending_keys.discard(get_key)
                     return obj, int(metadata.get("size", 0))
                 except Exception as e:
                     logger.error(f"SharedMemoryConnector inline get failed for req {get_key}: {e}")
                     return None
 
             if "shm" in metadata:
-                try:
-                    shm_handle = metadata["shm"]
-                    lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
-                    with open(lock_file, "w") as lockf:
-                        fcntl.flock(lockf, fcntl.LOCK_SH)
-                        data_bytes = shm_read_bytes(shm_handle)
-                        fcntl.flock(lockf, fcntl.LOCK_UN)
-                    if os.path.exists(lock_file):
-                        os.remove(lock_file)
-                    obj = self.deserialize_obj(data_bytes)
-                    return obj, int(metadata.get("size", 0))
-                except Exception as e:
-                    logger.error(f"SharedMemoryConnector shm get failed for req {get_key}: {e}")
-                    return None
+                shm_handle = metadata["shm"]
+                lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
+                result = self._get_data_with_lock(lock_file, shm_handle)
+                if result is not None:
+                    self._pending_keys.discard(get_key)
+                return result
 
-            return None
+            # Metadata is a dict but has no SHM-specific handle (e.g. RDMA-
+            # style source_host/source_port).  Fall back to key-based read.
+            return self._get_by_key(get_key)
 
-        from multiprocessing import shared_memory as shm_pkg
-
-        # Wait for shared memory to be available (with retry logic)
-        max_retries = 30
-        retry_delay = 0.1  # 100ms between retries
-        shm = None
-
-        for attempt in range(max_retries):
-            try:
-                shm = shm_pkg.SharedMemory(name=get_key)
-                break  # Successfully opened, exit retry loop
-            except FileNotFoundError:
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-                else:
-                    # Max retries reached, return None
-                    logger.warning(f"Shared memory '{get_key}' not found after {max_retries} retries")
-                    return None
-
-        if shm is None:
-            return None
-
-        try:
-            lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
-            with open(lock_file) as lockf:
-                fcntl.flock(lockf, fcntl.LOCK_SH)
-                data_bytes = shm_read_bytes({"name": get_key, "size": shm.size})
-                fcntl.flock(lockf, fcntl.LOCK_UN)
-            # Clean up the temporary file if it still exists.
-            if os.path.exists(lock_file):
-                os.remove(lock_file)
-            obj = self.deserialize_obj(data_bytes)
-            return obj, shm.size
-        finally:
-            shm.close()
-
-        # TODO: update another read method
+        return self._get_by_key(get_key)
 
     def cleanup(self, request_id: str) -> None:
-        # SHM segments are automatically unlinked during 'get' (shm_read_bytes).
-        # If 'get' is never called (e.g. error flow), the SHM segment might leak.
-        # A robust implementation might track created segments and unlink them here
-        # if they haven't been consumed.
-        # For now, we rely on the consumer to read and unlink.
-        pass
+        """Best-effort cleanup of unconsumed SHM segments for *request_id*.
+
+        Matches pending keys where *request_id* appears as the full key,
+        as a ``_``-delimited prefix, or as a ``_``-delimited suffix.
+        If ``get()`` was never called, we unlink it here so /dev/shm
+        doesn't leak.
+        """
+        stale = [
+            k
+            for k in self._pending_keys
+            if k == request_id or k.startswith(request_id + "_") or k.endswith("_" + request_id)
+        ]
+        for key in stale:
+            self._pending_keys.discard(key)
+            try:
+                seg = shm_pkg.SharedMemory(name=key)
+                seg.close()
+                seg.unlink()
+                logger.debug("cleanup: unlinked unconsumed SHM segment %s", key)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logger.debug("cleanup: failed to unlink SHM segment %s: %s", key, e)
+            lock_file = f"/dev/shm/shm_{key}_lockfile.lock"
+            if os.path.exists(lock_file):
+                try:
+                    os.remove(lock_file)
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        """Unlink all remaining tracked SHM segments."""
+        for key in list(self._pending_keys):
+            try:
+                seg = shm_pkg.SharedMemory(name=key)
+                seg.close()
+                seg.unlink()
+            except Exception:
+                pass
+            lock_file = f"/dev/shm/shm_{key}_lockfile.lock"
+            if os.path.exists(lock_file):
+                try:
+                    os.remove(lock_file)
+                except OSError:
+                    pass
+        self._pending_keys.clear()
 
     def health(self) -> dict[str, Any]:
         return {"status": "healthy", "threshold": self.threshold, **self._metrics}

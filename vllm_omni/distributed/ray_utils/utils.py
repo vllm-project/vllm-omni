@@ -176,6 +176,26 @@ def start_ray_actor(
         runtime_env={"env_vars": {"PYTHONPATH": os.environ.get("PYTHONPATH", "")}, "CUDA_LAUNCH_BLOCKING": "1"},
     ).remote()
 
-    worker_actor.run.remote(worker_entry_fn, *args, **kwargs)
+    task_ref = worker_actor.run.remote(worker_entry_fn, *args, **kwargs)
 
-    return worker_actor
+    return worker_actor, task_ref
+
+
+def is_ray_task_alive(task_ref: Any, **kwargs):
+    """Checks ray task status. Returns FALSE if ray task has exited for any reason."""
+    if not RAY_AVAILABLE:
+        raise ImportError("ray is required to query ray tasks")
+
+    ready, _ = ray.wait([task_ref], **kwargs)
+    return not bool(ready)
+
+
+def get_ray_task_error(task_ref: Any, **kwargs) -> Exception | None:
+    """Gets ray task. Returns RayTaskError if ray instance exited with any error, else None."""
+    if not RAY_AVAILABLE:
+        raise ImportError("ray is required to query ray tasks")
+
+    try:
+        ray.get(task_ref, **kwargs)
+    except Exception as e:
+        return e

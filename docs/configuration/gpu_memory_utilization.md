@@ -158,7 +158,7 @@ The stage initialized but ran out of memory during processing.
 
 **Solutions:**
 1. Reduce `max_num_batched_tokens`
-2. Reduce `max_batch_size` in runtime config
+2. Reduce `max_num_seqs` in engine_args
 3. Lower `gpu_memory_utilization` slightly
 4. Enable quantization if supported
 

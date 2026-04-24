@@ -39,6 +39,7 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.ovis_image.ovis_image_transformer import OvisImageTransformer2DModel
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
@@ -140,7 +141,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class OvisImagePipeline(nn.Module, CFGParallelMixin):
+class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin):
     def __init__(
         self,
         *,
@@ -188,6 +189,9 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
         self.user_prompt_begin_id = 28
         self.tokenizer_max_length = 256 + self.user_prompt_begin_id
         self.default_sample_size = 128
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     def _get_messages(
         self,
@@ -681,6 +685,7 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
 
         negative_text_ids = None
         if do_classifier_free_guidance:
+            negative_prompt = negative_prompt if negative_prompt is not None else ""
             negative_prompt_embeds, negative_text_ids = self.encode_prompt(
                 prompt=negative_prompt,
                 prompt_embeds=negative_prompt_embeds,
@@ -734,7 +739,9 @@ class OvisImagePipeline(nn.Module, CFGParallelMixin):
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(output=image)
+        return DiffusionOutput(
+            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

@@ -12,6 +12,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
+
 
 class ResponseFormat(str, Enum):
     """Image response format"""
@@ -43,6 +45,10 @@ class ImageGenerationRequest(BaseModel):
     )
     response_format: ResponseFormat = Field(default=ResponseFormat.B64_JSON, description="Format of the returned image")
     user: str | None = Field(default=None, description="User identifier for tracking")
+    layers: int | None = Field(
+        default=None,
+        description="Number of output layers for layered image models. Supported range: 3-10.",
+    )
 
     @field_validator("size")
     @classmethod
@@ -67,8 +73,32 @@ class ImageGenerationRequest(BaseModel):
             raise ValueError(f"Only 'b64_json' response format is supported, got: {v}")
         return v
 
+    @field_validator("layers")
+    @classmethod
+    def validate_layers(cls, v):
+        """Validate the layers parameter for layered image models."""
+        return validate_layered_layers(v)
+
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the image")
+    system_prompt: str | None = Field(
+        default=None, description="Custom system prompt. Used when --use_system_prompt is custom"
+    )
+    use_system_prompt: str | None = Field(
+        default=None,
+        description="System prompt type. Options: None, dynamic, en_vanilla, "
+        "en_recaption, en_think_recaption, en_unified, custom",
+    )
+
+    @field_validator("use_system_prompt")
+    @classmethod
+    def validate_use_system_prompt(cls, v):
+        """Validate system prompt type."""
+        valid_types = [None, "dynamic", "en_vanilla", "en_recaption", "en_think_recaption", "en_unified", "custom"]
+        if v not in valid_types:
+            raise ValueError(f"Invalid use_system_prompt type: {v}. Must be one of: {valid_types[1:] + [None]}")
+        return v
+
     num_inference_steps: int | None = Field(
         default=None,
         ge=1,

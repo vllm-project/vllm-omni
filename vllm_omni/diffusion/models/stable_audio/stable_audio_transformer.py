@@ -17,6 +17,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 
 logger = init_logger(__name__)
 
@@ -374,6 +375,9 @@ class StableAudioDiTModel(nn.Module):
     - postprocess_conv: residual conv layer (keeps 64 channels)
     - Output: [B, out_channels, L]
     """
+
+    _repeated_blocks = ["StableAudioDiTBlock"]
+    _hsdp_shard_conditions = [is_transformer_block_module]
 
     def __init__(
         self,

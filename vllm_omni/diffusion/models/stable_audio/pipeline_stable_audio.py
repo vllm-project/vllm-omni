@@ -29,7 +29,9 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
 from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import StableAudioDiTModel
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 
 logger = init_logger(__name__)
 
@@ -58,7 +60,7 @@ def get_stable_audio_post_process_func(
     return post_process_func
 
 
-class StableAudioPipeline(nn.Module, SupportAudioOutput):
+class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMixin):
     """
     Pipeline for text-to-audio generation using Stable Audio Open.
 
@@ -127,8 +129,9 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
             local_files_only=local_files_only,
         ).to(self.device)
 
-        # Initialize our custom transformer (weights loaded via load_weights)
-        self.transformer = StableAudioDiTModel(od_config=od_config)
+        # Initialize transformer from HF config to keep architecture aligned with checkpoint.
+        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, StableAudioDiTModel)
+        self.transformer = StableAudioDiTModel(od_config=od_config, **transformer_kwargs)
 
         # Load scheduler
         self.scheduler = CosineDPMSolverMultistepScheduler.from_pretrained(
@@ -147,6 +150,9 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         self._guidance_scale = None
         self._num_timesteps = None
         self._current_timestep = None
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     @property
     def guidance_scale(self):
@@ -567,7 +573,9 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         # Trim to requested length
         audio = audio[:, :, waveform_start:waveform_end]
 
-        return DiffusionOutput(output=audio)
+        return DiffusionOutput(
+            output=audio, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""

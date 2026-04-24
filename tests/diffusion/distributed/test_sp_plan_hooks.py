@@ -47,6 +47,8 @@ requires_distributed = pytest.mark.skipif(
 pytestmark = [
     pytest.mark.diffusion,
     pytest.mark.parallel,
+    pytest.mark.core_model,
+    pytest.mark.cpu,
 ]
 
 # =============================================================================
@@ -984,6 +986,46 @@ class TestDimensionValidation:
         result = hook._prepare_sp_input(tensor_4d, metadata["x"], (), {})
         # Since expected_dims=3 but tensor has 4 dims, should return original
         assert result.shape == tensor_4d.shape
+
+
+@pytest.mark.cpu
+class TestStrictModeSplitValidation:
+    """Test strict mode divisibility validation in SequenceParallelSplitHook."""
+
+    def test_strict_mode_raises_on_non_divisible_seq_len(self):
+        """Strict Ulysses-SP should fail fast when seq_len is not divisible by sp_size."""
+        from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+        from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig
+        from vllm_omni.diffusion.forward_context import set_forward_context
+        from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
+
+        class DummyModule(nn.Module):
+            def forward(self, x):
+                return x
+
+        metadata = {"x": SequenceParallelInput(split_dim=1, expected_dims=3)}
+        config = SequenceParallelConfig(ulysses_degree=2, ring_degree=1)
+        hook = SequenceParallelSplitHook(metadata, config)
+        hook.initialize_hook(DummyModule())
+
+        # seq_len=5 is not divisible by sp_size=2
+        x = torch.randn(1, 5, 8)
+
+        parallel_config = DiffusionParallelConfig(
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            tensor_parallel_size=1,
+            sequence_parallel_size=2,
+            ulysses_degree=2,
+            ring_degree=1,
+            cfg_parallel_size=1,
+            ulysses_mode="strict",
+        )
+        od_config = OmniDiffusionConfig(model="test", dtype=torch.float32, parallel_config=parallel_config)
+
+        with set_forward_context(omni_diffusion_config=od_config):
+            with pytest.raises(ValueError, match=r"strict mode.*sequence_parallel_size"):
+                hook._prepare_sp_input(x, metadata["x"], (), {})
 
 
 @pytest.mark.cpu

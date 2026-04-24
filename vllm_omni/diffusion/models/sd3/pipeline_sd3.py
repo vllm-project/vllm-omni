@@ -6,7 +6,6 @@ from collections.abc import Iterable
 
 import torch
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.models.autoencoders import AutoencoderKL
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -16,12 +15,14 @@ from transformers import CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderMo
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
 )
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
@@ -127,7 +128,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
+class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin):
     def __init__(
         self,
         *,
@@ -174,9 +175,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
         )
         self.transformer = SD3Transformer2DModel(od_config=od_config)
 
-        self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
-        )
+        self.vae = DistributedAutoencoderKL.from_pretrained(
+            model, subfolder="vae", local_files_only=local_files_only
+        ).to(self.device)
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
@@ -187,6 +188,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
         self.default_sample_size = 128
         self.patch_size = 2
         self.output_type = self.od_config.output_type
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     def check_inputs(
         self,
@@ -692,7 +696,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin):
 
             image = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(output=image)
+        return DiffusionOutput(
+            output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

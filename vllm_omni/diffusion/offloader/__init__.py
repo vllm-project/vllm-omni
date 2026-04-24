@@ -55,8 +55,11 @@ def get_offload_backend(
         return None
 
     # Validate platform (CUDA required for now)
-    if not current_omni_platform.is_cuda() or current_omni_platform.get_device_count() < 1:
-        logger.warning("CPU offloading requires CUDA devices. Skipping offloading.")
+    if not current_omni_platform.supports_cpu_offload() or current_omni_platform.get_device_count() < 1:
+        logger.warning(
+            "Current device: %s does not support CPU offloading. Skipping offloading.",
+            current_omni_platform.get_device_name(),
+        )
         return None
 
     # Detect device if not provided

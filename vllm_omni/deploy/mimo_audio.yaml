@@ -1,0 +1,56 @@
+# MiMo Audio deploy: 2-stage thinker+talker → code2wav.
+#
+# Default mode is async-chunk streaming on a single GPU (both stages on
+# device 0) through SharedMemoryConnector. For the legacy 2-GPU sync
+# pipeline (stage 1 on a second card), pass ``--no-async-chunk
+# --stage-1-devices 1 --stage-1-max-model-len 18192
+# --stage-1-max-num-batched-tokens 18192`` to the serve CLI.
+async_chunk: true
+dtype: bfloat16
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 365536
+      codec_streaming: true
+      connector_get_sleep_s: 0.001
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 3
+      codec_left_context_frames: 3
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.3
+    enforce_eager: true
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 50
+      max_tokens: 18192
+      seed: 42
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.2
+    enforce_eager: true
+    async_scheduling: false
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 18192
+      seed: 42

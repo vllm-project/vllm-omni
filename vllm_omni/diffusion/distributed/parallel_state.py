@@ -35,6 +35,8 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion import envs
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.platforms import current_omni_platform
 
 from .group_coordinator import (
@@ -51,11 +53,12 @@ logger = init_logger(__name__)
 
 
 _WORLD: GroupCoordinator | None = None
-# get _TP from vllm.distributed.parallel_state
+# get _TP&_EP from vllm.distributed.parallel_state
 _SP: SequenceParallelGroupCoordinator | None = None
 _PP: PipelineGroupCoordinator | None = None
 _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
+_FS: GroupCoordinator | None = None  # Fully Sharded (HSDP shard dimension)
 _DIT: GroupCoordinator | None = None
 
 
@@ -175,7 +178,8 @@ class RankGenerator:
         pp: int,
         cfg: int,
         dp: int,
-        order: str,
+        fs: int = 1,
+        order: str = "tp-sp-pp-cfg-dp",
         rank_offset: int = 0,
     ) -> None:
         self.tp = tp
@@ -183,8 +187,10 @@ class RankGenerator:
         self.pp = pp
         self.cfg = cfg
         self.dp = dp
+        self.fs = fs
         self.rank_offset = rank_offset
         self.world_size = tp * sp * pp * cfg * dp
+        self.ep = tp * sp * cfg * dp  # EP level exclude PP
 
         self.name_to_size = {
             "tp": self.tp,
@@ -192,14 +198,19 @@ class RankGenerator:
             "pp": self.pp,
             "cfg": self.cfg,
             "dp": self.dp,
+            "fs": self.fs,
         }
         order = order.lower()
 
         for name in self.name_to_size.keys():
+            # Skip 'fs' validation - it's handled separately with independent_ranks=True
+            # and doesn't participate in the main orthogonal rank generation
+            if name == "fs":
+                continue
             if name not in order and self.name_to_size[name] != 1:
                 raise RuntimeError(
                     f"The size of ({name}) is ({self.name_to_size[name]}), "
-                    f"but you haven't specified the order ({self.order})."
+                    f"but you haven't specified the order ({order})."
                 )
             elif name not in order:
                 order = order + "-" + name
@@ -218,7 +229,7 @@ class RankGenerator:
             mask[ordered_token.index(t)] = True
         return mask
 
-    def get_ranks(self, token):
+    def get_ranks(self, token, independent_ranks: bool = False):
         """Get rank group by input token.
 
         Arguments:
@@ -227,7 +238,30 @@ class RankGenerator:
                 to obtain multiple parallel types, we can use a hyphen
                 '-' to separate them. For example, if we want to obtain
                 the TP_DP group, the token should be 'tp-dp'.
+            independent_ranks (bool):
+                If True, generate independent rank groups that divide the world
+                into groups of the specified size. Used for FS (fully shard) groups
+                which operate independently from the main parallelism hierarchy.
         """
+        if independent_ranks and token == "fs":
+            # FS groups divide world into groups of size fs
+            # e.g., world_size=8, fs=4 -> [[0,1,2,3], [4,5,6,7]]
+            ranks = []
+            num_groups = self.world_size // self.fs
+            for i in range(num_groups):
+                group = list(range(i * self.fs + self.rank_offset, (i + 1) * self.fs + self.rank_offset))
+                ranks.append(group)
+            return ranks
+
+        if token == "ep":
+            ranks = []
+            num_pp_stages = self.pp
+            for i in range(num_pp_stages):
+                start = i * self.ep + self.rank_offset
+                end = start + self.ep
+                ranks.append(list(range(start, end)))
+            return ranks
+
         mask = self.get_mask(self.order, token)
         ranks = generate_masked_orthogonal_rank_groups(self.world_size, self.ordered_size, mask)
         if self.rank_offset > 0:
@@ -333,6 +367,22 @@ def get_data_parallel_rank():
     return get_dp_group().rank_in_group
 
 
+# FS (Fully Shard / HSDP shard dimension)
+def get_fs_group() -> GroupCoordinator:
+    assert _FS is not None, "fully shard group is not initialized"
+    return _FS
+
+
+def get_fully_shard_world_size():
+    """Return world size for the fully shard group."""
+    return get_fs_group().world_size
+
+
+def get_fully_shard_rank():
+    """Return my rank for the fully shard group."""
+    return get_fs_group().rank_in_group
+
+
 def is_dp_last_group():
     """Return True if in the last data parallel group, False otherwise."""
     return (
@@ -436,8 +486,10 @@ def init_model_parallel_group(
         "data",
         "pipeline",
         "tensor",
+        "expert",
         "sequence",
         "classifier_free_guidance",
+        "fully_shard",
     ], f"parallel_mode {parallel_mode} is not supported"
     if parallel_mode == "pipeline":
         return PipelineGroupCoordinator(
@@ -629,6 +681,9 @@ def initialize_model_parallel(
     ring_degree: int = 1,
     tensor_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
+    fully_shard_degree: int = 1,
+    hsdp_replicate_size: int = 1,
+    enable_expert_parallel: bool = False,
     backend: str | None = None,
 ) -> None:
     if backend is None:
@@ -645,6 +700,7 @@ def initialize_model_parallel(
         ring_degree: number of GPUs used for ring sequence parallelism.
         tensor_parallel_size: number of GPUs used for tensor parallelism.
         pipeline_parallel_size: number of GPUs used for pipeline parallelism.
+        fully_shard_degree: number of GPUs used for fully sharded data parallelism (HSDP shard dimension).
         backend: distributed backend of pytorch collective comm.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
@@ -699,6 +755,14 @@ def initialize_model_parallel(
         data_parallel_size * cfg_parallel_size * sequence_parallel_size * pipeline_parallel_size * tensor_parallel_size
     )
 
+    # Check for standalone HSDP: all non-HSDP parallelism dimensions are 1
+    is_standalone_hsdp = dit_parallel_size == 1 and fully_shard_degree > 1
+
+    # For standalone HSDP: use (fully_shard_degree * hsdp_replicate_size) as dit_parallel_size
+    # This ensures orthogonal rank generation works correctly for all HSDP workers
+    if is_standalone_hsdp:
+        dit_parallel_size = fully_shard_degree * hsdp_replicate_size
+
     if world_size < dit_parallel_size:
         raise RuntimeError(
             f"world_size ({world_size}) is less than "
@@ -710,13 +774,18 @@ def initialize_model_parallel(
             f"data_parallel_size ({data_parallel_size})"
         )
 
+    # For standalone HSDP, use (fully_shard_degree * hsdp_replicate_size) as data_parallel_size
+    # so that RankGenerator.world_size matches the actual number of workers
+    effective_dp_size = (fully_shard_degree * hsdp_replicate_size) if is_standalone_hsdp else data_parallel_size
+
     rank_generator: RankGenerator = RankGenerator(
         tensor_parallel_size,
         sequence_parallel_size,
         pipeline_parallel_size,
         cfg_parallel_size,
-        data_parallel_size,
-        "tp-sp-pp-cfg-dp",
+        effective_dp_size,
+        fs=fully_shard_degree,
+        order="tp-sp-pp-cfg-dp",
     )
     sp_group_ranks = rank_generator.get_ranks("sp")
     global _DP
@@ -772,6 +841,28 @@ def initialize_model_parallel(
         backend=backend,
         parallel_mode="tensor",
     )
+
+    global _FS
+    assert _FS is None, "fully shard group is already initialized"
+    _FS = init_model_parallel_group(
+        group_ranks=rank_generator.get_ranks("fs", independent_ranks=True),
+        local_rank=get_world_group().local_rank,
+        backend=backend,
+        parallel_mode="fully_shard",
+    )
+
+    if enable_expert_parallel:
+        od_config: OmniDiffusionConfig | None = get_forward_context().omni_diffusion_config
+        if od_config and od_config.is_moe:
+            vllm_parallel_state._EP = init_model_parallel_group(
+                group_ranks=rank_generator.get_ranks("ep"),
+                local_rank=get_world_group().local_rank,
+                backend=backend,
+                parallel_mode="expert",
+            )
+        else:
+            raise RuntimeError("Expert parallelism enabled for a non-MoE model ")
+
     init_dit_group(dit_parallel_size, backend)
 
 
@@ -796,10 +887,19 @@ def destroy_model_parallel():
         vllm_parallel_state._TP.destroy()
     vllm_parallel_state._TP = None
 
+    if vllm_parallel_state._EP:
+        vllm_parallel_state._EP.destroy()
+    vllm_parallel_state._EP = None
+
     global _PP
     if _PP:
         _PP.destroy()
     _PP = None
+
+    global _FS
+    if _FS:
+        _FS.destroy()
+    _FS = None
 
 
 def destroy_distributed_environment():

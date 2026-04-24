@@ -39,9 +39,10 @@ def _expand_expected_modules_for_packed_layers(
     `supported_modules`, but the sublayer names are not. Expanding the set
     ensures these sublayer keys are not dropped when loading a LoRA checkpoint.
 
-    The packed→sublayer mapping is model-specific (see each diffusion model's
-    `packed_modules_mapping`) so new packed layers are added alongside the model
-    implementation rather than hard-coded in the LoRA framework.
+    The packed→sublayer mapping is model-specific and is derived from each
+    diffusion model's `stacked_params_mapping` (used by `load_weights()`), so
+    new packed layers are added alongside the model implementation rather than
+    hard-coded in the LoRA framework.
     """
     expanded = set(supported_modules)
     if not packed_modules_mapping:

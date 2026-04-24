@@ -7,15 +7,15 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-from vllm_omni import Omni
 
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
@@ -35,7 +35,7 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
         if not hasattr(first_output, "request_output") or not first_output.request_output:
             raise ValueError("No request_output found in OmniRequestOutput")
 
-        req_out = first_output.request_output[0]
+        req_out = first_output.request_output
         if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
             raise ValueError("Invalid request_output structure or missing 'images' key")
         return req_out.images
@@ -75,8 +75,8 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
         )
         return str(adapter_dir)
 
-    m = Omni(model=model_name)
-    try:
+    with OmniRunner(model_name) as runner:
+        m = runner.omni
         # high resolution may cause OOM on L4
         height = 256
         width = 256
@@ -89,7 +89,7 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
                 width=width,
                 num_inference_steps=2,
                 guidance_scale=0.0,
-                generator=torch.Generator("cuda").manual_seed(42),
+                generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
                 num_outputs_per_prompt=1,
             ),
         )
@@ -119,7 +119,7 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
                     width=width,
                     num_inference_steps=2,
                     guidance_scale=0.0,
-                    generator=torch.Generator("cuda").manual_seed(42),
+                    generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
                     num_outputs_per_prompt=1,
                     lora_request=lora_request,
                     lora_scale=2.0,
@@ -134,5 +134,3 @@ def test_diffusion_model(model_name: str, tmp_path: Path):
 
             diff = np.abs(np.array(images[0], dtype=np.int16) - np.array(images_lora[0], dtype=np.int16)).mean()
             assert diff > 0.0
-    finally:
-        m.close()

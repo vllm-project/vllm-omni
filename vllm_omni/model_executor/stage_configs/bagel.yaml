@@ -1,17 +1,23 @@
 # Stage 0: Thinker (multimodal understanding + text generation)
 
+# By default this config uses the shared-memory connector for stage-0 -> stage-1 forwarding.
+# To switch to RDMA, add output_connectors/input_connectors that point to
+# rdma_connector and keep the rest of the pipeline unchanged.
+
 stage_args:
   - stage_id: 0
     stage_type: llm
+    prompt_expand_func: vllm_omni.model_executor.stage_input_processors.bagel.expand_cfg_prompts
     runtime:
       devices: "0"
-      max_batch_size: 1
+      # 3 = 1 user prompt + 2 CFG companions (text-unconditional + image-unconditional).
     engine_args:
       model_stage: thinker
-      model_arch: BagelForConditionalGeneration
+      max_num_seqs: 3
+      model_arch: OmniBagelForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.35
+      gpu_memory_utilization: 0.45
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: text
@@ -34,22 +40,21 @@ stage_args:
       seed: 52
       detokenize: True
       repetition_penalty: 1.05
+    # Optional RDMA override:
+    # output_connectors:
+    #   to_stage_1: rdma_connector
 
   - stage_id: 1
     stage_type: diffusion
+    cfg_kv_collect_func: vllm_omni.model_executor.stage_input_processors.bagel.collect_cfg_kv_caches
     runtime:
       devices: "0"
-      max_batch_size: 1
     engine_args:
       model_stage: dit
-      gpu_memory_utilization: 0.55
+      max_num_seqs: 1
       enforce_eager: true
       trust_remote_code: true
-      engine_output_type: image
       distributed_executor_backend: "mp"
-      enable_prefix_caching: false
-      max_num_batched_tokens: 32768
-      tensor_parallel_size: 1
       omni_kv_config:
         need_recv_cache: true
     engine_input_source: [0]
@@ -59,14 +64,13 @@ stage_args:
     is_comprehension: false
     default_sampling_params:
       seed: 52
+    # Optional RDMA override:
+    # input_connectors:
+    #   from_stage_0: rdma_connector
 
 # Runtime edges
 runtime:
   enabled: true
-  defaults:
-    window_size: -1
-    max_inflight: 1
-
   # Distributed connectors configuration (optional)
   # More connectors will be supported in the future.
   connectors:
@@ -75,8 +79,24 @@ runtime:
       extra:
         shm_threshold_bytes: 65536 # 64KB threshold
 
+    # Optional RDMA connector template for Bagel. To enable it, point
+    # stage-0 output_connectors/to_stage_1 and stage-1 input_connectors/from_stage_0
+    # to rdma_connector instead of relying on the default shared-memory path.
+    rdma_connector:
+      name: MooncakeTransferEngineConnector
+      extra:
+        host: "auto"
+        zmq_port: 50051
+        protocol: "rdma"
+        device_name: ""
+        # Memory pool for RDMA-registered buffers.
+        # Supports both CPU pinned memory ("cpu") and GPU VRAM ("cuda").
+        # CPU mode works on all topologies; GPU mode (GPUDirect RDMA) requires
+        # NIC-GPU direct PCIe connectivity (PIX topology).
+        # Recommended: 4 GB for CPU, 2 GB for GPU (to conserve VRAM).
+        memory_pool_size: 4294967296   # 4 GB
+        memory_pool_device: "cpu"
 
   edges:
     - from: 0
       to: 1
-      window_size: -1

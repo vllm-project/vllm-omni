@@ -2,6 +2,8 @@ import pytest
 
 from vllm_omni.diffusion.models.z_image.z_image_transformer import validate_zimage_tp_constraints
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def test_validate_zimage_tp_constraints_tp2_ok():
     ffn_hidden_dim, final_out_dims, supported_tp = validate_zimage_tp_constraints(

@@ -1,0 +1,86 @@
+suite: test ingress
+templates:
+  - ingress.yaml
+tests:
+  - it: should not create Ingress when disabled
+    set:
+      ingress:
+        enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should create Ingress when enabled
+    set:
+      ingress:
+        enabled: true
+        host: "vllm-omni.example.com"
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: Ingress
+      - equal:
+          path: spec.rules[0].host
+          value: vllm-omni.example.com
+      - equal:
+          path: spec.rules[0].http.paths[0].path
+          value: /
+      - equal:
+          path: spec.rules[0].http.paths[0].pathType
+          value: Prefix
+      - equal:
+          path: spec.rules[0].http.paths[0].backend.service.name
+          value: RELEASE-NAME-service
+      - equal:
+          path: spec.rules[0].http.paths[0].backend.service.port.number
+          value: 80
+
+  - it: should set ingressClassName when specified
+    set:
+      ingress:
+        enabled: true
+        host: "vllm-omni.example.com"
+        ingressClassName: "nginx"
+    asserts:
+      - equal:
+          path: spec.ingressClassName
+          value: nginx
+
+  - it: should not set ingressClassName when empty
+    set:
+      ingress:
+        enabled: true
+        host: "vllm-omni.example.com"
+        ingressClassName: ""
+    asserts:
+      - notExists:
+          path: spec.ingressClassName
+
+  - it: should include annotations when specified
+    set:
+      ingress:
+        enabled: true
+        host: "vllm-omni.example.com"
+        annotations:
+          nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    asserts:
+      - isNotEmpty:
+          path: metadata.annotations
+
+  - it: should include TLS configuration when specified
+    set:
+      ingress:
+        enabled: true
+        host: "vllm-omni.example.com"
+        tls:
+          - secretName: vllm-omni-tls
+            hosts:
+              - vllm-omni.example.com
+    asserts:
+      - equal:
+          path: spec.tls[0].secretName
+          value: vllm-omni-tls
+      - equal:
+          path: spec.tls[0].hosts[0]
+          value: vllm-omni.example.com

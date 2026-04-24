@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.attention.backends.utils.fa import is_mate_available
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -20,7 +21,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # used in distributed environment to determine the master address
     "MASTER_ADDR": lambda: os.getenv("MASTER_ADDR", ""),
     # used in distributed environment to manually set the communication port
-    "MASTER_PORT": lambda: (int(os.getenv("MASTER_PORT", "0")) if "MASTER_PORT" in os.environ else None),
+    "MASTER_PORT": lambda: int(os.getenv("MASTER_PORT", "0")) if "MASTER_PORT" in os.environ else None,
     # path to cudatoolkit home directory, under which should be bin, include,
     # and lib directories.
     "CUDA_HOME": lambda: os.environ.get("CUDA_HOME", None),
@@ -51,6 +52,10 @@ class PackagesEnvChecker:
     def _check_flash_attn(self, packages_info) -> bool:
         """Check if flash attention is available and compatible."""
         platform = current_omni_platform
+
+        # MUSA uses MATE for flash attention
+        if platform.is_musa():
+            return is_mate_available()
 
         # Flash attention requires CUDA-like platforms (CUDA or ROCm)
         if not platform.is_cuda_alike():

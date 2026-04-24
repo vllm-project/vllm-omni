@@ -16,8 +16,6 @@ Equivalent to running:
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
-
 import signal
 import socket
 import subprocess
@@ -29,31 +27,48 @@ from typing import Any
 import pytest
 from PIL import Image
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.platforms import current_omni_platform
 
 # Reference pixel data extracted from the known-good output image
 # Each entry contains (x, y) position and expected (R, G, B) values
 # "Generated with seed=52, num_inference_steps=15,
 # prompt='A futuristic city skyline at twilight, cyberpunk style'"
 REFERENCE_PIXELS = [
-    {"position": (100, 100), "rgb": (68, 107, 134)},
-    {"position": (400, 50), "rgb": (95, 139, 166)},
-    {"position": (700, 100), "rgb": (99, 122, 151)},
-    {"position": (150, 400), "rgb": (111, 125, 153)},
-    {"position": (512, 512), "rgb": (97, 107, 131)},
-    {"position": (700, 400), "rgb": (48, 64, 98)},
-    {"position": (100, 700), "rgb": (79, 63, 84)},
-    {"position": (400, 700), "rgb": (40, 58, 79)},
-    {"position": (700, 700), "rgb": (60, 75, 103)},
-    {"position": (256, 256), "rgb": (97, 128, 156)},
+    {"position": (100, 100), "rgb": (115, 113, 94)},
+    {"position": (400, 50), "rgb": (159, 160, 144)},
+    {"position": (700, 100), "rgb": (164, 151, 123)},
+    {"position": (150, 400), "rgb": (120, 121, 107)},
+    {"position": (512, 512), "rgb": (165, 133, 127)},
+    {"position": (700, 400), "rgb": (217, 130, 66)},
+    {"position": (100, 700), "rgb": (191, 168, 152)},
+    {"position": (400, 700), "rgb": (130, 96, 77)},
+    {"position": (700, 700), "rgb": (247, 203, 140)},
+    {"position": (256, 256), "rgb": (167, 156, 150)},
 ]
+
+if current_omni_platform.is_rocm():
+    REFERENCE_PIXELS = [
+        {"position": (100, 100), "rgb": (115, 113, 94)},
+        {"position": (400, 50), "rgb": (159, 160, 144)},
+        {"position": (700, 100), "rgb": (164, 151, 123)},
+        {"position": (150, 400), "rgb": (120, 121, 107)},
+        {"position": (512, 512), "rgb": (165, 133, 127)},
+        {"position": (700, 400), "rgb": (217, 130, 66)},
+        {"position": (100, 700), "rgb": (191, 168, 152)},
+        {"position": (400, 700), "rgb": (130, 96, 77)},
+        {"position": (700, 700), "rgb": (247, 203, 140)},
+        {"position": (256, 256), "rgb": (167, 156, 150)},
+    ]
 
 # Maximum allowed difference per color channel
 PIXEL_TOLERANCE = 5
 
 # Default test prompt
-DEFAULT_PROMPT = "<|im_start|>A futuristic city skyline at twilight, cyberpunk style<|im_end|>"
+DEFAULT_PROMPT = "<|im_start|>A cute cat<|im_end|>"
 
 
 def _find_free_port() -> int:
@@ -65,21 +80,23 @@ def _find_free_port() -> int:
     return port
 
 
-def _configure_sampling_params(omni: Omni, max_tokens: int = 1, num_inference_steps: int = 15) -> list:
+def _configure_sampling_params(omni: Omni, num_inference_steps: int = 15) -> list:
     """Configure sampling parameters for Bagel text2img generation.
 
     Args:
         omni: The Omni instance to get default params from.
-        max_tokens: Maximum tokens for the first stage.
         num_inference_steps: Number of inference steps for the diffusion stage.
 
     Returns:
         Configured sampling params list.
     """
     params_list = omni.default_sampling_params_list
-    params_list[0].max_tokens = max_tokens  # type: ignore
     if len(params_list) > 1:
         params_list[1].num_inference_steps = num_inference_steps  # type: ignore
+        params_list[1].extra_args = {  # type: ignore
+            "cfg_text_scale": 4.0,
+            "cfg_img_scale": 1.5,
+        }
     return params_list
 
 
@@ -96,9 +113,9 @@ def _extract_generated_image(omni_outputs: list) -> Image.Image | None:
         if images := getattr(req_output, "images", None):
             return images[0]
         if hasattr(req_output, "request_output") and req_output.request_output:
-            for stage_out in req_output.request_output:
-                if hasattr(stage_out, "images") and stage_out.images:
-                    return stage_out.images[0]
+            stage_out = req_output.request_output
+            if hasattr(stage_out, "images") and stage_out.images:
+                return stage_out.images[0]
     return None
 
 
@@ -155,19 +172,40 @@ def _generate_bagel_image(omni: Omni, prompt: str = DEFAULT_PROMPT) -> Image.Ima
     return generated_image
 
 
+def _resolve_stage_config(config_path: str, run_level: str) -> str:
+    """Resolve stage config based on run level.
+
+    For advanced_model (real weights), strip load_format: dummy so the model
+    falls back to loading real weights from HuggingFace.
+    """
+    if run_level == "advanced_model":
+        return modify_stage_config(
+            config_path,
+            deletes={
+                "stage_args": {
+                    0: ["engine_args.load_format"],
+                    1: ["engine_args.load_format"],
+                }
+            },
+        )
+    return config_path
+
+
 @pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"})
-def test_bagel_text2img_shared_memory_connector():
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+def test_bagel_text2img_shared_memory_connector(run_level):
     """Test Bagel text2img with shared memory connector."""
     config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
-    omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=config_path, stage_init_timeout=300)
-
-    try:
-        generated_image = _generate_bagel_image(omni)
-        _validate_pixels(generated_image)
-    finally:
-        omni.close()
+    config_path = _resolve_stage_config(config_path, run_level)
+    with OmniRunner(
+        "ByteDance-Seed/BAGEL-7B-MoT",
+        stage_configs_path=config_path,
+    ) as runner:
+        generated_image = _generate_bagel_image(runner.omni)
+        if run_level == "advanced_model":
+            _validate_pixels(generated_image)
 
 
 def _wait_for_port(host: str, port: int, timeout: int = 30) -> bool:
@@ -188,6 +226,24 @@ def _wait_for_port(host: str, port: int, timeout: int = 30) -> bool:
         except (TimeoutError, ConnectionRefusedError):
             time.sleep(1)
     return False
+
+
+def _is_mooncake_master_available() -> bool:
+    """Check if mooncake_master binary is present and can actually execute."""
+    import shutil
+
+    binary = shutil.which("mooncake_master")
+    if binary is None:
+        return False
+    try:
+        result = subprocess.run(
+            [binary, "--help"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode != 127
+    except (subprocess.TimeoutExpired, OSError):
+        return True
 
 
 def _cleanup_mooncake_processes(timeout_secs: int = 5) -> None:
@@ -248,10 +304,13 @@ def _load_mooncake_config(host: str, rpc_port: int, http_port: int) -> str:
 
 
 @pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"})
-def test_bagel_text2img_mooncake_connector():
+def test_bagel_text2img_mooncake_connector(run_level):
     """Test Bagel text2img with Mooncake connector for inter-stage communication."""
+    if not _is_mooncake_master_available():
+        pytest.skip("mooncake_master is not available or cannot execute (missing shared libraries like libibverbs)")
     MOONCAKE_HOST = "127.0.0.1"
     MOONCAKE_RPC_PORT = _find_free_port()
     MOONCAKE_HTTP_PORT = _find_free_port()
@@ -259,7 +318,6 @@ def test_bagel_text2img_mooncake_connector():
 
     mooncake_master_proc = None
     temp_config_file = None
-    omni = None
 
     try:
         _cleanup_mooncake_processes()
@@ -288,14 +346,17 @@ def test_bagel_text2img_mooncake_connector():
             http_port=MOONCAKE_HTTP_PORT,
         )
 
-        omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=temp_config_file, stage_init_timeout=300)
-
-        generated_image = _generate_bagel_image(omni)
-        _validate_pixels(generated_image)
+        temp_config_file = _resolve_stage_config(temp_config_file, run_level)
+        with OmniRunner(
+            "ByteDance-Seed/BAGEL-7B-MoT",
+            stage_configs_path=temp_config_file,
+            stage_init_timeout=300,
+        ) as runner:
+            generated_image = _generate_bagel_image(runner.omni)
+            if run_level == "advanced_model":
+                _validate_pixels(generated_image)
 
     finally:
-        if omni:
-            omni.close()
         if temp_config_file:
             try:
                 os.unlink(temp_config_file)

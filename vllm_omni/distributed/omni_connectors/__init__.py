@@ -2,9 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from .connectors.base import OmniConnectorBase
-from .connectors.mooncake_connector import MooncakeConnector
+from .connectors.mooncake_store_connector import MooncakeStoreConnector
 from .connectors.shm_connector import SharedMemoryConnector
 from .connectors.yuanrong_connector import YuanrongConnector
+
+try:
+    from .connectors.mooncake_transfer_engine_connector import MooncakeTransferEngineConnector
+except ImportError:
+    MooncakeTransferEngineConnector = None  # RDMA deps (msgspec/zmq/mooncake) not installed
 from .factory import OmniConnectorFactory
 from .utils.config import ConnectorSpec, OmniTransferConfig
 from .utils.initialization import (
@@ -16,6 +21,10 @@ from .utils.initialization import (
     load_omni_transfer_config,
 )
 
+# Backward-compatible alias: MooncakeConnector was renamed to MooncakeStoreConnector.
+# Keep this alias for at least one release cycle.
+MooncakeConnector = MooncakeStoreConnector
+
 __all__ = [
     # Config
     "ConnectorSpec",
@@ -25,7 +34,9 @@ __all__ = [
     # Factory
     "OmniConnectorFactory",
     # Specific implementations
-    "MooncakeConnector",
+    "MooncakeConnector",  # compat alias → MooncakeStoreConnector
+    "MooncakeStoreConnector",
+    "MooncakeTransferEngineConnector",
     "SharedMemoryConnector",
     "YuanrongConnector",
     # Utilities

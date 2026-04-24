@@ -12,17 +12,41 @@ import torch
 from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.lora.request import LoRARequest
+from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.platforms import current_omni_platform
 
 
+def is_nextstep_model(model_name: str) -> bool:
+    """Check if the model is a NextStep model by reading its config."""
+    from vllm.transformers_utils.config import get_hf_file_to_dict
+
+    try:
+        cfg = get_hf_file_to_dict("config.json", model_name)
+        if cfg and cfg.get("model_type") == "nextstep":
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate an image with Qwen-Image.")
+    parser = argparse.ArgumentParser(description="Generate an image with supported diffusion models.")
     parser.add_argument(
         "--model",
         default="Qwen/Qwen-Image",
         help="Diffusion model name or local path. Supported models: "
-        "Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo, Qwen/Qwen-Image-2512",
+        "Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo, Qwen/Qwen-Image-2512, stepfun-ai/NextStep-1.1, "
+        "black-forest-labs/FLUX.1-dev, black-forest-labs/FLUX.2-klein-9B, "
+        "black-forest-labs/FLUX.2-dev, tencent/HunyuanImage-3.0-Instruct, "
+        "meituan-longcat/LongCat-Image, OvisAI/Ovis-Image, "
+        "stabilityai/stable-diffusion-3.5-medium, Tongyi-MAI/Z-Image-Turbo and etc.",
+    )
+    parser.add_argument(
+        "--stage-configs-path",
+        type=str,
+        default=None,
+        help="Path to a YAML file containing stage configurations for Omni.",
     )
     parser.add_argument("--prompt", default="a cup of coffee on the table", help="Text prompt for image generation.")
     parser.add_argument(
@@ -40,8 +64,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--guidance-scale",
         type=float,
-        default=1.0,
-        help="Classifier-free guidance scale.",
+        default=4.0,
+        help="Classifier-free guidance scale. HunyuanImage3 recommends 4.0-5.0.",
     )
     parser.add_argument("--height", type=int, default=1024, help="Height of generated image.")
     parser.add_argument("--width", type=int, default=1024, help="Width of generated image.")
@@ -86,6 +110,13 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for ulysses sequence parallelism.",
     )
     parser.add_argument(
+        "--ulysses-mode",
+        type=str,
+        default="strict",
+        choices=["strict", "advanced_uaa"],
+        help="Ulysses sequence-parallel mode: 'strict' (divisibility required) or 'advanced_uaa' (UAA).",
+    )
+    parser.add_argument(
         "--ring-degree",
         type=int,
         default=1,
@@ -114,13 +145,36 @@ def parse_args() -> argparse.Namespace:
         help="Enable layerwise (blockwise) offloading on DiT modules.",
     )
     parser.add_argument(
+        "--use-hsdp",
+        action="store_true",
+        help="Enable HSDP (Hybrid Sharded Data Parallel) for diffusion models.",
+    )
+    parser.add_argument(
+        "--hsdp-shard-size",
+        type=int,
+        default=1,
+        help="Number of GPUs to shard weights across for HSDP.",
+    )
+    parser.add_argument(
+        "--hsdp-replicate-size",
+        type=int,
+        default=1,
+        help="Number of HSDP replica groups.",
+    )
+    parser.add_argument(
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8"],
+        choices=["fp8", "int8", "gguf"],
         help="Quantization method for the transformer. "
-        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs). "
+        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs), 'int8' (Int8 W8A8), 'gguf' (GGUF quantized weights). "
         "Default: None (no quantization, uses BF16).",
+    )
+    parser.add_argument(
+        "--gguf-model",
+        type=str,
+        default=None,
+        help=("GGUF file path or HF reference for transformer weights. Required when --quantization gguf is set."),
     )
     parser.add_argument(
         "--ignored-layers",
@@ -148,10 +202,87 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
     )
     parser.add_argument(
+        "--enable-expert-parallel",
+        action="store_true",
+        help="Enable expert parallelism for MoE layers.",
+    )
+    parser.add_argument(
+        "--lora-path",
+        type=str,
+        default=None,
+        help="Path to LoRA adapter folder (PEFT format). Loaded at initialization and used for generation.",
+    )
+    parser.add_argument(
+        "--lora-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for LoRA weights (default: 1.0).",
+    )
+    parser.add_argument(
         "--vae-patch-parallel-size",
         type=int,
         default=1,
         help="Number of ranks used for VAE patch/tile parallelism (decode/encode).",
+    )
+    # NextStep-1.1 specific arguments
+    parser.add_argument(
+        "--guidance-scale-2",
+        type=float,
+        default=1.0,
+        help="Secondary guidance scale (e.g. image-level CFG for NextStep-1.1).",
+    )
+    parser.add_argument(
+        "--timesteps-shift",
+        type=float,
+        default=1.0,
+        help="[NextStep-1.1 only] Timesteps shift parameter for sampling.",
+    )
+    parser.add_argument(
+        "--cfg-schedule",
+        type=str,
+        default="constant",
+        choices=["constant", "linear"],
+        help="[NextStep-1.1 only] CFG schedule type.",
+    )
+    parser.add_argument(
+        "--use-norm",
+        action="store_true",
+        help="[NextStep-1.1 only] Apply layer normalization to sampled tokens.",
+    )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
+    parser.add_argument(
+        "--log-stats",
+        action="store_true",
+        help="Enable logging of diffusion pipeline stats.",
+    )
+    parser.add_argument(
+        "--init-timeout",
+        type=int,
+        default=600,
+        help="Timeout for initializing a single stage in seconds (default: 600s)",
+    )
+    parser.add_argument(
+        "--stage-init-timeout",
+        type=int,
+        default=600,
+        help="Timeout for initializing a single stage in seconds (default: 600s)",
+    )
+    parser.add_argument(
+        "--use-system-prompt",
+        type=str,
+        default=None,
+        choices=["None", "dynamic", "en_vanilla", "en_recaption", "en_think_recaption", "en_unified", "custom"],
+        help="System prompt preset for generation. Recommended: en_unified.",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help=("Custom system prompt. Used when --use-system-prompt is custom. "),
     )
     return parser.parse_args()
 
@@ -159,10 +290,12 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    use_nextstep = is_nextstep_model(args.model)
 
-    # Configure cache based on backend type
     cache_config = None
-    if args.cache_backend == "cache_dit":
+    cache_backend = args.cache_backend
+
+    if cache_backend == "cache_dit":
         # cache-dit configuration: Hybrid DBCache + SCM + TaylorSeer
         # All parameters marked with [cache-dit only] in DiffusionCacheConfig
         cache_config = {
@@ -179,7 +312,7 @@ def main():
             "scm_steps_mask_policy": None,  # SCM mask policy: None (disabled), "slow", "medium", "fast", "ultra"
             "scm_steps_policy": "dynamic",  # SCM steps policy: "dynamic" or "static"
         }
-    elif args.cache_backend == "tea_cache":
+    elif cache_backend == "tea_cache":
         # TeaCache configuration
         # All parameters marked with [tea_cache only] in DiffusionCacheConfig
         cache_config = {
@@ -193,19 +326,34 @@ def main():
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
+        ulysses_mode=args.ulysses_mode,
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
         vae_patch_parallel_size=args.vae_patch_parallel_size,
+        enable_expert_parallel=args.enable_expert_parallel,
     )
 
     # Check if profiling is requested via environment variable
     profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
 
+    # Prepare LoRA kwargs for Omni initialization
+    lora_args: dict[str, Any] = {}
+    if args.lora_path:
+        lora_args["lora_path"] = args.lora_path
+        print(f"Using LoRA from: {args.lora_path}")
+
     # Build quantization kwargs: use quantization_config dict when
     # ignored_layers is specified so the list flows through OmniDiffusionConfig
     quant_kwargs: dict[str, Any] = {}
     ignored_layers = [s.strip() for s in args.ignored_layers.split(",") if s.strip()] if args.ignored_layers else None
-    if args.quantization and ignored_layers:
+    if args.quantization == "gguf":
+        if not args.gguf_model:
+            raise ValueError("--gguf-model is required when --quantization gguf is set.")
+        quant_kwargs["quantization_config"] = {
+            "method": "gguf",
+            "gguf_model": args.gguf_model,
+        }
+    elif args.quantization and ignored_layers:
         quant_kwargs["quantization_config"] = {
             "method": args.quantization,
             "ignored_layers": ignored_layers,
@@ -213,19 +361,31 @@ def main():
     elif args.quantization:
         quant_kwargs["quantization"] = args.quantization
 
-    omni = Omni(
-        model=args.model,
-        enable_layerwise_offload=args.enable_layerwise_offload,
-        vae_use_slicing=args.vae_use_slicing,
-        vae_use_tiling=args.vae_use_tiling,
-        cache_backend=args.cache_backend,
-        cache_config=cache_config,
-        enable_cache_dit_summary=args.enable_cache_dit_summary,
-        parallel_config=parallel_config,
-        enforce_eager=args.enforce_eager,
-        enable_cpu_offload=args.enable_cpu_offload,
+    omni_kwargs = {
+        "model": args.model,
+        "enable_layerwise_offload": args.enable_layerwise_offload,
+        "vae_use_slicing": args.vae_use_slicing,
+        "vae_use_tiling": args.vae_use_tiling,
+        "cache_backend": args.cache_backend,
+        "cache_config": cache_config,
+        "enable_cache_dit_summary": args.enable_cache_dit_summary,
+        "parallel_config": parallel_config,
+        "enforce_eager": args.enforce_eager,
+        "enable_cpu_offload": args.enable_cpu_offload,
+        "mode": "text-to-image",
+        "log_stats": args.log_stats,
+        "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
+        "init_timeout": args.init_timeout,
+        "stage_init_timeout": args.stage_init_timeout,
+        **lora_args,
         **quant_kwargs,
-    )
+    }
+    if args.stage_configs_path:
+        omni_kwargs["stage_configs_path"] = args.stage_configs_path
+    if use_nextstep:
+        # NextStep-1.1 requires explicit pipeline class
+        omni_kwargs["model_class_name"] = "NextStep11Pipeline"
+    omni = Omni(**omni_kwargs)
 
     if profiler_enabled:
         print("[Profiler] Starting profiling...")
@@ -236,20 +396,47 @@ def main():
     print("Generation Configuration:")
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
-    print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    print(f"  Cache backend: {cache_backend if cache_backend else 'None (no acceleration)'}")
     print(f"  Quantization: {args.quantization if args.quantization else 'None (BF16)'}")
     if ignored_layers:
         print(f"  Ignored layers: {ignored_layers}")
     print(
         f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
-        f"ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
-        f"vae_patch_parallel_size={args.vae_patch_parallel_size}"
+        f"ulysses_degree={args.ulysses_degree}, ulysses_mode={args.ulysses_mode}, "
+        f"ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
+        f"vae_patch_parallel_size={args.vae_patch_parallel_size}, "
+        f"enable_expert_parallel={args.enable_expert_parallel}."
     )
-    print(f"  CPU offload: {args.enable_cpu_offload}")
+    print(f"  CPU offload: {args.enable_cpu_offload}; CPU Layerwise Offload: {args.enable_layerwise_offload}")
     print(f"  Image size: {args.width}x{args.height}")
+    if args.lora_path:
+        print(f"  LoRA: scale={args.lora_scale}")
+    if args.stage_configs_path:
+        print(f"  stage-configs-path: {args.stage_configs_path}")
     print(f"{'=' * 60}\n")
 
+    # Build LoRA request when --lora-path is set
+    lora_request = None
+    if args.lora_path:
+        lora_request_id = stable_lora_int_id(args.lora_path)
+        lora_request = LoRARequest(
+            lora_name=Path(args.lora_path).stem,
+            lora_int_id=lora_request_id,
+            lora_path=args.lora_path,
+        )
+
     generation_start = time.perf_counter()
+    extra_args = {
+        "timesteps_shift": args.timesteps_shift,
+        "cfg_schedule": args.cfg_schedule,
+        "use_norm": args.use_norm,
+        "use_system_prompt": args.use_system_prompt,
+        "system_prompt": args.system_prompt,
+    }
+    if lora_request:
+        extra_args["lora_request"] = lora_request
+        extra_args["lora_scale"] = args.lora_scale
+
     outputs = omni.generate(
         {
             "prompt": args.prompt,
@@ -261,10 +448,13 @@ def main():
             generator=generator,
             true_cfg_scale=args.cfg_scale,
             guidance_scale=args.guidance_scale,
+            guidance_scale_2=args.guidance_scale_2,
             num_inference_steps=args.num_inference_steps,
             num_outputs_per_prompt=args.num_images_per_prompt,
+            extra_args=extra_args,
         ),
     )
+
     generation_end = time.perf_counter()
     generation_time = generation_end - generation_start
 
@@ -288,20 +478,18 @@ def main():
         else:
             print("[Profiler] No valid profiling data returned.")
 
-    # Extract images from OmniRequestOutput
-    # omni.generate() returns list[OmniRequestOutput], extract images from the first output
+    # omni.generate() returns list[OmniRequestOutput]
     if not outputs or len(outputs) == 0:
         raise ValueError("No output generated from omni.generate()")
     logger.info(f"Outputs: {outputs}")
 
-    # Extract images from request_output[0]['images']
     first_output = outputs[0]
     if not hasattr(first_output, "request_output") or not first_output.request_output:
         raise ValueError("No request_output found in OmniRequestOutput")
 
-    req_out = first_output.request_output[0]
-    if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
-        raise ValueError("Invalid request_output structure or missing 'images' key")
+    req_out = first_output.request_output
+    if not hasattr(req_out, "images"):
+        raise ValueError("Invalid request_output structure or missing 'images'.")
 
     images = req_out.images
     if not images:

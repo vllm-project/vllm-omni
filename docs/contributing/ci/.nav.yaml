@@ -1,0 +1,6 @@
+nav:
+  - CI_5levels.md
+  - failures.md
+  - test_guide.md
+  - test_markers.md
+  - test_style.md

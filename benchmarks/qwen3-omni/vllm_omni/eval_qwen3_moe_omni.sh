@@ -26,12 +26,12 @@ else
                       --log-stats \
                       --log-dir $log_dir
     echo "Logs and outputs are saved in ${log_dir} and ${outputs_dir} respectively:"
-    echo "  - omni_llm_pipeline_text                       run dir/base name"
-    echo "  - omni_llm_pipeline_text.orchestrator.stats.jsonl  orchestrator-stage latency stats"
-    echo "  - omni_llm_pipeline_text.overall.stats.jsonl       overall latency/TPS stats"
-    echo "  - omni_llm_pipeline_text.stage0.log                per-stage detailed logs"
-    echo "  - omni_llm_pipeline_text.stage1.log"
-    echo "  - omni_llm_pipeline_text.stage2.log"
+    echo "  - omni_pipeline_text                       run dir/base name"
+    echo "  - omni_pipeline_text.orchestrator.stats.jsonl  orchestrator-stage latency stats"
+    echo "  - omni_pipeline_text.overall.stats.jsonl       overall latency/TPS stats"
+    echo "  - omni_pipeline_text.stage0.log                per-stage detailed logs"
+    echo "  - omni_pipeline_text.stage1.log"
+    echo "  - omni_pipeline_text.stage2.log"
     echo "Key checks: overall.stats.jsonl for end-to-end latency/TPS; orchestrator.stats.jsonl for stable per-stage latency; stage*.log for errors or long tails."
     echo "  - outputs/             Generated txt and wav files, there should be 100 text and wav files generated respectively"
 fi

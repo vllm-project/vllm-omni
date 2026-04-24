@@ -132,9 +132,19 @@ class Example:
             ".dat",
             ".db",
             ".sqlite",  # Data files
+            ".pyc",
+            ".pyo",
+            ".pyd",  # Python compiled
+            ".npy",
+            ".npz",
+            ".pkl",
+            ".pickle",  # Serialized data
         }
+        excluded_dirs = {"__pycache__", ".git", "node_modules", ".tox", ".mypy_cache"}
 
         def is_other_file(file: Path) -> bool:
+            if any(part in excluded_dirs for part in file.parts):
+                return False
             return file.is_file() and file != self.main_file and file.suffix.lower() not in binary_extensions
 
         return [file for file in self.path.rglob("*") if is_other_file(file)]

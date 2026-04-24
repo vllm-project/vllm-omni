@@ -11,8 +11,6 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
-    Qwen2_5OmniThinkerDummyInputsBuilder,
-    Qwen2_5OmniThinkerMultiModalProcessor,
     Qwen2_5OmniThinkerProcessingInfo,
 )
 from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VisionTransformer
@@ -28,7 +26,11 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import Qwen2_5OmniConditionalGenerationMixin
+from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
+    Qwen2_5OmniConditionalGenerationMixin,
+    Qwen2_5OmniThinkerDummyInputsBuilder,
+    Qwen2_5OmniThinkerMultiModalProcessor,
+)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -107,7 +109,6 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         multimodal_embeddings: MultiModalEmbeddings | None = None,
         *,
         is_multimodal: torch.Tensor | None = None,
-        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
         # This is to satisfy the type checker for each overload
         if multimodal_embeddings is None or is_multimodal is None:
@@ -117,7 +118,6 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
             input_ids,
             multimodal_embeddings=multimodal_embeddings,
             is_multimodal=is_multimodal,
-            handle_oov_mm_token=handle_oov_mm_token,
         )
 
     def forward(
@@ -230,7 +230,7 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
             return []
 
         # The result multimodal_embeddings is tuple of tensors, with each
-        # tensor correspoending to a multimodal data item (image or video).
+        # tensor corresponding to a multimodal data item (image or video).
         multimodal_embeddings: tuple[torch.Tensor, ...] = ()
 
         # NOTE: It is important to iterate over the keys in this dictionary

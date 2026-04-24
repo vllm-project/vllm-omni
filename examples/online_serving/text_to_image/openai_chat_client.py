@@ -24,6 +24,12 @@ def generate_image(
     seed: int | None = None,
     negative_prompt: str | None = None,
     num_outputs_per_prompt: int = 1,
+    lora_path: str | None = None,
+    lora_name: str | None = None,
+    lora_scale: float | None = None,
+    lora_int_id: int | None = None,
+    use_system_prompt: str | None = None,
+    system_prompt: str | None = None,
 ) -> bytes | None:
     """Generate an image using the images generation API.
 
@@ -37,6 +43,12 @@ def generate_image(
         seed: Random seed
         negative_prompt: Negative prompt
         num_outputs_per_prompt: Number of images to generate
+        lora_path: Server-local LoRA adapter folder path (PEFT format)
+        lora_name: LoRA name (optional, defaults to path stem)
+        lora_scale: LoRA scale factor (default: 1.0)
+        lora_int_id: LoRA integer ID (optional, derived from path if not provided)
+        use_system_prompt: System prompt for generation.
+        system_prompt: Custom system prompt.
 
     Returns:
         Image bytes or None if failed
@@ -62,6 +74,21 @@ def generate_image(
         payload["negative_prompt"] = negative_prompt
     if seed is not None:
         payload["seed"] = seed
+    if use_system_prompt is not None:
+        payload["use_system_prompt"] = use_system_prompt
+    if system_prompt is not None:
+        payload["system_prompt"] = system_prompt
+    # Add LoRA if provided
+    if lora_path:
+        lora_body: dict = {
+            "local_path": lora_path,
+            "name": lora_name or Path(lora_path).stem,
+        }
+        if lora_scale is not None:
+            lora_body["scale"] = float(lora_scale)
+        if lora_int_id is not None:
+            lora_body["int_id"] = int(lora_int_id)
+        payload["lora"] = lora_body
 
     try:
         response = requests.post(
@@ -99,8 +126,30 @@ def main():
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--negative", help="Negative prompt")
 
+    parser.add_argument("--lora-path", default=None, help="Server-local LoRA adapter folder (PEFT format)")
+    parser.add_argument("--lora-name", default=None, help="LoRA name (optional)")
+    parser.add_argument("--lora-scale", type=float, default=1.0, help="LoRA scale")
+    parser.add_argument(
+        "--lora-int-id",
+        type=int,
+        default=None,
+        help="LoRA integer id (cache key). If omitted, the server derives a stable id from lora_path.",
+    )
+    parser.add_argument(
+        "--use-system-prompt",
+        type=str,
+        default=None,
+        help=(
+            "System prompt for generation. Use predefined types: 'en_unified', 'en_vanilla', 'en_recaption', 'en_think_recaption', 'dynamic', or 'None'; Or provide custom text string directly. Recommended en_unified. "
+        ),
+    )
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help=("Custom system prompt. Used when --use-system-prompt is custom. "),
+    )
     args = parser.parse_args()
-
     print(f"Generating image for: {args.prompt}")
 
     image_bytes = generate_image(
@@ -112,6 +161,12 @@ def main():
         true_cfg_scale=args.cfg_scale,
         seed=args.seed,
         negative_prompt=args.negative,
+        lora_path=args.lora_path,
+        lora_name=args.lora_name,
+        lora_scale=args.lora_scale if args.lora_path else None,
+        lora_int_id=args.lora_int_id if args.lora_path else None,
+        use_system_prompt=args.use_system_prompt,
+        system_prompt=args.system_prompt,
     )
 
     if image_bytes:

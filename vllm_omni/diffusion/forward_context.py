@@ -31,15 +31,35 @@ class ForwardContext:
     # Original sequence length before padding (for removing padding in gather)
     sp_original_seq_len: int | None = None
 
-    # SP active scope tracking
+    # Set by registry when _sp_plan hooks are applied.
+    # When True, sp_active is determined by _sp_shard_depth (for _sp_plan hooks)
+    # When False, sp_active defaults to True when sequence_parallel_size > 1 (for manual SP, standalone tests, etc.)
+    sp_plan_hooks_applied: bool = False
+    # SP active scope tracking within the _sp_plan hook mechanism.
     # Tracks the depth of SP sharding - incremented on shard, decremented on gather
     # Used by attention layers to determine if SP communication should be enabled
     _sp_shard_depth: int = 0
 
     @property
     def sp_active(self) -> bool:
-        """Returns True when inside an SP sharded region (between shard and gather)."""
-        return self._sp_shard_depth > 0
+        """Returns True when SP attention parallelism should be enabled.
+
+        - If _sp_plan hooks are applied: use _sp_shard_depth (0 = outside sharded region).
+        - If _sp_plan hooks are NOT applied: default to True when sequence_parallel_size > 1,
+          since _sp_shard_depth is only meaningful within the _sp_plan hook mechanism.
+        """
+        if self.sp_plan_hooks_applied:
+            return self._sp_shard_depth > 0
+        # No _sp_plan: assume SP active when configured (manual SP, standalone tests)
+        if self.omni_diffusion_config is None:
+            raise ValueError(
+                "omni_diffusion_config is not set when checking sp_active! "
+                "This usually means set_forward_context() was not called. "
+                "Please call with set_forward_context(omni_diffusion_config=...)."
+            )
+
+        sp_size = self.omni_diffusion_config.parallel_config.sequence_parallel_size
+        return sp_size is not None and sp_size > 1
 
     def __post_init__(self):
         pass
@@ -58,6 +78,23 @@ def get_forward_context() -> ForwardContext:
 
 def is_forward_context_available() -> bool:
     return _forward_context is not None
+
+
+def get_ulysses_mode(*, default: str = "strict") -> str:
+    """Resolve the Ulysses-SP mode from the current ForwardContext.
+
+    Returns `default` when ForwardContext is unavailable or the diffusion
+    config is not set.
+    """
+    if not is_forward_context_available():
+        return default
+
+    cfg = get_forward_context().omni_diffusion_config
+    if cfg is None:
+        return default
+
+    parallel_config = cfg.parallel_config
+    return str(getattr(parallel_config, "ulysses_mode", default))
 
 
 def create_forward_context(
