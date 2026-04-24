@@ -6,6 +6,27 @@ Supports both:
 - text-only synthesis
 - voice cloning
 - text/clone batch inputs from txt or jsonl
+
+Usage::
+
+    # Sync (default voice)
+    python benchmarks/tts/bench_voxcpm_offline.py \\
+        --model /path/to/VoxCPM \\
+        --text "Hello world" \\
+        --output-dir results/audio/
+
+    # Streaming (async_chunk)
+    python benchmarks/tts/bench_voxcpm_offline.py \\
+        --model /path/to/VoxCPM \\
+        --stage-configs-path vllm_omni/model_executor/stage_configs/voxcpm_async_chunk.yaml \\
+        --txt-prompts prompts.txt \\
+        --output-dir results/audio/
+
+    # Voice cloning batch via JSONL
+    python benchmarks/tts/bench_voxcpm_offline.py \\
+        --model /path/to/VoxCPM \\
+        --jsonl-prompts prompts.jsonl \\
+        --output-dir results/audio/
 """
 
 from __future__ import annotations
@@ -26,7 +47,21 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni import AsyncOmni, Omni
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+
+def _find_repo_root(start: Path) -> Path:
+    """Walk up from ``start`` until a repo marker is found.
+
+    Falls back to ``parents[2]`` for backwards compatibility if no marker hits
+    (which can only happen in unusual checkouts — the tree should always have
+    pyproject.toml + vllm_omni/ at the top level).
+    """
+    for candidate in [start, *start.parents]:
+        if (candidate / "pyproject.toml").is_file() and (candidate / "vllm_omni").is_dir():
+            return candidate
+    return start.parents[2]
+
+
+REPO_ROOT = _find_repo_root(Path(__file__).resolve())
 DEFAULT_STAGE_ASYNC = REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "voxcpm_async_chunk.yaml"
 DEFAULT_STAGE_SYNC = REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "voxcpm.yaml"
 
@@ -473,9 +508,6 @@ def parse_args():
 
 def _is_streaming_stage_config(stage_configs_path: str) -> bool:
     cfg_name = Path(stage_configs_path).name.lower()
-    # Keep routing purely config-path based:
-    # - voxcpm.yaml => sync
-    # - voxcpm_async_chunk.yaml => streaming
     return "async_chunk" in cfg_name
 
 

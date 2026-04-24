@@ -120,7 +120,11 @@ def create_test_parameter_mapping(configs: list[dict[str, Any]]) -> dict[str, di
                 "test_name": test_name,
                 "benchmark_params": [],
             }
-        mapping[test_name]["benchmark_params"].extend(config["benchmark_params"])
+        for entry in config["benchmark_params"]:
+            # Skip disabled entries
+            if not entry.get("enabled", True):
+                continue
+            mapping[test_name]["benchmark_params"].append(entry)
     return mapping
 
 
