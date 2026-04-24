@@ -22,8 +22,15 @@ Or use the convenience script:
 
 ```bash
 cd /workspace/vllm-omni/examples/online_serving/bagel
+# Launch both stages in one session (legacy convenience flow)
 bash run_server.sh
+
+# Launch a single stage per terminal
+bash run_server_stage_cli.sh --stage 0
+bash run_server_stage_cli.sh --stage 1
 ```
+
+If you have a custom stage configs file, launch the server with the command below:
 
 ```bash
 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
@@ -115,12 +122,13 @@ mooncake_master \
 **2. Launch Stage 0 (Thinker / Orchestrator)** on the orchestrator node:
 
 ```bash
+# API server port for client requests: 8000
 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
-    --port 8000 \ # API server port for client requests
+    --port 8000 \
     --stage-configs-path vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml \
     --stage-id 0 \
-    -oma <ORCHESTRATOR_IP> \
-    -omp 8091
+    --omni-master-address <ORCHESTRATOR_IP> \
+    --omni-master-port 8091
 ```
 
 **3. Launch Stage 1 (DiT)** on the remote node in headless mode:
@@ -130,8 +138,8 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
     --stage-configs-path vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml \
     --stage-id 1 \
     --headless \
-    -oma <ORCHESTRATOR_IP> \
-    -omp 8091
+    --omni-master-address <ORCHESTRATOR_IP> \
+    --omni-master-port 8091
 ```
 
 **Mooncake Master arguments:**
@@ -150,8 +158,8 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
 | :------- | :---------- |
 | `--stage-id` | Which stage this process runs (0 = Thinker, 1 = DiT) |
 | `--headless` | Run without the API server (worker-only mode) |
-| `-oma` | Orchestrator master address |
-| `-omp` | Orchestrator master port for Stage 1 to connect to Stage 0 for task coordination |
+| `--omni-master-address` | Orchestrator master address |
+| `--omni-master-port` | Orchestrator master port for Stage 1 to connect to Stage 0 for task coordination |
 
 > [!IMPORTANT]
 > **Startup Order**: Stage 0 (orchestrator) must be launched **before** Stage 1 (headless).
@@ -165,7 +173,7 @@ All nodes must have network connectivity to each other. Ensure the following por
 | :--- | :------- | :------ | :-------- |
 | 50051 | TCP | Mooncake Master RPC | Worker → Orchestrator |
 | 8080 | TCP | Mooncake HTTP Metadata Server | Worker → Orchestrator |
-| 8091 | TCP | Orchestrator Master (`-omp`) | Worker → Orchestrator |
+| 8091 | TCP | Orchestrator Master (`--omni-master-port`) | Worker → Orchestrator |
 | 8000 | TCP | API Server (`--port`) | Client → Orchestrator |
 | 9003 | TCP | Metrics (optional) | Monitoring → Orchestrator |
 

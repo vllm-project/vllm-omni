@@ -19,7 +19,12 @@ Or use the convenience script:
 
 ```bash
 cd /workspace/vllm-omni/examples/online_serving/bagel
+# Initialize all stages within a single unified session (legacy operational sequence)
 bash run_server.sh
+
+# Initialize each stage in a discrete isolated process terminal
+bash run_server_stage_cli.sh --stage 0
+bash run_server_stage_cli.sh --stage 1
 ```
 
 ```bash
@@ -112,12 +117,13 @@ mooncake_master \
 **2. Launch Stage 0 (Thinker / Orchestrator)** on the orchestrator node:
 
 ```bash
+# API server port for client requests: 8000
 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
-    --port 8000 \ # API server port for client requests
+    --port 8000 \
     --stage-configs-path vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml \
     --stage-id 0 \
-    -oma <ORCHESTRATOR_IP> \
-    -omp 8091
+    --omni-master-address <ORCHESTRATOR_IP> \
+    --omni-master-port 8091
 ```
 
 **3. Launch Stage 1 (DiT)** on the remote node in headless mode:
@@ -127,8 +133,8 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
     --stage-configs-path vllm_omni/model_executor/stage_configs/bagel_multiconnector.yaml \
     --stage-id 1 \
     --headless \
-    -oma <ORCHESTRATOR_IP> \
-    -omp 8091
+    --omni-master-address <ORCHESTRATOR_IP> \
+    --omni-master-port 8091
 ```
 
 **Mooncake Master arguments:**
@@ -145,14 +151,10 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
 
 | Argument | Description |
 | :------- | :---------- |
-| `--stage-id` | Which stage this process runs (0 = Thinker, 1 = DiT) |
-| `--headless` | Run without the API server (worker-only mode) |
-| `-oma` | Orchestrator master address |
-| `-omp` | Orchestrator master port for Stage 1 to connect to Stage 0 for task coordination |
-
-> [!IMPORTANT]
-> **Startup Order**: Stage 0 (orchestrator) must be launched **before** Stage 1 (headless).
-> Stage 0 will appear to hang on startup until Stage 1 (worker) connects — this is expected behavior.
+| `--stage-id` | Designates the pipeline stage assigned to the process (e.g., 0 = Thinker, 1 = DiT) |
+| `--headless` | Executes the worker stage autonomously without initializing an API server |
+| `--omni-master-address` | Specifies the IP address binding the Orchestrator master node |
+| `--omni-master-port` | Specifies the targeted port establishing task coordination between Stage 1 and Stage 0 |
 
 **Network Requirements**
 
@@ -162,7 +164,7 @@ All nodes must have network connectivity to each other. Ensure the following por
 | :--- | :------- | :------ | :-------- |
 | 50051 | TCP | Mooncake Master RPC | Worker → Orchestrator |
 | 8080 | TCP | Mooncake HTTP Metadata Server | Worker → Orchestrator |
-| 8091 | TCP | Orchestrator Master (`-omp`) | Worker → Orchestrator |
+| 8091 | TCP | Orchestrator Master (`--omni-master-port`) | Worker → Orchestrator |
 | 8000 | TCP | API Server (`--port`) | Client → Orchestrator |
 | 9003 | TCP | Metrics (optional) | Monitoring → Orchestrator |
 
