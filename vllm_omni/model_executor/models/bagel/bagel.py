@@ -588,6 +588,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 existing = self._ropes_metadata.get(rid)
                 if existing and "image_shape" in existing and "image_shape" not in meta:
                     continue
+                ropes = meta.get("ropes")
+                if ropes:
+                    meta["ropes"] = [int(r.item()) if isinstance(r, torch.Tensor) else r for r in ropes]
                 self._ropes_metadata[rid] = meta
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
@@ -731,7 +734,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 positions = self._adjust_positions_for_img2img(positions, input_ids)
                 use_mot = True
             else:
-                rope = int(positions[seq_len - 1].item()) + 1
+                rope = positions[seq_len - 1] + 1
                 self._ropes_pending.append({"ropes": [rope]})
 
         if use_mot:

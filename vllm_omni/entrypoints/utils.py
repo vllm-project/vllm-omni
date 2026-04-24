@@ -343,6 +343,10 @@ def resolve_model_config_path(model: str) -> str:
     if os.path.exists(complete_config_path):
         return str(complete_config_path)
 
+    deploy_config_path = PROJECT_ROOT / "vllm_omni" / "deploy" / model_type_str
+    if os.path.exists(deploy_config_path):
+        return str(deploy_config_path)
+
     stage_config_file = f"vllm_omni/model_executor/stage_configs/{normalized_model_type}.yaml"
     stage_config_path = PROJECT_ROOT / stage_config_file
     if not os.path.exists(stage_config_path):
