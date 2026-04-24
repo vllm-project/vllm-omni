@@ -5,6 +5,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-*`) -- Qwen3-based TTS with CustomVoice, VoiceDesign, and Base (voice cloning) task types. Output: 24 kHz.
 - **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
+- **VoxCPM2** (`openbmb/VoxCPM2`) -- Single-stage AR + DiT/CFM TTS. Three synthesis modes: Voice Design (text-only voice description), Controllable Cloning (reference audio + style instructions), and Ultimate Cloning (reference audio + transcript for tightest identity match). Output: 48 kHz.
 
 Each server instance runs a single model (specified at startup via `vllm serve <model> --omni`).
 
@@ -26,6 +27,9 @@ vllm serve fishaudio/s2-pro --omni --port 8091
 
 # Voxtral TTS
 vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8091
+
+# VoxCPM2
+vllm serve openbmb/VoxCPM2 --omni --port 8091
 ```
 
 ### Generate Speech
@@ -118,6 +122,14 @@ Content-Type: application/json
 | `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`) |
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
+
+#### VoxCPM2-specific Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `cfg_value` | float | 2.0 | Classifier-free guidance scale for the CFM decoder. Range `0.1`–`10.0`; typical useful range is `1.5`–`3.0`. Higher values track the text more strictly at the cost of naturalness. Ignored by non-voxcpm2 models. |
+
+VoxCPM2 also reuses the standard `instructions`, `ref_audio`, and `ref_text` fields — see the mode table below for how they combine.
 
 ### Response Format
 
@@ -542,6 +554,62 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 | Model | Description |
 |-------|-------------|
 | `mistralai/Voxtral-4B-TTS-2603` | 3B AR + FlowMatching TTS. Supports text-to-speech with preset voices. |
+
+### VoxCPM2
+
+| Model | Description |
+|-------|-------------|
+| `openbmb/VoxCPM2` | Single-stage AR + DiT/CFM TTS. 48 kHz output, multilingual (primary EN/ZH, usable cross-lingual identity transfer via Ultimate Cloning). |
+
+VoxCPM2 exposes three synthesis modes through the same `/v1/audio/speech` endpoint — the mode is inferred from which fields are present in the request.
+
+| Mode | Required fields | Optional fields | Notes |
+|------|-----------------|-----------------|-------|
+| **Voice Design** | `input` | `instructions`, `cfg_value` | Synthesize a voice from a text description alone. `instructions` is prepended to the target text as `(instructions)input` following `voxcpm.cli.build_final_text`. |
+| **Controllable Cloning** | `input`, `ref_audio` | `instructions`, `cfg_value` | Clone the reference speaker's timbre; use `instructions` to steer emotion, pace, or other style attributes while preserving identity. |
+| **Ultimate Cloning** | `input`, `ref_audio`, `ref_text` | `cfg_value` | The model treats `ref_audio` + `ref_text` as a spoken prefix and continues from it. Reproduces every vocal nuance of the reference. `instructions` is not used in this mode. |
+
+Reference audio guidelines: 16 kHz mono, 1.5–30 seconds of clean speech. Longer or noisier clips degrade clone quality; the same `ref_audio` can be reused across Controllable and Ultimate modes.
+
+**Examples**
+
+Voice Design (no reference, pure text description):
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello everyone. Today I want to talk about open source AI.",
+        "instructions": "A warm young woman with a gentle, friendly voice",
+        "cfg_value": 2.5
+    }' --output voice_design.wav
+```
+
+Controllable Cloning (reference audio + style instructions):
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Good morning, let me tell you a short story.",
+        "ref_audio": "https://example.com/reference.wav",
+        "instructions": "Warm storyteller, slow cadence, dramatic pauses",
+        "cfg_value": 2.5
+    }' --output controllable_cloning.wav
+```
+
+Ultimate Cloning (reference audio + transcript; tightest identity):
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Welcome everyone. I will give a brief update on the project today.",
+        "ref_audio": "https://example.com/reference.wav",
+        "ref_text": "Transcript of what the reference speaker is saying in the reference clip.",
+        "cfg_value": 2.5
+    }' --output ultimate_cloning.wav
+```
 
 ## Error Responses
 
