@@ -134,20 +134,20 @@ class OmniEngineArgs(EngineArgs):
     """
 
     stage_id: int = 0
-    model_stage: str | None = None
+    model_stage: str = "thinker"
     model_arch: str | None = None
     engine_output_type: str | None = None
     hf_config_name: str | None = None
     custom_process_next_stage_input_func: str | None = None
     stage_connector_spec: dict[str, Any] = field(default_factory=dict)
     subtalker_sampling_params: dict[str, Any] | None = None
-    async_chunk: bool | None = None
+    async_chunk: bool = False
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
     worker_type: str | None = None
     task_type: str | None = None
-    worker_cls: str | None = None
-    enable_sleep_mode: bool | None = None
+    worker_cls: str = None
+    enable_sleep_mode: bool = False
     omni: bool = False
 
     @classmethod
@@ -168,7 +168,7 @@ class OmniEngineArgs(EngineArgs):
     omni_master_port: int | None = None
     stage_configs_path: str | None = None
     output_modalities: list[str] | None = None
-    log_stats: bool | None = None
+    log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
 

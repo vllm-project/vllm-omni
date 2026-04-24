@@ -743,8 +743,9 @@ def _build_engine_args(
                 continue
             engine_args[k] = v
         engine_args.update(ds.engine_extras)
-    if deploy.async_chunk:
-        engine_args["async_chunk"] = True
+    # Materialize the resolved pipeline-wide async_chunk value into every
+    # stage so explicit False overrides do not get lost downstream.
+    engine_args["async_chunk"] = bool(deploy.async_chunk)
     return engine_args
 
 
@@ -1043,14 +1044,14 @@ class StageConfigFactory:
         if errors:
             logger.warning(f"Pipeline validation warnings for {model}: {errors}")
 
-        # Inject pipeline-wide async_chunk into ALL stages' engine_args.
-        # The legacy loader (load_stage_configs_from_yaml) sets async_chunk
-        # on every stage so that build_engine_args_dict() can inject the
-        # stage_connector_spec.  AsyncOmniEngine.__init__ also reads it
-        # from stage_configs[0].engine_args.async_chunk.
-        if pipeline.async_chunk:
-            for stage in pipeline.stages:
-                stage.yaml_engine_args.setdefault("async_chunk", True)
+        # Materialize the resolved pipeline-wide async_chunk value into every
+        # stage so build_engine_args_dict() can inject the stage connector
+        # spec and explicit False overrides are preserved.
+        resolved_async_chunk = cli_overrides.get("async_chunk")
+        if resolved_async_chunk is None:
+            resolved_async_chunk = bool(pipeline.async_chunk)
+        for stage in pipeline.stages:
+            stage.yaml_engine_args["async_chunk"] = bool(resolved_async_chunk)
 
         # Apply CLI overrides
         result: list[StageConfig] = []
