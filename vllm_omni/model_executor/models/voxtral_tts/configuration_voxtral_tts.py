@@ -21,14 +21,16 @@ class VoxtralTTSConfig(PretrainedConfig):
         audio_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(**kwargs)
-
-        if isinstance(text_config, PretrainedConfig):
+        if text_config is None:
+            self.text_config = PretrainedConfig()
+        elif isinstance(text_config, PretrainedConfig):
             self.text_config = text_config
         elif isinstance(text_config, dict):
             self.text_config = PretrainedConfig.from_dict(text_config)
         else:
             self.text_config = PretrainedConfig()
+
+        super().__init__(**kwargs)
 
         self.audio_config = audio_config or {}
 
