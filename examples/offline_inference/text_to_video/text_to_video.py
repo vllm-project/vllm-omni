@@ -132,6 +132,13 @@ def parse_args() -> argparse.Namespace:
         help="Enable layerwise (blockwise) offloading on DiT modules.",
     )
     parser.add_argument(
+        "--ulysses-mode",
+        type=str,
+        default="strict",
+        choices=["strict", "advanced_uaa"],
+        help="Ulysses sequence-parallel mode: 'strict' (divisibility required) or 'advanced_uaa' (UAA).",
+    )
+    parser.add_argument(
         "--ulysses-degree",
         type=int,
         default=1,
@@ -184,6 +191,23 @@ def parse_args() -> argparse.Namespace:
         default=None,
         choices=["fp8", "gguf"],
         help="Quantization method for the transformer (fp8 for online FP8 quantization).",
+    )
+    parser.add_argument(
+        "--use-hsdp",
+        action="store_true",
+        help="Enable HSDP (Hybrid Sharded Data Parallel) for diffusion models.",
+    )
+    parser.add_argument(
+        "--hsdp-shard-size",
+        type=int,
+        default=1,
+        help="Number of GPUs to shard weights across for HSDP.",
+    )
+    parser.add_argument(
+        "--hsdp-replicate-size",
+        type=int,
+        default=1,
+        help="Number of HSDP replica groups.",
     )
     return parser.parse_args()
 

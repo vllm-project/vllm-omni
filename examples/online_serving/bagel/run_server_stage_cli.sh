@@ -116,8 +116,8 @@ run_stage_0() {
         --port "$PORT" \
         --stage-configs-path "$STAGE_CONFIGS_PATH" \
         --stage-id 0 \
-        -oma "$MASTER_ADDRESS" \
-        -omp "$MASTER_PORT" \
+        --omni-master-address "$MASTER_ADDRESS" \
+        --omni-master-port "$MASTER_PORT" \
         "${EXTRA_ARGS[@]}"
 }
 
@@ -127,8 +127,8 @@ run_stage_1() {
         --stage-configs-path "$STAGE_CONFIGS_PATH" \
         --stage-id 1 \
         --headless \
-        -oma "$MASTER_ADDRESS" \
-        -omp "$MASTER_PORT" \
+        --omni-master-address "$MASTER_ADDRESS" \
+        --omni-master-port "$MASTER_PORT" \
         "${EXTRA_ARGS[@]}"
 }
 

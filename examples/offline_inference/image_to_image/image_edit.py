@@ -197,6 +197,13 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for ulysses sequence parallelism.",
     )
     parser.add_argument(
+        "--ulysses-mode",
+        type=str,
+        default="strict",
+        choices=["strict", "advanced_uaa"],
+        help="Ulysses sequence-parallel mode: 'strict' (divisibility required) or 'advanced_uaa' (UAA).",
+    )
+    parser.add_argument(
         "--ring-degree",
         type=int,
         default=1,
@@ -324,6 +331,29 @@ def parse_args() -> argparse.Namespace:
         "--enable-layerwise-offload",
         action="store_true",
         help="Enable layerwise (blockwise) offloading on DiT modules.",
+    )
+    parser.add_argument(
+        "--vae-patch-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for VAE patch/tile parallelism (decode).",
+    )
+    parser.add_argument(
+        "--use-hsdp",
+        action="store_true",
+        help="Enable HSDP (Hybrid Sharded Data Parallel) for diffusion models.",
+    )
+    parser.add_argument(
+        "--hsdp-shard-size",
+        type=int,
+        default=1,
+        help="Number of GPUs to shard weights across for HSDP.",
+    )
+    parser.add_argument(
+        "--hsdp-replicate-size",
+        type=int,
+        default=1,
+        help="Number of HSDP replica groups.",
     )
     parser.add_argument(
         "--enable-diffusion-pipeline-profiler",
