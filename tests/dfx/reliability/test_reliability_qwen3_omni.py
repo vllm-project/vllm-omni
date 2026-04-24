@@ -454,8 +454,7 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
 ) -> None:
     """Black-box: text chat vs omni audio output should expose a consistent error contract under OOM.
 
-    Qwen3-Omni does not implement ``/v1/audio/speech`` (dedicated TTS only); speech-style output is
-    requested via ``/v1/chat/completions`` with ``modalities`` that include ``audio``.
+    Speech-style output is requested via ``/v1/chat/completions`` with ``modalities`` that include ``audio``.
     """
     device_spec = resolve_oom_device_spec(
         OOM_INJECTION_CONFIG,
