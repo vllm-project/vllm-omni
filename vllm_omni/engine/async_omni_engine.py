@@ -105,7 +105,13 @@ _STARTUP_POLL_INTERVAL_S = 1.0
 # Fields that must survive the "equal to default → strip" filter because
 # diffusion stages need them even when equal to vllm's default value
 # (e.g. colocate worker setup relies on worker_extension_cls being forwarded).
-_PARENT_ARGS_KEEP: frozenset[str] = frozenset({"worker_extension_cls"})
+_PARENT_ARGS_KEEP: frozenset[str] = frozenset(
+    {
+        "worker_extension_cls",
+        "allowed_local_media_path",
+        "allowed_media_domains",
+    }
+)
 
 # Omni orchestrator-level fields consumed by ``_resolve_stage_configs`` that
 # must never leak into per-stage EngineArgs (``stage_configs_path`` would
@@ -1444,7 +1450,10 @@ class AsyncOmniEngine:
                 if lora_scale is not None:
                     if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
                         cfg.engine_args.lora_scale = lora_scale
+                # Prefer explicit quantization_config; fallback to legacy --quantization.
                 quantization_config = kwargs.get("quantization_config")
+                if quantization_config is None:
+                    quantization_config = kwargs.get("quantization")
                 if quantization_config is not None:
                     if (
                         not hasattr(cfg.engine_args, "quantization_config")

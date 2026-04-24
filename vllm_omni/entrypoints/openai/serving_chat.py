@@ -559,6 +559,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 engine_prompt["additional_information"] = {}
             engine_prompt["additional_information"]["language"] = [language.strip()]
 
+        # Style instruction — used by Ming-flash-omni instruct TTS path
+        # (ming_task="instruct").  For the omni speech path the thinker2talker
+        # bridge drops this field to match upstream omni_audio_generation
+        # which hardcodes instruction=None.
+        instructions = getattr(request, "instructions", None)
+        if instructions is not None and isinstance(instructions, str) and instructions.strip():
+            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
+                engine_prompt["additional_information"] = {}
+            engine_prompt["additional_information"]["instruction"] = instructions.strip()
+
         return conversation, [engine_prompt]
 
     async def _inject_audio_from_video_urls(
@@ -1936,7 +1946,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         final_res = omni_outputs.request_output
         # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
         # Reference: examples/offline_inference/qwen3_omni/end2end.py line 421
-        audio_data = final_res.outputs[0].multimodal_output.get("audio")
+        mm_output = final_res.outputs[0].multimodal_output
+        audio_data = mm_output.get("audio")
         if isinstance(audio_data, list):
             if stream:
                 audio_tensor = audio_data[-1]
@@ -1950,9 +1961,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if audio_tensor.ndim > 1:
             audio_tensor = audio_tensor.flatten()
 
+        # Prefer the talker-reported sample rate when present. Qwen3-Omni
+        # omits "sr" and runs at 24kHz; Ming-flash-omni surfaces a 44.1kHz
+        # AudioVAE rate via multimodal_output["sr"].
+        sr_raw = mm_output.get("sr")
+        if sr_raw is None:
+            sample_rate = 24000
+        elif hasattr(sr_raw, "item"):
+            sample_rate = int(sr_raw.item())
+        else:
+            sample_rate = int(sr_raw)
+
         audio_obj = CreateAudio(
             audio_tensor=audio_tensor,
-            sample_rate=24000,
+            sample_rate=sample_rate,
             response_format="wav",
             speed=1.0,
             stream_format="audio",

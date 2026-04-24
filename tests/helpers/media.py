@@ -447,12 +447,16 @@ def generate_synthetic_image(
     *,
     force_regenerate: bool = False,
     cache_dir: Path | str | None = None,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     """
     Random colored squares on white background. Caches JPEG by ``width`` /
     ``height`` unless ``force_regenerate`` is true. Cache root: ``cache_dir``
     if given, else the default temp subdirectory.
     """
+    if seed is not None:
+        random.seed(seed)
+
     root = _resolve_synthetic_media_cache_dir(cache_dir)
     root.mkdir(parents=True, exist_ok=True)
     cache_path = root / f"synth_image_w{width}_h{height}.jpg"

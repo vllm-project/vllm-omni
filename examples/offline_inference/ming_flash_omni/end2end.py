@@ -7,6 +7,7 @@ import time
 from typing import NamedTuple
 
 import numpy as np
+import soundfile as sf
 import vllm
 from PIL import Image
 from transformers import AutoProcessor
@@ -319,7 +320,16 @@ def main(args):
         seed=SEED,
         detokenize=True,
     )
-    sampling_params_list = [thinker_sampling_params]
+    # Talker (ming_tts) uses a custom generation loop (CFM + AudioVAE);
+    # vLLM sampling is a no-op here — max_tokens=1 just satisfies the scheduler.
+    talker_sampling_params = SamplingParams(
+        temperature=0.0,
+        max_tokens=1,
+    )
+    all_sampling_params = [thinker_sampling_params, talker_sampling_params]
+    # Match sampling params to the number of configured stages
+    # (thinker-only yaml → 1, thinker+talker yaml → 2).
+    sampling_params_list = all_sampling_params[: omni.num_stages]
 
     prompts = [query_result.inputs for _ in range(args.num_prompts)]
 
@@ -362,7 +372,19 @@ def main(args):
                 print(f"Failed to write output file {out_txt}: {e}")
 
         elif stage_outputs.final_output_type == "audio":
-            raise NotImplementedError("Add audio example after talker supported.")
+            request_id = output.request_id
+            mm = output.outputs[0].multimodal_output
+            if mm and "audio" in mm:
+                audio = mm["audio"]
+                sr_raw = mm.get("sr", 44100)
+                sample_rate = int(sr_raw.item() if hasattr(sr_raw, "item") else sr_raw)
+                audio_numpy = audio.float().squeeze().cpu().numpy()
+                output_wav = os.path.join(output_dir, f"{request_id}.wav")
+                sf.write(output_wav, audio_numpy, samplerate=sample_rate, format="WAV")
+                print(
+                    f"Request ID: {request_id}, audio saved to {output_wav} "
+                    f"({len(audio_numpy) / sample_rate:.2f}s, {sample_rate}Hz)"
+                )
 
         processed_count += 1
         if profiler_enabled and processed_count >= total_requests:
