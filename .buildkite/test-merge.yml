@@ -191,9 +191,9 @@ steps:
     depends_on: upload-merge-pipeline
     commands:
       - |
-        timeout 15m bash -c '
-                pytest -s -v tests/engine -m 'advanced_model and cuda' --run-level "advanced_model"
-        '
+        timeout 15m bash -c "
+                pytest -s -v tests/engine -m 'advanced_model and cuda' --run-level 'advanced_model'
+        "
     agents:
       queue: "gpu_1_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
     plugins:
