@@ -1241,6 +1241,8 @@ class AsyncOmniEngine:
         if not isinstance(default_sampling_params, dict):
             default_sampling_params = None
         stage_default_sampling_params = default_sampling_params.get("0", {}) if default_sampling_params else {}
+        if normalized_kwargs.get("dtype") is None:
+            normalized_kwargs["dtype"] = "auto"
 
         # TODO: hack, convert dtype to string to avoid non-premitive omegaconf create error.
         if "dtype" in normalized_kwargs and not isinstance(normalized_kwargs["dtype"], str):
