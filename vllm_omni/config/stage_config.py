@@ -601,23 +601,6 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     return DeployConfig(**kwargs)
 
 
-def _detect_platform() -> str | None:
-    """Return "npu", "rocm", "xpu", or None (CUDA default)."""
-    try:
-        from vllm.platforms import current_platform
-
-        name = current_platform.device_name.lower()
-        if "npu" in name:
-            return "npu"
-        if "rocm" in name or "amd" in name:
-            return "rocm"
-        if "xpu" in name:
-            return "xpu"
-    except Exception as e:
-        logger.debug("Platform auto-detect failed, falling back to CUDA: %s", e)
-    return None
-
-
 def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
     """Return ``(overrides, devices)`` from a platform stage entry.
 
@@ -636,7 +619,9 @@ def _apply_platform_overrides(
 ) -> DeployConfig:
     """Merge platform-specific stage overrides into deploy config."""
     if platform is None:
-        platform = _detect_platform()
+        from vllm_omni.platforms import current_omni_platform
+
+        platform = current_omni_platform.device_name.lower()
     if platform is None or deploy.platforms is None:
         return deploy
     platform_section = deploy.platforms.get(platform)
