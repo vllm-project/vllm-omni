@@ -16,6 +16,7 @@ import pytest
 import torch
 from PIL import Image, ImageDraw
 
+from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -23,8 +24,6 @@ from vllm_omni.platforms import current_omni_platform
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-from vllm_omni import Omni
 
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
@@ -64,6 +63,18 @@ def _extract_images_from_output(outputs: list) -> list[Image.Image]:
                     if hasattr(s, "images") and s.images:
                         images.extend(s.images)
     return images
+
+
+# Regression test for https://github.com/vllm-project/vllm-omni/issues/3097
+@pytest.mark.core_model
+@pytest.mark.diffusion
+def test_flux2_klein_can_accept_text_inputs():
+    model = Omni(model=MODEL)
+    outputs = model.generate(
+        "a cup of coffee on the table",
+        OmniDiffusionSamplingParams(num_inference_steps=2, seed=42),
+    )
+    assert len(outputs[0].images) == 1
 
 
 @pytest.mark.core_model

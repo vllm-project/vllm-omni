@@ -829,14 +829,21 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
                 """Taking only the first image for now.""",
             )
         first_prompt = req.prompts[0]
-        prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
+        if isinstance(first_prompt, str):
+            multi_modal_data = {}
+            prompt = first_prompt
+            raw_image = None
+            mask_image = None
+            reference_image = None
+        else:
+            multi_modal_data = first_prompt.get("multi_modal_data", {})
+            prompt = first_prompt.get("prompt") or ""
+            raw_image = multi_modal_data.get("image")
+            mask_image = multi_modal_data.get("mask_image")
+            reference_image = multi_modal_data.get("reference_image")
 
-        if (
-            raw_image := None
-            if isinstance(first_prompt, str)
-            else first_prompt.get("multi_modal_data", {}).get("image")
-        ) is None:
-            pass  # use image from param list
+        if raw_image is None:
+            image = None
         elif isinstance(raw_image, list):
             image = [PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image, im) for im in raw_image]
         else:
@@ -955,11 +962,6 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
 
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
-
-        # Get mask_image and reference_image
-        multi_modal_data = req.prompts[0].get("multi_modal_data", {}) if req.prompts else {}
-        mask_image = multi_modal_data.get("mask_image")
-        reference_image = multi_modal_data.get("reference_image")
 
         if mask_image is not None and (image is None or (isinstance(image, list) and len(image) == 0)):
             raise ValueError("image must be provided when using mask_image for inpainting")
