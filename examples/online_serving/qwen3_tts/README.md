@@ -43,7 +43,7 @@ Then open http://localhost:7860 in your browser.
 
 ### Launch the Server
 
-The default stage config is located at `vllm_omni/model_executor/stage_configs/qwen3_tts.yaml`. For other platforms (e.g., NPU), refer to `vllm_omni/platforms/npu/stage_configs/qwen3_tts.yaml`.
+The default deploy config is located at `vllm_omni/deploy/qwen3_tts.yaml` and is loaded automatically by the model registry — no `--deploy-config` flag needed for default use. Platform-specific deltas (NPU, ROCm, XPU) are merged in automatically from the `platforms:` block of the same YAML based on the detected runtime.
 
 ```bash
 # CustomVoice model (predefined speakers)
@@ -69,6 +69,22 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --omni \
     --port 8091
 ```
+
+#### Sync vs async-chunk mode
+
+Qwen3-TTS supports both **chunked streaming** (default, lower latency) and
+**synchronous end-to-end** modes from the same deploy YAML. The bundled
+`qwen3_tts.yaml` ships with `async_chunk: true`; flip with `--no-async-chunk`
+and the pipeline automatically dispatches to the end-to-end codec processor:
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8091 \
+    --no-async-chunk
+```
+
+No variant YAML or extra flag is needed — the `StagePipelineConfig` on each
+stage declares both processor functions and the runtime picks based on the
+`async_chunk:` bool.
 
 Alternatively, use the convenience script:
 ```bash
@@ -376,6 +392,54 @@ Server -> Client:
 // binary PCM frame(s)
 {"type": "audio.done", "sentence_index": 0, "total_bytes": 96000, "error": false}
 {"type": "session.done", "total_sentences": 1}
+```
+
+## Choosing an Execution Backend: Uniproc vs Multiprocessing
+
+Qwen3-TTS stage configs support two execution backends controlled by the
+`distributed_executor_backend` engine arg. The performance tradeoff between
+them is **both hardware- and task-dependent**, so there is no single best
+default (see [#2603](https://github.com/vllm-project/vllm-omni/issues/2603),
+[#2604](https://github.com/vllm-project/vllm-omni/pull/2604) for the full
+investigation).
+
+| Backend | Stage config setting | Behaviour |
+| ------- | -------------------- | --------- |
+| **Uniproc** (default, world_size=1) | `distributed_executor_backend` omitted | Both stages run inside the orchestrator process. Avoids IPC serialisation, D2H copies, and msgpack overhead between stages. |
+| **Multiprocessing** | `distributed_executor_backend: "mp"` | Each stage runs in its own subprocess. The Talker can continue decoding while Code2Wav runs the vocoder in parallel, improving pipeline utilisation under concurrency. |
+
+> **Note:** When `distributed_executor_backend` is omitted and `world_size=1`,
+> vLLM [automatically uses the uniproc executor](https://github.com/vllm-project/vllm/blob/main/vllm/config/parallel.py#L825).
+> When `world_size > 1`, it defaults to `mp`.
+
+### When uniproc wins
+
+The uniproc path eliminates inter-process data transfer (D2H copies,
+msgpack serialisation/deserialisation, tensor detaching). This matters most
+when per-request processing is heavy relative to autoregressive decode.
+
+The Base cloning task involves reference-audio encoding on every request, making IPC
+overhead a larger fraction of total cost. Qwen3-Omni shows a similar pattern.
+
+### When multiprocessing (`mp`) wins
+
+For lighter per-request workloads, process-level parallelism between the
+Talker and Code2Wav stages dominates.
+
+CustomVoice is lighter per-request (no reference audio encoding), so the
+process-level parallelism of `mp` outweighs its serialisation cost at
+concurrency ≥ 4.
+
+### How to switch
+
+To use the uniproc executor on a single-GPU setup, pass the
+`qwen3_tts_uniproc.yaml` stage config:
+
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --omni \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts_uniproc.yaml \
+    --port 8091
 ```
 
 ## Limitations

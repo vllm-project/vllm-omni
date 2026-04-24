@@ -8,30 +8,21 @@ These tests require:
 """
 
 import gc
-import sys
-from pathlib import Path
+import os as _os
 
 import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.utils import DeviceMemoryMonitor, hardware_test
+from tests.helpers.env import DeviceMemoryMonitor
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
-# ruff: noqa: E402
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from vllm_omni import Omni
-
 QUANTIZED_MODEL = "vllm-project-org/FLUX.1-dev-AutoRound-w4a16"
 BASELINE_MODEL = "black-forest-labs/FLUX.1-dev"
-
-# Allow overriding via environment for local testing
-import os as _os
 
 QUANTIZED_MODEL = _os.environ.get("FLUX_AUTOROUND_MODEL", QUANTIZED_MODEL)
 BASELINE_MODEL = _os.environ.get("FLUX_BASELINE_MODEL", BASELINE_MODEL)
@@ -51,19 +42,18 @@ def _generate_image(model_name: str, **extra_kwargs) -> tuple[list, float]:
     monitor = DeviceMemoryMonitor(device_index=device_index, interval=0.02)
     monitor.start()
 
-    m = Omni(model=model_name, enforce_eager=True, **extra_kwargs)
-
-    current_omni_platform.reset_peak_memory_stats()
-    outputs = m.generate(
-        "a photo of a cat sitting on a laptop keyboard",
-        OmniDiffusionSamplingParams(
-            height=HEIGHT,
-            width=WIDTH,
-            num_inference_steps=NUM_STEPS,
-            guidance_scale=0.0,
-            generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(42),
-        ),
-    )
+    with OmniRunner(model_name, enforce_eager=True, **extra_kwargs) as runner:
+        current_omni_platform.reset_peak_memory_stats()
+        outputs = runner.omni.generate(
+            "a photo of a cat sitting on a laptop keyboard",
+            OmniDiffusionSamplingParams(
+                height=HEIGHT,
+                width=WIDTH,
+                num_inference_steps=NUM_STEPS,
+                guidance_scale=0.0,
+                generator=torch.Generator(device=current_omni_platform.device_type).manual_seed(42),
+            ),
+        )
 
     peak = monitor.peak_used_mb
     monitor.stop()
@@ -74,7 +64,6 @@ def _generate_image(model_name: str, **extra_kwargs) -> tuple[list, float]:
     assert isinstance(req_out, OmniRequestOutput) and hasattr(req_out, "images")
     images = req_out.images
 
-    del m
     gc.collect()
     current_omni_platform.empty_cache()
 

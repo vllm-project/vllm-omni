@@ -34,6 +34,7 @@ nav:
     - Online Serving:
       - BAGEL-7B-MoT: user_guide/examples/online_serving/bagel.md
       - vLLM-Omni Helm Chart: user_guide/examples/online_serving/chart-helm.md
+      - Diffusers Backend Adapter Example: user_guide/examples/online_serving/diffusers_pipeline_adapter.md
       - Fish Speech S2 Pro: user_guide/examples/online_serving/fish_speech.md
       - GLM-Image Online Serving: user_guide/examples/online_serving/glm_image.md
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
@@ -64,6 +65,8 @@ nav:
         - FP8: user_guide/diffusion/quantization/fp8.md
         - Int8: user_guide/diffusion/quantization/int8.md
         - GGUF: user_guide/diffusion/quantization/gguf.md
+      - Attention Backends: user_guide/diffusion/attention_backends.md
+      - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
       - Parallelism:
         - Overview: user_guide/diffusion/parallelism/overview.md
         - CFG Parallel: user_guide/diffusion/parallelism/cfg_parallel.md
@@ -80,7 +83,6 @@ nav:
 - Developer Guide:
   - General:
     - contributing/README.md
-    - pr_reviewer.md
     - glob: contributing/*
       flatten_single_child_sections: true
   - Model Implementation:
@@ -97,6 +99,7 @@ nav:
       - design/feature/disaggregated_inference.md
       - design/feature/ray_based_execution.md
       - design/feature/omni_connectors/
+      - design/feature/prefix_caching.md
       - design/feature/cfg_parallel.md
       - design/feature/expert_parallel.md
       - design/feature/sequence_parallel.md
@@ -105,7 +108,7 @@ nav:
       - design/feature/hsdp.md
       - design/feature/cache_dit.md
       - design/feature/teacache.md
-      - design/feature/async_chunk_design.md
+      - design/feature/async_chunk.md
       - design/feature/vae_parallel.md
       - design/feature/diffusion_step_execution.md
     - Module Design:

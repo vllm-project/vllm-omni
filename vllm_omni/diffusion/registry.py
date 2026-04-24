@@ -83,6 +83,26 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2_image2video",
         "LTX2ImageToVideoTwoStagesPipeline",
     ),
+    "LTX2T2VDMD2Pipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2T2VDMD2Pipeline",
+    ),
+    "LTX2I2VDMD2Pipeline": (
+        "ltx2",
+        "pipeline_ltx2_image2video",
+        "LTX2I2VDMD2Pipeline",
+    ),
+    "LTX23Pipeline": (
+        "ltx2",
+        "pipeline_ltx2_3",
+        "LTX23Pipeline",
+    ),
+    "LTX23ImageToVideoPipeline": (
+        "ltx2",
+        "pipeline_ltx2_3_image2video",
+        "LTX23ImageToVideoPipeline",
+    ),
     "StableAudioPipeline": (
         "stable_audio",
         "pipeline_stable_audio",
@@ -92,6 +112,16 @@ _DIFFUSION_MODELS = {
         "wan2_2",
         "pipeline_wan2_2_i2v",
         "Wan22I2VPipeline",
+    ),
+    "WanT2VDMD2Pipeline": (
+        "wan2_2",
+        "pipeline_wan2_2",
+        "WanT2VDMD2Pipeline",
+    ),
+    "WanI2VDMD2Pipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_i2v",
+        "WanI2VDMD2Pipeline",
     ),
     "LongCatImagePipeline": (
         "longcat_image",
@@ -119,8 +149,8 @@ _DIFFUSION_MODELS = {
         "FluxKontextPipeline",
     ),
     "HunyuanImage3ForCausalMM": (
-        "hunyuan_image_3",
-        "pipeline_hunyuan_image_3",
+        "hunyuan_image3",
+        "pipeline_hunyuan_image3",
         "HunyuanImage3Pipeline",
     ),
     "Flux2KleinPipeline": (
@@ -187,6 +217,11 @@ _DIFFUSION_MODELS = {
         "omnivoice",
         "pipeline_omnivoice",
         "OmniVoicePipeline",
+    ),
+    "DiffusersAdapterPipeline": (
+        "diffusers_adapter",
+        "pipeline_diffusers_adapter",
+        "DiffusersAdapterPipeline",
     ),
 }
 
@@ -357,8 +392,14 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2TwoStagesPipeline": "get_ltx2_post_process_func",
     "LTX2ImageToVideoPipeline": "get_ltx2_post_process_func",
     "LTX2ImageToVideoTwoStagesPipeline": "get_ltx2_post_process_func",
+    "LTX2T2VDMD2Pipeline": "get_ltx2_post_process_func",
+    "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
+    "LTX23Pipeline": "get_ltx2_post_process_func",
+    "LTX23ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
+    "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
+    "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
@@ -375,6 +416,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
+    "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -389,6 +431,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanPipeline": "get_wan22_pre_process_func",
     "WanVACEPipeline": "get_wan22_vace_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
+    "WanT2VDMD2Pipeline": "get_wan22_pre_process_func",
+    "WanI2VDMD2Pipeline": "get_wan22_i2v_pre_process_func",
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
     "HeliosPipeline": "get_helios_pre_process_func",
     "HeliosPyramidPipeline": "get_helios_pre_process_func",

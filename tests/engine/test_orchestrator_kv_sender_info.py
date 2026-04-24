@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 from vllm import SamplingParams
 
+from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -130,7 +131,7 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
 
     orchestrator.num_stages = 2
     orchestrator.stage_clients = [sender_stage, diffusion_stage]
-    orchestrator._companion_map = {}
+    orchestrator._cfg_tracker = CfgCompanionTracker()
     orchestrator.stage_vllm_configs = [None, None]
     orchestrator.output_processors = [None, None]
 
@@ -161,7 +162,7 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
 
     orchestrator.num_stages = 3
     orchestrator.stage_clients = [source_stage, previous_stage, diffusion_stage]
-    orchestrator._companion_map = {}
+    orchestrator._cfg_tracker = CfgCompanionTracker()
     orchestrator.stage_vllm_configs = [None, None, None]
     orchestrator.output_processors = [None, None, None]
 

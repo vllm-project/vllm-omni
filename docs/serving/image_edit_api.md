@@ -104,6 +104,8 @@ Content-Type: multipart/form-data
 | `guidance_scale` | float | model defaults | Classifier-free guidance scale (typically 0.0-20.0) |
 | `true_cfg_scale` | float | model defaults | True CFG scale (model-specific parameter, may be ignored if not supported) |
 | `seed` | integer | null | Random seed for reproducibility |
+| `reference_image` | string or array | null | Reference image for inpainting |
+| `mask_image` | string or array | null | Mask for inpainting (white areas will be inpainted) |
 
 ### Response Format
 

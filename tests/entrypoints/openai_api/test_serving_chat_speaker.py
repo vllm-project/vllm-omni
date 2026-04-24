@@ -4,9 +4,9 @@
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pytest_mock import MockerFixture
 
 from vllm_omni.entrypoints.openai.utils import (
     get_supported_speakers_from_hf_config,
@@ -25,9 +25,9 @@ def serving_chat():
     return instance
 
 
-def _make_hf_config(*, speaker_id: dict | None = None, spk_id: dict | None = None):
-    hf_config = MagicMock()
-    talker_config = MagicMock()
+def _make_hf_config(mocker: MockerFixture, *, speaker_id: dict | None = None, spk_id: dict | None = None):
+    hf_config = mocker.MagicMock()
+    talker_config = mocker.MagicMock()
     talker_config.speaker_id = speaker_id
     talker_config.spk_id = spk_id
     hf_config.talker_config = talker_config
@@ -51,14 +51,14 @@ def test_validate_requested_speaker_skips_validation_when_supported_empty():
     assert validate_requested_speaker("  ", {"vivian"}) is None
 
 
-def test_get_supported_speakers_from_hf_config_uses_spk_id_fallback():
-    hf_config = _make_hf_config(speaker_id=None, spk_id={"Serena": 0})
+def test_get_supported_speakers_from_hf_config_uses_spk_id_fallback(mocker: MockerFixture):
+    hf_config = _make_hf_config(mocker, speaker_id=None, spk_id={"Serena": 0})
     assert get_supported_speakers_from_hf_config(hf_config) == {"serena"}
 
 
-def test_get_supported_speakers_caches_normalized_keys(serving_chat):
-    serving_chat.model_config = MagicMock()
-    serving_chat.model_config.hf_config = _make_hf_config(speaker_id={"Vivian": 0, "Ethan": 1})
+def test_get_supported_speakers_caches_normalized_keys(mocker: MockerFixture, serving_chat):
+    serving_chat.model_config = mocker.MagicMock()
+    serving_chat.model_config.hf_config = _make_hf_config(mocker, speaker_id={"Vivian": 0, "Ethan": 1})
 
     assert serving_chat._get_supported_speakers() == {"vivian", "ethan"}
 
@@ -67,15 +67,15 @@ def test_get_supported_speakers_caches_normalized_keys(serving_chat):
     assert serving_chat._get_supported_speakers() == {"vivian", "ethan"}
 
 
-def test_create_chat_completion_converts_value_error_to_error_response(serving_chat):
+def test_create_chat_completion_converts_value_error_to_error_response(mocker: MockerFixture, serving_chat):
     serving_chat._diffusion_mode = False
-    serving_chat._check_model = AsyncMock(return_value=None)
-    serving_chat.engine_client = MagicMock(errored=False)
-    serving_chat._maybe_get_adapters = MagicMock(return_value=None)
-    serving_chat.models = MagicMock()
+    serving_chat._check_model = mocker.AsyncMock(return_value=None)
+    serving_chat.engine_client = mocker.MagicMock(errored=False)
+    serving_chat._maybe_get_adapters = mocker.MagicMock(return_value=None)
+    serving_chat.models = mocker.MagicMock()
     serving_chat.models.model_name.return_value = "test-model"
-    serving_chat.renderer = MagicMock()
-    serving_chat.renderer.get_tokenizer.return_value = MagicMock()
+    serving_chat.renderer = mocker.MagicMock()
+    serving_chat.renderer.get_tokenizer.return_value = mocker.MagicMock()
     serving_chat.reasoning_parser_cls = None
     serving_chat.tool_parser = None
     serving_chat.use_harmony = False
@@ -85,12 +85,12 @@ def test_create_chat_completion_converts_value_error_to_error_response(serving_c
     serving_chat.chat_template = None
     serving_chat.chat_template_content_format = "string"
     serving_chat.default_chat_template_kwargs = {}
-    serving_chat._validate_chat_template = MagicMock(return_value=None)
-    serving_chat._prepare_extra_chat_template_kwargs = MagicMock(return_value={})
-    serving_chat._preprocess_chat = AsyncMock(
+    serving_chat._validate_chat_template = mocker.MagicMock(return_value=None)
+    serving_chat._prepare_extra_chat_template_kwargs = mocker.MagicMock(return_value={})
+    serving_chat._preprocess_chat = mocker.AsyncMock(
         side_effect=ValueError("Invalid speaker 'uncle_fu'. Supported: ethan, vivian")
     )
-    serving_chat.create_error_response = MagicMock(return_value="error-response")
+    serving_chat.create_error_response = mocker.MagicMock(return_value="error-response")
 
     request = SimpleNamespace(
         tool_choice=None,

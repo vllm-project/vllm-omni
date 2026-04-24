@@ -127,9 +127,10 @@ Multi-stage omni serving:
 ```bash
 vllm serve Qwen/Qwen2.5-Omni-7B \
   --omni \
-  --stage-configs-path qwen2_5_omni.yaml \
   --port 8091
 ```
+
+(The default deploy config at `vllm_omni/deploy/qwen2_5_omni.yaml` is loaded automatically. Pass `--deploy-config /path/to/custom.yaml` to override.)
 
 Single-stage diffusion serving with torch profiler:
 
@@ -137,8 +138,26 @@ Single-stage diffusion serving with torch profiler:
 vllm serve Wan-AI/Wan2.2-I2V-A14B-Diffusers \
   --omni \
   --port 8091 \
-  --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile"}'
+  --profiler-config '{
+    "profiler": "torch",
+    "torch_profiler_dir": "/tmp/vllm_profile_wan22_i2v",
+    "torch_profiler_with_stack": true,
+    "torch_profiler_with_flops": false,
+    "torch_profiler_use_gzip": true,
+    "torch_profiler_dump_cuda_time_total": true,
+    "torch_profiler_record_shapes": true,
+    "torch_profiler_with_memory": true,
+    "delay_iterations": 0,
+    "max_iterations": 0
+  }'
 ```
+
+Useful optional fields:
+
+- `torch_profiler_with_stack`: export `by_stack` operator views and stack text files.
+- `torch_profiler_record_shapes`: export `by_shape` operator views.
+- `torch_profiler_with_memory`: dump `memory_snapshot_rank*.pickle` when the backend supports memory history.
+- `torch_profiler_use_gzip`: write the trace as `trace_rank*.json.gz`.
 
 Single-stage diffusion serving with Nsight Systems:
 
@@ -176,8 +195,11 @@ For mixed-stage pipelines, use explicit `stages` and pass the same stage list to
 
 Torch profiler output:
 
-- Chrome/Perfetto traces under `torch_profiler_dir`
-- Optional aggregated CUDA-time tables under the same directory
+- Chrome/Perfetto trace: `trace_rank*.json` or `trace_rank*.json.gz`
+- Excel workbook: `ops_rank*.xlsx` with `summary`, and optional `by_shape` / `by_stack` sheets
+- Stack exports: `stacks_cpu_rank*.txt` and `stacks_cuda_rank*.txt` when stack capture is enabled
+- Memory snapshot: `memory_snapshot_rank*.pickle` when memory capture is enabled and supported by the backend
+- Optional aggregated CUDA-time tables under the same session directory
 
 CUDA profiler / Nsight Systems output:
 

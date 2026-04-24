@@ -58,12 +58,12 @@ The script accepts the following arguments:
 
 ## Performance
 
-Measured on a single H20 GPU (80 GB), voxcpm 0.0.0, PyTorch 2.10.0+cu128:
+Measured on a single H20 GPU (80 GB):
 
 | Input length | RTF | Sample rate |
 |---|---|---|
-| Short (~6 words) | ~0.81 | 48 kHz |
-| Long (~50 words) | ~0.72 | 48 kHz |
+| Short (~10 tokens) | ~0.28 | 48 kHz |
+| Long (~100 tokens) | ~0.34 | 48 kHz |
 
 RTF < 1.0 means faster than real time.
 

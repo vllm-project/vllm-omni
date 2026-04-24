@@ -165,6 +165,9 @@ curl -X POST http://localhost:8091/v1/videos \
   -F "guidance_scale_2=4.0" \
   -F "boundary_ratio=0.875" \
   -F "flow_shift=5.0" \
+  -F "enable_frame_interpolation=true" \
+  -F "frame_interpolation_exp=1" \
+  -F "frame_interpolation_scale=1.0" \
   -F "seed=42"
 ```
 
@@ -187,6 +190,35 @@ curl -X POST http://localhost:8091/v1/videos \
 | `flow_shift`          | float  | None    | Scheduler flow shift (Wan2.2)                    |
 | `seed`                | int    | None    | Random seed (reproducible)                       |
 | `lora`                | object | None    | LoRA configuration                               |
+| `enable_frame_interpolation` | bool | false | Enable RIFE frame interpolation before MP4 encoding |
+| `frame_interpolation_exp` | int | 1 | Interpolation exponent; 1=2x temporal resolution, 2=4x |
+| `frame_interpolation_scale` | float | 1.0 | RIFE inference scale; use 0.5 for high-resolution inputs |
+| `frame_interpolation_model_path` | str | None | Local directory or Hugging Face repo ID with `flownet.pkl`; defaults to `elfgum/RIFE-4.22.lite` |
+
+## Frame Interpolation
+
+Frame interpolation is an optional post-processing step for `/v1/videos` and
+`/v1/videos/sync`. It synthesizes intermediate frames between generated frames
+without rerunning the diffusion model. If the generated video has `N` frames,
+the interpolated output frame count is `(N - 1) * 2**exp + 1`. The encoder FPS
+is multiplied by `2**exp` so the output duration remains close to the original.
+
+Frame interpolation runs in the diffusion worker post-processing path instead of
+the API server encoding path, so it can reuse the worker's current accelerator
+device without blocking the FastAPI event loop.
+
+Example: generate 5 frames and interpolate to 9 frames:
+
+```bash
+curl -X POST http://localhost:8091/v1/videos/sync \
+  -F "prompt=A dog running through a park" \
+  -F "num_frames=5" \
+  -F "fps=8" \
+  -F "enable_frame_interpolation=true" \
+  -F "frame_interpolation_exp=1" \
+  -F "frame_interpolation_scale=1.0" \
+  -o sync_t2v_interpolated.mp4
+```
 
 ## Create Response Format
 
@@ -254,6 +286,14 @@ done
 ```bash
 vllm serve Lightricks/LTX-2 --omni --port 8098 \
     --enforce-eager --flow-shift 1.0 --boundary-ratio 1.0
+```
+
+For multi-GPU memory reduction, you can enable HSDP:
+
+```bash
+vllm serve Lightricks/LTX-2 --omni --port 8098 \
+    --enforce-eager --flow-shift 1.0 --boundary-ratio 1.0 \
+    --use-hsdp --hsdp-shard-size 2
 ```
 
 #### Start with Optimization Presets

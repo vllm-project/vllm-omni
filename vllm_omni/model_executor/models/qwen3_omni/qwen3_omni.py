@@ -180,6 +180,11 @@ class Qwen3OmniMoeForConditionalGeneration(
                 "trailing_text_hidden",
                 "tts_pad_embed_projected",
             }
+            # Keys that need to be accumulated across streaming inputs
+            self.streaming_accumulated_keys: set[str] = {
+                "thinker_prefill_embeddings",
+                "thinker_hidden_states",
+            }
 
         elif self.model_stage == "code2wav":
             self.enable_update_additional_information = True
@@ -684,6 +689,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         input_embeds: torch.Tensor,
         last_talker_hidden: torch.Tensor,
         text_step: torch.Tensor,
+        **kwargs: Any,
     ):
         # TODO(Peiqi): not support intermediate_tensors now
         input_ids = safe_tensor_reshape(input_ids, (input_ids.shape[0], -1))
@@ -891,10 +897,11 @@ class Qwen3OmniMoeForConditionalGeneration(
         Returns:
             (input_ids, input_embeds) for talker
         """
+        target_len = thinker_result_ids.shape[-1]
         im_start_indexes = torch.cat(
             (
                 torch.nonzero(input_ids[0] == self.config.im_start_token_id).squeeze(),
-                torch.tensor([thinker_result_ids.shape[-1]], device=input_ids.device, dtype=input_ids.dtype),
+                torch.tensor([target_len], device=input_ids.device, dtype=input_ids.dtype),
             ),
             dim=-1,
         )  # Shape [n_starts + 1]; Take batch 0 since batched inference is not supported here.
@@ -1029,8 +1036,35 @@ class Qwen3OmniMoeForConditionalGeneration(
         return last_talker_hidden, text_step, update_dict
 
     def _get_talker_user_parts(self, im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed):
+        clamped = min(
+            segment_end_index,
+            multimodal_mask.shape[0],
+            thinker_hidden.shape[0],
+            thinker_embed.shape[0],
+        )
+        if clamped < segment_end_index:
+            logger.warning(
+                "_get_talker_user_parts: segment_end_index %d clamped to %d "
+                "(embed=%d, hidden=%d, mask=%d). "
+                "This usually means _merge_pd_embeddings failed to merge "
+                "prefill embeddings – check PD prefill_mm keys.",
+                segment_end_index,
+                clamped,
+                thinker_embed.shape[0],
+                thinker_hidden.shape[0],
+                multimodal_mask.shape[0],
+            )
+        segment_end_index = clamped
+        seg_len = segment_end_index - im_start_index
+        if seg_len <= 0:
+            return torch.empty(
+                (0, self.config.talker_config.text_config.hidden_size),
+                device=thinker_hidden.device,
+                dtype=torch.bfloat16,
+            )
+
         user_talker_part = torch.empty(
-            (segment_end_index - im_start_index, self.config.talker_config.text_config.hidden_size),
+            (seg_len, self.config.talker_config.text_config.hidden_size),
             device=thinker_hidden.device,
             dtype=torch.bfloat16,
         )

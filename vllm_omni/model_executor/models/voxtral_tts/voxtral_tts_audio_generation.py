@@ -108,6 +108,7 @@ class AcousticTransformerArgs:
     use_biases: bool = False
     norm_eps: float = 1e-5
     sigma: float = 1e-5  # was 0.01 in beta version
+    n_decoding_steps: int | None = None  # Number of Euler ODE steps for flow matching
 
 
 @dataclass
@@ -436,14 +437,11 @@ class FlowMatchingAudioTransformer(nn.Module):
         self._empty_audio_token_id = AudioSpecialTokens.id(AudioSpecialTokens.empty_audio)
 
         # Flow matching constants
-        # TODO(chenyo): hardcoded, need to fix
-        self._acoustic_decode_iters = 8
-        # TODO(chenyo): hardcoded, need to fix
-        self._cfg_alpha = 1.2
+        self._n_steps = args.n_decoding_steps
         self._noise_scale = 1.0
         self.register_buffer(
             "_timesteps",
-            torch.linspace(0, 1, self._acoustic_decode_iters),
+            torch.linspace(0, 1, self._n_steps + 1),
             persistent=False,
         )
 
@@ -512,6 +510,7 @@ class FlowMatchingAudioTransformer(nn.Module):
         self,
         semantic_code: torch.Tensor,
         llm_hidden: torch.Tensor,
+        cfg_alpha: torch.Tensor,
     ) -> torch.Tensor:
         B = semantic_code.shape[0]
 
@@ -524,6 +523,10 @@ class FlowMatchingAudioTransformer(nn.Module):
 
         timesteps = self._timesteps.to(dtype=llm_hidden.dtype)
         llm_hidden_zero = torch.zeros_like(llm_hidden)
+
+        # Reshape cfg_alpha for broadcasting: (B,) -> (B, 1)
+        cfg_alpha = cfg_alpha.to(dtype=llm_hidden.dtype, device=llm_hidden.device)
+        cfg_alpha = cfg_alpha.unsqueeze(1)  # (B, 1) for broadcasting with (B, C)
 
         # Euler integration with batched conditional + unconditional velocity
         sampled = x_0
@@ -544,7 +547,7 @@ class FlowMatchingAudioTransformer(nn.Module):
                 t_emb=t_emb_batched,
             )
             v_t, uncond_v_t = v_all[:B], v_all[B:]
-            v_t = self._cfg_alpha * v_t + (1 - self._cfg_alpha) * uncond_v_t
+            v_t = cfg_alpha * v_t + (1 - cfg_alpha) * uncond_v_t
 
             sampled = sampled + v_t * dt
 
@@ -585,6 +588,7 @@ class FlowMatchingAudioTransformer(nn.Module):
     def forward(
         self,
         llm_hidden: torch.Tensor,
+        cfg_alpha: torch.Tensor,
     ) -> torch.Tensor:
         # llm_hidden: BxD
         semantic_logit = self.semantic_codebook_output(llm_hidden).float()
@@ -594,10 +598,10 @@ class FlowMatchingAudioTransformer(nn.Module):
         # semantic_logit: Bx1
         semantic_code = semantic_logit.argmax(dim=-1, keepdim=True)
 
-        # acoustic codes, TODO(@chenyo): config sampling
         acoustic_codes = self.decode_one_frame(
             semantic_code.squeeze(1),
             llm_hidden,
+            cfg_alpha=cfg_alpha,
         )
 
         audio_codes = torch.concatenate(
@@ -864,6 +868,29 @@ class VoxtralTTSMultiModalProcessor(BaseMultiModalProcessor[VoxtralTTSProcessing
             ),
         ]
 
+    def _apply_hf_processor_mm_only(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        """
+        Apply the HF processor on the multi-modal data only.
+
+        Issue: Voxtral TTS use Mistral Tokenizer with custom audio encoder. It doesn't
+        inherit Transformers ProcessorMixin and can't use call_hf_processor_mm_only.
+
+        Solution: Override this method to call _apply_hf_processor_text_mm directly.
+        """
+        mm_counts = mm_items.get_all_counts()
+        _, mm_processed_data, _ = self._apply_hf_processor_text_mm(
+            prompt_text=self.dummy_inputs.get_dummy_text(mm_counts),
+            mm_items=mm_items,
+            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+            tokenization_kwargs=tokenization_kwargs,
+        )
+        return mm_processed_data
+
     def _cached_apply_hf_processor(
         self,
         inputs: ProcessorInputs,
@@ -1012,11 +1039,13 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
     def compute_mm_logits(
         self,
         hidden_states: torch.Tensor,
+        cfg_alpha: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         audio_codes = None
         mm_tokens = None
         audio_codes = self.acoustic_transformer(
             llm_hidden=hidden_states,
+            cfg_alpha=cfg_alpha,
         )
         fake_eos = torch.where(
             audio_codes[:, 0] == AudioSpecialTokens.id(AudioSpecialTokens.end_audio),

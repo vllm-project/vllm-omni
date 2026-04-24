@@ -182,7 +182,7 @@ def main(args):
 
     omni = Omni(
         model=model_name,
-        stage_configs_path=args.stage_configs_path,
+        deploy_config=args.deploy_config,
         log_stats=args.enable_stats,
         log_file=("omni_pipeline.log" if args.enable_stats else None),
         init_sleep_seconds=args.init_sleep_seconds,
@@ -428,10 +428,11 @@ def parse_args():
         help="Sampling rate for audio.",
     )
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         type=str,
-        default="../../../model_executor/stage_configs/mimo_audio.yaml",
-        help="Path to a stage configs file.",
+        default=None,
+        help="Override the deploy config path. If unset, auto-loads "
+        "vllm_omni/deploy/mimo_audio.yaml based on the HF model_type.",
     )
 
     return parser.parse_args()

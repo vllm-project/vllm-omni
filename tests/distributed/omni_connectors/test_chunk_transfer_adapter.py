@@ -4,10 +4,12 @@
 import threading
 from collections import deque
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
@@ -335,6 +337,27 @@ def test_cleanup_after_poll_flow(build_adapter):
     assert "ext-flow" not in adapter.request_payload
 
 
+def test_finish_requests_restores_status(build_adapter):
+    """Abort path must pop ``requests_origin_status`` and restore pre-wait status.
+
+    While ``process_pending_chunks`` holds a request off the scheduler queues, the
+    adapter records the prior status (WAITING or RUNNING). ``finish_requests`` must
+    put that status back on the live ``Request`` so base ``Scheduler.finish_requests``
+    can finish bookkeeping without inconsistent state / crashes.
+    """
+    adapter, _ = build_adapter(stage_id=1)
+    req_id = "req-abort-during-chunk"
+    prior = RequestStatus.RUNNING
+    request = _req(req_id, RequestStatus.WAITING_FOR_CHUNK)
+    adapter.requests_origin_status[req_id] = prior
+    requests_map = {req_id: request}
+
+    adapter.finish_requests([req_id], RequestStatus.FINISHED_ABORTED, requests_map)
+
+    assert request.status == prior
+    assert req_id not in adapter.requests_origin_status
+
+
 # ---------------------------------------------------------------
 # Scheduler trigger tests
 # ---------------------------------------------------------------
@@ -508,3 +531,31 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
 
     assert len(cleanup_calls) == 0
     assert len(save_calls) == 1
+
+
+def test_omni_ar_scheduler_finish_requests(mocker: MockerFixture):
+    """``OmniARScheduler.finish_requests`` must run chunk adapter hook before vLLM base."""
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+
+    order: list[str] = []
+
+    adapter = mocker.MagicMock()
+
+    def _adapter_finish(request_ids, finished_status, requests):
+        order.append("adapter")
+        return []
+
+    adapter.finish_requests.side_effect = _adapter_finish
+
+    def _super_finish(_self, request_ids, finished_status):
+        order.append("super")
+        return []
+
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched.chunk_transfer_adapter = adapter
+    sched.requests = {}
+
+    with patch.object(VLLMScheduler, "finish_requests", _super_finish):
+        OmniARScheduler.finish_requests(sched, ["r1"], RequestStatus.FINISHED_ABORTED)
+
+    assert order == ["adapter", "super"]

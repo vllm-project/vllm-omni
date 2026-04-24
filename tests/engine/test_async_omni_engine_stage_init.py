@@ -31,7 +31,6 @@ def test_initialize_stages_restores_device_visibility_after_diffusion_init(monke
     from vllm_omni.platforms import current_omni_platform
 
     engine = object.__new__(AsyncOmniEngine)
-    engine.log_stats = False
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
     engine.num_stages = 1
@@ -101,10 +100,11 @@ def test_initialize_stages_passes_stage_init_timeout_to_diffusion_handshake(monk
     engine.log_stats = False
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
-    engine.num_stages = 1
+    engine.num_stages = 2
     engine.async_chunk = False
     engine.diffusion_batch_size = 1
     engine.single_stage_mode = False
+    engine._omni_master_server = None
     engine.stage_configs = [types.SimpleNamespace(stage_id=0, stage_type="diffusion", engine_args={})]
 
     metadata = types.SimpleNamespace(
@@ -183,6 +183,7 @@ def test_launch_llm_stage_passes_stage_init_timeout_to_complete_stage_handshake(
     engine.model = "dummy-model"
     engine.single_stage_mode = False
     engine._omni_master_server = None
+    engine.stage_configs = []
 
     metadata = types.SimpleNamespace(stage_id=0, runtime_cfg={"devices": "0"})
     fake_vllm_config = types.SimpleNamespace()
@@ -226,6 +227,96 @@ def test_launch_llm_stage_passes_stage_init_timeout_to_complete_stage_handshake(
             os.environ[device_env_var] = prev_device_env
 
     assert captured_timeout == 302
+
+
+def test_launch_llm_stage_releases_launch_lock_before_complete_stage_handshake(monkeypatch):
+    """Regression test for parallel LLM stage startup during handshake wait."""
+    import vllm_omni.engine.async_omni_engine as engine_mod
+    from vllm_omni.platforms import current_omni_platform
+
+    engine = object.__new__(AsyncOmniEngine)
+    engine.log_stats = False
+    engine.model = "dummy-model"
+    engine.single_stage_mode = False
+    engine._omni_master_server = None
+    engine.stage_configs = []
+
+    fake_vllm_config = types.SimpleNamespace()
+    fake_addresses = types.SimpleNamespace()
+    shared_launch_lock = threading.Lock()
+    counter_lock = threading.Lock()
+    first_handshake_started = threading.Event()
+    second_stage_spawned = threading.Event()
+    allow_first_handshake_to_finish = threading.Event()
+    launch_errors: list[BaseException] = []
+    spawn_count = 0
+
+    device_env_var = current_omni_platform.device_control_env_var
+    prev_device_env = os.environ.get(device_env_var)
+    os.environ[device_env_var] = "0"
+
+    monkeypatch.setattr(engine_mod, "setup_stage_devices", lambda *_: None)
+    monkeypatch.setattr(engine_mod, "build_engine_args_dict", lambda *_, **__: {})
+    monkeypatch.setattr(engine_mod, "build_vllm_config", lambda *_, **__: (fake_vllm_config, object))
+    monkeypatch.setattr(engine_mod, "acquire_device_locks", lambda *_: [])
+
+    def _spawn_stage_core(**_):
+        nonlocal spawn_count
+        with counter_lock:
+            spawn_count += 1
+            call_idx = spawn_count
+        if call_idx == 2:
+            second_stage_spawned.set()
+        return fake_addresses, types.SimpleNamespace(), f"ipc://handshake-{call_idx}"
+
+    def _complete_stage_handshake(_proc, handshake_address, _addresses, _vllm_cfg, _timeout):
+        if handshake_address == "ipc://handshake-1":
+            first_handshake_started.set()
+            assert second_stage_spawned.wait(timeout=1), (
+                "second stage did not reach spawn_stage_core while first stage waited in handshake"
+            )
+            assert allow_first_handshake_to_finish.wait(timeout=1), (
+                "second stage did not enter handshake while first stage was still waiting"
+            )
+        else:
+            allow_first_handshake_to_finish.set()
+
+    monkeypatch.setattr(engine_mod, "spawn_stage_core", _spawn_stage_core)
+    monkeypatch.setattr(engine_mod, "complete_stage_handshake", _complete_stage_handshake)
+
+    def _launch_stage(stage_id: int) -> None:
+        metadata = types.SimpleNamespace(stage_id=stage_id, runtime_cfg={"devices": str(stage_id)})
+        try:
+            engine._launch_llm_stage(
+                stage_cfg=types.SimpleNamespace(engine_args={}),
+                metadata=metadata,
+                stage_connector_spec={},
+                stage_init_timeout=302,
+                llm_stage_launch_lock=shared_launch_lock,
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced through assertion below
+            launch_errors.append(exc)
+
+    try:
+        first_thread = threading.Thread(target=_launch_stage, args=(0,))
+        first_thread.start()
+        assert first_handshake_started.wait(timeout=1), "first stage never entered handshake"
+
+        second_thread = threading.Thread(target=_launch_stage, args=(1,))
+        second_thread.start()
+
+        first_thread.join(timeout=3)
+        second_thread.join(timeout=3)
+    finally:
+        if prev_device_env is None:
+            os.environ.pop(device_env_var, None)
+        else:
+            os.environ[device_env_var] = prev_device_env
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert second_stage_spawned.is_set()
+    assert not launch_errors
 
 
 def test_attach_llm_stage_uses_omni_input_preprocessor(monkeypatch):
@@ -283,10 +374,76 @@ def test_attach_llm_stage_uses_omni_input_preprocessor(monkeypatch):
     )
 
     engine = object.__new__(AsyncOmniEngine)
-    engine.log_stats = False
 
     _stage_client, _out_proc, _vllm_cfg, input_processor = engine._attach_llm_stage(started)
 
     assert input_processor is not None
     assert isinstance(input_processor.input_preprocessor, DummyOmniInputPreprocessor)
     assert input_processor.input_preprocessor.renderer is input_processor.renderer
+
+
+def test_inject_kv_stage_info_infers_sender_tp_topology():
+    from vllm_omni.engine.stage_init_utils import inject_kv_stage_info
+
+    stage0 = types.SimpleNamespace(
+        stage_id=0,
+        engine_args={
+            "tensor_parallel_size": 4,
+            "omni_kv_config": {
+                "need_send_cache": True,
+                "omni_from_stage": "0",
+                "omni_to_stage": "1",
+            },
+        },
+        engine_input_source=[],
+    )
+    stage1 = types.SimpleNamespace(
+        stage_id=1,
+        engine_args={
+            "parallel_config": {
+                "tensor_parallel_size": 2,
+                "cfg_parallel_size": 1,
+            },
+            "omni_kv_config": {"need_recv_cache": True},
+        },
+        engine_input_source=[0],
+    )
+
+    inject_kv_stage_info(stage0, 0, [stage0, stage1])
+
+    assert stage0.engine_args["omni_kv_config"]["stage_id"] == 0
+    assert stage0.engine_args["omni_kv_config"]["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
+
+
+def test_inject_kv_stage_info_infers_receiver_tp_topology():
+    from vllm_omni.engine.stage_init_utils import inject_kv_stage_info
+
+    stage0 = types.SimpleNamespace(
+        stage_id=0,
+        engine_args={
+            "tensor_parallel_size": 4,
+            "omni_kv_config": {"need_send_cache": True},
+        },
+        engine_input_source=[],
+    )
+    stage1 = types.SimpleNamespace(
+        stage_id=1,
+        engine_args={
+            "parallel_config": {
+                "tensor_parallel_size": 2,
+                "cfg_parallel_size": 1,
+            },
+            "omni_kv_config": {
+                "need_recv_cache": True,
+                "omni_from_stage": "0",
+                "omni_to_stage": "1",
+            },
+        },
+        engine_input_source=[0],
+    )
+
+    inject_kv_stage_info(stage1, 1, [stage0, stage1])
+
+    assert stage1.engine_args["omni_kv_config"]["stage_id"] == 1
+    assert stage1.engine_args["omni_kv_config"]["engine_input_source"] == [0]
+    assert stage1.engine_args["omni_kv_config"]["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
