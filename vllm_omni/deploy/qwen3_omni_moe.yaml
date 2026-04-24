@@ -61,7 +61,7 @@ stages:
       repetition_penalty: 1.1
 
 pd_disaggregation:
-  enabled: true
+  enabled: false
   target_stage_id: 0
   async_chunk: false
   # PD mode uses the common 3-GPU layout:
