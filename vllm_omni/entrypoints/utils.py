@@ -1,15 +1,18 @@
+import argparse
 import os
 import types
 from collections import Counter
-from dataclasses import asdict, fields, is_dataclass
+from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any, get_args, get_origin
 
-from omegaconf import OmegaConf
+import yaml
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
+from vllm_omni.config.stage_config import StageConfigFactory
+from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.platforms import current_omni_platform
 
@@ -17,6 +20,69 @@ from vllm_omni.platforms import current_omni_platform
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 logger = init_logger(__name__)
+
+_DIFFUSERS_CLASS_TO_CONFIG: dict[str, str] = {
+    "GlmImagePipeline": "glm_image",
+}
+
+
+def detect_explicit_cli_keys(
+    argv: list[str],
+    parser: argparse.ArgumentParser | None = None,
+) -> set[str]:
+    """Walk ``argv`` and return the set of ``dest`` attribute names the user
+    explicitly provided (e.g. ``--max-num-seqs 64`` → ``max_num_seqs``).
+
+    Used to distinguish user-typed CLI args from argparse default values so
+    deploy YAMLs are not silently overridden by parser defaults. Shared
+    across online (``vllm serve``) and offline (scripts, examples, tests,
+    CI) entry points — offline callers that parse CLI args via argparse
+    should invoke this on ``sys.argv[1:]`` and pass the result through to
+    ``AsyncOmni`` / ``Omni`` via the ``_cli_explicit_keys`` kwarg.
+
+    When ``parser`` is provided, each token is looked up in the parser's
+    action table to find its real ``dest``. This correctly handles flags
+    with ``dest=`` overrides, alias flags (e.g. ``--usp`` /
+    ``--ulysses-degree`` both mapping to ``ulysses_degree``), and
+    ``--disable-foo`` / ``store_false`` patterns that map to a differently
+    named dest. Callers with access to an ``argparse.ArgumentParser`` should
+    always pass it.
+
+    When ``parser`` is ``None``, a name-based heuristic is used as a
+    fallback (hyphens → underscores, plus a ``no_`` prefix strip for
+    ``argparse.BooleanOptionalAction``). This is correct for simple flags
+    but silently misidentifies ``--disable-X``-style flags and explicit
+    ``dest=`` overrides, so prefer the parser-aware form.
+    """
+    if parser is not None:
+        dest_map: dict[str, str] = {}
+        for action in parser._actions:
+            for opt in action.option_strings:
+                dest_map[opt] = action.dest
+        explicit: set[str] = set()
+        for tok in argv:
+            if not tok.startswith("--"):
+                continue
+            flag = tok.split("=", 1)[0]
+            dest = dest_map.get(flag)
+            if dest is not None:
+                explicit.add(dest)
+        return explicit
+
+    # Fallback: name-based heuristic (legacy path for callers without a parser).
+    explicit = set()
+    for tok in argv:
+        if not tok.startswith("--"):
+            continue
+        name = tok[2:].split("=", 1)[0]
+        if not name:
+            continue
+        attr = name.replace("-", "_")
+        explicit.add(attr)
+        # BooleanOptionalAction: --no-foo records as dest `foo`, not `no_foo`.
+        if attr.startswith("no_"):
+            explicit.add(attr[3:])
+    return explicit
 
 
 def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
@@ -141,12 +207,21 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     if isinstance(obj, set):
         return list(obj)
     # Handle dataclass objects
-    # Note: asdict() recursively converts nested dataclasses but not Counter objects,
-    # so we need to recursively process the result
-    if is_dataclass(obj):
-        result = asdict(obj)
-        # Recursively process the result to convert any Counter objects
-        return _convert_dataclasses_to_dict(result)
+    # Use field iteration instead of asdict() to:
+    # 1. Only include init fields (non-init fields cause "unexpected kwarg" errors)
+    # 2. Skip None values matching field defaults (avoids Pydantic validation
+    #    failures when None is explicitly passed for non-Optional typed fields,
+    #    e.g. CompilationConfig.cudagraph_capture_sizes: list[int] = None)
+    if is_dataclass(obj) and not isinstance(obj, type):
+        result = {}
+        for f in fields(obj):
+            if not f.init:
+                continue
+            value = getattr(obj, f.name)
+            if value is None and f.default is None:
+                continue
+            result[f.name] = _convert_dataclasses_to_dict(value)
+        return result
     # Handle dictionaries (recurse into values) and filter out callables(cause error in OmegaConf.create)
     # Note: This must come AFTER Counter check since Counter is a dict subclass
     if isinstance(obj, dict):
@@ -167,6 +242,31 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
             return obj
     # Primitive types and other objects that OmegaConf can handle
     return obj
+
+
+def _try_resolve_omni_model_type(model: str) -> str | None:
+    """Try to resolve model_type for omni models with empty config.json.
+
+    Searches both the legacy ``stage_configs/*.yaml`` directory and the
+    migrated ``deploy/*.yaml`` directory for a stem that substring-matches
+    the model path (e.g. ``cosyvoice3`` in
+    ``FunAudioLLM/Fun-CosyVoice3-0.5B-2512``). The longest match wins so
+    ``cosyvoice3`` beats ``cosyvoice`` and ``bagel_single_stage`` beats
+    ``bagel``.
+    """
+    model_lower = model.lower().replace("-", "").replace("_", "")
+    best_match: str | None = None
+    best_len = 0
+    for subdir in ("model_executor/stage_configs", "deploy"):
+        config_dir = PROJECT_ROOT / "vllm_omni" / subdir
+        if not config_dir.exists():
+            continue
+        for config_file in sorted(config_dir.glob("*.yaml")):
+            candidate = config_file.stem.replace("-", "").replace("_", "")
+            if candidate and candidate in model_lower and len(candidate) > best_len:
+                best_match = config_file.stem
+                best_len = len(candidate)
+    return best_match
 
 
 def resolve_model_config_path(model: str) -> str:
@@ -207,7 +307,11 @@ def resolve_model_config_path(model: str) -> str:
                 if config_dict and "model_type" in config_dict:
                     model_type = config_dict["model_type"]
                 else:
-                    raise ValueError(f"config.json found but missing 'model_type' for model: {model}")
+                    # For models with empty config.json (e.g. CosyVoice3),
+                    # try matching against registered omni stage configs.
+                    model_type = _try_resolve_omni_model_type(model)
+                    if model_type is None:
+                        raise ValueError(f"config.json found but missing 'model_type' for model: {model}")
             except Exception as e:
                 raise ValueError(f"Failed to read config.json for model: {model}. Error: {e}") from e
         else:
@@ -218,74 +322,220 @@ def resolve_model_config_path(model: str) -> str:
             )
 
     default_config_path = current_omni_platform.get_default_stage_config_path()
-    model_type_str = f"{model_type}.yaml"
+    if model_type in _DIFFUSERS_CLASS_TO_CONFIG:
+        normalized_model_type = _DIFFUSERS_CLASS_TO_CONFIG[model_type]
+    else:
+        normalized_model_type = model_type.replace("-", "_")
+    model_type_str = f"{normalized_model_type}.yaml"
     complete_config_path = PROJECT_ROOT / default_config_path / model_type_str
     if os.path.exists(complete_config_path):
         return str(complete_config_path)
 
-    # Fall back to default config
-    stage_config_file = f"vllm_omni/model_executor/stage_configs/{model_type}.yaml"
+    stage_config_file = f"vllm_omni/model_executor/stage_configs/{normalized_model_type}.yaml"
     stage_config_path = PROJECT_ROOT / stage_config_file
     if not os.path.exists(stage_config_path):
         return None
     return str(stage_config_path)
 
 
-def load_stage_configs_from_model(model: str, base_engine_args: dict | None = None) -> list:
+def load_stage_configs_from_model(
+    model: str,
+    base_engine_args: dict | None = None,
+    deploy_config_path: str | None = None,
+    stage_overrides: dict[str, dict[str, Any]] | None = None,
+    cli_explicit_keys: set[str] | None = None,
+) -> list:
     """Load stage configurations from model's default config file.
 
-    Loads stage configurations based on the model type and device type.
-    First tries to load a device-specific YAML file from stage_configs/{device_type}/
-    directory. If not found, falls back to the default config file.
+    For models registered in the pipeline registry (new path), uses
+    ``StageConfigFactory.create_from_model()`` which merges
+    PipelineConfig + DeployConfig + CLI overrides.
+
+    For other models (legacy path), loads stage configs from YAML.
 
     Args:
         model: Model name or path (used to determine model_type)
+        base_engine_args: Base engine args to merge as CLI overrides.
+        deploy_config_path: Optional explicit deploy config path.
+        stage_overrides: Per-stage overrides from --stage-overrides.
+        cli_explicit_keys: Set of CLI keys the user actually typed. When
+            provided, only these keys override deploy YAML; argparse defaults
+            stay subordinate to YAML. ``None`` means treat every kwarg as
+            explicit (programmatic ``Omni()`` calls).
 
     Returns:
         List of stage configuration dictionaries
-
-    Raises:
-        FileNotFoundError: If no stage config file exists for the model type
     """
     if base_engine_args is None:
         base_engine_args = {}
+
+    cli_overrides = _convert_dataclasses_to_dict(dict(base_engine_args))
+    # Per-stage JSON overrides are always explicit (the user typed --stage-overrides).
+    explicit = set(cli_explicit_keys) if cli_explicit_keys is not None else None
+    if stage_overrides:
+        for stage_id_str, overrides in stage_overrides.items():
+            for key, val in overrides.items():
+                stage_key = f"stage_{stage_id_str}_{key}"
+                cli_overrides[stage_key] = val
+                if explicit is not None:
+                    explicit.add(stage_key)
+
+    stages = StageConfigFactory.create_from_model(
+        model,
+        cli_overrides=cli_overrides,
+        deploy_config_path=deploy_config_path,
+        cli_explicit_keys=explicit,
+    )
+    if stages is not None:
+        # Convert StageConfig objects to OmegaConf for backward compat
+        return [stage.to_omegaconf() for stage in stages]
+
+    # Legacy fallback: load from YAML
     stage_config_path = resolve_model_config_path(model)
     if stage_config_path is None:
         return []
-    stage_configs = load_stage_configs_from_yaml(config_path=stage_config_path, base_engine_args=base_engine_args)
+    stage_configs = load_stage_configs_from_yaml(
+        config_path=stage_config_path,
+        base_engine_args=base_engine_args,
+        prefer_stage_engine_args=True,
+    )
     return stage_configs
 
 
-def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None = None) -> list:
-    """Load stage configurations from a YAML file.
+def load_stage_configs_from_yaml(
+    config_path: str,
+    base_engine_args: dict | None = None,
+    prefer_stage_engine_args: bool = True,
+) -> list:
+    """Load stage configurations from a YAML file (legacy OmegaConf path).
+
+    TODO(@lishunyang12): remove once all models use PipelineConfig + DeployConfig.
 
     Args:
         config_path: Path to the YAML configuration file
+        base_engine_args: Engine args supplied by the caller.
+        prefer_stage_engine_args: When True, YAML stage args override caller
+            engine args. When False, caller engine args override YAML defaults.
 
     Returns:
         List of stage configuration dictionaries from the file's stage_args
     """
     if base_engine_args is None:
         base_engine_args = {}
-    config_data = OmegaConf.load(config_path)
+    config_data = load_yaml_config(config_path)
     stage_args = config_data.stage_args
     global_async_chunk = config_data.get("async_chunk", False)
-    # Convert any nested dataclass objects to dicts before creating OmegaConf
+    # Convert any nested dataclass objects to dicts before creating DictConfig
     base_engine_args = _convert_dataclasses_to_dict(base_engine_args)
-    base_engine_args = OmegaConf.create(base_engine_args)
+    base_engine_args = create_config(base_engine_args)
     for stage_arg in stage_args:
         base_engine_args_tmp = base_engine_args.copy()
         # Update base_engine_args with stage-specific engine_args if they exist
         if hasattr(stage_arg, "engine_args") and stage_arg.engine_args is not None:
-            base_engine_args_tmp = OmegaConf.merge(base_engine_args_tmp, stage_arg.engine_args)
+            if prefer_stage_engine_args:
+                merged_engine_args = merge_configs(base_engine_args_tmp, stage_arg.engine_args)
+            else:
+                merged_engine_args = merge_configs(stage_arg.engine_args, base_engine_args_tmp)
+            base_engine_args_tmp = create_config(merged_engine_args)
         stage_type = getattr(stage_arg, "stage_type", "llm")
         if hasattr(stage_arg, "runtime") and stage_arg.runtime is not None and stage_type != "diffusion":
-            runtime_cfg = stage_arg.runtime
-            max_batch_size = int(runtime_cfg.get("max_batch_size", 1) or 1)
-            base_engine_args_tmp["max_num_seqs"] = max_batch_size
             base_engine_args_tmp.async_chunk = global_async_chunk
         stage_arg.engine_args = base_engine_args_tmp
     return stage_args
+
+
+def filter_stages(
+    config_path: str | None,
+    stage_configs: list,
+    kwargs: dict | None,
+) -> list:
+    """Filter stage configs by mode when YAML defines a `modes` section.
+
+    The YAML can define, e.g.:
+
+        modes:
+          - mode: text-to-image
+            stages: [1]
+          - mode: image-to-text
+            stages: [0]
+
+    When users pass `mode="image-to-text"` into Omni(**kwargs), only the stages
+    listed for that mode are returned. If no mode is provided, defaults to
+    "text-to-image". If no modes are defined or filtering fails, returns the
+    original stage_configs unchanged.
+
+    Args:
+        config_path: Path to the YAML config (used to read `modes`).
+        stage_configs: Loaded list of stage configs.
+        kwargs: Engine/caller kwargs; may contain "mode".
+
+    Returns:
+        Filtered list of stage configs (or original list if filtering not applied).
+    """
+    if not stage_configs or config_path is None:
+        return stage_configs
+
+    try:
+        cfg = load_yaml_config(config_path)
+        yaml_modes = getattr(cfg, "modes", None)
+        if yaml_modes is None:
+            return stage_configs
+
+        mode_to_stage_ids: dict[str, list[int]] = {}
+        if yaml_modes is not None:
+            for entry in yaml_modes:
+                mode_name = None
+                stages = None
+                if hasattr(entry, "mode") or hasattr(entry, "stages"):
+                    mode_name = getattr(entry, "mode", None)
+                    stages = getattr(entry, "stages", None)
+                elif isinstance(entry, dict):
+                    mode_name = entry.get("mode")
+                    stages = entry.get("stages")
+
+                if mode_name is None or stages is None:
+                    continue
+
+                if isinstance(stages, int):
+                    stage_list = [stages]
+                else:
+                    stage_list = list(stages)
+
+                mode_to_stage_ids[str(mode_name)] = [int(sid) for sid in stage_list]
+
+        # No modes section or empty mapping: use all stages and return early.
+        active_mode: str | None = None
+        if isinstance(kwargs, dict):
+            active_mode = kwargs.get("mode")
+
+        if active_mode is None:
+            active_mode = "text-to-image"
+
+        if active_mode not in mode_to_stage_ids:
+            logger.warning(
+                "Requested mode '%s' not found in config '%s'; available modes: %s. Using all stages.",
+                active_mode,
+                config_path,
+                sorted(mode_to_stage_ids.keys()),
+            )
+            return stage_configs
+
+        allowed_ids = set(mode_to_stage_ids[active_mode])
+        filtered_stage_configs = [sc for sc in stage_configs if getattr(sc, "stage_id", None) in allowed_ids]
+        if not filtered_stage_configs:
+            logger.warning(
+                "Mode '%s' in config '%s' resolved to stage ids %s, but none matched loaded stage_args. "
+                "Falling back to all stages.",
+                active_mode,
+                config_path,
+                sorted(allowed_ids),
+            )
+            return stage_configs
+
+        return filtered_stage_configs
+    except Exception as e:
+        logger.warning("Failed to apply mode-based stage filtering: %s", e)
+        return stage_configs
 
 
 def load_and_resolve_stage_configs(
@@ -293,31 +543,87 @@ def load_and_resolve_stage_configs(
     stage_configs_path: str | None,
     kwargs: dict | None,
     default_stage_cfg_factory: Any = None,
+    deploy_config_path: str | None = None,
+    stage_overrides: dict[str, dict[str, Any]] | None = None,
+    cli_explicit_keys: set[str] | None = None,
 ) -> tuple[str, list]:
     """Load stage configurations from model or YAML file with fallback to defaults.
 
     Args:
         model: Model name or path
-        stage_configs_path: Optional path to YAML file containing stage configurations
+        stage_configs_path: Optional path to legacy YAML (stage_args format)
         kwargs: Engine arguments to merge with stage configs
         default_stage_cfg_factory: Optional callable that takes no args and returns
             default stage config list when no configs are found
+        deploy_config_path: Optional path to deploy YAML (new format).
+            Mutually exclusive with ``stage_configs_path``.
+        stage_overrides: Per-stage overrides from ``--stage-overrides`` JSON.
+            Keys are stage_id strings, values are dicts of overrides.
 
     Returns:
         Tuple of (config_path, stage_configs)
     """
-    if stage_configs_path is None:
-        config_path = resolve_model_config_path(model)
-        stage_configs = load_stage_configs_from_model(model, base_engine_args=kwargs)
+    if stage_configs_path is not None and deploy_config_path is not None:
+        raise ValueError(
+            "--stage-configs-path and --deploy-config are mutually exclusive: "
+            "they use different path resolution rules and loading paths. "
+            "Use --deploy-config for new-format YAMLs (preferred); "
+            "--stage-configs-path is kept only for the legacy `stage_args` format "
+            "and will be removed in a future release."
+        )
+    if stage_configs_path is not None and deploy_config_path is None:
+        if not os.path.exists(stage_configs_path):
+            raise FileNotFoundError(
+                f"--stage-configs-path {stage_configs_path!r} does not exist. "
+                "Legacy `stage_configs/` yamls were replaced by `vllm_omni/deploy/<model>.yaml`; "
+                "use --deploy-config. See docs/configuration/stage_configs.md."
+            )
+        with open(stage_configs_path, encoding="utf-8") as f:
+            _peek = yaml.safe_load(f) or {}
+        if "stages" in _peek and "stage_args" not in _peek:
+            deploy_config_path = stage_configs_path
+            stage_configs_path = None
+        else:
+            logger.warning(
+                "--stage-configs-path is deprecated; migrate %r and use --deploy-config.",
+                stage_configs_path,
+            )
+
+    if deploy_config_path is not None:
+        config_path = deploy_config_path
+        stage_configs = load_stage_configs_from_model(
+            model,
+            base_engine_args=kwargs,
+            deploy_config_path=deploy_config_path,
+            stage_overrides=stage_overrides,
+            cli_explicit_keys=cli_explicit_keys,
+        )
         if not stage_configs:
             if default_stage_cfg_factory is not None:
                 default_stage_cfg = default_stage_cfg_factory()
-                stage_configs = OmegaConf.create(default_stage_cfg)
+                stage_configs = create_config(default_stage_cfg)
+            else:
+                stage_configs = []
+    elif stage_configs_path is None:
+        config_path = resolve_model_config_path(model)
+        stage_configs = load_stage_configs_from_model(
+            model,
+            base_engine_args=kwargs,
+            stage_overrides=stage_overrides,
+            cli_explicit_keys=cli_explicit_keys,
+        )
+        if not stage_configs:
+            if default_stage_cfg_factory is not None:
+                default_stage_cfg = default_stage_cfg_factory()
+                stage_configs = create_config(default_stage_cfg)
             else:
                 stage_configs = []
     else:
         config_path = stage_configs_path
         stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=kwargs)
+
+    stage_configs = filter_stages(config_path, stage_configs, kwargs)
+    logger.debug(f"stage_configs: {stage_configs}")
 
     return config_path, stage_configs
 
@@ -347,6 +653,7 @@ def get_final_stage_id_for_e2e(
         output_modalities = default_modalities
 
     try:
+        final_stage_id_for_e2e = last_stage_id
         for _sid in range(last_stage_id, -1, -1):
             if (
                 getattr(stage_list[_sid], "final_output", False)
@@ -354,8 +661,6 @@ def get_final_stage_id_for_e2e(
             ):
                 final_stage_id_for_e2e = _sid
                 break
-        if final_stage_id_for_e2e < 0:
-            final_stage_id_for_e2e = last_stage_id
     except Exception as e:
         logger.debug(
             "[Orchestrator] Failed to determine final stage for E2E; \

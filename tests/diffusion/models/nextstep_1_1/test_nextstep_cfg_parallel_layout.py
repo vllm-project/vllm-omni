@@ -8,6 +8,8 @@ import vllm_omni.diffusion.models.nextstep_1_1.pipeline_nextstep_1_1 as nextstep
 from vllm_omni.diffusion.models.nextstep_1_1.modeling_nextstep_heads import FlowMatchingHead
 from vllm_omni.diffusion.models.nextstep_1_1.pipeline_nextstep_1_1 import NextStep11Pipeline
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class _DummyImageHead:
     def __init__(self, token_dim: int):

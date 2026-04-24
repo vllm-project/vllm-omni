@@ -10,6 +10,7 @@ from torch import nn
 from transformers import BatchFeature, Qwen2Config
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
+from vllm.inputs import ModalityData, MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models import SupportsPP
@@ -18,9 +19,7 @@ from vllm.model_executor.models.utils import init_vllm_registered_model
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     AudioItem,
-    ModalityData,
     MultiModalBatchedField,
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalFieldElem,
     MultiModalKwargsItem,
@@ -255,7 +254,7 @@ class MiMoAudioLLMDummyInputsBuilder(BaseDummyInputsBuilder[MiMoAudioLLMProcessi
 
         dummy_processor_inputs = ProcessorInputs(
             prompt=dummy_text,
-            mm_items=dummy_mm_items,
+            mm_data_items=dummy_mm_items,
         )
 
         return dummy_processor_inputs
@@ -308,10 +307,6 @@ class MiMoAudioDataParser(MultiModalDataParser):
     ):
         if data is None:
             return AudioProcessorItems(None)
-
-        # also check single audio item with sampling rate
-        if self._is_empty(data) or (isinstance(data, tuple) and self._is_empty(data[0])):
-            return None
 
         if (
             is_list_of(data, float)
@@ -818,11 +813,13 @@ class MiMoAudioForConditionalGeneration(
                 )
             )
 
-            audio_tensor = self.generate_audio(code)
+            audio_result = self.token2wav(codes=code, **kwargs)
+            if isinstance(audio_result, OmniOutput):
+                return audio_result
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={
-                    "model_outputs": audio_tensor.reshape(1, -1) if audio_tensor is not None else audio_tensor
+                    "model_outputs": audio_result.reshape(1, -1) if audio_result is not None else audio_result
                 },
             )
 

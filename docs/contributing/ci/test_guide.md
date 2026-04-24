@@ -1,0 +1,106 @@
+# Test Guide
+## Setting Up the Test Environment
+### Creating a Container
+vLLM-Omni provides an official Docker image for deployment. These images are built upon vLLM Docker images and are available on [Docker Hub](https://hub.docker.com/r/vllm/vllm-omni/tags). The version of vLLM-Omni indicates which vLLM release it is based on.
+For a local test environment, you can follow the steps below to create a container:
+## Installing Dependencies
+### vLLM & vLLM-Omni
+vLLM-Omni is built based on vLLM. You can follow [install guide](../../getting_started/installation/README.md) to build your local environment.
+
+### Test Case Dependencies
+When running test cases, you may need to install the following dependencies:
+
+```bash
+uv pip install ".[dev]"
+apt-get install -y ffmpeg
+```
+
+## Running Tests
+Our test scripts use the pytest framework. First, please use `git clone https://github.com/vllm-project/vllm-omni.git` to download the vllm-omni source code. Then, in the root directory of vllm-omni, you can run the following commands in your local test environment to execute the corresponding test cases.
+
+=== "L1 level"
+
+    ```bash
+    cd tests
+    pytest -s -v -m "core_model and cpu"
+    ```
+    The latest test command is available in the "Simple Unit Test" step of this [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-ready.yml).
+
+=== "L2 level"
+
+    ```bash
+    cd tests
+    pytest -s -v -m "core_model and not cpu" --run-level=core_model
+    ```
+    If you only want to run a specific test case, you can use:
+    ```bash
+    pytest -s -v test_xxxx.py --run-level=core_model
+    ```
+    If you only want to run specific test cases on a particular platform, you can use:
+    ```bash
+    pytest -s -v -m "core_model and distributed_cuda and L4"  --run-level=core_model
+    ```
+    The latest test commands for various test suites can be found in the [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-ready.yml).
+
+=== "L3 level"
+
+    ```bash
+    pytest -s -v -m "advanced_model" --run-level=advanced_model
+    ```
+    If you only want to run a specific test case, you can use:
+    ```bash
+    pytest -s -v test_xxxx.py --run-level=advanced_model
+    ```
+    If you only want to run specific test cases on a particular platform, you can use:
+    ```bash
+    pytest -s -v -m "advanced_model and distributed_cuda and L4"  --run-level=advanced_model
+    ```
+    The latest L3 test commands for various test suites can be found in the [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-merge.yml).
+
+
+=== "L4 level"
+
+    ```bash
+    cd tests
+    pytest -s -v -m "full_model" --run-level=full_model
+    ```
+    If you only want to run a specific test case, you can use:
+    ```bash
+    pytest -s -v test_xxxx.py --run-level=full_model
+    ```
+    If you only want to run specific test cases on a particular platform, you can use:
+    ```bash
+    pytest -s -v -m "full_model and distributed_cuda and L4"  --run-level=full_model
+    ```
+    Note: To run performance tests (defaults to ``test_qwen_omni.json``; use ``--test-config-file tests/dfx/perf/tests/test_tts.json`` for TTS):
+    ```bash
+    pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
+    ```
+    The latest L4 (nightly) test commands use the `full_model` marker and `--run-level full_model` (see [test-nightly.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly.yml) and [test-nightly-diffusion.yml](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-nightly-diffusion.yml)). Example:
+
+    ```bash
+    cd tests
+    pytest -s -v -m "full_model and omni and H100" --run-level=full_model
+    ```
+
+=== "L5 level"
+
+    L5 includes stability and reliability testing. Typical commands:
+
+    ```bash
+    cd tests
+
+    # Stability: Qwen3-Omni
+    pytest -s -v dfx/stability/scripts/test_stability_qwen3_omni.py
+
+    # Stability: Wan2.2 (v1/videos diffusion benchmark loop)
+    pytest -s -v dfx/stability/scripts/test_stability_wan22.py
+
+    ```
+
+    The latest L5 commands for CI can be found in the [pipeline](https://github.com/vllm-project/vllm-omni/blob/main/.buildkite/test-ready.yml).
+
+You can find more information about markers in the documentation: [marker doc](./tests_markers.md)
+
+## Adding New Test Cases
+Please refer to the [L5 Layering Specification document](./CI_5levels.md).

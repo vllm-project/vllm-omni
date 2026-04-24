@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: "{{ .Release.Name }}-deployment-vllm-omni"
+  namespace: {{ .Release.Namespace }}
+  labels:
+  {{- include "chart.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  {{- include "chart.strategy" . | nindent 2 }}
+  selector:
+    matchLabels:
+    {{- include "chart.labels" . | nindent 6 }}
+  progressDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+      {{- include "chart.labels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: "vllm-omni"
+          image: "{{ required "Required value 'image.repository' must be defined !" .Values.image.repository }}:{{ required "Required value 'image.tag' must be defined !" .Values.image.tag }}"
+          command:
+            {{- include "chart.omni-command" . | nindent 12 }}
+          securityContext:
+            {{- if .Values.image.securityContext }}
+              {{- with .Values.image.securityContext }}
+              {{- toYaml . | nindent 12 }}
+              {{- end }}
+            {{- else }}
+            runAsNonRoot: false
+              {{- include "chart.user" . | indent 12 }}
+            {{- end }}
+          imagePullPolicy: IfNotPresent
+          env:
+            {{- include "chart.hf-env" . | nindent 12 }}
+            {{- if .Values.image.env }}
+            {{- toYaml .Values.image.env | nindent 12 }}
+            {{- end }}
+          {{- if or .Values.externalConfigs .Values.configs .Values.secrets }}
+          envFrom:
+            {{- if .Values.configs }}
+            - configMapRef:
+                name: "{{ .Release.Name }}-configs"
+            {{- end }}
+            {{- if .Values.secrets }}
+            - secretRef:
+                name: "{{ .Release.Name }}-secrets"
+            {{- end }}
+            {{- include "chart.externalConfigs" . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: {{ include "chart.container-port-name" . }}
+              containerPort: {{ include "chart.container-port" . }}
+            {{- include "chart.extraPorts" . | nindent 12 }}
+          {{- include "chart.probes" . | indent 10 }}
+          resources: {{- include "chart.resources" . | nindent 12 }}
+          volumeMounts:
+          - name: shm
+            mountPath: /dev/shm
+          - name: model-cache
+            mountPath: /cache
+
+        {{- with .Values.extraContainers }}
+        {{ toYaml . | nindent 8 }}
+        {{- end }}
+
+      {{- if .Values.extraInit.initContainers }}
+      initContainers:
+        {{- toYaml .Values.extraInit.initContainers | nindent 8 }}
+      {{- end }}
+
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.shmSize }}
+        - name: model-cache
+          {{- if .Values.modelCache.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-model-cache
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.gpuModels }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                - key: nvidia.com/gpu.product
+                  operator: In
+                  values:
+                    {{- toYaml .Values.gpuModels | nindent 20 }}
+      {{- end }}

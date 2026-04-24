@@ -1,0 +1,31 @@
+[
+    {
+        "test_name": "test_wan22_i2v_stability_v1_videos",
+        "server_params": {
+            "model": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+            "serve_args": {
+                "ulysses-degree": 2,
+                "vae-patch-parallel-size": 2,
+                "tensor-parallel-size": 1,
+                "use-hsdp": true,
+                "vae-use-slicing": true,
+                "vae-use-tiling": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "dataset": "random",
+                "task": "i2v",
+                "backend": "v1/videos",
+                "duration_sec": 86400,
+                "max_concurrency": 1,
+                "num_prompts_per_batch": 20,
+                "enable_negative_prompt": true,
+                "random_request_config": [
+                    {"width": 832, "height": 480, "num_inference_steps": 4, "num_frames": 81, "fps": 16, "weight": 0.5},
+                    {"width": 1280, "height": 720, "num_inference_steps": 4, "num_frames": 121, "fps": 16, "weight": 0.5}
+                ]
+            }
+        ]
+    }
+]

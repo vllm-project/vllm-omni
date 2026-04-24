@@ -4,9 +4,11 @@
 import math
 import time
 from collections import OrderedDict
+from typing import get_args
 
 import torch
 import torch.nn as nn
+from vllm.config.lora import MaxLoRARanks
 from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.lora.lora_model import LoRAModel
@@ -37,6 +39,9 @@ class DiffusionLoRAManager:
     Reuses vLLM's LoRA infrastructure, adapted for diffusion pipelines.
     Uses LRU cache management similar to LRUCacheLoRAModelManager.
     """
+
+    # Valid max allowed ranks for LoRA in vLLM
+    _VALID_MAX_RANKS: list[int] = sorted(get_args(MaxLoRARanks))
 
     def __init__(
         self,
@@ -132,17 +137,43 @@ class DiffusionLoRAManager:
     def _compute_packed_modules_mapping(self) -> dict[str, list[str]]:
         """Collect packed->sublayer mappings from the diffusion model.
 
-        vLLM models declare `packed_modules_mapping` on the model class. For
-        diffusion pipelines, we attach the same mapping on the transformer
-        module(s) that implement packed (fused) projections, so LoRA loading can
-        accept checkpoints trained against the logical sub-projections.
+        Diffusion models often use packed (fused) projections like `to_qkv` or
+        `w13`, while LoRA checkpoints are typically saved against the logical
+        sub-projections (e.g. `to_q`/`to_k`/`to_v`, `w1`/`w3`). Many diffusion
+        model implementations already define these relationships in
+        `load_weights()` via `stacked_params_mapping`. To avoid duplicating the
+        mapping in multiple places, we derive packed→sublayer mappings from the
+        model's `stacked_params_mapping`.
         """
+
+        def _derive_from_stacked_params_mapping(stacked: object) -> dict[str, list[str]]:
+            if not isinstance(stacked, (list, tuple)):
+                return {}
+            derived: dict[str, list[str]] = {}
+            for item in stacked:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                packed_suffix, sub_suffix = item[0], item[1]
+                if not isinstance(packed_suffix, str) or not packed_suffix:
+                    continue
+                if not isinstance(sub_suffix, str) or not sub_suffix:
+                    continue
+                # The mapping strings are usually suffix patterns (e.g. ".to_qkv"),
+                # but some models scope them under submodules (e.g. ".attn1.to_qkv").
+                # For LoRA we only care about the leaf module names.
+                packed_name = packed_suffix.strip(".").split(".")[-1]
+                sub_name = sub_suffix.strip(".").split(".")[-1]
+                existing = derived.get(packed_name)
+                if existing is None:
+                    derived[packed_name] = [sub_name]
+                elif sub_name not in existing:
+                    existing.append(sub_name)
+            return derived
+
         mapping: dict[str, list[str]] = {}
         for module in self.pipeline.modules():
-            packed = getattr(module, "packed_modules_mapping", None)
-            if not isinstance(packed, dict):
-                continue
-            for packed_name, sub_names in packed.items():
+            derived = _derive_from_stacked_params_mapping(getattr(module, "stacked_params_mapping", None))
+            for packed_name, sub_names in derived.items():
                 if not isinstance(packed_name, str) or not packed_name:
                     continue
                 if not isinstance(sub_names, (list, tuple)) or not all(isinstance(s, str) for s in sub_names):
@@ -156,7 +187,7 @@ class DiffusionLoRAManager:
                     mapping[packed_name] = sub_names_list
                 elif existing != sub_names_list:
                     logger.warning(
-                        "Conflicting packed_modules_mapping for %s: %s vs %s; using %s",
+                        "Conflicting packed module mapping for %s: %s vs %s; using %s",
                         packed_name,
                         existing,
                         sub_names_list,
@@ -171,7 +202,7 @@ class DiffusionLoRAManager:
             return None
         if len(sub_suffixes) != n_slices:
             logger.warning(
-                "packed_modules_mapping[%s] has %d slices but layer expects %d; skipping sublayer lookup",
+                "Packed module mapping[%s] has %d slices but layer expects %d; skipping sublayer lookup",
                 packed_module_suffix,
                 len(sub_suffixes),
                 n_slices,
@@ -187,10 +218,16 @@ class DiffusionLoRAManager:
             lora_scale: The external scale for the LoRA adapter.
         """
         if lora_request is None:
+            if self._active_adapter_id is None:
+                logger.debug("No lora_request provided and adapters are already inactive")
+                return
             logger.debug("No lora_request provided, deactivating all LoRA adapters")
             self._deactivate_all_adapters()
             return
         elif math.isclose(0.0, lora_scale):
+            if self._active_adapter_id is None:
+                logger.debug("Received LoRA scale 0 with adapters already inactive")
+                return
             logger.warning("Received a request with LoRA scale 0; deactivating all LoRA adapters")
             self._deactivate_all_adapters()
             return
@@ -329,12 +366,16 @@ class DiffusionLoRAManager:
             fully_sharded_loras=False,
         )
 
-        for component_name in ("transformer", "transformer_2", "dit"):
+        for component_name in ("transformer", "transformer_2", "dit", "bagel"):
             if not hasattr(self.pipeline, component_name):
                 continue
             component = getattr(self.pipeline, component_name)
             if not isinstance(component, nn.Module):
                 continue
+
+            # Collect replacements first to avoid mutating the module tree
+            # while iterating over named_modules().
+            pending_replacements: list[tuple[str, str, nn.Module, list[str]]] = []
 
             for module_name, module in component.named_modules(remove_duplicate=False):
                 # Don't recurse into already-replaced LoRA wrappers. Their
@@ -364,6 +405,9 @@ class DiffusionLoRAManager:
                     if not should_replace:
                         continue
 
+                pending_replacements.append((module_name, full_module_name, module, packed_modules_list))
+
+            for module_name, full_module_name, module, packed_modules_list in pending_replacements:
                 lora_layer = from_layer_diffusion(
                     layer=module,
                     max_loras=1,
@@ -387,11 +431,10 @@ class DiffusionLoRAManager:
         if min_rank <= self._max_lora_rank:
             return
 
-        if min_rank <= 0:
-            raise ValueError(f"Invalid LoRA rank: {min_rank}")
+        valid_max_rank = self._get_smallest_valid_max_rank(min_rank)
 
-        logger.info("Increasing max LoRA rank: %d -> %d", self._max_lora_rank, min_rank)
-        self._max_lora_rank = min_rank
+        logger.info("Increasing max LoRA rank: %d -> %d", self._max_lora_rank, valid_max_rank)
+        self._max_lora_rank = valid_max_rank
 
         if not self._lora_modules:
             return
@@ -414,6 +457,18 @@ class DiffusionLoRAManager:
             active_scale = self._adapter_scales[active_id]
             self._active_adapter_id = None
             self._activate_adapter(active_id, active_scale)
+
+    @classmethod
+    def _get_smallest_valid_max_rank(cls, min_rank: int) -> int:
+        """Given a LoRA rank, get the smallest max rank that can support it."""
+        if min_rank <= 0:
+            raise ValueError(f"Invalid LoRA rank: {min_rank}")
+
+        allowed_ranks = [rank for rank in cls._VALID_MAX_RANKS if rank >= min_rank]
+        if not allowed_ranks:
+            raise ValueError(f"LoRA rank of {min_rank} exceeds max allowed rank of {max(cls._VALID_MAX_RANKS)}")
+
+        return min(allowed_ranks)
 
     def _get_lora_weights(
         self,
@@ -563,6 +618,9 @@ class DiffusionLoRAManager:
         self._update_adapter_scale(adapter_id, scale)
 
     def _deactivate_all_adapters(self) -> None:
+        if self._active_adapter_id is None:
+            logger.debug("All adapters already inactive")
+            return
         logger.info("Deactivating all adapters: %d layers", len(self._lora_modules))
         for lora_layer in self._lora_modules.values():
             lora_layer.reset_lora(0)

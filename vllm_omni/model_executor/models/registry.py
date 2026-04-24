@@ -1,4 +1,8 @@
-from vllm.model_executor.models.registry import _VLLM_MODELS, _LazyRegisteredModel, _ModelRegistry
+from vllm.model_executor.models.registry import (
+    _VLLM_MODELS,
+    _LazyRegisteredModel,
+    _ModelRegistry,
+)
 
 _OMNI_MODELS = {
     "Qwen2_5OmniForConditionalGeneration": (
@@ -48,6 +52,41 @@ _OMNI_MODELS = {
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
     ),
+    "CosyVoice3Model": (
+        "cosyvoice3",
+        "cosyvoice3",
+        "CosyVoice3Model",
+    ),
+    "OmniVoiceModel": (
+        "omnivoice",
+        "omnivoice",
+        "OmniVoiceModel",
+    ),
+    "MammothModa2Qwen2ForCausalLM": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen2ForCausalLM",
+    ),
+    "MammothModa2ARForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ARForConditionalGeneration",
+    ),
+    "MammothModa2DiTPipeline": (
+        "mammoth_moda2",
+        "pipeline_mammothmoda2_dit",
+        "MammothModa2DiTPipeline",
+    ),
+    "MammothModa2ForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ForConditionalGeneration",
+    ),
+    "Mammothmoda2Model": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ForConditionalGeneration",
+    ),
     "Qwen3TTSForConditionalGeneration": (
         "qwen3_tts",
         "qwen3_tts_talker",
@@ -69,6 +108,11 @@ _OMNI_MODELS = {
         "mimo_audio",
         "MiMoAudioForConditionalGeneration",
     ),
+    "MiMoV2ASRForCausalLM": (
+        "mimo_audio",
+        "mimo_audio",
+        "MiMoAudioForConditionalGeneration",
+    ),
     "MiMoAudioLLMModel": (
         "mimo_audio",
         "mimo_audio_llm",
@@ -85,6 +129,78 @@ _OMNI_MODELS = {
         "glm_image_ar",
         "GlmImageForConditionalGeneration",
     ),
+    "OmniBagelForConditionalGeneration": (
+        "bagel",
+        "bagel",
+        "OmniBagelForConditionalGeneration",
+    ),
+    "HunyuanImage3ForCausalMM": (
+        "hunyuan_image3",
+        "hunyuan_image3",
+        "HunyuanImage3ForConditionalGeneration",
+    ),
+    ## fish_speech (Fish Speech S2 Pro)
+    "FishSpeechSlowARForConditionalGeneration": (
+        "fish_speech",
+        "fish_speech_slow_ar",
+        "FishSpeechSlowARForConditionalGeneration",
+    ),
+    "FishSpeechDACDecoder": (
+        "fish_speech",
+        "fish_speech_dac_decoder",
+        "FishSpeechDACDecoder",
+    ),
+    ## VoxCPM
+    "VoxCPMForConditionalGeneration": (
+        "voxcpm",
+        "voxcpm",
+        "VoxCPMForConditionalGeneration",
+    ),
+    ## VoxCPM2
+    "VoxCPM2TalkerForConditionalGeneration": (
+        "voxcpm2",
+        "voxcpm2_talker",
+        "VoxCPM2TalkerForConditionalGeneration",
+    ),
+    ## Voxtral TTS
+    "VoxtralTTSForConditionalGeneration": (
+        "voxtral_tts",
+        "voxtral_tts",
+        "VoxtralTTSForConditionalGeneration",
+    ),
+    "VoxtralTTSAudioGeneration": (
+        "voxtral_tts",
+        "voxtral_tts_audio_generation",
+        "VoxtralTTSAudioGenerationForConditionalGeneration",
+    ),
+    "VoxtralTTSAudioTokenizer": ("voxtral_tts", "voxtral_tts_audio_tokenizer", "VoxtralTTSAudioTokenizer"),
+    "DyninOmniForConditionalGeneration": (
+        "dynin_omni",
+        "dynin_omni",
+        "DyninOmniForConditionalGeneration",
+    ),
+    ## Ming-flash-omni-2.0
+    "MingFlashOmniForConditionalGeneration": (
+        "ming_flash_omni",
+        "ming_flash_omni",
+        "MingFlashOmniForConditionalGeneration",
+    ),
+    "MingFlashOmniThinkerForConditionalGeneration": (
+        "ming_flash_omni",
+        "ming_flash_omni_thinker",
+        "MingFlashOmniThinkerForConditionalGeneration",
+    ),
+    "MingFlashOmniTalkerForConditionalGeneration": (
+        "ming_flash_omni",
+        "ming_flash_omni_talker",
+        "MingFlashOmniTalkerForConditionalGeneration",
+    ),
+    # Alias: HF repo currently ships this architecture name in config.json
+    "BailingMM2NativeForConditionalGeneration": (
+        "ming_flash_omni",
+        "ming_flash_omni",
+        "MingFlashOmniForConditionalGeneration",
+    ),
 }
 
 
@@ -92,7 +208,6 @@ _VLLM_OMNI_MODELS = {
     **_VLLM_MODELS,
     **_OMNI_MODELS,
 }
-
 
 OmniModelRegistry = _ModelRegistry(
     {

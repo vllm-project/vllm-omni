@@ -7,6 +7,7 @@ tasks, then runs Omni generation and saves output wav files.
 import asyncio
 import logging
 import os
+import time
 from typing import Any, NamedTuple
 
 import soundfile as sf
@@ -50,16 +51,68 @@ def _estimate_prompt_len(
 
             tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, padding_side="left")
             cfg = Qwen3TTSConfig.from_pretrained(model_name, trust_remote_code=True)
-            _cache[model_name] = (tok, getattr(cfg, "talker_config", None))
 
-        tok, tcfg = _cache[model_name]
+            # Load speech tokenizer (codec encoder) for exact ref_code_len.
+            speech_tok = None
+            try:
+                import os
+
+                from transformers.utils import cached_file
+
+                from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_tokenizer import Qwen3TTSTokenizer
+
+                st_cfg_path = cached_file(model_name, "speech_tokenizer/config.json")
+                if st_cfg_path:
+                    speech_tok = Qwen3TTSTokenizer.from_pretrained(
+                        os.path.dirname(st_cfg_path), torch_dtype=torch.bfloat16
+                    )
+                    logger.info("Loaded speech tokenizer for exact ref_code_len estimation")
+            except Exception as e:
+                logger.debug("Could not load speech tokenizer: %s", e)
+
+            _cache[model_name] = (tok, getattr(cfg, "talker_config", None), speech_tok)
+
+        tok, tcfg, speech_tok = _cache[model_name]
         task_type = (additional_information.get("task_type") or ["CustomVoice"])[0]
+
+        def _estimate_ref_code_len(ref_audio: object) -> int | None:
+            """Encode ref_audio with the actual codec to get exact frame count."""
+            if not isinstance(ref_audio, (str, list)):
+                return None
+            audio_path = ref_audio[0] if isinstance(ref_audio, list) else ref_audio
+            if not isinstance(audio_path, str) or not audio_path.strip():
+                return None
+            try:
+                from vllm.multimodal.media import MediaConnector
+
+                connector = MediaConnector(allowed_local_media_path="/")
+                audio, sr = connector.fetch_audio(audio_path)
+                import numpy as np
+
+                wav_np = np.asarray(audio, dtype=np.float32)
+
+                if speech_tok is not None:
+                    enc = speech_tok.encode(wav_np, sr=int(sr), return_dict=True)
+                    ref_code = getattr(enc, "audio_codes", None)
+                    if isinstance(ref_code, list):
+                        ref_code = ref_code[0] if ref_code else None
+                    if ref_code is not None and hasattr(ref_code, "shape"):
+                        shape = ref_code.shape
+                        return int(shape[0]) if len(shape) == 2 else int(shape[1]) if len(shape) == 3 else None
+
+                # Fallback: estimate from duration
+                codec_hz = getattr(tcfg, "codec_frame_rate", None) or 12
+                return int(len(audio) / sr * codec_hz)
+            except Exception:
+                return None
+
         return Qwen3TTSTalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(
             additional_information=additional_information,
             task_type=task_type,
             tokenize_prompt=lambda t: tok(t, padding=False)["input_ids"],
             codec_language_id=getattr(tcfg, "codec_language_id", None),
             spk_is_dialect=getattr(tcfg, "spk_is_dialect", None),
+            estimate_ref_code_len=_estimate_ref_code_len,
         )
     except Exception as exc:
         logger.warning("Failed to estimate prompt length, using fallback 2048: %s", exc)
@@ -78,10 +131,16 @@ def get_custom_voice_query(use_batch_sample: bool = False) -> QueryResult:
     task_type = "CustomVoice"
     model_name = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     if use_batch_sample:
-        texts = ["其实我真的有发现，我是一个特别善于观察别人情绪的人。", "She said she would be here by noon."]
-        instructs = ["", "Very happy."]
-        languages = ["Chinese", "English"]
-        speakers = ["Vivian", "Ryan"]
+        texts = [
+            "其实我真的有发现，我是一个特别善于观察别人情绪的人。",
+            "She said she would be here by noon.",
+            "I like you very much.",
+            "Really, you do?",
+            "Yes, absolutely.",
+        ]
+        instructs = ["", "Very happy.", "Very happy.", "Very happy.", "Very happy."]
+        languages = ["Chinese", "English", "English", "English", "English"]
+        speakers = ["Vivian", "Ryan", "Ryan", "Ryan", "Ryan"]
         inputs = []
         for text, instruct, language, speaker in zip(texts, instructs, languages, speakers):
             additional_information = {
@@ -307,19 +366,14 @@ def main(args):
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    omni = Omni(
-        model=model_name,
-        stage_configs_path=args.stage_configs_path,
-        log_stats=args.log_stats,
-        stage_init_timeout=args.stage_init_timeout,
-    )
+    omni = Omni.from_cli_args(args, model=model_name)
 
     batch_size = args.batch_size
     for batch_start in range(0, len(inputs), batch_size):
         batch = inputs[batch_start : batch_start + batch_size]
         for stage_outputs in omni.generate(batch):
-            for output in stage_outputs.request_output:
-                _save_wav(output_dir, output.request_id, output.outputs[0].multimodal_output)
+            output = stage_outputs.request_output
+            _save_wav(output_dir, output.request_id, output.outputs[0].multimodal_output)
 
 
 async def main_streaming(args):
@@ -328,22 +382,31 @@ async def main_streaming(args):
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    omni = AsyncOmni(
-        model=model_name,
-        stage_configs_path=args.stage_configs_path,
-        log_stats=args.log_stats,
-        stage_init_timeout=args.stage_init_timeout,
-    )
+    omni = AsyncOmni.from_cli_args(args, model=model_name)
 
     for i, prompt in enumerate(inputs):
         request_id = str(i)
+        t_start = time.perf_counter()
+        t_prev = t_start
+        chunk_idx = 0
         async for stage_output in omni.generate(prompt, request_id=request_id):
             mm = stage_output.request_output.outputs[0].multimodal_output
             if not stage_output.finished:
+                t_now = time.perf_counter()
                 audio = mm.get("audio")
                 n = len(audio) if isinstance(audio, list) else (0 if audio is None else 1)
-                logger.info(f"Request {request_id}: received chunk {n}")
+                dt_ms = (t_now - t_prev) * 1000
+                ttfa_ms = (t_now - t_start) * 1000
+                if chunk_idx == 0:
+                    logger.info(f"Request {request_id}: chunk {chunk_idx} samples={n} TTFA={ttfa_ms:.1f}ms")
+                else:
+                    logger.info(f"Request {request_id}: chunk {chunk_idx} samples={n} inter_chunk={dt_ms:.1f}ms")
+                t_prev = t_now
+                chunk_idx += 1
             else:
+                t_end = time.perf_counter()
+                total_ms = (t_end - t_start) * 1000
+                logger.info(f"Request {request_id}: done total={total_ms:.1f}ms chunks={chunk_idx}")
                 _save_wav(output_dir, request_id, mm)
 
 

@@ -1,0 +1,34 @@
+[
+    {
+        "test_name": "test_qwen3_tts",
+        "server_params": {
+            "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+        },
+        "benchmark_params": [
+            {
+                "dataset_name": "random",
+                "backend": "openai-audio-speech",
+                "endpoint": "/v1/audio/speech",
+                "num_prompts": [
+                    10,
+                    40
+                ],
+                "max_concurrency": [
+                    1,
+                    4
+                ],
+                "random_input_len": 100,
+                "random_output_len": 100,
+                "extra_body": {
+                    "voice": "Vivian",
+                    "language": "English"
+                },
+                "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
+                "baseline": {
+                    "mean_audio_ttfp_ms": [6000, 6000],
+                    "mean_audio_rtf": [0.3, 0.3]
+                }
+            }
+        ]
+    }
+]

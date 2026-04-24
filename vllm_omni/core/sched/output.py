@@ -3,30 +3,26 @@ from dataclasses import dataclass, field
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
-from vllm_omni.engine import AdditionalInformationPayload, PromptEmbedsPayload
+from vllm_omni.engine import AdditionalInformationPayload
 
 
 @dataclass
 class OmniNewRequestData(NewRequestData):
     """New request data for omni models with embeddings support.
 
-    Extends NewRequestData to include prompt embeddings and additional
-    information for direct transfer between pipeline stages.
+    Extends NewRequestData to include additional information for direct
+    transfer between pipeline stages.
+
+    Note: prompt_embeds is inherited from NewRequestData
+    (torch.Tensor | None).
 
     Args:
-        prompt_embeds: Optional serialized prompt embeddings payload
-            (overrides parent's torch.Tensor type with PromptEmbedsPayload
-            for cross-process serialization)
         external_req_id: Optional external request ID for tracking
         additional_information: Optional serialized additional information
             dictionary containing tensors or lists
     """
 
-    # Optional serialized prompt embeddings (override parent type for serialization)
-    prompt_embeds: PromptEmbedsPayload | None = None  # type: ignore[assignment]
-    # Optional external request ID for tracking
     external_req_id: str | None = None
-    # Optional serialized additional information
     additional_information: AdditionalInformationPayload | None = None
 
     @classmethod
@@ -71,6 +67,7 @@ class OmniCachedRequestData(CachedRequestData):
     """
 
     prompt_token_ids: dict[str, list[int]]
+    additional_information: dict[str, dict | None]
 
 
 @dataclass

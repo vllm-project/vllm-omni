@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.16.0
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.19.0
 FROM ${BASE_IMAGE} AS base
 
 # Declare a variable to know if we want to use the nightly build or the stable build.
@@ -10,7 +10,7 @@ FROM ${BASE_IMAGE} AS base
 #    we should swap over to use stable release ASAP.
 #    We should avoid relying on custom commits.
 ARG USE_NIGHTLY_BUILD=0
-ARG VLLM_VERSION_OR_COMMIT_HASH=2d5be1dd5ce2e44dfea53ea03ff61143da5137eb
+ARG VLLM_VERSION_OR_COMMIT_HASH=89138b21cc246ae944c741d5c399c148e2b770ab
 ARG ARG_PYTORCH_ROCM_ARCH
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 
@@ -18,8 +18,10 @@ ARG COMMON_WORKDIR=/app
 WORKDIR ${COMMON_WORKDIR}
 
 # Step 1: Setup - Install system dependencies
+# Need to include ffmpeg because vllm rocm upstream docker image
+# does not include it.
 RUN apt-get update && \
-    apt-get install -y ffmpeg git sox libsox-fmt-all jq && \
+    apt-get install -y espeak-ng ffmpeg git jq && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -39,6 +41,24 @@ RUN if [ "${USE_NIGHTLY_BUILD}" = "1" ]; then \
 # Step 3: Copy vllm-omni code and install without uv
 RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
 COPY . ${COMMON_WORKDIR}/vllm-omni
+
+# This is a workaround to ensure pytest exits with the correct status code in CI tests.
+RUN printf '%s\n' \
+    'import os' \
+    '' \
+    '_exit_code = 1' \
+    '' \
+    'def pytest_sessionfinish(session, exitstatus):' \
+    '    global _exit_code' \
+    '    _exit_code = int(exitstatus)' \
+    '' \
+    'def pytest_unconfigure(config):' \
+    '    import sys' \
+    '    sys.stdout.flush()' \
+    '    sys.stderr.flush()' \
+    '    os._exit(_exit_code)' \
+    > ${COMMON_WORKDIR}/vllm-omni/conftest.py
+
 RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir ".[dev]" --no-build-isolation
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python

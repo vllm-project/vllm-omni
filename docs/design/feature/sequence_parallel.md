@@ -7,6 +7,7 @@ This section describes how to add Sequence Parallel (SP) to a diffusion transfor
 ## Table of Contents
 
 - [Overview](#overview)
+- [UAA Mode (Experimental)](#uaa-mode-experimental)
 - [Approach 1: Non-Intrusive `_sp_plan` (Recommended)](#approach-1-non-intrusive-_sp_plan-recommended)
 - [Approach 2: Intrusive Modification (For Complex Cases)](#approach-2-intrusive-modification-for-complex-cases)
 - [Testing](#testing)
@@ -46,6 +47,41 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard, sp_gather
 
 ---
 
+## UAA Mode (Experimental)
+
+`ulysses_mode="advanced_uaa"` enables the experimental UAA ("Ulysses Anything Attention") feature, which lets Ulysses attention handle arbitrary sequence lengths and arbitrary attention head counts. The same idea is also supported by [Cache-DiT](https://cache-dit.readthedocs.io/en/latest/user_guide/CONTEXT_PARALLEL/#uaa-ulysses-anything-attention).
+
+Use it when plain Ulysses-SP would otherwise fail because:
+
+- the local sequence shards are not evenly divisible after split hooks, or
+- the attention head count is not divisible by `ulysses_degree`.
+
+### Design Summary
+
+1. **Strict mode stays unchanged.**
+   `ulysses_mode="strict"` keeps the original fast path and still requires divisible sequence/head shapes.
+
+2. **UAA uses variable all-to-all split sizes for sequence shards.**
+   Before the Ulysses Q/K/V exchange, each rank all-gathers its local sequence length and uses those lengths as `all_to_all_single(..., output_split_sizes=seq_lens)`. This lets Ulysses gather the full sequence even when each rank started with a different local shard length.
+
+3. **UAA pads heads only inside the Ulysses exchange.**
+   If `head_cnt % ulysses_degree != 0`, UAA pads the head dimension up to the next multiple of `ulysses_degree`, performs the forward/reverse all-to-all, then slices the temporary head padding away after the reverse exchange. The same rule is applied to joint attention tensors.
+
+4. **Hybrid Ulysses + Ring is still shape-constrained.**
+   Ring attention expects every rank in a ring group to exchange exactly the same post-Ulysses sequence shape. UAA therefore validates those shapes before entering the ring path and raises a clear error if ring peers disagree on `S_global`.
+
+5. **Tiny scalar gathers stay out of TorchDynamo tracing.**
+   `_all_gather_int()` is marked with `@torch.compiler.disable` so the scalar `item()` conversions used by UAA metadata collection do not get traced into `torch.compile`.
+
+### UAA vs `auto_pad`
+
+- `auto_pad=True` pads sequence tokens in `_sp_plan` and requires attention backends that support `attention_mask`.
+- `advanced_uaa` does not depend on mask-based token padding inside Ulysses attention. It is therefore a better fit for non-divisible head counts and uneven Ulysses shard sizes.
+- `auto_pad=True` remains incompatible with Ring attention because the ring backend does not consume `attention_mask`.
+- `advanced_uaa` is still experimental and hybrid mode remains limited by Ring's equal-shape requirement.
+
+---
+
 ## Approach 1: Non-Intrusive `_sp_plan` (Recommended)
 
 The `_sp_plan` mechanism allows SP **without modifying `forward()` logic**. The framework automatically registers hooks to shard inputs and gather outputs at module boundaries.
@@ -54,6 +90,8 @@ The `_sp_plan` mechanism allows SP **without modifying `forward()` logic**. The 
 - Standard transformer architectures
 - Tensor operations happen at `nn.Module` boundaries
 - Predictable sharding/gathering patterns
+
+This is the ideal approach for integrating sequence parallelism into new models, as it is easier to maintain and ensure compatibility with other types of acceleration.
 
 **How it works:**
 1. Declare `_sp_plan` dict in your transformer class
@@ -201,6 +239,36 @@ class TransformerWithRoPE(nn.Module):
     }
 ```
 
+**Pattern 3: Shard RoPE for Dual Stream Attention**
+In some cases, different streams in attention may need to handle sequence parallelism differently. For example, we may want to shard the image embeddings, while replicating the text embeddings to correctly configure joint attention.
+
+```python
+class DualStreamTransformer(nn.Module):
+    """
+    Dual-stream model where we need to replicate the text components, but shard
+    the image components to correctly handle sequence parallelism.
+    """
+    _sp_plan = {
+        # In this case, the rope_preparer returns a tuple of len 4, where the
+        # first 2 items correspond to the text, and the second 2 correspond to
+        # visual inputs, so we only shard the second.
+        "rope_preparer": {
+            # Outputs 0, 1 (text) - NOT sharded (replicated)
+            # Outputs 2, 3 (image) - sharded
+            2: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True),  # img_cos
+            3: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True),  # img_sin
+        },
+        # Shard transformer block INPUT
+        "transformer_blocks.0": {
+            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3),
+        },
+        # Gather at output
+        "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
+```
+
+NOTE: be careful to test adequately when refactoring classes that take this style of plan, as changing the order of the return values will break sequence parallelism.
+
 ### API Reference
 
 **SequenceParallelInput Parameters:**
@@ -241,6 +309,7 @@ class TransformerWithRoPE(nn.Module):
 ## Approach 2: Intrusive Modification (For Complex Cases)
 
 For models with dynamic sharding logic that cannot be expressed via `_sp_plan`, manually insert shard/gather calls.
+
 
 **When to use:**
 - Dynamic/conditional sharding logic
@@ -331,9 +400,14 @@ _sp_plan = {
 
 - **Sequence Length not divisible by sp_size:**
 
-**Problem:** `SequenceParallelInput(auto_pad=False)` - auto_pad should be True to enable automatic sequence padding.
+**Problem:** strict Ulysses sequence parallel requires divisible shapes. If the shard length is uneven, or if the model head count is not divisible by `ulysses_degree`, the strict path will raise an error.
 
-**Solution:** In `SequenceParallelInput`, set `auto_pad=True` and add attention mask support.
+**Solutions:**
+
+1. Use `ulysses_mode="advanced_uaa"` for Ulysses-SP when you want the experimental uneven-shape path without relying on attention-mask padding.
+2. If the model already uses `_sp_plan` token padding and the attention backend supports `attention_mask`, set `auto_pad=True` and add attention-mask plumbing.
+
+> **Experimental Feature:** `ulysses_mode="advanced_uaa"` is experimental. It is intended to relax Ulysses divisibility constraints, but hybrid Ulysses + Ring still requires equal post-Ulysses sequence lengths inside each ring group.
 
 > **Experimental Feature:** `auto_pad=True` is an experimental feature and may be changed in the future. We plan to improve this solution to involve minimal changes to model files. More details are [here](https://github.com/vllm-project/vllm-omni/issues/1324).
 
@@ -435,6 +509,7 @@ Complete examples in the codebase:
 
 | Model | Path | Pattern | Notes |
 |-------|------|---------|-------|
+| **LongCat** | `vllm_omni/diffusion/models/longcat_image/longcat_image_transformer.py` | Dual-stream | Text components replicated, image components sharded |
 | **Qwen-Image** | `vllm_omni/diffusion/models/qwen_image/qwen_image_transformer.py` | Dual-stream + preprocessing | auto_pad, separate RoPE |
 | **Wan2.2** | `vllm_omni/diffusion/models/wan2_2/wan2_2_transformer.py` | Dual-Transformer + RoPE | Video transformer |
 | **Z-Image** | `vllm_omni/diffusion/models/z_image/z_image_transformer.py` | Unified sequence | Concatenated input |
@@ -449,7 +524,7 @@ Complete examples in the codebase:
 Adding Sequence Parallel support to a transformer:
 
 1. ✅ **Choose approach** - Use `_sp_plan` for standard cases, intrusive modification for complex cases
-2. ✅ **Identify sharding boundaries** - Where should tensors be split/gathered?
+2. ✅ **Identify sharding boundaries** - Where should tensors be split/gathered? And which module boundaries need to be moved to facilitate this?
 3. ✅ **Extract inline operations** - Move `torch.cat`, `pad_sequence`, etc. to submodules
 4. ✅ **Define `_sp_plan`** - Declare shard/gather points as class attribute
 5. ✅ **Use `auto_pad` for variable lengths** - Support non-uniform sequences

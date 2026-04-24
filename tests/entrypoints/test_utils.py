@@ -1,17 +1,24 @@
 """Unit tests for vllm_omni.entrypoints.utils module."""
 
+import os
 from collections import Counter
 from dataclasses import dataclass
 
 import pytest
+import torch
 from pytest_mock import MockerFixture
 
+from vllm_omni.config.yaml_util import create_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.utils import (
     _convert_dataclasses_to_dict,
     _filter_dict_like_object,
     filter_dataclass_kwargs,
+    load_and_resolve_stage_configs,
+    load_stage_configs_from_yaml,
+    resolve_model_config_path,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -269,3 +276,151 @@ class TestFilterDataclassKwargs:
         assert "unknown_top" not in result
         assert result["cache_config"]["rel_l1_thresh"] == 0.3
         assert "extra_param" not in result["cache_config"]
+
+
+class TestResolveModelConfigPath:
+    """Test suite for resolve_model_config_path function with diffusers format models."""
+
+    def test_glm_image_diffusers_format_resolution(self, mocker: MockerFixture):
+        """Test GlmImagePipeline diffusers class resolves to glm_image config."""
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.file_or_path_exists",
+            return_value=True,
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils._try_get_class_name_from_diffusers_config",
+            return_value="GlmImagePipeline",
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.current_omni_platform.get_default_stage_config_path",
+            return_value="vllm_omni/model_executor/stage_configs",
+        )
+
+        original_exists = os.path.exists
+
+        def mock_exists(path):
+            if "glm_image.yaml" in str(path):
+                return True
+            return original_exists(path)
+
+        mocker.patch("os.path.exists", side_effect=mock_exists)
+
+        result = resolve_model_config_path("zai-org/GLM-Image")
+
+        assert result is not None
+        assert "glm_image.yaml" in result
+
+    def test_voxcpm_transformers_format_resolution(self, mocker: MockerFixture):
+        """Test VoxCPM transformers config resolves to the voxcpm stage config."""
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.get_config",
+            side_effect=ValueError("missing transformers config"),
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.file_or_path_exists",
+            side_effect=lambda _model, filename, revision=None: filename == "config.json",
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.get_hf_file_to_dict",
+            return_value={"model_type": "voxcpm"},
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.current_omni_platform.get_default_stage_config_path",
+            return_value="vllm_omni/model_executor/stage_configs",
+        )
+
+        original_exists = os.path.exists
+
+        def mock_exists(path):
+            if "voxcpm.yaml" in str(path):
+                return True
+            return original_exists(path)
+
+        mocker.patch("os.path.exists", side_effect=mock_exists)
+
+        result = resolve_model_config_path("OpenBMB/VoxCPM1.5")
+
+        assert result is not None
+        assert "voxcpm.yaml" in result
+
+
+class TestLoadAndResolveStageConfigs:
+    def test_load_and_resolve_with_kwargs(self):
+        """Ensure that dtype survives default stage creation."""
+        kwargs = {"dtype": torch.float32}
+        config_path, stage_configs = load_and_resolve_stage_configs(
+            model="black-forest-labs/FLUX.2-klein-4B",
+            stage_configs_path=None,
+            kwargs=kwargs,
+            default_stage_cfg_factory=lambda: AsyncOmniEngine._create_default_diffusion_stage_cfg(kwargs),
+        )
+        assert config_path is None
+        assert len(stage_configs) == 1
+        assert "dtype" in stage_configs[0]["engine_args"]
+
+
+class TestLoadStageConfigsFromYaml:
+    """Regression tests for stage-config loading and merging."""
+
+    def test_deep_merges_stage_engine_args(self, mocker: MockerFixture):
+        yaml_config = create_config(
+            {
+                "async_chunk": True,
+                "stage_args": [
+                    {
+                        "stage_id": 0,
+                        "runtime": {"device": 0},
+                        "engine_args": {
+                            "parallel_config": {"tensor_parallel_size": 4},
+                        },
+                    }
+                ],
+            }
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.load_yaml_config",
+            return_value=yaml_config,
+        )
+
+        stages = load_stage_configs_from_yaml(
+            "fake.yaml",
+            base_engine_args={
+                "parallel_config": {
+                    "tensor_parallel_size": 1,
+                    "pipeline_parallel_size": 2,
+                },
+                "model": "base-model",
+            },
+        )
+
+        merged_engine_args = stages[0]["engine_args"]
+        assert merged_engine_args["parallel_config"]["tensor_parallel_size"] == 4
+        assert merged_engine_args["parallel_config"]["pipeline_parallel_size"] == 2
+        assert merged_engine_args["model"] == "base-model"
+        assert merged_engine_args["async_chunk"] is True
+
+    def test_merges_nested_stage_engine_args(self, mocker: MockerFixture):
+        yaml_config = create_config(
+            {
+                "stage_args": [
+                    {
+                        "stage_id": 0,
+                        "engine_args": {
+                            "nested": {"override": 2},
+                        },
+                    }
+                ],
+            }
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.load_yaml_config",
+            return_value=yaml_config,
+        )
+
+        stages = load_stage_configs_from_yaml(
+            "fake.yaml",
+            base_engine_args={"nested": {"base": 1}},
+        )
+
+        assert stages[0]["engine_args"]["nested"]["base"] == 1
+        assert stages[0]["engine_args"]["nested"]["override"] == 2

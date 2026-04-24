@@ -13,6 +13,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
 )
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
+from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader, maybe_remap_kv_scale_name
@@ -34,7 +35,6 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
@@ -50,6 +50,7 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     PromptUpdateDetails,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema
 
@@ -150,7 +151,6 @@ class MiMoLocalDecodeBuffer:
         dtype = next(model.hidden_states_downcast.parameters()).dtype
         hidden_size = model.local_config.hidden_size
 
-        self.pool = torch.cuda.graph_pool_handle()
         self.input_tensor = torch.zeros((max_batch_size, 1, hidden_size), dtype=dtype, device=device)
         self.sampler = MiMoLocalSamplerTensor(
             temperature=torch.ones(max_batch_size, dtype=torch.float32, device=device),
@@ -231,7 +231,7 @@ class MiMoLocalDecodeCudaGraph:
         cuda_graph = torch.cuda.CUDAGraph()
         if eager_run_first:
             model.base_local_forward(input_tensor, local_sampler=sampler)
-        with torch.cuda.graph(cuda_graph, buffer.pool):
+        with torch.cuda.graph(cuda_graph, pool=current_platform.get_global_graph_pool()):
             output_tensor = model.base_local_forward(input_tensor, local_sampler=sampler)
 
         return cls(
@@ -263,7 +263,6 @@ class MiMoInputLocalTransformerBuffer:
         hidden_size = model.input_local_config.hidden_size
         group_size = model.group_size
 
-        self.pool = torch.cuda.graph_pool_handle()
         self.input_tensor = torch.zeros((max_batch_size, group_size, hidden_size), dtype=dtype, device=device)
         self.lock = threading.Lock()
 
@@ -311,7 +310,7 @@ class MiMoInputLocalTransformerCudaGraph:
             out = model.input_local_transformer(inputs_embeds=input_tensor, return_dict=True, is_causal=False)
             _ = out.last_hidden_state
 
-        with torch.cuda.graph(cuda_graph, buffer.pool):
+        with torch.cuda.graph(cuda_graph, pool=current_platform.get_global_graph_pool()):
             out = model.input_local_transformer(inputs_embeds=input_tensor, return_dict=True, is_causal=False)
             output_tensor = out.last_hidden_state
 
@@ -556,12 +555,14 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             config.hidden_size,
             bias=False,
             return_bias=False,
+            gather_output=True,
         )
         self.hidden_states_downcast = ColumnParallelLinear(
             config.hidden_size,
             self.local_config.hidden_size,
             bias=False,
             return_bias=False,
+            gather_output=True,
         )
 
         self.lm_head = ColumnParallelLinear(
@@ -569,6 +570,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             config.vocab_size,
             bias=False,
             return_bias=False,
+            gather_output=True,
         )
 
         # Re-encode the sum of multi-layer RVQ embeddings to obtain true Audio Code Embeddings
@@ -770,7 +772,6 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         multimodal_embeddings: MultiModalEmbeddings | None = None,
         *,
         is_multimodal: torch.Tensor | None = None,
-        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
         # This is to satisfy the type checker for each overload
         if multimodal_embeddings is None or is_multimodal is None:
@@ -780,7 +781,6 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             input_ids,
             multimodal_embeddings=multimodal_embeddings,
             is_multimodal=is_multimodal,
-            handle_oov_mm_token=handle_oov_mm_token,
         )
 
     def base_local_forward(

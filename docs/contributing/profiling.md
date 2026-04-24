@@ -1,146 +1,214 @@
 # Profiling vLLM-Omni
 
-> **Warning:** Profiling incurs significant overhead. Use only for development and debugging, never in production.
+> **Warning:** Profiling is for development and debugging only. It adds significant overhead and should not be enabled in production.
 
-vLLM-Omni uses the PyTorch Profiler to analyze performance across both **multi-stage omni-modality models** and **diffusion models**.
+vLLM-Omni supports two profiler backends through `profiler_config`:
 
-### 1. Set the Output Directory
-Before running any script, set this environment variable. The system detects this and automatically saves traces here.
+- `torch`: detailed CPU/CUDA traces written to `torch_profiler_dir`
+- `cuda`: low-overhead CUDA range control for NVIDIA Nsight Systems (`nsys`)
+
+## 1. Configure Profiling
+
+Use the same `profiler_config` shape everywhere:
+
+```yaml
+profiler_config:
+  profiler: torch
+  torch_profiler_dir: ./perf
+```
+
+Supported fields:
+
+| Field | Description |
+|---|---|
+| `profiler` | Profiler backend. Supported values: `torch`, `cuda`. |
+| `torch_profiler_dir` | Output directory for torch traces. Required when `profiler: torch`. |
+| `delay_iterations` | Number of worker iterations to skip before profiling starts. |
+| `max_iterations` | Maximum number of worker iterations to capture before auto-stop. |
+| `warmup_iterations` | Torch-profiler warmup iterations. |
+| `active_iterations` | Torch-profiler active iterations. |
+| `wait_iterations` | Torch-profiler wait iterations before warmup. |
+
+For multi-stage omni pipelines, put `profiler_config` under the target stage's `engine_args`.
+
+```yaml
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    engine_args:
+      profiler_config:
+        profiler: torch
+        torch_profiler_dir: ./perf
+```
+
+For single-stage diffusion usage, pass `profiler_config` directly to `Omni(...)` or `vllm serve`.
+
+## 2. Profiling Omni Pipelines
+
+It is usually best to profile only the stages you need.
+
+```python
+# Profile all stages.
+omni.start_profile()
+
+# Profile selected stages only.
+omni.start_profile(stages=[0, 2])
+...
+omni.stop_profile(stages=[0, 2])
+```
+
+Always stop the same stage set that you started. If only some stages have `profiler_config`, pass an explicit `stages=[...]` list instead of relying on the default "all stages" behavior.
+
+Examples:
+
+1. [Qwen2.5-Omni end2end](https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/qwen2_5_omni/end2end.py)
+2. [Qwen3-Omni end2end](https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/qwen3_omni/end2end.py)
+
+## 3. Profiling Single-Stage Diffusion
+
+Single-stage diffusion models use the same `start_profile()` / `stop_profile()` controls, but you must provide `profiler_config` explicitly.
+
+### PyTorch profiler
+
+```python
+from vllm_omni import Omni
+
+omni = Omni(
+    model="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+    profiler_config={
+        "profiler": "torch",
+        "torch_profiler_dir": "./perf",
+    },
+)
+
+omni.start_profile()
+...
+omni.stop_profile()
+```
+
+### Nsight Systems (`nsys`)
+
+For Nsight Systems, use `profiler: cuda` and wrap the process with `nsys profile`.
 
 ```bash
-export VLLM_TORCH_PROFILER_DIR=./profiles
+nsys profile \
+  --trace-fork-before-exec=true \
+  --cuda-graph-trace=node \
+  --capture-range=cudaProfilerApi \
+  --capture-range-end=repeat \
+  -o diffusion_trace \
+  python image_to_video.py ...
 ```
 
-### 2. Profiling Omni-Modality Models
+The Python process being profiled must create the diffusion engine with:
 
-It is best to limit profiling to one iteration to keep trace files manageable.
+```python
+profiler_config={"profiler": "cuda"}
+```
+
+Then call `start_profile()` before the requests you want to capture and `stop_profile()` after them. The diffusion worker processes open and close the CUDA capture range themselves, so `nsys` sees the actual GPU work instead of only the parent process.
+
+Examples:
+
+1. [Image edit example](https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/image_to_image/image_edit.py)
+2. [Image to video example](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_video)
+
+## 4. Profiling Online Serving
+
+When any stage has `profiler_config.profiler` set, the server exposes:
+
+- `POST /start_profile`
+- `POST /stop_profile`
+
+### Start the server
+
+Multi-stage omni serving:
 
 ```bash
-export VLLM_PROFILER_MAX_ITERS=1
+vllm serve Qwen/Qwen2.5-Omni-7B \
+  --omni \
+  --port 8091
 ```
 
-**Selective Stage Profiling**
-The profiler is default to function across all stages. But It is highly recommended to profile specific stages by passing the stages list, preventing from producing too large trace files:
-```python
-# Profile all stages
-omni_llm.start_profile()
+(The default deploy config at `vllm_omni/deploy/qwen2_5_omni.yaml` is loaded automatically. Pass `--deploy-config /path/to/custom.yaml` to override.)
 
-# Only profile Stage 1
-omni_llm.start_profile(stages=[1])
+Single-stage diffusion serving with torch profiler:
+
+```bash
+vllm serve Wan-AI/Wan2.2-I2V-A14B-Diffusers \
+  --omni \
+  --port 8091 \
+  --profiler-config '{
+    "profiler": "torch",
+    "torch_profiler_dir": "/tmp/vllm_profile_wan22_i2v",
+    "torch_profiler_with_stack": true,
+    "torch_profiler_with_flops": false,
+    "torch_profiler_use_gzip": true,
+    "torch_profiler_dump_cuda_time_total": true,
+    "torch_profiler_record_shapes": true,
+    "torch_profiler_with_memory": true,
+    "delay_iterations": 0,
+    "max_iterations": 0
+  }'
 ```
 
-```python
-# Stage 0 (Thinker) and Stage 2 (Audio Decoder) for qwen omni
-omni_llm.start_profile(stages=[0, 2])
+Useful optional fields:
+
+- `torch_profiler_with_stack`: export `by_stack` operator views and stack text files.
+- `torch_profiler_record_shapes`: export `by_shape` operator views.
+- `torch_profiler_with_memory`: dump `memory_snapshot_rank*.pickle` when the backend supports memory history.
+- `torch_profiler_use_gzip`: write the trace as `trace_rank*.json.gz`.
+
+Single-stage diffusion serving with Nsight Systems:
+
+```bash
+nsys profile \
+  --trace-fork-before-exec=true \
+  --cuda-graph-trace=node \
+  --capture-range=cudaProfilerApi \
+  --capture-range-end=repeat \
+  -o serving_trace \
+  vllm serve Wan-AI/Wan2.2-I2V-A14B-Diffusers \
+    --omni \
+    --port 8091 \
+    --profiler-config '{"profiler": "cuda"}'
 ```
 
-**Python Usage**: Wrap your generation logic with `start_profile()` and `stop_profile()`.
+### Control capture
 
-```python
-from vllm_omni import omni_llm
+```bash
+# Start profiling on all profiled stages.
+curl -X POST http://localhost:8091/start_profile
 
-profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+# Start profiling on selected stages.
+curl -X POST http://localhost:8091/start_profile \
+  -H "Content-Type: application/json" \
+  -d '{"stages": [0]}'
 
-# 1. Start profiling if enabled
-if profiler_enabled:
-    omni_llm.start_profile(stages=[0])
-
-# Initialize generator
-omni_generator = omni_llm.generate(prompts, sampling_params_list, py_generator=args.py_generator)
-
-total_requests = len(prompts)
-processed_count = 0
-
-# Main Processing Loop
-for stage_outputs in omni_generator:
-
-    # ... [Output processing logic for text/audio would go here] ...
-
-    # Update count to track when to stop profiling
-    processed_count += len(stage_outputs.request_output)
-
-    # 2. Check if all requests are done to stop the profiler safely
-    if profiler_enabled and processed_count >= total_requests:
-        print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
-
-        # Stop the profiler while workers are still active
-        omni_llm.stop_profile()
-
-        # Wait for traces to flush to disk
-        print("[Info] Waiting 30s for workers to write trace files to disk...")
-        time.sleep(30)
-        print("[Info] Trace export wait time finished.")
-
-omni_llm.close()
+# Stop profiling.
+curl -X POST http://localhost:8091/stop_profile
 ```
 
+For mixed-stage pipelines, use explicit `stages` and pass the same stage list to both endpoints.
 
-**Examples**:
+## 5. Analyze Results
 
-1. **Qwen2.5-Omni**:  [https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/qwen2_5_omni/end2end.py](https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/qwen2_5_omni/end2end.py)
+Torch profiler output:
 
-2. **Qwen3-Omni**:   [https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/qwen3_omni/end2end.py](https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/qwen3_omni/end2end.py)
+- Chrome/Perfetto trace: `trace_rank*.json` or `trace_rank*.json.gz`
+- Excel workbook: `ops_rank*.xlsx` with `summary`, and optional `by_shape` / `by_stack` sheets
+- Stack exports: `stacks_cpu_rank*.txt` and `stacks_cuda_rank*.txt` when stack capture is enabled
+- Memory snapshot: `memory_snapshot_rank*.pickle` when memory capture is enabled and supported by the backend
+- Optional aggregated CUDA-time tables under the same session directory
 
+CUDA profiler / Nsight Systems output:
 
-### 3. Profiling diffusion models
+- `.nsys-rep` report files written by `nsys -o ...`
 
-Diffusion profiling is End-to-End, capturing encoding, denoising loops, and decoding.
+Recommended viewers:
 
-**CLI Usage:**
-```python
+- [Perfetto](https://ui.perfetto.dev/) for torch traces
+- `nsys stats <report>.nsys-rep` for CLI summaries
+- Nsight Systems GUI for CUDA kernel timelines
 
-python image_to_video.py \
-    --model Wan-AI/Wan2.2-I2V-A14B-Diffusers \
-    --image qwen-bear.png \
-    --prompt "A cat playing with yarn, smooth motion" \
-    \
-    # Minimize Spatial Dimensions (Optional but helpful):
-    #    Drastically reduces memory usage so the profiler doesn't
-    #    crash due to overhead, though for accurate performance
-    #    tuning you often want target resolutions.
-    --height 48 \
-    --width 64 \
-    \
-    # Minimize Temporal Dimension (Frames):
-    #    Video models process 3D tensors (Time, Height, Width).
-    #    Reducing frames to the absolute minimum (2) keeps the
-    #    tensor size small, ensuring the trace file doesn't become
-    #    multi-gigabytes in size.
-    --num-frames 2 \
-    \
-    # Minimize Iteration Loop (Steps):
-    #    This is the most critical setting for profiling.
-    #    Diffusion models run the same loop X times.
-    #    Profiling 2 steps gives you the exact same performance
-    #    data as 50 steps, but saves minutes of runtime and
-    #    prevents the trace viewer from freezing.
-    --num-inference-steps 2 \
-    \
-    --guidance-scale 5.0 \
-    --guidance-scale-high 6.0 \
-    --boundary-ratio 0.875 \
-    --flow-shift 12.0 \
-    --fps 16 \
-    --output i2v_output.mp4
-
-```
-
-**Examples**:
-
-1. **Qwen image edit**:  [https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/image_to_image/image_edit.py](https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/image_to_image/image_edit.py)
-
-2. **Wan-AI/Wan2.2-I2V-A14B-Diffusers**:   [https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_video](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_video)
-
-### 4. Analyzing Omni Traces
-
-Output files are saved to your configured ```VLLM_TORCH_PROFILER_DIR```.
-
-**Output**
-**Chrome Trace** (```.json.gz```): Visual timeline of kernels and stages. Open in Perfetto UI.
-
-**Viewing Tools:**
-
-- [Perfetto](https://ui.perfetto.dev/)(recommended)
-- ```chrome://tracing```(Chrome only)
-
-**Note**: vLLM-Omni reuses the PyTorch Profiler infrastructure from vLLM. See the official vLLM profiler documentation:  [vLLM Profiling Guide](https://docs.vllm.ai/en/stable/contributing/profiling/)
+vLLM-Omni reuses the vLLM profiling infrastructure where possible. For the upstream reference, see the [vLLM profiling guide](https://docs.vllm.ai/en/stable/contributing/profiling/).

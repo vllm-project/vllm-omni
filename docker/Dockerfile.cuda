@@ -1,0 +1,22 @@
+ARG BASE_IMAGE=vllm/vllm-openai:v0.19.0
+FROM ${BASE_IMAGE}
+
+ARG COMMON_WORKDIR=/app
+
+WORKDIR ${COMMON_WORKDIR}
+
+# Step 1: Setup - Install system dependencies
+RUN apt-get update && \
+    apt-get install -y git jq && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p ${COMMON_WORKDIR}/vllm-omni
+
+# Step 2: Copy vllm-omni code and install
+COPY . ${COMMON_WORKDIR}/vllm-omni
+RUN cd ${COMMON_WORKDIR}/vllm-omni && uv pip install --python "$(python3 -c 'import sys; print(sys.executable)')" --no-cache-dir "."
+
+RUN ln -sf /usr/bin/python3 /usr/bin/python
+
+ENTRYPOINT []

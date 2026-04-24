@@ -9,7 +9,7 @@ cd benchmarks/build_dataset
 pip install gdown
 
 # Download SeedTTS test set from Google Drive
-gdown --id 1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP
+gdown  1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP
 
 # Extract
 tar -xf seedtts_testset.tar
@@ -56,9 +56,9 @@ What it does:
 - Runs `examples/offline_inference/qwen3_omni/end2end.py` with `--log-stats`.
 - Uses `benchmarks/build_dataset/top100.txt` and writes to:
   - Logs: `benchmarks/qwen3-omni/vllm_omni/logs/`
-    - `omni_llm_pipeline_text.orchestrator.stats.jsonl` — per-stage latency stats.
-    - `omni_llm_pipeline_text.overall.stats.jsonl` — end-to-end latency/TPS.
-    - `omni_llm_pipeline_text.stage{0,1,2}.log` — per-stage detailed logs/errors.
+    - `omni_pipeline_text.orchestrator.stats.jsonl` — per-stage latency stats.
+    - `omni_pipeline_text.overall.stats.jsonl` — end-to-end latency/TPS.
+    - `omni_pipeline_text.stage{0,1,2}.log` — per-stage detailed logs/errors.
   - Outputs: `benchmarks/qwen3-omni/vllm_omni/outputs/` — ~100 text and `.wav` files.
 
 Key checks:

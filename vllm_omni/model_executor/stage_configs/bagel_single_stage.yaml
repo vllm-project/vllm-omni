@@ -1,0 +1,24 @@
+# Stage 0: Thinker (multimodal understanding + text generation)
+
+stage_args:
+
+  - stage_id: 0
+    stage_type: diffusion
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: dit
+      max_num_seqs: 1
+      enforce_eager: true
+      trust_remote_code: true
+      distributed_executor_backend: "mp"
+
+    final_output: true
+    final_output_type: image
+    is_comprehension: false
+    default_sampling_params:
+      seed: 52
+
+# Runtime edges
+runtime:
+  enabled: true

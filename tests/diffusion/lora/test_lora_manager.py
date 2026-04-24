@@ -7,8 +7,12 @@ import pytest
 import torch
 from vllm.lora.lora_weights import LoRALayerWeights
 from vllm.lora.utils import get_supported_lora_modules
-from vllm.model_executor.layers.linear import LinearBase
 
+from tests.diffusion.lora.helpers import (
+    DummyBaseLayerWithLoRA,
+    FakeLinearBase,
+    fake_replace_submodule,
+)
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.lora.request import LoRARequest
 
@@ -33,35 +37,9 @@ class _DummyLoRALayer:
         self.reset_calls += 1
 
 
-class _FakeLinearBase(LinearBase):
-    def __init__(self):
-        torch.nn.Module.__init__(self)
-
-
-class _DummyBaseLayerWithLoRA(torch.nn.Module):
-    def __init__(self, base_layer: torch.nn.Module):
-        super().__init__()
-        self.base_layer = base_layer
-
-        self.set_calls: list[
-            tuple[list[torch.Tensor | None] | torch.Tensor, list[torch.Tensor | None] | torch.Tensor]
-        ] = []
-        self.reset_calls: int = 0
-        self.create_calls: int = 0
-
-    def set_lora(self, index: int, lora_a, lora_b):
-        assert index == 0
-        self.set_calls.append((lora_a, lora_b))
-
-    def reset_lora(self, index: int):
-        assert index == 0
-        self.reset_calls += 1
-
-    def create_lora_weights(self, max_loras, lora_config, model_config):
-        # Needs to be callable for scale test when rank changes, but not
-        # actually used since we mock everything and check everything based
-        # on set calls.
-        self.create_calls += 1
+# Aliases for backward compatibility within this file
+_FakeLinearBase = FakeLinearBase
+_DummyBaseLayerWithLoRA = DummyBaseLayerWithLoRA
 
 
 class _DummyPipeline(torch.nn.Module):
@@ -182,7 +160,11 @@ def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch
     monkeypatch.setattr(manager_mod, "replace_submodule", _fake_replace_submodule)
 
     pipeline = torch.nn.Module()
-    pipeline.packed_modules_mapping = {"to_qkv": ["to_q", "to_k", "to_v"]}
+    pipeline.stacked_params_mapping = [
+        (".to_qkv.", ".to_q.", "q"),
+        (".to_qkv.", ".to_k.", "k"),
+        (".to_qkv.", ".to_v.", "v"),
+    ]
     pipeline.transformer = torch.nn.Module()
     pipeline.transformer.to_qkv = _FakeLinearBase()
 
@@ -194,7 +176,7 @@ def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch
     )
 
     # Treat the dummy layer as a packed 3-slice projection so the manager uses
-    # `packed_modules_mapping` to decide replacement based on target_modules.
+    # `stacked_params_mapping` to decide replacement based on target_modules.
     monkeypatch.setattr(manager, "_get_packed_modules_list", lambda _module: ["q", "k", "v"])
 
     peft_helper = type("_PH", (), {"r": 1, "target_modules": ["to_q"]})()
@@ -254,7 +236,11 @@ def test_lora_manager_activates_fused_lora_on_packed_layer():
 
 def test_lora_manager_activates_packed_lora_from_sublayers():
     pipeline = torch.nn.Module()
-    pipeline.packed_modules_mapping = {"to_qkv": ["to_q", "to_k", "to_v"]}
+    pipeline.stacked_params_mapping = [
+        (".to_qkv", ".to_q", "q"),
+        (".to_qkv", ".to_k", "k"),
+        (".to_qkv", ".to_v", "v"),
+    ]
     manager = DiffusionLoRAManager(
         pipeline=pipeline,
         device=torch.device("cpu"),
@@ -500,3 +486,92 @@ def test_scale_keys_are_rounded():
     # Currently we round keys to 3 decimal places
     manager._update_adapter_scale(adapter_id, 0.0031)
     assert manager._adapter_scales[adapter_id] == 0.003
+
+
+def test_lora_manager_uses_valid_max_rank(monkeypatch):
+    """Ensure that the LoRA manager uses a valid max rank for vLLM."""
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    # Ensure that the rank is correctly adjusted to the smallest valid max rank
+    supported_max_rank = 64
+    unsupported_max_rank = 63
+    assert supported_max_rank in DiffusionLoRAManager._VALID_MAX_RANKS
+    assert unsupported_max_rank not in DiffusionLoRAManager._VALID_MAX_RANKS
+
+    def _fake_load(_req: LoRARequest):
+        lora_model = type("LM", (), {"id": _req.lora_int_id})()
+        peft_helper = type("PH", (), {"r": unsupported_max_rank})()
+        return lora_model, peft_helper
+
+    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    req1 = _dummy_lora_request(1)
+    manager.add_adapter(req1)
+    assert manager._max_lora_rank == supported_max_rank
+
+
+@pytest.mark.parametrize("rank", [-1, 0, DiffusionLoRAManager._VALID_MAX_RANKS[-1] + 1])
+def test_lora_manager_max_rank_validation(monkeypatch, rank):
+    """Check that invalid max ranks are handled correctly."""
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    lora_rank = rank
+
+    def _fake_load(_req: LoRARequest):
+        lora_model = type("LM", (), {"id": _req.lora_int_id})()
+        peft_helper = type("PH", (), {"r": lora_rank})()
+        return lora_model, peft_helper
+
+    monkeypatch.setattr(manager, "_load_adapter", _fake_load)
+    req1 = _dummy_lora_request(1)
+    with pytest.raises(ValueError):
+        manager.add_adapter(req1)
+
+
+def test_lora_manager_discovers_bagel_component(monkeypatch):
+    """Verify that _replace_layers_with_lora finds layers under 'bagel'."""
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+
+    def _fake_from_layer_diffusion(*, layer: torch.nn.Module, **_kwargs):
+        if isinstance(layer, _FakeLinearBase):
+            return _DummyBaseLayerWithLoRA(layer)
+        return layer
+
+    replace_calls: list[str] = []
+
+    monkeypatch.setattr(manager_mod, "from_layer_diffusion", _fake_from_layer_diffusion)
+    monkeypatch.setattr(
+        manager_mod,
+        "replace_submodule",
+        lambda root, name, sub: fake_replace_submodule(root, name, sub, replace_calls),
+    )
+
+    # Pipeline with a 'bagel' component (no 'transformer')
+    pipeline = torch.nn.Module()
+    pipeline.bagel = torch.nn.Module()
+    pipeline.bagel.language_model = torch.nn.Module()
+    pipeline.bagel.language_model.qkv_proj = _FakeLinearBase()
+
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_cached_adapters=1,
+    )
+
+    peft_helper = type("_PH", (), {"r": 1})()
+    manager._replace_layers_with_lora(peft_helper)
+
+    assert "language_model.qkv_proj" in replace_calls
+    assert "bagel.language_model.qkv_proj" in manager._lora_modules
+    # Verify the module was actually replaced in the tree (not just recorded)
+    assert isinstance(pipeline.bagel.language_model.qkv_proj, _DummyBaseLayerWithLoRA)

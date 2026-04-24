@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import mimetypes
 import os
@@ -35,6 +36,7 @@ class RequestFuncOutput:
     error: str = ""
     start_time: float = 0.0
     response_body: dict[str, Any] = field(default_factory=dict)
+    stage_durations: dict[str, float] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
     slo_achieved: bool | None = None
 
@@ -55,6 +57,7 @@ async def async_request_chat_completions(
     input: RequestFuncInput,
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
+    enable_diffusion_pipeline_profiler: bool = False,
 ) -> RequestFuncOutput:
     output = RequestFuncOutput()
     output.start_time = time.perf_counter()
@@ -106,8 +109,31 @@ async def async_request_chat_completions(
                 resp_json = await response.json()
                 output.response_body = resp_json
                 output.success = True
-                if "peak_memory_mb" in resp_json:
-                    output.peak_memory_mb = resp_json["peak_memory_mb"]
+                try:
+                    choices = resp_json.get("choices", [])
+                    if choices and isinstance(choices, list):
+                        msg = choices[0].get("message", {})
+                        if isinstance(msg, dict):
+                            content = msg.get("content", [])
+                            if content and isinstance(content, list) and len(content) > 0:
+                                first_item = content[0]
+                                if isinstance(first_item, dict):
+                                    output.stage_durations = first_item.get("stage_durations") or {}
+                                    output.peak_memory_mb = first_item.get("peak_memory_mb", 0.0)
+                except (IndexError, TypeError, AttributeError):
+                    pass
+
+                if (not output.stage_durations or output.peak_memory_mb == 0.0) and isinstance(
+                    resp_json.get("metrics"), dict
+                ):
+                    m = resp_json["metrics"]
+                    if not output.stage_durations and isinstance(m.get("stage_durations"), dict):
+                        output.stage_durations = m.get("stage_durations") or {}
+                    if output.peak_memory_mb == 0.0 and m.get("peak_memory_mb") is not None:
+                        try:
+                            output.peak_memory_mb = float(m.get("peak_memory_mb") or 0.0)
+                        except (TypeError, ValueError):
+                            pass
             else:
                 output.error = f"HTTP {response.status}: {await response.text()}"
                 output.success = False
@@ -192,7 +218,142 @@ async def async_request_openai_images(
     return output
 
 
+async def async_request_v1_videos(
+    input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> RequestFuncOutput:
+    output = RequestFuncOutput()
+    output.start_time = time.perf_counter()
+
+    files = dict(input.extra_body)
+    if input.prompt:
+        files.setdefault("prompt", input.prompt)
+    if input.width and input.height:
+        files.setdefault("height", input.height)
+        files.setdefault("width", input.width)
+    if input.num_frames:
+        files.setdefault("num_frames", input.num_frames)
+    if input.num_inference_steps:
+        files.setdefault("num_inference_steps", input.num_inference_steps)
+    if input.seed is not None:
+        files.setdefault("seed", input.seed)
+    if input.fps:
+        files.setdefault("fps", input.fps)
+
+    form = aiohttp.FormData()
+    for k, v in files.items():
+        form.add_field(k, str(v))
+
+    image_file = None
+    if input.image_paths and len(input.image_paths) > 0:
+        image_path = input.image_paths[0]
+        image_file = open(image_path, "rb")
+        form.add_field(
+            "input_reference",
+            image_file,
+            filename=os.path.basename(image_path),
+            content_type="application/octet-stream",
+        )
+
+    job_id = None
+    job_status = None
+    poll_json = {}
+    resp_json = {}
+
+    try:
+        # invoke a post request (POST /v1/videos)
+        async with session.post(input.api_url, data=form) as response:
+            if response.status == 200:
+                resp_json = await response.json()
+                job_id = resp_json.get("id")
+                job_status = resp_json.get("status")
+                if not job_id or not job_status:
+                    output.error = "API response missing job 'id' or 'status' field."
+                    output.success = False
+                    return output
+            else:
+                output.error = f"HTTP {response.status}: {await response.text()}"
+                output.success = False
+                return output
+
+        # invoke a poll request (GET /v1/videos/{video_id})
+        poll_interval = 2.0  # Unit(s)
+        timeout_seconds = 600.0
+        deadline = time.perf_counter() + timeout_seconds
+        job_url = f"{input.api_url}/{job_id}"
+
+        while job_status not in {"completed", "failed"}:
+            await asyncio.sleep(poll_interval)
+
+            async with session.get(job_url) as poll_response:
+                if poll_response.status != 200:
+                    output.error = f"Polling failed HTTP {poll_response.status}: {await poll_response.text()}"
+                    output.success = False
+                    return output
+
+                poll_json = await poll_response.json()
+                job_status = poll_json.get("status")
+
+                if time.perf_counter() >= deadline:
+                    output.error = f"Timed out waiting for video job {job_id} to complete."
+                    output.success = False
+                    return output
+
+        if job_status == "failed":
+            output.error = f"Video job failed: {poll_json}"
+            output.success = False
+            return output
+
+        # invoke a get request (GET /v1/videos/{video_id}/content)
+        content_url = f"{job_url}/content"
+        async with session.get(content_url) as content_response:
+            if content_response.status != 200:
+                output.error = (
+                    f"Content retrieval failed HTTP {content_response.status}: {await content_response.text()}"
+                )
+                output.success = False
+                return output
+
+            video_bytes = await content_response.read()
+            output.response_body = video_bytes
+            output.success = True
+            if "stage_durations" in poll_json:
+                output.stage_durations = poll_json["stage_durations"] or {}
+            if "peak_memory_mb" in poll_json:
+                output.peak_memory_mb = poll_json["peak_memory_mb"]
+            elif "peak_memory_mb" in resp_json:
+                output.peak_memory_mb = resp_json["peak_memory_mb"]
+    except Exception as e:
+        output.error = str(e)
+        output.success = False
+    finally:
+        if image_file is not None:
+            image_file.close()
+
+        if job_id is not None:
+            try:
+                async with session.delete(f"{input.api_url}/{job_id}") as _:
+                    pass
+            except Exception as e:
+                print(f"Failed to clean up video job {job_id}: {e}")
+
+    output.latency = time.perf_counter() - output.start_time
+
+    if output.success and input.slo_ms is not None:
+        output.slo_achieved = (output.latency * 1000.0) <= float(input.slo_ms)
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 backends_function_mapping = {
-    "vllm-omni": (async_request_chat_completions, "/v1/chat/completions"),
-    "openai": (async_request_openai_images, "/v1/images/generations"),
+    "2i": {
+        "vllm-omni": (async_request_chat_completions, "/v1/chat/completions"),
+        "openai": (async_request_openai_images, "/v1/images/generations"),
+    },
+    "2v": {
+        "v1/videos": (async_request_v1_videos, "/v1/videos"),
+    },
 }

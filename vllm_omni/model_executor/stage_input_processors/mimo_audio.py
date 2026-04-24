@@ -9,6 +9,14 @@ from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import TALKER_
 
 logger = init_logger(__name__)
 
+# Maximum tokens supported by the code2wav stage. The flattened talker codec
+# sequence fed to stage-1 must not exceed this, otherwise gpu_input_batch
+# add_request will fail with a broadcast error when copying prompt_token_ids
+# into token_ids_cpu. Keep in sync with the stage-1 ``max_model_len`` in
+# ``vllm_omni/model_executor/stage_configs/mimo_audio.yaml`` and the offline
+# example ``examples/offline_inference/mimo_audio/end2end.py``.
+MAX_CODE2WAV_TOKENS = 18192
+
 
 def prepend_and_flatten_colmajor(x: torch.Tensor, pad_vec: torch.Tensor) -> torch.Tensor:
     """
@@ -50,6 +58,58 @@ def _make_finished_sentinel() -> dict[str, Any]:
     return {"code_predictor_codes": [], "finished": torch.tensor(True, dtype=torch.bool)}
 
 
+def _flush_remaining_codes(
+    transfer_manager: Any,
+    request_id: str,
+    chunk_size: int,
+    left_context_size: int,
+) -> dict[str, Any]:
+    """Flush any accumulated but unsent codes when the request finishes."""
+    accumulated = transfer_manager.code_prompt_token_ids.get(request_id, [])
+    if not accumulated:
+        return _make_finished_sentinel()
+
+    length = len(accumulated)
+    chunk_length = length % chunk_size
+    context_length = chunk_length if chunk_length != 0 else chunk_size
+    end_index = min(length, left_context_size + context_length)
+
+    # Align with qwen3_omni talker2code2wav_async_chunk: decoder strip uses explicit frame count.
+    left_ctx_frames = max(0, min(length - context_length, left_context_size))
+    flat_codes = torch.tensor(accumulated[-end_index:]).reshape(-1).tolist()
+
+    return {
+        "code_predictor_codes": flat_codes,
+        "left_context_size": left_ctx_frames,
+        "codec_chunk_frames": chunk_size,
+        "codec_left_context_frames": left_context_size,
+        "code_flat_numel": len(flat_codes),
+        "finished": torch.tensor(True, dtype=torch.bool),
+    }
+
+
+def _is_codes_empty(codes: Any) -> bool:
+    """Check whether code_predictor_codes should be treated as empty / invalid."""
+    if codes is None:
+        return True
+    if isinstance(codes, torch.Tensor):
+        return codes.numel() == 0 or not codes.any()
+    if hasattr(codes, "__len__") and len(codes) == 0:
+        return True
+    t = torch.tensor(codes, dtype=torch.long) if not isinstance(codes, torch.Tensor) else codes
+    return not t.any()
+
+
+def _to_code_tensor(codes: Any) -> torch.Tensor | None:
+    """Convert codes to a (B, 1, 8, 4) long tensor, or return None if shape is invalid."""
+    code_tensor = codes.to(torch.long) if isinstance(codes, torch.Tensor) else torch.tensor(codes, dtype=torch.long)
+    if code_tensor.ndim == 3:
+        code_tensor = code_tensor.unsqueeze(0)
+    if code_tensor.ndim != 4 or code_tensor.shape[-2:] != (8, 4):
+        return None
+    return code_tensor
+
+
 def llm2code2wav_async_chunk(
     transfer_manager: Any,
     pooling_output: dict[str, Any],
@@ -62,57 +122,39 @@ def llm2code2wav_async_chunk(
     Accumulates codes in connector per request_id,
     returns payload only when chunk_size is full or request is finished; returns None when waiting.
     """
-    if "code_predictor_codes" not in pooling_output:
+
+    connector = getattr(transfer_manager, "connector", None)
+    raw_cfg = getattr(connector, "config", {}) or {}
+    cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+    chunk_size = int(cfg.get("codec_chunk_frames", 3))
+    left_context_size = int(cfg.get("codec_left_context_frames", 3))
+
+    request_id = getattr(request, "external_req_id", None)
+
+    codes = pooling_output.get("code_predictor_codes")
+
+    if _is_codes_empty(codes):
         if is_finished:
-            return _make_finished_sentinel()
+            return _flush_remaining_codes(transfer_manager, request_id, chunk_size, left_context_size)
         return None
 
-    code_predictor_codes = pooling_output["code_predictor_codes"]
-
-    if code_predictor_codes is None:
+    code_tensor = _to_code_tensor(codes)
+    if code_tensor is None:
         if is_finished:
-            return _make_finished_sentinel()
-        return None
-    if isinstance(code_predictor_codes, torch.Tensor):
-        if code_predictor_codes.numel() == 0:
-            if is_finished:
-                return _make_finished_sentinel()
-            return None
-    elif hasattr(code_predictor_codes, "__len__"):
-        if len(code_predictor_codes) == 0:
-            return None
-
-    if isinstance(code_predictor_codes, torch.Tensor):
-        if not code_predictor_codes.any():
-            if is_finished:
-                return _make_finished_sentinel()
-            return None
-        code_tensor = code_predictor_codes.to(torch.long)
-    else:
-        code_tensor = torch.tensor(code_predictor_codes, dtype=torch.long)
-        if not code_tensor.any():
-            if is_finished:
-                return _make_finished_sentinel()
-            return None
-
-    if code_tensor.ndim == 3:
-        code_tensor = code_tensor.unsqueeze(0)
-    if code_tensor.ndim != 4 or code_tensor.shape[-2:] != (8, 4):
+            return _flush_remaining_codes(transfer_manager, request_id, chunk_size, left_context_size)
         return None
 
     pad_vec = torch.tensor([TALKER_CODEC_PAD_TOKEN_ID] * 4, device=code_tensor.device, dtype=code_tensor.dtype)
-    code_final = prepend_and_flatten_colmajor(code_tensor, pad_vec)
-    code_list = code_final.tolist()
+    code_list = prepend_and_flatten_colmajor(code_tensor, pad_vec).tolist()
+
     if sum(code_list) == 0:
         if is_finished:
-            return _make_finished_sentinel()
+            return _flush_remaining_codes(transfer_manager, request_id, chunk_size, left_context_size)
         return None
 
-    request_id = getattr(request, "external_req_id", None)
     if request_id is None:
         return None
 
-    chunk_size = left_context_size = 10
     transfer_manager.code_prompt_token_ids[request_id].append(code_list)
     length = len(transfer_manager.code_prompt_token_ids[request_id])
     chunk_length = length % chunk_size
@@ -121,14 +163,17 @@ def llm2code2wav_async_chunk(
 
     context_length = chunk_length if chunk_length != 0 else chunk_size
     end_index = min(length, left_context_size + context_length)
+    left_ctx_frames = max(0, min(length - context_length, left_context_size))
+    flat_codes = torch.tensor(transfer_manager.code_prompt_token_ids[request_id][-end_index:]).reshape(-1).tolist()
 
-    info = {
-        "code_predictor_codes": (
-            torch.tensor(transfer_manager.code_prompt_token_ids[request_id][-end_index:]).reshape(-1).tolist()
-        ),
+    return {
+        "code_predictor_codes": flat_codes,
+        "left_context_size": left_ctx_frames,
+        "codec_chunk_frames": chunk_size,
+        "codec_left_context_frames": left_context_size,
+        "code_flat_numel": len(flat_codes),
         "finished": torch.tensor(is_finished, dtype=torch.bool),
     }
-    return info
 
 
 def llm2code2wav(
@@ -197,6 +242,20 @@ def llm2code2wav(
 
         code_final = prepend_and_flatten_colmajor(codec_codes, pad_vec)
         code_final = code_final.tolist()
+
+        # Guard against flattened sequences longer than code2wav's max_model_len.
+        # Without this, add_request raises ``could not broadcast input array
+        # from shape (N,) into shape (max_model_len,)`` and kills the engine
+        # core (see issue #2683). Mirrors the offline end2end.py safeguard.
+        if len(code_final) > MAX_CODE2WAV_TOKENS:
+            request_id = getattr(talker_output, "request_id", f"unknown_{i}")
+            logger.warning(
+                "Request %s: code_final len=%d > MAX_CODE2WAV_TOKENS=%d, truncating.",
+                request_id,
+                len(code_final),
+                MAX_CODE2WAV_TOKENS,
+            )
+            code_final = code_final[:MAX_CODE2WAV_TOKENS]
 
         code2wav_inputs.append(
             OmniTokensPrompt(

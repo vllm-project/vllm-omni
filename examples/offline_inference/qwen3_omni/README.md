@@ -64,10 +64,47 @@ If media file paths are not provided, the script will use default assets. Suppor
 - `multi_audios`: Multiple audio inputs
 - `mixed_modalities`: Combination of video, image, and audio inputs
 
-### FAQ
+### Async-chunk (offline)
 
-If you encounter error about backend of librosa, try to install ffmpeg with command below.
+For true stage-level concurrency -- where downstream stages (Talker, Code2Wav)
+start **before** the upstream stage (Thinker) finishes -- use the async_chunk
+example. This requires:
+
+1. A deploy config YAML with ``async_chunk: true`` (e.g.
+   ``qwen3_omni_moe.yaml``).
+2. Hardware that matches the config (e.g. 2x H100 for the default 3-stage
+   config).
+
+The async_chunk example uses ``AsyncOmni`` instead of the synchronous ``Omni``
+class, which enables the async orchestrator to receive stage-0 intermediate
+outputs and trigger downstream stages early. Chunk data flows directly between
+stage workers via the in-worker ``OmniChunkTransferAdapter`` / connector,
+**not** through the orchestrator.
+
+#### Single prompt
+```bash
+cd examples/offline_inference/qwen3_omni
+bash run_single_prompt_async_chunk.sh
 ```
-sudo apt update
-sudo apt install ffmpeg
+
+#### Multiple prompts with concurrency control
+```bash
+bash run_multiple_prompts_async_chunk.sh --max-in-flight 4
 ```
+
+#### Text-only output (skip audio generation)
+```bash
+python end2end_async_chunk.py --query-type text --modalities text
+```
+
+#### Custom stage config
+```bash
+python end2end_async_chunk.py \
+    --query-type use_audio \
+    --deploy-config /path/to/your_deploy_config.yaml
+```
+
+> **Note**: The synchronous ``end2end.py`` (using ``Omni``) is still the
+> recommended entry point for non-async-chunk workflows. Only use the
+> async_chunk example when you need the stage-level concurrency semantics
+> described in PR #962 / #1151.

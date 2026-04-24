@@ -1,4 +1,10 @@
-from .qwen3_omni import Qwen3OmniMoeForConditionalGeneration
 from .registry import OmniModelRegistry  # noqa: F401
 
-__all__ = ["Qwen3OmniMoeForConditionalGeneration"]
+# Model classes are lazily loaded via OmniModelRegistry.
+# Do NOT eagerly import model classes here — it triggers heavy transitive
+# imports (CUDA, pynvml, bitsandbytes, etc.) that crash in subprocess
+# environments used by vLLM's model inspection.
+
+__all__ = [
+    "OmniModelRegistry",
+]

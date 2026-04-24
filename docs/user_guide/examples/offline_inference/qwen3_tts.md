@@ -11,18 +11,18 @@ Qwen3 TTS provides multiple task variants for speech generation:
 
 - **CustomVoice**: Generate speech with a known speaker identity (speaker ID) and optional instruction.
 - **VoiceDesign**: Generate speech from text plus a descriptive instruction that designs a new voice.
-- **Base**: Voice cloning using a reference audio + reference transcript, with optional mode selection.
+- **Base**: Voice cloning using a reference audio + reference transcript, with optional mode selection. The `ref_audio` field accepts a local file path, HTTP URL, or base64 data URL.
 
 ## Setup
 Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
 
 ### ROCm Dependencies
 
-You will need to install these two dependencies `onnxruntime-rocm` and `sox`.
+You will need to install the dependency `onnxruntime-rocm`.
 
 ```
 pip uninstall onnxruntime # should be removed before we can install onnxruntime-rocm
-pip install onnxruntime-rocm sox
+pip install onnxruntime-rocm
 ```
 
 ## Quick Start
@@ -90,6 +90,43 @@ Examples:
 python end2end.py --query-type Base --mode-tag icl
 ```
 
+## Voice and Language Control
+
+### Supported Voices (CustomVoice)
+
+Predefined speaker voices are set via the `speaker` (or `voice_type`) field in `additional_information`. Available speakers depend on the loaded checkpoint; check `talker_config.spk_id` in the model config for the full list. Common voices include `vivian`, `ryan`, `aiden`, `ethan`, `serena` (case-insensitive).
+
+Pass the speaker name in your request:
+
+```python
+additional_information = {
+    "text": ["你好，我是通义千问"],
+    "task_type": ["CustomVoice"],
+    "speaker": ["Vivian"],  
+    "language": ["Chinese"],
+}
+```
+
+### Supported Languages
+
+The `language` field controls the codec-level language tag. Use `"Auto"` (default) for automatic detection.
+
+Supported values: `Auto`, `Chinese`, `English`, `Japanese`, `Korean`, `German`, `French`, `Russian`, `Portuguese`, `Spanish`, `Italian`.
+
+```python
+additional_information = {
+    "text": ["Hello, nice to meet you."],
+    "task_type": ["CustomVoice"],
+    "speaker": ["Aiden"],
+    "language": ["English"],
+}
+```
+
+### VoiceDesign and Base
+
+- **VoiceDesign**: Use `instruct` for natural-language voice description; no `speaker` needed.
+- **Base**: Use `ref_audio` and `ref_text` for voice cloning; `language` is optional.
+
 ## Streaming Mode
 
 Add `--streaming` to stream audio chunks progressively via `AsyncOmni` (requires `async_chunk: true` in the stage config):
@@ -98,23 +135,25 @@ Add `--streaming` to stream audio chunks progressively via `AsyncOmni` (requires
 python end2end.py --query-type CustomVoice --streaming --output-dir /tmp/out_stream
 ```
 
-Each 25-frame Code2Wav chunk is logged as it arrives. The final WAV file is written once generation
+Each Code2Wav chunk is logged as it arrives (default 25 frames; configurable via `codec_chunk_frames`
+in the stage config). The initial chunk size is dynamically selected based on server load for reduced
+TTFA, and can be overridden per-request via the `initial_codec_chunk_frames` API field. The final WAV file is written once generation
 completes. This demonstrates that audio data is available progressively rather than only at the end.
 
 > **Note:** Streaming uses `AsyncOmni` internally. The non-streaming path (`Omni`) is unchanged.
 
 ## Batched Decoding
 
-The Code2Wav stage (stage 1) supports batched decoding, where multiple requests are decoded in a single forward pass through the SpeechTokenizer. To use it, provide a stage config with `max_batch_size > 1` and pass multiple prompts via `--txt-prompts` with a matching `--batch-size`.
+The Code2Wav stage (stage 1) supports batched decoding, where multiple requests are decoded in a single forward pass through the SpeechTokenizer. To use it, set `max_num_seqs > 1` on both stages via `--stage-overrides` and pass multiple prompts via `--txt-prompts` with a matching `--batch-size`.
 
 ```
 python end2end.py --query-type CustomVoice \
     --txt-prompts benchmark_prompts.txt \
     --batch-size 4 \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts_batch.yaml
+    --stage-overrides '{"0":{"max_num_seqs":4,"gpu_memory_utilization":0.2},"1":{"max_num_seqs":4,"gpu_memory_utilization":0.2}}'
 ```
 
-**Important:** `--batch-size` must match a CUDA graph capture size (1, 2, 4, 8, 16...) because the Talker's code predictor KV cache is sized to `max_num_seqs`, and CUDA graphs pad the batch to the next capture size. Both stages need `max_batch_size >= batch_size` in the stage config for batching to take effect. If only stage 1 has a higher `max_batch_size`, it won't help — stage 1 can only batch chunks from requests that are in-flight simultaneously, which requires stage 0 to also process multiple requests concurrently.
+**Important:** `--batch-size` must match a CUDA graph capture size (1, 2, 4, 8, 16...) because the Talker's code predictor KV cache is sized to `max_num_seqs`, and CUDA graphs pad the batch to the next capture size. Both stages need `max_num_seqs >= batch_size` in the stage config for batching to take effect. If only stage 1 has a higher `max_num_seqs`, it won't help — stage 1 can only batch chunks from requests that are in-flight simultaneously, which requires stage 0 to also process multiple requests concurrently.
 
 ## Notes
 

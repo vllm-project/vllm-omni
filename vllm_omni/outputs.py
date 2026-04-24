@@ -9,6 +9,33 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm_omni.inputs.data import OmniPromptType
 
 
+@dataclass
+class OmniConnectorOutput:
+    """Communication results from Model Runner to Scheduler.
+
+    Carries transfer readiness signals so the Scheduler can make scheduling
+    decisions without ever calling connector.put()/get() directly.
+
+    Attributes:
+        chunk_ready_req_ids: Request IDs with newly arrived chunks this cycle.
+        chunk_finished_req_ids: Request IDs whose final chunk has arrived.
+        request_metadata: Lightweight scheduling metadata keyed by request ID
+            (e.g. next_stage_prompt_len, code_predictor_codes, left_context_size).
+            Full payloads are owned by the Model Runner's local cache.
+        kv_sent_req_ids: Request IDs whose KV cache was successfully sent.
+        stage_recv_req_ids: Request IDs that received batch stage inputs.
+        has_pending_kv_work: True if the mixin has pending, active, or
+            completed KV transfers that the scheduler should account for.
+    """
+
+    chunk_ready_req_ids: set[str] = field(default_factory=set)
+    chunk_finished_req_ids: set[str] = field(default_factory=set)
+    request_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
+    kv_sent_req_ids: list[str] = field(default_factory=list)
+    stage_recv_req_ids: set[str] = field(default_factory=set)
+    has_pending_kv_work: bool = False
+
+
 class OmniModelRunnerOutput(ModelRunnerOutput):
     """Model runner output for omni models.
 
@@ -24,6 +51,7 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
+    omni_connector_output: OmniConnectorOutput | None = None
 
 
 @dataclass
@@ -58,8 +86,35 @@ class OmniRequestOutput:
     images: list[Image.Image] = field(default_factory=list)
     prompt: OmniPromptType | None = None
     latents: torch.Tensor | None = None
+    trajectory_latents: torch.Tensor | None = None
+    trajectory_timesteps: torch.Tensor | None = None
+    trajectory_log_probs: torch.Tensor | None = None
+    trajectory_decoded: list | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
     _multimodal_output: dict[str, Any] = field(default_factory=dict)
+    _custom_output: dict[str, Any] = field(default_factory=dict)
+
+    # profiling data
+    stage_durations: dict[str, float] = field(default_factory=dict)
+
+    # memory usage info
+    peak_memory_mb: float = 0.0
+
+    # Error information -- set when the output represents a failed request.
+    error: str | None = None
+
+    @classmethod
+    def from_error(
+        cls,
+        request_id: str,
+        error: str,
+    ) -> "OmniRequestOutput":
+        """Create an error output for a request that failed during generation."""
+        return cls(
+            request_id=request_id,
+            finished=True,
+            error=error,
+        )
 
     @classmethod
     def from_pipeline(
@@ -94,8 +149,15 @@ class OmniRequestOutput:
         prompt: OmniPromptType | None = None,
         metrics: dict[str, Any] | None = None,
         latents: torch.Tensor | None = None,
+        trajectory_latents: torch.Tensor | None = None,
+        trajectory_timesteps: torch.Tensor | None = None,
+        trajectory_log_probs: torch.Tensor | None = None,
+        trajectory_decoded: list | None = None,
         multimodal_output: dict[str, Any] | None = None,
+        custom_output: dict[str, Any] | None = None,
         final_output_type: str = "image",
+        stage_durations: dict[str, float] | None = None,
+        peak_memory_mb: float = 0.0,
     ) -> "OmniRequestOutput":
         """Create output from diffusion model.
 
@@ -105,6 +167,14 @@ class OmniRequestOutput:
             prompt: The prompt used
             metrics: Generation metrics
             latents: Optional latent tensors
+            trajectory_latents: Optional stacked trajectory latent tensors
+            trajectory_timesteps: Optional stacked trajectory timestep tensors
+            trajectory_log_probs: Optional stacked trajectory log-probability tensors
+            trajectory_decoded: Optional list of decoded trajectory images
+            multimodal_output: Optional multimodal output dict
+            custom_output: Optional custom output dict (e.g. prompt embeds)
+            stage_durations: Optional stage durations (execution time of each stage) dict
+            peak_memory_mb: Peak memory usage in MB
 
         Returns:
             OmniRequestOutput configured for diffusion mode
@@ -115,8 +185,15 @@ class OmniRequestOutput:
             images=images,
             prompt=prompt,
             latents=latents,
+            trajectory_latents=trajectory_latents,
+            trajectory_timesteps=trajectory_timesteps,
+            trajectory_log_probs=trajectory_log_probs,
+            trajectory_decoded=trajectory_decoded,
             metrics=metrics or {},
             _multimodal_output=multimodal_output or {},
+            _custom_output=custom_output or {},
+            stage_durations=stage_durations or {},
+            peak_memory_mb=peak_memory_mb,
             finished=True,
         )
 
@@ -130,15 +207,30 @@ class OmniRequestOutput:
         if self.request_output is None:
             return self._multimodal_output
 
-        request_outputs = self.request_output if isinstance(self.request_output, list) else [self.request_output]
-        for req_out in request_outputs:
-            # Check completion outputs first (where multimodal_output is attached)
-            for output in getattr(req_out, "outputs", []):
-                if mm := getattr(output, "multimodal_output", None):
-                    return mm
-            if mm := getattr(req_out, "multimodal_output", None):
+        # Check completion outputs first (where multimodal_output is attached)
+        for output in getattr(self.request_output, "outputs", []):
+            if mm := getattr(output, "multimodal_output", None):
                 return mm
+        if mm := getattr(self.request_output, "multimodal_output", None):
+            return mm
         return self._multimodal_output
+
+    @property
+    def custom_output(self) -> dict[str, Any]:
+        """Return custom output data from diffusion pipelines.
+
+        For diffusion outputs, returns the local _custom_output field.
+        For pipeline outputs with an inner OmniRequestOutput, forwards
+        the custom_output from the inner request output.
+        """
+        if self.request_output is not None:
+            if isinstance(self.request_output, OmniRequestOutput):
+                return self.request_output._custom_output
+        return self._custom_output
+
+    @custom_output.setter
+    def custom_output(self, value: dict[str, Any]) -> None:
+        self._custom_output = value
 
     @property
     def num_images(self) -> int:
@@ -250,6 +342,9 @@ class OmniRequestOutput:
             f"latents={self.latents}",
             f"metrics={self.metrics}",
             f"multimodal_output={self._multimodal_output}",
+            f"custom_output={self._custom_output}",
+            f"stage_durations={self.stage_durations}",
+            f"peak_memory_mb={self.peak_memory_mb}",
         ]
 
         return f"OmniRequestOutput({', '.join(parts)})"

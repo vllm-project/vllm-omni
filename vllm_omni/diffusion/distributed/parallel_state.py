@@ -35,6 +35,8 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion import envs
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.platforms import current_omni_platform
 
 from .group_coordinator import (
@@ -51,7 +53,7 @@ logger = init_logger(__name__)
 
 
 _WORLD: GroupCoordinator | None = None
-# get _TP from vllm.distributed.parallel_state
+# get _TP&_EP from vllm.distributed.parallel_state
 _SP: SequenceParallelGroupCoordinator | None = None
 _PP: PipelineGroupCoordinator | None = None
 _CFG: GroupCoordinator | None = None
@@ -188,6 +190,7 @@ class RankGenerator:
         self.fs = fs
         self.rank_offset = rank_offset
         self.world_size = tp * sp * pp * cfg * dp
+        self.ep = tp * sp * cfg * dp  # EP level exclude PP
 
         self.name_to_size = {
             "tp": self.tp,
@@ -248,6 +251,15 @@ class RankGenerator:
             for i in range(num_groups):
                 group = list(range(i * self.fs + self.rank_offset, (i + 1) * self.fs + self.rank_offset))
                 ranks.append(group)
+            return ranks
+
+        if token == "ep":
+            ranks = []
+            num_pp_stages = self.pp
+            for i in range(num_pp_stages):
+                start = i * self.ep + self.rank_offset
+                end = start + self.ep
+                ranks.append(list(range(start, end)))
             return ranks
 
         mask = self.get_mask(self.order, token)
@@ -474,6 +486,7 @@ def init_model_parallel_group(
         "data",
         "pipeline",
         "tensor",
+        "expert",
         "sequence",
         "classifier_free_guidance",
         "fully_shard",
@@ -669,6 +682,8 @@ def initialize_model_parallel(
     tensor_parallel_size: int = 1,
     pipeline_parallel_size: int = 1,
     fully_shard_degree: int = 1,
+    hsdp_replicate_size: int = 1,
+    enable_expert_parallel: bool = False,
     backend: str | None = None,
 ) -> None:
     if backend is None:
@@ -740,6 +755,14 @@ def initialize_model_parallel(
         data_parallel_size * cfg_parallel_size * sequence_parallel_size * pipeline_parallel_size * tensor_parallel_size
     )
 
+    # Check for standalone HSDP: all non-HSDP parallelism dimensions are 1
+    is_standalone_hsdp = dit_parallel_size == 1 and fully_shard_degree > 1
+
+    # For standalone HSDP: use (fully_shard_degree * hsdp_replicate_size) as dit_parallel_size
+    # This ensures orthogonal rank generation works correctly for all HSDP workers
+    if is_standalone_hsdp:
+        dit_parallel_size = fully_shard_degree * hsdp_replicate_size
+
     if world_size < dit_parallel_size:
         raise RuntimeError(
             f"world_size ({world_size}) is less than "
@@ -751,12 +774,16 @@ def initialize_model_parallel(
             f"data_parallel_size ({data_parallel_size})"
         )
 
+    # For standalone HSDP, use (fully_shard_degree * hsdp_replicate_size) as data_parallel_size
+    # so that RankGenerator.world_size matches the actual number of workers
+    effective_dp_size = (fully_shard_degree * hsdp_replicate_size) if is_standalone_hsdp else data_parallel_size
+
     rank_generator: RankGenerator = RankGenerator(
         tensor_parallel_size,
         sequence_parallel_size,
         pipeline_parallel_size,
         cfg_parallel_size,
-        data_parallel_size,
+        effective_dp_size,
         fs=fully_shard_degree,
         order="tp-sp-pp-cfg-dp",
     )
@@ -824,6 +851,18 @@ def initialize_model_parallel(
         parallel_mode="fully_shard",
     )
 
+    if enable_expert_parallel:
+        od_config: OmniDiffusionConfig | None = get_forward_context().omni_diffusion_config
+        if od_config and od_config.is_moe:
+            vllm_parallel_state._EP = init_model_parallel_group(
+                group_ranks=rank_generator.get_ranks("ep"),
+                local_rank=get_world_group().local_rank,
+                backend=backend,
+                parallel_mode="expert",
+            )
+        else:
+            raise RuntimeError("Expert parallelism enabled for a non-MoE model ")
+
     init_dit_group(dit_parallel_size, backend)
 
 
@@ -847,6 +886,10 @@ def destroy_model_parallel():
     if vllm_parallel_state._TP:
         vllm_parallel_state._TP.destroy()
     vllm_parallel_state._TP = None
+
+    if vllm_parallel_state._EP:
+        vllm_parallel_state._EP.destroy()
+    vllm_parallel_state._EP = None
 
     global _PP
     if _PP:

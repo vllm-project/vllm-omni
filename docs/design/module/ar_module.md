@@ -85,9 +85,6 @@ classDiagram
     class InputProcessor {
         +process_inputs() EngineCoreRequest
     }
-    class OmniInputProcessor {
-        +process_inputs() OmniEngineCoreRequest
-    }
 
     class VLLMOutputProcessor {
         +process_outputs() OutputProcessorOutput
@@ -96,7 +93,6 @@ classDiagram
         +process_outputs() OutputProcessorOutput
         +_route_and_normalize()
     }
-    InputProcessor <|-- OmniInputProcessor
     VLLMOutputProcessor <|-- MultimodalOutputProcessor
 ```
 
@@ -105,7 +101,7 @@ classDiagram
 - **Scheduler**: `OmniARScheduler` extends `vllm.v1.core.sched.scheduler.Scheduler` to enrich scheduled requests with omni-specific payloads
 - **Worker**: `GPUARWorker` extends `vllm.v1.worker.gpu_worker.Worker` to initialize AR-specific model runners
 - **ModelRunner**: `GPUARModelRunner` extends `OmniGPUModelRunner` → `vllm.v1.worker.gpu_model_runner.GPUModelRunner` to expose hidden states and handle multimodal outputs
-- **InputProcessor**: `OmniInputProcessor` extends `vllm.v1.engine.input_processor.InputProcessor` to serialize prompt embeddings and additional information
+- **InputProcessor**: Stage-0 uses upstream `vllm.v1.engine.input_processor.InputProcessor`; `AsyncOmniEngine` then restores omni-specific payloads (for example `additional_information` and `prompt_embeds`) when building `OmniEngineCoreRequest`
 - **OutputProcessor**: `MultimodalOutputProcessor` extends `vllm.v1.engine.output_processor.OutputProcessor` to route and accumulate multimodal outputs
 
 ## 3. Scheduler Design
@@ -118,7 +114,7 @@ The following diagram illustrates the request flow through the AR module compone
 
 ```mermaid
 flowchart TD
-    A[OmniInputProcessor] -->|OmniEngineCoreRequest| B[OmniARScheduler]
+    A[InputProcessor stage-0 in AsyncOmniEngine] -->|EngineCoreRequest then upgraded to OmniEngineCoreRequest| B[OmniARScheduler]
     B -->|schedule: OmniNewRequestData| C[GPUARWorker]
     C -->|SchedulerOutput| D[GPUARModelRunner]
     D -->|execute_model: None| E[Model Forward Pass]
@@ -297,15 +293,17 @@ The input/output processing pipeline handles serialization, routing, and accumul
 ```mermaid
 sequenceDiagram
     participant Client
-    participant OmniInputProcessor
+    participant AsyncOmniEngine
+    participant InputProcessor
     participant Scheduler
     participant ModelRunner
     participant MultimodalOutputProcessor
     participant Client
 
-    Client->>OmniInputProcessor: prompt + prompt_embeds + additional_info
-    OmniInputProcessor->>OmniInputProcessor: Serialize tensors to payloads
-    OmniInputProcessor->>Scheduler: OmniEngineCoreRequest (with payloads)
+    Client->>AsyncOmniEngine: prompt + prompt_embeds + additional_info
+    AsyncOmniEngine->>InputProcessor: process_inputs()
+    InputProcessor->>Scheduler: EngineCoreRequest
+    AsyncOmniEngine->>AsyncOmniEngine: _upgrade_to_omni_request() + serialize_additional_information()
     Scheduler->>ModelRunner: OmniNewRequestData (with payloads)
     ModelRunner->>ModelRunner: Decode payloads → CPU tensors
     ModelRunner->>ModelRunner: Overlay prompt_embeds on inputs_embeds
@@ -318,43 +316,18 @@ sequenceDiagram
     MultimodalOutputProcessor->>Client: RequestOutput (with multimodal_output)
 ```
 
-### OmniInputProcessor
+### Stage-0 Input Processing
 
-`OmniInputProcessor` extends the base input processor to serialize prompt embeddings and additional information for inter-stage transfer.
-
-#### Payload Serialization
-
-Converts PyTorch tensors to serialized payloads:
+Stage-0 now uses upstream `InputProcessor` directly, and `AsyncOmniEngine` upgrades the request to `OmniEngineCoreRequest` while restoring omni-specific payloads.
 
 ```python
-def process_inputs(self, ...) -> OmniEngineCoreRequest:
-    # Serialize prompt_embeds
-    if "prompt_embeds" in decoder_inputs:
-        pe_cpu = decoder_inputs["prompt_embeds"].detach().to("cpu").contiguous()
-        prompt_embeds_payload = PromptEmbedsPayload(
-            data=pe_cpu.numpy().tobytes(),
-            shape=[seq_len, hidden_size],
-            dtype=dtype_str,
-        )
-
-    # Serialize additional_information
-    if "additional_information" in decoder_inputs:
-        entries = {}
-        for key, value in raw_info.items():
-            if isinstance(value, torch.Tensor):
-                entry = AdditionalInformationEntry(
-                    tensor_data=value.numpy().tobytes(),
-                    tensor_shape=list(value.shape),
-                    tensor_dtype=dtype_str,
-                )
-            entries[key] = entry
-        additional_information_payload = AdditionalInformationPayload(entries=entries)
-
-    return OmniEngineCoreRequest(
-        # ... standard fields ...
-        prompt_embeds=prompt_embeds_payload,
-        additional_information=additional_information_payload,
-    )
+request = self.input_processor.process_inputs(
+    request_id=request_id,
+    prompt=prompt,
+    params=params,
+    supported_tasks=self.supported_tasks,
+)
+request = _upgrade_to_omni_request(request, prompt)
 ```
 
 ### MultimodalOutputProcessor
@@ -400,13 +373,13 @@ The AR module of vLLM-Omni extends vLLM through strategic inheritance and minima
 ### Key Design Patterns
 
 1. **Inheritance over composition**: Extends vLLM classes to preserve compatibility with existing scheduling, batching, and execution mechanisms
-2. **Payload serialization**: Uses `PromptEmbedsPayload` and `AdditionalInformationPayload` for efficient inter-stage data transfer
+2. **Payload serialization**: Uses serialized `additional_information` payloads together with prompt-embedding handoff for efficient inter-stage transfer
 3. **Two-phase execution**: Maintains vLLM's execute/sample separation for AR models while supporting single-phase execution for generation models
 4. **Multimodal routing**: Routes outputs by `output_type` and accumulates tensors incrementally to support streaming
 
 ### Differences from vLLM
 
-- **Payload support**: Serialized prompt embeddings and additional information enable direct transfer between pipeline stages
+- **Payload support**: Serialized additional information and prompt embeddings enable direct transfer between pipeline stages
 - **Multimodal handling**: Extended input/output processors support images, audio, and other modalities alongside text
 - **Hidden state exposure**: AR model runners expose per-request hidden states via `pooler_output` for downstream consumption
 - **Generation scheduler**: Fast-path scheduling for basic heterogeneous architectures that complete in one step

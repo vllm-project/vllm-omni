@@ -96,6 +96,7 @@ class TestWorkerWrapperBaseInitialization:
             local_rank=0,
             rank=0,
             od_config=mock_od_config,
+            skip_load_model=False,
         )
 
 

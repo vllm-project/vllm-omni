@@ -10,7 +10,9 @@ from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegi
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
+from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
+from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
 
 logger = init_logger(__name__)
 
@@ -56,6 +58,51 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2",
         "Wan22Pipeline",
     ),
+    "WanVACEPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_vace",
+        "Wan22VACEPipeline",
+    ),
+    "LTX2Pipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2Pipeline",
+    ),
+    "LTX2ImageToVideoPipeline": (
+        "ltx2",
+        "pipeline_ltx2_image2video",
+        "LTX2ImageToVideoPipeline",
+    ),
+    "LTX2TwoStagesPipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2TwoStagesPipeline",
+    ),
+    "LTX2ImageToVideoTwoStagesPipeline": (
+        "ltx2",
+        "pipeline_ltx2_image2video",
+        "LTX2ImageToVideoTwoStagesPipeline",
+    ),
+    "LTX2T2VDMD2Pipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2T2VDMD2Pipeline",
+    ),
+    "LTX2I2VDMD2Pipeline": (
+        "ltx2",
+        "pipeline_ltx2_image2video",
+        "LTX2I2VDMD2Pipeline",
+    ),
+    "LTX23Pipeline": (
+        "ltx2",
+        "pipeline_ltx2_3",
+        "LTX23Pipeline",
+    ),
+    "LTX23ImageToVideoPipeline": (
+        "ltx2",
+        "pipeline_ltx2_3_image2video",
+        "LTX23ImageToVideoPipeline",
+    ),
     "StableAudioPipeline": (
         "stable_audio",
         "pipeline_stable_audio",
@@ -65,6 +112,16 @@ _DIFFUSION_MODELS = {
         "wan2_2",
         "pipeline_wan2_2_i2v",
         "Wan22I2VPipeline",
+    ),
+    "WanT2VDMD2Pipeline": (
+        "wan2_2",
+        "pipeline_wan2_2",
+        "WanT2VDMD2Pipeline",
+    ),
+    "WanI2VDMD2Pipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_i2v",
+        "WanI2VDMD2Pipeline",
     ),
     "LongCatImagePipeline": (
         "longcat_image",
@@ -86,9 +143,14 @@ _DIFFUSION_MODELS = {
         "pipeline_sd3",
         "StableDiffusion3Pipeline",
     ),
+    "FluxKontextPipeline": (
+        "flux",
+        "pipeline_flux_kontext",
+        "FluxKontextPipeline",
+    ),
     "HunyuanImage3ForCausalMM": (
-        "hunyuan_image_3",
-        "pipeline_hunyuan_image_3",
+        "hunyuan_image3",
+        "pipeline_hunyuan_image3",
         "HunyuanImage3Pipeline",
     ),
     "Flux2KleinPipeline": (
@@ -110,6 +172,56 @@ _DIFFUSION_MODELS = {
         "omnigen2",
         "pipeline_omnigen2",
         "OmniGen2Pipeline",
+    ),
+    "HeliosPipeline": (
+        "helios",
+        "pipeline_helios",
+        "HeliosPipeline",
+    ),
+    "HeliosPyramidPipeline": (
+        "helios",
+        "pipeline_helios",
+        "HeliosPipeline",
+    ),
+    "Flux2Pipeline": (
+        "flux2",
+        "pipeline_flux2",
+        "Flux2Pipeline",
+    ),
+    "DreamIDOmniPipeline": (
+        "dreamid_omni",
+        "pipeline_dreamid_omni",
+        "DreamIDOmniPipeline",
+    ),
+    "HunyuanVideo15Pipeline": (
+        "hunyuan_video",
+        "pipeline_hunyuan_video_1_5",
+        "HunyuanVideo15Pipeline",
+    ),
+    "HunyuanVideo15ImageToVideoPipeline": (
+        "hunyuan_video",
+        "pipeline_hunyuan_video_1_5_i2v",
+        "HunyuanVideo15I2VPipeline",
+    ),
+    "MagiHumanPipeline": (
+        "magi_human",
+        "pipeline_magi_human",
+        "MagiHumanPipeline",
+    ),
+    "OmniVoicePipeline": (
+        "omnivoice",
+        "pipeline_omnivoice",
+        "OmniVoicePipeline",
+    ),
+    "OmniVoice": (
+        "omnivoice",
+        "pipeline_omnivoice",
+        "OmniVoicePipeline",
+    ),
+    "DiffusersAdapterPipeline": (
+        "diffusers_adapter",
+        "pipeline_diffusers_adapter",
+        "DiffusersAdapterPipeline",
     ),
 }
 
@@ -170,9 +282,9 @@ def initialize_model(
             od_config.vae_use_tiling = True
 
         # Configure VAE memory optimization settings from config
-        if hasattr(model.vae, "use_slicing"):
+        if hasattr(model, "vae") and hasattr(model.vae, "use_slicing"):
             model.vae.use_slicing = od_config.vae_use_slicing
-        if hasattr(model.vae, "use_tiling"):
+        if hasattr(model, "vae") and hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
 
         if is_distributed_vae:
@@ -215,7 +327,12 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
 
         for attr in transformer_attrs:
             if not hasattr(model, attr):
-                continue
+                # Some pipeline like LTX2TwoStagesPipeline have recursive
+                # modules that have the transformer
+                module = find_module_with_attr(model, attr)
+                if module is None:
+                    continue
+                model = module
 
             transformer = getattr(model, attr)
             if transformer is None:
@@ -244,6 +361,11 @@ def _apply_sequence_parallel_if_enabled(model, od_config: OmniDiffusionConfig) -
             apply_sequence_parallel(transformer, sp_config, plan)
             applied_count += 1
 
+        # update forward context sp_plan_hooks_applied
+        ctx = get_forward_context()
+        ctx.sp_plan_hooks_applied = applied_count > 0
+        logger.debug(f"Setting sp_plan_hooks_applied={ctx.sp_plan_hooks_applied} in ``ForwardContext``!")
+
         if applied_count == 0:
             logger.warning(
                 f"Sequence parallelism is enabled (sp_size={sp_size}) but no transformer with _sp_plan found. "
@@ -265,16 +387,36 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
     "WanPipeline": "get_wan22_post_process_func",
+    "WanVACEPipeline": "get_wan22_vace_post_process_func",
+    "LTX2Pipeline": "get_ltx2_post_process_func",
+    "LTX2TwoStagesPipeline": "get_ltx2_post_process_func",
+    "LTX2ImageToVideoPipeline": "get_ltx2_post_process_func",
+    "LTX2ImageToVideoTwoStagesPipeline": "get_ltx2_post_process_func",
+    "LTX2T2VDMD2Pipeline": "get_ltx2_post_process_func",
+    "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
+    "LTX23Pipeline": "get_ltx2_post_process_func",
+    "LTX23ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
+    "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
+    "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
+    "FluxKontextPipeline": "get_flux_kontext_post_process_func",
     "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
     "NextStep11Pipeline": "get_nextstep11_post_process_func",
     "FluxPipeline": "get_flux_post_process_func",
     "OmniGen2Pipeline": "get_omnigen2_post_process_func",
+    "HeliosPipeline": "get_helios_post_process_func",
+    "HeliosPyramidPipeline": "get_helios_post_process_func",
+    "Flux2Pipeline": "get_flux2_post_process_func",
+    "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
+    "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
+    "MagiHumanPipeline": "get_magi_human_post_process_func",
+    "OmniVoicePipeline": "get_omnivoice_post_process_func",
+    "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -287,8 +429,15 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "LongCatImageEditPipeline": "get_longcat_image_edit_pre_process_func",
     "QwenImageLayeredPipeline": "get_qwen_image_layered_pre_process_func",
     "WanPipeline": "get_wan22_pre_process_func",
+    "WanVACEPipeline": "get_wan22_vace_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
+    "WanT2VDMD2Pipeline": "get_wan22_pre_process_func",
+    "WanI2VDMD2Pipeline": "get_wan22_i2v_pre_process_func",
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
+    "HeliosPipeline": "get_helios_pre_process_func",
+    "HeliosPyramidPipeline": "get_helios_pre_process_func",
+    "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_pre_process_func",
+    "MagiHumanPipeline": "get_magi_human_pre_process_func",
 }
 
 

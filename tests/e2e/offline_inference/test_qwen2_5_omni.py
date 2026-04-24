@@ -2,28 +2,41 @@
 E2E tests for Qwen2.5-Omni model with mixed modality inputs, audio and text output.
 """
 
-from pathlib import Path
-
 import pytest
 
-from tests.conftest import (
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import (
     generate_synthetic_audio,
     generate_synthetic_image,
     generate_synthetic_video,
 )
-from tests.utils import hardware_test
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.platforms import current_omni_platform
 
 models = ["Qwen/Qwen2.5-Omni-7B"]
 
-# CI stage config optimized for 24GB GPU (L4/RTX3090) or NPU
-if current_omni_platform.is_npu():
-    stage_config = str(Path(__file__).parent / "stage_configs" / "npu" / "qwen2_5_omni_ci.yaml")
-elif current_omni_platform.is_rocm():
-    # ROCm stage config optimized for MI325 GPU
-    stage_config = str(Path(__file__).parent.parent / "stage_configs" / "rocm" / "qwen2_5_omni_ci.yaml")
+# Single CI deploy YAML; rocm/xpu deltas are picked automatically via the
+# platforms: section. NPU still uses the legacy per-platform YAML until it
+# also migrates to the new schema.
+_CI_DEPLOY = get_deploy_config_path("ci/qwen2_5_omni.yaml")
+
+
+def get_cuda_graph_config():
+    return modify_stage_config(
+        _CI_DEPLOY,
+        updates={
+            "stages": {
+                0: {"enforce_eager": True},
+                1: {"enforce_eager": True},
+            },
+        },
+    )
+
+
+if current_omni_platform.is_rocm() or current_omni_platform.is_xpu() or current_omni_platform.is_npu():
+    stage_config = _CI_DEPLOY
 else:
-    stage_config = str(Path(__file__).parent.parent / "stage_configs" / "qwen2_5_omni_ci.yaml")
+    stage_config = get_cuda_graph_config()
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models]
@@ -37,9 +50,9 @@ def get_question(prompt_type="mix"):
     return prompts.get(prompt_type, prompts["mix"])
 
 
-@pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 4, "rocm": 2, "xpu": 3})
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
     """
@@ -68,9 +81,9 @@ def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
     omni_runner_handler.send_request(request_config)
 
 
-@pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})
+@hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards={"cuda": 4, "rocm": 2, "xpu": 3})
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_text_to_text(omni_runner, omni_runner_handler) -> None:
     """

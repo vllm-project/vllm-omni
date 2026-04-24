@@ -2,80 +2,129 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import pytest
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from vllm_omni.entrypoints import utils as utils_module
-from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.entrypoints.cli.serve import OmniServeCommand, _create_default_diffusion_stage_cfg
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-MODEL = "riverclouds/qwen_image_random"
+
+def test_default_stage_config_includes_cache_backend():
+    """Ensure cache knobs survive the default diffusion-stage builder."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "cache_backend": "cache_dit",
+            "cache_config": '{"Fn_compute_blocks": 2}',
+            "vae_use_slicing": True,
+            "ulysses_degree": 2,
+        }
+    )[0]
+
+    engine_args = stage_cfg["engine_args"]
+    assert stage_cfg["stage_type"] == "diffusion"
+    assert engine_args["cache_backend"] == "cache_dit"
+    assert engine_args["cache_config"]["Fn_compute_blocks"] == 2
+    assert engine_args["vae_use_slicing"] is True
+    assert engine_args["parallel_config"].ulysses_degree == 2
+    assert engine_args["model_stage"] == "diffusion"
 
 
-def test_default_stage_config_includes_cache_backend(monkeypatch):
-    """Ensure cache_backend/cache_config are preserved in default diffusion stage."""
-    monkeypatch.setattr(utils_module, "load_stage_configs_from_model", lambda model, base_engine_args=None: [])
-    monkeypatch.setattr(utils_module, "resolve_model_config_path", lambda model: None)
-    monkeypatch.setattr(AsyncOmni, "_start_stages", lambda self, model: None)
-    monkeypatch.setattr(AsyncOmni, "_wait_for_stages_ready", lambda self, timeout=0: None)
+def test_default_cache_config_used_when_missing():
+    """Ensure default cache_config is synthesized when only backend is given."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "cache_backend": "cache_dit",
+        }
+    )[0]
 
-    omni = AsyncOmni(
-        model=MODEL,
-        cache_backend="cache_dit",
-        cache_config='{"Fn_compute_blocks": 2}',
-        vae_use_slicing=True,
-        ulysses_degree=2,
-    )
-
-    stage_cfg = omni.stage_configs[0]
-    engine_args = stage_cfg.engine_args
-
-    assert engine_args.get("cache_backend") == "cache_dit"
-    cache_config = engine_args.get("cache_config")
-    assert cache_config["Fn_compute_blocks"] == 2
-    assert engine_args.get("vae_use_slicing") is True
-    parallel_config = engine_args.get("parallel_config")
-    if hasattr(parallel_config, "get"):
-        ulysses_degree = parallel_config.get("ulysses_degree")
-    else:
-        ulysses_degree = getattr(parallel_config, "ulysses_degree", None)
-    assert ulysses_degree == 2
-
-
-def test_default_cache_config_used_when_missing(monkeypatch):
-    """Ensure default cache_config is applied when cache_backend is set."""
-    monkeypatch.setattr(utils_module, "load_stage_configs_from_model", lambda model, base_engine_args=None: [])
-    monkeypatch.setattr(utils_module, "resolve_model_config_path", lambda model: None)
-    monkeypatch.setattr(AsyncOmni, "_start_stages", lambda self, model: None)
-    monkeypatch.setattr(AsyncOmni, "_wait_for_stages_ready", lambda self, timeout=0: None)
-
-    omni = AsyncOmni(
-        model=MODEL,
-        cache_backend="cache_dit",
-    )
-
-    engine_args = omni.stage_configs[0].engine_args
-    cache_config = engine_args.get("cache_config")
+    cache_config = stage_cfg["engine_args"]["cache_config"]
     assert cache_config is not None
     assert cache_config["Fn_compute_blocks"] == 1
 
 
-def test_default_stage_devices_from_sequence_parallel(monkeypatch):
-    """Ensure devices list reflects sequence parallel size when no parallel_config is provided."""
-    monkeypatch.setattr(utils_module, "load_stage_configs_from_model", lambda model, base_engine_args=None: [])
-    monkeypatch.setattr(utils_module, "resolve_model_config_path", lambda model: None)
-    monkeypatch.setattr(AsyncOmni, "_start_stages", lambda self, model: None)
-    monkeypatch.setattr(AsyncOmni, "_wait_for_stages_ready", lambda self, timeout=0: None)
+def test_default_stage_devices_from_sequence_parallel():
+    """Ensure runtime devices reflect computed diffusion world size."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "ulysses_degree": 2,
+            "ring_degree": 2,
+        }
+    )[0]
 
-    omni = AsyncOmni(
-        model=MODEL,
-        ulysses_degree=2,
-        ring_degree=2,
+    assert stage_cfg["runtime"]["devices"] == "0,1,2,3"
+
+
+def test_default_stage_config_propagates_ulysses_mode():
+    """Ensure UAA mode survives default diffusion-stage creation."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "ulysses_degree": 4,
+            "ulysses_mode": "advanced_uaa",
+        }
+    )[0]
+
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config.ulysses_degree == 4
+    assert parallel_config.ulysses_mode == "advanced_uaa"
+
+
+def test_default_stage_config_includes_default_sampling_params():
+    """Ensure default sampling params survive the default diffusion-stage builder."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "default_sampling_params": '{"0": {"generator_device":"cpu", "guidance_scale":7.5}}',
+        }
+    )[0]
+
+    assert stage_cfg["default_sampling_params"] == {
+        "generator_device": "cpu",
+        "guidance_scale": 7.5,
+    }
+
+
+def test_serve_cli_accepts_ulysses_mode():
+    """Ensure diffusion serve CLI exposes ulysses_mode and wires it to parallel_config."""
+    parser = FlexibleArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Qwen/Qwen-Image",
+            "--omni",
+            "--usp",
+            "4",
+            "--ulysses-mode",
+            "advanced_uaa",
+        ]
     )
 
-    stage_cfg = omni.stage_configs[0]
-    runtime = stage_cfg.runtime
-    if hasattr(runtime, "get"):
-        devices = runtime.get("devices")
-    else:
-        devices = getattr(runtime, "devices", None)
-    assert devices == "0,1,2,3"
+    stage_cfg = _create_default_diffusion_stage_cfg(args)[0]
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+
+    assert args.ulysses_mode == "advanced_uaa"
+    assert parallel_config.ulysses_degree == 4
+    assert parallel_config.ulysses_mode == "advanced_uaa"
+
+
+def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
+    """Ensure diffusion serve CLI exposes the profiler switch."""
+    parser = FlexibleArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            "--omni",
+            "--enable-diffusion-pipeline-profiler",
+        ]
+    )
+
+    stage_cfg = _create_default_diffusion_stage_cfg(args)[0]
+
+    assert args.enable_diffusion_pipeline_profiler is True
+    assert stage_cfg["engine_args"]["enable_diffusion_pipeline_profiler"] is True

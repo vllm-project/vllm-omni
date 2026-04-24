@@ -1,0 +1,197 @@
+# -- Default values for chart vllm-omni
+# -- Declare variables to be passed into your templates.
+
+# -- HuggingFace model ID to serve
+model: "Tongyi-MAI/Z-Image-Turbo"
+
+# -- Image configuration
+image:
+  # -- Image repository
+  repository: "vllm/vllm-omni"
+  # -- Image tag
+  tag: "v0.16.0"
+  # -- Override the container command entirely. If empty, the chart constructs
+  # -- it automatically from model + omniArgs.
+  command: []
+  # -- Optional environment variables for the container
+  env: []
+  # -- Security context override
+  securityContext: {}
+
+# -- Container port
+containerPort: 8000
+# -- Service name (auto-generated from release name if empty)
+serviceName:
+# -- Service port
+servicePort: 80
+# -- Additional ports configuration
+extraPorts: []
+
+# -- Number of replicas
+replicaCount: 1
+
+# -- Deployment strategy configuration
+deploymentStrategy: {}
+
+# -- Resource configuration
+resources:
+  requests:
+    # -- Number of CPUs
+    cpu: 4
+    # -- CPU memory
+    memory: 24Gi
+    # -- Number of GPUs
+    nvidia.com/gpu: 1
+  limits:
+    # -- Number of CPUs
+    cpu: 4
+    # -- CPU memory
+    memory: 24Gi
+    # -- Number of GPUs
+    nvidia.com/gpu: 1
+
+# -- GPU model types for node affinity scheduling (optional)
+# -- Leave empty to schedule on any GPU node. Set to restrict to specific GPU types.
+# -- Example: ["NVIDIA-A100-SXM4-40GB"]
+gpuModels: []
+
+# -- vllm-omni specific CLI arguments
+omniArgs:
+  # -- Additional raw CLI flags appended to the serve command (list of strings)
+  extraArgs: []
+  # -- Enable VAE slicing for memory optimization
+  vaeUseSlicing: false
+  # -- Enable VAE tiling for memory optimization
+  vaeUseTiling: false
+  # -- Enable CPU offloading for diffusion models
+  enableCpuOffload: false
+  # -- Number of GPUs for diffusion inference (empty = auto)
+  numGpus:
+  # -- Path to stage configs file (empty = auto-detected from model)
+  stageConfigsPath:
+  # -- Cache backend: none, tea_cache, or cache_dit
+  cacheBackend: "none"
+  # -- Default sampling params as a JSON string
+  defaultSamplingParams:
+  # -- Worker backend: multi_process or ray
+  workerBackend: "multi_process"
+
+# -- HuggingFace token for gated models (optional)
+hfToken: ""
+
+# -- Shared memory size for PyTorch multiprocessing
+shmSize: "8Gi"
+
+# -- Model cache configuration (HuggingFace downloads)
+modelCache:
+  # -- Use a PersistentVolumeClaim for model cache (recommended for production)
+  enabled: true
+  # -- Storage size for the PVC
+  storageSize: "50Gi"
+  # -- Storage class name (empty = cluster default)
+  storageClassName: ""
+  # -- Access modes
+  accessModes:
+    - ReadWriteOnce
+
+# -- Autoscaling configuration
+autoscaling:
+  # -- Enable autoscaling
+  enabled: false
+  # -- Minimum replicas
+  minReplicas: 1
+  # -- Maximum replicas
+  maxReplicas: 10
+  # -- Target CPU utilization for autoscaling
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+# -- ConfigMap data (key-value pairs injected as environment variables)
+configs: {}
+
+# -- Secrets data (key-value pairs, base64-encoded automatically)
+secrets: {}
+
+# -- External ConfigMaps/Secrets references
+externalConfigs: []
+
+# -- Custom Kubernetes objects
+customObjects: []
+
+# -- PodDisruptionBudget max unavailable
+maxUnavailablePodDisruptionBudget: ""
+
+# -- Additional init containers
+extraInit:
+  initContainers: []
+
+# -- Additional sidecar containers
+extraContainers: []
+
+# -- Startup probe configuration
+# -- Protects slow-starting containers. Liveness and readiness probes
+# -- do not start until the startup probe succeeds.
+# -- failureThreshold * periodSeconds = max startup time (40 * 30 = 1200s = 20 min)
+startupProbe:
+  # -- HTTP check configuration
+  httpGet:
+    # -- Path to check
+    path: /health
+    # -- Port to check (uses named port to stay in sync with containerPort)
+    port: "container-port"
+  # -- Failures before killing the container
+  failureThreshold: 40
+  # -- How often to perform the probe
+  periodSeconds: 30
+
+# -- Readiness probe configuration
+readinessProbe:
+  # -- How often to perform the probe
+  periodSeconds: 10
+  # -- Failures before marking unready
+  failureThreshold: 3
+  # -- HTTP check configuration
+  httpGet:
+    # -- Path to check
+    path: /health
+    # -- Port to check (uses named port to stay in sync with containerPort)
+    port: "container-port"
+
+# -- Liveness probe configuration
+livenessProbe:
+  # -- Failures before restarting
+  failureThreshold: 3
+  # -- How often to perform the probe
+  periodSeconds: 15
+  # -- HTTP check configuration
+  httpGet:
+    # -- Path to check
+    path: /health
+    # -- Port to check (uses named port to stay in sync with containerPort)
+    port: "container-port"
+
+# -- Ingress configuration
+ingress:
+  # -- Enable Ingress
+  enabled: false
+  # -- Ingress class name (e.g., nginx, traefik)
+  ingressClassName: ""
+  # -- Hostname for the Ingress rule
+  host: "vllm-omni.example.com"
+  # -- Additional annotations
+  annotations: {}
+  # -- TLS configuration
+  tls: []
+  #  - secretName: vllm-omni-tls
+  #    hosts:
+  #      - vllm-omni.example.com
+
+# -- Node selector for pod scheduling
+nodeSelector: {}
+
+# -- Tolerations for pod scheduling
+tolerations: []
+
+# -- Labels applied to all resources
+labels:
+  app: "vllm-omni"

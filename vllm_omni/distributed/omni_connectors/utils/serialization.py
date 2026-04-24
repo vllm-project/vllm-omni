@@ -145,7 +145,7 @@ class OmniMsgpackEncoder:
             "encoder_prompt": obj.encoder_prompt,
             "encoder_prompt_token_ids": obj.encoder_prompt_token_ids,
             "num_cached_tokens": obj.num_cached_tokens,
-            "multi_modal_placeholders": obj.multi_modal_placeholders,
+            "multi_modal_placeholders": getattr(obj, "multi_modal_placeholders", None),
             "kv_transfer_params": obj.kv_transfer_params,
         }
         # Handle dynamically added multimodal_output attribute
@@ -301,15 +301,22 @@ class OmniMsgpackDecoder:
         """Decode dict to RequestOutput.
 
         RequestOutput is not a dataclass, so msgspec.convert doesn't work.
-        We construct it manually, passing all known fields via **kwargs.
+        We construct it manually using only the known __init__ parameters to
+        avoid triggering the "Ignoring extra arguments" warning in vllm.
+        Fields that are not part of RequestOutput.__init__ (e.g.
+        multi_modal_placeholders, multimodal_output) are extracted first and
+        then restored as dynamic attributes after construction.
         """
-        # Extract multimodal_output before constructing (it's dynamically added)
+        # Extract dynamically-added / non-init fields before constructing so
+        # they are not passed as unknown **kwargs to RequestOutput.__init__.
         mm_output = obj.pop("multimodal_output", None)
+        multi_modal_placeholders = obj.pop("multi_modal_placeholders", None)
 
-        # RequestOutput.__init__ accepts **kwargs for forward compatibility
         ro = RequestOutput(**obj)
 
-        # Restore dynamically added multimodal_output attribute
+        # Restore dynamic attributes that are not part of __init__.
+        if multi_modal_placeholders is not None:
+            setattr(ro, "multi_modal_placeholders", multi_modal_placeholders)
         if mm_output is not None:
             setattr(ro, "multimodal_output", mm_output)
         return ro
