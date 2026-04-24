@@ -1545,12 +1545,17 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
         logger.info(f"Successfully generated {len(images)} image(s)")
 
-        # Encode images to base64
-        image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in images]
+        # Encode images to base64 with the specified format
+        image_data = [
+            ImageData(b64_json=_encode_image_base64_with_compression(img, format=output_format), revised_prompt=None)
+            for img in images
+        ]
 
         return ImageGenerationResponse(
             created=int(time.time()),
             data=image_data,
+            output_format=output_format,
+            size=size_str if request.size else None,
         )
 
     except (EngineGenerateError, EngineDeadError) as exc:
