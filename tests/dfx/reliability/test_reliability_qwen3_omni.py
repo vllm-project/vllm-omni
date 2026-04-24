@@ -68,7 +68,7 @@ OOM_INJECTION_CONFIG = {
     "target_mem_ratio": 0.95,
     "hold_seconds": 0,
     "startup_timeout_sec": 20,
-    "strict": True,
+    "strict": False,
 }
 # Post-fault recovery probe: keep the API process alive on the same GPU.
 # ``strict=True`` sidecars keep allocating until CUDA refuses, which often
