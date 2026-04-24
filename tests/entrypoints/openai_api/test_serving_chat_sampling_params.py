@@ -697,3 +697,59 @@ class TestApplyRequestOverridesGLMImage:
         result = glm_serving_chat._apply_request_overrides(default_comprehension_params, req)
         # 512x512 t2i = 256 + 256 + 1 = 513
         assert result.max_tokens == 513
+
+    def test_falls_back_to_diffusion_stage_defaults_when_no_extra_body(
+        self, glm_serving_chat, mocker: MockerFixture, default_comprehension_params
+    ):
+        """No extra_body → serving_chat pulls h/w from any stage's default
+        sampling params. Simulates the recipe's bare-curl: GLM-Image stage-1
+        yaml declares height=1024, width=1024 which feeds the AR max_tokens
+        compute so the AR doesn't fall through to vLLM's max_model_len.
+        """
+        from types import SimpleNamespace
+
+        diffusion_defaults = SimpleNamespace(height=1024, width=1024)
+        glm_serving_chat.engine_client.default_sampling_params_list = [
+            default_comprehension_params,
+            diffusion_defaults,
+        ]
+
+        req = mocker.MagicMock()
+        for f in (
+            "temperature",
+            "top_p",
+            "top_k",
+            "max_tokens",
+            "min_tokens",
+            "seed",
+            "ignore_eos",
+            "stop",
+            "stop_token_ids",
+            "frequency_penalty",
+            "presence_penalty",
+        ):
+            setattr(req, f, None)
+        req.extra_body = {}
+        req.model_fields_set = set()
+
+        result = glm_serving_chat._apply_request_overrides(default_comprehension_params, req)
+        # t2i 1024x1024 = 256 + 1024 + 1 = 1281
+        assert result.max_tokens == 1281
+        assert result.extra_args["target_h"] == 1024
+        assert result.extra_args["target_w"] == 1024
+
+    def test_explicit_null_max_tokens_still_computes(self, glm_serving_chat, glm_request, default_comprehension_params):
+        """Sending ``max_tokens=None`` explicitly (Pydantic adds ``max_tokens``
+        to ``model_fields_set`` even when the value is None) must not suppress
+        the compute. The field-copy loop drops None values, so the compute
+        must still populate ``params.max_tokens`` from the target size —
+        otherwise ``max_tokens`` stays unset and falls through to vLLM's
+        ``max_model_len - seq_len`` default, reintroducing the original
+        IndexError.
+        """
+        glm_request.max_tokens = None
+        glm_request.model_fields_set = {"max_tokens"}
+
+        result = glm_serving_chat._apply_request_overrides(default_comprehension_params, glm_request)
+        # t2i 1024x1024 = 1281; must override the null the user sent
+        assert result.max_tokens == 1281
