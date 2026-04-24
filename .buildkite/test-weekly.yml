@@ -6,7 +6,6 @@ env:
 steps:
   - label: "Reliability Test - qwen3-omni"
     timeout_in_minutes: 180
-    key: weekly-dfx-reliability
     depends_on: upload-weekly-pipeline
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
     commands:
@@ -47,7 +46,6 @@ steps:
 
   - label: "Reliability Test - wan22"
     timeout_in_minutes: 180
-    key: weekly-dfx-reliability
     depends_on: upload-weekly-pipeline
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
     commands:
