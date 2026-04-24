@@ -487,15 +487,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         ref_sr = None
         if request.ref_audio is not None:
             ref_audio, ref_sr = await self._resolve_ref_audio(request.ref_audio)
-        return build_voxcpm2_prompt(
+        # VoxCPM2 uses a text-prefix convention for style/voice instructions:
+        # the native CLI wraps the instruction in parens and prepends it.
+        # Mirror that here so `instructions` works through the OpenAI endpoint.
+        text = request.input
+        if request.instructions:
+            text = f"({request.instructions.strip()}){text}"
+        prompt = build_voxcpm2_prompt(
             hf_config=self.engine_client.model_config.hf_config,
             tokenizer=self._voxcpm2_tokenizer,
             split_map=self._voxcpm2_split_map,
-            text=request.input,
+            text=text,
             ref_audio=ref_audio,
             ref_sr=ref_sr,
             ref_text=request.ref_text,
         )
+        # Per-request cfg_value threads via additional_information; the talker
+        # lifts it onto _RequestState in preprocess() and uses it in _run_cfm.
+        if request.cfg_value is not None:
+            prompt.setdefault("additional_information", {})["cfg_value"] = float(request.cfg_value)
+        return prompt
 
     def _get_uploaded_audio_data(self, voice_name: str) -> str | None:
         """Get base64 encoded audio data for uploaded voice."""

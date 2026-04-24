@@ -74,6 +74,14 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
     )
+    cfg_value: float | None = Field(
+        default=None,
+        ge=0.1,
+        le=10.0,
+        description=(
+            "VoxCPM2 classifier-free guidance scale (default 2.0; typical 1.5-3.0). Ignored by non-voxcpm2 models."
+        ),
+    )
     extra_params: dict[str, Any] | None = Field(
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args."),
