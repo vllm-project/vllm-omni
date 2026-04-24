@@ -1551,7 +1551,7 @@ class WanS2VTransformer3DModel(nn.Module):
     # Forward
     # ------------------------------------------------------------------
 
-    def encode_audio(self, audio_input, motion_frames):
+    def encode_audio(self, audio_input: torch.Tensor, motion_frames: list[int]) -> dict[str, torch.Tensor]:
         """Precompute audio embeddings from raw audio features.
 
         Call this once per clip before the denoising loop, then pass the
@@ -1578,21 +1578,21 @@ class WanS2VTransformer3DModel(nn.Module):
 
     def forward(
         self,
-        x,
-        t,
-        context,
-        seq_len,
-        ref_latents,
-        motion_latents,
-        cond_states,
-        audio_input=None,
-        motion_frames=[17, 5],
-        add_last_motion=2,
-        drop_motion_frames=False,
-        audio_emb=None,
-        *extra_args,
-        **extra_kwargs,
-    ):
+        x: torch.Tensor,
+        t: torch.Tensor,
+        context: torch.Tensor,
+        seq_len: int,
+        ref_latents: torch.Tensor,
+        motion_latents: torch.Tensor,
+        cond_states: torch.Tensor,
+        audio_input: torch.Tensor | None = None,
+        motion_frames: list[int] = [17, 5],
+        add_last_motion: int = 2,
+        drop_motion_frames: bool = False,
+        audio_emb: dict[str, torch.Tensor] | None = None,
+        *extra_args: object,
+        **extra_kwargs: object,
+    ) -> torch.Tensor:
         """Forward pass for S2V transformer.
 
         Args:
