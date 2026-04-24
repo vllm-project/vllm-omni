@@ -2779,6 +2779,8 @@ if __name__ == "__main__":
 
     from vllm.entrypoints.openai.cli_args import make_arg_parser
 
+    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+
     parser = argparse.ArgumentParser(description="vLLM-Omni OpenAI-Compatible REST API server")
     parser = make_arg_parser(parser)
     registered_flags = set()
@@ -2790,6 +2792,7 @@ if __name__ == "__main__":
         parser.add_argument(
             "--enable-sleep-mode", action="store_true", default=False, help="Enable GPU memory pool for sleep mode."
         )
+    nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
     if not hasattr(args, "model_tag"):
         setattr(args, "model_tag", args.model)

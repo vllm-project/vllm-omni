@@ -17,7 +17,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
-from vllm_omni.entrypoints.utils import detect_explicit_cli_keys, get_final_stage_id_for_e2e
+from vllm_omni.entrypoints.utils import get_final_stage_id_for_e2e
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
@@ -96,38 +96,23 @@ class OmniBase(PDDisaggregationMixin):
         parser: argparse.ArgumentParser | None = None,
         **overrides: Any,
     ) -> OmniBase:
-        """Construct an ``Omni`` / ``AsyncOmni`` from an ``argparse.Namespace``.
+        """Build from argparse. If ``parser`` is passed and not yet nullified,
+        un-typed engine fields are reset to ``None``."""
+        kwargs: dict[str, Any] = {k: v for k, v in vars(args).items() if not k.startswith("_")}
 
-        Mirrors the ``EngineArgs.from_cli_args`` pattern used upstream and in
-        ``OmniEngineArgs.from_cli_args``. This is the recommended entry point
-        for any argparse-based caller (offline scripts, tests, CI): it
-        expands ``vars(args)`` into kwargs and automatically captures which
-        flags the user typed on the command line so that argparse defaults
-        do not silently override deploy YAML values.
+        if parser is not None and not getattr(parser, "_omni_nullified", False):
+            from vllm_omni.engine.arg_utils import (
+                deploy_override_field_names,
+            )
+            from vllm_omni.entrypoints.utils import detect_explicit_cli_keys
 
-        Passing ``parser`` is strongly recommended: without it, flag-to-dest
-        resolution falls back to a name-based heuristic that misidentifies
-        flags with ``dest=`` overrides, alias flags, and ``--disable-X`` /
-        ``store_false`` pairs. See :func:`detect_explicit_cli_keys`.
+            explicit = detect_explicit_cli_keys(sys.argv[1:], parser) or set()
+            override_dests = deploy_override_field_names()
+            for key in list(kwargs):
+                if key in override_dests and key not in explicit:
+                    kwargs[key] = None
 
-        Args:
-            args: Parsed argparse namespace from ``parser.parse_args()``.
-            parser: The argparse parser used to produce ``args``. When
-                provided, each user-typed flag is resolved to its real
-                ``dest`` via the parser's action table.
-            **overrides: Extra keyword arguments that take precedence over
-                attributes on ``args``.
-
-        Example::
-
-            parser = FlexibleArgumentParser()
-            parser.add_argument("--model", required=True)
-            args = parser.parse_args()
-            omni = Omni.from_cli_args(args, parser=parser)          # preferred
-            omni = Omni.from_cli_args(args, parser=parser, model="other")
-        """
-        kwargs: dict[str, Any] = {**vars(args), **overrides}
-        kwargs["_cli_explicit_keys"] = detect_explicit_cli_keys(sys.argv[1:], parser)
+        kwargs.update(overrides)
         return cls(**kwargs)
 
     def __init__(
@@ -136,6 +121,7 @@ class OmniBase(PDDisaggregationMixin):
         **kwargs: Any,
     ) -> None:
         engine_args: OmniEngineArgs | None = kwargs.pop("engine_args", None)
+
         stage_init_timeout = kwargs.pop("stage_init_timeout", 300)
         init_timeout = kwargs.pop("init_timeout", 600)
         log_stats = kwargs.pop("log_stats", False)

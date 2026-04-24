@@ -116,6 +116,9 @@ def parse_args():
         help="Temperature for text generation sampling (default: 0.3).",
     )
 
+    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+
+    nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
     return args
 

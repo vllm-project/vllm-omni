@@ -97,7 +97,6 @@ def main():
     omni = Omni(
         model=args.model,
         stage_configs_path=args.stage_configs_path,
-        trust_remote_code=True,
         log_stats=args.log_stats,
         init_timeout=args.init_timeout,
         stage_init_timeout=args.stage_init_timeout,
