@@ -12,8 +12,7 @@ Euler ODE with CFG.  The synthetic model here uses simple linear layers
 to exercise the wrapper mechanism while keeping the test lightweight.
 """
 
-import importlib.util
-import os
+import functools
 
 import pytest
 import torch
@@ -32,50 +31,18 @@ N_ACOUSTIC_CODEBOOK = 7
 SEMANTIC_CODEBOOK_SIZE = 128
 ACOUSTIC_EMBEDDINGS_LEVELS = 1024
 
-# Load CUDAGraphAcousticTransformerWrapper: try package import first, fall back to direct file load
-try:
+
+@functools.lru_cache(maxsize=1)
+def _voxtral_cudagraph_deps():
+    """Load voxtral CUDA graph helpers only when CUDA tests run (avoids re-exec + duplicate vLLM op registration)."""
     from vllm_omni.model_executor.models.voxtral_tts.cuda_graph_acoustic_transformer_wrapper import (
         CUDAGraphAcousticTransformerWrapper,
     )
     from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation import (
         AudioSpecialTokens,
     )
-except Exception:
-    _WRAPPER_PATH = os.path.join(
-        os.path.dirname(__file__),
-        os.pardir,
-        os.pardir,
-        os.pardir,
-        os.pardir,
-        "vllm_omni",
-        "model_executor",
-        "models",
-        "voxtral_tts",
-        "cuda_graph_acoustic_transformer_wrapper.py",
-    )
-    _spec = importlib.util.spec_from_file_location(
-        "cuda_graph_acoustic_transformer_wrapper", os.path.abspath(_WRAPPER_PATH)
-    )
-    _mod = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_mod)
-    CUDAGraphAcousticTransformerWrapper = _mod.CUDAGraphAcousticTransformerWrapper
 
-    _AUDIO_GEN_PATH = os.path.join(
-        os.path.dirname(__file__),
-        os.pardir,
-        os.pardir,
-        os.pardir,
-        os.pardir,
-        "vllm_omni",
-        "model_executor",
-        "models",
-        "voxtral_tts",
-        "voxtral_tts_audio_generation.py",
-    )
-    _spec2 = importlib.util.spec_from_file_location("voxtral_tts_audio_generation", os.path.abspath(_AUDIO_GEN_PATH))
-    _mod2 = importlib.util.module_from_spec(_spec2)
-    _spec2.loader.exec_module(_mod2)
-    AudioSpecialTokens = _mod2.AudioSpecialTokens
+    return CUDAGraphAcousticTransformerWrapper, AudioSpecialTokens
 
 
 class SyntheticAcousticTransformerArgs:
@@ -102,6 +69,7 @@ class SyntheticAcousticTransformer(nn.Module):
 
     def __init__(self):
         super().__init__()
+        _, AudioSpecialTokens = _voxtral_cudagraph_deps()
         self.model_args = SyntheticModelArgs()
         self.acoustic_transformer_args = SyntheticAcousticTransformerArgs()
         self.acoustic_embeddings_levels = ACOUSTIC_EMBEDDINGS_LEVELS
@@ -128,6 +96,7 @@ class SyntheticModel(nn.Module):
 
     def __init__(self):
         super().__init__()
+        _, AudioSpecialTokens = _voxtral_cudagraph_deps()
         self.acoustic_transformer = SyntheticAcousticTransformer()
         end_audio_id = AudioSpecialTokens.id(AudioSpecialTokens.end_audio)
         empty_audio_id = AudioSpecialTokens.id(AudioSpecialTokens.empty_audio)
@@ -140,6 +109,7 @@ class SyntheticModel(nn.Module):
         cfg_alpha: torch.Tensor,
     ):
         """Eager fallback path: replicate what the wrapper does."""
+        _, AudioSpecialTokens = _voxtral_cudagraph_deps()
         at = self.acoustic_transformer
         B = hidden_states.shape[0]
 
@@ -200,6 +170,7 @@ def model():
 @pytest.fixture(scope="module")
 def wrapper(model):
     """Create a warmed-up CUDAGraphAcousticTransformerWrapper."""
+    CUDAGraphAcousticTransformerWrapper, _ = _voxtral_cudagraph_deps()
     w = CUDAGraphAcousticTransformerWrapper(
         model=model,
         capture_sizes=[1, 2, 4, 8, 16, 32],

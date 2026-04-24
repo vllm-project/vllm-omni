@@ -1,15 +1,21 @@
+import functools
 import math
 
 import pytest
 import torch
 
-from vllm_omni.model_executor.models.fish_speech import fish_speech_slow_ar as slow_ar_module
-from vllm_omni.model_executor.models.fish_speech.fish_speech_dac_decoder import FishSpeechDACDecoder
-from vllm_omni.model_executor.models.fish_speech.fish_speech_slow_ar import (
-    FishSpeechSlowARForConditionalGeneration,
-)
-
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@functools.lru_cache(maxsize=1)
+def _fish_speech_regression_modules():
+    from vllm_omni.model_executor.models.fish_speech import fish_speech_slow_ar as slow_ar_module
+    from vllm_omni.model_executor.models.fish_speech.fish_speech_dac_decoder import FishSpeechDACDecoder
+    from vllm_omni.model_executor.models.fish_speech.fish_speech_slow_ar import (
+        FishSpeechSlowARForConditionalGeneration,
+    )
+
+    return slow_ar_module, FishSpeechDACDecoder, FishSpeechSlowARForConditionalGeneration
 
 
 class _FakeCodec:
@@ -30,6 +36,7 @@ class _FakeTokenizer:
 
 
 def test_dac_decoder_mixed_batch_empty_request_does_not_misalign_indices():
+    _, FishSpeechDACDecoder, _ = _fish_speech_regression_modules()
     decoder = object.__new__(FishSpeechDACDecoder)
     torch.nn.Module.__init__(decoder)
     decoder._codec = _FakeCodec()
@@ -56,6 +63,7 @@ def test_dac_decoder_mixed_batch_empty_request_does_not_misalign_indices():
 
 
 def test_structured_voice_clone_prefill_adds_full_codebooks_with_decode_scale(monkeypatch):
+    slow_ar_module, _, FishSpeechSlowARForConditionalGeneration = _fish_speech_regression_modules()
     model = object.__new__(FishSpeechSlowARForConditionalGeneration)
     torch.nn.Module.__init__(model)
     model._num_codebooks = 2

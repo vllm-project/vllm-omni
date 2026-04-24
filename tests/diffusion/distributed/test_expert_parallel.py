@@ -148,6 +148,10 @@ EP_TEST_CONFIG = [
 @hardware_test(res={"cuda": "H100"}, num_cards={"cuda": TOTAL_CARD_NUM})
 @pytest.mark.parametrize("model_name", MODELS)
 def test_ep(model_name):
+    device_count = current_omni_platform.get_device_count()
+    if device_count < TOTAL_CARD_NUM:
+        pytest.skip(f"Requires at least {TOTAL_CARD_NUM} GPUs, got {device_count}")
+
     baseline_cache: dict[str, InferenceResult] = {}
     results: list[dict] = []
     # baseline_key = PROMPT + "_" + str(DEFAULT_HEIGHT) + "*" + str(DEFAULT_WIDTH) + "_" + str(DEFAULT_SEED) + "_" + str(DEFAULT_STEPS)
@@ -157,7 +161,6 @@ def test_ep(model_name):
     #     enable_expert_parallel=False,
     #     warmup=True,
     # )
-    device_count = current_omni_platform.get_device_count()
 
     print("\n" + "=" * 90)
     print(f"Sequence Parallel Test - Model: {model_name}")

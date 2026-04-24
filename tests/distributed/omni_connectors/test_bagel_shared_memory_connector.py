@@ -2,18 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-End-to-end test for Bagel img2img generation.
+End-to-end tests for Bagel with shared memory connector: img2img and text2img.
 
-This test validates that the Bagel model generates images from an input image
-and text prompt that match expected reference pixel values within a ±10 tolerance.
-
-Equivalent to running:
-    python3 examples/offline_inference/bagel/end2end.py \
-        --prompts "Change the grass color to red" \
-        --modality img2img --step 15 \
-        --image-path 2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg
+- img2img: validates output vs reference pixels within a ±10 tolerance.
+- text2img: validates output vs reference pixels within a ±5 tolerance
+  (equivalent to `examples/offline_inference/bagel/end2end.py` with
+  text2img modality and 15 steps).
 """
 
+import os
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 import socket
 from typing import Any
 
@@ -58,9 +57,42 @@ if current_omni_platform.is_rocm():
         {"position": (256, 256), "rgb": (181, 201, 221)},
     ]
 
+# text2img reference pixels (aligned with offline `bagel/end2end.py` text2img, 15 steps)
+# "Generated with seed=52, num_inference_steps=15,
+# prompt='A futuristic city skyline at twilight, cyberpunk style'"
+TEXT2IMG_REFERENCE_PIXELS = [
+    {"position": (100, 100), "rgb": (115, 113, 94)},
+    {"position": (400, 50), "rgb": (159, 160, 144)},
+    {"position": (700, 100), "rgb": (164, 151, 123)},
+    {"position": (150, 400), "rgb": (120, 121, 107)},
+    {"position": (512, 512), "rgb": (165, 133, 127)},
+    {"position": (700, 400), "rgb": (217, 130, 66)},
+    {"position": (100, 700), "rgb": (191, 168, 152)},
+    {"position": (400, 700), "rgb": (130, 96, 77)},
+    {"position": (700, 700), "rgb": (247, 203, 140)},
+    {"position": (256, 256), "rgb": (167, 156, 150)},
+]
+
+if current_omni_platform.is_rocm():
+    TEXT2IMG_REFERENCE_PIXELS = [
+        {"position": (100, 100), "rgb": (115, 113, 94)},
+        {"position": (400, 50), "rgb": (159, 160, 144)},
+        {"position": (700, 100), "rgb": (164, 151, 123)},
+        {"position": (150, 400), "rgb": (120, 121, 107)},
+        {"position": (512, 512), "rgb": (165, 133, 127)},
+        {"position": (700, 400), "rgb": (217, 130, 66)},
+        {"position": (100, 700), "rgb": (191, 168, 152)},
+        {"position": (400, 700), "rgb": (130, 96, 77)},
+        {"position": (700, 700), "rgb": (247, 203, 140)},
+        {"position": (256, 256), "rgb": (167, 156, 150)},
+    ]
+
 PIXEL_TOLERANCE = 10
+TEXT2IMG_PIXEL_TOLERANCE = 5
 
 DEFAULT_PROMPT = "<|fim_middle|><|im_start|>Change the grass color to red<|im_end|>"
+
+TEXT2IMG_DEFAULT_PROMPT = "<|im_start|>A cute cat<|im_end|>"
 
 EXPECTED_OUTPUT_SIZE = (1024, 672)
 
@@ -182,6 +214,24 @@ def _generate_bagel_img2img(
     return generated_image
 
 
+def _generate_bagel_text2img(omni: Omni, prompt: str = TEXT2IMG_DEFAULT_PROMPT) -> Image.Image:
+    """Generate an image using Bagel text2img with configured parameters."""
+    params_list = _configure_sampling_params(omni)
+
+    omni_outputs = list(
+        omni.generate(
+            prompts=[{"prompt": prompt, "modalities": ["image"]}],
+            sampling_params_list=params_list,
+        )
+    )
+
+    generated_image = _extract_generated_image(omni_outputs)
+    assert generated_image is not None, "No images generated"
+    assert generated_image.size == (1024, 1024), f"Expected 1024x1024, got {generated_image.size}"
+
+    return generated_image
+
+
 def _resolve_stage_config(config_path: str, run_level: str) -> str:
     """Resolve stage config based on run level.
 
@@ -217,3 +267,24 @@ def test_bagel_img2img_shared_memory_connector(run_level):
         generated_image = _generate_bagel_img2img(runner.omni, input_image)
         if run_level == "advanced_model":
             _validate_pixels(generated_image)
+
+
+@pytest.mark.core_model
+@pytest.mark.advanced_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+def test_bagel_text2img_shared_memory_connector(run_level):
+    """Test Bagel text2img with shared memory connector."""
+    config_path = get_deploy_config_path("bagel_sharedmemory_ci.yaml")
+    config_path = _resolve_stage_config(config_path, run_level)
+    with OmniRunner(
+        "ByteDance-Seed/BAGEL-7B-MoT",
+        stage_configs_path=config_path,
+    ) as runner:
+        generated_image = _generate_bagel_text2img(runner.omni)
+        if run_level == "advanced_model":
+            _validate_pixels(
+                generated_image,
+                reference_pixels=TEXT2IMG_REFERENCE_PIXELS,
+                tolerance=TEXT2IMG_PIXEL_TOLERANCE,
+            )

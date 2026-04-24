@@ -1,25 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
 from types import SimpleNamespace
 
 import pytest
 import torch
 from pytest_mock import MockerFixture
 
-from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import TALKER_CODEC_PAD_TOKEN_ID
-from vllm_omni.model_executor.models.mimo_audio.mimo_audio_code2wav import (
-    AudioStreamerConfig,
-    MiMoAudioToken2WavForConditionalGenerationVLLM,
-    flat_codec_group_element_count,
-)
-
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _GROUP = 4
 _AC = 8
-_GROUP_WIDTH = flat_codec_group_element_count(_GROUP, _AC)
 _FTP = 2 * 2 * 240  # frames_per_token from mocked tokenizer.config
+
+
+@functools.lru_cache(maxsize=1)
+def _mimo_code2wav_deps():
+    """Defer mimo code2wav (pulls vLLM model_executor) until first use."""
+    from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import TALKER_CODEC_PAD_TOKEN_ID
+    from vllm_omni.model_executor.models.mimo_audio.mimo_audio_code2wav import (
+        AudioStreamerConfig,
+        MiMoAudioToken2WavForConditionalGenerationVLLM,
+        flat_codec_group_element_count,
+    )
+
+    return (
+        TALKER_CODEC_PAD_TOKEN_ID,
+        AudioStreamerConfig,
+        MiMoAudioToken2WavForConditionalGenerationVLLM,
+        flat_codec_group_element_count,
+    )
+
+
+def _mimo_t2w_cls():
+    return _mimo_code2wav_deps()[2]
 
 
 def _codes_ns(empty: int = 555, eostm: int = 666):
@@ -28,7 +43,8 @@ def _codes_ns(empty: int = 555, eostm: int = 666):
 
 def _make_dummy_code_tensor() -> torch.Tensor:
     """Pad-only talker dummy; matches _check_dummy_code_tensor."""
-    t = torch.zeros(flat_codec_group_element_count(_GROUP, _AC), dtype=torch.long)
+    TALKER_CODEC_PAD_TOKEN_ID, _, _, fcec = _mimo_code2wav_deps()
+    t = torch.zeros(fcec(_GROUP, _AC), dtype=torch.long)
     t = t.view(_GROUP, _AC + 1)
     t[:, 0] = TALKER_CODEC_PAD_TOKEN_ID
     return t.view(-1)
@@ -53,6 +69,7 @@ def _make_invalid_flat_immediate_eostm(eostm_id: int = 666) -> torch.Tensor:
 
 def _minimal_model(mocker: MockerFixture):
     """Avoid __init__ (HF tokenizer paths); only fields used by _batch_decode_waveforms."""
+    _, AudioStreamerConfig, MiMoAudioToken2WavForConditionalGenerationVLLM, _ = _mimo_code2wav_deps()
     model = object.__new__(MiMoAudioToken2WavForConditionalGenerationVLLM)
     model.device = torch.device("cpu")
     model.config = SimpleNamespace(group_size=_GROUP, audio_channels=_AC)
@@ -81,7 +98,7 @@ def _minimal_model(mocker: MockerFixture):
 def test_batch_decode_waveforms_empty_input_list(mocker: MockerFixture):
     """Empty input list returns a single zero-length float32 tensor on model device."""
     model, _ = _minimal_model(mocker)
-    out = MiMoAudioToken2WavForConditionalGenerationVLLM._batch_decode_waveforms(model, [])
+    out = _mimo_t2w_cls()._batch_decode_waveforms(model, [])
     assert len(out) == 1
     assert out[0].dtype == torch.float32
     assert out[0].numel() == 0
@@ -96,7 +113,7 @@ def test_batch_decode_waveforms_single_vs_multiple_decoder_shapes(mocker: Mocker
     # Single valid request: decoder output rank-3 for double squeeze path
     flat = _make_valid_flat_codes(1)
     decoder.return_value = torch.ones(1, 1, 4 * _FTP + 100, dtype=torch.float32)
-    out1 = MiMoAudioToken2WavForConditionalGenerationVLLM._batch_decode_waveforms(model, [flat])
+    out1 = _mimo_t2w_cls()._batch_decode_waveforms(model, [flat])
     decoder.assert_called_once()
     packed_hs, input_lengths = decoder.call_args[0]
     assert packed_hs.shape == (4, 7)  # T from decode_vq mock
@@ -108,7 +125,7 @@ def test_batch_decode_waveforms_single_vs_multiple_decoder_shapes(mocker: Mocker
     a = _make_valid_flat_codes(1)
     b = _make_valid_flat_codes(2)
     decoder.return_value = torch.ones(2, 1, 8 * _FTP + 100, dtype=torch.float32)
-    out2 = MiMoAudioToken2WavForConditionalGenerationVLLM._batch_decode_waveforms(model, [a, b])
+    out2 = _mimo_t2w_cls()._batch_decode_waveforms(model, [a, b])
     decoder.assert_called_once()
     packed_hs2, input_lengths2 = decoder.call_args[0]
     assert packed_hs2.shape == (4 + 8, 7)  # 1 group -> T=4; 2 groups -> T=8
@@ -138,7 +155,7 @@ def test_batch_decode_waveforms_mixed_valid_invalid_requests(mocker: MockerFixtu
         valid_a,
         valid_b,
     ]
-    out = MiMoAudioToken2WavForConditionalGenerationVLLM._batch_decode_waveforms(model, inputs)
+    out = _mimo_t2w_cls()._batch_decode_waveforms(model, inputs)
 
     assert len(out) == len(inputs)
     for i in range(5):
@@ -154,7 +171,7 @@ def test_batch_decode_waveforms_mixed_valid_invalid_requests(mocker: MockerFixtu
 def test_batch_decode_waveforms_all_invalid_returns_per_request_empty(mocker: MockerFixture):
     """All-invalid batch skips decoder entirely and returns empty tensors for every slot."""
     model, audio_tok = _minimal_model(mocker)
-    out = MiMoAudioToken2WavForConditionalGenerationVLLM._batch_decode_waveforms(
+    out = _mimo_t2w_cls()._batch_decode_waveforms(
         model,
         [None, _make_dummy_code_tensor(), torch.tensor([], dtype=torch.long)],
     )
@@ -169,7 +186,7 @@ def test_batch_decode_waveforms_output_shape_trim_when_decoder_returns_extra_sam
     flat = _make_valid_flat_codes(1)
     # Longer than valid_len so branch wav = wav[:valid_len] runs
     audio_tok.decoder.return_value = torch.ones(1, 1, 10_000, dtype=torch.float32)
-    out = MiMoAudioToken2WavForConditionalGenerationVLLM._batch_decode_waveforms(model, [flat])
+    out = _mimo_t2w_cls()._batch_decode_waveforms(model, [flat])
     assert out[0].dim() == 1
     assert out[0].numel() == 4 * _FTP
     assert out[0].dtype == torch.float32
@@ -181,7 +198,7 @@ def test_batch_decode_waveforms_multi_request_trims_each_row_when_decoder_return
     a = _make_valid_flat_codes(1)
     b = _make_valid_flat_codes(2)
     audio_tok.decoder.return_value = torch.ones(2, 1, 10_000, dtype=torch.float32)
-    out = MiMoAudioToken2WavForConditionalGenerationVLLM._batch_decode_waveforms(model, [a, b])
+    out = _mimo_t2w_cls()._batch_decode_waveforms(model, [a, b])
     assert len(out) == 2
     assert out[0].shape == (4 * _FTP,)
     assert out[1].shape == (8 * _FTP,)
@@ -201,7 +218,7 @@ def test_batch_decode_waveforms_valid_only_at_edges_maps_to_correct_indices(mock
         last,
     ]
     audio_tok.decoder.return_value = torch.ones(2, 1, 10_000, dtype=torch.float32)
-    out = MiMoAudioToken2WavForConditionalGenerationVLLM._batch_decode_waveforms(model, inputs)
+    out = _mimo_t2w_cls()._batch_decode_waveforms(model, inputs)
     assert len(out) == 4
     assert out[0].numel() == 4 * _FTP
     assert out[1].numel() == 0
@@ -217,7 +234,7 @@ def test_batch_decode_waveforms_output_shapes_1d_float32_for_all_slots(mocker: M
     model, audio_tok = _minimal_model(mocker)
     inputs = [_make_valid_flat_codes(1), None, _make_valid_flat_codes(1)]
     audio_tok.decoder.return_value = torch.ones(2, 1, 5000, dtype=torch.float32)
-    out = MiMoAudioToken2WavForConditionalGenerationVLLM._batch_decode_waveforms(model, inputs)
+    out = _mimo_t2w_cls()._batch_decode_waveforms(model, inputs)
     assert len(out) == 3
     for i, t in enumerate(out):
         assert t.dim() == 1, f"slot {i}"

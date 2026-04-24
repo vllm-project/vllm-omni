@@ -2,15 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-End-to-end test for Bagel text2img generation.
+End-to-end test for Bagel text2img with the Mooncake inter-stage connector.
 
-This test validates that the Bagel model generates images that match
-expected reference pixel values within a ±5 tolerance.
-
-Equivalent to running:
-    python3 examples/offline_inference/bagel/end2end.py \
-        --prompts "A futuristic city skyline at twilight, cyberpunk style" \
-        --modality text2img --step 15
+Validates image output against reference pixels (±5) in advanced_model runs.
+Shared-memory connector coverage lives in `test_bagel_shared_memory_connector.py`.
 """
 
 import os
@@ -188,23 +183,6 @@ def _resolve_stage_config(config_path: str, run_level: str) -> str:
             },
         )
     return config_path
-
-
-@pytest.mark.core_model
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
-def test_bagel_text2img_shared_memory_connector(run_level):
-    """Test Bagel text2img with shared memory connector."""
-    config_path = get_deploy_config_path("bagel_sharedmemory_ci.yaml")
-    config_path = _resolve_stage_config(config_path, run_level)
-    with OmniRunner(
-        "ByteDance-Seed/BAGEL-7B-MoT",
-        stage_configs_path=config_path,
-    ) as runner:
-        generated_image = _generate_bagel_image(runner.omni)
-        if run_level == "advanced_model":
-            _validate_pixels(generated_image)
 
 
 def _wait_for_port(host: str, port: int, timeout: int = 30) -> bool:

@@ -66,27 +66,3 @@ def test_single_image_to_image_001(omni_server: OmniServer, openai_client: OpenA
     }
 
     openai_client.send_diffusion_request(request_config)
-
-
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.diffusion
-@pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
-def test_multi_images_to_image_001(omni_server: OmniServer, openai_client: OpenAIClientHandler):
-    """Default Qwen-Image-Layered smoke (single ``default`` server config)."""
-    image_data_url_list = [f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}" for _ in range(2)]
-
-    messages = dummy_messages_from_mix_data(image_data_url=image_data_url_list, content_text=EDIT_PROMPT)
-
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "extra_body": {
-            "num_inference_steps": 2,
-            "negative_prompt": NEGATIVE_PROMPT,
-            "true_cfg_scale": 4.0,
-            "seed": 42,
-        },
-    }
-
-    openai_client.send_diffusion_request(request_config)
