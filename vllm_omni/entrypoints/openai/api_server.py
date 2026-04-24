@@ -1545,6 +1545,9 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
         logger.info(f"Successfully generated {len(images)} image(s)")
 
+        # Determine output format (default to png)
+        output_format = _choose_output_format(request.output_format, None)
+
         # Encode images to base64 with the specified format
         image_data = [
             ImageData(b64_json=_encode_image_base64_with_compression(img, format=output_format), revised_prompt=None)
