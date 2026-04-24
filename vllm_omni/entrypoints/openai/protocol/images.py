@@ -141,8 +141,8 @@ class ImageGenerationRequest(BaseModel):
 
     # Output format for generated images
     output_format: str | None = Field(
-    default=None,
-    description="Output image format: 'png', 'jpeg', or 'webp'. Defaults to 'png'.",
+        default=None,
+        description="Output image format: 'png', 'jpeg', or 'webp'. Defaults to 'png'.",
     )
 
 
