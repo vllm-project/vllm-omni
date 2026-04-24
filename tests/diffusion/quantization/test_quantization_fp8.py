@@ -78,17 +78,28 @@ def _generate_single_stage_image(
             ),
         )
 
-        peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
-
         first_output = outputs[0]
         assert first_output.final_output_type == "image"
-        assert hasattr(first_output, "request_output") and first_output.request_output
-        req_out = first_output.request_output[0]
-        assert isinstance(req_out, OmniRequestOutput) and hasattr(req_out, "images")
-        images = req_out.images
+        if hasattr(first_output, "images") and first_output.images:
+            images = first_output.images
+        else:
+            assert hasattr(first_output, "request_output") and first_output.request_output
+            request_output = first_output.request_output
+            if isinstance(request_output, list):
+                req_out = request_output[0]
+            else:
+                req_out = request_output
+            assert isinstance(req_out, OmniRequestOutput) and hasattr(req_out, "images")
+            images = req_out.images
         assert len(images) >= 1
         assert images[0].width == width
         assert images[0].height == height
+
+        peak_mem_mb = getattr(first_output, "peak_memory_mb", None)
+        if peak_mem_mb is not None:
+            peak_mem = float(peak_mem_mb) / 1024.0
+        else:
+            peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
 
         return images, peak_mem
 
@@ -140,7 +151,10 @@ def _generate_bagel_image(
                 generated_image = images[0]
                 break
             if hasattr(req_output, "request_output") and req_output.request_output:
-                for stage_out in req_output.request_output:
+                stage_outputs = req_output.request_output
+                if not isinstance(stage_outputs, list):
+                    stage_outputs = [stage_outputs]
+                for stage_out in stage_outputs:
                     if hasattr(stage_out, "images") and stage_out.images:
                         generated_image = stage_out.images[0]
                         break
@@ -152,8 +166,11 @@ def _generate_bagel_image(
 
         # Check LLM stage output — should have finish_reason=stop (not length)
         for req_output in omni_outputs:
-            if hasattr(req_output, "request_output"):
-                for stage_out in req_output.request_output:
+            if hasattr(req_output, "request_output") and req_output.request_output:
+                stage_outputs = req_output.request_output
+                if not isinstance(stage_outputs, list):
+                    stage_outputs = [stage_outputs]
+                for stage_out in stage_outputs:
                     if hasattr(stage_out, "outputs"):
                         for comp_out in stage_out.outputs:
                             if hasattr(comp_out, "finish_reason"):

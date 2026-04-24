@@ -796,7 +796,10 @@ class OpenAIClientHandler:
 
         speech_fmt: str | None = None if response_format is omit else str(response_format).lower()
 
+        print(f"[audio.speech] start model={model}, stream={stream}, request_num={request_num}, timeout={timeout:.1f}s")
+
         if request_num == 1:
+            req_start = time.perf_counter()
             if stream:
                 # Use streaming response helper.
                 with self.client.audio.speech.with_streaming_response.create(
@@ -821,6 +824,8 @@ class OpenAIClientHandler:
                 omni_resp = self._process_non_stream_audio_speech_response(resp, response_format=speech_fmt)
 
             assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
+            elapsed = time.perf_counter() - req_start
+            print(f"[audio.speech] request#1 success in {elapsed:.3f}s")
             responses.append(omni_resp)
             return responses
         else:
@@ -828,7 +833,8 @@ class OpenAIClientHandler:
 
             if stream:
 
-                def _stream_task():
+                def _stream_task(request_idx: int):
+                    task_start = time.perf_counter()
                     with self.client.audio.speech.with_streaming_response.create(
                         model=model,
                         input=text_input,
@@ -837,31 +843,54 @@ class OpenAIClientHandler:
                         timeout=timeout,
                         voice=voice,
                     ) as resp:
-                        return self._process_stream_audio_speech_response(resp, response_format=speech_fmt)
+                        result = self._process_stream_audio_speech_response(resp, response_format=speech_fmt)
+                    elapsed = time.perf_counter() - task_start
+                    print(f"[audio.speech] request#{request_idx} success in {elapsed:.3f}s")
+                    return result
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
-                    futures = [executor.submit(_stream_task) for _ in range(request_num)]
+                    futures = {executor.submit(_stream_task, i + 1): i + 1 for i in range(request_num)}
                     for future in concurrent.futures.as_completed(futures):
-                        omni_resp = future.result()
+                        request_idx = futures[future]
+                        try:
+                            omni_resp = future.result()
+                        except Exception as e:
+                            print(
+                                f"[audio.speech] request#{request_idx} failed "
+                                f"(stream={stream}, timeout={timeout:.1f}s): {e!r}"
+                            )
+                            raise
                         assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
                         responses.append(omni_resp)
             else:
+
+                def _non_stream_task(request_idx: int):
+                    task_start = time.perf_counter()
+                    resp = self.client.audio.speech.create(
+                        model=model,
+                        input=text_input,
+                        response_format=response_format,
+                        extra_body=extra_body or None,
+                        timeout=timeout,
+                        voice=voice,
+                    )
+                    elapsed = time.perf_counter() - task_start
+                    print(f"[audio.speech] request#{request_idx} success in {elapsed:.3f}s")
+                    return resp
+
                 with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
-                    futures = []
-                    for _ in range(request_num):
-                        future = executor.submit(
-                            self.client.audio.speech.create,
-                            model=model,
-                            input=text_input,
-                            response_format=response_format,
-                            extra_body=extra_body or None,
-                            timeout=timeout,
-                            voice=voice,
-                        )
-                        futures.append(future)
+                    futures = {executor.submit(_non_stream_task, i + 1): i + 1 for i in range(request_num)}
 
                     for future in concurrent.futures.as_completed(futures):
-                        resp = future.result()
+                        request_idx = futures[future]
+                        try:
+                            resp = future.result()
+                        except Exception as e:
+                            print(
+                                f"[audio.speech] request#{request_idx} failed "
+                                f"(stream={stream}, timeout={timeout:.1f}s): {e!r}"
+                            )
+                            raise
                         omni_resp = self._process_non_stream_audio_speech_response(resp, response_format=speech_fmt)
                         assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
                         responses.append(omni_resp)

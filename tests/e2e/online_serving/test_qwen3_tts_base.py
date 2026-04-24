@@ -19,6 +19,7 @@ from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+DEFAULT_AUDIO_SPEECH_TIMEOUT_S = 180.0
 
 REF_AUDIO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
 REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
@@ -69,6 +70,7 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "input": get_prompt(),
         "stream": False,
+        "timeout": DEFAULT_AUDIO_SPEECH_TIMEOUT_S,
         "response_format": "wav",
         "task_type": "Base",
         "voice": "clone",
@@ -95,6 +97,7 @@ def test_text_to_audio_002(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "input": get_prompt(),
         "stream": True,
+        "timeout": DEFAULT_AUDIO_SPEECH_TIMEOUT_S,
         "response_format": "wav",
         "task_type": "Base",
         "voice": "clone",

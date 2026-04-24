@@ -79,7 +79,7 @@ def assert_not_silence(pcm_bytes: bytes):
 class TestSpeakerEmbeddingBase:
     """Speaker embedding tests against the 0.6B-Base model (supports Base task)."""
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speaker_embedding_produces_audio(self, omni_server) -> None:
@@ -102,7 +102,7 @@ class TestSpeakerEmbeddingBase:
         assert verify_wav_audio(response.content), "Response is not valid WAV"
         assert len(response.content) > MIN_AUDIO_BYTES, f"Audio too small: {len(response.content)} bytes"
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speaker_embedding_pcm_not_silence(self, omni_server) -> None:
@@ -124,7 +124,7 @@ class TestSpeakerEmbeddingBase:
         assert len(response.content) > MIN_AUDIO_BYTES
         assert_not_silence(response.content)
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speaker_embedding_streaming(self, omni_server) -> None:
@@ -148,7 +148,7 @@ class TestSpeakerEmbeddingBase:
         assert len(response.content) > MIN_AUDIO_BYTES
         assert_not_silence(response.content)
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speaker_embedding_mutually_exclusive_with_ref_audio(self, omni_server) -> None:
@@ -168,7 +168,7 @@ class TestSpeakerEmbeddingBase:
         assert response.status_code == 400, f"Expected 400, got {response.status_code}: {response.text}"
         assert "mutually exclusive" in response.text
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speaker_embedding_empty_rejected(self, omni_server) -> None:
@@ -195,7 +195,7 @@ class TestSpeakerEmbeddingBase:
 class TestSpeakerEmbedding1_7B:
     """Speaker embedding tests against the 1.7B-Base model (2048-dim embeddings)."""
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_2048_dim_embedding_produces_audio(self, omni_server) -> None:
@@ -218,7 +218,7 @@ class TestSpeakerEmbedding1_7B:
         assert verify_wav_audio(response.content), "Response is not valid WAV"
         assert len(response.content) > MIN_AUDIO_BYTES, f"Audio too small: {len(response.content)} bytes"
 
-    @pytest.mark.core_model
+    @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_1024_dim_on_1_7b_model_rejected_or_errors(self, omni_server) -> None:
