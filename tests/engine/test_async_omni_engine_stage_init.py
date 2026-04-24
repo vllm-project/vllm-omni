@@ -6,7 +6,6 @@ import types
 import pytest
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
-from vllm_omni.engine.stage_init_utils import extract_stage_metadata
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
