@@ -25,7 +25,7 @@ MIMO_AUDIO_PIPELINE = PipelineConfig(
     # ``model_executor/models/registry.py``; it resolves to the internal
     # class ``MiMoAudioForConditionalGeneration`` in ``mimo_audio.py``.
     model_arch="MiMoAudioModel",
-    hf_architectures=("MiMoAudioModel",),
+    hf_architectures=("MiMoAudioModel", "MiMoV2ASRForCausalLM"),
     stages=(
         StagePipelineConfig(
             stage_id=0,

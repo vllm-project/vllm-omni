@@ -15,15 +15,72 @@ Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
-If you want to open async chunking for qwen3-omni, launch the server with command below
+The default deployment configuration situated at `vllm_omni/deploy/qwen3_omni_moe.yaml` is resolved and loaded
+automatically via the model registry, obviating the necessity for the `--deploy-config` flag in standard deployment topologies.
+Asynchronous chunk streaming is **enabled by default** within the bundled configuration.
 
+To explicitly utilize a custom deployment YAML, specify the configuration path:
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --deploy-config /vllm_omni/deploy/qwen3_omni_moe.yaml
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --deploy-config /path/to/deploy_config_file
 ```
 
-If you have custom stage configs file, launch the server with command below
+### Launch individual stages (stage-based CLI)
+
+Adopt the stage-based CLI architecture to independently instantiate execution processes per functional stage.
+
+**1. Stage 0 (Thinker + API server)**
+
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --deploy-config /path/to/deploy_config_file
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --port 8091 \
+    --stage-id 0 \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+```
+
+**2. Stage 1 (Talker)**
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --stage-id 1 \
+    --headless \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+```
+
+**3. Stage 2 (Code2Wav)**
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --stage-id 2 \
+    --headless \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+```
+
+Add `--deploy-config /path/to/deploy_config_file` to every command if you want
+to override the bundled deploy YAML.
+
+For the regular one-process launch, stage-specific CLI tuning is usually done
+with `--stage-overrides`, for example:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --stage-overrides '{"1": {"gpu_memory_utilization": 0.5}}'
+```
+
+For the stage-based CLI, you usually do **not** need `--stage-overrides` for
+that kind of change. Since each command launches one stage, just pass the knob
+directly on that stage command:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --stage-id 1 \
+    --headless \
+    --gpu-memory-utilization 0.5 \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
 ```
 
 ### Send Multi-modal Request
