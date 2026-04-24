@@ -255,16 +255,22 @@ def test_reliability_fault_gpu_oom_concurrent_pressure_failure(omni_server_funct
         strict=OOM_INJECTION_CONFIG["strict"],
     )
     try:
+        video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(1280, 720, 161)['base64']}"
+        image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
+        audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(20, 1)['base64']}"
         messages = dummy_messages_from_mix_data(
             system_prompt=_get_system_prompt(),
-            content_text="What is the capital of China? Answer in 20 words.",
+            video_data_url=video_data_url,
+            image_data_url=image_data_url,
+            audio_data_url=audio_data_url,
+            content_text=f"{_get_mix_prompt()} " * 200,
         )
         request_config = {
             "model": omni_server_function.model,
             "messages": messages,
-            "stream": False,
-            "modalities": ["text"],
-            "key_words": {"text": ["beijing"]},
+            "stream": True,
+            "modalities": ["text", "audio"],
+            "key_words": {"audio": ["test"]},
         }
         try:
             openai_client_function.send_omni_request(request_config, request_num=4)
@@ -446,7 +452,11 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
 def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
     omni_server_function,
 ) -> None:
-    """Black-box: chat/speech should expose a consistent error contract under OOM."""
+    """Black-box: text chat vs omni audio output should expose a consistent error contract under OOM.
+
+    Qwen3-Omni does not implement ``/v1/audio/speech`` (dedicated TTS only); speech-style output is
+    requested via ``/v1/chat/completions`` with ``modalities`` that include ``audio``.
+    """
     device_spec = resolve_oom_device_spec(
         OOM_INJECTION_CONFIG,
         _stage_config_path_from_omni_server(omni_server_function),
@@ -460,33 +470,32 @@ def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
     )
     host = omni_server_function.host
     port = omni_server_function.port
+    mix_base = _mix_chat_completions_probe_payload(omni_server_function)
+    oom_contract_timeout_sec = 120
     try:
         chat_status, chat_body = post_json_raw(
             host,
             port,
             "/v1/chat/completions",
             {
-                "model": omni_server_function.model,
-                "messages": [{"role": "user", "content": "Summarize this sentence in one word."}],
+                "model": mix_base["model"],
+                "messages": mix_base["messages"],
                 "stream": False,
                 "modalities": ["text"],
             },
-            timeout_sec=25,
+            timeout_sec=oom_contract_timeout_sec,
         )
-        # Minimal Qwen3-TTS shape (no ref_*): tests/e2e/online_serving/test_qwen3_tts_customvoice.py
         speech_status, speech_body = post_json_raw(
             host,
             port,
-            "/v1/audio/speech",
+            "/v1/chat/completions",
             {
-                "model": omni_server_function.model,
-                "input": "hello reliability test",
+                "model": mix_base["model"],
+                "messages": mix_base["messages"],
                 "stream": False,
-                "response_format": "wav",
-                "task_type": "CustomVoice",
-                "voice": "vivian",
+                "modalities": ["text", "audio"],
             },
-            timeout_sec=25,
+            timeout_sec=oom_contract_timeout_sec,
         )
     finally:
         stop_gpu_oom_hogs(handle)
