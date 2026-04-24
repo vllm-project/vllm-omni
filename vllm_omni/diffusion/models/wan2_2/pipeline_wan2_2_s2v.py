@@ -1249,6 +1249,13 @@ class Wan22S2VPipeline(
 
             # -- Precompute audio embeddings once per clip --
             mf = [motion_frames, lat_motion_frames]
+            # When CPU offload is active the transformer lives on CPU until
+            # its __call__ hook fires.  encode_audio() bypasses __call__,
+            # so move the audio sub-module to GPU explicitly.
+            _audio_enc = getattr(self.transformer, "casual_audio_encoder", None)
+            _audio_on_cpu = _audio_enc is not None and next(_audio_enc.parameters()).device.type == "cpu"
+            if _audio_on_cpu:
+                _audio_enc.to(device)
             param_dtype = next(self.transformer.parameters()).dtype
             with torch.amp.autocast(device.type, dtype=param_dtype):
                 positive_audio_emb = self.transformer.encode_audio(audio_input, mf)
@@ -1258,6 +1265,8 @@ class Wan22S2VPipeline(
                     negative_audio_emb = self.transformer.encode_audio(0.0 * audio_input, mf)
             else:
                 negative_audio_emb = None
+            if _audio_on_cpu:
+                _audio_enc.to("cpu")
 
             # -- Denoising loop --
             latents = self.diffuse(
