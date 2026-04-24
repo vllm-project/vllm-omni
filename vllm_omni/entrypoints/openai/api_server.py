@@ -1546,7 +1546,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         logger.info(f"Successfully generated {len(images)} image(s)")
 
         # Determine output format (default to png)
-        output_format = _choose_output_format(request.output_format, None)
+        output_format = _choose_output_format(request.output_format or "png", None)
 
         # Encode images to base64 with the specified format
         image_data = [
@@ -1554,12 +1554,14 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             for img in images
         ]
 
-        return ImageGenerationResponse(
-            created=int(time.time()),
-            data=image_data,
-            output_format=output_format,
-            size=size_str if request.size else None,
-        )
+        response_kwargs = {
+            "created": int(time.time()),
+            "data": image_data,
+            "output_format": output_format,
+        }
+        if request.size:
+            response_kwargs["size"] = size_str
+        return ImageGenerationResponse(**response_kwargs)
 
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
