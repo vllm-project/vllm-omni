@@ -1463,7 +1463,12 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 )
             flat_images, _, _ = generation_result
             image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in flat_images]
-            return ImageGenerationResponse(created=int(time.time()), data=image_data)
+            return ImageGenerationResponse(
+                created=int(time.time()),
+                data=image_data,
+                output_format="png",
+                size=request.size or "model default",
+            )
 
         # Build params - pass through user values directly
         prompt: OmniTextPrompt = {"prompt": request.prompt}
@@ -1551,6 +1556,8 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         return ImageGenerationResponse(
             created=int(time.time()),
             data=image_data,
+            output_format="png",
+            size=size_str,
         )
 
     except (EngineGenerateError, EngineDeadError) as exc:
