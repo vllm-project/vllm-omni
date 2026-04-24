@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
 
 from itertools import chain
 from typing import Any
@@ -297,12 +298,19 @@ class LayerWiseOffloadBackend(OffloadBackend):
         for enc in modules.encoders:
             enc.to(self.device)
 
-        # Move VAE to GPU if available
-        if modules.vae is not None:
+        # Move VAE(s) to GPU if available
+        for vae in modules.vaes:
             try:
-                modules.vae.to(self.device, non_blocking=True)
+                vae.to(self.device, non_blocking=True)
             except Exception as exc:
                 logger.debug("Failed to move VAE to GPU: %s", exc)
+
+        # Move resident modules to GPU (small modules needed every forward)
+        for name, module in zip(modules.resident_names, modules.resident_modules):
+            try:
+                module.to(self.device)
+            except Exception as exc:
+                logger.debug("Failed to move resident module %s to GPU: %s", name, exc)
 
         logger.info("Applying layer-wise offloading on %s", modules.dit_names)
 

@@ -35,7 +35,6 @@ from tests.helpers.env import run_forced_gpu_cleanup_round
 from tests.helpers.media import (
     _merge_base64_audio_to_segment,
     convert_audio_bytes_to_text,
-    cosine_similarity_text,
     decode_b64_image,
 )
 from vllm_omni.config.stage_config import resolve_deploy_yaml
@@ -500,7 +499,6 @@ class OmniResponse:
     audio_content: str | None = None
     audio_format: str | None = None
     audio_bytes: bytes | None = None
-    similarity: float | None = None
     e2e_latency: float | None = None
     success: bool = False
     error_message: str | None = None
@@ -542,19 +540,15 @@ class OpenAIClientHandler:
                         text_content += content
             result.e2e_latency = time.perf_counter() - start_time
             audio_content = None
-            similarity = None
             if audio_data:
                 merged_seg = _merge_base64_audio_to_segment(audio_data)
                 wav_buf = BytesIO()
                 merged_seg.export(wav_buf, format="wav")
                 result.audio_bytes = wav_buf.getvalue()
                 audio_content = convert_audio_bytes_to_text(result.audio_bytes)
-            if audio_content and text_content:
-                similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
             result.text_content = text_content
             result.audio_data = audio_data
             result.audio_content = audio_content
-            result.similarity = similarity
             result.success = True
         except Exception as e:
             result.error_message = f"Stream processing error: {str(e)}"
@@ -578,15 +572,11 @@ class OpenAIClientHandler:
                 result.cached_tokens = details.cached_tokens
             result.e2e_latency = time.perf_counter() - start_time
             audio_content = None
-            similarity = None
             if audio_data:
                 result.audio_bytes = base64.b64decode(audio_data)
                 audio_content = convert_audio_bytes_to_text(result.audio_bytes)
-            if audio_content and text_content:
-                similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
             result.text_content = text_content
             result.audio_content = audio_content
-            result.similarity = similarity
             result.success = True
         except Exception as e:
             result.error_message = f"Non-stream processing error: {str(e)}"
@@ -630,6 +620,9 @@ class OpenAIClientHandler:
             mm = dict(extra_body.get("mm_processor_kwargs") or {})
             mm["use_audio_in_video"] = True
             extra_body["mm_processor_kwargs"] = mm
+        if "sampling_params_list" in request_config:
+            extra_body["sampling_params_list"] = request_config["sampling_params_list"]
+
         create_kwargs: dict[str, Any] = {
             "model": request_config.get("model"),
             "messages": request_config.get("messages"),

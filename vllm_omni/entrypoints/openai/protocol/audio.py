@@ -1,5 +1,5 @@
 import math
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
@@ -73,6 +73,10 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         ge=0,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
+    )
+    extra_params: dict[str, Any] | None = Field(
+        default=None,
+        description=("Optional model-specific parameters passed directly to the model's extra_args."),
     )
 
     @field_validator("stream_format")

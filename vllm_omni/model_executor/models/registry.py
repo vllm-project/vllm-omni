@@ -108,6 +108,11 @@ _OMNI_MODELS = {
         "mimo_audio",
         "MiMoAudioForConditionalGeneration",
     ),
+    "MiMoV2ASRForCausalLM": (
+        "mimo_audio",
+        "mimo_audio",
+        "MiMoAudioForConditionalGeneration",
+    ),
     "MiMoAudioLLMModel": (
         "mimo_audio",
         "mimo_audio_llm",
@@ -184,6 +189,11 @@ _OMNI_MODELS = {
         "ming_flash_omni",
         "ming_flash_omni_thinker",
         "MingFlashOmniThinkerForConditionalGeneration",
+    ),
+    "MingFlashOmniTalkerForConditionalGeneration": (
+        "ming_flash_omni",
+        "ming_flash_omni_talker",
+        "MingFlashOmniTalkerForConditionalGeneration",
     ),
     # Alias: HF repo currently ships this architecture name in config.json
     "BailingMM2NativeForConditionalGeneration": (

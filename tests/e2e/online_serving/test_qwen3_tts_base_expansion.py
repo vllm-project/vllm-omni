@@ -9,14 +9,16 @@ actual model inference, not mocks.
 
 import os
 
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
-
 import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
+
+pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 
@@ -61,9 +63,6 @@ tts_server_params = [
 ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_voice_clone_streaming_001(omni_server, openai_client) -> None:
@@ -89,9 +88,6 @@ def test_voice_clone_streaming_001(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size("few"))
 
 
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_response_format_001(omni_server, openai_client) -> None:

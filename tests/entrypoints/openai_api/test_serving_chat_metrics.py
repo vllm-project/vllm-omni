@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for OmniChatCompletionResponse/StreamResponse metrics field."""
 
+from types import SimpleNamespace
+
 import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -50,3 +52,36 @@ def test_omni_chat_completion_stream_response_metrics():
     )
     assert response.modality == "audio"
     assert response.metrics == {"stage_latency": 0.5}
+
+
+def test_create_image_choice_exposes_diffusion_metrics():
+    """Ensure image chat content exposes profiler metrics for clients."""
+    from PIL import Image
+
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    stage_durations = {"prefill": 0.12, "diffusion": 1.23}
+    peak_memory_mb = 3210.5
+    omni_outputs = SimpleNamespace(
+        request_output=None,
+        stage_durations=stage_durations,
+        peak_memory_mb=peak_memory_mb,
+        images=[Image.new("RGB", (2, 2), color=(255, 0, 0))],
+    )
+
+    choices = OmniOpenAIServingChat._create_image_choice(  # type: ignore[misc]
+        None,
+        omni_outputs=omni_outputs,
+        role="assistant",
+        request=SimpleNamespace(return_token_ids=False),
+    )
+
+    assert len(choices) == 1
+    content = choices[0].message.content
+    assert isinstance(content, list)
+    assert len(content) == 1
+    first_item = content[0]
+    assert first_item["type"] == "image_url"
+    assert first_item["image_url"]["url"].startswith("data:image/png;base64,")
+    assert first_item["stage_durations"] == stage_durations
+    assert first_item["peak_memory_mb"] == peak_memory_mb

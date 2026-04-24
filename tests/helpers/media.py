@@ -3,6 +3,7 @@
 import base64
 import concurrent.futures
 import gc
+import hashlib
 import io
 import logging
 import math
@@ -66,6 +67,7 @@ def generate_synthetic_audio(
     num_channels: int,
     sample_rate: int = 48000,
     *,
+    phrase_text: str = "test",
     force_regenerate: bool = False,
     cache_dir: Path | str | None = None,
 ) -> dict[str, Any]:
@@ -74,12 +76,16 @@ def generate_synthetic_audio(
 
     Caches the WAV under ``cache_dir`` when given, else under the default temp
     subdirectory. Reuses the file when the same
-    ``duration`` / ``num_channels`` / ``sample_rate`` are requested unless
-    ``force_regenerate`` is true.
+    ``duration`` / ``num_channels`` / ``sample_rate`` / ``phrase_text`` are
+    requested unless ``force_regenerate`` is true.
+
+    The cache filename includes a SHA-256 digest of ``phrase_text`` so different
+    phrases never share a WAV cache entry.
     """
     root = _resolve_synthetic_media_cache_dir(cache_dir)
     root.mkdir(parents=True, exist_ok=True)
-    cache_path = root / f"synth_audio_d{duration}_ch{num_channels}_sr{sample_rate}.wav"
+    phrase_key = hashlib.sha256(phrase_text.encode("utf-8")).hexdigest()
+    cache_path = root / f"synth_audio_d{duration}_ch{num_channels}_sr{sample_rate}_pt{phrase_key}.wav"
 
     if not force_regenerate and cache_path.is_file():
         data, _sr = sf.read(str(cache_path), dtype="float32", always_2d=True)
@@ -204,7 +210,6 @@ def generate_synthetic_audio(
             enhanced = enhanced / peak * 0.95
         return enhanced.astype(np.float32)
 
-    phrase_text = "test"
     num_samples = int(sample_rate * max(1, duration))
     audio_data = np.zeros((num_samples, num_channels), dtype=np.float32)
 
@@ -442,12 +447,16 @@ def generate_synthetic_image(
     *,
     force_regenerate: bool = False,
     cache_dir: Path | str | None = None,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     """
     Random colored squares on white background. Caches JPEG by ``width`` /
     ``height`` unless ``force_regenerate`` is true. Cache root: ``cache_dir``
     if given, else the default temp subdirectory.
     """
+    if seed is not None:
+        random.seed(seed)
+
     root = _resolve_synthetic_media_cache_dir(cache_dir)
     root.mkdir(parents=True, exist_ok=True)
     cache_path = root / f"synth_image_w{width}_h{height}.jpg"
@@ -544,7 +553,12 @@ def cosine_similarity_text(text1, text2, n: int = 3):
     norm2 = sum(b * b for b in vec2) ** 0.5
     if norm1 == 0 or norm2 == 0:
         return 0.0
-    return dot_product / (norm1 * norm2)
+    cosine = dot_product / (norm1 * norm2)
+    # Down-weight when lengths differ: repeated/hallucinated transcripts stay
+    # high in bag-of-ngrams cosine (e.g. ABCABCABC vs ABC) but should score low.
+    len1, len2 = len(text1), len(text2)
+    length_harmony = (2.0 * min(len1, len2)) / (len1 + len2)
+    return cosine * length_harmony
 
 
 def _merge_base64_audio_to_segment(base64_list: list[str]):

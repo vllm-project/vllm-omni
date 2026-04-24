@@ -21,6 +21,18 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 logger = init_logger(__name__)
 
+
+def _warn_deprecated_explicit_keys(kwargs: dict[str, Any]) -> None:
+    if "cli_explicit_keys" in kwargs:
+        import warnings
+
+        warnings.warn(
+            "cli_explicit_keys= is deprecated and ignored. Remove the kwarg.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+
 _DIFFUSERS_CLASS_TO_CONFIG: dict[str, str] = {
     "GlmImagePipeline": "glm_image",
 }
@@ -247,22 +259,25 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
 def _try_resolve_omni_model_type(model: str) -> str | None:
     """Try to resolve model_type for omni models with empty config.json.
 
-    Checks if any registered omni stage config file name matches a substring
-    in the model name (e.g. 'cosyvoice3' in 'FunAudioLLM/Fun-CosyVoice3-0.5B-2512').
-    When multiple configs match, the longest stem wins to avoid ambiguity
-    (e.g. 'bagel_single_stage' over 'bagel').
+    Searches both the legacy ``stage_configs/*.yaml`` directory and the
+    migrated ``deploy/*.yaml`` directory for a stem that substring-matches
+    the model path (e.g. ``cosyvoice3`` in
+    ``FunAudioLLM/Fun-CosyVoice3-0.5B-2512``). The longest match wins so
+    ``cosyvoice3`` beats ``cosyvoice`` and ``bagel_single_stage`` beats
+    ``bagel``.
     """
-    stage_configs_dir = PROJECT_ROOT / "vllm_omni" / "model_executor" / "stage_configs"
-    if not stage_configs_dir.exists():
-        return None
     model_lower = model.lower().replace("-", "").replace("_", "")
     best_match: str | None = None
     best_len = 0
-    for config_file in sorted(stage_configs_dir.glob("*.yaml")):
-        candidate = config_file.stem.replace("-", "").replace("_", "")
-        if candidate in model_lower and len(candidate) > best_len:
-            best_match = config_file.stem
-            best_len = len(candidate)
+    for subdir in ("model_executor/stage_configs", "deploy"):
+        config_dir = PROJECT_ROOT / "vllm_omni" / subdir
+        if not config_dir.exists():
+            continue
+        for config_file in sorted(config_dir.glob("*.yaml")):
+            candidate = config_file.stem.replace("-", "").replace("_", "")
+            if candidate and candidate in model_lower and len(candidate) > best_len:
+                best_match = config_file.stem
+                best_len = len(candidate)
     return best_match
 
 
@@ -328,6 +343,10 @@ def resolve_model_config_path(model: str) -> str:
     if os.path.exists(complete_config_path):
         return str(complete_config_path)
 
+    deploy_config_path = PROJECT_ROOT / "vllm_omni" / "deploy" / model_type_str
+    if os.path.exists(deploy_config_path):
+        return str(deploy_config_path)
+
     stage_config_file = f"vllm_omni/model_executor/stage_configs/{normalized_model_type}.yaml"
     stage_config_path = PROJECT_ROOT / stage_config_file
     if not os.path.exists(stage_config_path):
@@ -340,7 +359,7 @@ def load_stage_configs_from_model(
     base_engine_args: dict | None = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
-    cli_explicit_keys: set[str] | None = None,
+    **deprecated_kwargs: Any,
 ) -> list:
     """Load stage configurations from model's default config file.
 
@@ -355,33 +374,25 @@ def load_stage_configs_from_model(
         base_engine_args: Base engine args to merge as CLI overrides.
         deploy_config_path: Optional explicit deploy config path.
         stage_overrides: Per-stage overrides from --stage-overrides.
-        cli_explicit_keys: Set of CLI keys the user actually typed. When
-            provided, only these keys override deploy YAML; argparse defaults
-            stay subordinate to YAML. ``None`` means treat every kwarg as
-            explicit (programmatic ``Omni()`` calls).
 
     Returns:
         List of stage configuration dictionaries
     """
+    _warn_deprecated_explicit_keys(deprecated_kwargs)
+
     if base_engine_args is None:
         base_engine_args = {}
 
     cli_overrides = _convert_dataclasses_to_dict(dict(base_engine_args))
-    # Per-stage JSON overrides are always explicit (the user typed --stage-overrides).
-    explicit = set(cli_explicit_keys) if cli_explicit_keys is not None else None
     if stage_overrides:
         for stage_id_str, overrides in stage_overrides.items():
             for key, val in overrides.items():
-                stage_key = f"stage_{stage_id_str}_{key}"
-                cli_overrides[stage_key] = val
-                if explicit is not None:
-                    explicit.add(stage_key)
+                cli_overrides[f"stage_{stage_id_str}_{key}"] = val
 
     stages = StageConfigFactory.create_from_model(
         model,
         cli_overrides=cli_overrides,
         deploy_config_path=deploy_config_path,
-        cli_explicit_keys=explicit,
     )
     if stages is not None:
         # Convert StageConfig objects to OmegaConf for backward compat
@@ -542,7 +553,7 @@ def load_and_resolve_stage_configs(
     default_stage_cfg_factory: Any = None,
     deploy_config_path: str | None = None,
     stage_overrides: dict[str, dict[str, Any]] | None = None,
-    cli_explicit_keys: set[str] | None = None,
+    **deprecated_kwargs: Any,
 ) -> tuple[str, list]:
     """Load stage configurations from model or YAML file with fallback to defaults.
 
@@ -586,6 +597,8 @@ def load_and_resolve_stage_configs(
                 stage_configs_path,
             )
 
+    _warn_deprecated_explicit_keys(deprecated_kwargs)
+
     if deploy_config_path is not None:
         config_path = deploy_config_path
         stage_configs = load_stage_configs_from_model(
@@ -593,7 +606,6 @@ def load_and_resolve_stage_configs(
             base_engine_args=kwargs,
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
-            cli_explicit_keys=cli_explicit_keys,
         )
         if not stage_configs:
             if default_stage_cfg_factory is not None:
@@ -607,7 +619,6 @@ def load_and_resolve_stage_configs(
             model,
             base_engine_args=kwargs,
             stage_overrides=stage_overrides,
-            cli_explicit_keys=cli_explicit_keys,
         )
         if not stage_configs:
             if default_stage_cfg_factory is not None:
