@@ -108,6 +108,11 @@ _OMNI_MODELS = {
         "mimo_audio",
         "MiMoAudioForConditionalGeneration",
     ),
+    "MiMoV2ASRForCausalLM": (
+        "mimo_audio",
+        "mimo_audio",
+        "MiMoAudioForConditionalGeneration",
+    ),
     "MiMoAudioLLMModel": (
         "mimo_audio",
         "mimo_audio_llm",
