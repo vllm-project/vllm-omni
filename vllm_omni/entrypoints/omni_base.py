@@ -7,7 +7,6 @@ import time
 import types
 import weakref
 from collections.abc import Sequence
-from pprint import pformat
 from typing import TYPE_CHECKING, Any, Literal
 
 import huggingface_hub
@@ -250,8 +249,6 @@ class OmniBase(PDDisaggregationMixin):
         try:
             if req_state is None or req_state.metrics is None:
                 return
-            summary = req_state.metrics.build_and_log_summary()
-            logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
         except Exception:
             logger.exception(
                 "[%s] Failed to build/log summary for req=%s",

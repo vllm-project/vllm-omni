@@ -19,13 +19,16 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | `platforms` | dict | optional | `null` | Keyed by `npu` / `rocm` / `xpu`, each contains a `stages:` list with per-platform overrides applied on top of the CUDA defaults. |
 | `pipeline` | str | optional | `null` | Override the auto-detected pipeline registry key (used for structural variants like `qwen2_5_omni_thinker_only`). |
 | `trust_remote_code` | bool | optional | `true` | **Pipeline-wide.** Trust HF remote code on model load; applies to every stage. |
-| `distributed_executor_backend` | str | optional | `"mp"` | **Pipeline-wide.** Executor backend (`"mp"` or `"ray"`). |
+| `distributed_executor_backend` | str \| null | optional | `null` | **Pipeline-wide.** Distributed executor backend forwarded to vLLM (`"mp"`, `"ray"`, `"external_launcher"`). If omitted, vLLM auto-selects backend from runtime topology. |
 | `dtype` | str \| null | optional | `null` | **Pipeline-wide.** Model dtype for every stage. |
 | `quantization` | str \| null | optional | `null` | **Pipeline-wide.** Quantization method for every stage. |
 | `enable_prefix_caching` | bool | optional | `false` | **Pipeline-wide.** Prefix cache toggle applied to every stage. |
 | `enable_chunked_prefill` | bool \| null | optional | `null` | **Pipeline-wide.** Chunked prefill toggle applied to every stage. |
 | `data_parallel_size` | int | optional | `1` | **Pipeline-wide.** DP degree for every stage. |
 | `pipeline_parallel_size` | int | optional | `1` | **Pipeline-wide.** PP degree for every stage. |
+
+Note: for diffusion path, `distributed_executor_backend` currently defaults to
+`mp`, and `ray` / `external_launcher` are not fully supported yet.
 
 ### Stage fields
 
