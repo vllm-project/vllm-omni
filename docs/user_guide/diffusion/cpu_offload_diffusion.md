@@ -143,7 +143,6 @@ class Flux2Transformer2DModel(nn.Module):
     _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 ```
 
-
 ### Limitations
 - Cold start latency increases because of
     1) components are loaded to CPU first at the very first during initialization,
