@@ -314,7 +314,7 @@ class OmniSchedulingCoordinator:
                 runtime_seed = None
                 if "left_context_size" in metadata:
                     runtime_seed = {
-                        "left_context_size": metadata["left_context_size"],
+                        "meta": {"left_context_size": metadata["left_context_size"]},
                     }
                 request._omni_initial_model_buffer = runtime_seed
                 if new_ids:

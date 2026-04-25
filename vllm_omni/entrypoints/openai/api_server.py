@@ -1793,20 +1793,85 @@ async def edit_images(
         _update_if_not_none(gen_params, "layers", layers)
         _update_if_not_none(gen_params, "resolution", resolution)
 
-        # 4. Generate images using AsyncOmni (multi-stage mode)
+        # 4. Generate images
         request_id = f"img_edit-{random_uuid()}"
         raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
         logger.info(f"Generating {n} image(s) {size_str}")
-        result = await _generate_with_async_omni(
-            engine_client=engine_client,
-            gen_params=gen_params,
-            stage_configs=stage_configs,
-            prompt=prompt,
-            request_id=request_id,
-        )
 
-        # 5. Extract images from result
-        images = _extract_images_from_result(result)
+        if len(stage_configs) > 1:
+            # Multi-stage pipeline (e.g. GLM-Image AR+Diffusion): route through
+            # the chat handler so the AR stage gets correct max_tokens and
+            # target_h/w (same path as /v1/images/generations).
+            chat_handler = getattr(raw_request.app.state, "openai_serving_chat", None)
+            if chat_handler is None:
+                raise HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                    detail="openai_serving_chat is not initialized for multi-stage image editing.",
+                )
+
+            # Encode input images to base64 for generate_diffusion_images.
+            import base64
+            import io as _io
+
+            ref_b64_list: list[str] = []
+            for _img in pil_images:
+                buf = _io.BytesIO()
+                _img.save(buf, format="PNG")
+                ref_b64_list.append(base64.b64encode(buf.getvalue()).decode())
+
+            effective_seed = seed if seed is not None else random.randint(0, MAX_UINT32_SEED)
+            extra_body: dict[str, Any] = {
+                "seed": effective_seed,
+                "num_outputs_per_prompt": n,
+            }
+            if width is not None:
+                extra_body["width"] = width
+            if height is not None:
+                extra_body["height"] = height
+            if negative_prompt is not None:
+                extra_body["negative_prompt"] = negative_prompt
+            if num_inference_steps is not None:
+                extra_body["num_inference_steps"] = num_inference_steps
+            if guidance_scale is not None:
+                extra_body["guidance_scale"] = guidance_scale
+            if strength is not None:
+                extra_body["strength"] = strength
+            if true_cfg_scale is not None:
+                extra_body["true_cfg_scale"] = true_cfg_scale
+            if layers is not None:
+                extra_body["layers"] = layers
+            if resolution is not None:
+                extra_body["resolution"] = resolution
+            if lora is not None:
+                # Validate LoRA, then pass through.
+                lora_dict = _get_lora_from_json_str(lora)
+                _parse_lora_request(lora_dict)
+                extra_body["lora"] = lora_dict
+
+            prompt_text = prompt.get("prompt", "")
+            generation_result = await chat_handler.generate_diffusion_images(
+                prompt=prompt_text,
+                extra_body=extra_body,
+                reference_images=ref_b64_list,
+                request_id=request_id,
+            )
+            if isinstance(generation_result, ErrorResponse):
+                raise HTTPException(
+                    status_code=generation_result.error.code if generation_result.error else 400,
+                    detail=generation_result.message,
+                )
+            images, _, _ = generation_result
+        else:
+            # Single-stage diffusion: use the direct path.
+            result = await _generate_with_async_omni(
+                engine_client=engine_client,
+                gen_params=gen_params,
+                stage_configs=stage_configs,
+                prompt=prompt,
+                request_id=request_id,
+            )
+            images = _extract_images_from_result(result)
+
         logger.info(f"Successfully generated {len(images)} image(s)")
 
         # Encode images to base64
