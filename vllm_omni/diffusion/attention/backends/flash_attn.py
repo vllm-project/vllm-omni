@@ -199,6 +199,17 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
+
+        # NPU aclnnFlashAttentionScore requires mask shape to be one of:
+        # [B, N, Sq, Skv], [B, 1, Sq, Skv], [1, 1, Sq, Skv], or [Sq, Skv]
+        # But the incoming mask is 2D [B, S] — reshape to [B, 1, 1, S] so NPU
+        # can broadcast it correctly across the sequence dimension.
+        if attention_mask is not None and attention_mask.ndim == 2:
+            # [B, S] -> [B, 1, 1, S]
+            mask_k = attention_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S]
+            mask_q = attention_mask.unsqueeze(1).unsqueeze(3)  # [B, 1, S, 1]
+            attention_mask = (mask_k & mask_q)                 # [B, 1, S, S]
+            
         output = attention_forward(
             query,
             key,
