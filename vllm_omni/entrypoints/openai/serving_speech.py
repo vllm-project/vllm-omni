@@ -508,8 +508,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
         # Per-request cfg_value threads via additional_information; the talker
         # lifts it onto _RequestState in preprocess() and uses it in _run_cfm.
-        if request.cfg_value is not None:
-            prompt.setdefault("additional_information", {})["cfg_value"] = float(request.cfg_value)
+        # Following the convention from #2338 (Voxtral TTS / cfg_alpha), the
+        # value is provided via the shared `extra_params` dict rather than as
+        # a top-level protocol field, keeping OpenAICreateSpeechRequest free
+        # of model-specific knobs.
+        if request.extra_params and "cfg_value" in request.extra_params:
+            try:
+                cfg_value = float(request.extra_params["cfg_value"])
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"extra_params['cfg_value'] must be a number: {e}") from e
+            if not 0.1 <= cfg_value <= 10.0:
+                raise ValueError(f"extra_params['cfg_value']={cfg_value} out of range (0.1-10.0)")
+            prompt.setdefault("additional_information", {})["cfg_value"] = cfg_value
         return prompt
 
     def _get_uploaded_audio_data(self, voice_name: str) -> str | None:

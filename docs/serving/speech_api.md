@@ -125,11 +125,13 @@ Content-Type: application/json
 
 #### VoxCPM2-specific Parameters
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `cfg_value` | float | 2.0 | Classifier-free guidance scale for the CFM decoder. Range `0.1`–`10.0`; typical useful range is `1.5`–`3.0`. Higher values track the text more strictly at the cost of naturalness. Ignored by non-voxcpm2 models. |
+VoxCPM2 reuses the shared `extra_params: dict` field (introduced in #2338 for Voxtral TTS) for model-specific knobs rather than adding new top-level fields:
 
-VoxCPM2 also reuses the standard `instructions`, `ref_audio`, and `ref_text` fields — see the mode table below for how they combine.
+| Key (inside `extra_params`) | Type | Default | Description |
+|-----------------------------|------|---------|-------------|
+| `cfg_value` | float | 2.0 | Classifier-free guidance scale for the CFM decoder. Range `0.1`–`10.0`; typical useful range is `1.5`–`3.0`. Higher values track the text more strictly at the cost of naturalness. |
+
+Send as e.g. `{"input": "...", "extra_params": {"cfg_value": 2.5}}`. VoxCPM2 also reuses the standard `instructions`, `ref_audio`, and `ref_text` fields, see the mode table below for how they combine.
 
 ### Response Format
 
@@ -565,9 +567,9 @@ VoxCPM2 exposes three synthesis modes through the same `/v1/audio/speech` endpoi
 
 | Mode | Required fields | Optional fields | Notes |
 |------|-----------------|-----------------|-------|
-| **Voice Design** | `input` | `instructions`, `cfg_value` | Synthesize a voice from a text description alone. `instructions` is prepended to the target text as `(instructions)input` following `voxcpm.cli.build_final_text`. Both English and Chinese instructions are supported. |
-| **Controllable Cloning** | `input`, `ref_audio` | `instructions`, `cfg_value` | Clone the reference speaker's timbre; use `instructions` to steer emotion, pace, or other style attributes while preserving identity. |
-| **Hi-Fi Cloning** | `input`, `ref_audio`, `ref_text` | `cfg_value` | The model treats `ref_audio` + `ref_text` as a spoken prefix and continues from it. Reproduces every vocal nuance of the reference. Per the canonical VoxCPM2 docs, when Hi-Fi mode is enabled the control instruction is ignored; the server drops `instructions` in this mode automatically if present. |
+| **Voice Design** | `input` | `instructions`, `extra_params.cfg_value` | Synthesize a voice from a text description alone. `instructions` is prepended to the target text as `(instructions)input` following `voxcpm.cli.build_final_text`. Both English and Chinese instructions are supported. |
+| **Controllable Cloning** | `input`, `ref_audio` | `instructions`, `extra_params.cfg_value` | Clone the reference speaker's timbre; use `instructions` to steer emotion, pace, or other style attributes while preserving identity. |
+| **Hi-Fi Cloning** | `input`, `ref_audio`, `ref_text` | `extra_params.cfg_value` | The model treats `ref_audio` + `ref_text` as a spoken prefix and continues from it. Reproduces every vocal nuance of the reference. Per the canonical VoxCPM2 docs, when Hi-Fi mode is enabled the control instruction is ignored; the server drops `instructions` in this mode automatically if present. |
 
 Reference audio guidelines: 16 kHz mono, at least 5 seconds recommended for a good clone (1 second hard minimum, 30 seconds hard maximum). Clean, non-reverberant speech; the same `ref_audio` can be reused across Controllable and Hi-Fi modes.
 
@@ -583,7 +585,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     -d '{
         "input": "Hello everyone. Today I want to talk about open source AI.",
         "instructions": "A warm young woman with a gentle, friendly voice",
-        "cfg_value": 2.5
+        "extra_params": {"cfg_value": 2.5}
     }' --output voice_design.wav
 ```
 
@@ -596,7 +598,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "input": "Good morning, let me tell you a short story.",
         "ref_audio": "https://example.com/reference.wav",
         "instructions": "Warm storyteller, slow cadence, dramatic pauses",
-        "cfg_value": 2.5
+        "extra_params": {"cfg_value": 2.5}
     }' --output controllable_cloning.wav
 ```
 
@@ -609,7 +611,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "input": "Welcome everyone. I will give a brief update on the project today.",
         "ref_audio": "https://example.com/reference.wav",
         "ref_text": "Transcript of what the reference speaker is saying in the reference clip.",
-        "cfg_value": 2.5
+        "extra_params": {"cfg_value": 2.5}
     }' --output ultimate_cloning.wav
 ```
 

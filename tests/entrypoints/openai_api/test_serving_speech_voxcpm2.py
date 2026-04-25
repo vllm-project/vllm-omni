@@ -118,15 +118,24 @@ class TestVoxCPM2Serving:
         assert mock_build_voxcpm2_prompt.call_args.kwargs["text"] == "(calm radio)hello"
 
     def test_build_prompt_stashes_cfg_value(self, voxcpm2_server, mock_build_voxcpm2_prompt):
-        """`cfg_value` lands in `additional_information` for the talker to lift."""
-        request = OpenAICreateSpeechRequest(input="hello", cfg_value=2.7)
+        """`extra_params['cfg_value']` lands in `additional_information` for the talker to lift."""
+        request = OpenAICreateSpeechRequest(input="hello", extra_params={"cfg_value": 2.7})
         prompt = asyncio.run(voxcpm2_server._build_voxcpm2_prompt(request))
 
         assert prompt["additional_information"]["cfg_value"] == 2.7
 
-    def test_build_prompt_omits_cfg_value_when_none(self, voxcpm2_server, mock_build_voxcpm2_prompt):
+    def test_build_prompt_omits_cfg_value_when_extra_params_missing(self, voxcpm2_server, mock_build_voxcpm2_prompt):
         """Omitting `cfg_value` must not add the key (talker falls back to its default)."""
         request = OpenAICreateSpeechRequest(input="hello")
+        prompt = asyncio.run(voxcpm2_server._build_voxcpm2_prompt(request))
+
+        assert "cfg_value" not in prompt["additional_information"]
+
+    def test_build_prompt_omits_cfg_value_when_extra_params_has_other_keys(
+        self, voxcpm2_server, mock_build_voxcpm2_prompt
+    ):
+        """`extra_params` set but without `cfg_value` must not affect the prompt."""
+        request = OpenAICreateSpeechRequest(input="hello", extra_params={"some_other_knob": 1})
         prompt = asyncio.run(voxcpm2_server._build_voxcpm2_prompt(request))
 
         assert "cfg_value" not in prompt["additional_information"]
@@ -136,7 +145,7 @@ class TestVoxCPM2Serving:
         request = OpenAICreateSpeechRequest(
             input="hello",
             instructions="excited",
-            cfg_value=2.5,
+            extra_params={"cfg_value": 2.5},
         )
         prompt = asyncio.run(voxcpm2_server._build_voxcpm2_prompt(request))
 
@@ -153,7 +162,7 @@ class TestVoxCPM2Serving:
             input="clone me",
             ref_audio="data:audio/wav;base64,QUJD",
             ref_text="reference transcript",
-            cfg_value=2.7,
+            extra_params={"cfg_value": 2.7},
         )
         prompt = asyncio.run(voxcpm2_server._build_voxcpm2_prompt(request))
 
@@ -213,15 +222,23 @@ class TestVoxCPM2Serving:
         # The prompt builder must NOT be reached when validation fails.
         mock_build_voxcpm2_prompt.assert_not_called()
 
-    @pytest.mark.parametrize("cfg", [0.5, 1.5, 2.0, 2.7, 5.0, 10.0])
+    @pytest.mark.parametrize("cfg", [0.1, 0.5, 1.5, 2.0, 2.7, 5.0, 10.0])
     def test_cfg_value_accepts_range(self, voxcpm2_server, mock_build_voxcpm2_prompt, cfg):
-        """Protocol validates 0.1 ≤ cfg_value ≤ 10.0; these should all pass."""
-        request = OpenAICreateSpeechRequest(input="hello", cfg_value=cfg)
+        """`_build_voxcpm2_prompt` accepts cfg_value within 0.1-10.0 inclusive."""
+        request = OpenAICreateSpeechRequest(input="hello", extra_params={"cfg_value": cfg})
         prompt = asyncio.run(voxcpm2_server._build_voxcpm2_prompt(request))
         assert prompt["additional_information"]["cfg_value"] == cfg
 
     @pytest.mark.parametrize("cfg", [0.0, -1.0, 10.5, 100.0])
-    def test_cfg_value_rejects_out_of_range(self, cfg):
-        """Out-of-range `cfg_value` raises at schema construction time."""
-        with pytest.raises(ValueError):
-            OpenAICreateSpeechRequest(input="hello", cfg_value=cfg)
+    def test_cfg_value_rejects_out_of_range(self, voxcpm2_server, mock_build_voxcpm2_prompt, cfg):
+        """Out-of-range `cfg_value` (validated in `_build_voxcpm2_prompt`) raises ValueError."""
+        request = OpenAICreateSpeechRequest(input="hello", extra_params={"cfg_value": cfg})
+        with pytest.raises(ValueError, match="out of range"):
+            asyncio.run(voxcpm2_server._build_voxcpm2_prompt(request))
+
+    @pytest.mark.parametrize("bad", ["abc", None, [1, 2], {"x": 1}])
+    def test_cfg_value_rejects_non_numeric(self, voxcpm2_server, mock_build_voxcpm2_prompt, bad):
+        """Non-numeric `extra_params['cfg_value']` raises ValueError instead of crashing the talker."""
+        request = OpenAICreateSpeechRequest(input="hello", extra_params={"cfg_value": bad})
+        with pytest.raises(ValueError, match="must be a number|out of range"):
+            asyncio.run(voxcpm2_server._build_voxcpm2_prompt(request))
