@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import argparse
 import os
-import sys
 import time
 import types
 import weakref
@@ -86,33 +84,6 @@ OutputMessageHandleResult = tuple[Literal[True], None, None, None] | tuple[Liter
 
 class OmniBase(PDDisaggregationMixin):
     """Shared runtime foundation for AsyncOmni and Omni."""
-
-    @classmethod
-    def from_cli_args(
-        cls,
-        args: argparse.Namespace,
-        *,
-        parser: argparse.ArgumentParser | None = None,
-        **overrides: Any,
-    ) -> OmniBase:
-        """Build from argparse. If ``parser`` is passed and not yet nullified,
-        un-typed engine fields are reset to ``None``."""
-        kwargs: dict[str, Any] = {k: v for k, v in vars(args).items() if not k.startswith("_")}
-
-        if parser is not None and not getattr(parser, "_omni_nullified", False):
-            from vllm_omni.engine.arg_utils import (
-                deploy_override_field_names,
-            )
-            from vllm_omni.entrypoints.utils import detect_explicit_cli_keys
-
-            explicit = detect_explicit_cli_keys(sys.argv[1:], parser) or set()
-            override_dests = deploy_override_field_names()
-            for key in list(kwargs):
-                if key in override_dests and key not in explicit:
-                    kwargs[key] = None
-
-        kwargs.update(overrides)
-        return cls(**kwargs)
 
     def __init__(
         self,

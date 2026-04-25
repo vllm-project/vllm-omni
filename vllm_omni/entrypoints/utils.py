@@ -1,4 +1,3 @@
-import argparse
 import os
 import types
 from collections import Counter
@@ -38,65 +37,6 @@ def _warn_deprecated_explicit_keys(kwargs: dict[str, Any]) -> None:
 _DIFFUSERS_CLASS_TO_CONFIG: dict[str, str] = {
     "GlmImagePipeline": "glm_image",
 }
-
-
-def detect_explicit_cli_keys(
-    argv: list[str],
-    parser: argparse.ArgumentParser | None = None,
-) -> set[str]:
-    """Walk ``argv`` and return the set of ``dest`` attribute names the user
-    explicitly provided (e.g. ``--max-num-seqs 64`` → ``max_num_seqs``).
-
-    Used to distinguish user-typed CLI args from argparse default values so
-    deploy YAMLs are not silently overridden by parser defaults. Shared
-    across online (``vllm serve``) and offline (scripts, examples, tests,
-    CI) entry points — offline callers that parse CLI args via argparse
-    should invoke this on ``sys.argv[1:]`` and pass the result through to
-    ``AsyncOmni`` / ``Omni`` via the ``_cli_explicit_keys`` kwarg.
-
-    When ``parser`` is provided, each token is looked up in the parser's
-    action table to find its real ``dest``. This correctly handles flags
-    with ``dest=`` overrides, alias flags (e.g. ``--usp`` /
-    ``--ulysses-degree`` both mapping to ``ulysses_degree``), and
-    ``--disable-foo`` / ``store_false`` patterns that map to a differently
-    named dest. Callers with access to an ``argparse.ArgumentParser`` should
-    always pass it.
-
-    When ``parser`` is ``None``, a name-based heuristic is used as a
-    fallback (hyphens → underscores, plus a ``no_`` prefix strip for
-    ``argparse.BooleanOptionalAction``). This is correct for simple flags
-    but silently misidentifies ``--disable-X``-style flags and explicit
-    ``dest=`` overrides, so prefer the parser-aware form.
-    """
-    if parser is not None:
-        dest_map: dict[str, str] = {}
-        for action in parser._actions:
-            for opt in action.option_strings:
-                dest_map[opt] = action.dest
-        explicit: set[str] = set()
-        for tok in argv:
-            if not tok.startswith("--"):
-                continue
-            flag = tok.split("=", 1)[0]
-            dest = dest_map.get(flag)
-            if dest is not None:
-                explicit.add(dest)
-        return explicit
-
-    # Fallback: name-based heuristic (legacy path for callers without a parser).
-    explicit = set()
-    for tok in argv:
-        if not tok.startswith("--"):
-            continue
-        name = tok[2:].split("=", 1)[0]
-        if not name:
-            continue
-        attr = name.replace("-", "_")
-        explicit.add(attr)
-        # BooleanOptionalAction: --no-foo records as dest `foo`, not `no_foo`.
-        if attr.startswith("no_"):
-            explicit.add(attr[3:])
-    return explicit
 
 
 def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
