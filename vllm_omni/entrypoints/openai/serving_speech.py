@@ -1687,6 +1687,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.instructions:
                 prompt["instruct"] = request.instructions
         elif self._tts_model_type == "voxcpm2":
+            # Run the same validator the batch endpoint uses so single-request
+            # /v1/audio/speech enforces the instructions-length cap and any
+            # other voxcpm2-specific checks (e.g. Hi-Fi mode + instructions).
+            validation_error = self._validate_tts_request(request)
+            if validation_error:
+                raise ValueError(validation_error)
             prompt = await self._build_voxcpm2_prompt(request)
             tts_params = {}
         elif self._is_tts:

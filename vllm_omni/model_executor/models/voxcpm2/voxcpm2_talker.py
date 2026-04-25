@@ -960,7 +960,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if pfc.ndim == 2:
             pfc = pfc.unsqueeze(0)
 
-        pred_feat = self._run_cfm(dit_h, pfc.transpose(1, 2).contiguous())
+        pred_feat = self._run_cfm(dit_h, pfc.transpose(1, 2).contiguous(), cfg_value=state.cfg_value)
         next_embed = tts.enc_to_lm_proj(tts.feat_encoder(pred_feat.unsqueeze(1))).squeeze(1)
 
         state.precomputed_stop_logits = stop_fn(lm_h).detach()

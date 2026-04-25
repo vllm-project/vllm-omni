@@ -199,6 +199,20 @@ class TestVoxCPM2Serving:
         request = OpenAICreateSpeechRequest(input="hello", instructions=at_limit)
         assert voxcpm2_server._validate_tts_request(request) is None
 
+    def test_prepare_speech_generation_runs_validator_for_voxcpm2(
+        self, voxcpm2_server, mock_build_voxcpm2_prompt, mocker: MockerFixture
+    ):
+        """Single-request `/v1/audio/speech` path must invoke `_validate_tts_request`
+        before building the prompt, so the instructions-length cap actually fires
+        for normal (non-batch) requests too. Regression guard for #3118 P2.
+        """
+        oversize = "x" * (voxcpm2_server._max_instructions_length + 1)
+        request = OpenAICreateSpeechRequest(input="hello", instructions=oversize)
+        with pytest.raises(ValueError, match=str(voxcpm2_server._max_instructions_length)):
+            asyncio.run(voxcpm2_server._prepare_speech_generation(request))
+        # The prompt builder must NOT be reached when validation fails.
+        mock_build_voxcpm2_prompt.assert_not_called()
+
     @pytest.mark.parametrize("cfg", [0.5, 1.5, 2.0, 2.7, 5.0, 10.0])
     def test_cfg_value_accepts_range(self, voxcpm2_server, mock_build_voxcpm2_prompt, cfg):
         """Protocol validates 0.1 ≤ cfg_value ≤ 10.0; these should all pass."""
