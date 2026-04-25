@@ -200,6 +200,74 @@ QWEN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, DEPLO
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
+def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
+    omni_server_function,
+) -> None:
+    """Black-box: text chat vs omni audio output should expose a consistent error contract under OOM.
+
+    Speech-style output is requested via ``/v1/chat/completions`` with ``modalities`` that include ``audio``.
+    """
+    device_spec = resolve_oom_device_spec(
+        OOM_INJECTION_CONFIG,
+        _stage_config_path_from_omni_server(omni_server_function),
+    )
+    handle = inject_gpu_oom(
+        device=device_spec,
+        target_mem_ratio=OOM_INJECTION_CONFIG["target_mem_ratio"],
+        hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
+        startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
+        strict=OOM_INJECTION_CONFIG["strict"],
+    )
+    host = omni_server_function.host
+    port = omni_server_function.port
+    mix_base = _mix_chat_completions_probe_payload(omni_server_function)
+    oom_contract_timeout_sec = 120
+    try:
+        chat_status, chat_body = post_json_raw(
+            host,
+            port,
+            "/v1/chat/completions",
+            {
+                "model": mix_base["model"],
+                "messages": mix_base["messages"],
+                "stream": False,
+                "modalities": ["text"],
+            },
+            timeout_sec=oom_contract_timeout_sec,
+        )
+        speech_status, speech_body = post_json_raw(
+            host,
+            port,
+            "/v1/chat/completions",
+            {
+                "model": mix_base["model"],
+                "messages": mix_base["messages"],
+                "stream": False,
+                "modalities": ["text", "audio"],
+            },
+            timeout_sec=oom_contract_timeout_sec,
+        )
+    finally:
+        stop_gpu_oom_hogs(handle)
+
+    # Under OOM pressure both chat and speech should surface runtime-class (5xx)
+    # failures instead of request-validation-class (4xx) errors.
+    chat_error = extract_openai_error_contract_from_bytes(chat_body)
+    speech_error = extract_openai_error_contract_from_bytes(speech_body)
+    print(chat_status, chat_error, speech_status, speech_error)
+
+    assert chat_status >= 500, f"expected chat error under OOM, got status={chat_status}"
+    assert speech_status >= 500, f"expected speech runtime error under OOM, got status={speech_status}"
+
+    assert chat_error is not None, f"chat error payload not OpenAI-compatible: {chat_body[:300]!r}"
+    assert speech_error is not None, f"speech error payload not OpenAI-compatible: {speech_body[:300]!r}"
+    assert "code" in chat_error, f"chat error lacks code field: {chat_error!r}"
+    assert "code" in speech_error, f"speech error lacks code field: {speech_error!r}"
+
+
+@pytest.mark.slow
+@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_chat_large_payload_failure(omni_server_function, openai_client_function) -> None:
     device_spec = resolve_oom_device_spec(
         OOM_INJECTION_CONFIG,
@@ -444,74 +512,6 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
     assert fault_observed, (
         "[process_kill concurrent] expected at least one request to fail after process-kill fault injection"
     )
-
-
-@pytest.mark.slow
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
-def test_reliability_fault_gpu_oom_error_contract_consistent_chat_speech(
-    omni_server_function,
-) -> None:
-    """Black-box: text chat vs omni audio output should expose a consistent error contract under OOM.
-
-    Speech-style output is requested via ``/v1/chat/completions`` with ``modalities`` that include ``audio``.
-    """
-    device_spec = resolve_oom_device_spec(
-        OOM_INJECTION_CONFIG,
-        _stage_config_path_from_omni_server(omni_server_function),
-    )
-    handle = inject_gpu_oom(
-        device=device_spec,
-        target_mem_ratio=OOM_INJECTION_CONFIG["target_mem_ratio"],
-        hold_seconds=OOM_INJECTION_CONFIG["hold_seconds"],
-        startup_timeout_sec=OOM_INJECTION_CONFIG["startup_timeout_sec"],
-        strict=OOM_INJECTION_CONFIG["strict"],
-    )
-    host = omni_server_function.host
-    port = omni_server_function.port
-    mix_base = _mix_chat_completions_probe_payload(omni_server_function)
-    oom_contract_timeout_sec = 120
-    try:
-        chat_status, chat_body = post_json_raw(
-            host,
-            port,
-            "/v1/chat/completions",
-            {
-                "model": mix_base["model"],
-                "messages": mix_base["messages"],
-                "stream": False,
-                "modalities": ["text"],
-            },
-            timeout_sec=oom_contract_timeout_sec,
-        )
-        speech_status, speech_body = post_json_raw(
-            host,
-            port,
-            "/v1/chat/completions",
-            {
-                "model": mix_base["model"],
-                "messages": mix_base["messages"],
-                "stream": False,
-                "modalities": ["text", "audio"],
-            },
-            timeout_sec=oom_contract_timeout_sec,
-        )
-    finally:
-        stop_gpu_oom_hogs(handle)
-
-    # Under OOM pressure both chat and speech should surface runtime-class (5xx)
-    # failures instead of request-validation-class (4xx) errors.
-    chat_error = extract_openai_error_contract_from_bytes(chat_body)
-    speech_error = extract_openai_error_contract_from_bytes(speech_body)
-    print(chat_status, chat_error, speech_status, speech_error)
-
-    assert chat_status >= 500, f"expected chat error under OOM, got status={chat_status}"
-    assert speech_status >= 500, f"expected speech runtime error under OOM, got status={speech_status}"
-
-    assert chat_error is not None, f"chat error payload not OpenAI-compatible: {chat_body[:300]!r}"
-    assert speech_error is not None, f"speech error payload not OpenAI-compatible: {speech_body[:300]!r}"
-    assert "code" in chat_error, f"chat error lacks code field: {chat_error!r}"
-    assert "code" in speech_error, f"speech error lacks code field: {speech_error!r}"
 
 
 @pytest.mark.slow
