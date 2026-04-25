@@ -34,7 +34,7 @@ from safetensors.torch import save_file
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
@@ -43,24 +43,13 @@ MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
 BAGEL_STAGE_CONFIG = get_deploy_config_path("ci/bagel.yaml")
 DEFAULT_PROMPT = "<|im_start|>A cute cat<|im_end|>"
 
+# (model, stage_configs_path) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
+_OMNI_RUNNER_PARAM = (MODEL, BAGEL_STAGE_CONFIG)
+
 
 # ---------------------------------------------------------------------------
 # Helpers (reused from test_bagel_text2img.py patterns)
 # ---------------------------------------------------------------------------
-
-
-def _resolve_deploy_config(config_path: str, run_level: str) -> str:
-    if run_level == "advanced_model":
-        return modify_stage_config(
-            config_path,
-            deletes={
-                "stages": {
-                    0: ["load_format"],
-                    1: ["load_format"],
-                }
-            },
-        )
-    return config_path
 
 
 def _configure_sampling_params(omni: Omni, num_inference_steps: int = 10) -> list[OmniSamplingParams]:
@@ -148,49 +137,52 @@ def _make_file_lora_request(adapter_dir: Path) -> LoRARequest:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.full_model
-@pytest.mark.diffusion
+pytestmark = [
+    pytest.mark.full_model,
+    pytest.mark.diffusion,
+    pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
+]
+
+
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
-def test_bagel_lora_scale_and_deactivation(run_level, tmp_path):
+def test_bagel_lora_scale_and_deactivation(omni_runner: OmniRunner, tmp_path) -> None:
     """Validate LoRA effect, bounded perturbation, and clean deactivation."""
-    config_path = _resolve_deploy_config(BAGEL_STAGE_CONFIG, run_level)
-    with OmniRunner(MODEL, stage_configs_path=config_path) as runner:
-        omni = runner.omni
-        lora_request = _make_file_lora_request(tmp_path / "bagel_lora")
+    omni = omni_runner.omni
+    lora_request = _make_file_lora_request(tmp_path / "bagel_lora")
 
-        # 1) Baseline (no LoRA)
-        baseline = _generate_bagel_image(omni)
+    # 1) Baseline (no LoRA)
+    baseline = _generate_bagel_image(omni)
 
-        # 2) LoRA with scale=1.0
-        img_1x = _generate_bagel_image_with_lora(omni, lora_request, lora_scale=1.0)
+    # 2) LoRA with scale=1.0
+    img_1x = _generate_bagel_image_with_lora(omni, lora_request, lora_scale=1.0)
 
-        # 3) LoRA with scale=2.0
-        img_2x = _generate_bagel_image_with_lora(omni, lora_request, lora_scale=2.0)
+    # 3) LoRA with scale=2.0
+    img_2x = _generate_bagel_image_with_lora(omni, lora_request, lora_scale=2.0)
 
-        # 4) No LoRA again (deactivation)
-        restored = _generate_bagel_image(omni)
+    # 4) No LoRA again (deactivation)
+    restored = _generate_bagel_image(omni)
 
-        baseline_arr = np.array(baseline, dtype=np.int16)
-        img_1x_arr = np.array(img_1x, dtype=np.int16)
-        img_2x_arr = np.array(img_2x, dtype=np.int16)
-        restored_arr = np.array(restored, dtype=np.int16)
+    baseline_arr = np.array(baseline, dtype=np.int16)
+    img_1x_arr = np.array(img_1x, dtype=np.int16)
+    img_2x_arr = np.array(img_2x, dtype=np.int16)
+    restored_arr = np.array(restored, dtype=np.int16)
 
-        diff_1x = np.abs(baseline_arr - img_1x_arr).mean()
-        diff_2x = np.abs(baseline_arr - img_2x_arr).mean()
-        diff_restored = np.abs(baseline_arr - restored_arr).mean()
+    diff_1x = np.abs(baseline_arr - img_1x_arr).mean()
+    diff_2x = np.abs(baseline_arr - img_2x_arr).mean()
+    diff_restored = np.abs(baseline_arr - restored_arr).mean()
 
-        # (a) Adapter has visible effect at both scales
-        assert diff_1x > 0.5, f"LoRA scale=1.0 had no visible effect: diff={diff_1x}"
-        assert diff_2x > 0.5, f"LoRA scale=2.0 had no visible effect: diff={diff_2x}"
+    # (a) Adapter has visible effect at both scales
+    assert diff_1x > 0.5, f"LoRA scale=1.0 had no visible effect: diff={diff_1x}"
+    assert diff_2x > 0.5, f"LoRA scale=2.0 had no visible effect: diff={diff_2x}"
 
-        # (b) Different scales produce different outputs
-        assert not np.isclose(diff_1x, diff_2x, atol=1.0), (
-            f"LoRA scale has no effect: diff_1x={diff_1x:.2f}, diff_2x={diff_2x:.2f}"
-        )
+    # (b) Different scales produce different outputs
+    assert not np.isclose(diff_1x, diff_2x, atol=1.0), (
+        f"LoRA scale has no effect: diff_1x={diff_1x:.2f}, diff_2x={diff_2x:.2f}"
+    )
 
-        # (c) Output is not corrupted (scale=2.0 can produce ~2x the diff of scale=1.0)
-        assert diff_1x < 80, f"LoRA output looks corrupted: diff_1x={diff_1x}"
-        assert diff_2x < 120, f"LoRA output looks corrupted: diff_2x={diff_2x}"
+    # (c) Output is not corrupted (scale=2.0 can produce ~2x the diff of scale=1.0)
+    assert diff_1x < 80, f"LoRA output looks corrupted: diff_1x={diff_1x}"
+    assert diff_2x < 120, f"LoRA output looks corrupted: diff_2x={diff_2x}"
 
-        # (d) Deactivation fully restores base model
-        assert diff_restored == 0.0, f"Base model not restored after LoRA deactivation: diff={diff_restored}"
+    # (d) Deactivation fully restores base model
+    assert diff_restored == 0.0, f"Base model not restored after LoRA deactivation: diff={diff_restored}"

@@ -7,8 +7,8 @@ Online serving tests for the Qwen-Image-Edit family (image-to-image via chat com
 - ``test_single_image_to_image_001``: ``Qwen/Qwen-Image-Edit`` — one reference image, fixed 512×512.
 - ``test_multi_images_to_image_001``: ``Qwen/Qwen-Image-Edit-2509`` — two reference images, fixed 512×512.
 - ``test_different_sizes_001``: ``Qwen/Qwen-Image-Edit-2509`` only, ``advanced_model`` — mixed input
-  resolutions; ``extra_body`` uses ``num_outputs_per_prompt`` and per-output ``width`` / ``height``
-  lists (length must match decoded images; validated in ``assert_image_diffusion_response``).
+  resolutions; ``extra_body`` uses per-output ``width``/``height`` lists; the test client sends one
+  scalar-size request per list index in parallel and merges images (see ``OpenAIClientHandler.send_diffusion_request``).
 
 ``_get_diffusion_feature_cases`` registers a single ``default`` ``OmniServerParams`` row per model.
 
@@ -122,7 +122,7 @@ def test_multi_images_to_image_001(omni_server: OmniServer, openai_client: OpenA
     indirect=True,
 )
 def test_different_sizes_001(omni_server: OmniServer, openai_client: OpenAIClientHandler):
-    """Multi-reference edit with distinct input resolutions; per-output ``width``/``height`` lists in ``extra_body``."""
+    """Multi-reference edit with distinct input resolutions; per-output ``width``/``height`` as lists (client splits into concurrent scalar-size calls)."""
     image_data_url_list = [
         f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}",
         f"data:image/jpeg;base64,{generate_synthetic_image(384, 256)['base64']}",
@@ -130,12 +130,11 @@ def test_different_sizes_001(omni_server: OmniServer, openai_client: OpenAIClien
 
     messages = dummy_messages_from_mix_data(image_data_url=image_data_url_list, content_text=MULTI_EDIT_PROMPT)
 
-    # Per-output expected sizes (must match len(decoded images)); lists are validated in assert_image_diffusion_response.
+    # List height/width: client sends 512×512 and 768×512 in parallel, merges to two images; assertions use lists.
     request_config = {
         "model": omni_server.model,
         "messages": messages,
         "extra_body": {
-            "num_outputs_per_prompt": 2,
             "height": [512, 768],
             "width": [512, 512],
             "num_inference_steps": 2,

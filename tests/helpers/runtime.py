@@ -2,6 +2,7 @@
 
 import base64
 import concurrent.futures
+import copy
 import io
 import json
 import os
@@ -20,7 +21,7 @@ import requests
 import soundfile as sf
 import torch
 import yaml
-from openai import OpenAI, omit
+from openai import APIError, OpenAI, omit
 from PIL import Image
 from vllm import TextPrompt
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
@@ -43,6 +44,42 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+def _split_request_config_by_per_output_sizes(cfg: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """If ``extra_body`` has list ``height``/``width``, return one config per index (scalar h/w, ``num_outputs_per_prompt=1``)."""
+    eb = cfg.get("extra_body")
+    if not eb:
+        return None
+    h, w = eb.get("height"), eb.get("width")
+    if (isinstance(h, (list, tuple)) or isinstance(w, (list, tuple))) and not (
+        isinstance(h, (list, tuple)) and isinstance(w, (list, tuple))
+    ):
+        raise ValueError("extra_body height and width must both be lists or both be scalars")
+    if not (isinstance(h, (list, tuple)) and isinstance(w, (list, tuple))):
+        return None
+    if len(h) != len(w):
+        raise ValueError(f"height and width lists must have equal length; got {len(h)=} {len(w)=}")
+    n = len(h)
+    n_out = eb.get("num_outputs_per_prompt")
+    if n_out is not None:
+        n_out = int(n_out)
+        if n_out != n:
+            raise ValueError(
+                "When height/width are lists, num_outputs_per_prompt must equal their length; "
+                f"got num_outputs_per_prompt={n_out}, len(lists)={n}"
+            )
+    splits: list[dict[str, Any]] = []
+    for i in range(n):
+        sub = copy.deepcopy(cfg)
+        sub_eb = dict(sub.get("extra_body") or {})
+        sub_eb["height"] = int(h[i])
+        sub_eb["width"] = int(w[i])
+        sub_eb["num_outputs_per_prompt"] = 1
+        sub["extra_body"] = sub_eb
+        splits.append(sub)
+    return splits
+
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
@@ -505,6 +542,8 @@ class OmniResponse:
     success: bool = False
     error_message: str | None = None
     cached_tokens: int | None = None
+    # Set for HTTP-level assertions (e.g. ``assert_audio_speech_response`` with ``status_code`` in config).
+    status_code: int | None = None
 
 
 @dataclass
@@ -516,6 +555,20 @@ class DiffusionResponse:
     e2e_latency: float | None = None
     success: bool = False
     error_message: str | None = None
+
+
+def _merge_diffusion_responses(parts: list[DiffusionResponse]) -> DiffusionResponse:
+    """Concatenate images in order; ``e2e_latency`` is wall-clock of the batch (set by caller) or max of parts."""
+    merged = DiffusionResponse()
+    merged.success = all(p.success for p in parts) and len(parts) > 0
+    imgs: list[Image.Image] = []
+    for p in parts:
+        if p.images:
+            imgs.extend(p.images)
+    merged.images = imgs if imgs else None
+    latencies = [p.e2e_latency for p in parts if p.e2e_latency is not None]
+    merged.e2e_latency = max(latencies) if latencies else None
+    return merged
 
 
 class OpenAIClientHandler:
@@ -775,6 +828,12 @@ class OpenAIClientHandler:
           - input: text to synthesize (required)
           - response_format: audio format such as "wav" or "pcm" (optional)
           - task_type, ref_text, ref_audio: TTS-specific extras (optional, passed via extra_body)
+          - min_audio_bytes: optional minimum ``len(audio_bytes)`` checked in ``assert_audio_speech_response``
+          - status_code: if set, HTTP status is asserted (int or e.g. ``(400, 422)``); uses APIError handling
+          - err_message: optional substring(s) to match against error text (``str`` or list/tuple of alternatives;
+            see ``assert_audio_speech_response``). If set, uses the same APIError path as ``status_code``.
+          - When both ``status_code`` and ``err_message`` are absent (or each is ``None``), the normal request path
+            is used (no try/except around ``APIError``).
           - timeout: request timeout in seconds (float, optional, default 120.0)
           - stream: whether to use streaming API (bool, optional, default False)
         """
@@ -801,9 +860,54 @@ class OpenAIClientHandler:
 
         print(f"[audio.speech] start model={model}, stream={stream}, request_num={request_num}, timeout={timeout:.1f}s")
 
+        # Error validation path: only when at least one of these is set to a non-``None`` value.
+        expect_error_handling = (request_config.get("status_code") is not None) or (
+            request_config.get("err_message") is not None
+        )
+        if expect_error_handling and request_num != 1:
+            raise ValueError(
+                "request_config error validation (status_code / err_message) is only supported when request_num=1"
+            )
+
         if request_num == 1:
             req_start = time.perf_counter()
-            if stream:
+            if expect_error_handling:
+                # ``status`` and/or ``err_message`` requested: catch APIError (4xx) and (optionally) assert body text;
+                # HTTP 200 with JSON error body is handled in ``assert_audio_speech_response``.
+                try:
+                    if stream:
+                        with self.client.audio.speech.with_streaming_response.create(
+                            model=model,
+                            input=text_input,
+                            response_format=response_format,
+                            extra_body=extra_body or None,
+                            timeout=timeout,
+                            voice=voice,
+                        ) as resp:
+                            omni_resp = self._process_stream_audio_speech_response(resp, response_format=speech_fmt)
+                    else:
+                        resp = self.client.audio.speech.create(
+                            model=model,
+                            input=text_input,
+                            response_format=response_format,
+                            extra_body=extra_body or None,
+                            timeout=timeout,
+                            voice=voice,
+                        )
+                        omni_resp = self._process_non_stream_audio_speech_response(resp, response_format=speech_fmt)
+                except APIError as e:
+                    sc = getattr(e, "status_code", None)
+                    if sc is None:
+                        raise
+                    omni_resp = OmniResponse(
+                        success=False,
+                        status_code=sc,
+                        error_message=str(e),
+                    )
+                else:
+                    if getattr(omni_resp, "status_code", None) is None:
+                        omni_resp.status_code = 200
+            elif stream:
                 # Use streaming response helper.
                 with self.client.audio.speech.with_streaming_response.create(
                     model=model,
@@ -905,6 +1009,8 @@ class OpenAIClientHandler:
     ) -> list[DiffusionResponse]:
         """
         Send OpenAI requests for diffusion models.
+        If ``extra_body`` has list ``height``/``width``, sends one chat completion per index in parallel
+        (scalar h/w, ``num_outputs_per_prompt=1`` each) and merges images in list order.
         Args:
             request_config: A single request configuration dict, or a list of
                 request configuration dicts (one request per element)
@@ -919,10 +1025,12 @@ class OpenAIClientHandler:
             if stream:
                 raise NotImplementedError("Streaming is not currently implemented for diffusion model e2e test")
             modalities = cfg.get("modalities", omit)  # Most diffusion models don't require modalities param
+            eb = cfg.get("extra_body")
+            extra = copy.deepcopy(eb) if eb else None
             return self.client.chat.completions.create(
                 model=cfg.get("model"),
                 messages=cfg.get("messages"),
-                extra_body=cfg.get("extra_body", None),
+                extra_body=extra,
                 modalities=modalities,
             )
 
@@ -940,6 +1048,22 @@ class OpenAIClientHandler:
                     assert_diffusion_response(response, cfg, run_level=self.run_level)
                     responses.append(response)
             return responses
+
+        size_splits = _split_request_config_by_per_output_sizes(request_config)
+        if size_splits is not None:
+            if request_num != 1:
+                raise ValueError(
+                    "request_num must be 1 when extra_body height/width are lists (split into concurrent per-size calls)"
+                )
+            t0 = time.perf_counter()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(size_splits)) as executor:
+                futures = [executor.submit(_create_from_config, sub) for sub in size_splits]
+                chat_completions = [f.result() for f in futures]
+            parts = [self._process_diffusion_response(cc) for cc in chat_completions]
+            merged = _merge_diffusion_responses(parts)
+            merged.e2e_latency = time.perf_counter() - t0
+            assert_diffusion_response(merged, request_config, run_level=self.run_level)
+            return [merged]
 
         if request_num == 1:
             # Send single request

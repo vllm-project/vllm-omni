@@ -1,5 +1,6 @@
-# Stage config for OmniVoice TTS via diffusion engine
-# Single stage: text → 32-step iterative unmasking → 8-codebook tokens → DAC decode → 24kHz audio
+# OmniVoice TTS deploy: diffusion engine single stage (dit).
+# Text → iterative unmasking → codebook tokens → DAC decode → 24kHz audio.
+# (Migrated from model_executor/stage_configs/omnivoice.yaml for deploy/ layout.)
 
 stage_args:
   - stage_id: 0

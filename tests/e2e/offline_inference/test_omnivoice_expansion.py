@@ -11,21 +11,15 @@ import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
-from pathlib import Path
-
 import numpy as np
 import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "k2-fsa/OmniVoice"
-
-
-def get_stage_config():
-    return str(
-        Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / "omnivoice.yaml"
-    )
+STAGE_CONFIG = get_deploy_config_path("omnivoice.yaml")
 
 
 @pytest.mark.full_model
@@ -42,7 +36,7 @@ def test_omnivoice_text_to_audio() -> None:
 
     with OmniRunner(
         MODEL,
-        stage_configs_path=get_stage_config(),
+        stage_configs_path=STAGE_CONFIG,
         trust_remote_code=True,
         log_stats=True,
     ) as runner:

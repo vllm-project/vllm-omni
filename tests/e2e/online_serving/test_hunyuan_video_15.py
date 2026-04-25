@@ -24,7 +24,6 @@ NEGATIVE_PROMPT = "low quality, blurry, distorted"
 MODEL = "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v"
 
 SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
-PARALLEL_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 
 def _get_diffusion_feature_cases(model: str):

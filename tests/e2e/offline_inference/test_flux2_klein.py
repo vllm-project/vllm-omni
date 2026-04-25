@@ -9,8 +9,6 @@ Inpainting uses ``omni_runner_handler.send_diffusion_request`` with
 :meth:`OmniRunnerHandler.send_diffusion_request` in ``tests.helpers.runtime``.
 """
 
-import os
-
 import pytest
 import torch
 from PIL import Image, ImageDraw
@@ -19,8 +17,6 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import DiffusionResponse, OmniRunnerHandler
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
-
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
 MODEL = "black-forest-labs/FLUX.2-klein-4B"
 
