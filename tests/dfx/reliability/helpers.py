@@ -1,7 +1,6 @@
 """Shared reliability fault-injection helpers.
 
 This module keeps fault injection callable from tests directly:
-- abnormal input (raw HTTP malformed requests)
 - GPU OOM (CUDA sidecar memory hog)
 - process kill by pattern and signal
 - post-ready hooks via ``fault_injector`` / ``omni_server_after_fault`` fixtures
@@ -16,42 +15,17 @@ import os
 import select
 import shlex
 import signal
-import socket
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 import psutil
 import pytest
-import requests
 
-FaultVariant = str
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class FaultPhaseResult:
-    """Observed HTTP statuses during abnormal-input injection."""
-
-    http_statuses: list[int]
-    notes: str
-
-
-@dataclass(frozen=True)
-class RecoveryResult:
-    """Structured outcome after fault injection and follow-up request."""
-
-    recovered: bool
-    recovery_time_sec: float | None
-    health_check_ok: bool
-    post_fault_success_count: int
-    post_fault_error_count: int
-    notes: str
 
 
 @dataclass
@@ -62,16 +36,6 @@ class OomHandle:
     device: int
     target_mem_ratio: float
     start_ts: float
-
-
-@dataclass
-class RuntimeTeardownContainerHandle:
-    """Handle for a dockerized vLLM-Omni server used by runtime teardown tests."""
-
-    container_name: str
-    host: str
-    port: int
-    model: str
 
 
 def post_chat_completions_raw(
@@ -172,117 +136,6 @@ def extract_openai_error_contract_from_payload(payload: Any) -> dict[str, Any] |
     if not isinstance(error_obj.get("message"), str):
         return None
     return error_obj
-
-
-def create_video_job_with_invalid_lora(host: str, port: int, *, timeout_sec: int = 30) -> tuple[int, dict[str, Any]]:
-    """Create one video job expected to fail due to malformed lora payload."""
-    url = f"http://{host}:{port}/v1/videos"
-    response = requests.post(
-        url,
-        data={
-            "prompt": "qwen async failure mapping",
-            "lora": '{"name": "bad-lora"}',
-        },
-        headers={"Accept": "application/json"},
-        timeout=timeout_sec,
-    )
-    payload = response.json() if response.content else {}
-    return response.status_code, payload
-
-
-def poll_video_job_status(
-    host: str,
-    port: int,
-    video_id: str,
-    *,
-    timeout_sec: int = 180,
-    interval_sec: float = 1.0,
-) -> tuple[int, dict[str, Any]]:
-    """Poll /v1/videos/{id} until completed/failed and return latest status+payload."""
-    url = f"http://{host}:{port}/v1/videos/{video_id}"
-    deadline = time.monotonic() + timeout_sec
-    last_status = 0
-    last_payload: dict[str, Any] = {}
-    while time.monotonic() < deadline:
-        response = requests.get(
-            url,
-            headers={"Accept": "application/json"},
-            timeout=20,
-        )
-        last_status = response.status_code
-        try:
-            payload = response.json()
-        except Exception:  # noqa: BLE001
-            payload = {"raw": response.text}
-        if isinstance(payload, dict):
-            last_payload = payload
-            if payload.get("status") in {"completed", "failed"}:
-                return last_status, payload
-        time.sleep(interval_sec)
-    raise TimeoutError(
-        f"video job {video_id} did not reach terminal status within {timeout_sec}s; "
-        f"last_status={last_status}, last_payload={json.dumps(last_payload)[:500]}"
-    )
-
-
-def inject_abnormal_input_faults(
-    host: str,
-    port: int,
-    model: str,
-    fault_params: dict[str, Any],
-) -> FaultPhaseResult:
-    """Run configured abnormal-input variants against the running server."""
-    variants: list[FaultVariant] = fault_params.get(
-        "variants",
-        ["malformed_json", "invalid_messages_type"],
-    )
-    statuses: list[int] = []
-    notes_parts: list[str] = []
-
-    for key in variants:
-        if key == "malformed_json":
-            status, _ = post_chat_completions_raw(host, port, b"not json {{{")
-            statuses.append(status)
-            notes_parts.append(f"malformed_json:{status}")
-        elif key == "invalid_messages_type":
-            bad = json.dumps({"model": model, "messages": "must_be_a_list_not_string"})
-            status, body = post_chat_completions_raw(host, port, bad)
-            statuses.append(status)
-            notes_parts.append(f"invalid_messages_type:{status}:{len(body)}B")
-        else:
-            raise ValueError(f"Unknown abnormal_input variant: {key!r}")
-
-    return FaultPhaseResult(http_statuses=statuses, notes="; ".join(notes_parts))
-
-
-def assert_fault_http_expectation(statuses: list[int], expect: dict[str, Any]) -> None:
-    """Assert fault-phase HTTP statuses match ``expect.fault_http_status_class``."""
-    cls = expect.get("fault_http_status_class", "4xx")
-    if cls == "4xx":
-        for status in statuses:
-            assert 400 <= status < 500, f"expected 4xx for abnormal input, got {status}"
-        return
-    raise ValueError(f"Unsupported fault_http_status_class: {cls!r}")
-
-
-def build_recovery_result(
-    *,
-    recovered: bool,
-    recovery_time_sec: float | None,
-    health_check_ok: bool,
-    post_fault_success_count: int,
-    post_fault_error_count: int,
-    notes: str,
-) -> RecoveryResult:
-    """Factory for RecoveryResult."""
-    return RecoveryResult(
-        recovered=recovered,
-        recovery_time_sec=recovery_time_sec,
-        health_check_ok=health_check_ok,
-        post_fault_success_count=post_fault_success_count,
-        post_fault_error_count=post_fault_error_count,
-        notes=notes,
-    )
 
 
 def _build_sidecar_cmd(device: int, target_mem_ratio: float, hold_seconds: int, strict: bool) -> list[str]:
@@ -507,19 +360,6 @@ def stop_gpu_oom_hogs(handles: OomHandle | list[OomHandle], *, timeout_sec: int 
         stop_gpu_oom_hog(handle, timeout_sec=timeout_sec)
 
 
-def list_process_pids_by_pattern(pattern: str) -> list[int]:
-    """Return matched PIDs from ``pgrep -f <pattern>``."""
-    out = subprocess.run(
-        ["pgrep", "-f", pattern],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if out.returncode not in (0, 1):
-        raise RuntimeError(f"pgrep failed for pattern={pattern!r}: {out.stderr.strip()}")
-    return [int(item) for item in out.stdout.split() if item.strip().isdigit()]
-
-
 def _runtime_teardown_ssh_target() -> str:
     target = os.getenv("RUNTIME_TEARDOWN_SSH_TARGET", "").strip()
     # Default to root@127.0.0.1 for same-host SSH control path.
@@ -562,204 +402,6 @@ def list_remote_process_pids_by_pattern(pattern: str) -> list[int]:
     if out.returncode not in (0, 1):
         raise RuntimeError(f"remote pgrep failed for pattern={pattern!r}: {out.stderr.strip()}")
     return [int(item) for item in out.stdout.split() if item.strip().isdigit()]
-
-
-def force_remove_container(container_name: str) -> None:
-    """Force-remove a docker container on remote host via SSH."""
-    _runtime_teardown_ssh_cmd(
-        f"docker rm -f {shlex.quote(container_name)} >/dev/null 2>&1 || true",
-        step="docker-rm-f",
-    )
-
-
-def _allocate_open_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _wait_tcp_port_ready(host: str, port: int, timeout_sec: int) -> None:
-    deadline = time.time() + timeout_sec
-    start_ts = time.time()
-    next_log_ts = start_ts
-    while time.time() < deadline:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(1.0)
-            if sock.connect_ex((host, port)) == 0:
-                elapsed = int(time.time() - start_ts)
-                print(
-                    f"[runtime-teardown][wait-port] ready host={host} port={port} elapsed={elapsed}s",
-                    flush=True,
-                )
-                return
-        now = time.time()
-        if now >= next_log_ts:
-            elapsed = int(now - start_ts)
-            print(
-                f"[runtime-teardown][wait-port] waiting host={host} port={port} elapsed={elapsed}s",
-                flush=True,
-            )
-            next_log_ts = now + 15
-        time.sleep(2)
-    raise TimeoutError(f"Server in container did not become ready within {timeout_sec}s: {host}:{port}")
-
-
-def start_runtime_teardown_container_server(
-    *,
-    model: str,
-    serve_args: list[str],
-    image: str | None = None,
-    docker_run_args: list[str] | None = None,
-    bootstrap_cmd: str | None = None,
-    startup_timeout_sec: int = 1200,
-) -> RuntimeTeardownContainerHandle:
-    """Start a dedicated container on remote host via SSH and wait until port is ready."""
-    if os.name == "nt":
-        raise RuntimeError("runtime teardown container helper currently supports POSIX platforms only.")
-    if subprocess.run(["ssh", "-V"], check=False, capture_output=True, text=True).returncode != 0:
-        pytest.skip("ssh client not available for runtime teardown test")
-
-    container_name = f"omni_rt_teardown_{uuid4().hex[:8]}"
-    host = os.getenv("RUNTIME_TEARDOWN_SERVER_HOST", "127.0.0.1")
-    bind_host = os.getenv("RUNTIME_TEARDOWN_BIND_HOST", "0.0.0.0")
-    port = _allocate_open_port()
-    local_repo_root = Path(__file__).resolve().parents[3]
-    remote_workdir = os.getenv("RUNTIME_TEARDOWN_REMOTE_WORKDIR", str(local_repo_root))
-    resolved_image = image or os.getenv("RUNTIME_TEARDOWN_IMAGE", "nvcr.io/nvidia/pytorch:25.01-py3")
-    resolved_bootstrap = bootstrap_cmd if bootstrap_cmd is not None else os.getenv("RUNTIME_TEARDOWN_BOOTSTRAP_CMD", "")
-    if docker_run_args is not None:
-        extra_run_args = docker_run_args
-    else:
-        extra_run_args = shlex.split(os.getenv("RUNTIME_TEARDOWN_DOCKER_ARGS", ""))
-
-    run_cmd_args = [
-        "docker",
-        "run",
-        "-d",
-        "--shm-size=128g",
-        "--privileged=true",
-        "--restart=always",
-        "--gpus",
-        "all",
-        "--name",
-        container_name,
-        "--net=host",
-        "-v",
-        "/home:/home",
-        "-v",
-        f"{remote_workdir}:{remote_workdir}",
-        "--cap-add=SYS_PTRACE",
-        "--security-opt",
-        "seccomp=unconfined",
-        *extra_run_args,
-        resolved_image,
-        "sleep",
-        "infinity",
-    ]
-    run_cmd = " ".join(shlex.quote(arg) for arg in run_cmd_args)
-    print(
-        f"[runtime-teardown] container={container_name} host={host} port={port} image={resolved_image}",
-        flush=True,
-    )
-    run_out = _runtime_teardown_ssh_cmd(run_cmd, step="docker-run")
-    if run_out.returncode != 0:
-        raise RuntimeError(f"failed to start runtime teardown container: {run_out.stderr.strip()}")
-    run_stdout = (run_out.stdout or "").strip()
-    run_stderr = (run_out.stderr or "").strip()
-    if "Usage:  docker [OPTIONS] COMMAND" in run_stderr:
-        raise RuntimeError(
-            "docker-run rendered docker CLI help on remote host; command likely malformed. "
-            f"run_cmd={run_cmd!r}, stderr={run_stderr!r}. "
-            "Check RUNTIME_TEARDOWN_DOCKER_ARGS and avoid passing a full 'docker run ...' command there "
-            "(only extra args are allowed)."
-        )
-    print(
-        f"[runtime-teardown][docker-run] stdout={run_stdout!r} stderr={run_stderr!r}",
-        flush=True,
-    )
-    # Verify container really exists right after docker run.
-    ps_out = _runtime_teardown_ssh_cmd(
-        f"docker ps -a --filter name={shlex.quote(container_name)} --format '{{{{.ID}}}} {{{{.Status}}}} {{{{.Names}}}}'",
-        step="docker-ps-verify",
-    )
-    ps_text = (ps_out.stdout or "").strip()
-    print(f"[runtime-teardown][docker-ps-verify] {ps_text!r}", flush=True)
-    if not ps_text:
-        raise RuntimeError(
-            f"container not found right after docker run: name={container_name}, "
-            f"docker_run_stdout={run_stdout!r}, docker_run_stderr={run_stderr!r}"
-        )
-
-    serve_cmd = [
-        "python",
-        "-m",
-        "vllm_omni.entrypoints.cli.main",
-        "serve",
-        model,
-        "--host",
-        bind_host,
-        "--port",
-        str(port),
-        "--omni",
-        *serve_args,
-    ]
-    serve_cmd_str = " ".join(shlex.quote(arg) for arg in serve_cmd)
-    bootstrap_prefix = f"{resolved_bootstrap} && " if resolved_bootstrap.strip() else ""
-    serve_log_path = "/tmp/vllm_runtime_teardown_serve.log"
-    exec_cmd = [
-        "docker",
-        "exec",
-        "-d",
-        container_name,
-        "bash",
-        "-lc",
-        (
-            f"cd {shlex.quote(remote_workdir)} && "
-            f"{bootstrap_prefix}VLLM_WORKER_MULTIPROC_METHOD=spawn {serve_cmd_str} "
-            f"> {shlex.quote(serve_log_path)} 2>&1"
-        ),
-    ]
-    exec_cmd_str = " ".join(shlex.quote(arg) for arg in exec_cmd)
-    exec_out = _runtime_teardown_ssh_cmd(exec_cmd_str, step="docker-exec-start-serve")
-    if exec_out.returncode != 0:
-        force_remove_container(container_name)
-        raise RuntimeError(f"failed to start server in runtime teardown container: {exec_out.stderr.strip()}")
-
-    try:
-        print(
-            f"[runtime-teardown] waiting server ready container={container_name} host={host} bind_host={bind_host} port={port} timeout={startup_timeout_sec}s",
-            flush=True,
-        )
-        _wait_tcp_port_ready(host, port, timeout_sec=startup_timeout_sec)
-    except Exception:
-        logs = _runtime_teardown_ssh_cmd(
-            (
-                f"docker exec {shlex.quote(container_name)} bash -lc "
-                f'"tail -n 200 {shlex.quote(serve_log_path)} 2>/dev/null || '
-                f"echo '[no-serve-log-file] {shlex.quote(serve_log_path)}'\""
-            ),
-            step="docker-exec-tail-serve-log",
-        )
-        keep_on_failure = os.getenv("RUNTIME_TEARDOWN_KEEP_CONTAINER_ON_FAILURE", "0").strip() == "1"
-        if keep_on_failure:
-            print(
-                f"[runtime-teardown] keep container for debugging: {container_name}",
-                flush=True,
-            )
-        else:
-            force_remove_container(container_name)
-        raise RuntimeError(
-            "runtime teardown container server startup failed. "
-            f"host={host} bind_host={bind_host} port={port}; "
-            f"serve_log_tail={logs.stdout[-2000:]}"
-        ) from None
-
-    return RuntimeTeardownContainerHandle(
-        container_name=container_name,
-        host=host,
-        port=port,
-        model=model,
-    )
 
 
 def inject_process_kill(
