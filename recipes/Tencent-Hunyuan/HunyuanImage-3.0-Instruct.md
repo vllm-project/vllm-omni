@@ -131,10 +131,16 @@ curl -s http://localhost:8091/v1/chat/completions \
 
 #### Benchmark
 
-PR [#2495](https://github.com/vllm-project/vllm-omni/pull/2495) tracks the
-same DiT-only settings in performance CI. The user-facing equivalent is to
-launch one of the CLI commands above and generate 1024x1024 images with
-50 denoising steps.
+PR [#2495](https://github.com/vllm-project/vllm-omni/pull/2495) adds
+performance CI configs for the same DiT-only settings. The CI step is
+currently opt-in (gated by `RUN_HUNYUAN_IMAGE3_PERF=1`) with `soft_fail`
+enabled, intended for initial data collection. Performance assertions are
+skipped (`skip-performance-assertion: true`); the baseline values in the
+JSON configs are reference-only and will be promoted to regression gates
+once enough nightly data has been collected.
+
+The user-facing equivalent is to launch one of the CLI commands above and
+generate 1024x1024 images with 50 denoising steps.
 
 #### Verification
 
