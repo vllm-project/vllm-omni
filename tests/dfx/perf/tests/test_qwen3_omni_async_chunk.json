@@ -10,16 +10,16 @@
                 "dataset_name": "random",
                 "backend": "openai-chat-omni",
                 "endpoint": "/v1/chat/completions",
-                "num_prompts": [4, 16, 32, 64],
-                "max_concurrency": [1, 4, 8, 16],
+                "num_prompts": [4, 16, 32, 64, 128],
+                "max_concurrency": [1, 4, 8, 16, 32],
                 "random_input_len": 2500,
                 "random_output_len": 900,
                 "ignore_eos": true,
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
-                    "mean_ttft_ms": [1000, 3000, 5000, 7000],
-                    "mean_audio_ttfp_ms": [1000, 3000, 5000, 7000],
-                    "mean_audio_rtf": [0.2, 0.35, 0.6, 0.85]
+                    "mean_ttft_ms": [1000, 3000, 5000, 7000, 9000],
+                    "mean_audio_ttfp_ms": [1000, 3000, 5000, 7000, 9000],
+                    "mean_audio_rtf": [0.2, 0.35, 0.6, 0.85, 0.9]
                 }
             },
             {

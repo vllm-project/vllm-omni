@@ -121,7 +121,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         # If the request is preempted, skip the already saved chunks.
         if request.num_computed_tokens < self.requests_num_chunks_sent.get(request.external_req_id, 0):
-            logger.error(
+            logger.warning(
                 f"Enqueue save_async for request {request.external_req_id}, "
                 f"request.num_computed_tokens={request.num_computed_tokens}, "
                 f"previous_chunks_sent={self.requests_num_chunks_sent.get(request.external_req_id, 0)}"
@@ -376,6 +376,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Add additional info for cached requests and
         clean up ready chunks from scheduler output.
         """
+        stage_id = self.connector.stage_id
+
+        if stage_id == 0:
+            return
+
         if requests is not None:
             self.attach_cached_additional_information(scheduler_output, requests)
         self._clear_chunk_ready(scheduler_output)
@@ -391,6 +396,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             request = requests.get(req_id) if req_id else None
             additional_info = getattr(request, "additional_information", None) if request else None
             cached_reqs.additional_information[req_id] = additional_info
+            if request and additional_info:
+                request.additional_information = None
 
     def _process_chunk_queue(
         self,

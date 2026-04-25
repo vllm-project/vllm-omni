@@ -349,27 +349,29 @@ def thinker2talker_async_chunk(
             payload.hidden_states.output = torch.cat(
                 (save_payload.get("hidden_states", {}).get("output"), payload.hidden_states.output), dim=0
             )
-            prefill_shape = talker_additional_info["embed"]["prefill"].shape[0]
+            prefill_shape = payload.embed.prefill.shape[0]
             if not is_finished and prefill_shape <= len(prompt_token_ids):
-                transfer_manager.request_payload[request_id] = talker_additional_info
+                transfer_manager.request_payload[request_id] = to_dict(payload)
                 return None
     else:
-        talker_additional_info: OmniPayload = {
-            "meta": {"finished": torch.tensor(is_finished, dtype=torch.bool)},
-        }
-        talker_additional_info["meta"]["override_keys"] = [("embed", "decode"), ("ids", "output")]
-        talker_additional_info["embed"] = {"decode": thinker_layers[int(_EMBED_LAYER_KEY)].detach().cpu()}
-        if talker_additional_info["embed"]["decode"].shape[0] > 1:
+        if thinker_emb.shape[0] > 1:
             logger.warning(
                 "Unexpected multiple embeddings in thinker2talker_async_chunk for chunk_id %d: "
                 "request_id %s, num_computed_tokens%d %s. Expected shape [1, D].",
                 chunk_id,
                 request_id,
                 request.num_computed_tokens,
-                talker_additional_info["embed"]["decode"].shape,
+                thinker_emb.shape,
             )
             return None
-    return talker_additional_info
+        meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
+        payload = OmniPayloadStruct(
+            meta=meta,
+            embed=EmbeddingsStruct(decode=thinker_emb.detach().cpu()),
+            speaker=speaker,
+            language=language,
+        )
+    return payload
 
 
 def thinker2talker(

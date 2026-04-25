@@ -986,7 +986,6 @@ class Qwen3OmniMoeForConditionalGeneration(
         cached_thinker_decode_embeds = embed.get("cached_decode", None)
         thinker_decode_embed = embed.get("decode", None)
         start_index = meta.get("num_processed_tokens", 0)
-        thinker_output_token_ids = ids.get("output", [])
 
         if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
             cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(device)
