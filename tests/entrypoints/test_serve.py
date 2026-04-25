@@ -8,14 +8,13 @@ import pytest
 from pytest_mock import MockerFixture
 
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand, run_headless
-from vllm_omni.entrypoints.utils import detect_explicit_cli_keys
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
-    """``--no-async-chunk`` should parse to ``async_chunk=False`` and mark the
-    shared deploy-level dest as explicitly provided by the user."""
+def test_serve_parser_accepts_no_async_chunk() -> None:
+    """``--no-async-chunk`` should parse after deploy-overriding parser
+    defaults are nullified."""
     try:
         from vllm.utils.argparse_utils import FlexibleArgumentParser
     except Exception as exc:
@@ -24,14 +23,12 @@ def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
     root = FlexibleArgumentParser()
     subparsers = root.add_subparsers(dest="subcommand")
     cmd = OmniServeCommand()
-    serve_parser = cmd.subparser_init(subparsers)
+    cmd.subparser_init(subparsers)
 
     argv = ["serve", "fake-model", "--omni", "--no-async-chunk"]
     args = root.parse_args(argv)
 
     assert args.async_chunk is False
-    explicit = detect_explicit_cli_keys(argv, serve_parser)
-    assert "async_chunk" in explicit
 
 
 def _make_headless_args() -> argparse.Namespace:
