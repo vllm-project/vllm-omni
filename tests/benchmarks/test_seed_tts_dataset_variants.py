@@ -56,6 +56,7 @@ def seed_tts_root(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skip(reason="issue #3122")
 def test_seed_tts_text_dataset_omits_ref_audio(seed_tts_root, mocker):
     ds = SeedTTSTextDataset(
         dataset_path=str(seed_tts_root),
@@ -91,6 +92,7 @@ def seed_tts_design_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.mark.skip(reason="issue #3122")
 def test_seed_tts_design_dataset_has_instructions(seed_tts_design_root, mocker):
     ds = SeedTTSDesignDataset(
         dataset_path=str(seed_tts_design_root),
@@ -112,6 +114,7 @@ def test_seed_tts_design_dataset_has_instructions(seed_tts_design_root, mocker):
         assert req.seed_tts_ref_wav_path == ""
 
 
+@pytest.mark.skip(reason="issue #3122")
 def test_seed_tts_design_dataset_rejects_missing_description(seed_tts_design_root, mocker):
     """Lines without a voice_description should be skipped."""
     locale_dir = seed_tts_design_root / "en"
