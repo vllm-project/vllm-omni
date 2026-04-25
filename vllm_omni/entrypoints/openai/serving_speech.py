@@ -490,12 +490,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # VoxCPM2 uses a text-prefix convention for style/voice instructions:
         # the native CLI wraps the instruction in parens and prepends it.
         # Mirror that here so `instructions` works through the OpenAI endpoint.
-        # Hi-Fi Cloning mode (ref_audio + ref_text) ignores instructions per
-        # canonical VoxCPM2 docs ("When Hi-Fi mode is enabled, the control
-        # instruction is ignored"); strip server-side so those requests do not
-        # get a surprise text prefix.
+        # The Hi-Fi Cloning mode (ref_audio + ref_text) + instructions combo
+        # is rejected upstream in `_validate_tts_request`, so by the time we
+        # reach this builder we can assume the combination is valid.
         text = request.input
-        if request.instructions and not request.ref_text:
+        if request.instructions:
             text = f"({request.instructions.strip()}){text}"
         prompt = build_voxcpm2_prompt(
             hf_config=self.engine_client.model_config.hf_config,
@@ -876,11 +875,26 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self._tts_model_type == "voxcpm":
             return self._validate_voxcpm_request(request)
         if self._tts_model_type == "voxcpm2":
-            # Accept any text input, but cap `instructions` length for parity
-            # with qwen3_tts / voxtral / fish_tts (prevents blowing the prefill
-            # budget via an unbounded parenthetical prefix).
+            # Hi-Fi Cloning mode (`ref_audio` + `ref_text`) does not use the
+            # control instruction. Upstream voxcpm CLI errors out on the same
+            # combination (src/voxcpm/cli.py:128-131: --control cannot be used
+            # together with --prompt-text); we surface a 400 to match instead
+            # of silently dropping user input.
+            if request.instructions and request.ref_text:
+                return (
+                    "`instructions` is incompatible with `ref_text` in Hi-Fi Cloning "
+                    "mode (the control instruction is ignored when ref_text is set)."
+                )
+            # Cap `instructions` length for parity with qwen3_tts / voxtral /
+            # fish_tts (prevents blowing the prefill budget via an unbounded
+            # parenthetical prefix). Upstream voxcpm has no cap; this is a
+            # serving-side safety net, see PR #3118 discussion.
             if request.instructions and len(request.instructions) > self._max_instructions_length:
-                return f"Instructions too long (max {self._max_instructions_length} characters)"
+                return (
+                    f"Instructions too long ({len(request.instructions)}/"
+                    f"{self._max_instructions_length} chars). Upstream voxcpm has no cap; "
+                    f"this limit prevents exceeding the prefill budget."
+                )
             return None
         if self._tts_model_type == "ming_flash_omni_tts":
             return self._validate_ming_tts_request(request)
