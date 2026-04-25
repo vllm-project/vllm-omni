@@ -276,6 +276,7 @@ class DiffusionServer:
 # Config helpers
 # ---------------------------------------------------------------------------
 
+
 def _build_serve_args(serve_args_dict: dict[str, Any]) -> list[str]:
     """Convert a serve_args dict from test.json into a flat CLI argument list."""
     args: list[str] = []
