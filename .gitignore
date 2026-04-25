@@ -267,6 +267,8 @@ vllm_omni/_version.py
 *.wav
 # Vendored test reference audio (small, intentionally checked in)
 !tests/assets/**/*.wav
+# Machine-local batch path overrides (see examples/offline_inference/omniweaving/local_batch_paths.example.sh)
+examples/offline_inference/omniweaving/local_batch_paths.sh
 .worktrees/
 # CI overlay yamls materialized from tests/utils.py:_CI_OVERLAYS at test time
 tests/.ci_generated/

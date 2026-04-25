@@ -6,7 +6,8 @@ set -euo pipefail
 MODEL="${MODEL:-Tencent-Hunyuan/OmniWeaving}"
 PORT="${PORT:-8096}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
-FLOW_SHIFT="${FLOW_SHIFT:-5.0}"
+# I2V aligned defaults: same as offline end2end / OMNIWEAVING_I2V_MI2V_PERF (I2V 480p uses 7.0)
+FLOW_SHIFT="${FLOW_SHIFT:-7.0}"
 
 echo "Starting OmniWeaving I2V server..."
 echo "Model: $MODEL"

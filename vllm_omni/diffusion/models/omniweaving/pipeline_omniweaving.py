@@ -21,6 +21,7 @@ from diffusers.video_processor import VideoProcessor
 from torch import nn
 from transformers import (
     AutoConfig,
+    AutoProcessor,
     AutoTokenizer,
     Qwen2_5_VLForConditionalGeneration,
     Qwen2Tokenizer,
@@ -54,13 +55,23 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
 
+# Official OmniWeaving I2V `prompt_mode=2` system prompt (see `OmniWeaving/hyvideo/models/text_encoders/__init__.py`).
+OMNIWEAVING_I2V_SYSTEM_MESSAGE = (
+    "You are a helpful assistant. Describe the key features of the input image (color, shape, size, "
+    "texture, objects, background), then explain how the user's text instruction should alter the image "
+    "to introduce motion and evolution over time. Generate a video using this image as the first frame that "
+    "meets the user's requirements, ensuring the specified elements evolve or move in a way that fulfills the "
+    "text description while maintaining consistency."
+)
+
 
 def get_omniweaving_post_process_func(od_config: OmniDiffusionConfig):
     return get_hunyuan_video_15_post_process_func(od_config)
 
 
 def get_omniweaving_pre_process_func(od_config: OmniDiffusionConfig):
-    max_area = 480 * 832
+    # Official aligned I2V 480p: 480×848 (26:15). Use the same area target when inferring WxH from the image.
+    max_area = 480 * 848
     divisor = 16
 
     def pre_process_func(req: OmniDiffusionRequest) -> OmniDiffusionRequest:
@@ -135,11 +146,56 @@ class OmniWeavingPipeline(
         self.qwen_path = self._resolve_external_model_path(od_config, "qwen_path", self.DEFAULT_QWEN_PATH)
         self.siglip_path = self._resolve_external_model_path(od_config, "siglip_path", self.DEFAULT_SIGLIP_PATH)
         self.t2v_path = self._resolve_external_model_path(od_config, "t2v_path", self.DEFAULT_T2V_PATH)
+        # Only force offline HF when the *Qwen* path itself is a local directory/file; do not use the
+        # OmniWeaving checkpoint's local_files_only (that would break Hub IDs when the main model is local).
+        qwen_local_files_only: bool = os.path.isdir(self.qwen_path)
 
-        self.tokenizer = Qwen2Tokenizer.from_pretrained(self.qwen_path)
-        self.mllm = Qwen2_5_VLForConditionalGeneration.from_pretrained(self.qwen_path, torch_dtype=dtype).to(
-            self.device
-        )
+        custom_args = od_config.custom_pipeline_args if isinstance(od_config.custom_pipeline_args, dict) else {}
+        self._mllm_i2v_use_vision: bool = bool(custom_args.get("mllm_i2v_use_vision", True))
+        self._mllm_i2v_crop_start: int = int(custom_args.get("mllm_i2v_crop_start", 92))
+        self._mllm_i2v_vision_token_budget: int = int(custom_args.get("mllm_i2v_vision_token_budget", 400))
+        # `hunyuan_video_pipeline` throttles MLLM vision to max edge 560 before `prepare_input` (I2V).
+        self._mllm_i2v_qwen_thumbnail_max: int = int(custom_args.get("mllm_i2v_qwen_thumbnail_max", 560))
+        # `TextEncoder.encode(..., setclip=True)`: after crop_start, drop vision
+        # prefix up to last `token_id` (Qwen2-VL).
+        self._mllm_i2v_setclip: bool = bool(custom_args.get("mllm_i2v_setclip", True))
+        self._mllm_i2v_setclip_token_id: int = int(custom_args.get("mllm_i2v_setclip_token_id", 151653))
+        # Official-style bench: use slow Qwen2-VL image path unless explicitly
+        # overridden (OMNIWEAVING_I2V_MI2V_PERF.md).
+        self._qwen_image_processor_use_fast: bool = bool(custom_args.get("qwen_image_processor_use_fast", False))
+        # VAE first-frame `cond_latents`: diffusers `resize_mode="default"` =
+        # independent scale to H×W (aspect not kept).
+        # Portrait or AR-mismatched refs get stretched, harming I2V temporal
+        # consistency. Prefer letterboxing ("fill").
+        self._i2v_cond_resize_mode: str = str(custom_args.get("i2v_cond_resize_mode", "fill"))
+        trust = bool(getattr(od_config, "trust_remote_code", True))
+
+        self.qwen_processor: Any | None = None
+        try:
+            self.qwen_processor = AutoProcessor.from_pretrained(
+                self.qwen_path,
+                local_files_only=qwen_local_files_only,
+                trust_remote_code=trust,
+            )
+            self.tokenizer = self.qwen_processor.tokenizer
+            _ip = getattr(self.qwen_processor, "image_processor", None)
+            if _ip is not None and hasattr(_ip, "use_fast") and not self._qwen_image_processor_use_fast:
+                _ip.use_fast = False
+        except Exception as e:
+            logger.warning(
+                "AutoProcessor could not be loaded for Qwen2.5-VL (%s); I2V multimodal Qwen path disabled. %s",
+                self.qwen_path,
+                e,
+            )
+            self.qwen_processor = None
+            self.tokenizer = Qwen2Tokenizer.from_pretrained(self.qwen_path, local_files_only=qwen_local_files_only)
+
+        self.mllm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            self.qwen_path,
+            torch_dtype=dtype,
+            local_files_only=qwen_local_files_only,
+            trust_remote_code=trust,
+        ).to(self.device)
 
         ckpt_dir = os.path.join(model, "text_encoder")
         safetensors_files = glob.glob(os.path.join(ckpt_dir, "**", "*.safetensors"), recursive=True)
@@ -151,6 +207,17 @@ class OmniWeavingPipeline(
                 if "__metadata__" in te_weights:
                     del te_weights["__metadata__"]
                 self.mllm.load_state_dict(te_weights, strict=False)
+
+        self._process_vision_info = None
+        try:
+            from qwen_vl_utils import process_vision_info as _pvi
+
+            self._process_vision_info = _pvi
+        except ImportError:
+            logger.warning(
+                "qwen_vl_utils is not installed; OmniWeaving I2V will not feed images into Qwen. "
+                "Install with: pip install qwen-vl-utils"
+            )
 
         try:
             self.tokenizer_2 = AutoTokenizer.from_pretrained(
@@ -187,6 +254,9 @@ class OmniWeavingPipeline(
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(self.t2v_path, subfolder="scheduler")
         if od_config.flow_shift is not None:
             self.scheduler._shift = od_config.flow_shift
+        # `Omni` sets `od_config.flow_shift` once; offline bench may vary per case via
+        # `sampling_params.extra_args['flow_shift']`. Reset in `forward` before `set_timesteps`.
+        self._default_scheduler_shift = float(getattr(self.scheduler, "_shift", 1.0))
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, HunyuanVideo15Transformer3DModel)
         self.transformer = HunyuanVideo15Transformer3DModel(od_config=od_config, **transformer_kwargs)
@@ -235,6 +305,7 @@ class OmniWeavingPipeline(
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
+        self._logged_i2v_text_only_mllm = False
 
     @property
     def guidance_scale(self):
@@ -248,7 +319,124 @@ class OmniWeavingPipeline(
     def current_timestep(self):
         return self._current_timestep
 
+    def _mllm_inputs_to_device(self, proc_inputs: dict[str, Any], device: torch.device) -> dict[str, Any]:
+        """Map processor outputs to Qwen2.5-VL forward kwargs; move tensors to device with correct dtype."""
+        out: dict[str, Any] = {}
+        mllm_dtype = next(self.mllm.model.parameters()).dtype
+        for key in (
+            "input_ids",
+            "attention_mask",
+            "pixel_values",
+            "image_grid_thw",
+            "video_grid_thw",
+            "pixel_values_videos",
+            "second_per_grid_ts",
+            "position_ids",
+        ):
+            if key not in proc_inputs or proc_inputs[key] is None:
+                continue
+            v = proc_inputs[key]
+            if not isinstance(v, torch.Tensor):
+                out[key] = v
+                continue
+            v = v.to(device)
+            if key in ("image_grid_thw", "video_grid_thw"):
+                out[key] = v.long()
+            elif key in ("pixel_values", "pixel_values_videos"):
+                out[key] = v.to(dtype=mllm_dtype)
+            else:
+                out[key] = v
+        return out
+
+    @staticmethod
+    def _mllm_forward_kwargs(model_kw: dict[str, Any]) -> dict[str, Any]:
+        allowed = {
+            "input_ids",
+            "attention_mask",
+            "pixel_values",
+            "image_grid_thw",
+            "video_grid_thw",
+            "pixel_values_videos",
+            "second_per_grid_ts",
+            "position_ids",
+        }
+        return {k: v for k, v in model_kw.items() if k in allowed and v is not None}
+
+    @staticmethod
+    def _resize_pil_for_qwen_mllm(img: PIL.Image.Image, max_edge: int) -> PIL.Image.Image:
+        if max_edge <= 0:
+            return img
+        out = img.copy()
+        out.thumbnail((max_edge, max_edge))
+        return out
+
+    @staticmethod
+    def _apply_omniweaving_mllm_setclip(
+        last_hidden: torch.Tensor,
+        attention: torch.Tensor,
+        input_ids: torch.Tensor,
+        token_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Port of `TextEncoder.encode(..., setclip=True)` post-crop path (official OmniWeaving)."""
+        b, s, d = last_hidden.shape
+        device, dtype_h = last_hidden.device, last_hidden.dtype
+        idt = input_ids
+        all_h: list[torch.Tensor] = []
+        all_a: list[torch.Tensor] = []
+        for k in range(b):
+            mask = idt[k] == token_id
+            if not mask.any():
+                all_h.append(last_hidden[k])
+                all_a.append(attention[k])
+                continue
+            last_pos = int(mask.nonzero()[-1, 0].item())
+            if last_pos < s - 1:
+                all_h.append(last_hidden[k, last_pos + 1 :])
+                all_a.append(attention[k, last_pos + 1 :])
+            else:
+                all_h.append(last_hidden[k])
+                all_a.append(attention[k])
+        max_len = max(t.shape[0] for t in all_h)
+        padded_h = torch.zeros(b, max_len, d, device=device, dtype=dtype_h)
+        padded_a = torch.zeros(b, max_len, device=device, dtype=attention.dtype)
+        for i in range(b):
+            c = all_h[i].size(0)
+            padded_h[i, :c] = all_h[i]
+            padded_a[i, :c] = all_a[i]
+        return padded_h, padded_a
+
     def _get_mllm_prompt_embeds(
+        self,
+        prompt: list[str],
+        device: torch.device,
+        dtype: torch.dtype,
+        images: list[PIL.Image.Image] | None = None,
+        num_hidden_layers_to_skip: int = 2,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        use_i2v_vision = (
+            self._mllm_i2v_use_vision
+            and images is not None
+            and len(images) == len(prompt)
+            and all(im is not None for im in images)
+            and self.qwen_processor is not None
+            and self._process_vision_info is not None
+        )
+        if (
+            not use_i2v_vision
+            and images is not None
+            and any(im is not None for im in images)
+            and not self._logged_i2v_text_only_mllm
+        ):
+            self._logged_i2v_text_only_mllm = True
+            logger.info(
+                "OmniWeaving I2V: Qwen is running in text-only mode; install qwen-vl-utils and ensure "
+                "AutoProcessor loads to align with the official prompt_mode=2 multimodal MLLM path."
+            )
+        if use_i2v_vision:
+            return self._get_mllm_prompt_embeds_i2v_vision(prompt, device, dtype, images, num_hidden_layers_to_skip)
+        return self._get_mllm_prompt_embeds_text_only(prompt, device, dtype, num_hidden_layers_to_skip)
+
+    def _get_mllm_prompt_embeds_text_only(
         self,
         prompt: list[str],
         device: torch.device,
@@ -269,11 +457,14 @@ class OmniWeavingPipeline(
         text_input_ids = text_inputs.input_ids.to(device=device)
         prompt_attention_mask = text_inputs.attention_mask.to(device=device)
         with torch.no_grad():
-            outputs = self.mllm.model(
+            outputs = self.mllm(
                 input_ids=text_input_ids,
                 attention_mask=prompt_attention_mask,
                 output_hidden_states=True,
+                return_dict=True,
             )
+        if not outputs.hidden_states:
+            raise RuntimeError("Qwen2.5-VL forward did not return hidden_states (output_hidden_states=True).")
         prompt_embeds = outputs.hidden_states[-(num_hidden_layers_to_skip + 1)]
         crop_start = self.prompt_template_encode_start_idx
         if crop_start is not None and crop_start > 0:
@@ -282,6 +473,83 @@ class OmniWeavingPipeline(
         return (
             torch.clamp(prompt_embeds, min=-65504.0, max=65504.0).to(dtype=dtype),
             prompt_attention_mask,
+        )
+
+    def _get_mllm_prompt_embeds_i2v_vision(
+        self,
+        prompt: list[str],
+        device: torch.device,
+        dtype: torch.dtype,
+        images: list[PIL.Image.Image],
+        num_hidden_layers_to_skip: int = 2,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.qwen_processor is not None and self._process_vision_info is not None
+        system_block = {
+            "role": "system",
+            "content": [{"type": "text", "text": OMNIWEAVING_I2V_SYSTEM_MESSAGE}],
+        }
+        max_length = self.tokenizer_max_length + self._mllm_i2v_crop_start + self._mllm_i2v_vision_token_budget
+        batch_conversations: list[list[dict[str, Any]]] = []
+        text_for_proc: list[str] = []
+        tmax = self._mllm_i2v_qwen_thumbnail_max
+        for p, img in zip(prompt, images, strict=True):
+            txt = p if p else " "
+            vis = self._resize_pil_for_qwen_mllm(img, tmax)
+            user_block: dict[str, Any] = {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": vis},
+                    {"type": "text", "text": txt},
+                ],
+            }
+            conv = [system_block, user_block]
+            batch_conversations.append(conv)
+            text_for_proc.append(
+                self.qwen_processor.apply_chat_template(
+                    conv,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            )
+        assert self._process_vision_info is not None
+        image_inputs, video_inputs = self._process_vision_info(batch_conversations)
+        proc_inputs = self.qwen_processor(
+            text=text_for_proc,
+            images=image_inputs,
+            videos=video_inputs,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=max_length,
+        )
+        model_kw = self._mllm_inputs_to_device(dict(proc_inputs), device)
+        fwd_kw = self._mllm_forward_kwargs(model_kw)
+        with torch.no_grad():
+            outputs = self.mllm(
+                **fwd_kw,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        if not outputs.hidden_states:
+            raise RuntimeError("Qwen2.5-VL forward did not return hidden_states (output_hidden_states=True).")
+        prompt_embeds = outputs.hidden_states[-(num_hidden_layers_to_skip + 1)]
+        attention_mask = fwd_kw["attention_mask"]
+        input_ids = fwd_kw["input_ids"]
+        crop_start = self._mllm_i2v_crop_start
+        if crop_start and crop_start > 0:
+            prompt_embeds = prompt_embeds[:, crop_start:]
+            attention_mask = attention_mask[:, crop_start:]
+            input_ids = input_ids[:, crop_start:]
+        if self._mllm_i2v_setclip and "pixel_values" in fwd_kw and input_ids.numel() > 0:
+            prompt_embeds, attention_mask = self._apply_omniweaving_mllm_setclip(
+                prompt_embeds,
+                attention_mask,
+                input_ids,
+                self._mllm_i2v_setclip_token_id,
+            )
+        return (
+            torch.clamp(prompt_embeds, min=-65504.0, max=65504.0).to(dtype=dtype),
+            attention_mask,
         )
 
     def _get_t5_2_prompt_embeds(
@@ -325,7 +593,10 @@ class OmniWeavingPipeline(
         do_classifier_free_guidance: bool = False,
     ) -> tuple:
         prompt = [prompt] if isinstance(prompt, str) else prompt
-        prompt_embeds, prompt_embeds_mask = self._get_mllm_prompt_embeds(prompt, device, dtype)
+        mllm_images: list[PIL.Image.Image] | None = None
+        if image is not None:
+            mllm_images = [image] * len(prompt)
+        prompt_embeds, prompt_embeds_mask = self._get_mllm_prompt_embeds(prompt, device, dtype, images=mllm_images)
         prompt_embeds_2, prompt_embeds_mask_2 = self._get_t5_2_prompt_embeds(prompt, device, dtype)
         prompt_embeds_mask = prompt_embeds_mask.to(dtype=dtype)
         prompt_embeds_mask_2 = prompt_embeds_mask_2.to(dtype=dtype)
@@ -341,10 +612,14 @@ class OmniWeavingPipeline(
                 if isinstance(negative_prompt, str)
                 else (negative_prompt if negative_prompt else [""])
             )
+            if mllm_images is not None and len(mllm_images) != len(neg_p):
+                neg_mllm_images = [mllm_images[0]] * len(neg_p)
+            else:
+                neg_mllm_images = mllm_images
             (
                 negative_prompt_embeds,
                 negative_prompt_embeds_mask,
-            ) = self._get_mllm_prompt_embeds(neg_p, device, dtype)
+            ) = self._get_mllm_prompt_embeds(neg_p, device, dtype, images=neg_mllm_images)
             (
                 negative_prompt_embeds_2,
                 negative_prompt_embeds_mask_2,
@@ -376,7 +651,12 @@ class OmniWeavingPipeline(
     def _get_image_latents(self, image: PIL.Image.Image, height: int, width: int, device: torch.device) -> torch.Tensor:
         image_tensor = (
             VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
-            .preprocess(image, height=height, width=width)
+            .preprocess(
+                image,
+                height=height,
+                width=width,
+                resize_mode=self._i2v_cond_resize_mode,
+            )
             .unsqueeze(2)
             .to(device=device, dtype=self.vae.dtype)
         )
@@ -463,6 +743,11 @@ class OmniWeavingPipeline(
         dtype = self.transformer.transformer_blocks[0].norm1.linear.weight.dtype
         if generator is None and req.sampling_params.seed is not None:
             generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
+
+        self.scheduler._shift = self._default_scheduler_shift
+        extra = getattr(req.sampling_params, "extra_args", None) or {}
+        if isinstance(extra, dict) and extra.get("flow_shift") is not None:
+            self.scheduler._shift = float(extra["flow_shift"])
 
         enc_tuple = self.encode_prompt(prompt, image, device, dtype, negative_prompt, do_cfg)
 

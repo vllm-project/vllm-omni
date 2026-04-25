@@ -28,8 +28,9 @@ FLOW_SHIFT="${FLOW_SHIFT:-}"
 
 case "${RESOLUTION}" in
     480p)
-        RESOLUTION_DIMS="480x832"
-        DEFAULT_FLOW_SHIFT="5.0"
+        # Match official / OMNIWEAVING_I2V_MI2V_PERF aligned case: 26:15, flow_shift=7.0
+        RESOLUTION_DIMS="480x848"
+        DEFAULT_FLOW_SHIFT="7.0"
         TEST_LABEL="I2V 480p"
         DEFAULT_OUTPUT="omniweaving_i2v_480p.mp4"
         ;;
