@@ -1680,7 +1680,11 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                    input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
+                    input_ids=input_ids[s:e],
+                    input_embeds=embed_slice,
+                    start=s,
+                    end=e,
+                    **req_infos,
                 )
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
