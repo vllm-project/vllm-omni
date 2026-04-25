@@ -35,7 +35,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
-STAGE_CONFIGS_PATH = get_deploy_config_path("bagel_sharedmemory_ci.yaml")
+STAGE_CONFIGS_PATH = get_deploy_config_path("ci/bagel.yaml")
 
 TEXT2IMG_PROMPT = "A cute cat"
 IMG2IMG_PROMPT = "Change the grass color to red"

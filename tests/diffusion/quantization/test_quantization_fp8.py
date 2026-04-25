@@ -27,6 +27,9 @@ Usage:
 """
 
 import os
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
 from typing import Any
 
 import pytest
@@ -112,7 +115,7 @@ def _generate_bagel_image(
 
     Returns (generated_image, peak_memory_gib).
     """
-    config_path = get_deploy_config_path("bagel_sharedmemory_ci.yaml")
+    config_path = get_deploy_config_path("ci/bagel.yaml")
     omni_kwargs: dict[str, Any] = {
         "model": "ByteDance-Seed/BAGEL-7B-MoT",
         "stage_configs_path": config_path,

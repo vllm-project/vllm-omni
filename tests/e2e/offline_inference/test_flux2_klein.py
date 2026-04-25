@@ -74,6 +74,19 @@ def _send_inpaint_with_generator(
     )
 
 
+# Regression test for https://github.com/vllm-project/vllm-omni/issues/3097
+@pytest.mark.advanced_model
+@pytest.mark.diffusion
+def test_flux2_klein_can_accept_text_inputs(omni_runner_handler: OmniRunnerHandler):
+    omni_runner_handler.send_diffusion_request(
+        {
+            "model": MODEL,
+            "prompt": "a cup of coffee on the table",
+            "sampling_params": OmniDiffusionSamplingParams(num_inference_steps=2, seed=42),
+        }
+    )
+
+
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4"}, num_cards=1)

@@ -21,6 +21,26 @@ from tests.helpers.stage_config import modify_stage_config
 omni_fixture_lock = threading.Lock()
 
 
+def _core_model_stage_config_path_with_dummy_load_format(stage_config_path: str | None, run_level: str) -> str | None:
+    """For ``core_model`` runs, patch every stage in the deploy YAML to ``load_format: dummy``.
+
+    Matches ``omni_server`` and keeps multi-stage L2 tests fast without full weights.
+    """
+    if run_level != "core_model" or stage_config_path is None:
+        return stage_config_path
+    with open(stage_config_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    new_schema_stages = cfg.get("stages")
+    stage_key = "stages" if new_schema_stages is not None else "stage_args"
+    update_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
+    stage_entries = cfg.get(stage_key, [])
+    stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
+    return modify_stage_config(
+        stage_config_path,
+        updates={stage_key: {stage_id: {update_path: "dummy"} for stage_id in stage_ids}},
+    )
+
+
 @pytest.fixture(scope="module")
 def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: str) -> Generator[OmniServer, Any, None]:
     """Start vLLM-Omni through the standard or stage-CLI launcher.
@@ -35,22 +55,7 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
         params: OmniServerParams = request.param
         model = model_prefix + params.model
         port = params.port
-        stage_config_path = params.stage_config_path
-        if run_level == "core_model" and stage_config_path is not None:
-            with open(stage_config_path, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f) or {}
-            # New schema (``stages:``) writes ``load_format`` flat at stage level;
-            # legacy schema (``stage_args:``) nests it as
-            # ``engine_args.load_format``. Handle both.
-            new_schema_stages = cfg.get("stages")
-            stage_key = "stages" if new_schema_stages is not None else "stage_args"
-            update_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
-            stage_entries = cfg.get(stage_key, [])
-            stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
-            stage_config_path = modify_stage_config(
-                stage_config_path,
-                updates={stage_key: {stage_id: {update_path: "dummy"} for stage_id in stage_ids}},
-            )
+        stage_config_path = _core_model_stage_config_path_with_dummy_load_format(params.stage_config_path, run_level)
 
         server_args = params.server_args or []
         if params.use_omni and params.stage_init_timeout is not None:
@@ -115,7 +120,7 @@ def openai_client(request: pytest.FixtureRequest, run_level: str):
 
 
 @pytest.fixture(scope="module")
-def omni_runner(request: pytest.FixtureRequest, model_prefix: str):
+def omni_runner(request: pytest.FixtureRequest, model_prefix: str, run_level: str):
     from tests.helpers.runtime import OmniRunner
 
     with omni_fixture_lock:
@@ -131,6 +136,7 @@ def omni_runner(request: pytest.FixtureRequest, model_prefix: str):
         else:
             model, stage_config_path, extra = param[0], param[1], param[2]
             extra_omni_kwargs = dict(extra) if extra is not None else {}
+        stage_config_path = _core_model_stage_config_path_with_dummy_load_format(stage_config_path, run_level)
         model = model_prefix + model
         with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, **extra_omni_kwargs) as runner:
             print("OmniRunner started successfully")

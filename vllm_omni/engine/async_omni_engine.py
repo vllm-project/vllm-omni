@@ -279,13 +279,16 @@ class AsyncOmniEngine:
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
-        # Merge typed engine_args fields into kwargs; explicit kwargs take priority.
+        # Merge tracked engine_args fields into kwargs; explicit kwargs take priority.
         if engine_args is not None:
-            ea_dict = {
-                f.name: getattr(engine_args, f.name)
-                for f in dataclasses.fields(engine_args)
-                if not f.name.startswith("_")
-            }
+            if not hasattr(engine_args, "_explicit_fields"):
+                raise TypeError(
+                    "engine_args=OmniEngineArgs(...) is ambiguous under "
+                    "sentinel-default precedence. Use "
+                    "OmniEngineArgs.create(**explicit) or pass explicit kwargs "
+                    "directly."
+                )
+            ea_dict = engine_args.explicit_kwargs()
             # Remove model since it is passed as a positional arg already.
             ea_dict.pop("model", None)
             kwargs = {**ea_dict, **kwargs}
@@ -1238,6 +1241,8 @@ class AsyncOmniEngine:
         if not isinstance(default_sampling_params, dict):
             default_sampling_params = None
         stage_default_sampling_params = default_sampling_params.get("0", {}) if default_sampling_params else {}
+        if normalized_kwargs.get("dtype") is None:
+            normalized_kwargs["dtype"] = "auto"
 
         # TODO: hack, convert dtype to string to avoid non-premitive omegaconf create error.
         if "dtype" in normalized_kwargs and not isinstance(normalized_kwargs["dtype"], str):
@@ -1388,10 +1393,7 @@ class AsyncOmniEngine:
         stage_configs_path = kwargs.get("stage_configs_path", None)
         deploy_config_path = kwargs.pop("deploy_config", None)
         stage_overrides_json = kwargs.pop("stage_overrides", None)
-        # Set of CLI keys the user actually typed; ``None`` means we have no
-        # parser-level info (e.g. programmatic Omni() call) and the lower
-        # layers should treat all kwargs as explicit.
-        cli_explicit_keys = kwargs.pop("_cli_explicit_keys", None)
+        kwargs.pop("_cli_explicit_keys", None)
         explicit_stage_configs = kwargs.pop("stage_configs", None)
         if explicit_stage_configs is not None:
             logger.warning(
@@ -1424,7 +1426,6 @@ class AsyncOmniEngine:
             default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
-            cli_explicit_keys=cli_explicit_keys,
         )
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.

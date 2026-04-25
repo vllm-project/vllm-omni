@@ -40,7 +40,9 @@ from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRan
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
     SeedTTSDataset,
+    SeedTTSDesignDataset,
     SeedTTSSampleRequest,
+    SeedTTSTextDataset,
 )
 
 get_samples_old = datasets.get_samples
@@ -85,23 +87,16 @@ def _attach_daily_omni_to_request_func_input(sample: SampleRequest, rfi: Request
 
 
 def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
-    """Merge Seed-TTS per-row TTS fields (ref_audio, ref_text, task_type, …) into ``extra_body``.
+    """Merge Seed-TTS per-row TTS fields into ``extra_body`` and mark for PCM capture.
 
-    Used by both ``/v1/audio/speech`` and ``/v1/chat/completions`` (flattened into JSON body).
-    For ``openai-chat-omni``, also sets ``omni_chat_messages`` (system + user) so Qwen3-Omni
-    follows the same role layout as official TTS / multimodal demos. ``/v1/audio/speech`` ignores
-    ``messages`` and only uses ``input`` + body fields.
-    Flags ``openai-chat-omni`` to request audio output and optionally export PCM for WER.
+    Always sets ``seed_tts_row=True`` on the RequestFuncInput for any
+    :class:`SeedTTSSampleRequest` subclass (including text-only and design
+    variants that carry no ``ref_audio``).  This enables PCM capture for WER /
+    UTMOS evaluation even when there is no reference audio.
     """
     if not isinstance(sample, SeedTTSSampleRequest):
         return
-    ex = sample.seed_tts_speech_extra
-    if not ex:
-        return
-    base = dict(rfi.extra_body) if rfi.extra_body else {}
-    base.update(ex)
-    rfi.extra_body = base
-    # Used by request funcs to force streaming TTS behavior and to export PCM when WER is on.
+    # Mark for PCM capture (WER / UTMOS eval) regardless of extra body presence.
     setattr(rfi, "seed_tts_row", True)
     sys_prompt = (sample.seed_tts_system_prompt or "").strip() or SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT
     setattr(
@@ -112,6 +107,12 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
             {"role": "user", "content": [{"type": "text", "text": sample.prompt}]},
         ],
     )
+    ex = sample.seed_tts_speech_extra
+    if not ex:
+        return  # voice comes from --extra-body in config; no ref_audio to merge
+    base = dict(rfi.extra_body) if rfi.extra_body else {}
+    base.update(ex)
+    rfi.extra_body = base
 
 
 def _daily_omni_repo_from_args(args) -> str | None:
@@ -136,7 +137,7 @@ def get_samples(args, tokenizer):
     is_daily_omni = args.dataset_name == "daily-omni" or (
         args.dataset_name == "hf" and _daily_omni_repo_from_args(args) is not None
     )
-    is_seed_tts = args.dataset_name == "seed-tts"
+    is_seed_tts = args.dataset_name in ("seed-tts", "seed-tts-text", "seed-tts-design")
 
     # Check if we need to handle omni-related backends/datasets
     is_omni_backend = args.backend in ["openai-chat-omni", "openai-audio-speech", "daily-omni"]
@@ -249,7 +250,13 @@ def get_samples(args, tokenizer):
                 "--hf-name for the Hub dataset id."
             )
 
-        dataset = SeedTTSDataset(
+        _cls_map = {
+            "seed-tts": SeedTTSDataset,
+            "seed-tts-text": SeedTTSTextDataset,
+            "seed-tts-design": SeedTTSDesignDataset,
+        }
+        DatasetCls = _cls_map[args.dataset_name]
+        dataset = DatasetCls(
             dataset_path=repo_id,
             random_seed=args.seed,
             locale=getattr(args, "seed_tts_locale", "en"),

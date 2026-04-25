@@ -28,6 +28,15 @@ def get_pipeline_path(model_dir: str, filename: str) -> Path:
 logger = init_logger(__name__)
 
 
+def _warn_deprecated_kwargs(kwargs: dict[str, Any]) -> None:
+    if "cli_explicit_keys" in kwargs:
+        warnings.warn(
+            "cli_explicit_keys= is deprecated and ignored. Remove the kwarg.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
 
@@ -592,23 +601,6 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     return DeployConfig(**kwargs)
 
 
-def _detect_platform() -> str | None:
-    """Return "npu", "rocm", "xpu", or None (CUDA default)."""
-    try:
-        from vllm.platforms import current_platform
-
-        name = current_platform.device_name.lower()
-        if "npu" in name:
-            return "npu"
-        if "rocm" in name or "amd" in name:
-            return "rocm"
-        if "xpu" in name:
-            return "xpu"
-    except Exception as e:
-        logger.debug("Platform auto-detect failed, falling back to CUDA: %s", e)
-    return None
-
-
 def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
     """Return ``(overrides, devices)`` from a platform stage entry.
 
@@ -627,7 +619,9 @@ def _apply_platform_overrides(
 ) -> DeployConfig:
     """Merge platform-specific stage overrides into deploy config."""
     if platform is None:
-        platform = _detect_platform()
+        from vllm_omni.platforms import current_omni_platform
+
+        platform = current_omni_platform.device_name.lower()
     if platform is None or deploy.platforms is None:
         return deploy
     platform_section = deploy.platforms.get(platform)
@@ -734,8 +728,11 @@ def _build_engine_args(
                 continue
             engine_args[k] = v
         engine_args.update(ds.engine_extras)
-    if deploy.async_chunk:
-        engine_args["async_chunk"] = True
+    # Materialize the resolved pipeline-wide async_chunk value into every
+    # stage so explicit False overrides do not get lost downstream.
+    engine_args["async_chunk"] = bool(deploy.async_chunk)
+    if ps.omni_kv_config:
+        engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
     return engine_args
 
 
@@ -755,6 +752,10 @@ def _build_extras(
         extras["output_connectors"] = dict(ds.output_connectors)
     if ds is not None and ds.input_connectors:
         extras["input_connectors"] = dict(ds.input_connectors)
+    if ps.prompt_expand_func:
+        extras["prompt_expand_func"] = ps.prompt_expand_func
+    if ps.cfg_kv_collect_func:
+        extras["cfg_kv_collect_func"] = ps.cfg_kv_collect_func
     if ps.extras:
         extras.update(ps.extras)
     return extras
@@ -996,17 +997,14 @@ class StageConfigFactory:
         model: str,
         cli_overrides: dict[str, Any] | None = None,
         deploy_config_path: str | None = None,
-        cli_explicit_keys: set[str] | None = None,
+        **deprecated_kwargs: Any,
     ) -> list[StageConfig] | None:
         """Load pipeline + deploy config, merge with CLI overrides.
 
         Checks _PIPELINE_REGISTRY first (new path), falls back to legacy YAML.
-
-        ``cli_explicit_keys`` is the set of CLI keys the user actually typed
-        (captured at the parser layer in ``vllm serve``). When ``None`` —
-        which is the case for programmatic ``Omni()`` callers — every kwarg
-        in ``cli_overrides`` is treated as explicit.
         """
+        _warn_deprecated_kwargs(deprecated_kwargs)
+
         if cli_overrides is None:
             cli_overrides = {}
 
@@ -1015,7 +1013,7 @@ class StageConfigFactory:
         # --- New path: check pipeline registry by model_type first ---
         model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
         if model_type and model_type in _PIPELINE_REGISTRY:
-            return cls._create_from_registry(model_type, cli_overrides, deploy_config_path, cli_explicit_keys)
+            return cls._create_from_registry(model_type, cli_overrides, deploy_config_path)
 
         # --- HF architecture fallback: some models report a generic
         # model_type that collides with another model. Match by the
@@ -1025,9 +1023,7 @@ class StageConfigFactory:
             if hf_archs:
                 for registered in _PIPELINE_REGISTRY.values():
                     if hf_archs.intersection(registered.hf_architectures):
-                        return cls._create_from_registry(
-                            registered.model_type, cli_overrides, deploy_config_path, cli_explicit_keys
-                        )
+                        return cls._create_from_registry(registered.model_type, cli_overrides, deploy_config_path)
 
         # --- Legacy path: load from pipeline YAML ---
         pipeline = cls._load_pipeline(model, trust_remote_code=trust_remote_code)
@@ -1039,14 +1035,14 @@ class StageConfigFactory:
         if errors:
             logger.warning(f"Pipeline validation warnings for {model}: {errors}")
 
-        # Inject pipeline-wide async_chunk into ALL stages' engine_args.
-        # The legacy loader (load_stage_configs_from_yaml) sets async_chunk
-        # on every stage so that build_engine_args_dict() can inject the
-        # stage_connector_spec.  AsyncOmniEngine.__init__ also reads it
-        # from stage_configs[0].engine_args.async_chunk.
-        if pipeline.async_chunk:
-            for stage in pipeline.stages:
-                stage.yaml_engine_args.setdefault("async_chunk", True)
+        # Materialize the resolved pipeline-wide async_chunk value into every
+        # stage so build_engine_args_dict() can inject the stage connector
+        # spec and explicit False overrides are preserved.
+        resolved_async_chunk = cli_overrides.get("async_chunk")
+        if resolved_async_chunk is None:
+            resolved_async_chunk = bool(pipeline.async_chunk)
+        for stage in pipeline.stages:
+            stage.yaml_engine_args["async_chunk"] = bool(resolved_async_chunk)
 
         # Apply CLI overrides
         result: list[StageConfig] = []
@@ -1063,20 +1059,15 @@ class StageConfigFactory:
         model_type: str,
         cli_overrides: dict[str, Any],
         deploy_config_path: str | None = None,
-        cli_explicit_keys: set[str] | None = None,
+        **deprecated_kwargs: Any,
     ) -> list[StageConfig]:
         """Create StageConfigs from pipeline registry + deploy YAML.
 
-        Precedence (high → low):
-            explicit CLI args  >  deploy YAML  >  parser default CLI values
-
-        ``cli_explicit_keys`` carries the set of long-option attribute names
-        the user actually typed (captured in ``OmniServeCommand.cmd``). Any
-        kwarg whose key is not in that set is treated as a parser default
-        and is only used to fill fields YAML doesn't already cover. When the
-        set is ``None`` (programmatic ``Omni()`` callers, which have no
-        argparse layer), every kwarg is treated as explicit.
+        Precedence: caller-typed (non-None) value > deploy YAML >
+        StageDeployConfig dataclass default.
         """
+        _warn_deprecated_kwargs(deprecated_kwargs)
+
         # Resolve deploy config path
         if deploy_config_path is None:
             deploy_path = _DEPLOY_DIR / f"{model_type}.yaml"
@@ -1093,7 +1084,7 @@ class StageConfigFactory:
             deploy_cfg = load_deploy_config(deploy_path)
 
         cli_async_chunk = cli_overrides.get("async_chunk")
-        if cli_async_chunk is not None and (cli_explicit_keys is None or "async_chunk" in cli_explicit_keys):
+        if cli_async_chunk is not None:
             deploy_cfg.async_chunk = bool(cli_async_chunk)
 
         pipeline_key = deploy_cfg.pipeline or model_type
@@ -1107,25 +1098,10 @@ class StageConfigFactory:
 
         stages = merge_pipeline_deploy(pipeline_cfg, deploy_cfg, cli_overrides)
 
-        # Precedence: explicit CLI > yaml > parser-default CLI.
-        # Per-stage (``stage_N_*``) keys are always treated as explicit.
-        explicit_overrides: dict[str, Any] = {}
-        default_overrides: dict[str, Any] = {}
-        for key, value in cli_overrides.items():
-            if value is None:
-                continue
-            is_per_stage = bool(re.match(r"stage_\d+_", key))
-            is_explicit = cli_explicit_keys is None or key in cli_explicit_keys or is_per_stage
-            if is_explicit:
-                explicit_overrides[key] = value
-            else:
-                default_overrides[key] = value
+        explicit_overrides = {k: v for k, v in cli_overrides.items() if v is not None}
 
         for stage in stages:
-            yaml_keys = set(stage.yaml_engine_args)
-            fallback = {k: v for k, v in default_overrides.items() if k not in yaml_keys}
-            merged = {**fallback, **explicit_overrides}
-            stage.runtime_overrides = cls._merge_cli_overrides(stage, merged)
+            stage.runtime_overrides = cls._merge_cli_overrides(stage, explicit_overrides)
 
         return stages
 
