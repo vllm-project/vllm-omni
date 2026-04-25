@@ -228,7 +228,7 @@ steps:
         agents:
           queue: "mithril-h100-pool"
         plugins:
-          - kubernetes:8
+          - kubernetes:
               podSpec:
                 containers:
                   - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
