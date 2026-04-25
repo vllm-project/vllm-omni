@@ -105,7 +105,8 @@ Through five levels (L1-L5) and common (Common) specifications, the system clari
       <td> Depends on reality </td>
       <td>
         <strong>Stability:</strong><br>
-        /tests/dfx/stability/tests/test.json<br>
+        /tests/dfx/stability/tests/test_qwen3_omni.json<br>
+        /tests/dfx/stability/tests/test_wan22.json<br>
         <strong>Reliability:</strong><br>
         tests/e2e/reliability/test_{model_name}.py
       </td>
@@ -574,12 +575,12 @@ L5 level testing focuses on the performance of model services under ***long-runn
 
 ### 4.2 Testing Content and Scope
 
--   ***Long-term Stability (Stability) Testing***: Uses the `tests/dfx/stability/tests/test.json` configuration to run the service under moderate load for an extended period (e.g., over 12 hours), monitoring whether metrics like memory/VRAM usage, response time, and throughput degrade over time, and whether the service process remains stable.
+-   ***Long-term Stability (Stability) Testing***: Uses JSON under `tests/dfx/stability/tests/` (for example `test_qwen3_omni.json` and `test_wan22.json`) to run the service under moderate load for an extended period (e.g., over 12 hours), monitoring whether metrics like memory/VRAM usage, response time, and throughput degrade over time, and whether the service process remains stable.
 -   ***Reliability Testing***: Uses `tests/e2e/reliability/test_{model_name}.py` to actively simulate various fault and abnormal scenarios, such as: dependent service interruption, abnormal input data, network flicker, hardware resource preemption, etc., to verify the system's fault tolerance, self-healing, and graceful degradation capabilities.
 
 ### 4.3 Test Directory and Execution Files
 
--   ***Stability Test Configuration***: `tests/dfx/stability/tests/test.json`
+-   ***Stability Test Configuration***: `tests/dfx/stability/tests/test_qwen3_omni.json`, `tests/dfx/stability/tests/test_wan22.json` (one JSON per model / runner family)
 -   ***Reliability Test Suite***: `tests/e2e/reliability/test_{model_name}.py`
 
 ### 4.4 Execution Method and Example
@@ -590,7 +591,7 @@ L5 level testing focuses on the performance of model services under ***long-runn
 <details>
 <summary> Test Examples</summary>
 
-When you want to add L5-level stability test cases, you can refer to the following format for case addition in `tests/dfx/stability/tests/test.json`:
+When you want to add L5-level stability test cases, add or extend the appropriate JSON file under `tests/dfx/stability/tests/` (for example `test_qwen3_omni.json` for Omni bench traffic, or `test_wan22.json` for diffusion `/v1/videos` workloads). The following illustrates the Qwen3-Omni shape:
 
 ```json
 {
@@ -661,7 +662,7 @@ All other optional parameters follow the same rules as the in Chapter 3.4.
 
 </details>
 
--   -   ***Stability***: `pytest -s -v tests/dfx/stability/scripts/test_{model_name}.py`
+-   -   ***Stability***: `pytest -s -v tests/dfx/stability/scripts/test_stability_qwen3_omni.py` or `pytest -s -v tests/dfx/stability/scripts/test_stability_wan22.py` (or add `test_stability_<model>.py` alongside a matching JSON config)
     -   ***Reliability***: `pytest -s -v tests/e2e/reliability/test_{model_name}.py`
 
 ## Summary

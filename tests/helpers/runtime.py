@@ -620,6 +620,9 @@ class OpenAIClientHandler:
             mm = dict(extra_body.get("mm_processor_kwargs") or {})
             mm["use_audio_in_video"] = True
             extra_body["mm_processor_kwargs"] = mm
+        if "sampling_params_list" in request_config:
+            extra_body["sampling_params_list"] = request_config["sampling_params_list"]
+
         create_kwargs: dict[str, Any] = {
             "model": request_config.get("model"),
             "messages": request_config.get("messages"),

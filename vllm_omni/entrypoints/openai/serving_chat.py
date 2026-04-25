@@ -2192,6 +2192,24 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 comprehension_idx = idx
                 break
 
+        is_glm_image_multistage = False
+        for stage_cfg in stage_configs:
+            if isinstance(stage_cfg, dict):
+                engine_args = stage_cfg.get("engine_args")
+                model_arch = stage_cfg.get("model_arch")
+            else:
+                engine_args = getattr(stage_cfg, "engine_args", None)
+                model_arch = getattr(stage_cfg, "model_arch", None)
+
+            if model_arch is None and engine_args is not None:
+                if isinstance(engine_args, dict):
+                    model_arch = engine_args.get("model_arch")
+                else:
+                    model_arch = getattr(engine_args, "model_arch", None)
+            if model_arch in {"GlmImageForConditionalGeneration", "GlmImagePipeline"}:
+                is_glm_image_multistage = True
+                break
+
         sampling_params_list: list[Any] = []
         for idx, stage_cfg in enumerate(stage_configs):
             stage_type = get_stage_type(stage_cfg)
@@ -2240,6 +2258,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 default_stage_params.lora_scale = lora_scale
                     except Exception as e:  # pragma: no cover - safeguard
                         logger.warning("Failed to parse LoRA request: %s", e)
+            elif (
+                is_glm_image_multistage
+                and comprehension_idx is not None
+                and idx == comprehension_idx
+                and isinstance(default_stage_params, SamplingParams)
+                and height is not None
+                and width is not None
+            ):
+                from vllm_omni.model_executor.stage_input_processors.glm_image import compute_max_tokens
+
+                default_stage_params.max_tokens = compute_max_tokens(
+                    int(height),
+                    int(width),
+                    is_i2i=bool(reference_images),
+                )
+                extra_args = dict(getattr(default_stage_params, "extra_args", {}) or {})
+                extra_args["target_h"] = int(height)
+                extra_args["target_w"] = int(width)
+                default_stage_params.extra_args = extra_args
 
             sampling_params_list.append(default_stage_params)
 

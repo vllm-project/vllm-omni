@@ -23,21 +23,19 @@ Equivalent to running:
 import base64
 import os
 from io import BytesIO
-from pathlib import Path
 
 import pytest
 from vllm.assets.image import ImageAsset
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
+from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
-STAGE_CONFIGS_PATH = str(
-    Path(__file__).parent.parent / "offline_inference" / "stage_configs" / "bagel_sharedmemory_ci.yaml"
-)
+STAGE_CONFIGS_PATH = get_deploy_config_path("ci/bagel.yaml")
 
 TEXT2IMG_PROMPT = "A cute cat"
 IMG2IMG_PROMPT = "Change the grass color to red"
@@ -107,7 +105,7 @@ def test_bagel_text2img_online(omni_server, openai_client) -> None:
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_bagel_img2img_online(omni_server, openai_client) -> None:
-    """Test Bagel img2img with explicit height/width in chat completions API."""
+    """Test Bagel img2img via OpenAI-compatible chat completions API."""
     input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
     buffer = BytesIO()
     input_image.save(buffer, format="JPEG")
@@ -118,8 +116,6 @@ def test_bagel_img2img_online(omni_server, openai_client) -> None:
         "messages": _build_img2img_messages(IMG2IMG_PROMPT, image_b64),
         "modalities": ["image"],
         "extra_body": {
-            "height": 512,
-            "width": 512,
             "num_inference_steps": 2,
             "guidance_scale": 0.0,
             "seed": 42,

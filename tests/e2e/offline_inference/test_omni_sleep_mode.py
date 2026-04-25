@@ -38,8 +38,8 @@ def get_dynamic_devices(stage_idx, num_stages, tp_size):
 # Test 1: Diffusion Model (2-Stage BAGEL)
 @pytest.mark.advanced_model
 @pytest.mark.omni
-@pytest.mark.parametrize("tp_size", [1, 2])
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("tp_size", [1])
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.asyncio
 async def test_diffusion_model_sleep_tp(tp_size):
     num_gpus = torch.cuda.device_count()

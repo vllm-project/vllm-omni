@@ -13,6 +13,7 @@ import weakref
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+import psutil
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
@@ -29,6 +30,8 @@ if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniTokensPrompt
 
 logger = init_logger(__name__)
+
+SHUTDOWN_TIMEOUT_S = 5
 
 
 class StageEngineCoreClientBase:
@@ -420,13 +423,37 @@ class StageEngineCoreClientBase:
 
     def shutdown(self) -> None:
         """Shutdown managed resources and any externally spawned subprocess."""
-        super().shutdown()
-        if self._proc is not None and self._proc.is_alive():
-            self._proc.terminate()
-            self._proc.join(timeout=5)
-            if self._proc.is_alive():
-                self._proc.kill()
-        self._proc = None
+        child_procs: list[psutil.Process] = []
+        if self._proc is not None and self._proc.pid is not None:
+            try:
+                child_procs = psutil.Process(self._proc.pid).children(recursive=True)
+            except psutil.Error:
+                child_procs = []
+
+        try:
+            super().shutdown()
+        finally:
+            if self._proc is not None and self._proc.is_alive():
+                self._proc.terminate()
+                self._proc.join(timeout=SHUTDOWN_TIMEOUT_S)
+                if self._proc.is_alive():
+                    self._proc.kill()
+                    self._proc.join(timeout=SHUTDOWN_TIMEOUT_S)
+
+            alive_children = [proc for proc in child_procs if proc.is_running()]
+            for proc in alive_children:
+                try:
+                    proc.terminate()
+                except psutil.Error:
+                    pass
+            _, still_alive = psutil.wait_procs(alive_children, timeout=SHUTDOWN_TIMEOUT_S)
+            for proc in still_alive:
+                try:
+                    proc.kill()
+                except psutil.Error:
+                    pass
+            # The process handle is no longer reliable after best-effort cleanup.
+            self._proc = None
 
 
 class StageEngineCoreClient(StageEngineCoreClientBase, AsyncMPClient):
