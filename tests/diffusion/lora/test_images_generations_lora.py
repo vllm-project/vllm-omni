@@ -23,12 +23,11 @@ from PIL import Image
 from safetensors.torch import save_file
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServer
+from tests.helpers.runtime import OmniServer, OmniServerParams
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = "Tongyi-MAI/Z-Image-Turbo"
-DIFFUSION_INIT_TIMEOUT_S = 900
 
 
 PROMPT = "a photo of a cat sitting on a laptop keyboard"
@@ -36,20 +35,18 @@ SIZE = "256x256"
 SEED = 42
 
 
-@pytest.fixture(scope="module")
-def omni_server():
-    with OmniServer(
-        MODEL,
-        [
-            "--num-gpus",
-            "1",
-            "--stage-init-timeout",
-            str(DIFFUSION_INIT_TIMEOUT_S),
-            "--init-timeout",
-            str(DIFFUSION_INIT_TIMEOUT_S),
-        ],
-    ) as server:
-        yield server
+server_params = [
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            server_args=[
+                "--num-gpus",
+                "1",
+            ],
+        ),
+        id="zimage_turbo_lora",
+    ),
+]
 
 
 def _write_zimage_lora(adapter_dir: Path, *, q_scale: float = 0.0, k_scale: float = 0.0, v_scale: float = 0.0):
@@ -159,6 +156,7 @@ def _basic_payload() -> dict:
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
+@pytest.mark.parametrize("omni_server", server_params, indirect=True)
 def test_images_generations_per_request_lora_switching(omni_server: OmniServer, tmp_path: Path) -> None:
     # Base generation.
     base_img = _post_images(omni_server, _basic_payload())

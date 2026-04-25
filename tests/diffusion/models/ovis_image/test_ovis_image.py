@@ -1,7 +1,10 @@
-"""
-Tests for Ovis Image model pipeline.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-Strategy:
+"""
+Tests for Ovis Image model pipeline (unit-style with heavy mocks, plus a small
+real transformer forward for coverage).
+
 1. `mock_dependencies` fixture mocks heavy external components (VAE, Scheduler, TextEncoder)
    to allow fast testing of the pipeline logic without downloading weights.
    - Mocks are configured to return tensors on the correct device.
@@ -18,10 +21,6 @@ from pytest_mock import MockerFixture
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
-
-# Mock the OvisImageTransformer2DModel to avoid complex init if needed,
-# or let it run if it's lightweight. It's likely not lightweight.
-# Better to mock the transformer forwarding to return random noise.
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.ovis_image.pipeline_ovis_image import OvisImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -150,6 +149,8 @@ def ovis_pipeline(mocker: MockerFixture, mock_dependencies, monkeypatch: pytest.
     return pipeline
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_interface_compliance(ovis_pipeline):
     """Verify methods required by vllm-omni framework."""
     assert hasattr(ovis_pipeline, "load_weights")
@@ -159,6 +160,8 @@ def test_interface_compliance(ovis_pipeline):
     # assert hasattr(ovis_pipeline, "vae") # Ovis uses VAE
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_basic_generation(ovis_pipeline):
     """Test the forward pass logic."""
     # Setup request
@@ -184,6 +187,8 @@ def test_basic_generation(ovis_pipeline):
     assert ovis_pipeline.transformer.call_count > 0
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_guidance_scale(ovis_pipeline):
     """Test that classifier-free guidance path is taken when scale > 1.0."""
     req = OmniDiffusionRequest(
@@ -205,6 +210,8 @@ def test_guidance_scale(ovis_pipeline):
     assert ovis_pipeline.transformer.call_count >= 2
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
 def test_resolution_check(ovis_pipeline):
     """Test resolution divisible validation logic if present."""
     # Pass odd resolution
@@ -223,8 +230,7 @@ def test_resolution_check(ovis_pipeline):
     assert output is not None
 
 
-@pytest.mark.core_model
-@pytest.mark.diffusion
+@pytest.mark.advanced_model
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 def test_real_transformer_init_and_forward(mocker: MockerFixture):
     """Test the real OvisImageTransformer2DModel initialization and forward pass for coverage."""

@@ -30,7 +30,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 
 def _get_ltx2_model() -> str:
-    return os.environ.get("VLLM_TEST_LTX2_MODEL", "Lightricks/LTX-2")
+    return "Lightricks/LTX-2"
 
 
 def _md5(path: Path) -> str:
@@ -62,7 +62,7 @@ def _run_and_check(cmd: list[str], env: dict, output_path: Path, expected_md5: s
 # ── T2V tests ──
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
 @pytest.mark.slow
@@ -106,7 +106,7 @@ def test_ltx2_t2v_cfg_parallel(tmp_path: Path):
     _run_and_check(cmd, env, output, expected_md5="08e606b9c522fee4b6f30cee8b77db40")
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.slow
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -148,7 +148,7 @@ def test_ltx2_t2v_no_cfg(tmp_path: Path):
 # ── I2V tests ──
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
 @pytest.mark.slow
@@ -198,7 +198,7 @@ def test_ltx2_i2v_cfg_parallel(tmp_path: Path):
     _run_and_check(cmd, env, output, expected_md5="aed7e56084b36373244d8f839b16d115")
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.slow
 @hardware_test(res={"cuda": "L4"}, num_cards=1)

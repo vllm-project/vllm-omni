@@ -54,6 +54,8 @@ vllm_omni/                                    tests/
 │   │                                            │   │   └── test_lora_manager.py        ✅
 │   ├── models/                                 │   ├── models/
 │   │   ├── qwen_image/                         │   │   ├── qwen_image/                 (e2e coverage)
+│   │   ├── ovis_image/                         │   │   ├── ovis_image/
+│   │   │   └── ...                             │   │   │   └── test_ovis_image.py     ✅
 │   │   ├── z_image/                            │   │   └── z_image/
 │   │   └── ...                                 │   │       └── test_zimage_tp_constraints.py  ✅
 │   └── worker/                                 │   └── worker/
@@ -141,7 +143,6 @@ vllm_omni/                                    tests/
                                                    ├── test_bagel_text2img.py
                                                    ├── test_z_image.py
                                                    ├── test_wan22.py
-                                                   ├── test_ovis_image.py
                                                    ├── test_zimage_tensor_parallel.py
                                                    ├── test_cache_dit.py
                                                    ├── test_teacache.py

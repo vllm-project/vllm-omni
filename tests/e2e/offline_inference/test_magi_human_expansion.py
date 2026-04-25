@@ -38,15 +38,11 @@ def _validate_mp4(video_bytes: bytes, min_frames: int = 10) -> None:
     container.close()
 
 
-@pytest.mark.core_model
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
-def test_magi_human_e2e(run_level):
+def test_magi_human_e2e():
     """End-to-end test for MagiHuman generating video and audio."""
-    if run_level != "advanced_model":
-        pytest.skip("MagiHuman e2e test requires advanced_model run level with real weights.")
-
     model_path = "SII-GAIR/daVinci-MagiHuman-Base-1080p"
 
     prompt = (

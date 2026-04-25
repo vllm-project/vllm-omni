@@ -1400,19 +1400,24 @@ class OmniRunnerHandler:
         videos = request_config.get("videos")
         images = request_config.get("images")
         audios = request_config.get("audios")
+        # Full dict (e.g. image + mask_image for inpainting) or partial; merged with top-level image/video keys.
+        extra_multi_modal = request_config.get("multi_modal_data")
         modalities = request_config.get("modalities")  # only used by limited models. Do not add default value here
 
         prompt_object = OmniTextPrompt(prompt=prompt)
         if negative_prompt:
             prompt_object["negative_prompt"] = negative_prompt
-        if videos is not None or images is not None or audios is not None:
-            prompt_object["multi_modal_data"] = {}
-            if videos is not None:
-                prompt_object["multi_modal_data"]["video"] = videos
-            if images is not None:
-                prompt_object["multi_modal_data"]["image"] = images
-            if audios is not None:
-                prompt_object["multi_modal_data"]["audio"] = audios
+        multi_modal: dict = {}
+        if extra_multi_modal is not None:
+            multi_modal.update(dict(extra_multi_modal))
+        if videos is not None:
+            multi_modal["video"] = videos
+        if images is not None:
+            multi_modal["image"] = images
+        if audios is not None:
+            multi_modal["audio"] = audios
+        if multi_modal:
+            prompt_object["multi_modal_data"] = multi_modal
         if modalities:
             prompt_object["modalities"] = modalities  # pyright: ignore[reportGeneralTypeIssues]
 

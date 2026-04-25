@@ -119,9 +119,20 @@ def omni_runner(request: pytest.FixtureRequest, model_prefix: str):
     from tests.helpers.runtime import OmniRunner
 
     with omni_fixture_lock:
-        model, stage_config_path = request.param
+        param = request.param
+        if not isinstance(param, (tuple, list)) or len(param) not in (2, 3):
+            raise ValueError(
+                "omni_runner param must be (model, stage_config_path) or "
+                "(model, stage_config_path, extra_omni_kwargs_dict)"
+            )
+        if len(param) == 2:
+            model, stage_config_path = param[0], param[1]
+            extra_omni_kwargs: dict = {}
+        else:
+            model, stage_config_path, extra = param[0], param[1], param[2]
+            extra_omni_kwargs = dict(extra) if extra is not None else {}
         model = model_prefix + model
-        with OmniRunner(model, seed=42, stage_configs_path=stage_config_path) as runner:
+        with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, **extra_omni_kwargs) as runner:
             print("OmniRunner started successfully")
             yield runner
             print("OmniRunner stopping...")
