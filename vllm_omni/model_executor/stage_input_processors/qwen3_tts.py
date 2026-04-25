@@ -37,8 +37,10 @@ def talker2code2wav(
             # accumulated the final code sequence.
             continue
         output = talker_output.outputs[0]
+        mm = output.multimodal_output
+        mm_codes = mm.get("codes", {})
         # audio_codes shape: [num_frames, Q] where Q=num_quantizers (16)
-        audio_codes = output.multimodal_output["audio_codes"].to(torch.long)
+        audio_codes = mm_codes["audio"].to(torch.long)
         token_ids = output.token_ids
         # token_ids provides an upper bound on the newly generated codec span.
         # audio_codes may still contain zero-padded / invalid rows, so trim only
@@ -51,8 +53,8 @@ def talker2code2wav(
         audio_codes = audio_codes[valid_mask]
         if seq_len > 0 and audio_codes.ndim == 2 and int(audio_codes.shape[0]) > seq_len:
             audio_codes = audio_codes[-seq_len:]
-        ref_code = output.multimodal_output.get("ref_code")
-        ref_code_len = output.multimodal_output.get("ref_code_len")
+        ref_code = mm_codes.get("ref")
+        ref_code_len = mm.get("meta", {}).get("ref_code_len")
         if isinstance(ref_code_len, torch.Tensor):
             ref_code_len = int(ref_code_len.reshape(-1)[-1].item()) if ref_code_len.numel() > 0 else 0
         elif ref_code_len is None:
@@ -95,7 +97,7 @@ def talker2code2wav(
         codec_codes = audio_codes.transpose(0, 1).cpu().reshape(-1).tolist()
         additional_information: dict[str, Any] = {}
         if ref_code_len > 0:
-            additional_information["left_context_size"] = [ref_code_len]
+            additional_information["meta"] = {"left_context_size": [ref_code_len]}
         # Propagate speaker and language from the original prompt so they are
         # available as runtime_additional_information in later pipeline stages,
         # consistent with qwen3-omni and qwen2.5-omni stage input processors.
@@ -117,7 +119,7 @@ def talker2code2wav(
 
 
 def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
-    audio_codes = pooling_output.get("audio_codes")
+    audio_codes = pooling_output.get("codes", {}).get("audio")
     if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
         return None
     if audio_codes.ndim == 2:
@@ -148,7 +150,7 @@ def talker2code2wav_async_chunk(
         if frame is not None:
             codec_codes = frame.cpu().tolist()
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
-        ref_code = pooling_output.get("ref_code")
+        ref_code = pooling_output.get("codes", {}).get("ref")
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
             request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
     elif not finished:
@@ -207,8 +209,8 @@ def talker2code2wav_async_chunk(
     if length <= 0:
         if finished:
             return {
-                "code_predictor_codes": [],
-                "finished": True,
+                "codes": {"audio": []},
+                "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
             }
         return None
 
@@ -254,9 +256,8 @@ def talker2code2wav_async_chunk(
     code_predictor_codes = [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)]
 
     info: dict[str, Any] = {
-        "code_predictor_codes": code_predictor_codes,
-        "left_context_size": left_context_size,
-        "finished": finished,
+        "codes": {"audio": code_predictor_codes},
+        "meta": {"left_context_size": left_context_size, "finished": torch.tensor(finished, dtype=torch.bool)},
     }
     # Propagate speaker and language from the request so they are available
     # as runtime_additional_information in subsequent pipeline stages, consistent

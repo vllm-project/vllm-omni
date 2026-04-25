@@ -2321,7 +2321,7 @@ class GlmImageModel(nn.Module):
                 upsampled_token_ids.append(tokens_upsampled.view(-1))
 
             prior_token_image_ids_info = {
-                "prior_token_image_ids": upsampled_token_ids,
+                "ids": {"prior_image": upsampled_token_ids},
                 "image_grid_thw": image_grid_thw.tolist(),
             }
 
@@ -2533,9 +2533,7 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         # image_grid_thw is NOT included because:
         # 1. vLLM's pooling_output expects dict[str, torch.Tensor], not mixed types
         # 2. ar2diffusion doesn't need it - the grid info is already encoded in tensor shape
-        prior_token_info = {
-            "prior_token_image_ids": upsampled_token_ids,
-        }
+        prior_token_info = {"ids": {"prior_image": upsampled_token_ids}}
 
         # Debug: log prior_token_info
         shapes = [t.shape for t in upsampled_token_ids]

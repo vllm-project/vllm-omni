@@ -365,16 +365,21 @@ class OmniConnectorModelRunnerMixin:
     #  Scheduling metadata extraction
     # ------------------------------------------------------------------ #
 
-    _SCHEDULING_METADATA_KEYS = (
-        "next_stage_prompt_len",
-        "code_predictor_codes",
-        "left_context_size",
-    )
-
     @classmethod
     def _extract_scheduling_metadata(cls, payload: dict[str, Any]) -> dict[str, Any]:
         """Extract only the fields the scheduler needs from a full payload."""
-        return {k: payload[k] for k in cls._SCHEDULING_METADATA_KEYS if k in payload}
+        extracted: dict[str, Any] = {}
+        if "next_stage_prompt_len" in payload:
+            extracted["next_stage_prompt_len"] = payload["next_stage_prompt_len"]
+        audio_codes = cls._payload_audio_codes(payload)
+        if audio_codes is not None:
+            extracted["code_predictor_codes"] = audio_codes
+        meta = payload.get("meta")
+        if isinstance(meta, dict) and "left_context_size" in meta:
+            extracted["left_context_size"] = meta["left_context_size"]
+        elif "left_context_size" in payload:
+            logger.warning_once("legacy flat 'left_context_size' key in payload; expected 'meta.left_context_size'")
+        return extracted
 
     _NON_CONSUMABLE_PAYLOAD_KEYS = {
         "finished",
@@ -396,6 +401,31 @@ class OmniConnectorModelRunnerMixin:
             return len(value) > 0
         return True
 
+    @staticmethod
+    def _payload_finished(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if "finished" in payload:
+            logger.warning_once("legacy flat 'finished' key in payload; expected 'meta.finished'")
+        meta = payload.get("meta")
+        if not isinstance(meta, dict) or "finished" not in meta:
+            return False
+        flag = meta["finished"]
+        if isinstance(flag, torch.Tensor):
+            return flag.numel() == 1 and bool(flag.item())
+        return bool(flag)
+
+    @staticmethod
+    def _payload_audio_codes(payload: Any) -> Any:
+        if not isinstance(payload, dict):
+            return None
+        if "code_predictor_codes" in payload:
+            logger.warning_once("legacy flat 'code_predictor_codes' key in payload; expected 'codes.audio'")
+        codes = payload.get("codes")
+        if isinstance(codes, dict):
+            return codes.get("audio")
+        return None
+
     @classmethod
     def _payload_is_consumable(cls, payload: dict[str, Any] | None) -> bool:
         """Return True when an async payload can drive a real forward step.
@@ -414,15 +444,14 @@ class OmniConnectorModelRunnerMixin:
                 return True
             return decode_embeddings.numel() > 0 and decode_embeddings.shape[0] > 0
 
-        if "code_predictor_codes" in payload:
-            code_predictor_codes = payload.get("code_predictor_codes")
-            if isinstance(code_predictor_codes, torch.Tensor):
-                return code_predictor_codes.numel() > 0
+        audio_codes = cls._payload_audio_codes(payload)
+        if audio_codes is not None:
+            if isinstance(audio_codes, torch.Tensor):
+                return audio_codes.numel() > 0
             # Codec code 0 is valid; non-empty code payloads are consumable.
-            if hasattr(code_predictor_codes, "__len__"):
-                return len(code_predictor_codes) > 0
-            else:
-                return code_predictor_codes is not None
+            if hasattr(audio_codes, "__len__"):
+                return len(audio_codes) > 0
+            return True
 
         for key, value in payload.items():
             if key in cls._NON_CONSUMABLE_PAYLOAD_KEYS:
@@ -731,20 +760,21 @@ class OmniConnectorModelRunnerMixin:
                 logger.info("[Stage-%s] send_full_payload_outputs: payload is None for %s", self._stage_id, req_id)
                 continue
             if isinstance(payload, dict):
-                code_predictor_codes = payload.get("code_predictor_codes")
-                if isinstance(code_predictor_codes, torch.Tensor):
-                    code_len = int(code_predictor_codes.numel())
-                elif hasattr(code_predictor_codes, "__len__"):
-                    code_len = len(code_predictor_codes)
+                audio_codes = self._payload_audio_codes(payload)
+                if isinstance(audio_codes, torch.Tensor):
+                    code_len = int(audio_codes.numel())
+                elif hasattr(audio_codes, "__len__"):
+                    code_len = len(audio_codes)
                 else:
                     code_len = None
+                meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
                 logger.info(
                     "[Stage-%s] send_full_payload_outputs: req=%s payload_keys=%s code_len=%s left_context_size=%s",
                     self._stage_id,
                     req_id,
                     sorted(payload.keys()),
                     code_len,
-                    payload.get("left_context_size"),
+                    meta.get("left_context_size"),
                 )
 
             external_req_id = self._resolve_external_req_id(request, req_id)
@@ -1545,20 +1575,20 @@ class OmniConnectorModelRunnerMixin:
                 external_req_id,
                 connector_get_key,
                 sorted(payload_data.keys()),
-                bool(payload_data.get("finished")) if "finished" in payload_data else None,
+                self._payload_finished(payload_data),
             )
 
         self._get_req_chunk[req_id] += 1
 
         if self._async_chunk:
-            is_finished = bool(payload_data.get("finished"))
+            is_finished = self._payload_finished(payload_data)
             incoming_payload_consumable = self._payload_is_consumable(payload_data)
 
             if self._model_mode == "ar":
                 payload_data = self._accumulate_payload(external_req_id, payload_data)
                 payload_consumable = incoming_payload_consumable
             else:
-                new_ids = payload_data.get("code_predictor_codes", [])
+                new_ids = self._payload_audio_codes(payload_data) or []
                 if not new_ids and not is_finished:
                     return False
                 payload_consumable = self._payload_is_consumable(payload_data)

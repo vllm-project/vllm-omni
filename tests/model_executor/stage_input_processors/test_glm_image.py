@@ -299,7 +299,7 @@ class TestAr2Diffusion:
     def test_i2i_with_mm_output(self):
         """Test image-to-image with prior_token_image_ids from AR model."""
         token_ids = list(range(1024)) + [16385]
-        mm_output = {"prior_token_image_ids": torch.tensor([1, 2, 3])}
+        mm_output = {"ids": {"prior_image": torch.tensor([1, 2, 3])}}
         stage_list = [_stage_with_outputs([_source_output(token_ids, mm_output)])]
 
         from PIL import Image
