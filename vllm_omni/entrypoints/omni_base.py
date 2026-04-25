@@ -13,6 +13,7 @@ import huggingface_hub
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.diffusion.models.f5_tts.hf_utils import is_f5_model
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
@@ -56,6 +57,11 @@ def omni_snapshot_download(model_id: str) -> str:
     if os.path.exists(model_id):
         return model_id
 
+    # F5-TTS checkpoints are addressed as repo/subfolder and need
+    # custom resolution later, so avoid passing the invalid repo id form to HF.
+    if is_f5_model(model_id):
+        return model_id
+
     # TODO: this is just a workaround for quickly use modelscope, we should support
     # modelscope in weight loading feature instead of using `snapshot_download`
     if os.environ.get("VLLM_USE_MODELSCOPE", False):
@@ -72,6 +78,8 @@ def omni_snapshot_download(model_id: str) -> str:
         )
     except huggingface_hub.errors.RepositoryNotFoundError:
         logger.warning("Repository not found for '%s'.", model_id)
+    except huggingface_hub.errors.HFValidationError:
+        logger.warning("Skipping eager snapshot download for special model id '%s'.", model_id)
     except PermissionError:
         logger.warning(
             "Permission denied when downloading '%s'. Assuming the model is already cached locally.",

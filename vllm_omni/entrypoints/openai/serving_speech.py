@@ -30,6 +30,7 @@ from vllm.utils import random_uuid
 from vllm.utils.async_utils import make_async
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.diffusion.models.f5_tts.hf_utils import is_f5_model
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
@@ -40,6 +41,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     SpeechBatchItem,
     SpeechBatchItemResult,
 )
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     build_fish_text_only_prompt_ids,
     estimate_fish_voice_clone_prompt_len_from_normalized,
@@ -194,7 +196,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return instance
 
     def __init__(self, *args, **kwargs):
+        self.model_name = kwargs.pop("model_name", None)
         super().__init__(*args, **kwargs)
+        self.diffusion_mode = False
         # Initialize uploaded speakers storage (ephemeral — cleared on restart)
         speech_voice_samples_dir = os.environ.get("SPEECH_VOICE_SAMPLES", "/tmp/voice_samples")
         self.uploaded_speakers_dir = Path(speech_voice_samples_dir)
@@ -203,6 +207,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Find and cache the TTS stage (if any) during initialization
         self._tts_stage = self._find_tts_stage()
         self._is_tts = self._tts_stage is not None
+        self._is_f5_tts = self._is_f5_tts_model()
         self._is_fish_speech = (
             self._tts_stage is not None
             and getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None) == "fish_speech_slow_ar"
@@ -343,6 +348,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # 3. Default fallback
         return _TTS_MAX_INSTRUCTIONS_LENGTH
+
+    # @classmethod
+    # def for_diffusion(cls, *args, **kwargs) -> "OmniOpenAIServingSpeech":
+    #     """Create an instance configured to run in diffusion mode."""
+    #     instance = cls(*args, **kwargs)
+    #     instance.diffusion_mode = True
+    #     return instance
 
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
@@ -840,6 +852,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Check if the current model is a supported TTS model."""
         return any(stage.engine_args.model_stage in _TTS_MODEL_STAGES for stage in self.engine_client.stage_configs)
 
+    def _is_f5_tts_model(self) -> bool:
+        return self._diffusion_mode and is_f5_model(self.model_name)
+
+    @staticmethod
+    def _audio_value_numel(audio_value: Any) -> int:
+        if hasattr(audio_value, "numel"):
+            return int(audio_value.numel())
+        return int(np.asarray(audio_value).size)
+
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
         if self._tts_model_type == "voxtral_tts":
@@ -1264,8 +1285,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     chunk_np = (
                         chunk_tensor.float().detach().cpu().numpy() if hasattr(chunk_tensor, "float") else chunk_tensor
                     )
-                    if chunk_np.ndim > 1:
-                        chunk_np = chunk_np.squeeze()
+                    chunk_np = self._normalize_audio_tensor_for_output(chunk_np)
                     # For WAV format, emit header before first audio chunk
                     if response_format == "wav" and first_chunk:
                         # Assert that sample rate has been set from chunk metadata (not just default)
@@ -1628,6 +1648,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
+        sampling_params_list = self.engine_client.default_sampling_params_list
+
         if self._is_fish_speech:
             validation_error = self._validate_fish_tts_request(request)
             if validation_error:
@@ -1669,12 +1691,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         elif self._tts_model_type == "voxcpm2":
             prompt = await self._build_voxcpm2_prompt(request)
             tts_params = {}
+
+            # Override Stage-0 max_tokens if caller specified max_new_tokens (Fish Speech).
+            if request.max_new_tokens is not None and sampling_params_list:
+                import copy
+
+            sampling_params_list[0].max_tokens = request.max_new_tokens
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+
         elif self._is_tts:
             validation_error = self._validate_tts_request(request)
             if validation_error:
                 raise ValueError(validation_error)
 
             if self._tts_model_type == "voxtral_tts":
+                prompt = await self._build_voxtral_prompt(request)
                 prompt = await self._build_voxtral_prompt_async(request)
                 tts_params = {}
             elif self._tts_model_type == "cosyvoice3":
@@ -1697,6 +1728,35 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
                 ph_len = await self._estimate_prompt_len_async(tts_params)
                 prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
+        elif self._is_f5_tts:
+            # Validate TTS parameters
+            validation_error = self._validate_tts_request(request)
+            if validation_error:
+                raise ValueError(validation_error)
+
+            # Build TTS parameters and prompt
+            tts_params = self._build_tts_params(request)
+
+            # Pass ref_audio as the raw base64/URL string — the
+            # pipeline decodes it internally (unlike Qwen3-TTS which
+            # resolves to wav samples here).
+            if request.ref_audio is not None:
+                tts_params["ref_audio"] = [request.ref_audio]
+
+            prompt = {
+                "prompt": request.input,
+                "additional_information": tts_params,
+            }
+
+            # Build sampling params for diffusion
+            sampling_params_list = [OmniDiffusionSamplingParams(num_outputs_per_prompt=1)]
+
+            if request.guidance_scale is not None:
+                sampling_params_list[0].guidance_scale = request.guidance_scale
+            sampling_params_list[0].guidance_scale_provided = True
+
+            if request.num_inference_steps is not None:
+                sampling_params_list[0].num_inference_steps = request.num_inference_steps
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The
@@ -1720,8 +1780,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             prompt = {"prompt": request.input}
 
         request_id = request_id or f"speech-{random_uuid()}"
+
         if self._is_fish_speech:
             model_type = "fish_speech"
+        elif self._is_f5_tts:
+            model_type = "f5_tts"
         elif self._tts_model_type == "voxtral_tts":
             model_type = "voxtral_tts"
         elif self._tts_model_type == "cosyvoice3":
@@ -1839,9 +1902,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
         if isinstance(audio_tensor, list):
-            async_chunk = bool(getattr(self.engine_client.model_config, "async_chunk", False))
+            model_config = getattr(self.engine_client, "model_config", None)
+            async_chunk = bool(getattr(model_config, "async_chunk", False))
             if async_chunk:
-                non_empty_chunks = [candidate for candidate in audio_tensor if candidate.numel() > 0]
+                non_empty_chunks = [candidate for candidate in audio_tensor if self._audio_value_numel(candidate) > 0]
                 audio_tensor = (
                     torch.cat(non_empty_chunks, dim=-1) if non_empty_chunks else np.zeros((0,), dtype=np.float32)
                 )
@@ -1850,14 +1914,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 audio_tensor = np.zeros((0,), dtype=np.float32)
                 # Non-async Qwen3-TTS returns cumulative history snapshots, so keep the latest non-empty tensor.
                 for candidate in reversed(audio_history):
-                    if candidate.numel() > 0:
+                    if self._audio_value_numel(candidate) > 0:
                         audio_tensor = candidate
                         break
         if hasattr(audio_tensor, "float"):
             audio_tensor = audio_tensor.float().detach().cpu().numpy()
-
-        if audio_tensor.ndim > 1:
-            audio_tensor = audio_tensor.squeeze()
+        audio_tensor = self._normalize_audio_tensor_for_output(audio_tensor)
 
         audio_obj = CreateAudio(
             audio_tensor=audio_tensor,

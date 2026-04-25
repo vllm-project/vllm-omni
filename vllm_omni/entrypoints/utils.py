@@ -13,6 +13,10 @@ from vllm.transformers_utils.repo_utils import file_or_path_exists
 
 from vllm_omni.config.stage_config import StageConfigFactory
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
+from vllm_omni.diffusion.models.f5_tts.hf_utils import (
+    F5_PIPELINE_CLASS,
+    is_f5_model,
+)
 from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.platforms import current_omni_platform
 
@@ -139,6 +143,9 @@ def _try_get_class_name_from_diffusers_config(model: str) -> str | None:
     Returns:
         Model type string if found, None otherwise
     """
+    if is_f5_model(model):
+        return F5_PIPELINE_CLASS
+
     model_index = get_hf_file_to_dict("model_index.json", model, revision=None)
     if model_index and isinstance(model_index, dict) and "_class_name" in model_index:
         logger.debug(f"Found model_type '{model_index['_class_name']}' in model_index.json")
@@ -298,6 +305,9 @@ def resolve_model_config_path(model: str) -> str:
         ValueError: If model_type cannot be determined
         FileNotFoundError: If no stage config file exists for the model type
     """
+    if is_f5_model(model):
+        return None
+
     # Try to get config from standard transformers format first
     try:
         hf_config = get_config(model, trust_remote_code=True)

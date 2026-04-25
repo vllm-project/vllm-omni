@@ -311,6 +311,10 @@ class _DiffusionServingModels:
         return self._base_model_paths
 
     def __getattr__(self, name):
+        """
+        Any attribute OpenAIServing tries to access but we don't explicitly define
+        will safely resolve to None.
+        """
         return self._Unsupported(name)
 
     async def show_available_models(self) -> ModelList:
@@ -578,10 +582,10 @@ async def omni_init_app_state(
 
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
+    model_name = served_model_names[0] if served_model_names else args.model
 
     # Pure Diffusion mode: use simplified initialization logic
     if is_pure_diffusion:
-        model_name = served_model_names[0] if served_model_names else args.model
         state.vllm_config = None
         state.diffusion_engine = engine_client
         state.openai_serving_models = _DiffusionServingModels(base_model_paths)
@@ -591,6 +595,13 @@ async def omni_init_app_state(
         # Use for_diffusion method to create chat handler
         state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
+            model_name=model_name,
+        )
+
+        state.openai_serving_speech = OmniOpenAIServingSpeech.for_diffusion(
+            engine_client,
+            state.openai_serving_models,
+            request_logger=request_logger,
             model_name=model_name,
         )
 
@@ -903,7 +914,7 @@ async def omni_init_app_state(
     )
 
     state.openai_serving_speech = OmniOpenAIServingSpeech(
-        engine_client, state.openai_serving_models, request_logger=request_logger
+        engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
     )
 
     state.openai_streaming_speech = OmniStreamingSpeechHandler(

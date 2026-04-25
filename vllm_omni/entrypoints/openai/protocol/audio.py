@@ -46,9 +46,9 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Language code (e.g., 'Chinese', 'English', 'Auto')",
     )
-    ref_audio: str | None = Field(
+    ref_audio: str | bytes | None = Field(
         default=None,
-        description="Reference audio for voice cloning (Base task). URL, base64, or file URI.",
+        description="Reference audio for voice cloning (Base task). URL, base64, or file path or raw bytes.",
     )
     ref_text: str | None = Field(
         default=None,
@@ -77,6 +77,21 @@ class OpenAICreateSpeechRequest(BaseModel):
     extra_params: dict[str, Any] | None = Field(
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args."),
+    )
+
+    seed: int | None = Field(
+        default=None,
+        description="Random seed for reproducibility",
+    )
+
+    guidance_scale: float | None = Field(
+        default=None,
+        description="Guidance scale for diffusion models",
+    )
+
+    num_inference_steps: int | None = Field(
+        default=None,
+        description="Number of inference steps",
     )
 
     @field_validator("stream_format")

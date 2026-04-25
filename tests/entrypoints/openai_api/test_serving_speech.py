@@ -685,6 +685,32 @@ class TestTTSMethods:
         assert server._is_tts is True
         assert server._tts_stage is mock_stage
 
+    def test_is_f5_tts_model_uses_registered_f5_model_ids(self, mocker: MockerFixture):
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.stage_configs = []
+        mock_engine_client.tts_max_instructions_length = None
+        mock_engine_client.model = "SWivid/F5-TTS/F5TTS_Base"
+        mock_engine_client.model_config = SimpleNamespace(
+            model_type=None,
+            model_class_name=None,
+            model="SWivid/F5-TTS/F5TTS_Base",
+            hf_config=SimpleNamespace(model_type=None, _name_or_path="SWivid/F5-TTS/F5TTS_Base"),
+        )
+
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+            model_name="SWivid/F5-TTS/F5TTS_Base",
+        )
+        server.diffusion_mode = True
+
+        assert server._is_f5_tts_model() is True
+
     def test_prepare_speech_rejects_non_tts_omni_model(self, mocker: MockerFixture):
         """Multi-stage omni models (e.g. Qwen3-Omni) must not use /v1/audio/speech."""
         mock_engine_client = mocker.MagicMock()

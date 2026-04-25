@@ -18,10 +18,27 @@ logger = init_logger(__name__)
 class AudioMixin:
     """Mixin class to add audio-related utilities."""
 
+    def _normalize_audio_tensor_for_output(self, audio_tensor) -> np.ndarray:
+        """Normalize mono/stereo audio into a shape soundfile can write reliably."""
+        audio_tensor = np.asarray(audio_tensor)
+
+        if audio_tensor.ndim == 0:
+            return audio_tensor.reshape(1)
+        if audio_tensor.ndim == 1:
+            return audio_tensor
+        if audio_tensor.ndim == 2:
+            if 1 in audio_tensor.shape:
+                return audio_tensor.reshape(-1)
+            return audio_tensor
+
+        raise ValueError(
+            f"Unsupported audio tensor dimension: {audio_tensor.ndim}. Only mono (1D) and stereo (2D) are supported."
+        )
+
     def create_audio(self, audio_obj: CreateAudio) -> AudioResponse:
         """Convert audio tensor to bytes in the specified format."""
 
-        audio_tensor = audio_obj.audio_tensor
+        audio_tensor = self._normalize_audio_tensor_for_output(audio_obj.audio_tensor)
         sample_rate = audio_obj.sample_rate
         response_format = audio_obj.response_format.lower()
         stream_format = audio_obj.stream_format
@@ -34,12 +51,6 @@ class AudioMixin:
         if soundfile is None:
             raise ImportError(
                 "soundfile is required for audio generation. Please install it with: pip install soundfile"
-            )
-
-        if audio_tensor.ndim > 2:
-            raise ValueError(
-                f"Unsupported audio tensor dimension: {audio_tensor.ndim}. "
-                "Only mono (1D) and stereo (2D) are supported."
             )
 
         audio_tensor, sample_rate = self._apply_speed_adjustment(audio_tensor, speed, sample_rate)
