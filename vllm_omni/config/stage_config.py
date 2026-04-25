@@ -439,7 +439,7 @@ class DeployConfig:
 
     # === Pipeline-wide engine settings (applied uniformly to every stage) ===
     trust_remote_code: bool = True
-    distributed_executor_backend: str = "mp"
+    distributed_executor_backend: str | None = None
     dtype: str | None = None
     quantization: str | None = None
     enable_prefix_caching: bool = False
