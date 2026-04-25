@@ -18,7 +18,6 @@ Each entry in the file contains the test metadata (test_name, backend, benchmark
 timestamp) together with the raw metrics returned by the benchmark script.
 """
 
-import atexit
 import json
 import os
 import socket
@@ -33,7 +32,6 @@ from typing import Any, cast
 
 import psutil
 import pytest
-import yaml
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
@@ -277,41 +275,11 @@ class DiffusionServer:
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
-_GENERATED_STAGE_CONFIG_PATHS: set[str] = set()
-
-
-def _cleanup_generated_stage_configs() -> None:
-    for path in list(_GENERATED_STAGE_CONFIG_PATHS):
-        try:
-            Path(path).unlink(missing_ok=True)
-        except Exception:
-            pass
-
-
-atexit.register(_cleanup_generated_stage_configs)
-
-
-def _materialize_stage_config(stage_config: dict) -> str:
-    """Creating a temp YAML file according to stage config dict."""
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8")
-    yaml.dump(stage_config, tmp, default_flow_style=False, sort_keys=False, allow_unicode=True, indent=2)
-    tmp.close()
-    _GENERATED_STAGE_CONFIG_PATHS.add(tmp.name)
-    return tmp.name
-
 
 def _build_serve_args(serve_args_dict: dict[str, Any]) -> list[str]:
     """Convert a serve_args dict from test.json into a flat CLI argument list."""
     args: list[str] = []
     for key, value in serve_args_dict.items():
-        if key == "stage-configs":
-            # stage-configs must be materialized to a YAML file on disk;
-            # the server reads it via --stage-configs-path, not inline JSON.
-            assert isinstance(value, dict), "stage_configs must be a dict"
-            path = _materialize_stage_config(value)
-            args.extend(["--stage-configs-path", path])
-            continue
-
         flag = f"--{key}"
         if isinstance(value, bool):
             if value:

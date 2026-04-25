@@ -6,26 +6,11 @@
         "server_params": {
             "model": "tencent/HunyuanImage-3.0-Instruct",
             "serve_args": {
-                "stage-configs": {
-                    "stage_args": [
-                        {
-                            "stage_id": 0,
-                            "stage_type": "diffusion",
-                            "engine_args": {
-                                "enforce_eager": true,
-                                "distributed_executor_backend": "mp",
-                                "quantization": "fp8",
-                                "parallel_config": {
-                                    "tensor_parallel_size": 2,
-                                    "sequence_parallel_size": 2,
-                                    "ulysses_degree": 2
-                                }
-                            },
-                            "final_output": true,
-                            "final_output_type": "image"
-                        }
-                    ]
-                },
+                "tensor-parallel-size": 2,
+                "usp": 2,
+                "quantization": "fp8",
+                "distributed-executor-backend": "mp",
+                "enforce-eager": true,
                 "enable-diffusion-pipeline-profiler": true
             }
         },

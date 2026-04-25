@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
-# =============================================================================
-# Diffusion Model Profiling Script
-# Collects per-layer breakdown + torch.profiler kernel trace for any diffusion
-# model served by vllm-omni.
+# Diffusion profiling helper for vLLM-Omni.
 #
 # Usage:
-#   bash run_diffusion_profiling.sh <model> [phase]
-#   phase: all | stage_durations | torch_profile  (default: all)
+#   bash tools/run_diffusion_profiling.sh <model> [all|stage_durations|torch_profile]
 #
 # Example:
-#   bash run_diffusion_profiling.sh tencent/HunyuanImage-3.0-Instruct all
-#   bash run_diffusion_profiling.sh Qwen/Qwen-Image-2512 stage_durations
-# =============================================================================
+#   bash tools/run_diffusion_profiling.sh tencent/HunyuanImage-3.0-Instruct all
+
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -19,27 +14,25 @@ if [ $# -lt 1 ]; then
     exit 1
 fi
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 MODEL="$1"
 PHASE="${2:-all}"
-VLLM_OMNI_DIR="${VLLM_OMNI_DIR:-/path/to/vllm-omni}"
+VLLM_OMNI_DIR="${VLLM_OMNI_DIR:-$(pwd)}"
 MODEL_SHORT="$(echo "$MODEL" | sed 's|.*/||; s|[^a-zA-Z0-9_-]|_|g')"
-RESULT_DIR="/tmp/${MODEL_SHORT}_profiling_results"
-TORCH_PROFILE_DIR="/tmp/${MODEL_SHORT}_torch_traces"
-PORT=8100
-HOST="127.0.0.1"
-NUM_PROMPTS=3
-NUM_STEPS=50
-WIDTH=1024
-HEIGHT=1024
+RESULT_DIR="${RESULT_DIR:-/tmp/${MODEL_SHORT}_profiling_results}"
+TORCH_PROFILE_DIR="${TORCH_PROFILE_DIR:-/tmp/${MODEL_SHORT}_torch_traces}"
+PORT="${PORT:-8100}"
+HOST="${HOST:-127.0.0.1}"
+NUM_PROMPTS="${NUM_PROMPTS:-3}"
+NUM_STEPS="${NUM_STEPS:-50}"
+WIDTH="${WIDTH:-1024}"
+HEIGHT="${HEIGHT:-1024}"
+
+SERVER_PID=""
+declare -a SERVER_ARGS
+CONFIG_NAMES=("tp4_fp8" "tp2_fp8_sp2" "tp2_fp8_cfgp2")
 
 mkdir -p "$RESULT_DIR" "$TORCH_PROFILE_DIR"
 
-# ---------------------------------------------------------------------------
-# 环境检查（规则 18：启动前三连）
-# ---------------------------------------------------------------------------
 preflight() {
     echo "=== Preflight checks ==="
     echo "--- GPU status ---"
@@ -49,78 +42,68 @@ preflight() {
     ls "${HF_HOME:-/root/.cache/huggingface}/hub/" 2>/dev/null | grep "models--" | head -5 || echo "(no models cached)"
     echo "--- Cache vars ---"
     env | grep -iE "cache|hf_home|offline" || true
-    echo "--- unset TRANSFORMERS_CACHE ---"
     unset TRANSFORMERS_CACHE 2>/dev/null || true
     echo "=== Preflight done ==="
 }
 
-# ---------------------------------------------------------------------------
-# Stage config YAML 生成
-# ---------------------------------------------------------------------------
-write_stage_config() {
-    local name="$1" tp="$2" quant="$3"
-    shift 3
-    local extra_parallel="$*"
-    local yaml_file="$RESULT_DIR/stage_config_${name}.yaml"
+build_server_args() {
+    local name="$1"
+    local profiler_json="${2:-}"
 
-    cat > "$yaml_file" <<YAML
-stage_args:
-  - stage_id: 0
-    stage_type: diffusion
-    engine_args:
-      enforce_eager: true
-      distributed_executor_backend: mp
-      quantization: ${quant}
-      parallel_config:
-        tensor_parallel_size: ${tp}
-${extra_parallel}
-    final_output: true
-    final_output_type: image
-YAML
-    echo "$yaml_file"
+    case "$name" in
+        tp4_fp8)
+            SERVER_ARGS=(
+                --tensor-parallel-size 4
+                --quantization fp8
+                --distributed-executor-backend mp
+                --enforce-eager
+                --enable-diffusion-pipeline-profiler
+            )
+            ;;
+        tp2_fp8_sp2)
+            SERVER_ARGS=(
+                --tensor-parallel-size 2
+                --usp 2
+                --quantization fp8
+                --distributed-executor-backend mp
+                --enforce-eager
+                --enable-diffusion-pipeline-profiler
+            )
+            ;;
+        tp2_fp8_cfgp2)
+            SERVER_ARGS=(
+                --tensor-parallel-size 2
+                --cfg-parallel-size 2
+                --quantization fp8
+                --distributed-executor-backend mp
+                --enforce-eager
+                --enable-diffusion-pipeline-profiler
+            )
+            ;;
+        *)
+            echo "Unknown config: $name"
+            exit 1
+            ;;
+    esac
+
+    if [ -n "$profiler_json" ]; then
+        SERVER_ARGS+=(--profiler-config "$profiler_json")
+    fi
 }
 
-write_stage_config_with_torch_profiler() {
-    local name="$1" tp="$2" quant="$3"
-    shift 3
-    local extra_parallel="$*"
-    local yaml_file="$RESULT_DIR/stage_config_${name}_torch.yaml"
-
-    cat > "$yaml_file" <<YAML
-stage_args:
-  - stage_id: 0
-    stage_type: diffusion
-    engine_args:
-      enforce_eager: true
-      distributed_executor_backend: mp
-      quantization: ${quant}
-      parallel_config:
-        tensor_parallel_size: ${tp}
-${extra_parallel}
-      profiler_config:
-        profiler: torch
-        torch_profiler_dir: ${TORCH_PROFILE_DIR}/${name}
-        delay_iterations: 1
-        warmup_iterations: 0
-        active_iterations: 1
-        max_iterations: 2
-    final_output: true
-    final_output_type: image
-YAML
-    echo "$yaml_file"
-}
-
-# ---------------------------------------------------------------------------
-# Server 启停
-# ---------------------------------------------------------------------------
 start_server() {
-    local config_yaml="$1"
-    echo ">>> Starting server with config: $config_yaml"
+    local name="$1"
+    local profiler_json="${2:-}"
+    local log_file="$RESULT_DIR/server_${name}.log"
+
+    build_server_args "$name" "$profiler_json"
+    echo ">>> Starting server for $name"
     python -m vllm_omni.entrypoints.cli.main serve "$MODEL" \
-        --stage-configs-path "$config_yaml" \
-        --enable-diffusion-pipeline-profiler \
+        --omni \
+        --host "$HOST" \
         --port "$PORT" \
-        2>&1 | tee "$RESULT_DIR/server_$(basename "$config_yaml" .yaml).log" &
+        "${SERVER_ARGS[@]}" \
+        2>&1 | tee "$log_file" &
     SERVER_PID=$!
 
     echo ">>> Waiting for server on $HOST:$PORT ..."
@@ -128,9 +111,9 @@ start_server() {
     while ! curl -s "http://$HOST:$PORT/health" > /dev/null 2>&1; do
         sleep 5
         waited=$((waited + 5))
-        if [ $waited -ge 600 ]; then
+        if [ "$waited" -ge 600 ]; then
             echo "ERROR: Server did not start within 600s"
-            kill $SERVER_PID 2>/dev/null || true
+            stop_server
             return 1
         fi
     done
@@ -138,19 +121,20 @@ start_server() {
 }
 
 stop_server() {
-    echo ">>> Stopping server (PID=$SERVER_PID)"
-    kill $SERVER_PID 2>/dev/null || true
-    wait $SERVER_PID 2>/dev/null || true
-    sleep 5
-    # 确认 GPU 显存释放
-    nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
+    if [ -n "${SERVER_PID:-}" ]; then
+        echo ">>> Stopping server (PID=$SERVER_PID)"
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+        SERVER_PID=""
+        sleep 5
+        nvidia-smi --query-gpu=index,memory.used --format=csv,noheader || true
+    fi
 }
 
-# ---------------------------------------------------------------------------
-# Benchmark 运行
-# ---------------------------------------------------------------------------
 run_benchmark() {
-    local name="$1" output_file="$RESULT_DIR/bench_${name}.json"
+    local name="$1"
+    local output_file="$RESULT_DIR/bench_${name}.json"
+
     echo ">>> Running benchmark: $name"
     python "$VLLM_OMNI_DIR/benchmarks/diffusion/diffusion_benchmark_serving.py" \
         --backend vllm-omni \
@@ -167,134 +151,104 @@ run_benchmark() {
     echo ">>> Results saved to: $output_file"
 }
 
-# ---------------------------------------------------------------------------
-# Torch profiler: 发一个请求触发 trace
-# ---------------------------------------------------------------------------
 run_torch_profile_request() {
     local name="$1"
-    echo ">>> Sending profiling request for: $name"
 
-    # start_profile
+    echo ">>> Sending profiling request for: $name"
     curl -s -X POST "http://$HOST:$PORT/start_profile" || true
     sleep 2
 
-    # 发一个请求
     curl -s -X POST "http://$HOST:$PORT/v1/chat/completions" \
         -H "Content-Type: application/json" \
         -d "{
-            \"model\": \"$MODEL\",
-            \"messages\": [{\"role\": \"user\", \"content\": \"A photo of a cat sitting on a windowsill\"}],
-            \"width\": $WIDTH,
-            \"height\": $HEIGHT,
-            \"num_inference_steps\": $NUM_STEPS
+            \"messages\": [{\"role\": \"user\", \"content\": \"A cinematic photo of a glass observatory on Mars at sunrise\"}],
+            \"extra_body\": {
+                \"height\": $HEIGHT,
+                \"width\": $WIDTH,
+                \"num_inference_steps\": $NUM_STEPS,
+                \"guidance_scale\": 5.0,
+                \"seed\": 42
+            }
         }" -o "$RESULT_DIR/profile_response_${name}.json"
 
     sleep 2
-    # stop_profile
     curl -s -X POST "http://$HOST:$PORT/stop_profile" || true
     sleep 5
     echo ">>> Torch traces should be in: $TORCH_PROFILE_DIR/$name/"
 }
 
-# ---------------------------------------------------------------------------
-# 三种配置定义
-# ---------------------------------------------------------------------------
-declare -A CONFIGS
-CONFIGS[tp4_fp8]="4 fp8 "
-CONFIGS[tp2_fp8_sp2]="2 fp8         sequence_parallel_size: 2
-        ulysses_degree: 2"
-CONFIGS[tp2_fp8_cfgp2]="2 fp8         cfg_parallel_size: 2"
-
-CONFIG_NAMES=("tp4_fp8" "tp2_fp8_sp2" "tp2_fp8_cfgp2")
-
-# ---------------------------------------------------------------------------
-# Phase 1: Stage durations (lightweight pipeline profiler)
-# ---------------------------------------------------------------------------
-run_stage_durations() {
-    echo ""
-    echo "============================================================"
-    echo "  Phase 1: Per-layer stage_durations (pipeline profiler)"
-    echo "============================================================"
-
-    for name in "${CONFIG_NAMES[@]}"; do
-        echo ""
-        echo "--- Config: $name ---"
-        local tp quant extra
-        read -r tp quant <<< "$(echo "${CONFIGS[$name]}" | head -1 | awk '{print $1, $2}')"
-
-        local extra_lines=""
-        if [ "$name" = "tp2_fp8_sp2" ]; then
-            extra_lines="        sequence_parallel_size: 2
-        ulysses_degree: 2"
-        elif [ "$name" = "tp2_fp8_cfgp2" ]; then
-            extra_lines="        cfg_parallel_size: 2"
-        fi
-
-        local yaml_file
-        yaml_file=$(write_stage_config "$name" "$tp" "$quant" "$extra_lines")
-
-        start_server "$yaml_file"
-        run_benchmark "$name"
-        stop_server
-    done
-
+print_stage_duration_summary() {
     echo ""
     echo "=== Stage duration results ==="
     for name in "${CONFIG_NAMES[@]}"; do
         echo ""
         echo "--- $name ---"
         python3 -c "
-import json, sys
-with open('$RESULT_DIR/bench_${name}.json') as f:
+import json
+path = '$RESULT_DIR/bench_${name}.json'
+with open(path) as f:
     data = json.load(f)
-print(f'  Throughput: {data.get(\"throughput_qps\", \"N/A\"):.4f} qps')
-print(f'  Latency mean: {data.get(\"latency_mean\", \"N/A\"):.3f}s')
-print(f'  Peak memory: {data.get(\"peak_memory_mb_mean\", \"N/A\"):.0f} MB')
-sd = data.get('stage_durations_mean', {})
-if sd:
+print(f'  Throughput: {data.get(\"throughput_qps\", 0):.4f} qps')
+print(f'  Latency mean: {data.get(\"latency_mean\", 0):.3f}s')
+print(f'  Peak memory: {data.get(\"peak_memory_mb_mean\", 0):.0f} MB')
+stage_durations = data.get('stage_durations_mean', {})
+if stage_durations:
     print('  Stage durations (mean):')
-    for k, v in sorted(sd.items(), key=lambda x: -x[1]):
-        print(f'    {k}: {v:.4f}s')
+    for key, value in sorted(stage_durations.items(), key=lambda item: -item[1]):
+        print(f'    {key}: {value:.4f}s')
 else:
     print('  (no stage_durations in output)')
 " 2>/dev/null || echo "  (parse error, check $RESULT_DIR/bench_${name}.json)"
     done
 }
 
-# ---------------------------------------------------------------------------
-# Phase 2: Torch profiler (kernel-level)
-# ---------------------------------------------------------------------------
+run_stage_durations() {
+    echo ""
+    echo "============================================================"
+    echo "  Phase 1: Per-layer stage durations"
+    echo "============================================================"
+
+    for name in "${CONFIG_NAMES[@]}"; do
+        echo ""
+        echo "--- Config: $name ---"
+        start_server "$name"
+        run_benchmark "$name"
+        stop_server
+    done
+
+    print_stage_duration_summary
+}
+
 run_torch_profiling() {
     echo ""
     echo "============================================================"
-    echo "  Phase 2: Torch profiler (kernel traces for fp8 GEMM)"
+    echo "  Phase 2: Torch profiler"
     echo "============================================================"
-    echo "  Only running tp4_fp8 config (representative for fp8 path)"
+    echo "  Only running tp4_fp8 config as the representative FP8 path"
     echo ""
 
     local name="tp4_fp8"
-    local tp=4 quant="fp8"
-    mkdir -p "$TORCH_PROFILE_DIR/$name"
+    local trace_dir="$TORCH_PROFILE_DIR/$name"
+    mkdir -p "$trace_dir"
 
-    local yaml_file
-    yaml_file=$(write_stage_config_with_torch_profiler "$name" "$tp" "$quant" "")
+    local profiler_json
+    profiler_json=$(printf '{"profiler":"torch","torch_profiler_dir":"%s","delay_iterations":1,"warmup_iterations":0,"active_iterations":1,"max_iterations":2}' "$trace_dir")
 
-    start_server "$yaml_file"
+    start_server "$name" "$profiler_json"
     run_torch_profile_request "$name"
     stop_server
 
     echo ""
     echo "=== Torch profiler traces ==="
-    echo "Traces saved to: $TORCH_PROFILE_DIR/$name/"
-    ls -la "$TORCH_PROFILE_DIR/$name/" 2>/dev/null || echo "(empty)"
+    echo "Traces saved to: $trace_dir/"
+    ls -la "$trace_dir/" 2>/dev/null || echo "(empty)"
     echo ""
     echo "To analyze top-N kernels:"
-    echo "  python3 tools/analyze_torch_trace.py $TORCH_PROFILE_DIR/$name/"
+    echo "  python3 tools/analyze_torch_trace.py $trace_dir/"
 }
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+trap stop_server EXIT
+
 preflight
 
 case "$PHASE" in
@@ -309,7 +263,7 @@ case "$PHASE" in
         run_torch_profiling
         ;;
     *)
-        echo "Usage: $0 [all|stage_durations|torch_profile]"
+        echo "Usage: $0 <model> [all|stage_durations|torch_profile]"
         exit 1
         ;;
 esac
