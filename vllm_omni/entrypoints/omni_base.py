@@ -124,6 +124,7 @@ class OmniBase(PDDisaggregationMixin):
         stage_init_timeout = kwargs.pop("stage_init_timeout", 300)
         init_timeout = kwargs.pop("init_timeout", 600)
         log_stats = kwargs.pop("log_stats", False)
+        self._enable_ar_profiler = kwargs.pop("enable_ar_profiler", False)
         # NOTE: read-only lookup — must NOT pop. Popping here drops the key
         # before it reaches ``StageConfigFactory._create_from_registry``, so
         # ``--no-async-chunk`` (``async_chunk=False``) silently fails to
@@ -375,6 +376,30 @@ class OmniBase(PDDisaggregationMixin):
         engine_outputs = result.get("engine_outputs")
         stage_durations = getattr(result["engine_outputs"], "stage_durations", {})
         peak_memory_mb = getattr(result["engine_outputs"], "peak_memory_mb", 0.0)
+
+        # Merge AR stage timing from OrchestratorAggregator.stage_events
+        if self._enable_ar_profiler:
+            ar_events = metrics.stage_events.get(str(req_id), [])
+            for evt in ar_events:
+                if evt.stage_id != stage_id:
+                    stage_durations[f"ar_stage_{evt.stage_id}"] = evt.stage_gen_time_ms / 1000.0
+
+        # Merge pipeline timings from Orchestrator into stage_durations
+        _m = result.get("metrics")
+        if _m is not None and hasattr(_m, "pipeline_timings") and _m.pipeline_timings:
+            for key, value in _m.pipeline_timings.items():
+                if key not in stage_durations:
+                    stage_durations[key] = value
+
+        # Merge per-stage gen times into stage_durations
+        for evt in metrics.stage_events.get(str(req_id), []):
+            key = f"stage_{evt.stage_id}_gen_ms"
+            if key not in stage_durations:
+                stage_durations[key] = evt.stage_gen_time_ms
+        # Current stage gen time (not yet in stage_events at this point)
+        if _m is not None:
+            stage_durations.setdefault(f"stage_{stage_id}_gen_ms", _m.stage_gen_time_ms)
+
         finished = engine_outputs.finished
 
         submit_ts = result.get("stage_submit_ts")

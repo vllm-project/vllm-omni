@@ -477,6 +477,11 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable diffusion pipeline profiler to display stage durations.",
         )
+        omni_config_group.add_argument(
+            "--enable-ar-profiler",
+            action="store_true",
+            help="Enable AR stage profiler to include AR stage timing in stage_durations.",
+        )
         # Stash via type(self) so the docs hook (which execs this function in a
         # sandboxed globals dict via ``DummySelf``) doesn't fail on a NameError.
         type(self)._parser = serve_parser

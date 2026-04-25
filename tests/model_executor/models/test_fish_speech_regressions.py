@@ -45,7 +45,7 @@ def test_dac_decoder_mixed_batch_empty_request_does_not_misalign_indices():
 
     out = decoder.forward(
         input_ids=torch.arange(20, dtype=torch.long),
-        runtime_additional_information=[{}, {"left_context_size": 1}],
+        runtime_additional_information=[{}, {"meta": {"left_context_size": 1}}],
     )
 
     audios = out.multimodal_outputs["model_outputs"]

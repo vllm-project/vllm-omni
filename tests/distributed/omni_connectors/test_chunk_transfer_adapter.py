@@ -12,6 +12,7 @@ from pytest_mock import MockerFixture
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -111,7 +112,11 @@ def test_load_poll(build_adapter):
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
 
     adapter.load_async(request)
-    payload = {"code_predictor_codes": [[1]], "hidden_states": torch.tensor([[2.0]]), "finished": True}
+    payload: OmniPayload = {
+        "codes": {"audio": [[1]]},
+        "hidden_states": {"output": torch.tensor([[2.0]])},
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
     connector.get.return_value = (payload, 16)
     adapter._poll_single_request(request)
 
@@ -154,12 +159,49 @@ def test_send_single_request_cleans_up_after_finished_payload(build_adapter, mon
 def test_update_request_payload(build_adapter):
     adapter, _ = build_adapter()
 
-    adapter._update_request_payload("ext", {"h": torch.tensor([[1.0]]), "codes": [1], "finished": False})
-    merged = adapter._update_request_payload("ext", {"h": torch.tensor([[2.0]]), "codes": [2], "finished": True})
+    first: OmniPayload = {
+        "hidden_states": {"output": torch.tensor([[1.0]])},
+        "codes": {"audio": [1]},
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+    }
+    adapter._update_request_payload("ext", first)
+    second: OmniPayload = {
+        "hidden_states": {"output": torch.tensor([[2.0]])},
+        "codes": {"audio": [2]},
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+    merged = adapter._update_request_payload("ext", second)
 
-    assert torch.equal(merged["h"], torch.tensor([[1.0], [2.0]]))
-    assert merged["codes"] == [1, 2]
-    assert merged["finished"] is True
+    assert torch.equal(merged["hidden_states"]["output"], torch.tensor([[1.0], [2.0]]))
+    assert merged["codes"]["audio"] == [1, 2]
+    assert merged["meta"]["finished"].item() is True
+
+
+def test_load_poll_ar_request_additional_information_concats_tensors(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req("req-merged", RequestStatus.WAITING, external_req_id="ext-merged")
+
+    adapter.request_ids_mapping["req-merged"] = "ext-merged"
+    adapter.request_payload["ext-merged"] = {
+        "hidden_states": {"output": torch.tensor([[1.0]])},
+        "ids": {"prompt": [11, 12]},
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+    }
+    payload: OmniPayload = {
+        "hidden_states": {"output": torch.tensor([[2.0]])},
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+    connector.get.return_value = (payload, 8)
+
+    adapter._poll_single_request(request)
+
+    assert torch.equal(
+        request.additional_information["hidden_states"]["output"],
+        torch.tensor([[1.0], [2.0]]),
+    )
+    # Keys absent from the new chunk are dropped (matches main's behavior).
+    assert "ids" not in request.additional_information
+    assert request.additional_information["meta"]["finished"].item() is True
 
 
 def test_process_and_restore_queues(build_adapter):
@@ -321,7 +363,10 @@ def test_cleanup_after_poll_flow(build_adapter):
     adapter.load_async(request)
 
     adapter.request_ids_mapping["req-flow"] = "ext-flow"
-    payload = {"hidden_states": torch.tensor([[1.0]]), "finished": True}
+    payload: OmniPayload = {
+        "hidden_states": {"output": torch.tensor([[1.0]])},
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
     connector.get.return_value = (payload, 8)
     adapter._poll_single_request(request)
 

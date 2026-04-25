@@ -545,7 +545,9 @@ class Qwen3MoeLLMModel(_Qwen3MoeLLMModel):
 
             if captured_hidden_states is not None and capture_set is not None:
                 if layer_idx in capture_set:
-                    captured_hidden_states[str(layer_idx)] = hidden_states.clone().view(-1, hidden_states.shape[-1])
+                    hs = captured_hidden_states.setdefault("hidden_states", {})
+                    layers = hs.setdefault("layers", {})
+                    layers[layer_idx] = hidden_states.clone().view(-1, hidden_states.shape[-1])
 
             hidden_states, residual = layer(
                 positions,
