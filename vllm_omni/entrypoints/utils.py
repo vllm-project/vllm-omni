@@ -45,12 +45,14 @@ def detect_explicit_cli_keys(
     parser: argparse.ArgumentParser | None = None,
 ) -> set[str]:
     """Walk ``argv`` and return the set of ``dest`` attribute names the user
-    explicitly provided (e.g. ``--max-num-seqs 64`` -> ``max_num_seqs``).
+    explicitly provided (e.g. ``--max-num-seqs 64`` → ``max_num_seqs``).
 
     Used to distinguish user-typed CLI args from argparse default values so
     deploy YAMLs are not silently overridden by parser defaults. Shared
     across online (``vllm serve``) and offline (scripts, examples, tests,
-    CI) entry points.
+    CI) entry points — offline callers that parse CLI args via argparse
+    should invoke this on ``sys.argv[1:]`` and pass the result through to
+    ``AsyncOmni`` / ``Omni`` via the ``_cli_explicit_keys`` kwarg.
 
     When ``parser`` is provided, each token is looked up in the parser's
     action table to find its real ``dest``. This correctly handles flags
@@ -61,7 +63,7 @@ def detect_explicit_cli_keys(
     always pass it.
 
     When ``parser`` is ``None``, a name-based heuristic is used as a
-    fallback (hyphens -> underscores, plus a ``no_`` prefix strip for
+    fallback (hyphens → underscores, plus a ``no_`` prefix strip for
     ``argparse.BooleanOptionalAction``). This is correct for simple flags
     but silently misidentifies ``--disable-X``-style flags and explicit
     ``dest=`` overrides, so prefer the parser-aware form.
