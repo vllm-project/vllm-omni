@@ -689,6 +689,18 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
 )
 
 
+def deploy_override_field_names() -> frozenset[str]:
+    """Return deploy-schema fields whose CLI defaults must not override YAML."""
+    return (
+        frozenset(_STAGE_DEPLOY_FIELDS)
+        | frozenset(_PIPELINE_WIDE_ENGINE_FIELDS)
+        | {
+            "async_chunk",
+            "devices",
+        }
+    )
+
+
 def _build_engine_args(
     ps: StagePipelineConfig,
     ds: StageDeployConfig | None,
