@@ -30,6 +30,7 @@ from vllm import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni import AsyncOmni
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 
 logger = logging.getLogger(__name__)
@@ -304,6 +305,7 @@ def parse_args() -> Namespace:
         default=None,
         help="CFG alpha for flow-matching guidance (default: use value from stage config, typically 1.2).",
     )
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 
