@@ -385,6 +385,7 @@ def main(args):
     os.makedirs(output_dir, exist_ok=True)
 
     omni_kwargs = vars(args).copy()
+    # Override CLI --model with the derived model_name.
     omni_kwargs["model"] = model_name
     omni = Omni(**omni_kwargs)
 
@@ -403,6 +404,7 @@ async def main_streaming(args):
     os.makedirs(output_dir, exist_ok=True)
 
     omni_kwargs = vars(args).copy()
+    # Override CLI --model with the derived model_name.
     omni_kwargs["model"] = model_name
     omni = AsyncOmni(**omni_kwargs)
 

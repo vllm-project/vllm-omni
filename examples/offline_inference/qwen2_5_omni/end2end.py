@@ -327,6 +327,7 @@ def main(args):
         query_result = query_func()
     args.quantization_config = quantization_config
     omni_kwargs = vars(args).copy()
+    # Override CLI --model with the derived model_name.
     omni_kwargs["model"] = model_name
     omni = Omni(**omni_kwargs)
     thinker_sampling_params = SamplingParams(

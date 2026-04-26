@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import os
 import time
 import types
+import warnings
 import weakref
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal
@@ -84,6 +86,25 @@ OutputMessageHandleResult = tuple[Literal[True], None, None, None] | tuple[Liter
 
 class OmniBase(PDDisaggregationMixin):
     """Shared runtime foundation for AsyncOmni and Omni."""
+
+    @classmethod
+    def from_cli_args(
+        cls,
+        args: argparse.Namespace,
+        *,
+        parser: argparse.ArgumentParser | None = None,
+        **overrides: Any,
+    ) -> OmniBase:
+        warnings.warn(
+            "`from_cli_args()` is deprecated. Nullify deploy-overriding parser defaults "
+            "with `nullify_stage_engine_defaults(parser)` and construct Omni/AsyncOmni "
+            "directly from `vars(args)`.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        kwargs: dict[str, Any] = {k: v for k, v in vars(args).items() if not k.startswith("_")}
+        kwargs.update(overrides)
+        return cls(**kwargs)
 
     def __init__(
         self,

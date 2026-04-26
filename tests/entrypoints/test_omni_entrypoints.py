@@ -193,6 +193,27 @@ def test_direct_omni_with_nullified_parser_only_nulls_untyped_override_fields(
 
     assert captured["gpu_memory_utilization"] is None
     assert captured["hsdp_shard_size"] == -1
+    assert "_cli_explicit_keys" not in captured
+
+
+def test_from_cli_args_warns_and_forwards_without_internal_keys(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, Any] = {}
+
+    def fake_engine(*args: Any, **kwargs: Any) -> FakeAsyncOmniEngine:
+        captured.update(kwargs)
+        return FakeAsyncOmniEngine()
+
+    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", fake_engine)
+    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
+
+    args = argparse.Namespace(model="fake-model", gpu_memory_utilization=0.9, _cli_explicit_keys={"model"})
+    with pytest.deprecated_call(match="from_cli_args"):
+        Omni.from_cli_args(args)
+
+    assert captured["gpu_memory_utilization"] == 0.9
+    assert "_cli_explicit_keys" not in captured
 
 
 def _make_base():

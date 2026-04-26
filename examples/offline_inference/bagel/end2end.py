@@ -164,6 +164,7 @@ def main():
     if args.quantization:
         omni_kwargs["quantization_config"] = args.quantization
 
+    # Override CLI --model with the derived model_name.
     omni_kwargs["model"] = model_name
     omni = Omni(**omni_kwargs)
 

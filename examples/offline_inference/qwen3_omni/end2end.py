@@ -296,6 +296,7 @@ def main(args):
         query_result = query_func()
 
     omni_kwargs = vars(args).copy()
+    # Override CLI --model with the derived model_name.
     omni_kwargs["model"] = model_name
     omni = Omni(**omni_kwargs)
 
