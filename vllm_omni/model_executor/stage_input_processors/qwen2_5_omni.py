@@ -33,7 +33,7 @@ def thinker2talker(
     for i, thinker_output in enumerate(thinker_outputs):
         output = thinker_output.outputs[0]
         prompt_token_ids = thinker_output.prompt_token_ids
-        thinker_output_ids = output.token_ids
+        thinker_output_ids = output.cumulative_token_ids
         prompt_token_ids_len = len(prompt_token_ids)
         mm: OmniPayload = output.multimodal_output
         latent = mm["latent"]

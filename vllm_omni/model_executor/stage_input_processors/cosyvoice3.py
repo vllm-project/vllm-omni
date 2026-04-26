@@ -79,7 +79,7 @@ def text2flow(
         if multi_modal_data is None:
             raise RuntimeError(f"Missing multimodal_output for request {source_output.request_id}")
 
-        output_ids = _ensure_list(output.token_ids)
+        output_ids = _ensure_list(output.cumulative_token_ids)
         prefix_ids = _ensure_list(source_output.prompt_token_ids)
         additional_info = dict(multi_modal_data)
         additional_info.setdefault("ids", {})["prompt"] = prefix_ids
