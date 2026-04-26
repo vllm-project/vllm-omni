@@ -416,7 +416,7 @@ def thinker2talker(
         output = thinker_output.outputs[0]
         req_id = str(getattr(thinker_output, "request_id", f"idx-{i}"))
         prompt_token_ids = _ensure_list(thinker_output.prompt_token_ids)
-        output_ids = _ensure_list(output.token_ids)
+        output_ids = _ensure_list(output.cumulative_token_ids)
         is_streaming_session = bool(getattr(streaming_context, "enabled", False))
         if is_streaming_session:
             prompt_token_ids, output_ids, thinker_sequences, thinker_input_ids = _get_streaming_talker_tokens(
@@ -595,7 +595,7 @@ def talker2code2wav(
     for i, talker_output in enumerate(talker_outputs):
         output = talker_output.outputs[0]
         req_id = str(getattr(talker_output, "request_id", f"idx-{i}"))
-        cur_seq_len = len(output.token_ids) - 1
+        cur_seq_len = len(output.cumulative_token_ids) - 1
         seq_len = cur_seq_len
         is_streaming_session = bool(getattr(streaming_context, "enabled", False))
         if is_streaming_session:

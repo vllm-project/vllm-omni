@@ -27,7 +27,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def _source_output(token_ids: list[int], mm_output: dict | None = None):
     """Create a minimal AR output mock."""
     return SimpleNamespace(
-        outputs=[SimpleNamespace(token_ids=token_ids)],
+        outputs=[SimpleNamespace(token_ids=token_ids, cumulative_token_ids=token_ids)],
         multimodal_output=mm_output,
     )
 

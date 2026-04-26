@@ -240,7 +240,7 @@ def ar2diffusion(
     for i, ar_output in enumerate(ar_outputs):
         _t_req = time.perf_counter()
         output = ar_output.outputs[0]
-        generated_token_ids = output.token_ids
+        generated_token_ids = output.cumulative_token_ids
 
         # Get original prompt info
         original_prompt = prompt[i] if i < len(prompt) else {}
