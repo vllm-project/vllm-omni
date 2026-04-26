@@ -28,7 +28,6 @@ from PIL import Image
 from pydantic import BaseModel, Field
 from starlette.datastructures import State
 from starlette.routing import Route
-from vllm import SamplingParams
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.chat_utils import load_chat_template
@@ -118,11 +117,15 @@ from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.serving_video_stream import OmniStreamingVideoHandler
+from vllm_omni.entrypoints.openai.stage_params import (
+    build_stage_sampling_params_list,
+    get_default_sampling_params_list,
+)
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 logger = init_logger(__name__)
 router = APIRouter()
@@ -2018,34 +2021,12 @@ async def _generate_with_async_omni(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
             detail="Stage configs not found. Start server with a multi-stage omni model.",
         )
-    default_params_list: list[OmniSamplingParams] | None = getattr(
-        engine_client,
-        "default_sampling_params_list",
-        None,
+    sampling_params_list = build_stage_sampling_params_list(
+        normalized_stage_configs,
+        get_default_sampling_params_list(engine_client),
+        diffusion_params=gen_params,
+        replace_diffusion_params=True,
     )
-    if not isinstance(default_params_list, list):
-        default_params_list = []
-    else:
-        default_params_list = list(default_params_list)
-
-    sampling_params_list: list[OmniSamplingParams] = []
-    for idx, stage_cfg in enumerate(normalized_stage_configs):
-        stage_type = get_stage_type(stage_cfg)
-        if stage_type == "diffusion":
-            sampling_params_list.append(gen_params)
-            continue
-
-        if idx < len(default_params_list):
-            default_stage_params = default_params_list[idx]
-        else:
-            default_stage_params = SamplingParams()
-
-        if hasattr(default_stage_params, "clone"):
-            try:
-                default_stage_params = default_stage_params.clone()
-            except Exception:
-                pass
-        sampling_params_list.append(default_stage_params)
 
     async for output in engine_client.generate(
         sampling_params_list=sampling_params_list,
