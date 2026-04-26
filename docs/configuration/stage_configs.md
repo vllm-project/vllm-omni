@@ -19,13 +19,16 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | `platforms` | dict | optional | `null` | Keyed by `npu` / `rocm` / `xpu`, each contains a `stages:` list with per-platform overrides applied on top of the CUDA defaults. |
 | `pipeline` | str | optional | `null` | Override the auto-detected pipeline registry key (used for structural variants like `qwen2_5_omni_thinker_only`). |
 | `trust_remote_code` | bool | optional | `true` | **Pipeline-wide.** Trust HF remote code on model load; applies to every stage. |
-| `distributed_executor_backend` | str | optional | `"mp"` | **Pipeline-wide.** Executor backend (`"mp"` or `"ray"`). |
+| `distributed_executor_backend` | str \| null | optional | `null` | **Pipeline-wide.** Distributed executor backend forwarded to vLLM (`"mp"`, `"ray"`, `"external_launcher"`). If omitted, vLLM auto-selects backend from runtime topology. |
 | `dtype` | str \| null | optional | `null` | **Pipeline-wide.** Model dtype for every stage. |
 | `quantization` | str \| null | optional | `null` | **Pipeline-wide.** Quantization method for every stage. |
 | `enable_prefix_caching` | bool | optional | `false` | **Pipeline-wide.** Prefix cache toggle applied to every stage. |
 | `enable_chunked_prefill` | bool \| null | optional | `null` | **Pipeline-wide.** Chunked prefill toggle applied to every stage. |
 | `data_parallel_size` | int | optional | `1` | **Pipeline-wide.** DP degree for every stage. |
 | `pipeline_parallel_size` | int | optional | `1` | **Pipeline-wide.** PP degree for every stage. |
+
+Note: for diffusion path, `distributed_executor_backend` currently defaults to
+`mp`, and `ray` / `external_launcher` are not fully supported yet.
 
 ### Stage fields
 
@@ -88,6 +91,55 @@ stages:
 | `--async-chunk` / `--no-async-chunk` | Flip the deploy YAML's `async_chunk:` bool. Unset (default) leaves the YAML value in force. |
 | `--stage-configs-path` | **Deprecated.** Accepts legacy `stage_args` yamls and (auto-detected) new deploy yamls; emits a deprecation warning. Migrate to `--deploy-config`. To be removed in a follow-up PR. |
 
+### Stage-Based CLI Paradigm
+
+The stage-based CLI paradigm facilitates the execution of discrete pipeline stages within isolated processes:
+
+- **Stage 0** typically encapsulates the orchestrator and the primary API server. Invocation requires `--stage-id 0`,
+  `--omni-master-address`, `--omni-master-port`, and standard port declarations (e.g., `--port`).
+- **Worker Stages** operate without a distinct API server (i.e., using `--headless`), are assigned sequential `--stage-id` identifiers, and must reference the corresponding
+  `--omni-master-address` and `--omni-master-port` parameters to successfully register with Stage 0.
+
+For migrated architectures, the system automatically resolves and loads the bundled deployment YAML. Consequently, the primary execution path
+does **not** necessitate the explicit definition of `--deploy-config`:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --port 8091 \
+    --stage-id 0 \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --stage-id 1 \
+    --headless \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+```
+
+When instantiating a custom deployment YAML conforming to the updated schema, append the `--deploy-config /path/to/override.yaml` directive
+to all node invocations. For legacy architectures (e.g., BAGEL) configured via deprecated `stage_args:` schemas, continue to specify the relevant configuration via `--stage-configs-path /path/to/config.yaml`.
+
+In the context of standard initialization architectures, utilizing the `--stage-overrides` parameter operates as the optimal methodology
+for delineating stage-specific tuning from the CLI interface:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --stage-overrides '{"1": {"gpu_memory_utilization": 0.5}}'
+```
+
+Conversely, in the context of the **stage-based CLI** paradigm, given that each execution process exclusively instantiates a single pipeline stage, configuration override attributes
+can be defined uniformly via explicit CLI flags on the corresponding instantiation command, rendering composite `--stage-overrides` JSON strings unnecessary:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --stage-id 1 \
+    --headless \
+    --gpu-memory-utilization 0.5 \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+```
+
 ### Precedence
 
 From highest to lowest:
@@ -133,6 +185,17 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     --stage-overrides '{"0": {"max_num_seqs": 8}}'
 ```
 
+Within the stage-based CLI paradigm, equivalent configuration parameters can inherently be passed directly
+as command-line arguments to the designated single-stage process instantiation:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --stage-id 0 \
+    --max-num-seqs 8 \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+```
+
 Effective config per stage after the merge:
 
 | Stage | Field | Final value | Source |
@@ -153,9 +216,14 @@ Therefore, as a core part of vLLM-Omni, the stage configs for a model have sever
 - Input and output dependencies for each stage.
 - Default input parameters.
 
-If users want to modify some part of it. The custom stage_configs file can be input as input argument in both online and offline. Just like examples below:
+To override specific parameters, explicitly inject the customized configuration schema
+in both online and offline instantiation flows. Prioritize the `--deploy-config` flag
+when loading the new-schema deploy YAML schemas, reserving the `--stage-configs-path` parameter
+exclusively to maintain compatibility with legacy `stage_args` YAML constructs.
 
-For offline (Assume necessary dependencies have ben imported):
+Examples:
+
+For offline (Assume necessary dependencies have been imported):
 ```python
 model_name = "Qwen/Qwen2.5-Omni-7B"
 omni = Omni(model=model_name, stage_configs_path="/path/to/custom_stage_configs.yaml")
@@ -163,7 +231,13 @@ omni = Omni(model=model_name, stage_configs_path="/path/to/custom_stage_configs.
 
 For online serving:
 ```bash
-vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/deploy_config.yaml
+```
+
+Legacy online serving:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
 ```
 !!! important
     We are actively iterating on the definition of stage configs, and we welcome all feedbacks from both community users and developers to help us shape the development!

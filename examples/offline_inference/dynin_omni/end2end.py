@@ -970,6 +970,9 @@ def parse_args(repo_root: Path) -> argparse.Namespace:
     parser.add_argument("--vq-model-audio-local-files-only", action=argparse.BooleanOptionalAction, default=None)
 
     parser.add_argument("--disable-hf-xet", action=argparse.BooleanOptionalAction, default=True)
+    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

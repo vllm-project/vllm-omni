@@ -19,6 +19,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "FishSpeechFastARConfig": "vllm_omni.transformers_utils.configs.fish_speech",
     "VoxCPMConfig": "vllm_omni.transformers_utils.configs.voxcpm",
     "VoxCPM2Config": "vllm_omni.transformers_utils.configs.voxcpm2",
+    "VoxtralTTSConfig": "vllm_omni.transformers_utils.configs.voxtral_tts",
     "BailingMoeV2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "BailingMM2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "MingFlashOmniConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
@@ -36,6 +37,7 @@ __all__ = [
     "FishSpeechFastARConfig",
     "VoxCPMConfig",
     "VoxCPM2Config",
+    "VoxtralTTSConfig",
     "BailingMoeV2Config",
     "BailingMM2Config",
     "MingFlashOmniConfig",
@@ -64,3 +66,4 @@ from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2
 from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_omni  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm as _voxcpm  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import voxtral_tts as _voxtral_tts  # noqa: F401, E402

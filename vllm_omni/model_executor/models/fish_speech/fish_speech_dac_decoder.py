@@ -230,8 +230,9 @@ class FishSpeechDACDecoder(nn.Module):
             for i, info in enumerate(runtime_additional_information):
                 if i >= len(left_context_size):
                     break
-                if "left_context_size" in info:
-                    left_context_size[i] = info["left_context_size"]
+                meta = info.get("meta", {}) if isinstance(info, dict) else {}
+                if "left_context_size" in meta:
+                    left_context_size[i] = meta["left_context_size"]
 
         for i, req_ids in enumerate(request_ids_list):
             if req_ids.numel() < 1:

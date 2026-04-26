@@ -5,6 +5,7 @@ import importlib
 
 import torch.nn as nn
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -13,6 +14,7 @@ from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -83,6 +85,26 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2_image2video",
         "LTX2ImageToVideoTwoStagesPipeline",
     ),
+    "LTX2T2VDMD2Pipeline": (
+        "ltx2",
+        "pipeline_ltx2",
+        "LTX2T2VDMD2Pipeline",
+    ),
+    "LTX2I2VDMD2Pipeline": (
+        "ltx2",
+        "pipeline_ltx2_image2video",
+        "LTX2I2VDMD2Pipeline",
+    ),
+    "LTX23Pipeline": (
+        "ltx2",
+        "pipeline_ltx2_3",
+        "LTX23Pipeline",
+    ),
+    "LTX23ImageToVideoPipeline": (
+        "ltx2",
+        "pipeline_ltx2_3_image2video",
+        "LTX23ImageToVideoPipeline",
+    ),
     "StableAudioPipeline": (
         "stable_audio",
         "pipeline_stable_audio",
@@ -92,6 +114,16 @@ _DIFFUSION_MODELS = {
         "wan2_2",
         "pipeline_wan2_2_i2v",
         "Wan22I2VPipeline",
+    ),
+    "WanT2VDMD2Pipeline": (
+        "wan2_2",
+        "pipeline_wan2_2",
+        "WanT2VDMD2Pipeline",
+    ),
+    "WanI2VDMD2Pipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_i2v",
+        "WanI2VDMD2Pipeline",
     ),
     "LongCatImagePipeline": (
         "longcat_image",
@@ -188,6 +220,11 @@ _DIFFUSION_MODELS = {
         "pipeline_omnivoice",
         "OmniVoicePipeline",
     ),
+    "DiffusersAdapterPipeline": (
+        "diffusers_adapter",
+        "pipeline_diffusers_adapter",
+        "DiffusersAdapterPipeline",
+    ),
 }
 
 
@@ -205,6 +242,22 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
 }
+
+
+def _prepare_diffusion_quant_config(
+    od_config: OmniDiffusionConfig,
+    model_class: type[nn.Module],
+) -> None:
+    """Prepare diffusion quant config using vLLM-style model bindings."""
+    quant_config = od_config.quantization_config
+    if quant_config is None:
+        return
+    if hasattr(quant_config, "maybe_update_config"):
+        quant_config.maybe_update_config(od_config.model)
+    diffusion_packed_modules_mapping = current_omni_platform.get_diffusion_packed_modules_mapping(model_class)
+    if diffusion_packed_modules_mapping is not None:
+        model_class.packed_modules_mapping = diffusion_packed_modules_mapping
+    configure_quant_config(quant_config, model_class)
 
 
 def initialize_model(
@@ -229,6 +282,7 @@ def initialize_model(
     """
     model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
     if model_class is not None:
+        _prepare_diffusion_quant_config(od_config, model_class)
         model = model_class(od_config=od_config)
 
         vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
@@ -357,8 +411,14 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX2TwoStagesPipeline": "get_ltx2_post_process_func",
     "LTX2ImageToVideoPipeline": "get_ltx2_post_process_func",
     "LTX2ImageToVideoTwoStagesPipeline": "get_ltx2_post_process_func",
+    "LTX2T2VDMD2Pipeline": "get_ltx2_post_process_func",
+    "LTX2I2VDMD2Pipeline": "get_ltx2_post_process_func",
+    "LTX23Pipeline": "get_ltx2_post_process_func",
+    "LTX23ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
+    "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
+    "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
@@ -390,6 +450,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanPipeline": "get_wan22_pre_process_func",
     "WanVACEPipeline": "get_wan22_vace_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
+    "WanT2VDMD2Pipeline": "get_wan22_pre_process_func",
+    "WanI2VDMD2Pipeline": "get_wan22_i2v_pre_process_func",
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
     "HeliosPipeline": "get_helios_pre_process_func",
     "HeliosPyramidPipeline": "get_helios_pre_process_func",

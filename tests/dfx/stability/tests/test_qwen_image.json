@@ -1,0 +1,28 @@
+[
+    {
+        "test_name": "test_qwen_image_stability",
+        "server_params": {
+            "model": "Qwen/Qwen-Image"
+        },
+        "benchmark_params": [
+            {
+                "dataset": "random",
+                "task": "t2i",
+                "backend": "vllm-omni",
+                "duration_sec": 86400,
+                "max_concurrency": 1,
+                "num_prompts_per_batch": 10,
+                "width": {
+                    "min": 512,
+                    "max": 2048
+                },
+                "height": {
+                    "min": 512,
+                    "max": 2048
+                },
+                "num_inference_steps": 50,
+                "enable_negative_prompt": true
+            }
+        ]
+    }
+]

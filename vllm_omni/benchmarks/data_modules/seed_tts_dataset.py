@@ -94,7 +94,7 @@ def _load_meta_rows(meta_file: Path) -> list[_SeedTTSRow]:
     return rows
 
 
-def resolve_seed_tts_root(dataset_path: str | None, *, explicit_root: str | None) -> Path:
+def resolve_seed_tts_root(dataset_path: str | None, *, explicit_root: str | None, locale: str = "en") -> Path:
     """Return directory containing ``{locale}/meta.lst`` and ``{locale}/prompt-wavs/``."""
     if explicit_root:
         root = Path(explicit_root).expanduser().resolve()
@@ -117,7 +117,14 @@ def resolve_seed_tts_root(dataset_path: str | None, *, explicit_root: str | None
             "Install huggingface_hub to download Seed-TTS from the Hub, or clone the dataset "
             "locally and pass --dataset-path / --seed-tts-root to that directory."
         ) from e
-    cache = snapshot_download(repo_id=repo_id, repo_type="dataset")
+    # Download only the requested locale subtree instead of the whole dataset
+    # repo. This avoids large, flaky nightly downloads when we only need e.g.
+    # ``en/meta.lst`` + ``en/prompt-wavs/**``.
+    cache = snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        allow_patterns=[f"{locale}/**"],
+    )
     return Path(cache).resolve()
 
 
@@ -172,7 +179,7 @@ class SeedTTSDataset(BenchmarkDataset):
             disable_shuffle=disable_shuffle,
             **kwargs,
         )
-        self._root = resolve_seed_tts_root(self.dataset_path, explicit_root=self._explicit_root)
+        self._root = resolve_seed_tts_root(self.dataset_path, explicit_root=self._explicit_root, locale=self.locale)
         self._rows: list[_SeedTTSRow] = []
         self.load_data()
 
@@ -252,6 +259,146 @@ class SeedTTSDataset(BenchmarkDataset):
         return out
 
 
+@dataclass
+class _SeedTTSDesignRow:
+    utterance_id: str
+    target_text: str
+    voice_description: str
+
+
+def _parse_design_meta_line(line: str) -> _SeedTTSDesignRow | None:
+    """Parse a 5-field design meta.lst line.
+
+    Format: ``utt_id|ref_text|wav_rel|target_text|voice_description``
+
+    Returns None (with a warning) if the line has fewer than 5 fields or if
+    voice_description is empty.
+    """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    parts = line.split("|")
+    if len(parts) < 5:
+        logger.warning("Skipping malformed design meta.lst line (need 5 '|'-fields): %r", line[:120])
+        return None
+    utt_id = parts[0].strip()
+    target_text = parts[3].strip()
+    voice_description = parts[4].strip()
+    if not voice_description:
+        logger.warning("Skipping design meta.lst line with empty voice_description: %r", line[:120])
+        return None
+    return _SeedTTSDesignRow(
+        utterance_id=utt_id,
+        target_text=target_text,
+        voice_description=voice_description,
+    )
+
+
+@dataclass
+class SeedTTSDesignSampleRequest(SeedTTSSampleRequest):
+    """SampleRequest for voice-design TTS (no ref_audio; voice described via natural language).
+
+    The ``seed_tts_speech_extra`` dict carries ``instructions`` (natural-language
+    voice description, forwarded as-is to the Qwen3-TTS VoiceDesign endpoint) and
+    ``task_type="VoiceDesign"`` instead of ``ref_audio`` / ``ref_text``.
+    SIM is skipped (``seed_tts_ref_wav_path`` is empty).
+    """
+
+
+class SeedTTSDesignDataset(SeedTTSDataset):
+    """Seed-TTS prompts for voice-design benchmarking (dataset name: ``seed-tts-design``).
+
+    Loads a 5-field ``meta.lst``::
+
+        utt_id|ref_text|wav_rel|target_text|voice_description
+
+    and builds requests with ``task_type="VoiceDesign"`` and the natural-language
+    ``voice_description`` column forwarded via the ``instructions`` field
+    (the Qwen3-TTS VoiceDesign endpoint's expected key) instead of
+    ``ref_audio`` / ``ref_text``.  Speaker-similarity (SIM) is not computed.
+    """
+
+    def load_data(self) -> None:
+        # Does NOT call super().load_data() — the format is different (5 fields,
+        # no wav file).  self._rows is intentionally left empty; the parent
+        # sample() is fully overridden so an empty self._rows is safe.
+        meta = self._root / self.locale / "meta.lst"
+        if not meta.is_file():
+            raise FileNotFoundError(
+                f"Seed-TTS-Design meta not found: {meta}. Expected layout: {self._root}/{self.locale}/meta.lst"
+            )
+        text = meta.read_text(encoding="utf-8")
+        design_rows: list[_SeedTTSDesignRow] = []
+        for line in text.splitlines():
+            r = _parse_design_meta_line(line)
+            if r is not None:
+                design_rows.append(r)
+        if not design_rows:
+            raise ValueError(f"No valid rows in {meta}")
+        if not self.disable_shuffle:
+            rng = random.Random(self.random_seed)
+            rng.shuffle(design_rows)
+        self._design_rows = design_rows
+        # Keep self._rows empty — parent sample() is overridden.
+        self._rows = []
+        self.data = self._design_rows
+        logger.info(
+            "Loaded Seed-TTS-Design: root=%s locale=%s rows=%d",
+            self._root,
+            self.locale,
+            len(self._design_rows),
+        )
+
+    def sample(
+        self,
+        tokenizer: TokenizerLike,
+        num_requests: int,
+        output_len: int | None = None,
+        request_id_prefix: str = "",
+        no_oversample: bool = False,
+        **kwargs: Any,
+    ) -> list[SampleRequest]:
+        if output_len is None:
+            output_len = self.DEFAULT_OUTPUT_LEN
+
+        tok = get_cached_tokenizer(tokenizer)
+        lang = "English" if self.locale == "en" else "Chinese"
+        out: list[SampleRequest] = []
+        for i, row in enumerate(self._design_rows):
+            if len(out) >= num_requests:
+                break
+            target = row.target_text
+            prompt_len = len(tok.encode(target))
+            speech_extra: dict[str, Any] = {
+                "instructions": row.voice_description,
+                "task_type": "VoiceDesign",
+                "language": lang,
+                "max_new_tokens": output_len,
+            }
+            out.append(
+                SeedTTSDesignSampleRequest(
+                    prompt=target,
+                    prompt_len=prompt_len,
+                    expected_output_len=output_len,
+                    multi_modal_data=None,
+                    request_id=f"{request_id_prefix}{i}",
+                    seed_tts_speech_extra=speech_extra,
+                    seed_tts_utterance_id=row.utterance_id,
+                    seed_tts_locale=self.locale,
+                    seed_tts_system_prompt=self._system_prompt,
+                    seed_tts_ref_wav_path="",  # SIM skipped for voice-design
+                )
+            )
+
+        logger.info(
+            "Seed-TTS-Design: built %d requests (asked %d) — no ref_audio (voice design)",
+            len(out),
+            num_requests,
+        )
+        self.maybe_oversample_requests(out, num_requests, request_id_prefix, no_oversample)
+        return out
+
+
 def load_seed_tts_dataset(
     dataset_path: str,
     random_seed: int = 0,
@@ -270,3 +417,65 @@ def load_seed_tts_dataset(
         system_prompt=system_prompt,
         **kwargs,
     )
+
+
+@dataclass
+class SeedTTSTextSampleRequest(SeedTTSSampleRequest):
+    """SampleRequest for default-voice TTS (no ref_audio, no ref_text).
+
+    The voice param (e.g. ``voice: "Vivian"``) is supplied at request time via
+    ``--extra-body`` in the benchmark config. SIM is skipped (empty ref_wav_path).
+    WER and UTMOS are computed normally.
+    """
+
+
+class SeedTTSTextDataset(SeedTTSDataset):
+    """Seed-TTS prompts for default-voice benchmarking (dataset name: ``seed-tts-text``).
+
+    Loads the same ``meta.lst`` as :class:`SeedTTSDataset` but builds requests
+    WITHOUT ``ref_audio`` / ``ref_text`` body fields. The named voice must be
+    supplied via ``--extra-body`` in the benchmark config.
+    Speaker-similarity (SIM) is not computed.
+    """
+
+    def sample(
+        self,
+        tokenizer: TokenizerLike,
+        num_requests: int,
+        output_len: int | None = None,
+        request_id_prefix: str = "",
+        no_oversample: bool = False,
+        **kwargs: Any,
+    ) -> list[SampleRequest]:
+        if output_len is None:
+            output_len = self.DEFAULT_OUTPUT_LEN
+
+        tok = get_cached_tokenizer(tokenizer)
+        out: list[SampleRequest] = []
+        for i, row in enumerate(self._rows):
+            if len(out) >= num_requests:
+                break
+            target = row.target_text
+            prompt_len = len(tok.encode(target))
+            out.append(
+                SeedTTSTextSampleRequest(
+                    prompt=target,
+                    prompt_len=prompt_len,
+                    expected_output_len=output_len,
+                    multi_modal_data=None,
+                    request_id=f"{request_id_prefix}{i}",
+                    seed_tts_speech_extra=None,  # voice supplied via --extra-body in config
+                    seed_tts_utterance_id=row.utterance_id,
+                    seed_tts_locale=self.locale,
+                    seed_tts_system_prompt=self._system_prompt,
+                    seed_tts_ref_wav_path="",  # empty → SIM skipped in seed_tts_eval
+                )
+            )
+
+        logger.info(
+            "Seed-TTS-Text: built %d requests (asked %d) — no ref_audio (default voice)",
+            len(out),
+            num_requests,
+        )
+        self.maybe_oversample_requests(out, num_requests, request_id_prefix, no_oversample)
+        return out
