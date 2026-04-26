@@ -44,7 +44,28 @@ def detect_explicit_cli_keys(
     argv: list[str],
     parser: argparse.ArgumentParser | None = None,
 ) -> set[str]:
-    """Return argparse dest names explicitly provided on the CLI."""
+    """Walk ``argv`` and return the set of ``dest`` attribute names the user
+    explicitly provided (e.g. ``--max-num-seqs 64`` -> ``max_num_seqs``).
+
+    Used to distinguish user-typed CLI args from argparse default values so
+    deploy YAMLs are not silently overridden by parser defaults. Shared
+    across online (``vllm serve``) and offline (scripts, examples, tests,
+    CI) entry points.
+
+    When ``parser`` is provided, each token is looked up in the parser's
+    action table to find its real ``dest``. This correctly handles flags
+    with ``dest=`` overrides, alias flags (e.g. ``--usp`` /
+    ``--ulysses-degree`` both mapping to ``ulysses_degree``), and
+    ``--disable-foo`` / ``store_false`` patterns that map to a differently
+    named dest. Callers with access to an ``argparse.ArgumentParser`` should
+    always pass it.
+
+    When ``parser`` is ``None``, a name-based heuristic is used as a
+    fallback (hyphens -> underscores, plus a ``no_`` prefix strip for
+    ``argparse.BooleanOptionalAction``). This is correct for simple flags
+    but silently misidentifies ``--disable-X``-style flags and explicit
+    ``dest=`` overrides, so prefer the parser-aware form.
+    """
     if parser is not None:
         dest_map: dict[str, str] = {}
         for action in parser._actions:
@@ -60,6 +81,7 @@ def detect_explicit_cli_keys(
                 explicit.add(dest)
         return explicit
 
+    # Fallback: name-based heuristic (legacy path for callers without a parser).
     explicit = set()
     for tok in argv:
         if not tok.startswith("--"):
@@ -69,6 +91,7 @@ def detect_explicit_cli_keys(
             continue
         attr = name.replace("-", "_")
         explicit.add(attr)
+        # BooleanOptionalAction: --no-foo records as dest `foo`, not `no_foo`.
         if attr.startswith("no_"):
             explicit.add(attr[3:])
     return explicit

@@ -96,6 +96,14 @@ class OmniBase(PDDisaggregationMixin):
         parser: argparse.ArgumentParser | None = None,
         **overrides: Any,
     ) -> OmniBase:
+        """Deprecated argparse builder.
+
+        Build from argparse. If ``parser`` is passed and not yet nullified,
+        un-typed engine fields are reset to ``None``. New callers should
+        nullify deploy-overriding parser defaults with
+        ``nullify_stage_engine_defaults(parser)`` and construct Omni/AsyncOmni
+        directly.
+        """
         warnings.warn(
             "`from_cli_args()` is deprecated. Nullify deploy-overriding parser defaults "
             "with `nullify_stage_engine_defaults(parser)` and construct Omni/AsyncOmni "
