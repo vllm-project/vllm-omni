@@ -697,6 +697,24 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
+      - label: ":full_moon: Diffusion · Quantization Test"
+        depends_on: upload-nightly-pipeline
+        if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test"
+        commands:
+          - timeout 30m pytest -sv tests/diffusion/quantization -m 'full_model and cuda' --run-level "full_model"
+        agents:
+          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
   - label: ":bar_chart: Testcase Statistics"
     key: nightly-testcase-statistics
     timeout_in_minutes: 120

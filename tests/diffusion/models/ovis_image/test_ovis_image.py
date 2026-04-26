@@ -189,8 +189,16 @@ def test_basic_generation(ovis_pipeline):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_guidance_scale(ovis_pipeline):
-    """Test that classifier-free guidance path is taken when scale > 1.0."""
+def test_guidance_scale(ovis_pipeline, monkeypatch: pytest.MonkeyPatch):
+    """Test that classifier-free guidance path is taken when scale > 1.0.
+
+    Unit tests do not initialize the CFG process group; stub world size 1 / rank 0 so
+    ``predict_noise_maybe_with_cfg`` uses the sequential (non-CFG-parallel) branch.
+    """
+    _cfg_parallel = "vllm_omni.diffusion.distributed.cfg_parallel"
+    monkeypatch.setattr(f"{_cfg_parallel}.get_classifier_free_guidance_world_size", lambda: 1)
+    monkeypatch.setattr(f"{_cfg_parallel}.get_classifier_free_guidance_rank", lambda: 0)
+
     req = OmniDiffusionRequest(
         prompts=[
             {
