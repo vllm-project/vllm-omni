@@ -65,11 +65,16 @@ def test_build_stage_sampling_params_list_can_replace_diffusion_defaults():
 
     assert resolved[0] is not llm_default
     assert resolved[0].temperature == 0.1
-    assert resolved[1] is request_params
-    assert resolved[2] is request_params
+    assert resolved[1] is not request_params
+    assert resolved[2] is not request_params
+    assert resolved[1] is not resolved[2]
+    assert resolved[1].height == 512
+    assert resolved[2].height == 512
+    assert resolved[1].width == 512
+    assert resolved[2].width == 512
 
 
-def test_get_default_sampling_params_list_ignores_missing_or_non_list_defaults():
+def test_get_default_sampling_params_list_reads_engine_defaults_only():
     assert get_default_sampling_params_list(SimpleNamespace()) == []
     assert get_default_sampling_params_list(SimpleNamespace(default_sampling_params_list=None)) == []
 

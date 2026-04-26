@@ -7,9 +7,12 @@ import copy
 from typing import Any
 
 from vllm import SamplingParams
+from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.utils import get_stage_type
 from vllm_omni.inputs.data import OmniSamplingParams
+
+logger = init_logger(__name__)
 
 
 def clone_sampling_params(params: OmniSamplingParams) -> OmniSamplingParams:
@@ -17,18 +20,19 @@ def clone_sampling_params(params: OmniSamplingParams) -> OmniSamplingParams:
     if hasattr(params, "clone"):
         try:
             return params.clone()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to clone sampling params with clone(): %s", exc)
 
     try:
         return copy.deepcopy(params)
-    except Exception:
+    except Exception as exc:
+        logger.warning("Failed to deepcopy sampling params; reusing original object: %s", exc)
         return params
 
 
-def get_default_sampling_params_list(source: Any) -> list[OmniSamplingParams]:
-    """Return a mutable copy of an engine/default sampling params list."""
-    default_params = getattr(source, "default_sampling_params_list", source)
+def get_default_sampling_params_list(engine_client: Any) -> list[OmniSamplingParams]:
+    """Return a mutable copy of an engine client's default sampling params."""
+    default_params = getattr(engine_client, "default_sampling_params_list", None)
     if isinstance(default_params, list):
         return list(default_params)
     return []
@@ -60,14 +64,15 @@ def build_stage_sampling_params_list(
 ) -> list[OmniSamplingParams]:
     """Build effective sampling params for a multi-stage request.
 
-    When ``replace_diffusion_params`` is set, diffusion stages receive the
-    request-level diffusion params directly. That preserves existing image and
-    video endpoint behavior where request params replace diffusion defaults.
+    When ``replace_diffusion_params`` is set, diffusion stages receive cloned
+    request-level diffusion params. That preserves existing image and video
+    endpoint behavior where request params replace diffusion defaults without
+    sharing mutable state across stages.
     """
     sampling_params_list: list[OmniSamplingParams] = []
     for idx, stage_cfg in enumerate(stage_configs):
         if replace_diffusion_params and get_stage_type(stage_cfg) == "diffusion" and diffusion_params is not None:
-            sampling_params_list.append(diffusion_params)
+            sampling_params_list.append(clone_sampling_params(diffusion_params))
         else:
             sampling_params_list.append(
                 resolve_stage_sampling_params(
