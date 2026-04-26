@@ -477,6 +477,7 @@ class DiffusionEngine:
                 # NOTE: add_req_and_wait_for_response() is synchronous, will be only called
                 # within _dummy_run, only one request will be scheduled
                 sched_req_id = sched_output.scheduled_req_ids[0]
+                exec_start = time.perf_counter()
                 try:
                     runner_output = self.execute_fn(sched_output)
                 except EngineDeadError:
@@ -489,6 +490,8 @@ class DiffusionEngine:
                         finished=True,
                         result=DiffusionOutput(error=str(exc)),
                     )
+                exec_ms = (time.perf_counter() - exec_start) * 1000
+                logger.debug("execute_fn completed in %.2f ms for request %s", exec_ms, sched_req_id)
 
                 self._process_aborts_queue()
 
@@ -593,6 +596,7 @@ class DiffusionEngine:
 
         deadline = None if timeout is None else time.monotonic() + timeout
         acquired = False
+        lock_wait_start = time.perf_counter()
         try:
             if deadline is None:
                 self._rpc_lock.acquire()
@@ -600,8 +604,10 @@ class DiffusionEngine:
             else:
                 lock_timeout = max(0, deadline - time.monotonic())
                 acquired = self._rpc_lock.acquire(timeout=lock_timeout)
+            lock_wait_ms = (time.perf_counter() - lock_wait_start) * 1000
             if not acquired:
                 raise TimeoutError(f"RPC call to {method} timed out waiting for engine lock.")
+            logger.debug("collective_rpc(%s) acquired lock in %.2f ms", method, lock_wait_ms)
 
             rpc_timeout = None if deadline is None else max(0, deadline - time.monotonic())
             if deadline is not None and rpc_timeout <= 0:
