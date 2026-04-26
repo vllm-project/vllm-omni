@@ -1372,6 +1372,35 @@ class OmniGPUModelRunner(GPUModelRunner):
         subtalker_params = getattr(self.vllm_config.model_config, "subtalker_sampling_params", None)
         if not isinstance(subtalker_params, dict):
             subtalker_params = {}
+        # Extract seed from the first request's sampling params for Fast AR
+        # determinism.  NOTE: when batch_size > 1, all requests share the first
+        # request's seed.  Per-request Fast AR seeding requires row-by-row
+        # torch.multinomial calls and is left as a follow-up optimisation.
+        _seed = None
+        if decode_req_ids:
+            _first_sp = getattr(self.requests[decode_req_ids[0]], "sampling_params", None)
+            if _first_sp is not None and getattr(_first_sp, "seed", None) is not None:
+                _seed = _first_sp.seed
+            # Warn when batched requests have different seeds.
+            if len(decode_req_ids) > 1 and _seed is not None:
+                _other_seeds = {
+                    getattr(getattr(self.requests[rid], "sampling_params", None), "seed", None)
+                    for rid in decode_req_ids[1:]
+                }
+                if _other_seeds != {_seed}:
+                    logger.warning(
+                        "Fast AR seed: batch has mixed seeds; using first request's seed=%d for all %d requests.",
+                        _seed,
+                        len(decode_req_ids),
+                    )
+        talker_kwargs = {
+            "do_sample": subtalker_params.get("do_sample"),
+            "temperature": subtalker_params.get("temperature"),
+            "top_k": subtalker_params.get("top_k"),
+            "top_p": subtalker_params.get("top_p"),
+        }
+        if _seed is not None:
+            talker_kwargs["seed"] = _seed
         with set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
@@ -1380,10 +1409,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 req_embeds,
                 last_talker_hidden,
                 text_step,
-                do_sample=subtalker_params.get("do_sample"),
-                temperature=subtalker_params.get("temperature"),
-                top_k=subtalker_params.get("top_k"),
-                top_p=subtalker_params.get("top_p"),
+                **talker_kwargs,
             )
         # update the inputs_embeds and code_predictor_codes
         out_key = getattr(self.model, "talker_mtp_output_key", ("codes", "audio"))

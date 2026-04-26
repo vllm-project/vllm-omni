@@ -1656,6 +1656,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         temperature: float | None = None,
         top_k: int | None = None,
         top_p: float | None = None,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """GPU fast-path used by OmniGPUModelRunner to predict residual codebooks (1..Q-1).
         Returns (inputs_embeds, audio_codes) for the current step."""
