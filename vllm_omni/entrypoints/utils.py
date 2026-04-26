@@ -1,3 +1,4 @@
+import argparse
 import os
 import types
 from collections import Counter
@@ -37,6 +38,40 @@ def _warn_deprecated_explicit_keys(kwargs: dict[str, Any]) -> None:
 _DIFFUSERS_CLASS_TO_CONFIG: dict[str, str] = {
     "GlmImagePipeline": "glm_image",
 }
+
+
+def detect_explicit_cli_keys(
+    argv: list[str],
+    parser: argparse.ArgumentParser | None = None,
+) -> set[str]:
+    """Return argparse dest names explicitly provided on the CLI."""
+    if parser is not None:
+        dest_map: dict[str, str] = {}
+        for action in parser._actions:
+            for opt in action.option_strings:
+                dest_map[opt] = action.dest
+        explicit: set[str] = set()
+        for tok in argv:
+            if not tok.startswith("--"):
+                continue
+            flag = tok.split("=", 1)[0]
+            dest = dest_map.get(flag)
+            if dest is not None:
+                explicit.add(dest)
+        return explicit
+
+    explicit = set()
+    for tok in argv:
+        if not tok.startswith("--"):
+            continue
+        name = tok[2:].split("=", 1)[0]
+        if not name:
+            continue
+        attr = name.replace("-", "_")
+        explicit.add(attr)
+        if attr.startswith("no_"):
+            explicit.add(attr[3:])
+    return explicit
 
 
 def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:

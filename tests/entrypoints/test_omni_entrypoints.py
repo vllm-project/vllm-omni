@@ -216,6 +216,34 @@ def test_from_cli_args_warns_and_forwards_without_internal_keys(
     assert "_cli_explicit_keys" not in captured
 
 
+def test_deprecated_from_cli_args_preserves_legacy_parser_nulling(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm_omni.entrypoints.omni import Omni
+
+    captured: dict[str, Any] = {}
+
+    def fake_engine(*args: Any, **kwargs: Any) -> FakeAsyncOmniEngine:
+        captured.update(kwargs)
+        return FakeAsyncOmniEngine()
+
+    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", fake_engine)
+    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
+    monkeypatch.setattr("sys.argv", ["prog"])
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--hsdp-shard-size", type=int, default=-1)
+    args = parser.parse_args([])
+    args.model = "fake-model"
+
+    with pytest.deprecated_call(match="from_cli_args"):
+        Omni.from_cli_args(args, parser=parser)
+
+    assert captured["gpu_memory_utilization"] is None
+    assert captured["hsdp_shard_size"] == -1
+
+
 def _make_base():
     from vllm_omni.entrypoints.omni_base import OmniBase
 
