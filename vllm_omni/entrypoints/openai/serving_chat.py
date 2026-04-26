@@ -16,6 +16,7 @@ from pydantic import TypeAdapter
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
+from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 try:
@@ -390,6 +391,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 else:
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
+
+                # If this is a streaming (output) request, coerce cumulative outputs
+                # to delta to ensure emitted outputs are correctly drained. Otherwise
+                # convert cumulative to Final Only to ensure the output is correct.
+                sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
 
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):
@@ -1007,12 +1013,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             cur_channel = harmony_parser.current_channel
                             cur_recipient = harmony_parser.current_recipient
                         else:
-                            # output.text is cumulative, extract only the delta portion
-                            previous_text = previous_texts[i] if previous_texts else ""
-                            if output.text is not None:
-                                delta_text = output.text[len(previous_text) :]
-                            else:
-                                delta_text = ""
+                            delta_text = output.text or ""
 
                         if not delta_text and not output.token_ids and not previous_num_tokens[i]:
                             # Chunked prefill case, don't return empty chunks
