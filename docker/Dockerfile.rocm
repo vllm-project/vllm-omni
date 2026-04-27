@@ -21,7 +21,7 @@ WORKDIR ${COMMON_WORKDIR}
 # Need to include ffmpeg because vllm rocm upstream docker image
 # does not include it.
 RUN apt-get update && \
-    apt-get install -y espeak-ng ffmpeg git sox libsox-fmt-all jq && \
+    apt-get install -y espeak-ng ffmpeg git jq && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 

@@ -19,6 +19,7 @@ from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import omni_run_server
 
@@ -79,6 +80,9 @@ class OmniServeCommand(CLISubcommand):
     """The `serve` subcommand for the vLLM CLI."""
 
     name = "serve"
+    # Parser stashed at subparser_init so ``cmd`` can resolve each user-typed
+    # flag to its real ``dest`` via the parser's action table.
+    _parser: FlexibleArgumentParser | None = None
 
     @staticmethod
     def cmd(args: argparse.Namespace) -> None:
@@ -130,6 +134,17 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable vLLM-Omni mode for multi-modal and diffusion models",
         )
+
+        try:
+            omni_config_group.add_argument(
+                "--enable-sleep-mode",
+                action="store_true",
+                default=False,
+                help="Enable GPU memory pool for sleep mode.",
+            )
+        except argparse.ArgumentError:
+            pass
+
         omni_config_group.add_argument(
             "--task-type",
             type=str,
@@ -138,11 +153,33 @@ class OmniServeCommand(CLISubcommand):
             help="Default task type for TTS models (CustomVoice, VoiceDesign, or Base). "
             "If not specified, will be inferred from model path.",
         )
+        # TODO(@lishunyang12): deprecate once all models migrate to --deploy-config
         omni_config_group.add_argument(
             "--stage-configs-path",
             type=str,
             default=None,
-            help="Path to the stage configs file. If not specified, the stage configs will be loaded from the model.",
+            help="[Deprecated — will be removed in a future release] Path to a legacy "
+            "stage configs YAML (stage_args format). Prefer --deploy-config for new-format deploy YAMLs.",
+        )
+        omni_config_group.add_argument(
+            "--deploy-config",
+            type=str,
+            default=None,
+            help="Path to a deploy config YAML (new format with stages/engine_args). "
+            "Mutually exclusive with --stage-configs-path.",
+        )
+        omni_config_group.add_argument(
+            "--stage-overrides",
+            type=str,
+            default=None,
+            help="Per-stage JSON overrides. Example: "
+            '\'{"0": {"gpu_memory_utilization": 0.8}, "2": {"enforce_eager": true}}\'',
+        )
+        omni_config_group.add_argument(
+            "--async-chunk",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Override the deploy YAML's ``async_chunk:`` bool. Unset leaves the YAML value in force.",
         )
         omni_config_group.add_argument(
             "--stage-id",
@@ -224,6 +261,40 @@ class OmniServeCommand(CLISubcommand):
             type=str,
             default=None,
             help="Override the diffusion pipeline class name (e.g. LTX2ImageToVideoPipeline).",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-load-format",
+            dest="diffusion_load_format",
+            type=str,
+            default=None,
+            choices=["default", "custom_pipeline", "dummy", "diffusers"],
+            help=(
+                "How to load the diffusion pipeline: native/registry (default), "
+                "custom_pipeline, dummy, or diffusers for the HF diffusers adapter."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusers-load-kwargs",
+            dest="diffusers_load_kwargs",
+            type=json.loads,
+            default="{}",
+            help=(
+                "JSON object passed to DiffusionPipeline.from_pretrained()."
+                "It overrides corresponding parameters in the standard vLLM-Omni interface."
+                '(e.g. \'{"use_safetensors": true, "variant": "fp16"}\').'
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusers-call-kwargs",
+            dest="diffusers_call_kwargs",
+            type=json.loads,
+            default="{}",
+            help=(
+                "JSON object passed to pipeline.__call__(). "
+                "Useful for model-specific sampling parameters not covered by the vLLM-Omni interface."
+                "During request time, it is overridden by corresponding parameters in the vLLM-Omni interface."
+                '(e.g. \'{"num_inference_steps": 30, "guidance_scale": 7.5}\').'
+            ),
         )
         omni_config_group.add_argument(
             "--usp",
@@ -406,6 +477,16 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable diffusion pipeline profiler to display stage durations.",
         )
+        omni_config_group.add_argument(
+            "--enable-ar-profiler",
+            action="store_true",
+            help="Enable AR stage profiler to include AR stage timing in stage_durations.",
+        )
+        # Stash via type(self) so the docs hook (which execs this function in a
+        # sandboxed globals dict via ``DummySelf``) doesn't fail on a NameError.
+        type(self)._parser = serve_parser
+
+        nullify_stage_engine_defaults(serve_parser)
         return serve_parser
 
 
@@ -461,6 +542,7 @@ def run_headless(args: argparse.Namespace) -> None:
         raise ValueError("headless mode requires worker_backend=multi_process")
 
     args_dict = vars(args).copy()
+    args_dict.pop("_cli_explicit_keys", None)
     config_path, stage_configs = load_and_resolve_stage_configs(
         model,
         args_dict.get("stage_configs_path"),

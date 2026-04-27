@@ -12,16 +12,220 @@ Please refer to [README.md](../../../README.md)
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
-If you want to open async chunking for qwen3-omni, launch the server with command below
+The default deployment configuration, situated at `vllm_omni/deploy/qwen3_omni_moe.yaml`, is resolved and loaded
+automatically via the model registry, obviating the `--deploy-config` flag in standard deployment topologies.
+Asynchronous chunk streaming operates as **enabled by default** within this bundled configuration.
+Additionally, NPU, ROCm, and XPU per-platform configuration deltas are deterministically merged from the
+`platforms`: section of the corresponding YAML.
 
+**Note:** The OpenAI-style **`/v1/realtime`** WebSocket interface (facilitating streaming PCM audio input alongside audio and transcription output)
+is currently **unsupported** while the `async_chunk` configuration attribute is enabled.
+It is requisite to instantiate the default omni architecture or utilize a deployment configuration specifying `async_chunk: false` to facilitate real-time streaming sessions.
+
+To explicitly utilize a custom deployment YAML, mandate the configuration path accordingly:
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_omni_moe_async_chunk.yaml
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --deploy-config /path/to/your_deploy_config.yaml
 ```
 
-If you have custom stage configs file, launch the server with command below
+### Launch individual stages (stage-based CLI)
+
+Use the stage-based CLI when you want to run one stage per process.
+
+**1. Stage 0 (Thinker + API server)**
+
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --port 8091 \
+    --stage-id 0 \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
 ```
+
+**2. Stage 1 (Talker)**
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --stage-id 1 \
+    --headless \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+```
+
+**3. Stage 2 (Code2Wav)**
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --stage-id 2 \
+    --headless \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+```
+
+Append `--deploy-config /path/to/your_deploy_config.yaml` to each node invocation if it is necessary
+to explicitly override the bundled deployment YAML schema.
+
+For standard **unified-process** launcher, stage-specific CLI configuration tuning is conventionally implemented
+via the `--stage-overrides` directive, as demonstrated below:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --stage-overrides '{"1": {"gpu_memory_utilization": 0.5}}'
+```
+
+Conversely, within the stage-based CLI paradigm, `--stage-overrides` modifiers are typically **unnecessary**
+for this category of optimization. Given that each instantiation strictly initiates a single functional stage,
+parameter flags can be systematically assigned directly onto that specific stage's command sequence:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --stage-id 1 \
+    --headless \
+    --gpu-memory-utilization 0.5 \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+```
+
+### Tuning deployment parameters
+
+Most engine knobs (`max_num_batched_tokens`, `max_model_len`, `enforce_eager`,
+`gpu_memory_utilization`, `tensor_parallel_size`, …) can be tuned without
+editing the YAML. There are three layers, in increasing specificity:
+
+#### 1. Global CLI flags (apply to every stage)
+
+```bash
+# Tighter memory budget on a smaller GPU
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --gpu-memory-utilization 0.85
+
+# Disable cudagraphs (e.g. for debugging)
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --enforce-eager
+
+# Reduce context length
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --max-model-len 32768
+
+# Toggle prefix caching on every stage (yaml default: off)
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --enable-prefix-caching
+# ...or force it off if the yaml turned it on
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --no-enable-prefix-caching
+
+# Toggle pipeline-wide async chunked streaming between stages
+# (yaml default for qwen3_omni_moe: on)
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --no-async-chunk
+```
+
+For the TTS counterpart (synchronous codec variant), see
+[qwen3_tts README](../qwen3_tts/README.md#sync-vs-async-chunk-mode).
+
+Explicit CLI flags **override** the deploy YAML (which itself overrides the
+parser defaults). If you don't pass a flag, the YAML value wins.
+
+> **Note on `--no-async-chunk`**: Flips the deploy yaml's `async_chunk:`
+> bool. Pipelines that implement alternate processor functions for
+> chunked vs end-to-end modes (e.g. qwen3_tts code2wav) dispatch
+> automatically based on that bool — no extra flag or variant yaml is
+> needed.
+
+> ⚠️ **For multi-stage models that share GPUs (qwen3_omni_moe by default
+> shares cuda:1 between stages 1 and 2), avoid using global memory flags.**
+> A global `--gpu-memory-utilization 0.85` would apply to every stage and
+> oversubscribe the shared device. Use per-stage overrides instead — see
+> below.
+
+#### 2. Per-stage overrides via `--stage-overrides` (recommended for memory)
+
+```bash
+# Lower stage 1's memory budget; leave others at the YAML default
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --stage-overrides '{
+        "1": {"gpu_memory_utilization": 0.5},
+        "2": {"max_num_batched_tokens": 65536}
+    }'
+```
+
+Per-stage values are always treated as explicit and beat YAML defaults for
+the named stage. Other stages keep their YAML values.
+
+If you switch to the stage-based CLI, the same per-stage tuning can usually be
+passed directly on that stage's command instead of using `--stage-overrides`.
+
+#### 3. Custom deploy YAML
+
+When per-stage overrides get long, write a small overlay YAML that inherits
+from the bundled default:
+
+```yaml
+# my_qwen3_omni_overrides.yaml
+base_config: /path/to/vllm_omni/deploy/qwen3_omni_moe.yaml
+
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 65536
+    enforce_eager: true
+  - stage_id: 1
+    gpu_memory_utilization: 0.5
+  - stage_id: 2
+    max_model_len: 8192
+```
+
+Then start the server with `--deploy-config my_qwen3_omni_overrides.yaml`.
+The `base_config:` line tells the loader to inherit everything else (stages,
+connectors, edges, platforms section) from the bundled production YAML, so
+you only need to spell out the deltas.
+
+#### 4. Multi-node deployment (cross-host transfer connector)
+
+The bundled `qwen3_omni_moe.yaml` uses `SharedMemoryConnector` between stages,
+which only works when all stages run on the same physical host. For
+**cross-node** deployments, write a small overlay YAML that swaps in a
+network-capable connector (e.g. `MooncakeStoreConnector`) and re-points each
+stage's connector wiring at it. The connector spec carries your own server
+addresses — there is no checked-in default because every cluster is
+different.
+
+```yaml
+# my_qwen3_omni_multinode.yaml
+base_config: /path/to/vllm_omni/deploy/qwen3_omni_moe.yaml
+
+connectors:
+  mooncake_connector:
+    name: MooncakeStoreConnector
+    extra:
+      host: "127.0.0.1"
+      metadata_server: "http://YOUR_METADATA_HOST:8080/metadata"
+      master: "YOUR_MASTER_HOST:50051"
+      segment: 512000000    # 512 MB transfer segment
+      localbuf: 64000000    # 64 MB local buffer
+      proto: "tcp"
+
+stages:
+  - stage_id: 0
+    output_connectors:
+      to_stage_1: mooncake_connector
+  - stage_id: 1
+    input_connectors:
+      from_stage_0: mooncake_connector
+    output_connectors:
+      to_stage_2: mooncake_connector
+  - stage_id: 2
+    input_connectors:
+      from_stage_1: mooncake_connector
+```
+
+Then launch with `--deploy-config my_qwen3_omni_multinode.yaml`. Same
+pattern works for Qwen2.5-Omni — replace `base_config:` with the path to
+`vllm_omni/deploy/qwen2_5_omni.yaml`.
+
+> ⚠️ Replace `YOUR_METADATA_HOST` / `YOUR_MASTER_HOST` with the actual
+> mooncake server addresses for your cluster. The `base_config:` overlay
+> inherits all stage budgets, devices, and edges from the bundled prod
+> YAML — you only need to spell out the connector swap.
 
 ### Send Multi-modal Request
 
@@ -38,36 +242,43 @@ python examples/online_serving/openai_chat_completion_client_for_multimodal_gene
 
 #### Realtime WebSocket client (`openai_realtime_client.py`)
 
-[`openai_realtime_client.py`](./openai_realtime_client.py) connects to **`ws://<host>:<port>/v1/realtime`**, uploads a local audio file as **PCM16 mono @ 16 kHz** chunks (OpenAI-style `input_audio_buffer.append` / `commit`), and prints **streaming transcription** (`transcription.delta` / `transcription.done`).
+[`openai_realtime_client.py`](./openai_realtime_client.py) connects to **`ws://<host>:<port>/v1/realtime`**, streams a local WAV as **PCM16 mono @ 16 kHz** in fixed-size chunks (OpenAI-style `input_audio_buffer.append` / `commit`), and receives **`response.audio.delta`** (incremental PCM for the reply) plus **`transcription.*`** events. By default it concatenates audio deltas and writes **`--output-wav`** (model output is typically **24 kHz**). Optional **`--delta-dump-dir`** saves each delta as `delta_000001.wav`, … for debugging.
+
+Streaming input works well for translation-style use cases; if the Thinker runs while input is still incomplete, consider limiting **`max_tokens`** in your session / server defaults to avoid over-generation.
 
 **Dependencies:**
 
 ```bash
-pip install websockets numpy
+pip install websockets
 ```
 
 **From this directory** (`examples/online_serving/qwen3_omni`):
 
 ```bash
 python openai_realtime_client.py \
-  --host localhost \
-  --port 8091 \
+  --url ws://localhost:8091/v1/realtime \
   --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
-  --audio_path /path/to/your.wav
+  --input-wav /path/to/input_16k_mono.wav \
+  --output-wav realtime_output.wav \
+  --delta-dump-dir ./rt_delta_wavs
 ```
-
-If `--audio_path` is omitted, the script uses a bundled default clip (`mary_had_lamb` via vLLM assets).
 
 **Arguments:**
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--host` | `localhost` | API server host |
-| `--port` | `8000` | API server port (match your `vllm serve` port, e.g. `8091`) |
-| `--model` | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | Must match the served model (also sent in `session.update`) |
-| `--audio_path` | *(optional)* | Path to input audio; resampled to 16 kHz mono inside the client |
+| `--url` | `ws://localhost:8091/v1/realtime` | Full WebSocket URL including path |
+| `--model` | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | Must match the served model (sent in `session.update`) |
+| `--input-wav` | *(required)* | Input WAV: mono, 16-bit PCM, **16 kHz** |
+| `--output-wav` | `realtime_output.wav` | Output path for concatenated reply audio |
+| `--output-text` | *(optional)* | If set, write final transcription text to this path |
+| `--chunk-ms` | `200` | Size of each uploaded audio chunk (milliseconds of audio) |
+| `--send-delay-ms` | `0` | Delay between chunk sends (simulate realtime upload) |
+| `--delta-dump-dir` | *(optional)* | Directory to write per-`response.audio.delta` WAV files |
+| `--num-requests` | `1` | Number of sequential sessions (see `--concurrency`) |
+| `--concurrency` | `1` | Max concurrent WebSocket sessions when `--num-requests` > 1 |
 
-Ensure the vLLM-Omni server is running with realtime support for this endpoint, for example:
+Ensure the server is running **without** `async_chunk` if you use `/v1/realtime`, for example:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
@@ -276,7 +487,7 @@ The script supports the following arguments:
 - `--model`: Model name/path (default: Qwen/Qwen3-Omni-30B-A3B-Instruct)
 - `--server-port`: Port for vLLM server (default: 8091)
 - `--gradio-port`: Port for Gradio demo (default: 7861)
-- `--stage-configs-path`: Path to custom stage configs YAML file (optional)
+- `--deploy-config`: Path to custom deploy config YAML file (optional)
 - `--server-host`: Host for vLLM server (default: 0.0.0.0)
 - `--gradio-ip`: IP for Gradio demo (default: 127.0.0.1)
 - `--share`: Share Gradio demo publicly (creates a public link)
@@ -291,7 +502,7 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 
 If you have custom stage configs file:
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --deploy-config /path/to/deploy_config_file
 ```
 
 **Step 2: Run the Gradio demo**

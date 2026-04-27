@@ -9,25 +9,21 @@ actual model inference, not mocks.
 
 import os
 
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
-
-from pathlib import Path
-
 import pytest
 
-from tests.conftest import OmniServerParams
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServerParams
+from tests.helpers.stage_config import get_deploy_config_path
+
+pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 
 REF_AUDIO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
 REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
-
-
-def get_stage_config(name: str = "qwen3_tts.yaml"):
-    """Get the stage config path from vllm_omni model_executor stage_configs."""
-    return str(Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / name)
 
 
 def get_prompt(prompt_type="text"):
@@ -48,25 +44,25 @@ tts_server_params = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=get_stage_config("qwen3_tts.yaml"),
+            stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
             server_args=["--trust-remote-code", "--disable-log-stats"],
         ),
         id="async_chunk",
     ),
+    # Synchronous (no async-chunk) variant — ``--no-async-chunk`` alone
+    # flips the deploy yaml's bool and the pipeline dispatches to the
+    # end-to-end codec processor. No variant yaml / pipeline needed.
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=get_stage_config("qwen3_tts_no_async_chunk.yaml"),
-            server_args=["--trust-remote-code", "--disable-log-stats"],
+            stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
+            server_args=["--trust-remote-code", "--disable-log-stats", "--no-async-chunk"],
         ),
         id="no_async_chunk",
     ),
 ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_voice_clone_streaming_001(omni_server, openai_client) -> None:
@@ -92,9 +88,6 @@ def test_voice_clone_streaming_001(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config, request_num=get_max_batch_size("few"))
 
 
-@pytest.mark.advanced_model
-@pytest.mark.core_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_response_format_001(omni_server, openai_client) -> None:

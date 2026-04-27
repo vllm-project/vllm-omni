@@ -10,11 +10,11 @@ Covers:
 
 import os
 import tempfile
-from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import torch
+from pytest_mock import MockerFixture
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -61,18 +61,18 @@ class TestFishSpeechVoiceCacheIntegration:
     """Test the cache-hit / cache-miss / no-cache paths in the model."""
 
     @pytest.fixture
-    def mock_model(self):
+    def mock_model(self, mocker: MockerFixture):
         """Create a mock FishSpeechSlowARForConditionalGeneration with cache."""
         from vllm_omni.utils.voice_cache import VoiceEmbeddingCache
 
-        model = MagicMock()
+        model = mocker.MagicMock()
         model._voice_cache = VoiceEmbeddingCache(max_entries=4)
         model._semantic_begin_id = 151678
         model._num_codebooks = 10
         model._codebook_size = 4096
         model.model_path = "/fake/model"
-        model.codebook_embeddings = MagicMock()
-        model.codebook_embeddings.weight = MagicMock()
+        model.codebook_embeddings = mocker.MagicMock()
+        model.codebook_embeddings.weight = mocker.MagicMock()
         model.codebook_embeddings.weight.device = torch.device("cpu")
         return model
 
@@ -166,9 +166,9 @@ class TestFishSpeechVoiceCacheIntegration:
 class TestFishSpeechValidatorUploadedVoice:
     """Test _validate_fish_tts_request uploaded voice resolution."""
 
-    def test_uploaded_voice_resolves_ref_audio(self):
+    def test_uploaded_voice_resolves_ref_audio(self, mocker: MockerFixture):
         """When voice matches an uploaded speaker, ref_audio should be auto-set."""
-        request = MagicMock()
+        request = mocker.MagicMock()
         request.input = "Hello"
         request.voice = "alice"
         request.ref_audio = None
@@ -185,17 +185,17 @@ class TestFishSpeechValidatorUploadedVoice:
         }
 
         # Simulate: voice in uploaded_speakers, file exists, get_audio returns data URL.
-        with patch("pathlib.Path.exists", return_value=True):
-            voice_lower = request.voice.lower()
-            assert voice_lower in uploaded_speakers
+        mocker.patch("pathlib.Path.exists", return_value=True)
+        voice_lower = request.voice.lower()
+        assert voice_lower in uploaded_speakers
 
-            speaker_info = uploaded_speakers[voice_lower]
-            ref_text_from_upload = speaker_info.get("ref_text")
-            assert ref_text_from_upload == "Hi this is Alice"
+        speaker_info = uploaded_speakers[voice_lower]
+        ref_text_from_upload = speaker_info.get("ref_text")
+        assert ref_text_from_upload == "Hi this is Alice"
 
-    def test_uploaded_voice_without_ref_text_uses_request_ref_text(self):
+    def test_uploaded_voice_without_ref_text_uses_request_ref_text(self, mocker: MockerFixture):
         """If upload has no ref_text but request provides it, use request's."""
-        request = MagicMock()
+        request = mocker.MagicMock()
         request.input = "Hello"
         request.voice = "bob"
         request.ref_audio = None

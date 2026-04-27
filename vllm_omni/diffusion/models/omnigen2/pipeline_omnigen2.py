@@ -8,7 +8,7 @@ import os
 import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import PIL.Image
@@ -32,6 +32,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.interface import SupportsModuleOffload
 from vllm_omni.diffusion.models.omnigen2.omnigen2_transformer import (
     OmniGen2RotaryPosEmbed,
     OmniGen2Transformer2DModel,
@@ -620,7 +621,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class OmniGen2Pipeline(CFGParallelMixin, nn.Module):
+class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsModuleOffload):
     """
     Pipeline for text-to-image generation using OmniGen2.
 
@@ -633,6 +634,10 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module):
     Args:
         od_config (OmniDiffusionConfig): The OmniDiffusion configuration.
     """
+
+    _dit_modules: ClassVar[list[str]] = ["transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["mllm"]
+    _vae_modules: ClassVar[list[str]] = ["vae"]
 
     def __init__(
         self,
@@ -676,7 +681,10 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module):
         )
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, OmniGen2Transformer2DModel)
-        self.transformer = OmniGen2Transformer2DModel(**transformer_kwargs)
+        self.transformer = OmniGen2Transformer2DModel(
+            **transformer_kwargs,
+            quant_config=od_config.quantization_config,
+        )
         self.mllm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="mllm", local_files_only=local_files_only
         ).to(self.device)
@@ -1252,8 +1260,6 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module):
     ):
         # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
         timestep = t.expand(latents.shape[0]).to(latents.dtype)
-
-        batch_size, num_channels_latents, height, width = latents.shape
 
         optional_kwargs = {}
         if "ref_image_hidden_states" in set(inspect.signature(self.transformer.forward).parameters.keys()):

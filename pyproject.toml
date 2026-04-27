@@ -55,6 +55,12 @@ dev = [
     "pyttsx3>=2.99",
     "opencc>=1.2.0",
     "mistune>=3.2.0", # for example tests
+    "torchmetrics>=1.4.0", # for accuracy similarity metrics
+    "jiwer>=3.0.0",
+    "zhon>=2.0.0",
+    "zhconv>=1.4.2",
+    "scipy>=1.10.0",
+    "funasr>=1.0.0",
 ]
 
 demo = [
@@ -115,12 +121,13 @@ exclude = [
 
 [tool.ruff.lint]
 select = [
-    "E",  # pycodestyle errors
-    "W",  # pycodestyle warnings
-    "F",  # pyflakes
-    "I",  # isort (handled separately, but included for compatibility)
-    "N",  # pep8-naming
-    "UP", # pyupgrade
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort (handled separately, but included for compatibility)
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "TID251", # flake8-tidy-imports.banned-api
 ]
 ignore = [
     "E203",  # whitespace before ':' (conflicts with black)
@@ -134,6 +141,9 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "examples/**" = ["E501"]  # Allow long lines in examples
 "tests/**" = ["E501"]  # Allow long lines in tests
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"
 
 [tool.mypy]
 python_version = "3.12, 3.13"
@@ -163,7 +173,8 @@ addopts = [
 markers = [
     # ci/cd required
     "core_model: L1&L2 tests (run in each PR)",
-    "advanced_model: L3&L4 level tests (run in each merge or nightly)",
+    "advanced_model: L3 level tests (run on each merge)",
+    "full_model: L4 level tests (run nightly)",
     # function module markers
     "diffusion: Diffusion model tests",
     "omni: Omni model tests",
@@ -182,6 +193,7 @@ markers = [
     "H100: Tests that require H100 GPU",
     "L4: Tests that require L4 GPU",
     "MI325: Tests that require MI325 GPU (AMD/ROCm)",
+    "B60: Tests that require Intel Arc Pro B60 XPU",
     "S5000: Tests that require S5000 GPU (Moore Threads/MUSA)",
     "A2: Tests that require A2 NPU",
     "A3: Tests that require A3 NPU",
@@ -224,3 +236,5 @@ ue = "ue"
 semantics = "semantics"
 fullset = "fullset"
 Vai = "Vai"
+tockens = "tockens"
+CANN = "CANN"

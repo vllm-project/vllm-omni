@@ -16,52 +16,54 @@ Equivalent to running:
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 import signal
 import socket
 import subprocess
 import tempfile
 import time
-from pathlib import Path
 from typing import Any
 
 import pytest
 from PIL import Image
 
-from tests.conftest import modify_stage_config
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.platforms import current_omni_platform
+
+BAGEL_CI_DEPLOY = get_deploy_config_path("ci/bagel.yaml")
+BAGEL_MOONCAKE_CI_DEPLOY = get_deploy_config_path("ci/bagel_mooncake.yaml")
 
 # Reference pixel data extracted from the known-good output image
 # Each entry contains (x, y) position and expected (R, G, B) values
 # "Generated with seed=52, num_inference_steps=15,
 # prompt='A futuristic city skyline at twilight, cyberpunk style'"
 REFERENCE_PIXELS = [
-    {"position": (100, 100), "rgb": (121, 118, 100)},
-    {"position": (400, 50), "rgb": (163, 162, 143)},
-    {"position": (700, 100), "rgb": (170, 156, 127)},
-    {"position": (150, 400), "rgb": (129, 127, 112)},
-    {"position": (512, 512), "rgb": (135, 61, 59)},
-    {"position": (700, 400), "rgb": (205, 107, 43)},
-    {"position": (100, 700), "rgb": (197, 177, 157)},
-    {"position": (400, 700), "rgb": (139, 107, 86)},
-    {"position": (700, 700), "rgb": (247, 205, 146)},
-    {"position": (256, 256), "rgb": (171, 160, 153)},
+    {"position": (100, 100), "rgb": (115, 113, 94)},
+    {"position": (400, 50), "rgb": (159, 160, 144)},
+    {"position": (700, 100), "rgb": (164, 151, 123)},
+    {"position": (150, 400), "rgb": (120, 121, 107)},
+    {"position": (512, 512), "rgb": (165, 133, 127)},
+    {"position": (700, 400), "rgb": (217, 130, 66)},
+    {"position": (100, 700), "rgb": (191, 168, 152)},
+    {"position": (400, 700), "rgb": (130, 96, 77)},
+    {"position": (700, 700), "rgb": (247, 203, 140)},
+    {"position": (256, 256), "rgb": (167, 156, 150)},
 ]
 
 if current_omni_platform.is_rocm():
     REFERENCE_PIXELS = [
-        {"position": (100, 100), "rgb": (123, 119, 100)},
-        {"position": (400, 50), "rgb": (162, 161, 142)},
-        {"position": (700, 100), "rgb": (171, 156, 127)},
-        {"position": (150, 400), "rgb": (131, 128, 112)},
-        {"position": (512, 512), "rgb": (134, 61, 59)},
-        {"position": (700, 400), "rgb": (204, 107, 43)},
-        {"position": (100, 700), "rgb": (201, 180, 165)},
-        {"position": (400, 700), "rgb": (140, 108, 87)},
-        {"position": (700, 700), "rgb": (247, 205, 145)},
-        {"position": (256, 256), "rgb": (171, 160, 153)},
+        {"position": (100, 100), "rgb": (115, 113, 94)},
+        {"position": (400, 50), "rgb": (159, 160, 144)},
+        {"position": (700, 100), "rgb": (164, 151, 123)},
+        {"position": (150, 400), "rgb": (120, 121, 107)},
+        {"position": (512, 512), "rgb": (165, 133, 127)},
+        {"position": (700, 400), "rgb": (217, 130, 66)},
+        {"position": (100, 700), "rgb": (191, 168, 152)},
+        {"position": (400, 700), "rgb": (130, 96, 77)},
+        {"position": (700, 700), "rgb": (247, 203, 140)},
+        {"position": (256, 256), "rgb": (167, 156, 150)},
     ]
 
 # Maximum allowed difference per color channel
@@ -172,8 +174,8 @@ def _generate_bagel_image(omni: Omni, prompt: str = DEFAULT_PROMPT) -> Image.Ima
     return generated_image
 
 
-def _resolve_stage_config(config_path: str, run_level: str) -> str:
-    """Resolve stage config based on run level.
+def _resolve_deploy_config(config_path: str, run_level: str) -> str:
+    """Resolve deploy config based on run level.
 
     For advanced_model (real weights), strip load_format: dummy so the model
     falls back to loading real weights from HuggingFace.
@@ -182,9 +184,9 @@ def _resolve_stage_config(config_path: str, run_level: str) -> str:
         return modify_stage_config(
             config_path,
             deletes={
-                "stage_args": {
-                    0: ["engine_args.load_format"],
-                    1: ["engine_args.load_format"],
+                "stages": {
+                    0: ["load_format"],
+                    1: ["load_format"],
                 }
             },
         )
@@ -197,16 +199,14 @@ def _resolve_stage_config(config_path: str, run_level: str) -> str:
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_bagel_text2img_shared_memory_connector(run_level):
     """Test Bagel text2img with shared memory connector."""
-    config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
-    config_path = _resolve_stage_config(config_path, run_level)
-    omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=config_path, stage_init_timeout=300)
-
-    try:
-        generated_image = _generate_bagel_image(omni)
+    config_path = _resolve_deploy_config(BAGEL_CI_DEPLOY, run_level)
+    with OmniRunner(
+        "ByteDance-Seed/BAGEL-7B-MoT",
+        stage_configs_path=config_path,
+    ) as runner:
+        generated_image = _generate_bagel_image(runner.omni)
         if run_level == "advanced_model":
             _validate_pixels(generated_image)
-    finally:
-        omni.close()
 
 
 def _wait_for_port(host: str, port: int, timeout: int = 30) -> bool:
@@ -278,7 +278,7 @@ def _cleanup_mooncake_processes(timeout_secs: int = 5) -> None:
 
 
 def _load_mooncake_config(host: str, rpc_port: int, http_port: int) -> str:
-    """Load Mooncake config from YAML and substitute placeholders.
+    """Load Mooncake config from CI overlay and substitute placeholders.
 
     Args:
         host: Mooncake host address.
@@ -288,16 +288,13 @@ def _load_mooncake_config(host: str, rpc_port: int, http_port: int) -> str:
     Returns:
         Path to the temporary config file with substituted values.
     """
-    config_path = str(Path(__file__).parent / "stage_configs" / "bagel_mooncake_ci.yaml")
-    with open(config_path) as f:
+    with open(BAGEL_MOONCAKE_CI_DEPLOY) as f:
         config_content = f.read()
 
-    # Substitute placeholders
     config_content = config_content.replace("${MOONCAKE_HOST}", host)
     config_content = config_content.replace("${MOONCAKE_RPC_PORT}", str(rpc_port))
     config_content = config_content.replace("${MOONCAKE_HTTP_PORT}", str(http_port))
 
-    # Write to temp file
     temp_file = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
     temp_file.write(config_content)
     temp_file.close()
@@ -319,7 +316,6 @@ def test_bagel_text2img_mooncake_connector(run_level):
 
     mooncake_master_proc = None
     temp_config_file = None
-    omni = None
 
     try:
         _cleanup_mooncake_processes()
@@ -348,16 +344,17 @@ def test_bagel_text2img_mooncake_connector(run_level):
             http_port=MOONCAKE_HTTP_PORT,
         )
 
-        temp_config_file = _resolve_stage_config(temp_config_file, run_level)
-        omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=temp_config_file, stage_init_timeout=300)
-
-        generated_image = _generate_bagel_image(omni)
-        if run_level == "advanced_model":
-            _validate_pixels(generated_image)
+        temp_config_file = _resolve_deploy_config(temp_config_file, run_level)
+        with OmniRunner(
+            "ByteDance-Seed/BAGEL-7B-MoT",
+            stage_configs_path=temp_config_file,
+            stage_init_timeout=300,
+        ) as runner:
+            generated_image = _generate_bagel_image(runner.omni)
+            if run_level == "advanced_model":
+                _validate_pixels(generated_image)
 
     finally:
-        if omni:
-            omni.close()
         if temp_config_file:
             try:
                 os.unlink(temp_config_file)

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import inspect
 import queue
 import threading
 import time
@@ -13,6 +14,7 @@ import numpy as np
 import PIL.Image
 import torch
 from vllm.logger import init_logger
+from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
@@ -78,6 +80,12 @@ class DiffusionEngine:
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)
+        # Cache whether the model-specific postprocess accepts request-level
+        # sampling params so step() can support both legacy and extended hooks.
+        self._post_process_accepts_sampling_params = bool(
+            self.post_process_func is not None
+            and "sampling_params" in inspect.signature(self.post_process_func).parameters
+        )
 
         executor_class = DiffusionExecutor.get_class(od_config)
         self.executor = executor_class(od_config)
@@ -115,7 +123,7 @@ class DiffusionEngine:
         if output.aborted:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
-            raise RuntimeError(f"{output.error}")
+            raise RuntimeError(output.error)
         logger.info("Generation completed successfully.")
 
         if output.output is None:
@@ -143,12 +151,22 @@ class DiffusionEngine:
             output_data = output_data.cpu()
 
         postprocess_start_time = time.perf_counter()
-        outputs = self.post_process_func(output_data) if self.post_process_func is not None else output_data
+        if self.post_process_func is not None:
+            # Some video pipelines need request-level controls during
+            # postprocess (for example worker-side frame interpolation).
+            if self._post_process_accepts_sampling_params:
+                outputs = self.post_process_func(output_data, sampling_params=request.sampling_params)
+            else:
+                outputs = self.post_process_func(output_data)
+        else:
+            outputs = output_data
         audio_payload = None
+        custom_output = output.custom_output or {}
         model_audio_sample_rate = None
         model_fps = None
         if isinstance(outputs, dict):
             audio_payload = outputs.get("audio")
+            custom_output.update(outputs.get("custom_output") or {})
             model_audio_sample_rate = outputs.get("audio_sample_rate")
             model_fps = outputs.get("fps")
             outputs = outputs.get("video", outputs)
@@ -225,7 +243,7 @@ class DiffusionEngine:
                         trajectory_timesteps=output.trajectory_timesteps,
                         trajectory_log_probs=output.trajectory_log_probs,
                         trajectory_decoded=output.trajectory_decoded,
-                        custom_output=output.custom_output or {},
+                        custom_output=custom_output,
                         multimodal_output=mm_output,
                         stage_durations=output.stage_durations,
                         peak_memory_mb=output.peak_memory_mb,
@@ -295,7 +313,7 @@ class DiffusionEngine:
                             trajectory_timesteps=output.trajectory_timesteps,
                             trajectory_log_probs=output.trajectory_log_probs,
                             trajectory_decoded=output.trajectory_decoded,
-                            custom_output=output.custom_output or {},
+                            custom_output=custom_output,
                             multimodal_output=mm_output,
                             stage_durations=output.stage_durations,
                             peak_memory_mb=output.peak_memory_mb,
@@ -341,6 +359,8 @@ class DiffusionEngine:
                 sched_req_id = sched_output.scheduled_req_ids[0]
                 try:
                     runner_output = self.execute_fn(sched_output)
+                except EngineDeadError:
+                    raise
                 except Exception as exc:
                     logger.error("Execution failed for diffusion request %s", sched_req_id, exc_info=True)
                     runner_output = RunnerOutput(

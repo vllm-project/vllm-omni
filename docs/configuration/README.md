@@ -6,7 +6,7 @@ For options within a vLLM Engine. Please refer to [vLLM Configuration](https://d
 
 Currently, the main options are maintained by stage configs for each model.
 
-For specific example, please refer to [Qwen2.5-omni stage config](stage_configs/qwen2_5_omni.yaml)
+For a specific example, see the [Qwen2.5-Omni deploy config](gh-file:vllm_omni/deploy/qwen2_5_omni.yaml). The matching frozen pipeline topology lives at [vllm_omni/model_executor/models/qwen2_5_omni/pipeline.py](gh-file:vllm_omni/model_executor/models/qwen2_5_omni/pipeline.py).
 
 For introduction, please check [Introduction for stage config](./stage_configs.md)
 

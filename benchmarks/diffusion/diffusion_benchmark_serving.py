@@ -12,15 +12,15 @@ Supports multiple backends:
     - v1/videos: Use /v1/videos endpoint
 
 Usage:
-    # Video (vllm-omni backend)
+    # Video (v1/videos backend)
     t2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend vllm-omni --dataset vbench --task t2v --num-prompts 10 \
+        --backend v1/videos --dataset vbench --task t2v --num-prompts 10 \
         --height 480 --width 640 --fps 16 --num-frames 80
 
     i2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend vllm-omni --dataset vbench --task i2v --num-prompts 10
+        --backend v1/videos --dataset vbench --task i2v --num-prompts 10
 
 
     # Image (vllm-omni backend)
@@ -49,7 +49,7 @@ Usage:
         --backend openai --dataset vbench --task t2i --num-prompts 10 \
         --height 1024 --width 1024 --port 3000
 
-    # Video (v1/vedeos)
+    # Video (v1/videos)
     t2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
         --backend v1/videos --dataset random --task t2v --num-prompts 1 \
@@ -558,6 +558,7 @@ class RandomDataset(BaseDataset):
         super().__init__(args, api_url, model)
         self.num_prompts = args.num_prompts
         self.enable_negative_prompt = enable_negative_prompt
+        self.num_input_images = max(1, args.num_input_images)
         self.random_request_config = getattr(args, "random_request_config", None)
         if self.random_request_config:
             self.random_request_config = json.loads(self.random_request_config)
@@ -580,11 +581,7 @@ class RandomDataset(BaseDataset):
 
         # Random image generate
         if self.args.task in ["i2v", "ti2v", "ti2i", "i2i"]:
-            img = Image.new("RGB", (512, 512), (255, 255, 255))
-
-            image_path = os.path.join(tempfile.gettempdir(), "diffusion_benchmark_random_image.png")
-            self._random_image_path = [image_path]
-            img.save(image_path)
+            self._random_image_path = self._generate_random_image_paths()
         else:
             self._random_image_path = None
 
@@ -618,6 +615,18 @@ class RandomDataset(BaseDataset):
 
     def get_requests(self) -> list[RequestFuncInput]:
         return [self[i] for i in range(len(self))]
+
+    def _generate_random_image_paths(self) -> list[str]:
+        image_paths: list[str] = []
+        for image_idx in range(self.num_input_images):
+            img = Image.new("RGB", (512, 512), (255, 255, 255))
+            image_path = os.path.join(
+                tempfile.gettempdir(),
+                f"diffusion_benchmark_random_image_{image_idx}.png",
+            )
+            img.save(image_path)
+            image_paths.append(image_path)
+        return image_paths
 
 
 def _compute_expected_latency_ms_from_base(req: RequestFuncInput, args, base_time_ms: float | None) -> float | None:
@@ -1113,6 +1122,15 @@ if __name__ == "__main__":
             "Example: "
             '[{"width":512,"height":512,"num_inference_steps":20,"weight":0.15},'
             '{"width":768,"height":768,"num_inference_steps":20,"weight":0.85}]'
+        ),
+    )
+    parser.add_argument(
+        "--num-input-images",
+        type=int,
+        default=1,
+        help=(
+            "Number of synthetic input images to attach for image-conditioned tasks "
+            "(i2v, ti2v, ti2i, i2i) when using random dataset."
         ),
     )
 

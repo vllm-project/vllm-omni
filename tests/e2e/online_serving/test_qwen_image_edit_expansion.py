@@ -7,14 +7,11 @@ and are supported by the following models:
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-    dummy_messages_from_mix_data,
-    generate_synthetic_image,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.media import generate_synthetic_image
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 EDIT_PROMPT = "Transform this modern, geometrist image into a Vincent van Gogh style impressionist painting."
 MULTI_EDIT_PROMPT = (
@@ -113,8 +110,6 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit"),
@@ -143,8 +138,6 @@ def test_qwen_image_edit(omni_server: OmniServer, openai_client: OpenAIClientHan
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases("Qwen/Qwen-Image-Edit-2509"),

@@ -1,5 +1,5 @@
 import math
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
@@ -69,10 +69,21 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Maximum tokens to generate",
     )
+    seed: int | None = Field(
+        default=None,
+        ge=0,
+        le=2**63 - 1,
+        description="Random seed for reproducible generation. When set, ensures "
+        "deterministic output for the same input text and seed value.",
+    )
     initial_codec_chunk_frames: int | None = Field(
         default=None,
         ge=0,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
+    )
+    extra_params: dict[str, Any] | None = Field(
+        default=None,
+        description=("Optional model-specific parameters passed directly to the model's extra_args."),
     )
 
     @field_validator("stream_format")

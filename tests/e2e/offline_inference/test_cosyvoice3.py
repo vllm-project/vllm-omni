@@ -15,19 +15,18 @@ from __future__ import annotations
 import functools
 import io
 import os
-import tempfile
 from pathlib import Path
 from urllib.request import urlopen
 
 import numpy as np
 import pytest
 import soundfile as sf
-import yaml
 from huggingface_hub import snapshot_download
 from vllm.sampling_params import SamplingParams
 
-from tests.conftest import OmniRunner
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 
@@ -44,13 +43,9 @@ REFERENCE_STAGE0_TEMPERATURE = 1.0
 REFERENCE_STAGE0_REPETITION_PENALTY = 2.0
 
 
-def _stage_config(name: str) -> str:
-    return str(Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / name)
-
-
-STAGE_CONFIGS = [
-    _stage_config("cosyvoice3.yaml"),
-    _stage_config("cosyvoice3_async_chunk.yaml"),
+ASYNC_CHUNK_MODES = [
+    pytest.param(False, id="sync"),
+    pytest.param(True, id="async_chunk"),
 ]
 
 
@@ -138,19 +133,6 @@ def _get_stage_engine_outputs(omni_runner: OmniRunner, stage_id: int):
     raise AttributeError("Unable to locate stage outputs on Omni runner")
 
 
-def _patched_stage_config(base_stage_config: str, model_dir: Path, tmp_dir: Path) -> str:
-    cfg = yaml.safe_load(Path(base_stage_config).read_text(encoding="utf-8"))
-    tokenizer_path = str(model_dir / "CosyVoice-BlankEN")
-    for stage in cfg.get("stage_args", []):
-        engine_args = stage.setdefault("engine_args", {})
-        engine_args["tokenizer"] = tokenizer_path
-        engine_args["enforce_eager"] = True
-        engine_args["hf_overrides"] = {"architectures": ["CosyVoice3Model"]}
-    out_path = tmp_dir / Path(base_stage_config).name
-    out_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
-    return str(out_path)
-
-
 def _build_reference_inputs(prompt_audio: tuple[np.ndarray, int]) -> list[dict[str, object]]:
     return [
         {
@@ -165,54 +147,54 @@ def _build_reference_inputs(prompt_audio: tuple[np.ndarray, int]) -> list[dict[s
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("base_stage_config", STAGE_CONFIGS)
-def test_cosyvoice3_offline_reference_zero_shot(base_stage_config: str) -> None:
+@pytest.mark.parametrize("async_chunk", ASYNC_CHUNK_MODES)
+def test_cosyvoice3_offline_reference_zero_shot(async_chunk: bool) -> None:
     """CosyVoice3 zero-shot reference inference should stop cleanly and produce sane audio."""
     prompt_audio, prompt_sr = _load_reference_prompt_wav()
     model_dir = _resolve_model_dir()
     expected_stop_token = int(CosyVoice3Config().llm["eos_token_id"])
 
-    with tempfile.TemporaryDirectory(prefix="cv3-e2e-") as tmp:
-        stage_config = _patched_stage_config(base_stage_config, model_dir, Path(tmp))
-        with OmniRunner(
-            str(model_dir), seed=42, stage_configs_path=stage_config, stage_init_timeout=300
-        ) as omni_runner:
-            sampling_params_list = omni_runner.get_default_sampling_params_list()
-            sampling_params_list[0] = _reference_zero_shot_stage0_sampling(text=REFERENCE_SYNTH_TEXT)
+    with OmniRunner(
+        str(model_dir),
+        seed=42,
+        stage_configs_path=get_deploy_config_path("cosyvoice3.yaml"),
+        async_chunk=async_chunk,
+        stage_init_timeout=300,
+    ) as omni_runner:
+        sampling_params_list = omni_runner.get_default_sampling_params_list()
+        sampling_params_list[0] = _reference_zero_shot_stage0_sampling(text=REFERENCE_SYNTH_TEXT)
 
-            outputs = omni_runner.omni.generate(
-                _build_reference_inputs((prompt_audio, prompt_sr)), sampling_params_list
+        outputs = omni_runner.omni.generate(_build_reference_inputs((prompt_audio, prompt_sr)), sampling_params_list)
+
+        assert outputs, "No outputs returned"
+        audio_mm = outputs[0].multimodal_output
+        assert "audio" in audio_mm, "No audio output found"
+
+        audio = _concat_audio(audio_mm["audio"])
+        assert audio.size > 0, "Generated audio is empty"
+
+        sr_val = audio_mm.get("sr", 24000)
+        if isinstance(sr_val, list) and sr_val:
+            sr_val = sr_val[-1]
+        if hasattr(sr_val, "item"):
+            sr_val = sr_val.item()
+        sr = int(sr_val)
+        assert sr == 24000, f"Unexpected sample_rate={sr}"
+
+        duration_s = audio.size / sr
+        assert 2.8 <= duration_s <= 8.8, f"Unexpected duration={duration_s:.3f}s (samples={audio.size}, sr={sr})"
+
+        stage0_outputs = _get_stage_engine_outputs(omni_runner, 0)
+        if stage0_outputs:
+            completion = stage0_outputs[0].outputs[0]
+            finish_reason = getattr(completion, "finish_reason", None)
+            stop_reason = getattr(completion, "stop_reason", None)
+            num_tokens = len(getattr(completion, "token_ids", []) or [])
+
+            assert finish_reason == "stop", f"Stage-0 finish_reason={finish_reason}, expected 'stop'"
+            assert int(stop_reason) == expected_stop_token, (
+                f"Stage-0 stop_reason={stop_reason}, expected {expected_stop_token}"
             )
-
-            assert outputs, "No outputs returned"
-            audio_mm = outputs[0].multimodal_output
-            assert "audio" in audio_mm, "No audio output found"
-
-            audio = _concat_audio(audio_mm["audio"])
-            assert audio.size > 0, "Generated audio is empty"
-
-            sr_val = audio_mm.get("sr", 24000)
-            if isinstance(sr_val, list) and sr_val:
-                sr_val = sr_val[-1]
-            if hasattr(sr_val, "item"):
-                sr_val = sr_val.item()
-            sr = int(sr_val)
-            assert sr == 24000, f"Unexpected sample_rate={sr}"
-
-            duration_s = audio.size / sr
-            assert 2.8 <= duration_s <= 8.8, f"Unexpected duration={duration_s:.3f}s (samples={audio.size}, sr={sr})"
-
-            stage0_outputs = _get_stage_engine_outputs(omni_runner, 0)
-            if stage0_outputs:
-                completion = stage0_outputs[0].outputs[0]
-                finish_reason = getattr(completion, "finish_reason", None)
-                stop_reason = getattr(completion, "stop_reason", None)
-                num_tokens = len(getattr(completion, "token_ids", []) or [])
-
-                assert finish_reason == "stop", f"Stage-0 finish_reason={finish_reason}, expected 'stop'"
-                assert int(stop_reason) == expected_stop_token, (
-                    f"Stage-0 stop_reason={stop_reason}, expected {expected_stop_token}"
-                )
-                assert 80 <= num_tokens <= 220, f"Stage-0 num_tokens={num_tokens}, expected sane stop-bound range"
-            else:
-                assert "async_chunk" in Path(base_stage_config).name, "Stage-0 produced no engine outputs"
+            assert 80 <= num_tokens <= 220, f"Stage-0 num_tokens={num_tokens}, expected sane stop-bound range"
+        else:
+            assert async_chunk, "Stage-0 produced no engine outputs"

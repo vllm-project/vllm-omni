@@ -4,12 +4,15 @@
 import threading
 from collections import deque
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -109,7 +112,11 @@ def test_load_poll(build_adapter):
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
 
     adapter.load_async(request)
-    payload = {"code_predictor_codes": [[1]], "hidden_states": torch.tensor([[2.0]]), "finished": True}
+    payload: OmniPayload = {
+        "codes": {"audio": [[1]]},
+        "hidden_states": {"output": torch.tensor([[2.0]])},
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
     connector.get.return_value = (payload, 16)
     adapter._poll_single_request(request)
 
@@ -152,12 +159,49 @@ def test_send_single_request_cleans_up_after_finished_payload(build_adapter, mon
 def test_update_request_payload(build_adapter):
     adapter, _ = build_adapter()
 
-    adapter._update_request_payload("ext", {"h": torch.tensor([[1.0]]), "codes": [1], "finished": False})
-    merged = adapter._update_request_payload("ext", {"h": torch.tensor([[2.0]]), "codes": [2], "finished": True})
+    first: OmniPayload = {
+        "hidden_states": {"output": torch.tensor([[1.0]])},
+        "codes": {"audio": [1]},
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+    }
+    adapter._update_request_payload("ext", first)
+    second: OmniPayload = {
+        "hidden_states": {"output": torch.tensor([[2.0]])},
+        "codes": {"audio": [2]},
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+    merged = adapter._update_request_payload("ext", second)
 
-    assert torch.equal(merged["h"], torch.tensor([[1.0], [2.0]]))
-    assert merged["codes"] == [1, 2]
-    assert merged["finished"] is True
+    assert torch.equal(merged["hidden_states"]["output"], torch.tensor([[1.0], [2.0]]))
+    assert merged["codes"]["audio"] == [1, 2]
+    assert merged["meta"]["finished"].item() is True
+
+
+def test_load_poll_ar_request_additional_information_concats_tensors(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req("req-merged", RequestStatus.WAITING, external_req_id="ext-merged")
+
+    adapter.request_ids_mapping["req-merged"] = "ext-merged"
+    adapter.request_payload["ext-merged"] = {
+        "hidden_states": {"output": torch.tensor([[1.0]])},
+        "ids": {"prompt": [11, 12]},
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+    }
+    payload: OmniPayload = {
+        "hidden_states": {"output": torch.tensor([[2.0]])},
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+    connector.get.return_value = (payload, 8)
+
+    adapter._poll_single_request(request)
+
+    assert torch.equal(
+        request.additional_information["hidden_states"]["output"],
+        torch.tensor([[1.0], [2.0]]),
+    )
+    # Keys absent from the new chunk are dropped (matches main's behavior).
+    assert "ids" not in request.additional_information
+    assert request.additional_information["meta"]["finished"].item() is True
 
 
 def test_process_and_restore_queues(build_adapter):
@@ -319,7 +363,10 @@ def test_cleanup_after_poll_flow(build_adapter):
     adapter.load_async(request)
 
     adapter.request_ids_mapping["req-flow"] = "ext-flow"
-    payload = {"hidden_states": torch.tensor([[1.0]]), "finished": True}
+    payload: OmniPayload = {
+        "hidden_states": {"output": torch.tensor([[1.0]])},
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
     connector.get.return_value = (payload, 8)
     adapter._poll_single_request(request)
 
@@ -333,6 +380,27 @@ def test_cleanup_after_poll_flow(build_adapter):
     assert "req-flow" not in adapter.get_req_chunk
     assert "req-flow" not in adapter.request_ids_mapping
     assert "ext-flow" not in adapter.request_payload
+
+
+def test_finish_requests_restores_status(build_adapter):
+    """Abort path must pop ``requests_origin_status`` and restore pre-wait status.
+
+    While ``process_pending_chunks`` holds a request off the scheduler queues, the
+    adapter records the prior status (WAITING or RUNNING). ``finish_requests`` must
+    put that status back on the live ``Request`` so base ``Scheduler.finish_requests``
+    can finish bookkeeping without inconsistent state / crashes.
+    """
+    adapter, _ = build_adapter(stage_id=1)
+    req_id = "req-abort-during-chunk"
+    prior = RequestStatus.RUNNING
+    request = _req(req_id, RequestStatus.WAITING_FOR_CHUNK)
+    adapter.requests_origin_status[req_id] = prior
+    requests_map = {req_id: request}
+
+    adapter.finish_requests([req_id], RequestStatus.FINISHED_ABORTED, requests_map)
+
+    assert request.status == prior
+    assert req_id not in adapter.requests_origin_status
 
 
 # ---------------------------------------------------------------
@@ -508,3 +576,31 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
 
     assert len(cleanup_calls) == 0
     assert len(save_calls) == 1
+
+
+def test_omni_ar_scheduler_finish_requests(mocker: MockerFixture):
+    """``OmniARScheduler.finish_requests`` must run chunk adapter hook before vLLM base."""
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+
+    order: list[str] = []
+
+    adapter = mocker.MagicMock()
+
+    def _adapter_finish(request_ids, finished_status, requests):
+        order.append("adapter")
+        return []
+
+    adapter.finish_requests.side_effect = _adapter_finish
+
+    def _super_finish(_self, request_ids, finished_status):
+        order.append("super")
+        return []
+
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched.chunk_transfer_adapter = adapter
+    sched.requests = {}
+
+    with patch.object(VLLMScheduler, "finish_requests", _super_finish):
+        OmniARScheduler.finish_requests(sched, ["r1"], RequestStatus.FINISHED_ABORTED)
+
+    assert order == ["adapter", "super"]

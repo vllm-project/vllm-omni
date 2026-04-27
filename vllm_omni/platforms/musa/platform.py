@@ -25,11 +25,11 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
-        return "vllm_omni.platforms.musa.worker.musa_ar_worker.MUSAARWorker"
+        return "vllm_omni.worker.gpu_ar_worker.GPUARWorker"
 
     @classmethod
     def get_omni_generation_worker_cls(cls) -> str:
-        return "vllm_omni.platforms.musa.worker.musa_generation_worker.MUSAGenerationWorker"
+        return "vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker"
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
@@ -39,7 +39,7 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
     def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:
         # MUSA uses default implementations for diffusion ops
         if op_name == "hunyuan_fused_moe":
-            return "vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
+            return "vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
         return super().get_diffusion_model_impl_qualname(op_name)
 
     @classmethod

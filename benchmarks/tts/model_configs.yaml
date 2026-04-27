@@ -1,0 +1,39 @@
+# Universal TTS benchmark model registry.
+# Maps HuggingFace model ID → supported tasks + per-task extra body fields.
+# To add a new TTS model: add an entry here. No code changes required.
+#
+# The server auto-loads its Deploy YAML from vllm_omni/deploy/<model>.yaml via
+# the Pipeline + Deploy schema introduced in #2383, so no stage_config path
+# is tracked here.
+
+models:
+  # -CustomVoice checkpoints lack speaker_encoder weights, so voice_clone is
+  # NOT supported (an attempt raises ValueError from _extract_speaker_embedding
+  # at model runtime).  Use -Base for voice_clone.
+  Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice:
+    supported_tasks: [default_voice, voice_design]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      default_voice:
+        voice: Vivian
+        language: English
+        task_type: CustomVoice
+      voice_design:
+        task_type: VoiceDesign
+        language: English
+
+  Qwen/Qwen3-TTS-12Hz-1.7B-Base:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone:
+        task_type: Base
+
+  openbmb/VoxCPM2:
+    supported_tasks: [voice_clone]
+    backend: openai-audio-speech
+    endpoint: /v1/audio/speech
+    task_extra_body:
+      voice_clone: {}

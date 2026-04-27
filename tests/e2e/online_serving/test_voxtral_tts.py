@@ -12,19 +12,16 @@ import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
-from pathlib import Path
-
 import httpx
 import pytest
 
-from tests.conftest import OmniServerParams
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServerParams
+from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "mistralai/Voxtral-4B-TTS-2603"
 
-STAGE_CONFIG = str(
-    Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / "voxtral_tts.yaml"
-)
+STAGE_CONFIG = get_deploy_config_path("voxtral_tts.yaml")
 EXTRA_ARGS = ["--trust-remote-code", "--enforce-eager", "--disable-log-stats"]
 TEST_PARAMS = [OmniServerParams(model=MODEL, stage_config_path=STAGE_CONFIG, server_args=EXTRA_ARGS)]
 
@@ -83,6 +80,30 @@ class TestVoxtralTTSFixedVoice:
         assert verify_wav_audio(response.content), "Response is not valid WAV audio"
         assert len(response.content) > MIN_AUDIO_BYTES, (
             f"Audio content too small ({len(response.content)} bytes), expected at least {MIN_AUDIO_BYTES} bytes"
+        )
+
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    def test_speech_english_streaming(self, omni_server) -> None:
+        """Test basic streaming English TTS generation."""
+        url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech"
+        payload = {
+            "input": "Hello, how are you?",
+            "voice": "casual_female",
+            "language": "English",
+            "stream": True,
+            "response_format": "pcm",
+        }
+
+        with httpx.Client(timeout=120.0) as client:
+            with client.stream("POST", url, json=payload) as response:
+                assert response.status_code == 200
+                assert response.headers.get("content-type") == "audio/pcm"
+                total = sum(len(c) for c in response.iter_bytes())
+
+        assert total > MIN_AUDIO_BYTES, (
+            f"Streamed audio too small ({total} bytes), expected at least {MIN_AUDIO_BYTES} bytes"
         )
 
     @pytest.mark.advanced_model

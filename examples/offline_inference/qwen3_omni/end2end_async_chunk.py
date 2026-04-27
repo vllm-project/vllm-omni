@@ -14,7 +14,7 @@ actively processing while stage-0 is still generating.
 Usage
 -----
     python end2end_async_chunk.py --query-type use_audio \
-        --stage-configs-path <path-to-async-chunk-yaml>
+        --deploy-config <path-to-deploy-config-yaml>
 
 See ``--help`` for all options.
 """
@@ -179,20 +179,26 @@ def clone_prompt_for_request(template: dict) -> dict:
     return cloned
 
 
-def _default_async_chunk_stage_configs_path() -> str | None:
-    """Best-effort default stage config for running Qwen3-Omni with async_chunk.
+def _default_deploy_config_path() -> str | None:
+    """Best-effort default deploy config for running Qwen3-Omni with async_chunk.
 
-    When this example is executed from within the repository, we resolve the
-    default YAML path relative to this file. When installed elsewhere, the
-    file may not exist and callers should pass --stage-configs-path explicitly.
+    The default ``vllm_omni/deploy/qwen3_omni_moe.yaml`` ships with
+    ``async_chunk: true`` at the top level, so loading it is enough to
+    enable async-chunk semantics. To disable it, copy the YAML and set
+    ``async_chunk: false`` (or pass ``--deploy-config`` to a YAML that
+    overrides the flag).
+
+    When this example is executed from within the repository, we resolve
+    the default YAML path relative to this file. When installed elsewhere,
+    the file may not exist and callers should pass ``--deploy-config``
+    explicitly.
     """
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
     candidate = os.path.join(
         repo_root,
         "vllm_omni",
-        "model_executor",
-        "stage_configs",
-        "qwen3_omni_moe_async_chunk.yaml",
+        "deploy",
+        "qwen3_omni_moe.yaml",
     )
     return candidate if os.path.exists(candidate) else None
 
@@ -236,8 +242,7 @@ async def run_single_request(
                 if stage_0_first_output_ts is None:
                     stage_0_first_output_ts = time.perf_counter()
                 text_output = output.outputs[0].text
-                if output.finished:
-                    text_parts.append(text_output)
+                text_parts.append(text_output)
             elif omni_output.final_output_type == "audio":
                 mm_out = output.outputs[0].multimodal_output
                 if mm_out and "audio" in mm_out:
@@ -287,7 +292,7 @@ async def run_single_request(
     if text_parts:
         text_file = os.path.join(output_dir, f"{request_id}.txt")
         with open(text_file, "w", encoding="utf-8") as f:
-            f.write("\n".join(text_parts))
+            f.write("".join(text_parts))
         result["saved_files"].append(text_file)
         print(
             f"[Request {request_id}] Text saved to {text_file} "
@@ -374,18 +379,23 @@ async def run_all(args):
             prompt["modalities"] = output_modalities
 
     # Create AsyncOmni
-    print(f"[Info] Creating AsyncOmni with stage_configs_path={args.stage_configs_path}")
+    print(f"[Info] Creating AsyncOmni with deploy_config={args.deploy_config}")
     async_omni = None
     try:
-        async_omni = AsyncOmni(
-            model=args.model,
-            stage_configs_path=args.stage_configs_path,
-            log_stats=args.log_stats,
-            stage_init_timeout=args.stage_init_timeout,
-        )
+        # ``from_cli_args`` expands vars(args) into kwargs and auto-captures
+        # ``_cli_explicit_keys`` from ``sys.argv[1:]`` so argparse defaults
+        # do not silently override deploy YAML values. Mirrors the
+        # ``EngineArgs.from_cli_args`` pattern used throughout vllm /
+        # vllm-omni. ``deploy_config=None`` (the default) falls through to
+        # the bundled ``vllm_omni/deploy/qwen3_omni_moe.yaml``.
+        async_omni = AsyncOmni.from_cli_args(args)
 
         # Use default sampling params from stage config (they are pre-configured
         # in the YAML for each stage).
+        #
+        # NOTE: Since we do not set the sampling params directly, .generate in
+        # will automatically set the output kind to delta, since this is what
+        # makes sense for most multimodal use-cases.
         sampling_params_list = None
 
         output_dir = args.output_dir
@@ -470,11 +480,11 @@ def parse_args():
         help="Query type.",
     )
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         type=str,
-        default=_default_async_chunk_stage_configs_path(),
+        default=_default_deploy_config_path(),
         help=(
-            "Path to an async_chunk stage config YAML. "
+            "Path to a deploy config YAML. "
             "If not set, uses the model's default config "
             "(make sure it has async_chunk: true)."
         ),

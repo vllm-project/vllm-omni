@@ -78,6 +78,13 @@ except Exception:
     AudioSpecialTokens = _mod2.AudioSpecialTokens
 
 
+class SyntheticAcousticTransformerArgs:
+    """Mimics AcousticTransformerArgs interface."""
+
+    def __init__(self):
+        self.n_decoding_steps = 7
+
+
 class SyntheticModelArgs:
     """Mimics MultimodalAudioModelArgs interface."""
 
@@ -96,6 +103,7 @@ class SyntheticAcousticTransformer(nn.Module):
     def __init__(self):
         super().__init__()
         self.model_args = SyntheticModelArgs()
+        self.acoustic_transformer_args = SyntheticAcousticTransformerArgs()
         self.acoustic_embeddings_levels = ACOUSTIC_EMBEDDINGS_LEVELS
 
         # semantic_codebook_output: hidden_dim -> padded_codebook_size
@@ -129,7 +137,7 @@ class SyntheticModel(nn.Module):
     def compute_mm_logits(
         self,
         hidden_states: torch.Tensor,
-        mm_sampling_tensors=None,
+        cfg_alpha: torch.Tensor,
     ):
         """Eager fallback path: replicate what the wrapper does."""
         at = self.acoustic_transformer
@@ -208,6 +216,10 @@ def _random_hidden(batch_size, device=DEVICE, dtype=torch.bfloat16):
     return torch.randn(batch_size, HIDDEN_DIM, device=device, dtype=dtype)
 
 
+def _cfg_alpha(batch_size, value=1.2, device=DEVICE):
+    return torch.full((batch_size,), value, device=device, dtype=torch.float32)
+
+
 def _unpack_audio_codes(result):
     """Unpack (fake_eos, {"audio": [list of tensors]}) into (fake_eos, audio_codes)."""
     fake_eos, mm_tokens = result
@@ -227,7 +239,7 @@ def test_exact_size_output_format(model, wrapper, batch_size):
     """Graph path returns correctly shaped and bounded outputs."""
     hidden = _random_hidden(batch_size)
     with torch.no_grad():
-        graph_eos, graph_codes = _unpack_audio_codes(wrapper(hidden))
+        graph_eos, graph_codes = _unpack_audio_codes(wrapper(hidden, cfg_alpha=_cfg_alpha(batch_size)))
     assert graph_eos.shape == (batch_size,)
     assert graph_codes.shape == (batch_size, 1 + N_ACOUSTIC_CODEBOOK)
     # fake_eos should be 0.0 or 1.0
@@ -240,11 +252,12 @@ def test_exact_size_output_format(model, wrapper, batch_size):
 def test_exact_size_deterministic(model, wrapper, batch_size):
     """Same input + same RNG state produces identical CUDA graph output."""
     hidden = _random_hidden(batch_size)
+    cfg_alpha = _cfg_alpha(batch_size)
     with torch.no_grad():
         torch.manual_seed(42)
-        eos1, codes1 = _unpack_audio_codes(wrapper(hidden))
+        eos1, codes1 = _unpack_audio_codes(wrapper(hidden, cfg_alpha=cfg_alpha))
         torch.manual_seed(42)
-        eos2, codes2 = _unpack_audio_codes(wrapper(hidden))
+        eos2, codes2 = _unpack_audio_codes(wrapper(hidden, cfg_alpha=cfg_alpha))
     torch.testing.assert_close(eos1, eos2, atol=0, rtol=0)
     torch.testing.assert_close(codes1, codes2, atol=0, rtol=0)
 
@@ -259,7 +272,7 @@ def test_padded_output_shape(model, wrapper, batch_size):
     """Padded decode must return output trimmed to actual batch size."""
     hidden = _random_hidden(batch_size)
     with torch.no_grad():
-        graph_eos, graph_codes = _unpack_audio_codes(wrapper(hidden))
+        graph_eos, graph_codes = _unpack_audio_codes(wrapper(hidden, cfg_alpha=_cfg_alpha(batch_size)))
     assert graph_eos.shape == (batch_size,)
     assert graph_codes.shape == (batch_size, 1 + N_ACOUSTIC_CODEBOOK)
 
@@ -269,7 +282,7 @@ def test_padded_output_bounded(model, wrapper, batch_size):
     """Padded output audio codes should be non-negative integers."""
     hidden = _random_hidden(batch_size)
     with torch.no_grad():
-        graph_eos, graph_codes = _unpack_audio_codes(wrapper(hidden))
+        graph_eos, graph_codes = _unpack_audio_codes(wrapper(hidden, cfg_alpha=_cfg_alpha(batch_size)))
     # fake_eos should be 0.0 or 1.0
     assert torch.all((graph_eos == 0.0) | (graph_eos == 1.0))
     # Audio codes should be non-negative
@@ -285,11 +298,12 @@ def test_padded_output_bounded(model, wrapper, batch_size):
 def test_fallback_eager_exact_match(model, wrapper, batch_size):
     """Cudagraph fallback to eager. Two eager runs should produce identical results."""
     hidden = _random_hidden(batch_size)
+    alpha = _cfg_alpha(batch_size)
     with torch.no_grad():
         torch.manual_seed(100)
-        eager_eos, eager_codes = _unpack_audio_codes(model.compute_mm_logits(hidden))
+        eager_eos, eager_codes = _unpack_audio_codes(model.compute_mm_logits(hidden, cfg_alpha=alpha))
         torch.manual_seed(100)
-        graph_eos, graph_codes = _unpack_audio_codes(wrapper(hidden))
+        graph_eos, graph_codes = _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha))
     torch.testing.assert_close(graph_eos, eager_eos, atol=0, rtol=0)
     torch.testing.assert_close(graph_codes, eager_codes, atol=0, rtol=0)
 
@@ -302,12 +316,13 @@ def test_fallback_eager_exact_match(model, wrapper, batch_size):
 def test_disabled_wrapper_matches_eager(model, wrapper):
     """Cudagraph fallback to eager. Two eager runs should produce identical results."""
     hidden = _random_hidden(4)
+    alpha = _cfg_alpha(4)
     wrapper.enabled = False
     with torch.no_grad():
         torch.manual_seed(200)
-        eager_eos, eager_codes = _unpack_audio_codes(model.compute_mm_logits(hidden))
+        eager_eos, eager_codes = _unpack_audio_codes(model.compute_mm_logits(hidden, cfg_alpha=alpha))
         torch.manual_seed(200)
-        graph_eos, graph_codes = _unpack_audio_codes(wrapper(hidden))
+        graph_eos, graph_codes = _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha))
     wrapper.enabled = True
     torch.testing.assert_close(graph_eos, eager_eos, atol=0, rtol=0)
     torch.testing.assert_close(graph_codes, eager_codes, atol=0, rtol=0)
@@ -321,10 +336,11 @@ def test_disabled_wrapper_matches_eager(model, wrapper):
 def test_deterministic_across_calls(model, wrapper):
     """Same input + same RNG state. Two cudagraph runs should produce identical results."""
     hidden = _random_hidden(4)
+    alpha = _cfg_alpha(4)
     with torch.no_grad():
         torch.manual_seed(300)
-        eos1, codes1 = _unpack_audio_codes(wrapper(hidden))
+        eos1, codes1 = _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha))
         torch.manual_seed(300)
-        eos2, codes2 = _unpack_audio_codes(wrapper(hidden))
+        eos2, codes2 = _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha))
     torch.testing.assert_close(eos1, eos2, atol=0, rtol=0)
     torch.testing.assert_close(codes1, codes2, atol=0, rtol=0)

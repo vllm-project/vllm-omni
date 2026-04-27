@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.config.yaml_util import create_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -15,6 +16,7 @@ from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.utils import (
     _convert_dataclasses_to_dict,
     _filter_dict_like_object,
+    coerce_param_message_types,
     filter_dataclass_kwargs,
     load_and_resolve_stage_configs,
     load_stage_configs_from_yaml,
@@ -310,6 +312,39 @@ class TestResolveModelConfigPath:
         assert result is not None
         assert "glm_image.yaml" in result
 
+    def test_voxcpm_transformers_format_resolution(self, mocker: MockerFixture):
+        """Test VoxCPM transformers config resolves to the voxcpm stage config."""
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.get_config",
+            side_effect=ValueError("missing transformers config"),
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.file_or_path_exists",
+            side_effect=lambda _model, filename, revision=None: filename == "config.json",
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.get_hf_file_to_dict",
+            return_value={"model_type": "voxcpm"},
+        )
+        mocker.patch(
+            "vllm_omni.entrypoints.utils.current_omni_platform.get_default_stage_config_path",
+            return_value="vllm_omni/model_executor/stage_configs",
+        )
+
+        original_exists = os.path.exists
+
+        def mock_exists(path):
+            if "voxcpm.yaml" in str(path):
+                return True
+            return original_exists(path)
+
+        mocker.patch("os.path.exists", side_effect=mock_exists)
+
+        result = resolve_model_config_path("OpenBMB/VoxCPM1.5")
+
+        assert result is not None
+        assert "voxcpm.yaml" in result
+
 
 class TestLoadAndResolveStageConfigs:
     def test_load_and_resolve_with_kwargs(self):
@@ -391,3 +426,44 @@ class TestLoadStageConfigsFromYaml:
 
         assert stages[0]["engine_args"]["nested"]["base"] == 1
         assert stages[0]["engine_args"]["nested"]["override"] == 2
+
+
+class TestCumulativeStreamingCoercion:
+    @pytest.mark.parametrize("skip_clone", [True, False])
+    def test_cumulative_default_becomes_delta_if_stream(self, skip_clone):
+        """Ensure cumulative messages are coercible to delta if streaming."""
+        sp = SamplingParams(output_kind=RequestOutputKind.CUMULATIVE)
+        sp.skip_clone = skip_clone
+        result = coerce_param_message_types([sp], is_streaming=True)[0]
+        assert isinstance(result, SamplingParams)
+        assert result.output_kind == RequestOutputKind.DELTA
+        assert (skip_clone and sp is result) or (not skip_clone and sp is not result)
+
+    @pytest.mark.parametrize("skip_clone", [True, False])
+    def test_cumulative_default_becomes_final_only_if_not_stream(self, skip_clone):
+        """Ensure cumulative messages are coercible to final only if not streaming."""
+        sp = SamplingParams(output_kind=RequestOutputKind.CUMULATIVE)
+        sp.skip_clone = skip_clone
+        result = coerce_param_message_types([sp], is_streaming=False)[0]
+        assert isinstance(result, SamplingParams)
+        assert result.output_kind == RequestOutputKind.FINAL_ONLY
+        assert (skip_clone and sp is result) or (not skip_clone and sp is not result)
+
+    @pytest.mark.parametrize("is_streaming", [True, False])
+    @pytest.mark.parametrize("output_kind", [RequestOutputKind.DELTA, RequestOutputKind.FINAL_ONLY])
+    def test_non_cumulative_are_coerced(self, output_kind, is_streaming):
+        """Ensure non-cumulative params are coerced to the target type."""
+        sp = SamplingParams(output_kind=output_kind)
+        expected = RequestOutputKind.DELTA if is_streaming else RequestOutputKind.FINAL_ONLY
+        result = coerce_param_message_types([sp], is_streaming=is_streaming)[0]
+        assert isinstance(result, SamplingParams)
+        assert result.output_kind == expected
+
+    def test_coercion_applies_to_all_stages(self):
+        """Ensure all stages are coerced to DELTA for streaming."""
+        sp0 = SamplingParams(output_kind=RequestOutputKind.CUMULATIVE)
+        sp1 = SamplingParams(output_kind=RequestOutputKind.CUMULATIVE)
+        result = coerce_param_message_types([sp0, sp1], is_streaming=True)
+        assert all([isinstance(r, SamplingParams) for r in result])
+        assert result[0].output_kind == RequestOutputKind.DELTA
+        assert result[1].output_kind == RequestOutputKind.DELTA

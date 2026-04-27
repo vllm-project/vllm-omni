@@ -21,18 +21,16 @@ Equivalent to running:
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
-from pathlib import Path
 
 import pytest
 from vllm.assets.image import ImageAsset
 
-from tests.conftest import modify_stage_config
-from tests.utils import hardware_test
-from vllm_omni.entrypoints.omni import Omni
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 MODEL_NAME = "ByteDance-Seed/BAGEL-7B-MoT"
-STAGE_CONFIG = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
+STAGE_CONFIG = get_deploy_config_path("ci/bagel.yaml")
 
 REFERENCE_TEXT_TEXT2TEXT = "The capital of France is Paris."
 
@@ -45,15 +43,15 @@ REFERENCE_TEXT_IMG2TEXT = (
 )
 
 
-def _resolve_stage_config(config_path: str, run_level: str) -> str:
+def _resolve_deploy_config(config_path: str, run_level: str) -> str:
     """Strip load_format: dummy for advanced_model (real weights)."""
     if run_level == "advanced_model":
         return modify_stage_config(
             config_path,
             deletes={
-                "stage_args": {
-                    0: ["engine_args.load_format"],
-                    1: ["engine_args.load_format"],
+                "stages": {
+                    0: ["load_format"],
+                    1: ["load_format"],
                 }
             },
         )
@@ -75,14 +73,12 @@ def _extract_text(omni_outputs: list) -> str:
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_bagel_text2text(run_level):
     """Test Bagel text2text produces correct text output."""
-    config_path = _resolve_stage_config(STAGE_CONFIG, run_level)
-    omni = Omni(
-        model=MODEL_NAME,
+    config_path = _resolve_deploy_config(STAGE_CONFIG, run_level)
+    with OmniRunner(
+        MODEL_NAME,
         stage_configs_path=config_path,
-        stage_init_timeout=300,
-    )
-
-    try:
+    ) as runner:
+        omni = runner.omni
         prompt = "<|im_start|>user\nWhere is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
         params_list = omni.default_sampling_params_list
         omni_outputs = list(
@@ -100,8 +96,6 @@ def test_bagel_text2text(run_level):
             assert text == REFERENCE_TEXT_TEXT2TEXT, (
                 f"Text mismatch: expected {REFERENCE_TEXT_TEXT2TEXT!r}, got {text!r}"
             )
-    finally:
-        omni.close()
 
 
 @pytest.mark.core_model
@@ -111,14 +105,13 @@ def test_bagel_text2text(run_level):
 def test_bagel_img2text(run_level):
     """Test Bagel img2text produces correct text output."""
     input_image = ImageAsset("2560px-Gfp-wisconsin-madison-the-nature-boardwalk").pil_image.convert("RGB")
-    config_path = _resolve_stage_config(STAGE_CONFIG, run_level)
-    omni = Omni(
-        model=MODEL_NAME,
+    config_path = _resolve_deploy_config(STAGE_CONFIG, run_level)
+    with OmniRunner(
+        MODEL_NAME,
         stage_configs_path=config_path,
         stage_init_timeout=300,
-    )
-
-    try:
+    ) as runner:
+        omni = runner.omni
         prompt = "<|im_start|>user\n<|image_pad|>\nPlease describe this image<|im_end|>\n<|im_start|>assistant\n"
         params_list = omni.default_sampling_params_list
         omni_outputs = list(
@@ -140,5 +133,3 @@ def test_bagel_img2text(run_level):
 
         if run_level == "advanced_model":
             assert text == REFERENCE_TEXT_IMG2TEXT, f"Text mismatch: expected {REFERENCE_TEXT_IMG2TEXT!r}, got {text!r}"
-    finally:
-        omni.close()

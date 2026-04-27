@@ -53,7 +53,12 @@ def parse_args():
     parser.add_argument("--shm-threshold-bytes", type=int, default=65536)
     parser.add_argument("--worker-backend", type=str, default="process", choices=["process", "ray"])
     parser.add_argument("--ray-address", type=str, default=None)
-    parser.add_argument("--stage-configs-path", type=str, default=None)
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help="Path to deploy YAML. If unset, auto-loads vllm_omni/deploy/bagel.yaml based on the HF model_type.",
+    )
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
 
     parser.add_argument("--cfg-text-scale", type=float, default=4.0, help="Text CFG scale (default: 4.0)")
@@ -97,7 +102,28 @@ def parse_args():
         default=False,
         help="Enable thinking mode: AR stage decodes <think>...</think> planning tokens before image generation.",
     )
+    parser.add_argument(
+        "--max-think-tokens",
+        type=int,
+        default=1000,
+        help="Maximum number of tokens for thinking text generation (default: 1000).",
+    )
+    parser.add_argument(
+        "--do-sample",
+        action="store_true",
+        default=False,
+        help="Enable sampling for text generation (default: greedy).",
+    )
+    parser.add_argument(
+        "--text-temperature",
+        type=float,
+        default=0.3,
+        help="Temperature for text generation sampling (default: 0.3).",
+    )
 
+    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+
+    nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
     return args
 
@@ -108,7 +134,6 @@ def main():
     model_name = args.model
     prompts: list[OmniPromptType] = []
     try:
-        # Preferred: load from txt file (one prompt per line)
         if getattr(args, "txt_prompts", None) and args.prompt_type == "text":
             with open(args.txt_prompts, encoding="utf-8") as f:
                 lines = [ln.strip() for ln in f.readlines()]
@@ -121,22 +146,20 @@ def main():
         raise
 
     if not prompts:
-        # Default prompt for text2img test if none provided
         prompts = ["A cute cat"]
         print(f"[Info] No prompts provided, using default: {prompts}")
-    omni_outputs = []
 
     from PIL import Image
 
     from vllm_omni.entrypoints.omni import Omni
 
     omni_kwargs = {}
-    stage_configs_path = args.stage_configs_path
-    if args.think and stage_configs_path is None:
-        stage_configs_path = "vllm_omni/model_executor/stage_configs/bagel_think.yaml"
-        print(f"[Info] Think mode enabled, using stage config: {stage_configs_path}")
-    if stage_configs_path:
-        omni_kwargs["stage_configs_path"] = stage_configs_path
+    deploy_config = args.deploy_config
+    if args.think and deploy_config is None:
+        deploy_config = "vllm_omni/deploy/bagel_think.yaml"
+        print(f"[Info] Think mode enabled, using deploy config: {deploy_config}")
+    if deploy_config:
+        omni_kwargs["deploy_config"] = deploy_config
 
     omni_kwargs.update(
         {
@@ -153,7 +176,7 @@ def main():
     if args.quantization:
         omni_kwargs["quantization_config"] = args.quantization
 
-    omni = Omni(model=model_name, **omni_kwargs)
+    omni = Omni.from_cli_args(args, model=model_name, **omni_kwargs)
 
     formatted_prompts = []
     for p in prompts:
@@ -198,40 +221,63 @@ def main():
             formatted_prompts.append(prompt_dict)
 
     params_list = omni.default_sampling_params_list
+    # Bagel exposes 1 sampling param set for single-stage (DiT-only) and
+    # 2 for two-stage (Thinker + DiT).  This heuristic may need updating
+    # if future pipelines break that 1:1 mapping.
+    is_single_stage = len(params_list) == 1
+
+    diffusion_params_idx = 0 if is_single_stage else (1 if len(params_list) > 1 else 0)
+    diffusion_params = params_list[diffusion_params_idx]
+
     if args.modality in ("text2img", "img2img"):
-        if len(params_list) > 1:
-            diffusion_params = params_list[1]
-            diffusion_params.num_inference_steps = args.steps  # type: ignore
-            diffusion_params.cfg_parallel_size = args.cfg_parallel_size  # type: ignore
-            if args.seed is not None:
-                diffusion_params.seed = args.seed  # type: ignore
-            extra = {
-                "cfg_text_scale": args.cfg_text_scale,
-                "cfg_img_scale": args.cfg_img_scale,
-            }
-            if args.cfg_interval is not None:
-                extra["cfg_interval"] = tuple(args.cfg_interval)
-            if args.cfg_renorm_type is not None:
-                extra["cfg_renorm_type"] = args.cfg_renorm_type
-            if args.cfg_renorm_min is not None:
-                extra["cfg_renorm_min"] = args.cfg_renorm_min
-            if args.negative_prompt is not None:
-                extra["negative_prompt"] = args.negative_prompt
-            diffusion_params.extra_args = extra  # type: ignore
+        diffusion_params.num_inference_steps = args.steps  # type: ignore
+        diffusion_params.cfg_parallel_size = args.cfg_parallel_size  # type: ignore
+        if args.seed is not None:
+            diffusion_params.seed = args.seed  # type: ignore
+
+    extra = getattr(diffusion_params, "extra_args", {}) or {}
+    extra["cfg_text_scale"] = args.cfg_text_scale
+    extra["cfg_img_scale"] = args.cfg_img_scale
+    if args.cfg_interval is not None:
+        extra["cfg_interval"] = tuple(args.cfg_interval)
+    if args.cfg_renorm_type is not None:
+        extra["cfg_renorm_type"] = args.cfg_renorm_type
+    if args.cfg_renorm_min is not None:
+        extra["cfg_renorm_min"] = args.cfg_renorm_min
+    if args.negative_prompt is not None:
+        extra["negative_prompt"] = args.negative_prompt
+
+    needs_text_gen = is_single_stage and (args.think or args.modality in ("text2text", "img2text"))
+    if needs_text_gen:
+        if args.think:
+            extra["think"] = True
+        extra["max_think_tokens"] = args.max_think_tokens
+        extra["do_sample"] = args.do_sample
+        extra["text_temperature"] = args.text_temperature
+    diffusion_params.extra_args = extra  # type: ignore
 
     omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
 
     img_idx = 0
     for req_output in omni_outputs:
-        if args.think:
-            ro = getattr(req_output, "request_output", None)
-            if ro and getattr(ro, "outputs", None):
-                txt = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
-                if txt:
-                    print(txt)
+        # 2-stage think mode: text output from thinker stage
+        ro = getattr(req_output, "request_output", None)
+        if ro and getattr(ro, "outputs", None):
+            txt = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
+            if txt:
+                if args.think:
+                    print(f"[Think]\n{txt}")
+                else:
+                    print(f"[Output] Text:\n{txt}")
+
+        # Single-stage DiT: text from custom_output
+        custom = getattr(req_output, "_custom_output", {}) or {}
+        if custom.get("think_text"):
+            print(f"[Think]\n{custom['think_text']}")
+        if custom.get("text_output"):
+            print(f"[Output] Text:\n{custom['text_output']}")
 
         images = getattr(req_output, "images", None)
-
         if not images:
             continue
 
@@ -240,8 +286,6 @@ def main():
             img.save(save_path)
             print(f"[Output] Saved image to {save_path}")
         img_idx += 1
-
-    print(omni_outputs)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from vllm.multimodal.image import convert_image_mode
 from vllm.multimodal.media.audio import load_audio
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 
 SEED = 42
@@ -294,14 +295,7 @@ def main(args):
     else:
         query_result = query_func()
 
-    omni = Omni(
-        model=model_name,
-        dtype=args.dtype,
-        stage_configs_path=args.stage_configs_path,
-        log_stats=args.log_stats,
-        stage_init_timeout=args.stage_init_timeout,
-        init_timeout=args.init_timeout,
-    )
+    omni = Omni.from_cli_args(args, model=model_name)
 
     thinker_sampling_params = SamplingParams(
         temperature=0.9,
@@ -557,6 +551,7 @@ def parse_args():
         help="Model dtype (auto, half, float16, bfloat16, float, float32).",
     )
 
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

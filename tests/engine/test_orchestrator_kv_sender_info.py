@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 from vllm import SamplingParams
 
+from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -130,7 +131,7 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
 
     orchestrator.num_stages = 2
     orchestrator.stage_clients = [sender_stage, diffusion_stage]
-    orchestrator._companion_map = {}
+    orchestrator._cfg_tracker = CfgCompanionTracker()
     orchestrator.stage_vllm_configs = [None, None]
     orchestrator.output_processors = [None, None]
 
@@ -161,7 +162,7 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
 
     orchestrator.num_stages = 3
     orchestrator.stage_clients = [source_stage, previous_stage, diffusion_stage]
-    orchestrator._companion_map = {}
+    orchestrator._cfg_tracker = CfgCompanionTracker()
     orchestrator.stage_vllm_configs = [None, None, None]
     orchestrator.output_processors = [None, None, None]
 
@@ -180,6 +181,52 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
     assert diffusion_stage.calls[0]["kv_sender_info"] == {
         0: {"host": "10.0.0.2", "zmq_port": 50151},
     }
+
+
+def test_forward_to_diffusion_returns_terminal_error_for_empty_custom_inputs():
+    orchestrator = object.__new__(Orchestrator)
+    sender_stage = _DummySenderStage({"host": "10.0.0.2", "zmq_port": 50151})
+    diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
+    diffusion_stage.custom_process_input_func = lambda *_args, **_kwargs: []
+
+    class _AsyncQueue:
+        def __init__(self):
+            self.items = []
+
+        async def put(self, item):
+            self.items.append(item)
+
+    orchestrator.num_stages = 2
+    orchestrator.stage_clients = [sender_stage, diffusion_stage]
+    orchestrator._cfg_tracker = CfgCompanionTracker()
+    orchestrator.stage_vllm_configs = [None, None]
+    orchestrator.output_processors = [None, None]
+    orchestrator.output_async_queue = _AsyncQueue()
+    orchestrator.request_states = {}
+    orchestrator._pd_kv_params = {}
+
+    params = OmniDiffusionSamplingParams()
+    req_state = OrchestratorRequestState(
+        request_id="req-empty",
+        prompt={"prompt": "hello"},
+        sampling_params_list=[SamplingParams(max_tokens=4), params],
+        final_stage_id=1,
+    )
+    orchestrator.request_states["req-empty"] = req_state
+
+    output = SimpleNamespace(request_id="req-empty", finished=True)
+    asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-empty", 0, output, req_state))
+
+    assert sender_stage.engine_outputs == [output]
+    assert diffusion_stage.calls == []
+    assert len(orchestrator.output_async_queue.items) == 1
+    terminal_msg = orchestrator.output_async_queue.items[0]
+    assert terminal_msg["type"] == "output"
+    assert terminal_msg["request_id"] == "req-empty"
+    assert terminal_msg["stage_id"] == 1
+    assert terminal_msg["finished"] is True
+    assert "produced no valid inputs" in terminal_msg["engine_outputs"].error
+    assert "req-empty" not in orchestrator.request_states
 
 
 def test_prewarm_diffusion_attaches_kv_sender_info():

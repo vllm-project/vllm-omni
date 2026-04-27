@@ -1,0 +1,32 @@
+# Single-stage TTS config for Ming-flash-omni-2.0 Talker
+# Stage 0: Talker only (text → audio waveform via CFM + AudioVAE)
+# Use this config for standalone TTS deployment without thinker.
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: ming_tts
+      model_arch: MingFlashOmniTalkerForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.8
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: audio
+      enable_prefix_caching: false
+      max_num_batched_tokens: 100000
+      tokenizer_subdir: talker/llm
+      # NOTE: `hf_config_name` for Ming talker acts as a placeholder
+      # The HF repo ships BailingMM2Config (thinker-only) at root,
+      # OmniModelConfig treats that as "stage does not share outer mrope"
+      hf_config_name: talker_config
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1

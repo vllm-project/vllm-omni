@@ -3,6 +3,7 @@
 
 """Audio utility functions shared across models and entrypoints."""
 
+import numpy as np
 import torch
 from torchaudio.functional import melscale_fbanks
 
@@ -43,3 +44,25 @@ def mel_filter_bank(
         mel_scale="slaney",
         norm="slaney",
     ).T
+
+
+def peak_normalize(
+    audio: np.ndarray,
+    db_level: float = -6.0,
+) -> np.ndarray:
+    """Normalize audio so peak amplitude reaches a target dB level.
+
+    Drop-in replacement for ``sox.Transformer().norm(db_level=...)``.
+
+    Args:
+        audio: Input waveform as a 1-D numpy array.
+        db_level: Target peak amplitude in dBFS.
+
+    Returns:
+        Normalized waveform with the same dtype as *audio*.
+    """
+    peak = np.abs(audio).max()
+    if peak == 0:
+        return audio
+    target = 10.0 ** (db_level / 20.0)
+    return audio * (target / peak)

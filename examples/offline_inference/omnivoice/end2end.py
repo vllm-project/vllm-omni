@@ -89,7 +89,6 @@ def run_e2e():
     omni = Omni(
         model=args.model,
         stage_configs_path=args.stage_config,
-        trust_remote_code=True,
         log_stats=True,
     )
 

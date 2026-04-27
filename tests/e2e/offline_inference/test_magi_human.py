@@ -8,9 +8,9 @@ import av
 import numpy as np
 import pytest
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
 from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
-from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 
@@ -48,12 +48,6 @@ def test_magi_human_e2e(run_level):
         pytest.skip("MagiHuman e2e test requires advanced_model run level with real weights.")
 
     model_path = "SII-GAIR/daVinci-MagiHuman-Base-1080p"
-
-    omni = Omni(
-        model=model_path,
-        init_timeout=1200,
-        tensor_parallel_size=2,
-    )
 
     prompt = (
         "A young woman with long, wavy golden blonde hair and bright blue eyes, "
@@ -94,7 +88,12 @@ def test_magi_human_e2e(run_level):
         },
     )
 
-    try:
+    with OmniRunner(
+        model_path,
+        init_timeout=1200,
+        tensor_parallel_size=2,
+    ) as runner:
+        omni = runner.omni
         outputs = list(
             omni.generate(
                 prompts=[prompt],
@@ -140,5 +139,3 @@ def test_magi_human_e2e(run_level):
         assert len(video_bytes) > 1000, f"MP4 too small ({len(video_bytes)} bytes)"
 
         _validate_mp4(video_bytes)
-    finally:
-        omni.close()
