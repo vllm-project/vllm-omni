@@ -111,6 +111,14 @@ class DiffusionEngine:
         self._rpc_lock = threading.RLock()
         self._cv = threading.Condition(self._rpc_lock)
         self._out_queue: dict[str, asyncio.Future] = {}
+        # Aggregated _rpc_lock contention stats. Updated on every
+        # collective_rpc invocation (success and timeout) and exposed via
+        # get_rpc_lock_stats(). Used as the headline observability number
+        # for RFC #3158 (DiffusionEngine RPC lock narrowing).
+        self._rpc_lock_stats_lock = threading.Lock()
+        self._rpc_lock_wait_ms_total: float = 0.0
+        self._rpc_lock_wait_count: int = 0
+        self._rpc_lock_wait_max_ms: float = 0.0
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
 
@@ -605,7 +613,15 @@ class DiffusionEngine:
                 lock_timeout = max(0, deadline - time.monotonic())
                 acquired = self._rpc_lock.acquire(timeout=lock_timeout)
             lock_wait_ms = (time.perf_counter() - lock_wait_start) * 1000
+            # Record wait time for both success and timeout cases so that
+            # get_rpc_lock_stats() reflects the true contention surface.
+            with self._rpc_lock_stats_lock:
+                self._rpc_lock_wait_ms_total += lock_wait_ms
+                self._rpc_lock_wait_count += 1
+                if lock_wait_ms > self._rpc_lock_wait_max_ms:
+                    self._rpc_lock_wait_max_ms = lock_wait_ms
             if not acquired:
+                logger.debug("collective_rpc(%s) timed out waiting %.2f ms for lock", method, lock_wait_ms)
                 raise TimeoutError(f"RPC call to {method} timed out waiting for engine lock.")
             logger.debug("collective_rpc(%s) acquired lock in %.2f ms", method, lock_wait_ms)
 
@@ -623,6 +639,29 @@ class DiffusionEngine:
         finally:
             if acquired:
                 self._rpc_lock.release()
+
+    def get_rpc_lock_stats(self) -> dict[str, float | int]:
+        """Aggregated _rpc_lock acquisition stats since engine construction.
+
+        Returns a snapshot dict with keys ``count``, ``total_wait_ms``,
+        ``mean_wait_ms`` and ``max_wait_ms``. Both successful acquisitions
+        and timeout failures are counted, so the numbers reflect the full
+        contention surface seen by collective_rpc callers.
+
+        Intended as the headline observability number for the RFC #3158
+        DiffusionEngine RPC lock narrowing work; safe to call from any
+        thread.
+        """
+        with self._rpc_lock_stats_lock:
+            count = self._rpc_lock_wait_count
+            total = self._rpc_lock_wait_ms_total
+            max_ms = self._rpc_lock_wait_max_ms
+        return {
+            "count": count,
+            "total_wait_ms": total,
+            "mean_wait_ms": (total / count) if count else 0.0,
+            "max_wait_ms": max_ms,
+        }
 
     def close(self) -> None:
         if hasattr(self, "scheduler"):
