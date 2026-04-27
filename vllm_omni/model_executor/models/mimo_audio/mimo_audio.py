@@ -10,6 +10,7 @@ from torch import nn
 from transformers import BatchFeature, Qwen2Config
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
+from vllm.inputs import ModalityData, MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models import SupportsPP
@@ -18,9 +19,7 @@ from vllm.model_executor.models.utils import init_vllm_registered_model
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     AudioItem,
-    ModalityData,
     MultiModalBatchedField,
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalFieldElem,
     MultiModalKwargsItem,
@@ -800,7 +799,7 @@ class MiMoAudioForConditionalGeneration(
 
             return OmniOutput(
                 text_hidden_states=text_hidden_states.reshape(-1, text_hidden_states.shape[-1]),
-                multimodal_outputs={"code_predictor_codes": next_speech_tokens},
+                multimodal_outputs={"codes": {"audio": next_speech_tokens}},
             )
 
         if self.model_stage == "code2wav":

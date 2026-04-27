@@ -4,6 +4,7 @@
 import json
 import time
 
+import pytest
 import zmq
 from vllm.v1.utils import get_engine_client_zmq_addr
 
@@ -12,6 +13,8 @@ from vllm_omni.distributed.omni_coordinator import (
     OmniCoordinator,
     StageStatus,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _recv_instance_list(sub: zmq.Socket, timeout_ms: int = 2000) -> dict | None:
@@ -36,6 +39,74 @@ def _wait_for_instance_list(
         if msg is not None and len(msg.get("instances", [])) == expected_count:
             return msg
     return None
+
+
+def _drain_sub_messages(sub: zmq.Socket, max_seconds: float = 0.4) -> None:
+    """Drain queued SUB messages for a short window."""
+    deadline = time.time() + max_seconds
+    while time.time() < deadline:
+        _recv_instance_list(sub, timeout_ms=50)
+
+
+def test_omni_coordinator_pub_coalescing_on_rapid_queue_updates():
+    """Rapid updates should be coalesced into fewer PUB messages."""
+    router_addr = get_engine_client_zmq_addr(
+        local_only=False,
+        host="127.0.0.1",
+        port=0,
+    )
+    pub_addr = get_engine_client_zmq_addr(
+        local_only=False,
+        host="127.0.0.1",
+        port=0,
+    )
+    coordinator = OmniCoordinator(
+        router_zmq_addr=router_addr,
+        pub_zmq_addr=pub_addr,
+        heartbeat_timeout=1000.0,
+    )
+
+    sub_ctx = zmq.Context.instance()
+    sub = sub_ctx.socket(zmq.SUB)
+    sub.connect(pub_addr)
+    sub.setsockopt(zmq.SUBSCRIBE, b"")
+
+    time.sleep(0.3)  # PUB/SUB slow-joiner
+
+    client = OmniCoordClientForStage(
+        router_addr,
+        "tcp://stage:coalesce",
+        "tcp://stage:coalesce-out",
+        0,
+    )
+
+    # Wait for initial registration broadcast and clear any queued messages.
+    msg = _wait_for_instance_list(sub, expected_count=1)
+    assert msg is not None
+    _drain_sub_messages(sub)
+
+    # Burst many queue updates in a short period.
+    update_count = 80
+    for i in range(update_count):
+        client.update_info(queue_length=i)
+
+    # With publish_min_interval=0.1s, received messages over ~1s should be
+    # much smaller than update_count (coalescing effect).
+    window_s = 1.1
+    deadline = time.time() + window_s
+    recv_count = 0
+    while time.time() < deadline:
+        if _recv_instance_list(sub, timeout_ms=100) is not None:
+            recv_count += 1
+
+    assert recv_count < update_count // 2, (
+        f"expected coalesced PUB traffic, got {recv_count} for {update_count} updates"
+    )
+
+    client.close()
+    coordinator.close()
+    sub.close(0)
+    sub_ctx.term()
 
 
 def test_omni_coordinator_registration_broadcast():

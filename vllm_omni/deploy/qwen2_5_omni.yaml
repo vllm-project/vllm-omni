@@ -1,0 +1,92 @@
+# Qwen2.5-Omni deploy: CUDA defaults + platform overrides, verified on 2x H100.
+# Stage 2 disables flashinfer autotune because its DiT block never invokes
+# flashinfer; the autotune dummy run OOMs the shared cuda:0 device otherwise.
+#
+# Fields omitted from a stage fall back to StageDeployConfig dataclass
+# defaults (see vllm_omni/config/stage_config.py). For instance, every
+# stage here uses vLLM's default max_num_batched_tokens=32768 because
+# chat-sized prefill comfortably fits; only models with codec prefill
+# (Qwen3-Omni, Qwen3-TTS) need to bump it above 32k.
+#
+# enforce_eager policy across the three deploy YAMLs:
+#   * code2wav / generation stages:  always true (cudagraph incompatible with
+#     the custom generation loop — set explicitly everywhere).
+#   * AR stages (thinker, talker):   model-dependent. Qwen2.5-Omni runs eager
+#     on CUDA (thinker uses custom ops that don't trace cleanly); NPU / XPU
+#     platform overrides flip back to false where cudagraph is verified.
+#     Qwen3-Omni / Qwen3-TTS AR stages use the default (false = cudagraph on).
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.8
+    enforce_eager: true
+    mm_processor_cache_gb: 0
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.8
+    enforce_eager: true
+    devices: "1"
+    default_sampling_params:
+      temperature: 0.9
+      top_p: 0.8
+      top_k: 40
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.05
+
+  - stage_id: 2
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.15
+    enforce_eager: true
+    enable_flashinfer_autotune: false
+    async_scheduling: false
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.1
+
+platforms:
+  npu:
+    stages:
+      # NPU has cudagraph support for the thinker, unlike GPU which still
+      # only runs eager.
+      - stage_id: 0
+        enforce_eager: false
+      - stage_id: 2
+        # 3-NPU layout: stage 2 lives on its own card.
+        devices: "2"
+
+  rocm:
+    stages:
+      - stage_id: 2
+        # 3-GPU MI325 layout: stage 2 on a separate card.
+        devices: "2"
+
+  xpu:
+    stages:
+      # Verified on 2x Intel Arc Pro B60. Both AR stages use cudagraphs.
+      - stage_id: 0
+        gpu_memory_utilization: 0.9
+        enforce_eager: false
+      - stage_id: 1
+        gpu_memory_utilization: 0.5
+        enforce_eager: false
+      - stage_id: 2
+        gpu_memory_utilization: 0.3
+        # Stage 2 colocates with stage 1's device on XPU.
+        devices: "1"

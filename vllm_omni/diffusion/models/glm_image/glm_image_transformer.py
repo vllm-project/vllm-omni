@@ -4,7 +4,7 @@
 import math
 from collections.abc import Iterable
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -19,9 +19,19 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
+)
+from vllm_omni.diffusion.forward_context import get_forward_context
 
 logger = init_logger(__name__)
 
@@ -107,8 +117,8 @@ class GlmImageImageProjector(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, channel, height, width = hidden_states.shape
-        post_patch_height = height // self.patch_size
-        post_patch_width = width // self.patch_size
+        post_patch_height = torch.tensor(height // self.patch_size, device=hidden_states.device, dtype=torch.int64)
+        post_patch_width = torch.tensor(width // self.patch_size, device=hidden_states.device, dtype=torch.int64)
 
         # Reshape: [B, C, H, W] -> [B, H', W', C*p*p] -> [B, H'*W', C*p*p]
         hidden_states = hidden_states.reshape(
@@ -156,6 +166,65 @@ class GlmImageRotaryPosEmbed(nn.Module):
         freqs = torch.cat([freqs, freqs], dim=-1)
         freqs = freqs.reshape(height * width, -1)
         return (freqs.cos(), freqs.sin())
+
+
+class GlmImagePrepare(nn.Module):
+    """Prepare module for GLM-Image that handles patch embedding and RoPE computation.
+
+    This module encapsulates the input processing pipeline to create a module boundary
+    where _sp_plan can shard outputs via split_output=True.
+
+    Similar to Qwen-Image's ImageRopePrepare, this ensures hidden_states and RoPE
+    embeddings are sharded together to maintain dimension alignment.
+    """
+
+    def __init__(
+        self,
+        image_projector: nn.Module,
+        rope: GlmImageRotaryPosEmbed,
+        patch_size: int,
+    ):
+        super().__init__()
+        self.image_projector = image_projector
+        self.rope = rope
+        self.patch_size = patch_size
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        prior_hidden_states: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Process hidden_states and compute RoPE embeddings.
+
+        Args:
+            hidden_states: Input latent tensor [B, C, H, W]
+            prior_hidden_states: Optional prior embedding to add
+
+        Returns:
+            hidden_states: Patched hidden states [B, seq_len, D]
+            rope_cos: RoPE cos embeddings [seq_len, dim]
+            rope_sin: RoPE sin embeddings [seq_len, dim]
+            post_patch_height: Scalar tensor for height after patching
+            post_patch_width: Scalar tensor for width after patching
+        """
+        batch_size, num_channels, height, width = hidden_states.shape
+
+        post_patch_height = torch.tensor(height // self.patch_size, device=hidden_states.device, dtype=torch.int64)
+        post_patch_width = torch.tensor(width // self.patch_size, device=hidden_states.device, dtype=torch.int64)
+
+        # Compute RoPE (uses original 4D hidden_states shape)
+        image_rotary_emb = self.rope(hidden_states)
+        rope_cos = image_rotary_emb[0].to(hidden_states.device)
+        rope_sin = image_rotary_emb[1].to(hidden_states.device)
+
+        # Patch embedding: [B, C, H, W] -> [B, seq_len, D]
+        hidden_states = self.image_projector(hidden_states)
+
+        # Add prior embedding if provided
+        if prior_hidden_states is not None:
+            hidden_states = hidden_states + prior_hidden_states
+
+        return hidden_states, rope_cos, rope_sin, post_patch_height, post_patch_width
 
 
 class GlmImageAdaLayerNormZero(nn.Module):
@@ -396,13 +465,16 @@ class GlmImageAttention(nn.Module):
         dim: int,
         num_heads: int,
         head_dim: int,
+        parallel_config: DiffusionParallelConfig | None = None,
         out_bias: bool = True,
         eps: float = 1e-5,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.dim = dim
         self.total_num_heads = num_heads
         self.head_dim = head_dim
+        self.parallel_config = parallel_config
 
         # QKV projection (fused for efficiency)
         self.to_qkv = QKVParallelLinear(
@@ -412,6 +484,7 @@ class GlmImageAttention(nn.Module):
             total_num_kv_heads=num_heads,
             bias=True,
             return_bias=False,
+            quant_config=quant_config,
         )
 
         # QK normalization (LayerNorm, not RMSNorm for GLM-Image)
@@ -427,6 +500,7 @@ class GlmImageAttention(nn.Module):
                     bias=out_bias,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
                 ),
                 nn.Dropout(0.0),
             ]
@@ -449,22 +523,32 @@ class GlmImageAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         kv_cache: GlmImageLayerKVCache | None = None,
         kv_cache_mode: KVCacheMode | None = None,
+        hidden_states_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for joint attention.
 
         Args:
-            hidden_states: Image hidden states [B, img_seq_len, D]
-            encoder_hidden_states: Text hidden states [B, text_seq_len, D]
-            image_rotary_emb: Tuple of (cos, sin) for RoPE
+            hidden_states: Image hidden states [B, img_seq_len, D] (sharded in SP mode)
+            encoder_hidden_states: Text hidden states [B, text_seq_len, D] (full in SP mode)
+            image_rotary_emb: Tuple of (cos, sin) for RoPE (sharded in SP mode)
+            attention_mask: Optional attention mask
             kv_cache: Optional layer KV cache for image editing
             kv_cache_mode: Cache mode (WRITE, READ, SKIP)
+            hidden_states_mask: Mask for SP padding (True=valid, False=padding)
 
         Returns:
             Tuple of (image_hidden_states, text_hidden_states)
         """
         dtype = encoder_hidden_states.dtype
         batch_size, text_seq_length, _ = encoder_hidden_states.shape
+
+        # Check if SP is enabled
+        sp_size = self.parallel_config.sequence_parallel_size if self.parallel_config else None
+        use_sp = sp_size is not None and sp_size > 1
+        if use_sp:
+            forward_ctx = get_forward_context()
+            use_sp = not forward_ctx.split_text_embed_in_sp
 
         # Concatenate text and image: [text, image]
         hidden_states_combined = torch.cat([encoder_hidden_states, hidden_states], dim=1)
@@ -484,41 +568,88 @@ class GlmImageAttention(nn.Module):
         query = self.norm_q(query).to(dtype=dtype)
         key = self.norm_k(key).to(dtype=dtype)
 
-        # Apply RoPE only to image tokens (not text tokens)
-        if image_rotary_emb is not None:
-            # Only apply RoPE to image part (after text_seq_length)
-            query_img = query[:, text_seq_length:, :, :]
-            key_img = key[:, text_seq_length:, :, :]
-            from diffusers.models.embeddings import apply_rotary_emb
+        if use_sp:
+            # SP mode: use joint attention mechanism
+            # Split Q/K/V into text and image parts
+            text_query = query[:, :text_seq_length, :, :]
+            text_key = key[:, :text_seq_length, :, :]
+            text_value = value[:, :text_seq_length, :, :]
+            img_query = query[:, text_seq_length:, :, :]
+            img_key = key[:, text_seq_length:, :, :]
+            img_value = value[:, text_seq_length:, :, :]
 
-            query_img = apply_rotary_emb(query_img, image_rotary_emb, sequence_dim=1, use_real_unbind_dim=-2)
-            key_img = apply_rotary_emb(key_img, image_rotary_emb, sequence_dim=1, use_real_unbind_dim=-2)
-            query = torch.cat([query[:, :text_seq_length, :, :], query_img], dim=1)
-            key = torch.cat([key[:, :text_seq_length, :, :], key_img], dim=1)
+            # Apply RoPE only to image part
+            if image_rotary_emb is not None:
+                from diffusers.models.embeddings import apply_rotary_emb
 
-        # Handle KV cache for image editing
-        if kv_cache is not None and kv_cache_mode is not None:
-            if kv_cache_mode == KVCacheMode.WRITE:
-                kv_cache.store(key, value)
-            elif kv_cache_mode == KVCacheMode.READ:
-                k_cached, v_cached = kv_cache.get()
-                if k_cached is not None:
-                    key = torch.cat([k_cached, key], dim=1)
-                    value = torch.cat([v_cached, value], dim=1)
-            # KVCacheMode.SKIP: do nothing
+                img_query = apply_rotary_emb(img_query, image_rotary_emb, sequence_dim=1, use_real_unbind_dim=-2)
+                img_key = apply_rotary_emb(img_key, image_rotary_emb, sequence_dim=1, use_real_unbind_dim=-2)
 
-        # Attention computation
-        hidden_states_out = self.attn(query, key, value)
-        hidden_states_out = hidden_states_out.flatten(2, 3)
-        hidden_states_out = hidden_states_out.to(dtype)
+            # Create attention metadata for joint attention
+            attn_metadata = AttentionMetadata(
+                joint_query=text_query,
+                joint_key=text_key,
+                joint_value=text_value,
+                joint_strategy="front",
+            )
 
-        # Output projection
-        for module in self.to_out:
-            hidden_states_out = module(hidden_states_out)
+            # Add padding mask for SP if available
+            if hidden_states_mask is not None:
+                attn_metadata.attn_mask = hidden_states_mask
 
-        # Split back to text and image
-        encoder_hidden_states_out = hidden_states_out[:, :text_seq_length, :]
-        hidden_states_out = hidden_states_out[:, text_seq_length:, :]
+            # Attention computation with joint text/image
+            # Note: Ulysses post_attention returns [text, image] concatenated
+            joint_hidden_states_out = self.attn(img_query, img_key, img_value, attn_metadata)
+
+            # Project combined [text, image] outputs, then split.
+            # This keeps SP numerically aligned with the non-SP path.
+            joint_hidden_states_out = joint_hidden_states_out.flatten(2, 3).to(dtype)
+            for module in self.to_out:
+                joint_hidden_states_out = module(joint_hidden_states_out)
+
+            encoder_hidden_states_out = joint_hidden_states_out[:, :text_seq_length, :]
+            hidden_states_out = joint_hidden_states_out[:, text_seq_length:, :]
+        else:
+            # Non-SP mode: original logic
+            # Apply RoPE only to image tokens (not text tokens)
+            if image_rotary_emb is not None:
+                query_img = query[:, text_seq_length:, :, :]
+                key_img = key[:, text_seq_length:, :, :]
+                from diffusers.models.embeddings import apply_rotary_emb
+
+                query_img = apply_rotary_emb(query_img, image_rotary_emb, sequence_dim=1, use_real_unbind_dim=-2)
+                key_img = apply_rotary_emb(key_img, image_rotary_emb, sequence_dim=1, use_real_unbind_dim=-2)
+                query = torch.cat([query[:, :text_seq_length, :, :], query_img], dim=1)
+                key = torch.cat([key[:, :text_seq_length, :, :], key_img], dim=1)
+
+            # Handle KV cache for image editing
+            if kv_cache is not None and kv_cache_mode is not None:
+                if kv_cache_mode == KVCacheMode.WRITE:
+                    kv_cache.store(key, value)
+                elif kv_cache_mode == KVCacheMode.READ:
+                    k_cached, v_cached = kv_cache.get()
+                    if k_cached is not None:
+                        key = torch.cat([k_cached, key], dim=1)
+                        value = torch.cat([v_cached, value], dim=1)
+
+            # Attention computation
+            attn_metadata = None
+            if attention_mask is not None:
+                if attention_mask.dim() == 3:
+                    attention_mask = attention_mask.unsqueeze(1)
+                attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+
+            hidden_states_out = self.attn(query, key, value, attn_metadata)
+            hidden_states_out = hidden_states_out.flatten(2, 3)
+            hidden_states_out = hidden_states_out.to(dtype)
+
+            # Output projection
+            for module in self.to_out:
+                hidden_states_out = module(hidden_states_out)
+
+            # Split back to text and image
+            encoder_hidden_states_out = hidden_states_out[:, :text_seq_length, :]
+            hidden_states_out = hidden_states_out[:, text_seq_length:, :]
 
         return hidden_states_out, encoder_hidden_states_out
 
@@ -531,6 +662,7 @@ class ColumnParallelGELU(nn.Module):
         *,
         approximate: str = "none",
         bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.proj = ColumnParallelLinear(
@@ -539,6 +671,7 @@ class ColumnParallelGELU(nn.Module):
             bias=bias,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
         )
         self.approximate = approximate
 
@@ -554,6 +687,7 @@ class ColumnParallelSiLU(nn.Module):
         dim_out: int,
         *,
         bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.proj = ColumnParallelLinear(
@@ -562,6 +696,7 @@ class ColumnParallelSiLU(nn.Module):
             bias=bias,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -578,6 +713,7 @@ class GlmImageFeedForward(nn.Module):
         inner_dim: int | None = None,
         bias: bool = True,
         activation_fn: str = "gelu",
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         inner_dim = inner_dim or int(dim * mult)
@@ -585,7 +721,7 @@ class GlmImageFeedForward(nn.Module):
 
         if activation_fn == "linear-silu":
             layers: list[nn.Module] = [
-                ColumnParallelSiLU(dim, inner_dim, bias=bias),
+                ColumnParallelSiLU(dim, inner_dim, bias=bias, quant_config=quant_config),
                 nn.Identity(),
                 RowParallelLinear(
                     inner_dim,
@@ -593,12 +729,13 @@ class GlmImageFeedForward(nn.Module):
                     bias=bias,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
                 ),
             ]
         else:
             approximate = "tanh" if activation_fn == "gelu-approximate" else "none"
             layers = [
-                ColumnParallelGELU(dim, inner_dim, approximate=approximate, bias=bias),
+                ColumnParallelGELU(dim, inner_dim, approximate=approximate, bias=bias, quant_config=quant_config),
                 nn.Identity(),
                 RowParallelLinear(
                     inner_dim,
@@ -606,6 +743,7 @@ class GlmImageFeedForward(nn.Module):
                     bias=bias,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
                 ),
             ]
 
@@ -627,6 +765,8 @@ class GlmImageTransformerBlock(nn.Module):
         attention_head_dim: int = 40,
         time_embed_dim: int = 512,
         ffn_hidden_dim: int | None = None,
+        quant_config: "QuantizationConfig | None" = None,
+        parallel_config: DiffusionParallelConfig | None = None,
     ) -> None:
         super().__init__()
 
@@ -636,12 +776,20 @@ class GlmImageTransformerBlock(nn.Module):
             dim=dim,
             num_heads=num_attention_heads,
             head_dim=attention_head_dim,
+            quant_config=quant_config,
+            parallel_config=parallel_config,
         )
 
         # 2. Feedforward
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-5)
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-5)
-        self.ff = GlmImageFeedForward(dim=dim, dim_out=dim, inner_dim=ffn_hidden_dim, activation_fn="gelu-approximate")
+        self.ff = GlmImageFeedForward(
+            dim=dim,
+            dim_out=dim,
+            inner_dim=ffn_hidden_dim,
+            activation_fn="gelu-approximate",
+            quant_config=quant_config,
+        )
 
     def forward(
         self,
@@ -653,6 +801,7 @@ class GlmImageTransformerBlock(nn.Module):
         attention_kwargs: dict[str, Any] | None = None,
         kv_cache: GlmImageLayerKVCache | None = None,
         kv_cache_mode: KVCacheMode | None = None,
+        hidden_states_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for transformer block.
@@ -666,6 +815,7 @@ class GlmImageTransformerBlock(nn.Module):
             attention_kwargs: Additional attention arguments
             kv_cache: Layer-specific KV cache for image editing
             kv_cache_mode: Cache mode (WRITE, READ, SKIP)
+            hidden_states_mask: Mask for SP padding (True=valid, False=padding)
 
         Returns:
             Tuple of (image_hidden_states, text_hidden_states)
@@ -692,6 +842,7 @@ class GlmImageTransformerBlock(nn.Module):
             attention_mask=attention_mask,
             kv_cache=kv_cache,
             kv_cache_mode=kv_cache_mode,
+            hidden_states_mask=hidden_states_mask,
         )
         hidden_states = hidden_states + attn_hidden_states * gate_msa.unsqueeze(1)
         encoder_hidden_states = encoder_hidden_states + attn_encoder_hidden_states * c_gate_msa.unsqueeze(1)
@@ -723,10 +874,33 @@ class GlmImageTransformer2DModel(CachedTransformer):
     """
 
     _repeated_blocks = ["GlmImageTransformerBlock"]
+    # SP plan using GlmImagePrepare module for sharding hidden_states and RoPE together.
+    # Similar to Qwen-Image's ImageRopePrepare, this creates a module boundary where
+    # _sp_plan can shard outputs via split_output=True.
+    #
+    # Key insight: hidden_states and RoPE embeddings MUST be sharded together
+    # to maintain dimension alignment for RoPE computation in attention layers.
+    _sp_plan = {
+        # Shard GlmImagePrepare outputs (hidden_states and RoPE must be sharded together)
+        "prepare": {
+            # hidden_states: [B, seq_len, D] - shard along sequence dimension
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            # RoPE cos: [seq_len, dim] - shard along sequence dimension
+            1: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
+            # RoPE sin: [seq_len, dim] - shard along sequence dimension
+            2: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
+            # post_patch_height and post_patch_width are scalars, not sharded
+        },
+        # Gather output at proj_out
+        "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
+
+    _hsdp_shard_conditions = [is_transformer_block_module]
 
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
 
@@ -780,12 +954,23 @@ class GlmImageTransformer2DModel(CachedTransformer):
         # 2. Patch & Text-timestep embedding
         self.image_projector = GlmImageImageProjector(in_channels, inner_dim, patch_size)
         self.glyph_projector = GlmImageFeedForward(
-            dim=text_embed_dim, dim_out=inner_dim, inner_dim=inner_dim, activation_fn="gelu"
+            dim=text_embed_dim,
+            dim_out=inner_dim,
+            inner_dim=inner_dim,
+            activation_fn="gelu",
+            quant_config=quant_config,
         )
         self.prior_token_embedding = nn.Embedding(prior_vq_quantizer_codebook_size, inner_dim)
         self.prior_projector = GlmImageFeedForward(
-            dim=inner_dim, dim_out=inner_dim, inner_dim=inner_dim, activation_fn="linear-silu"
+            dim=inner_dim,
+            dim_out=inner_dim,
+            inner_dim=inner_dim,
+            activation_fn="linear-silu",
+            quant_config=quant_config,
         )
+
+        # Prepare module for SP (encapsulates patch embedding and RoPE for _sp_plan)
+        self.prepare = GlmImagePrepare(self.image_projector, self.rope, patch_size)
 
         self.time_condition_embed = GlmImageCombinedTimestepSizeEmbeddings(
             embedding_dim=time_embed_dim,
@@ -803,6 +988,8 @@ class GlmImageTransformer2DModel(CachedTransformer):
                     attention_head_dim,
                     time_embed_dim,
                     ffn_hidden_dim=ffn_hidden_dim,
+                    quant_config=quant_config,
+                    parallel_config=self.parallel_config,
                 )
                 for _ in range(num_layers)
             ]
@@ -856,33 +1043,51 @@ class GlmImageTransformer2DModel(CachedTransformer):
         # Get KV cache mode
         kv_cache_mode = kv_cache.mode if kv_cache is not None else None
 
-        # 1. RoPE
-        if image_rotary_emb is None:
-            image_rotary_emb = self.rope(hidden_states)
-            # Move to correct device
-            image_rotary_emb = (
-                image_rotary_emb[0].to(hidden_states.device),
-                image_rotary_emb[1].to(hidden_states.device),
-            )
+        # Set SP context if enabled
+        sp_size = self.parallel_config.sequence_parallel_size
+        if sp_size is not None and sp_size > 1:
+            get_forward_context().split_text_embed_in_sp = False
 
-        # 2. Patch & Timestep embeddings
-        p = self.patch_size
-        post_patch_height = height // p
-        post_patch_width = width // p
-
-        hidden_states = self.image_projector(hidden_states)
+        # Text embedding projection
         encoder_hidden_states = self.glyph_projector(encoder_hidden_states)
 
         # Prior embedding with dropout
         prior_embedding = self.prior_token_embedding(prior_token_id)
         prior_embedding[prior_token_drop] *= 0.0
         prior_hidden_states = self.prior_projector(prior_embedding)
-        hidden_states = hidden_states + prior_hidden_states
+
+        # 1. Prepare hidden_states and RoPE via GlmImagePrepare module
+        # _sp_plan will shard hidden_states and RoPE together via split_output=True
+        hidden_states, rope_cos, rope_sin, post_patch_height_t, post_patch_width_t = self.prepare(
+            hidden_states, prior_hidden_states
+        )
+        image_rotary_emb = (rope_cos, rope_sin)
+        post_patch_height = int(post_patch_height_t.item())
+        post_patch_width = int(post_patch_width_t.item())
 
         # Timestep conditioning
         temb = self.time_condition_embed(timestep, target_size, crop_coords, hidden_states.dtype)
 
-        # 3. Transformer blocks
+        # Create padding mask for SP if needed (after _sp_plan hooks have run)
+        hidden_states_mask = None
+        if sp_size is not None and sp_size > 1:
+            from vllm_omni.diffusion.forward_context import is_forward_context_available
+
+            if is_forward_context_available():
+                ctx = get_forward_context()
+                if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+                    img_padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+                    hidden_states_mask = torch.ones(
+                        batch_size,
+                        img_padded_seq_len,
+                        dtype=torch.bool,
+                        device=hidden_states.device,
+                    )
+                    hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+                    if hidden_states_mask.all():
+                        hidden_states_mask = None
+
+        # 2. Transformer blocks
         for layer_idx, block in enumerate(self.transformer_blocks):
             # Get layer-specific KV cache if available
             layer_kv_cache = kv_cache[layer_idx] if kv_cache is not None else None
@@ -896,13 +1101,16 @@ class GlmImageTransformer2DModel(CachedTransformer):
                 attention_kwargs,
                 kv_cache=layer_kv_cache,
                 kv_cache_mode=kv_cache_mode,
+                hidden_states_mask=hidden_states_mask,
             )
 
-        # 4. Output norm & projection
+        # 3. Output norm & projection
+        # _sp_plan will gather hidden_states via proj_out hook
         hidden_states = self.norm_out(hidden_states, temb)
         hidden_states = self.proj_out(hidden_states)
 
-        # 5. Unpatchify: [B, H'*W', C*p*p] -> [B, C, H, W]
+        # 4. Unpatchify: [B, H'*W', C*p*p] -> [B, C, H, W]
+        p = self.patch_size
         hidden_states = hidden_states.reshape(batch_size, post_patch_height, post_patch_width, -1, p, p)
         output = hidden_states.permute(0, 3, 1, 4, 2, 5).flatten(4, 5).flatten(2, 3)
 

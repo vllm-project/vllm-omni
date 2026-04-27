@@ -29,21 +29,22 @@ Usage:
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
-from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
 
-from tests.utils import hardware_test
-from vllm_omni.entrypoints.omni import Omni
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -61,16 +62,15 @@ def _generate_single_stage_image(
 
     Returns (images, peak_memory_gib).
     """
-    omni_kwargs: dict[str, Any] = {"model": model, **extra_omni_kwargs}
+    omni_kwargs: dict[str, Any] = dict(extra_omni_kwargs)
     if quantization:
         omni_kwargs["quantization"] = quantization
 
-    omni = Omni(**omni_kwargs)
-    try:
+    with OmniRunner(model, **omni_kwargs) as runner:
         torch.cuda.reset_peak_memory_stats()
 
         generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
-        outputs = omni.generate(
+        outputs = runner.omni.generate(
             "a photo of a cat sitting on a laptop keyboard",
             OmniDiffusionSamplingParams(
                 height=height,
@@ -94,8 +94,6 @@ def _generate_single_stage_image(
         assert images[0].height == height
 
         return images, peak_mem
-    finally:
-        omni.close()
 
 
 def _generate_bagel_image(
@@ -106,7 +104,7 @@ def _generate_bagel_image(
 
     Returns (generated_image, peak_memory_gib).
     """
-    config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
+    config_path = get_deploy_config_path("ci/bagel.yaml")
     omni_kwargs: dict[str, Any] = {
         "model": "ByteDance-Seed/BAGEL-7B-MoT",
         "stage_configs_path": config_path,
@@ -115,12 +113,12 @@ def _generate_bagel_image(
     if quantization_config:
         omni_kwargs["quantization_config"] = quantization_config
 
-    omni = Omni(**omni_kwargs)
-    try:
+    model_name = omni_kwargs.pop("model")
+    with OmniRunner(model_name, **omni_kwargs) as runner:
+        omni = runner.omni
         torch.cuda.reset_peak_memory_stats()
 
         params_list = omni.default_sampling_params_list
-        params_list[0].max_tokens = 1  # type: ignore
         if len(params_list) > 1:
             params_list[1].num_inference_steps = num_inference_steps  # type: ignore
             params_list[1].extra_args = {  # type: ignore
@@ -169,8 +167,6 @@ def _generate_bagel_image(
                                 )
 
         return generated_image, peak_mem
-    finally:
-        omni.close()
 
 
 # ─── Single-stage diffusion model tests ──────────────────────────────────────

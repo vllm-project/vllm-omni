@@ -13,16 +13,17 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import struct
-from pathlib import Path
 
 import httpx
 import pytest
 
-from tests.conftest import OmniServer
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServer
+from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL_BASE = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 MODEL_BASE_1_7B = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+STAGE_INIT_TIMEOUT_S = 120
 
 # A synthetic 1024-dim speaker embedding (all 0.1 — not a real voice, but
 # exercises the full code path through the talker's _build_prompt_embeds).
@@ -36,10 +37,8 @@ MIN_AUDIO_BYTES = 2000
 MAX_NEW_TOKENS = 256
 
 
-def get_stage_config():
-    return str(
-        Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / "qwen3_tts.yaml"
-    )
+def get_stage_config() -> str:
+    return get_deploy_config_path("qwen3_tts.yaml")
 
 
 def _server_args():
@@ -47,7 +46,7 @@ def _server_args():
         "--stage-configs-path",
         get_stage_config(),
         "--stage-init-timeout",
-        "120",
+        str(STAGE_INIT_TIMEOUT_S),
         "--trust-remote-code",
         "--enforce-eager",
         "--disable-log-stats",

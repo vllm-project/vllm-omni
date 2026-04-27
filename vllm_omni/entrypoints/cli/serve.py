@@ -561,7 +561,6 @@ def run_headless(args: argparse.Namespace) -> None:
         model,
         stage_connector_spec=stage_connector_spec,
     )
-
     # Inject omni KV connector config so the engine runner can initialize the
     # correct connector (sender/receiver role, type, addresses, etc.).
     if omni_conn_cfg:

@@ -5,12 +5,12 @@ import random
 import re
 from collections.abc import Callable
 
-import librosa
 import numpy as np
 import torch
 import torchaudio
 from process_speechdata import InputSegment, StreamingInputSegment
 from torchaudio.transforms import MelSpectrogram
+from vllm.multimodal.media.audio import load_audio
 
 speech_zeroemb_idx = 151667
 empty_token = "<|empty|>"
@@ -685,7 +685,7 @@ def get_audio_data(audio_url):
         # File path
         audio_file = audio_url
 
-    audio_signal, sr = librosa.load(audio_file, sr=24000)
+    audio_signal, sr = load_audio(audio_file, sr=24000)
     audio_data = (audio_signal.astype(np.float32), sr)
     return audio_data
 

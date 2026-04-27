@@ -164,7 +164,7 @@ cache_config={
 
 **Performance Tips**:
 
-- Default `Fn_compute_blocks=1` works well for most cases. Some models (e.g., [FLUX.2-klein](https://github.com/wtomin/vllm-omni/blob/main/vllm_omni/diffusion/cache/cache_dit_backend.py#L363)) use a larger value for `Fn_compute_blocks` for a balanced performance.
+- Default `Fn_compute_blocks=1` works well for most cases. Some models (e.g., FLUX.2-klein) use a larger value for `Fn_compute_blocks` for a balanced performance.
 - Increase `residual_diff_threshold` (e.g., 0.12-0.15) for faster inference with slight quality trade-off, or decrease from default 0.24 for higher quality.
 - Default `max_warmup_steps=4` is optimized for few-step models. Increase to 6-8 for more steps if needed.
 
@@ -283,3 +283,10 @@ Using Cache-DiT acceleration:
 
 1. ✅ **Enable Cache-DiT** - Set `cache_backend="cache_dit"` to get 1.5x-3x speedup with optimized defaults
 2. ✅ **(Optional) Customize** - Adjust `cache_config` parameters for specific speed/quality trade-offs
+
+---
+
+## Additional Resources
+
+- [Cache-DiT documentation](https://cache-dit.readthedocs.io/en/latest/)
+- [Cache-DiT API reference](https://cache-dit.readthedocs.io/en/latest/user_guide/CACHE_API/)

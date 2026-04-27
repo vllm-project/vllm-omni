@@ -58,7 +58,7 @@ Then open http://localhost:7860 in your browser.
 ```bash
 # CustomVoice model (predefined speakers)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
@@ -66,7 +66,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
 
 # VoiceDesign model
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
@@ -74,7 +74,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
 
 # Base model (voice cloning)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
@@ -159,7 +159,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, how are you?",
-        "speaker": "vivian",
+        "voice": "vivian",
         "language": "English"
     }' --output output.wav
 
@@ -168,7 +168,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "I am so excited!",
-        "speaker": "vivian",
+        "voice": "vivian",
         "instructions": "Speak with great enthusiasm"
     }' --output excited.wav
 
@@ -185,7 +185,7 @@ client = OpenAI(base_url="http://localhost:8091/v1", api_key="none")
 
 response = client.audio.speech.create(
     model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-    speaker="vivian",
+    voice="vivian",
     input="Hello, how are you?",
 )
 
@@ -201,7 +201,7 @@ response = httpx.post(
     "http://localhost:8091/v1/audio/speech",
     json={
         "input": "Hello, how are you?",
-        "speaker": "vivian",
+        "voice": "vivian",
         "language": "English",
     },
     timeout=300.0,
@@ -209,14 +209,6 @@ response = httpx.post(
 
 with open("output.wav", "wb") as f:
     f.write(response.content)
-```
-
-### FAQ
-
-If you encounter error about backend of librosa, try to install ffmpeg with command below.
-```
-sudo apt update
-sudo apt install ffmpeg
 ```
 
 ## API Reference
@@ -237,11 +229,15 @@ List all available voices/speakers from the loaded model, including both built-i
       "consent": "user_consent_id",
       "created_at": 1738660000,
       "file_size": 1024000,
-      "mime_type": "audio/wav"
+      "mime_type": "audio/wav",
+      "ref_text": "The exact transcript of the audio sample.",
+      "speaker_description": "warm narrator"
     }
   ]
 }
 ```
+
+Fields `ref_text` and `speaker_description` are omitted per-entry when not provided at upload time.
 
 #### POST /v1/audio/voices
 
@@ -252,6 +248,7 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 - `consent` (required): Consent recording ID
 - `name` (required): Name for the new voice
 - `ref_text` (optional): Transcript of the audio. Enables in-context voice cloning (higher quality).
+- `speaker_description` (optional): Free-form description of the voice (e.g. "warm narrator", "energetic presenter"). Stored as metadata.
 
 **Response Example:**
 ```json
@@ -262,18 +259,23 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
     "consent": "user_consent_id",
     "created_at": 1738660000,
     "mime_type": "audio/wav",
-    "file_size": 1024000
+    "file_size": 1024000,
+    "ref_text": "The exact transcript of the audio sample.",
+    "speaker_description": "warm narrator"
   }
 }
 ```
 
+Fields `ref_text` and `speaker_description` are omitted when not provided at upload time.
+
 **Usage Example:**
 ```bash
-curl -X POST http://localhost:8000/v1/audio/voices \
+curl -X POST http://localhost:8091/v1/audio/voices \
   -F "audio_sample=@/path/to/voice_sample.wav" \
   -F "consent=user_consent_id" \
   -F "name=custom_voice_1" \
-  -F "ref_text=The exact transcript of the audio sample."
+  -F "ref_text=The exact transcript of the audio sample." \
+  -F "speaker_description=warm narrator"
 ```
 
 ### Endpoint
@@ -290,7 +292,7 @@ This endpoint follows the [OpenAI Audio Speech API](https://platform.openai.com/
 ```json
 {
     "input": "Text to synthesize",
-    "speaker": "vivian",
+    "voice": "vivian",
     "response_format": "wav",
     "task_type": "CustomVoice",
     "language": "Auto",
@@ -310,7 +312,7 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 
 ### Voice and language (summary)
 
-- **Speaker**: Use the `speaker` request field to select the speaker (e.g., `vivian`, `ryan`, `aiden`). List available speakers with `GET /v1/audio/voices`.
+- **Speaker**: Use the `voice` request field to select the speaker (e.g., `vivian`, `ryan`, `aiden`). List available speakers with `GET /v1/audio/voices`.
 - **Language**: Use the `language` field for the codec language tag (`Auto`, `Chinese`, `English`, etc.). Default is `Auto` for automatic detection.
 - **CustomVoice**: Requires a valid `voice` from the model’s speaker set. **VoiceDesign**: Use `instructions` to describe the voice. **Base**: Use `ref_audio` and `ref_text` for voice cloning.
 
@@ -322,7 +324,7 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 | ----------------- | ------ | -------------- | ----------------------------------------------------------- |
 | `input`           | string | **required**   | Text to synthesize                                          |
 | `model`           | string | server's model | Model to use (optional, should match server if specified)   |
-| `speaker`         | string | "vivian"       | Speaker name (e.g., vivian, ryan, aiden)                    |
+| `voice`           | string | "vivian"       | Speaker name (e.g., vivian, ryan, aiden)                    |
 | `response_format` | string | "wav"          | Audio format: wav, mp3, flac, pcm, aac, opus                |
 | `speed`           | float  | 1.0            | Playback speed (0.25-4.0, not supported with `stream=true`) |
 
@@ -357,7 +359,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, how are you?",
-        "speaker": "vivian",
+        "voice": "vivian",
         "language": "English",
         "stream": true,
         "response_format": "pcm"

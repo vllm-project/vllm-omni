@@ -16,7 +16,7 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 
 # Mock the OvisImageTransformer2DModel to avoid complex init if needed,
