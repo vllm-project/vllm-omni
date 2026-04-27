@@ -26,37 +26,28 @@ import torch
 from torch import nn
 from transformers import AutoTokenizer, PretrainedConfig
 
-from vllm.model_executor.layers.attention import Attention
+from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import ignore_torch_compile, support_torch_compile
-from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.distributed import get_pp_group
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import init_logger
-from vllm.compilation.backends import set_model_tag
-from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.interfaces import SupportsPP
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
-    is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
-    make_layers,
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
@@ -236,46 +227,6 @@ def _sample_from_logits(
     return _multinomial_sample(logits)
 
 
-class Qwen3TTSTalkerMLP(nn.Module):
-    """MLP for Qwen3TTS Talker - standard SwiGLU architecture."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
-        )
-        if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
-            )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
-
-
 class Qwen3TTSTalkerResizeMLP(nn.Module):
     """Resize MLP for text projection in Qwen3TTS Talker.
     
@@ -414,107 +365,6 @@ class Qwen3TTSNativeAttention(nn.Module):
         return output
 
 
-class Qwen3TTSTalkerAttention(nn.Module):
-    """Multi-headed attention for Qwen3TTS Talker with MRoPE support."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        rope_parameters: dict,
-        head_dim: Optional[int] = None,
-        max_position: int = 32768,
-        rms_norm_eps: float = 1e-6,
-        qkv_bias: bool = False,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
-        
-        self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        
-        self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        
-        self.head_dim = head_dim if head_dim else hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
-
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=qkv_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=qkv_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
-        )
-        
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            max_position=max_position,
-            rope_parameters=rope_parameters,
-        )
-        
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.attn",
-        )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        
-        # Apply QK normalization per head
-        q = q.view(*q.shape[:-1], -1, self.head_dim)
-        q = self.q_norm(q)
-        q = q.view(*q.shape[:-2], -1)
-        
-        k = k.view(*k.shape[:-1], -1, self.head_dim)
-        k = self.k_norm(k)
-        k = k.view(*k.shape[:-2], -1)
-        
-        # Apply rotary embeddings
-        # Expand positions to 3D for MRoPE (all dims get same values for TTS)
-        if positions.ndim == 1:
-            positions = positions.unsqueeze(0).expand(3, -1)
-        q, k = self.rotary_emb(positions, q, k)
-        
-        attn_output = self.attn(q, k, v)
-        output, _ = self.o_proj(attn_output)
-        return output
-
-
 class Qwen3TTSNativeMLP(nn.Module):
     """Native MLP for Qwen3TTS Code Predictor using standard PyTorch layers."""
 
@@ -589,90 +439,6 @@ class Qwen3TTSCodePredictorDecoderLayer(nn.Module):
         return hidden_states
 
 
-class Qwen3TTSTalkerDecoderLayer(nn.Module):
-    """Decoder layer for Qwen3TTS Talker."""
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        
-        rope_theta = getattr(config, "rope_theta", 1000000.0)
-        # Newer HF transformers (v4.50+) may convert rope_scaling →
-        # rope_parameters and drop the rope_scaling attribute.  Try both.
-        rope_scaling = getattr(config, "rope_scaling", None)
-        rope_params_attr = getattr(config, "rope_parameters", None)
-        if rope_scaling is not None:
-            rope_parameters = dict(rope_scaling)
-            rope_parameters["rope_theta"] = rope_theta
-        elif rope_params_attr is not None:
-            rope_parameters = dict(rope_params_attr)
-            rope_parameters.setdefault("rope_theta", rope_theta)
-        else:
-            rope_parameters = {"rope_type": "default", "rope_theta": rope_theta}
-        
-        self.self_attn = Qwen3TTSTalkerAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            rope_parameters=rope_parameters,
-            head_dim=getattr(config, "head_dim", None),
-            max_position=config.max_position_embeddings,
-            rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, "attention_bias", False),
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.self_attn",
-        )
-        
-        self.mlp = Qwen3TTSTalkerMLP(
-            hidden_size=self.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-            quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
-        )
-        
-        self.input_layernorm = RMSNorm(
-            config.hidden_size, 
-            eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, 
-            eps=config.rms_norm_eps
-        )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
-
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual
-        )
-        hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
-
-
 # Keys whose values must stay as plain dicts (expected by downstream code)
 _KEEP_AS_DICT_KEYS = {"rope_scaling"}
 
@@ -706,136 +472,6 @@ def _get_talker_config(hf_config: PretrainedConfig):
         return tc
     # Otherwise assume this is already the talker config
     return hf_config
-
-
-@support_torch_compile
-class Qwen3TTSTalkerModel(nn.Module):
-    """Qwen3TTS Talker Model - transformer backbone with text embeddings.
-
-    The codec embedding lives in the code predictor; this module only
-    keeps the text embedding (needed on the first PP rank for input
-    processing).
-    """
-
-    def __init__(
-        self,
-        *,
-        vllm_config: VllmConfig,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        
-        config = _get_talker_config(vllm_config.model_config.hf_config)
-        cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
-        
-        self.config = config
-        self.quant_config = quant_config
-        self.vocab_size = config.vocab_size
-        
-        # Text embedding for text tokens (codec embedding is in code_predictor)
-        if get_pp_group().is_first_rank:
-            self.text_embedding = VocabParallelEmbedding(
-                config.text_vocab_size,
-                config.text_hidden_size,
-                quant_config=quant_config,
-                prefix=f"{prefix}.text_embedding",
-            )
-        else:
-            self.text_embedding = PPMissingLayer()
-        
-        # Decoder layers
-        self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
-            lambda prefix: Qwen3TTSTalkerDecoderLayer(
-                config=config,
-                cache_config=cache_config,
-                quant_config=quant_config,
-                prefix=prefix,
-            ),
-            prefix=f"{prefix}.layers",
-        )
-        
-        # Final layer norm
-        if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        else:
-            self.norm = PPMissingLayer()
-        
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
-        )
-
-    def get_text_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Get text embeddings for input ids."""
-        return self.text_embedding(input_ids)
-
-    def forward(
-        self,
-        input_ids: Optional[torch.Tensor],
-        positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        combined_embeddings: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
-        if get_pp_group().is_first_rank:
-            hidden_states = combined_embeddings
-            residual = None
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-
-        for layer in self.layers[self.start_layer:self.end_layer]:
-            hidden_states, residual = layer(positions, hidden_states, residual)
-
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors({
-                "hidden_states": hidden_states,
-                "residual": residual
-            })
-
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
-
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> set[str]:
-        """Load talker backbone weights, packing q/k/v and gate/up."""
-        stacked_params_mapping = [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded: set[str] = set()
-        for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                packed_name = name.replace(weight_name, param_name)
-                if packed_name not in params_dict:
-                    continue
-                if is_pp_missing_parameter(packed_name, self):
-                    continue
-                param = params_dict[packed_name]
-                param.weight_loader(param, loaded_weight, shard_id)
-                loaded.add(packed_name)
-                break
-            else:
-                if name not in params_dict:
-                    continue
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(
-                    param, "weight_loader", default_weight_loader
-                )
-                weight_loader(param, loaded_weight)
-                loaded.add(name)
-        return loaded
 
 
 class Qwen3TTSTalkerCodePredictorModel(nn.Module):
@@ -1144,11 +780,15 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
     # ``talker.model.layers.`` rule could match.
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
-            # Group-0 codec embedding moved to the code predictor.
+            # Group-0 codec embedding lives inside the code predictor.
             "talker.model.codec_embedding.":
                 "code_predictor.codec_embedding.",
-            # Talker backbone (text embed + transformer + final norm).
-            "talker.model.text_embedding.": "model.text_embedding.",
+            # Text embedding lifted to the outer model (vLLM's Qwen3Model
+            # owns ``embed_tokens`` for codec ids; text tokens use a
+            # separate top-level table).
+            "talker.model.text_embedding.": "text_embedding.",
+            # Talker backbone (transformer + final norm) — uses vLLM's
+            # ``Qwen3Model`` directly, matching layer/norm names 1:1.
             "talker.model.layers.": "model.layers.",
             "talker.model.norm.": "model.norm.",
             # Side modules.
@@ -1195,12 +835,29 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
             self.model_path, trust_remote_code=True, padding_side="left"
         )
 
-        # Transformer backbone (not compiled – uses vLLM paged Attention)
+        # Transformer backbone — vLLM's reusable Qwen3Model. The talker
+        # has Qwen3-style decoder layers, so we delegate the entire
+        # backbone (decoder layers, final norm, and a per-rank
+        # ``embed_tokens`` table that we do not actually consume — every
+        # forward goes through ``inputs_embeds``).
         with set_model_tag("talker"):
-            self.model = Qwen3TTSTalkerModel(
+            self.model = Qwen3Model(
                 vllm_config=vllm_config,
                 prefix=maybe_prefix(prefix, "model"),
             )
+
+        # Text-token embedding lives outside the backbone (Qwen3Model only
+        # owns the codec-vocab ``embed_tokens``). Only needed on the first
+        # PP rank where prefill prompt embeddings are assembled.
+        if get_pp_group().is_first_rank:
+            self.text_embedding = VocabParallelEmbedding(
+                config.text_vocab_size,
+                config.text_hidden_size,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "text_embedding"),
+            )
+        else:
+            self.text_embedding = PPMissingLayer()
 
         # Text projection MLP
         self.text_projection = Qwen3TTSTalkerResizeMLP(
@@ -1415,11 +1072,14 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
                 )
             combined_embeddings[valid_dec_idx] = decode_embed
 
+        # Qwen3Model.forward(input_ids, positions, intermediate_tensors,
+        # inputs_embeds): when ``inputs_embeds`` is provided, ``input_ids``
+        # is ignored and the embedded sequence is fed directly into the
+        # decoder layers.
         hidden_states = self.model(
             input_ids,
             positions,
             intermediate_tensors,
-            None,
             combined_embeddings,
         )
 
@@ -1630,7 +1290,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
             dtype=torch.long,
         )
         tts_bos_embed, tts_eos_embed, tts_pad_embed = self.text_projection(
-            self.model.get_text_embeddings(tts_tokens)
+            self.text_embedding(tts_tokens)
         ).chunk(3, dim=1)
 
         # Codec control prefix: choose with/without language_id.
@@ -1693,7 +1353,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
         )
 
         role_embed = self.text_projection(
-            self.model.get_text_embeddings(input_ids[:, :3])
+            self.text_embedding(input_ids[:, :3])
         )
         codec_prefix = torch.cat(
             (
@@ -1707,7 +1367,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
 
         # Non-streaming: full synth text in prefill + (tts_pad, codec_bos) tail.
         text_all = self.text_projection(
-            self.model.get_text_embeddings(input_ids[:, 3:-5])
+            self.text_embedding(input_ids[:, 3:-5])
         )
         text_all = torch.cat([text_all, tts_eos_embed], dim=1)
         pad_ids = torch.full(
@@ -1916,7 +1576,14 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
         # ``DefaultModelLoader.load_weights`` doesn't flag them. These
         # are populated either in ``__init__`` (rotary inv_freq) or in
         # ``_init_runtime_buffers`` (suppress_mask).
+        #
+        # ``model.embed_tokens`` is created by ``Qwen3Model`` on the first
+        # PP rank but is never invoked in this model — every prefill /
+        # decode step feeds the backbone via ``inputs_embeds`` assembled
+        # from ``code_predictor.codec_embedding`` and ``text_embedding``.
+        # Skip it from the strict-load check.
         loaded.add("suppress_mask")
+        loaded.add("model.embed_tokens.weight")
         for name, _ in self.named_parameters():
             if name.endswith("rotary_emb.inv_freq"):
                 loaded.add(name)
@@ -1962,7 +1629,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
         device = next(self.parameters()).device
         pad_id = int(hf.tts_pad_token_id)
         pad_ids = torch.tensor([[pad_id]], device=device, dtype=torch.long)
-        text_emb = self.model.get_text_embeddings(pad_ids)
+        text_emb = self.text_embedding(pad_ids)
         pad_proj = self.text_projection(text_emb).reshape(1, -1)
         self._tts_pad_text_embed.copy_(
             pad_proj.to(
