@@ -21,11 +21,25 @@ from tests.helpers.stage_config import get_deploy_config_path
 MODEL = "k2-fsa/OmniVoice"
 STAGE_CONFIG = get_deploy_config_path("omnivoice.yaml")
 
+# (model, stage_config_path, extra_omni_kwargs) — see ``omni_runner`` in tests.helpers.fixtures.runtime
+_OMNI_RUNNER_PARAM = (
+    MODEL,
+    STAGE_CONFIG,
+    {
+        "trust_remote_code": True,
+        "log_stats": True,
+    },
+)
 
-@pytest.mark.full_model
-@pytest.mark.omni
+pytestmark = [
+    pytest.mark.full_model,
+    pytest.mark.omni,
+    pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
+]
+
+
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_omnivoice_text_to_audio() -> None:
+def test_omnivoice_text_to_audio(omni_runner: OmniRunner) -> None:
     """
     Test OmniVoice text-to-audio generation via offline Omni runner.
     Deploy Setting: omnivoice.yaml (enforce_eager=true)
@@ -34,17 +48,10 @@ def test_omnivoice_text_to_audio() -> None:
     """
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    with OmniRunner(
-        MODEL,
-        stage_configs_path=STAGE_CONFIG,
-        trust_remote_code=True,
-        log_stats=True,
-    ) as runner:
-        prompts = {"prompt": "Hello, this is a test for text to audio."}
+    prompts = {"prompt": "Hello, this is a test for text to audio."}
+    sampling_params_list = [OmniDiffusionSamplingParams()]
 
-        sampling_params_list = [OmniDiffusionSamplingParams()]
-
-        outputs = list(runner.omni.generate(prompts, sampling_params_list=sampling_params_list))
+    outputs = list(omni_runner.omni.generate(prompts, sampling_params_list=sampling_params_list))
 
     assert len(outputs) > 0, "No outputs generated"
 

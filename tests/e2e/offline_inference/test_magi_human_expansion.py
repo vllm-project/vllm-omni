@@ -13,6 +13,24 @@ from tests.helpers.runtime import OmniRunner
 from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+MODEL = "SII-GAIR/daVinci-MagiHuman-Base-1080p"
+
+# (model, stage_config_path, extra_omni_kwargs) — see ``omni_runner`` in tests.helpers.fixtures.runtime
+_OMNI_RUNNER_PARAM = (
+    MODEL,
+    None,
+    {
+        "init_timeout": 1200,
+        "tensor_parallel_size": 2,
+    },
+)
+
+pytestmark = [
+    pytest.mark.full_model,
+    pytest.mark.diffusion,
+    pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
+]
+
 
 def _validate_mp4(video_bytes: bytes, min_frames: int = 10) -> None:
     """Validate that the MP4 contains meaningful video and audio tracks."""
@@ -38,13 +56,9 @@ def _validate_mp4(video_bytes: bytes, min_frames: int = 10) -> None:
     container.close()
 
 
-@pytest.mark.full_model
-@pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
-def test_magi_human_e2e():
+def test_magi_human_e2e(omni_runner: OmniRunner):
     """End-to-end test for MagiHuman generating video and audio."""
-    model_path = "SII-GAIR/daVinci-MagiHuman-Base-1080p"
-
     prompt = (
         "A young woman with long, wavy golden blonde hair and bright blue eyes, "
         "wearing a fitted ivory silk blouse with a delicate lace collar, sits "
@@ -84,54 +98,49 @@ def test_magi_human_e2e():
         },
     )
 
-    with OmniRunner(
-        model_path,
-        init_timeout=1200,
-        tensor_parallel_size=2,
-    ) as runner:
-        omni = runner.omni
-        outputs = list(
-            omni.generate(
-                prompts=[prompt],
-                sampling_params_list=[sampling_params],
-            )
+    omni = omni_runner.omni
+    outputs = list(
+        omni.generate(
+            prompts=[prompt],
+            sampling_params_list=[sampling_params],
         )
+    )
 
-        assert len(outputs) > 0, "No outputs returned"
-        first = outputs[0]
+    assert len(outputs) > 0, "No outputs returned"
+    first = outputs[0]
 
-        assert hasattr(first, "images") and first.images, "No video frames in output"
-        video_frames = first.images[0]
-        assert isinstance(video_frames, np.ndarray), f"Expected numpy array, got {type(video_frames)}"
-        assert video_frames.ndim == 4, f"Expected 4D array (T,H,W,3), got shape {video_frames.shape}"
+    assert hasattr(first, "images") and first.images, "No video frames in output"
+    video_frames = first.images[0]
+    assert isinstance(video_frames, np.ndarray), f"Expected numpy array, got {type(video_frames)}"
+    assert video_frames.ndim == 4, f"Expected 4D array (T,H,W,3), got shape {video_frames.shape}"
 
-        mm = first.multimodal_output
-        assert mm, "multimodal_output is empty or missing"
+    mm = first.multimodal_output
+    assert mm, "multimodal_output is empty or missing"
 
-        audio_waveform = mm.get("audio")
-        assert audio_waveform is not None, "No audio waveform in multimodal_output"
+    audio_waveform = mm.get("audio")
+    assert audio_waveform is not None, "No audio waveform in multimodal_output"
 
-        audio_sample_rate = mm.get("audio_sample_rate")
-        assert audio_sample_rate is not None, (
-            "audio_sample_rate not found in multimodal_output; model post-process must propagate it"
-        )
-        assert isinstance(audio_sample_rate, (int, float)), (
-            f"audio_sample_rate should be numeric, got {type(audio_sample_rate)}"
-        )
-        assert int(audio_sample_rate) > 0, f"audio_sample_rate must be positive, got {audio_sample_rate}"
+    audio_sample_rate = mm.get("audio_sample_rate")
+    assert audio_sample_rate is not None, (
+        "audio_sample_rate not found in multimodal_output; model post-process must propagate it"
+    )
+    assert isinstance(audio_sample_rate, (int, float)), (
+        f"audio_sample_rate should be numeric, got {type(audio_sample_rate)}"
+    )
+    assert int(audio_sample_rate) > 0, f"audio_sample_rate must be positive, got {audio_sample_rate}"
 
-        fps = mm.get("fps")
-        assert fps is not None, "fps not found in multimodal_output; model post-process must propagate it"
-        assert isinstance(fps, (int, float)), f"fps should be numeric, got {type(fps)}"
-        assert int(fps) > 0, f"fps must be positive, got {fps}"
+    fps = mm.get("fps")
+    assert fps is not None, "fps not found in multimodal_output; model post-process must propagate it"
+    assert isinstance(fps, (int, float)), f"fps should be numeric, got {type(fps)}"
+    assert int(fps) > 0, f"fps must be positive, got {fps}"
 
-        video_bytes = mux_video_audio_bytes(
-            video_frames,
-            audio_waveform,
-            fps=float(fps),
-            audio_sample_rate=int(audio_sample_rate),
-        )
-        assert isinstance(video_bytes, bytes), f"Expected MP4 bytes, got {type(video_bytes)}"
-        assert len(video_bytes) > 1000, f"MP4 too small ({len(video_bytes)} bytes)"
+    video_bytes = mux_video_audio_bytes(
+        video_frames,
+        audio_waveform,
+        fps=float(fps),
+        audio_sample_rate=int(audio_sample_rate),
+    )
+    assert isinstance(video_bytes, bytes), f"Expected MP4 bytes, got {type(video_bytes)}"
+    assert len(video_bytes) > 1000, f"MP4 too small ({len(video_bytes)} bytes)"
 
-        _validate_mp4(video_bytes)
+    _validate_mp4(video_bytes)

@@ -6,7 +6,7 @@ This directory contains the minimal offline VoxCPM example for vLLM Omni.
 
 - single text-to-speech
 - single voice cloning with `ref_audio` + `ref_text`
-- non-streaming with `vllm_omni/model_executor/stage_configs/voxcpm.yaml`
+- non-streaming with `vllm_omni/deploy/voxcpm.yaml`
 - streaming with `vllm_omni/model_executor/stage_configs/voxcpm_async_chunk.yaml`
 
 Advanced workflows were moved out of the getting-started example:

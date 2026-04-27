@@ -5,9 +5,6 @@ import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from vllm.logger import init_logger
-
-from vllm_omni.diffusion.attention.backends.utils.fa import is_mate_available
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -30,8 +27,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "LOCAL_RANK": lambda: int(os.environ.get("LOCAL_RANK", "0")),
 }
 
-logger = init_logger(__name__)
-
 
 class PackagesEnvChecker:
     """Singleton class for checking package availability."""
@@ -46,58 +41,17 @@ class PackagesEnvChecker:
 
     def initialize(self):
         packages_info = {}
-        packages_info["has_flash_attn"] = self._check_flash_attn(packages_info)
+        packages_info["has_flash_attn"] = self._check_flash_attn()
         self.packages_info = packages_info
 
-    def _check_flash_attn(self, packages_info) -> bool:
+    def _check_flash_attn(self) -> bool:
         """Check if flash attention is available and compatible."""
         platform = current_omni_platform
 
-        # MUSA uses MATE for flash attention
-        if platform.is_musa():
-            return is_mate_available()
-
-        # Flash attention requires CUDA-like platforms (CUDA or ROCm)
-        if not platform.is_cuda_alike():
-            return False
-
-        # Check if devices are available
         if platform.get_device_count() == 0:
             return False
 
-        try:
-            gpu_name = platform.get_device_name()
-            # Turing/Tesla/T4 GPUs don't support flash attention well
-            if "Turing" in gpu_name or "Tesla" in gpu_name or "T4" in gpu_name:
-                return False
-
-            # Check for any FA backend: FA3 (fa3_fwd_interface, flash_attn_interface) or FA2 (flash_attn)
-            # Try FA3 from fa3-fwd PyPI package
-            try:
-                import fa3_fwd_interface  # noqa: F401
-
-                return True
-            except (ImportError, ModuleNotFoundError):
-                pass
-
-            # Try FA3 from flash-attention source build
-            try:
-                import flash_attn_interface  # noqa: F401
-
-                return True
-            except (ImportError, ModuleNotFoundError):
-                pass
-
-            # Try FA2 from flash-attn package
-            from flash_attn import __version__
-
-            if __version__ < "2.6.0":
-                raise ImportError("install flash_attn >= 2.6.0")
-            return True
-        except (ImportError, ModuleNotFoundError):
-            if not packages_info.get("has_aiter", False):
-                logger.warning("No Flash Attention backend found, using pytorch SDPA implementation")
-            return False
+        return platform.has_flash_attn_package()
 
     def get_packages_info(self) -> dict:
         """Get the packages info dictionary."""

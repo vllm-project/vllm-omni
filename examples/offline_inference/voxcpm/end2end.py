@@ -14,7 +14,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm_omni import AsyncOmni, Omni
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_SYNC_STAGE_CONFIG = REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "voxcpm.yaml"
+DEFAULT_SYNC_STAGE_CONFIG = REPO_ROOT / "vllm_omni" / "deploy" / "voxcpm.yaml"
 
 
 def _build_prompt(args) -> dict[str, Any]:

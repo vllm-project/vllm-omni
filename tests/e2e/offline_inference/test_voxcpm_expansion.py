@@ -3,44 +3,28 @@
 
 """E2E test for VoxCPM offline inference."""
 
-import json
-import os
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
 import torch
 
-import tests.helpers.runtime as omni_runtime
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
-from vllm_omni.model_executor.models.voxcpm.voxcpm_runtime_utils import (
-    prepare_voxcpm_hf_config_dir,
-    resolve_voxcpm_model_dir,
-)
+from tests.helpers.stage_config import get_deploy_config_path
 
-VOXCPM_MODEL = os.environ.get("VOXCPM_MODEL", "OpenBMB/VoxCPM1.5")
-STAGE_CONFIG = str(
-    Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / "voxcpm.yaml"
-)
+VOXCPM_MODEL = "OpenBMB/VoxCPM1.5"
+STAGE_CONFIG = get_deploy_config_path("voxcpm.yaml")
 SAMPLE_RATE = 24000
 
+# (model, stage_config_path) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
+_OMNI_RUNNER_PARAM = (VOXCPM_MODEL, STAGE_CONFIG)
 
-@pytest.fixture(autouse=True)
-def _patch_npu_cleanup_for_voxcpm(monkeypatch: pytest.MonkeyPatch):
-    """Limit the NPU cleanup workaround to this VoxCPM test module only."""
-    original_cleanup = omni_runtime.cleanup_dist_env_and_memory
-
-    def _safe_cleanup() -> None:
-        try:
-            original_cleanup()
-        except RuntimeError as exc:
-            if "Allocator for npu is not a DeviceAllocator" in str(exc):
-                return
-            raise
-
-    monkeypatch.setattr(omni_runtime, "cleanup_dist_env_and_memory", _safe_cleanup)
+pytestmark = [
+    pytest.mark.full_model,
+    pytest.mark.omni,
+    pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
+]
 
 
 def _build_prompt(text: str) -> dict[str, Any]:
@@ -94,50 +78,9 @@ def _extract_final_multimodal_output(outputs) -> dict[str, Any]:
     raise AssertionError("No multimodal audio output found in VoxCPM generate results")
 
 
-@pytest.fixture
-def voxcpm_model_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
-    model_dir = resolve_voxcpm_model_dir(VOXCPM_MODEL)
-
-    hf_config_env = os.environ.get("VLLM_OMNI_VOXCPM_HF_CONFIG_PATH")
-    if hf_config_env:
-        hf_config_dir = Path(hf_config_env).expanduser()
-    else:
-        hf_config_dir = tmp_path / "voxcpm_hf_config"
-
-    if not (hf_config_dir / "config.json").exists():
-        prepare_voxcpm_hf_config_dir(model_dir, hf_config_dir)
-
-    monkeypatch.setenv("VLLM_OMNI_VOXCPM_HF_CONFIG_PATH", str(hf_config_dir))
-    return str(model_dir)
-
-
-def test_prepare_voxcpm_hf_config_dir(tmp_path: Path):
-    model_dir = tmp_path / "model"
-    model_dir.mkdir()
-    (model_dir / "config.json").write_text(json.dumps({"hidden_size": 1024}), encoding="utf-8")
-    (model_dir / "generation_config.json").write_text(json.dumps({"do_sample": False}), encoding="utf-8")
-
-    hf_config_dir = prepare_voxcpm_hf_config_dir(model_dir, tmp_path / "voxcpm_hf_config")
-
-    prepared_config = json.loads((hf_config_dir / "config.json").read_text(encoding="utf-8"))
-    assert prepared_config["model_type"] == "voxcpm"
-    assert prepared_config["architectures"] == ["VoxCPMForConditionalGeneration"]
-    assert (hf_config_dir / "generation_config.json").exists()
-
-
-def test_resolve_voxcpm_model_dir_local_path(tmp_path: Path):
-    model_dir = tmp_path / "OpenBMB" / "VoxCPM1.5"
-    model_dir.mkdir(parents=True)
-
-    assert resolve_voxcpm_model_dir(str(model_dir)) == model_dir
-
-
-@pytest.mark.full_model
-@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_voxcpm_zero_shot_001(voxcpm_model_path: str):
-    with OmniRunner(voxcpm_model_path, stage_configs_path=STAGE_CONFIG) as runner:
-        outputs = list(runner.omni.generate(_build_prompt("Hello, this is a VoxCPM offline inference test.")))
+def test_voxcpm_zero_shot_001(omni_runner: OmniRunner) -> None:
+    outputs = list(omni_runner.omni.generate(_build_prompt("Hello, this is a VoxCPM offline inference test.")))
 
     assert outputs, "No outputs returned"
 

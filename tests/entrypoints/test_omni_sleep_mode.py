@@ -152,7 +152,7 @@ async def diffusion_engine():
 
 class TestOmniSleepMode:
     @pytest.mark.asyncio
-    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
     async def test_llm_sleep_ack(self, llm_engine: AsyncOmni):
         """LLM Thinker (GPU0) Signal and Physical Recycling Audit"""
         try:
@@ -168,7 +168,7 @@ class TestOmniSleepMode:
             llm_engine.shutdown()
 
     @pytest.mark.asyncio
-    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
     async def test_diffusion_sleep_handshake(self, diffusion_engine: AsyncOmni):
         """Diffusion Worker stage signal loop"""
         try:
@@ -189,7 +189,7 @@ class TestOmniSleepMode:
             logger.info("Manual shutdown executed. Test should exit now.")
 
     @pytest.mark.asyncio
-    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
     async def test_cross_device_cleanup(self, diffusion_engine: AsyncOmni):
         """Physical recycling audit: leveraging deterministic data returned by Workers"""
         try:
@@ -206,7 +206,7 @@ class TestOmniSleepMode:
             diffusion_engine.shutdown()
 
     @pytest.mark.asyncio
-    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
     async def test_diffusion_integrity_bit_level(self, diffusion_engine: AsyncOmni):
         """Bit-level consistency after Diffusion wake-up (prevent image corruption)"""
         try:
@@ -251,7 +251,7 @@ class TestOmniSleepMode:
             logger.info("Cleanup complete, test exiting.")
 
     @pytest.mark.asyncio
-    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
     async def test_coordinated_cross_device(self, llm_engine: AsyncOmni, diffusion_engine: AsyncOmni):
         """Heterogeneous Coordinated Cleanup Test (Talker and Diffusion on GPU 1)"""
         device_id = 1
@@ -291,7 +291,7 @@ class TestOmniSleepMode:
             logger.info("All engines scavenged. Ready for next test.")
 
     @pytest.mark.asyncio
-    @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
     async def test_diffusion_vram_lifecycle_audit(self, diffusion_engine: AsyncOmni):
         """Diffusion memory loop: Active -> Deep Sleep -> Active -> inference sanity check"""
         device_id = 1

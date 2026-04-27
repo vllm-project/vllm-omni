@@ -43,12 +43,6 @@ REFERENCE_STAGE0_TEMPERATURE = 1.0
 REFERENCE_STAGE0_REPETITION_PENALTY = 2.0
 
 
-ASYNC_CHUNK_MODES = [
-    pytest.param(False, id="sync"),
-    pytest.param(True, id="async_chunk"),
-]
-
-
 @functools.lru_cache(maxsize=1)
 def _load_reference_prompt_wav() -> tuple[np.ndarray, int]:
     with urlopen(REFERENCE_PROMPT_WAV_URL, timeout=30) as resp:
@@ -144,57 +138,67 @@ def _build_reference_inputs(prompt_audio: tuple[np.ndarray, int]) -> list[dict[s
     ]
 
 
-@pytest.mark.full_model
-@pytest.mark.omni
+# (model, stage_configs_path, extra_omni_kwargs) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
+_cosy_deployment = get_deploy_config_path("cosyvoice3.yaml")
+_cosy_model_path = str(_resolve_model_dir())
+_OMNI_RUNNER_PARAMS = [
+    pytest.param(
+        (_cosy_model_path, _cosy_deployment, {"async_chunk": False}),
+        id="sync",
+    ),
+    pytest.param(
+        (_cosy_model_path, _cosy_deployment, {"async_chunk": True}),
+        id="async_chunk",
+    ),
+]
+pytestmark = [
+    pytest.mark.full_model,
+    pytest.mark.omni,
+    pytest.mark.parametrize("omni_runner", _OMNI_RUNNER_PARAMS, indirect=True),
+]
+
+
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("async_chunk", ASYNC_CHUNK_MODES)
-def test_cosyvoice3_offline_reference_zero_shot(async_chunk: bool) -> None:
+def test_cosyvoice3_offline_reference_zero_shot(omni_runner: OmniRunner) -> None:
     """CosyVoice3 zero-shot reference inference should stop cleanly and produce sane audio."""
+    async_chunk = bool(getattr(omni_runner.omni, "async_chunk", False))
     prompt_audio, prompt_sr = _load_reference_prompt_wav()
-    model_dir = _resolve_model_dir()
     expected_stop_token = int(CosyVoice3Config().llm["eos_token_id"])
 
-    with OmniRunner(
-        str(model_dir),
-        seed=42,
-        stage_configs_path=get_deploy_config_path("cosyvoice3.yaml"),
-        async_chunk=async_chunk,
-        stage_init_timeout=300,
-    ) as omni_runner:
-        sampling_params_list = omni_runner.get_default_sampling_params_list()
-        sampling_params_list[0] = _reference_zero_shot_stage0_sampling(text=REFERENCE_SYNTH_TEXT)
+    sampling_params_list = omni_runner.get_default_sampling_params_list()
+    sampling_params_list[0] = _reference_zero_shot_stage0_sampling(text=REFERENCE_SYNTH_TEXT)
 
-        outputs = omni_runner.omni.generate(_build_reference_inputs((prompt_audio, prompt_sr)), sampling_params_list)
+    outputs = omni_runner.omni.generate(_build_reference_inputs((prompt_audio, prompt_sr)), sampling_params_list)
 
-        assert outputs, "No outputs returned"
-        audio_mm = outputs[0].multimodal_output
-        assert "audio" in audio_mm, "No audio output found"
+    assert outputs, "No outputs returned"
+    audio_mm = outputs[0].multimodal_output
+    assert "audio" in audio_mm, "No audio output found"
 
-        audio = _concat_audio(audio_mm["audio"])
-        assert audio.size > 0, "Generated audio is empty"
+    audio = _concat_audio(audio_mm["audio"])
+    assert audio.size > 0, "Generated audio is empty"
 
-        sr_val = audio_mm.get("sr", 24000)
-        if isinstance(sr_val, list) and sr_val:
-            sr_val = sr_val[-1]
-        if hasattr(sr_val, "item"):
-            sr_val = sr_val.item()
-        sr = int(sr_val)
-        assert sr == 24000, f"Unexpected sample_rate={sr}"
+    sr_val = audio_mm.get("sr", 24000)
+    if isinstance(sr_val, list) and sr_val:
+        sr_val = sr_val[-1]
+    if hasattr(sr_val, "item"):
+        sr_val = sr_val.item()
+    sr = int(sr_val)
+    assert sr == 24000, f"Unexpected sample_rate={sr}"
 
-        duration_s = audio.size / sr
-        assert 2.8 <= duration_s <= 8.8, f"Unexpected duration={duration_s:.3f}s (samples={audio.size}, sr={sr})"
+    duration_s = audio.size / sr
+    assert 2.8 <= duration_s <= 8.8, f"Unexpected duration={duration_s:.3f}s (samples={audio.size}, sr={sr})"
 
-        stage0_outputs = _get_stage_engine_outputs(omni_runner, 0)
-        if stage0_outputs:
-            completion = stage0_outputs[0].outputs[0]
-            finish_reason = getattr(completion, "finish_reason", None)
-            stop_reason = getattr(completion, "stop_reason", None)
-            num_tokens = len(getattr(completion, "token_ids", []) or [])
+    stage0_outputs = _get_stage_engine_outputs(omni_runner, 0)
+    if stage0_outputs:
+        completion = stage0_outputs[0].outputs[0]
+        finish_reason = getattr(completion, "finish_reason", None)
+        stop_reason = getattr(completion, "stop_reason", None)
+        num_tokens = len(getattr(completion, "token_ids", []) or [])
 
-            assert finish_reason == "stop", f"Stage-0 finish_reason={finish_reason}, expected 'stop'"
-            assert int(stop_reason) == expected_stop_token, (
-                f"Stage-0 stop_reason={stop_reason}, expected {expected_stop_token}"
-            )
-            assert 80 <= num_tokens <= 220, f"Stage-0 num_tokens={num_tokens}, expected sane stop-bound range"
-        else:
-            assert async_chunk, "Stage-0 produced no engine outputs"
+        assert finish_reason == "stop", f"Stage-0 finish_reason={finish_reason}, expected 'stop'"
+        assert int(stop_reason) == expected_stop_token, (
+            f"Stage-0 stop_reason={stop_reason}, expected {expected_stop_token}"
+        )
+        assert 80 <= num_tokens <= 220, f"Stage-0 num_tokens={num_tokens}, expected sane stop-bound range"
+    else:
+        assert async_chunk, "Stage-0 produced no engine outputs"
