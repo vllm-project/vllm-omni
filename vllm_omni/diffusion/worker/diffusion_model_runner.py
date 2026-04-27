@@ -555,7 +555,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     self.pipeline.is_buffer_setup = False   
                     self.pipeline.prepare_encode(state)
 
-                if pp_group.is_first_rank: # TODO: race condition
+                if pp_group.is_first_rank: 
                     denoised_chunks = state.extra.get("denoised_chunks", [])
                     decoded_chunks = state.extra.setdefault("decoded_chunks", [])
                     new_denoised_chunks = []
@@ -576,7 +576,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             finished=True,
                             result=self._merge_chunk_outputs(decoded_chunks),
                         )
-                        self._update_states_after(state, finished=True) # TODO: call properly on all ranks
+                        self._update_states_after(state, finished=True) 
                         return output
 
                 
@@ -600,14 +600,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 with state.use_chunk(chunk):
                     if not self.pipeline.is_buffer_setup:
                         self.pipeline.set_pp_recv_dict_buffers(state)
+
                     noise_pred = self.pipeline.denoise_step(state)
                     if noise_pred is None and getattr(self.pipeline, "interrupt", False):
+                        self._update_states_after(state, finished=True) 
                         return RunnerOutput(
                             req_id=task.sched_req_id,
                             result=DiffusionOutput(error="micro-step denoise interrupted"),
                         )
+                    
                     self.pipeline.step_scheduler(state, noise_pred)
-                    chunk_done = state.denoise_completed
+                    chunk_completed = state.denoise_completed
 
 
                 # prefetch the chunk of the next micro-step
@@ -617,17 +620,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                         self.pipeline.prefetch_its(state)
 
 
-                output = RunnerOutput(
-                    req_id=task.sched_req_id,
-                    step_index=chunk.step_index,
-                    chunk_idx=task.chunk_idx,
-                )
-
-                if chunk_done:
-                    output.chunk_completed = True
+                if chunk_completed:
                     state.extra["chunks"].pop(task.chunk_idx, None)
+
                     if pp_group.is_first_rank:
                         steps_left = pp_group.world_size 
                         state.extra.setdefault("denoised_chunks", []).append((chunk, steps_left))
-            
-                return output
+
+                return RunnerOutput(
+                    req_id=task.sched_req_id,
+                    step_index=chunk.step_index,
+                    chunk_idx=task.chunk_idx,
+                    chunk_completed=chunk_completed,
+                )
+
