@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Default model name
+MODEL="${MODEL:-Qwen/Qwen2.5-Omni-7B}"
+
 # Default query type
 QUERY_TYPE="${1:-mixed_modalities}"
 
@@ -162,7 +165,7 @@ echo ""
 
 request_body=$(cat <<EOF
 {
-  "model": "Qwen/Qwen2.5-Omni-7B",
+  "model": "$MODEL",
   "sampling_params_list": $sampling_params_list,
   "mm_processor_kwargs": $mm_processor_kwargs,
   "modalities": $MODALITIES,

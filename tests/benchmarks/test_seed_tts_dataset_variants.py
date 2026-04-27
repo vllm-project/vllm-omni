@@ -32,6 +32,19 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (  # noqa: E402
     SeedTTSTextSampleRequest,
 )
 
+
+def _make_mock_tokenizer(mocker):
+    """Return a MagicMock tokenizer that satisfies get_cached_tokenizer."""
+    tok = mocker.MagicMock()
+    tok.encode = lambda text, **kw: [0] * len(text.split())
+    tok.get_vocab.return_value = {"a": 0, "b": 1}
+    tok.all_special_ids = []
+    tok.all_special_tokens = []
+    tok.vocab_size = 2
+    tok.__len__.return_value = 2
+    return tok
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -63,8 +76,7 @@ def test_seed_tts_text_dataset_omits_ref_audio(seed_tts_root, mocker):
         locale="en",
         disable_shuffle=True,
     )
-    tokenizer = mocker.MagicMock()
-    tokenizer.encode = lambda text, **kw: [0] * len(text.split())
+    tokenizer = _make_mock_tokenizer(mocker)
     requests = ds.sample(tokenizer, num_requests=3)
     assert len(requests) == 3
     for req in requests:
@@ -98,8 +110,7 @@ def test_seed_tts_design_dataset_has_instructions(seed_tts_design_root, mocker):
         locale="en",
         disable_shuffle=True,
     )
-    tokenizer = mocker.MagicMock()
-    tokenizer.encode = lambda text, **kw: [0] * len(text.split())
+    tokenizer = _make_mock_tokenizer(mocker)
     requests = ds.sample(tokenizer, num_requests=3)
     assert len(requests) == 3
     for req in requests:
@@ -125,10 +136,11 @@ def test_seed_tts_design_dataset_rejects_missing_description(seed_tts_design_roo
         locale="en",
         disable_shuffle=True,
     )
-    tokenizer = mocker.MagicMock()
-    tokenizer.encode = lambda text, **kw: [0] * len(text.split())
+    tokenizer = _make_mock_tokenizer(mocker)
     requests = ds.sample(tokenizer, num_requests=10)
-    assert len(requests) == 1  # only the valid row
+    # Oversampling may repeat the single valid row; verify ALL come from it.
+    assert len(requests) > 0
+    assert all(r.seed_tts_utterance_id == "ok001" for r in requests)
 
 
 def test_attach_sets_seed_tts_row_even_without_extra_body():
