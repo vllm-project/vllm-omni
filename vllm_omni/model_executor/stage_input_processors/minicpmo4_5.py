@@ -21,6 +21,8 @@ TTS_EOS_ID = 151704
 ASYNC_TTS_CHUNK_SIZE = 10
 DEBUG_REF_AUDIO_ENV = "VLLM_OMNI_MINICPMO45_DEBUG_REF_AUDIO"
 E2E_ARTIFACT_DIR_ENV = "MINICPMO45_E2E_OUTPUT_DIR"
+E2E_DEBUG_ARTIFACTS_ENV = "MINICPMO45_E2E_DEBUG_ARTIFACTS"
+E2E_DEBUG_TENSORS_ENV = "MINICPMO45_E2E_DEBUG_TENSORS"
 
 logger = init_logger(__name__)
 _ASYNC_TTS_STATE_KEY = "_minicpmo4_5_async_tts_state"
@@ -64,6 +66,9 @@ def _ensure_list(x: Any) -> list[Any]:
 
 
 def _async_debug_request_dir(request_id: str | None) -> Path | None:
+    if os.environ.get(E2E_DEBUG_ARTIFACTS_ENV, "").strip() != "1":
+        return None
+
     artifact_root = os.environ.get(E2E_ARTIFACT_DIR_ENV, "").strip()
     if not artifact_root:
         return None
@@ -75,6 +80,10 @@ def _async_debug_request_dir(request_id: str | None) -> Path | None:
     request_dir = Path(artifact_root) / "debug" / "minicpmo4_5_async_chunk" / safe_request_id
     request_dir.mkdir(parents=True, exist_ok=True)
     return request_dir
+
+
+def _debug_tensors_enabled() -> bool:
+    return os.environ.get(E2E_DEBUG_TENSORS_ENV, "").strip() == "1"
 
 
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -210,13 +219,25 @@ def _dump_async_tts_processor_step(
     aligned_hidden_summary = None
     delta_hidden_summary = None
     if isinstance(raw_hidden_states, torch.Tensor):
-        raw_hidden_summary = _write_tensor_dump(step_dir / "raw_hidden_states.pt", raw_hidden_states)
+        raw_hidden_summary = (
+            _write_tensor_dump(step_dir / "raw_hidden_states.pt", raw_hidden_states)
+            if _debug_tensors_enabled()
+            else _summarize_tensor(raw_hidden_states)
+        )
     if isinstance(aligned_hidden_states, torch.Tensor):
-        aligned_hidden_summary = _write_tensor_dump(step_dir / "aligned_hidden_states.pt", aligned_hidden_states)
+        aligned_hidden_summary = (
+            _write_tensor_dump(step_dir / "aligned_hidden_states.pt", aligned_hidden_states)
+            if _debug_tensors_enabled()
+            else _summarize_tensor(aligned_hidden_states)
+        )
     if isinstance(delta_tts_hidden_states, torch.Tensor):
-        delta_hidden_summary = _write_tensor_dump(
-            step_dir / "delta_tts_hidden_states.pt",
-            delta_tts_hidden_states,
+        delta_hidden_summary = (
+            _write_tensor_dump(
+                step_dir / "delta_tts_hidden_states.pt",
+                delta_tts_hidden_states,
+            )
+            if _debug_tensors_enabled()
+            else _summarize_tensor(delta_tts_hidden_states)
         )
 
     delta_token_list = [int(tok) for tok in torch.as_tensor(delta_llm_tokens, dtype=torch.long).reshape(-1).tolist()]

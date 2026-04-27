@@ -32,13 +32,13 @@ stage_args:
     output_connectors:
       to_stage_1: connector_stage0_to_1
     default_sampling_params:
-      temperature: 0.0
+      temperature: 0.7
       top_p: 1.0
-      top_k: -1
+      top_k: 50
       max_tokens: 2048
       seed: 42
       detokenize: True
-      repetition_penalty: 1.1
+      repetition_penalty: 1.0
 
   - stage_id: 1
     stage_type: llm
@@ -65,12 +65,13 @@ stage_args:
     output_connectors:
       to_stage_2: connector_stage1_to_2
     default_sampling_params:
-      temperature: 0.9
+      temperature: 0.7
+      top_p: 1.0
       top_k: 50
-      max_tokens: 4096
+      max_tokens: 2048
       seed: 42
       detokenize: False
-      repetition_penalty: 1.05
+      repetition_penalty: 1.0
       stop_token_ids: [6561]
 
   - stage_id: 2

@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Final
@@ -29,8 +31,15 @@ REMOTE_OUTPUT_DIR: Final = Path("/root/minicpmo45-offline-pytest-output")
 REMOTE_REPO_ROOT: Final = Path("/root/vllm-omni-local")
 REMOTE_REQUIREMENTS_ROOT: Final = Path("/root/vllm-omni-requirements")
 DEFAULT_PYTEST_TARGET: Final = "tests/e2e/offline_inference/test_minicpmo4_5.py"
+ASYNC_TO_AUDIO_PYTEST_TARGETS: Final = [
+    f"{DEFAULT_PYTEST_TARGET}::test_minicpmo45_async_chunk_text_to_audio",
+    f"{DEFAULT_PYTEST_TARGET}::test_minicpmo45_async_chunk_text_image_to_audio",
+    f"{DEFAULT_PYTEST_TARGET}::test_minicpmo45_async_chunk_text_video_to_audio",
+]
 ARTIFACT_DIR_ENV: Final = "MINICPMO45_E2E_OUTPUT_DIR"
 REF_AUDIO_PATH_ENV: Final = "MINICPMO45_REF_AUDIO_PATH"
+SYNTHETIC_MEDIA_SEED_ENV: Final = "MINICPMO45_SYNTHETIC_MEDIA_SEED"
+DEBUG_ARTIFACTS_ENV: Final = "MINICPMO45_E2E_DEBUG_ARTIFACTS"
 MINUTES: Final = 60
 
 LOCAL_REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -123,6 +132,27 @@ def _list_relative_files(root: Path) -> list[str]:
     return sorted(str(path.relative_to(REMOTE_OUTPUT_DIR)) for path in root.rglob("*") if path.is_file())
 
 
+def _prune_remote_debug_artifacts() -> dict[str, Any]:
+    if not REMOTE_OUTPUT_DIR.exists():
+        return {"removed_debug_dirs": 0, "errors": []}
+
+    removed_debug_dirs = 0
+    errors: list[str] = []
+    for debug_dir in sorted(REMOTE_OUTPUT_DIR.glob("*_artifacts/debug")):
+        if not debug_dir.is_dir():
+            continue
+        try:
+            shutil.rmtree(debug_dir)
+            removed_debug_dirs += 1
+        except OSError as e:
+            errors.append(f"{debug_dir}: {e}")
+
+    return {
+        "removed_debug_dirs": removed_debug_dirs,
+        "errors": errors,
+    }
+
+
 def _resolve_remote_repo_path(local_path_str: str) -> str:
     local_path = Path(local_path_str).expanduser()
     if not local_path.is_absolute():
@@ -172,15 +202,26 @@ def run_pytest(
     remote_junitxml_name: str = "",
     remote_artifact_dir_name: str = "",
     remote_ref_audio_path: str = "",
+    synthetic_media_seed: str = "",
+    async_to_audio_only: bool = False,
+    include_debug_artifacts: bool = False,
+    prune_remote_debug_artifacts: bool = False,
 ) -> dict[str, Any]:
     snapshot_path = _download_model()
     hf_cache_volume.commit()
 
+    prune_summary = (
+        _prune_remote_debug_artifacts() if prune_remote_debug_artifacts else {"removed_debug_dirs": 0, "errors": []}
+    )
+    if prune_remote_debug_artifacts:
+        output_volume.commit()
+
+    pytest_targets = ASYNC_TO_AUDIO_PYTEST_TARGETS if async_to_audio_only else [pytest_target]
     command = [
         "python",
         "-m",
         "pytest",
-        pytest_target,
+        *pytest_targets,
         "-s",
         "-v",
         "--maxfail=1",
@@ -197,33 +238,64 @@ def run_pytest(
         env[ARTIFACT_DIR_ENV] = str(artifact_dir)
     if remote_ref_audio_path:
         env[REF_AUDIO_PATH_ENV] = remote_ref_audio_path
+    if synthetic_media_seed:
+        env[SYNTHETIC_MEDIA_SEED_ENV] = str(synthetic_media_seed)
+    if include_debug_artifacts:
+        env[DEBUG_ARTIFACTS_ENV] = "1"
+    else:
+        env.pop(DEBUG_ARTIFACTS_ENV, None)
 
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         command,
         cwd=str(REMOTE_REPO_ROOT),
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        check=False,
         env=env,
     )
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    def _stream_output(pipe: Any, chunks: list[str]) -> None:
+        if pipe is None:
+            return
+        for line in iter(pipe.readline, ""):
+            chunks.append(line)
+            print(line, end="", flush=True)
+
+    stdout_thread = threading.Thread(target=_stream_output, args=(proc.stdout, stdout_chunks), daemon=True)
+    stderr_thread = threading.Thread(target=_stream_output, args=(proc.stderr, stderr_chunks), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    return_code = proc.wait()
+    stdout_thread.join()
+    stderr_thread.join()
+    stdout = "".join(stdout_chunks)
+    stderr = "".join(stderr_chunks)
 
     REMOTE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    (REMOTE_OUTPUT_DIR / remote_stdout_name).write_text(proc.stdout, encoding="utf-8")
-    (REMOTE_OUTPUT_DIR / remote_stderr_name).write_text(proc.stderr, encoding="utf-8")
+    (REMOTE_OUTPUT_DIR / remote_stdout_name).write_text(stdout, encoding="utf-8")
+    (REMOTE_OUTPUT_DIR / remote_stderr_name).write_text(stderr, encoding="utf-8")
     output_volume.commit()
 
-    artifact_paths = _list_relative_files(artifact_dir) if artifact_dir is not None else []
+    all_artifact_paths = _list_relative_files(artifact_dir) if artifact_dir is not None else []
+    artifact_paths = all_artifact_paths
+    if not include_debug_artifacts:
+        artifact_paths = [path for path in all_artifact_paths if "/debug/" not in path]
 
     return {
         "snapshot_path": snapshot_path,
         "command": command,
-        "exit_code": int(proc.returncode),
+        "exit_code": int(return_code),
         "stdout_path": remote_stdout_name,
         "stderr_path": remote_stderr_name,
         "junitxml_path": remote_junitxml_name or None,
-        "stdout_tail": _tail_text(proc.stdout),
-        "stderr_tail": _tail_text(proc.stderr),
+        "stdout_tail": _tail_text(stdout),
+        "stderr_tail": _tail_text(stderr),
         "artifact_paths": artifact_paths,
+        "artifact_path_count": len(all_artifact_paths),
+        "skipped_debug_artifact_count": len(all_artifact_paths) - len(artifact_paths),
+        "prune_summary": prune_summary,
     }
 
 
@@ -237,6 +309,10 @@ def main(
     stderr_output: str = "",
     artifact_output_dir: str = "minicpmo45_offline_pytest_artifacts",
     ref_audio_path: str = "",
+    synthetic_media_seed: str = "",
+    async_to_audio_only: bool = False,
+    download_debug_artifacts: bool = False,
+    prune_remote_debug_artifacts: bool = False,
 ) -> None:
     snapshot_path = preload_model.remote()
     print(f"Model cached at: {snapshot_path}")
@@ -258,6 +334,10 @@ def main(
         remote_junitxml_name=junitxml_name,
         remote_artifact_dir_name=artifact_dir_name,
         remote_ref_audio_path=remote_ref_audio_path,
+        synthetic_media_seed=synthetic_media_seed,
+        async_to_audio_only=async_to_audio_only,
+        include_debug_artifacts=download_debug_artifacts,
+        prune_remote_debug_artifacts=prune_remote_debug_artifacts,
     )
 
     stdout_bytes = b"".join(output_volume.read_file(result["stdout_path"]))
@@ -289,9 +369,11 @@ def main(
         print(f"Saved junit xml to: {junit_path}")
 
     local_artifact_paths: list[str] = []
-    if artifact_output_dir and result.get("artifact_paths"):
+    artifact_paths = result.get("artifact_paths") or []
+
+    if artifact_output_dir and artifact_paths:
         artifact_root = Path(artifact_output_dir)
-        for remote_path in result["artifact_paths"]:
+        for remote_path in artifact_paths:
             local_path = artifact_root / remote_path
             local_path.parent.mkdir(parents=True, exist_ok=True)
             artifact_bytes = b"".join(output_volume.read_file(remote_path))
@@ -312,8 +394,14 @@ def main(
                 "stderr_path": result["stderr_path"],
                 "junitxml_path": result["junitxml_path"],
                 "artifact_paths": result["artifact_paths"],
+                "downloaded_artifact_paths": artifact_paths,
+                "artifact_path_count": result.get("artifact_path_count", len(result["artifact_paths"])),
+                "skipped_debug_artifact_count": result.get("skipped_debug_artifact_count", 0),
+                "prune_summary": result.get("prune_summary"),
                 "local_artifact_paths": local_artifact_paths,
                 "remote_ref_audio_path": remote_ref_audio_path or None,
+                "synthetic_media_seed": synthetic_media_seed or None,
+                "async_to_audio_only": bool(async_to_audio_only),
             },
             indent=2,
             sort_keys=True,

@@ -162,6 +162,7 @@ def test_thinker2talker_async_chunk_starts_when_tts_bos_is_in_prompt():
 
 def test_thinker2talker_async_chunk_writes_debug_artifacts(tmp_path, monkeypatch):
     monkeypatch.setenv("MINICPMO45_E2E_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("MINICPMO45_E2E_DEBUG_ARTIFACTS", "1")
     tm = _tm()
 
     thinker2talker_async_chunk(
@@ -346,6 +347,7 @@ def test_talker2code2wav_async_chunk_uses_output_token_delta():
 
 def test_talker2code2wav_async_chunk_writes_debug_artifacts(tmp_path, monkeypatch):
     monkeypatch.setenv("MINICPMO45_E2E_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("MINICPMO45_E2E_DEBUG_ARTIFACTS", "1")
     tm = _tm()
 
     payload = talker2code2wav_async_chunk(

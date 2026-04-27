@@ -34,6 +34,37 @@ class MiniCPMO4_5PoppedToken:
     is_eos: bool = False
 
 
+class MiniCPMO4_5RepeatPenaltyLogitsProcessor:
+    """MiniCPM streaming TTS repeat penalty from the HF reference code.
+
+    The generic Transformers repetition penalty only records token presence.
+    MiniCPM's streaming TTS decoder uses recent token frequency, which matters
+    once a codec token starts dominating the filtered candidate set.
+    """
+
+    def __init__(self, penalty: float, max_input_ids: int, past_window: int) -> None:
+        if penalty <= 0:
+            raise ValueError(f"penalty must be positive, got {penalty}.")
+        self.penalty = float(penalty)
+        self.max_input_ids = int(max_input_ids)
+        self.past_window = int(past_window)
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        if input_ids.numel() == 0 or self.penalty == 1.0:
+            return scores
+
+        if input_ids.size(1) > self.past_window:
+            input_ids = input_ids.narrow(1, -self.past_window, self.past_window)
+
+        freq = F.one_hot(input_ids.to(dtype=torch.long), scores.size(1)).sum(1)
+        if freq.size(0) > self.max_input_ids:
+            freq.narrow(0, self.max_input_ids, freq.size(0) - self.max_input_ids).zero_()
+
+        alpha = torch.pow(self.penalty, freq)
+        scores = scores.contiguous()
+        return torch.where(scores < 0, scores * alpha, scores / alpha)
+
+
 @dataclass
 class _MiniCPMO4_5GeneratorState:
     pending_conditions: list[MiniCPMO4_5EnqueuedCondition] = field(default_factory=list)
@@ -213,6 +244,18 @@ class MiniCPMO4_5TTSStreamingGenerator:
                 is_eos=False,
             )
 
+        if state.token_buffer:
+            token = state.token_buffer.pop(0)
+            return MiniCPMO4_5PoppedToken(
+                token_id=int(token.reshape(-1)[0].item()),
+                condition_index=state.current_condition_index,
+                condition_shape=(
+                    None if state.current_condition_shape is None else list(state.current_condition_shape)
+                ),
+                text_finished=bool(state.current_condition_text_finished),
+                is_eos=False,
+            )
+
         if state.eos_pending and not state.eos_emitted:
             state.eos_emitted = True
             state.stream_finished = True
@@ -254,6 +297,10 @@ class MiniCPMO4_5TTSStreamingGenerator:
         prefill_len = condition_length
         chunk_generated_tokens: list[torch.Tensor] = []
         saw_audio_eos = False
+        stop_current_condition = False
+        repeated_token_id: int | None = None
+        repeated_token_count = 0
+        repetition_guard_limit = max(2 * int(self.chunk_size), 50)
 
         for t in range(max_new_token):
             if t == 0:
@@ -322,6 +369,30 @@ class MiniCPMO4_5TTSStreamingGenerator:
             if next_id == self.eos_token_id:
                 saw_audio_eos = True
             else:
+                if repeated_token_id == next_id:
+                    repeated_token_count += 1
+                else:
+                    repeated_token_id = next_id
+                    repeated_token_count = 1
+
+                if repeated_token_count > repetition_guard_limit:
+                    stop_current_condition = True
+                    if bool(text_finished):
+                        saw_audio_eos = True
+                    if self.condition_event_logger is not None:
+                        self.condition_event_logger(
+                            {
+                                "event": "repetition_guard_stop",
+                                "condition_index": state.current_condition_index,
+                                "condition_shape": state.current_condition_shape,
+                                "token_id": int(next_id),
+                                "repeat_count": int(repeated_token_count),
+                                "repeat_limit": int(repetition_guard_limit),
+                                "text_finished": bool(text_finished),
+                            }
+                        )
+                    break
+
                 next_tok = next_token.reshape(1, 1).to(dtype=torch.long, device=device)
                 state.last_generated_token = next_tok.detach().clone()
                 state.all_generated_tokens.append(next_tok.clone())
@@ -401,7 +472,7 @@ class MiniCPMO4_5TTSStreamingGenerator:
                 batch = torch.cat(state.token_buffer[: self.chunk_size], dim=1)
                 yield batch, False
                 state.token_buffer = state.token_buffer[self.chunk_size :]
-                if saw_audio_eos:
+                if saw_audio_eos or stop_current_condition:
                     break
             else:
                 if saw_audio_eos:
@@ -409,6 +480,8 @@ class MiniCPMO4_5TTSStreamingGenerator:
                         batch = torch.cat(state.token_buffer, dim=1)
                         yield batch, True
                         state.token_buffer = []
+                    break
+                if stop_current_condition:
                     break
                 continue
 

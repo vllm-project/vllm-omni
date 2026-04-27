@@ -2,12 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm_omni.model_executor.models.minicpmo4_5.minicpmo4_5_talker import (
     MiniCPMO4_5TalkerForConditionalGeneration,
     _MiniCPMOAsyncTalkerState,
+)
+from vllm_omni.model_executor.models.minicpmo4_5.minicpmo4_5_tts_generator import (
+    MiniCPMO4_5RepeatPenaltyLogitsProcessor,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -20,8 +25,46 @@ def _minimal_talker():
     return model
 
 
+def test_repeat_penalty_counts_recent_minicpm_codec_tokens():
+    processor = MiniCPMO4_5RepeatPenaltyLogitsProcessor(
+        penalty=2.0,
+        max_input_ids=100,
+        past_window=4,
+    )
+
+    scores = torch.tensor([[8.0, 8.0, -8.0]], dtype=torch.float32)
+    input_ids = torch.tensor([[2, 1, 1, 1, 0]], dtype=torch.long)
+
+    adjusted = processor(input_ids, scores)
+
+    assert adjusted.tolist() == [[4.0, 1.0, -8.0]]
+
+
+def test_async_sampling_controls_keep_multiple_tts_candidates():
+    model = _minimal_talker()
+    model._async_chunk_enabled = True
+    model._async_sampling_repetition_penalty = 1.02
+    model._async_sampling_do_sample = True
+    model._async_sampling_top_p = 0.1
+    model._async_sampling_top_k = 2
+    model._async_sampling_min_p = 0.0
+    model.config = SimpleNamespace(num_audio_tokens=10)
+
+    model._rebuild_async_sampling_controls()
+
+    assert isinstance(model._async_logits_processors[0], MiniCPMO4_5RepeatPenaltyLogitsProcessor)
+
+    input_ids = torch.tensor([[0]], dtype=torch.long)
+    logits = torch.tensor([[10.0, 9.0, 8.0, 1.0, 0.0]], dtype=torch.float32)
+    for warper in model._async_logits_warpers:
+        logits = warper(input_ids, logits)
+
+    assert int(torch.isfinite(logits).sum().item()) == 3
+
+
 def test_record_async_emitted_audio_token_writes_single_condition_chunk(tmp_path, monkeypatch):
     monkeypatch.setenv("MINICPMO45_E2E_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("MINICPMO45_E2E_DEBUG_ARTIFACTS", "1")
     model = _minimal_talker()
     state = _MiniCPMOAsyncTalkerState(request_id="r")
 
@@ -59,6 +102,7 @@ def test_record_async_emitted_audio_token_writes_single_condition_chunk(tmp_path
 
 def test_record_async_emitted_audio_token_marks_mixed_condition_final_chunk(tmp_path, monkeypatch):
     monkeypatch.setenv("MINICPMO45_E2E_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("MINICPMO45_E2E_DEBUG_ARTIFACTS", "1")
     model = _minimal_talker()
     state = _MiniCPMOAsyncTalkerState(request_id="r")
 

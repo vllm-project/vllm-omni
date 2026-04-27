@@ -18,7 +18,6 @@ from transformers import LlamaConfig
 from transformers import LlamaModel as HFLlamaModel
 from transformers.generation.logits_process import (
     MinPLogitsWarper,
-    RepetitionPenaltyLogitsProcessor,
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
@@ -35,14 +34,20 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.minicpmo4_5.minicpmo4_5_tts_generator import (
     MiniCPMO4_5PoppedToken,
+    MiniCPMO4_5RepeatPenaltyLogitsProcessor,
     MiniCPMO4_5TTSStreamingGenerator,
 )
 
 logger = init_logger(__name__)
 E2E_ARTIFACT_DIR_ENV = "MINICPMO45_E2E_OUTPUT_DIR"
+E2E_DEBUG_ARTIFACTS_ENV = "MINICPMO45_E2E_DEBUG_ARTIFACTS"
+E2E_DEBUG_TENSORS_ENV = "MINICPMO45_E2E_DEBUG_TENSORS"
 
 
 def _async_debug_request_dir(request_id: str | None) -> Path | None:
+    if os.environ.get(E2E_DEBUG_ARTIFACTS_ENV, "").strip() != "1":
+        return None
+
     artifact_root = os.environ.get(E2E_ARTIFACT_DIR_ENV, "").strip()
     if not artifact_root:
         return None
@@ -54,6 +59,10 @@ def _async_debug_request_dir(request_id: str | None) -> Path | None:
     request_dir = Path(artifact_root) / "debug" / "minicpmo4_5_async_chunk" / safe_request_id
     request_dir.mkdir(parents=True, exist_ok=True)
     return request_dir
+
+
+def _debug_tensors_enabled() -> bool:
+    return os.environ.get(E2E_DEBUG_TENSORS_ENV, "").strip() == "1"
 
 
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -653,7 +662,13 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
 
     def _rebuild_async_sampling_controls(self) -> None:
         self._async_logits_processors = (
-            [RepetitionPenaltyLogitsProcessor(self._async_sampling_repetition_penalty)]
+            [
+                MiniCPMO4_5RepeatPenaltyLogitsProcessor(
+                    self._async_sampling_repetition_penalty,
+                    int(self.config.num_audio_tokens),
+                    16,
+                )
+            ]
             if self._async_chunk_enabled and self._async_sampling_repetition_penalty != 1.0
             else []
         )
@@ -661,9 +676,9 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
         if not self._async_chunk_enabled or not self._async_sampling_do_sample:
             return
         if self._async_sampling_top_p < 1.0:
-            self._async_logits_warpers.append(TopPLogitsWarper(self._async_sampling_top_p))
+            self._async_logits_warpers.append(TopPLogitsWarper(self._async_sampling_top_p, min_tokens_to_keep=3))
         if self._async_sampling_top_k > 0:
-            self._async_logits_warpers.append(TopKLogitsWarper(self._async_sampling_top_k))
+            self._async_logits_warpers.append(TopKLogitsWarper(self._async_sampling_top_k, min_tokens_to_keep=3))
         if self._async_sampling_min_p > 0.0:
             self._async_logits_warpers.append(MinPLogitsWarper(self._async_sampling_min_p))
 
@@ -744,22 +759,19 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
             return None
 
         dump_dir = request_dir / "condition_tensors" / f"condition_{condition_index:04d}"
+        summarize = _write_tensor_dump if _debug_tensors_enabled() else lambda _path, tensor: _summarize_tensor(tensor)
         tensor_summaries = {
-            "llm_tokens": _write_tensor_dump(dump_dir / "llm_tokens.pt", components["llm_tokens"]),
-            "last_hidden_states": _write_tensor_dump(
-                dump_dir / "last_hidden_states.pt", components["last_hidden_states"]
-            ),
-            "llm_embeds": _write_tensor_dump(dump_dir / "llm_embeds.pt", components["llm_embeds"]),
-            "hidden_embeds": _write_tensor_dump(dump_dir / "hidden_embeds.pt", components["hidden_embeds"]),
-            "tts_embeds": _write_tensor_dump(dump_dir / "tts_embeds.pt", components["tts_embeds"]),
-            "condition": _write_tensor_dump(dump_dir / "condition.pt", components["condition"]),
+            "llm_tokens": summarize(dump_dir / "llm_tokens.pt", components["llm_tokens"]),
+            "last_hidden_states": summarize(dump_dir / "last_hidden_states.pt", components["last_hidden_states"]),
+            "llm_embeds": summarize(dump_dir / "llm_embeds.pt", components["llm_embeds"]),
+            "hidden_embeds": summarize(dump_dir / "hidden_embeds.pt", components["hidden_embeds"]),
+            "tts_embeds": summarize(dump_dir / "tts_embeds.pt", components["tts_embeds"]),
+            "condition": summarize(dump_dir / "condition.pt", components["condition"]),
         }
         if int(components["text_eos_embed"].shape[0]) > 0:
-            tensor_summaries["text_eos_embed"] = _write_tensor_dump(
-                dump_dir / "text_eos_embed.pt", components["text_eos_embed"]
-            )
+            tensor_summaries["text_eos_embed"] = summarize(dump_dir / "text_eos_embed.pt", components["text_eos_embed"])
         if int(components["audio_bos_embed"].shape[0]) > 0:
-            tensor_summaries["audio_bos_embed"] = _write_tensor_dump(
+            tensor_summaries["audio_bos_embed"] = summarize(
                 dump_dir / "audio_bos_embed.pt", components["audio_bos_embed"]
             )
 
@@ -794,6 +806,8 @@ class MiniCPMO4_5TalkerForConditionalGeneration(nn.Module, SupportsPP):
     ) -> str | None:
         request_dir = _async_debug_request_dir(state.request_id)
         if request_dir is None:
+            return None
+        if not _debug_tensors_enabled():
             return None
 
         dump_dir = request_dir / "talker_decode_step_tensors" / f"step_{int(step_index):04d}"
