@@ -137,7 +137,7 @@ DOCKER_BUILDKIT=1 docker build \
 
 ```bash
 docker run --runtime nvidia --gpus 2 \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface \
   --env "HF_TOKEN=$HF_TOKEN" \
   -p 8091:8091 \
   --ipc=host \
@@ -145,11 +145,13 @@ docker run --runtime nvidia --gpus 2 \
   vllm serve --omni --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8091
 ```
 
+By default, this mounts `$HOME/.cache/huggingface` as the model cache directory. To use a custom location, set the `HF_HOME` environment variable before running the command (e.g., `export HF_HOME=/data/models`).
+
 ##### Launch with interactive session for development
 
 ```bash
 docker run --runtime nvidia --gpus all -it --rm \
-  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface \
   --env "HF_TOKEN=$HF_TOKEN" \
   -p 8091:8091 \
   --ipc=host \
