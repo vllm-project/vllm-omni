@@ -46,10 +46,13 @@ For more details on parallelism acceleration, see the [Parallelism Acceleration 
 ## Offline CLI Generation
 
 For one-shot local inference without starting an HTTP server, use
-`vllm generate --omni` with the same model and generation controls:
+`vllm generate` with the same model and generation controls. The CLI supports
+text-to-image (`t2i`), image-to-image (`i2i`), text-to-video (`t2v`), and
+image-to-video (`i2v`) diffusion tasks.
 
 ```bash
-vllm generate --omni \
+vllm generate \
+  --task t2i \
   --model Qwen/Qwen-Image \
   --prompt "A beautiful landscape painting" \
   --output output.png \
@@ -61,18 +64,64 @@ vllm generate --omni \
   --seed 42
 ```
 
+Image-conditioned tasks take one or more `--input-image` arguments:
+
+```bash
+vllm generate \
+  --task i2i \
+  --model Qwen/Qwen-Image-Edit \
+  --prompt "Turn this into a watercolor painting" \
+  --input-image input.png \
+  --output edited.png \
+  --num-inference-steps 50 \
+  --cfg-scale 4.0 \
+  --guidance-scale 4.0 \
+  --seed 42
+```
+
+Video tasks save MP4 output and accept `--num-frames` and `--fps`:
+
+```bash
+vllm generate \
+  --task t2v \
+  --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --prompt "A cinematic shot of waves crashing at sunset" \
+  --output output.mp4 \
+  --height 480 \
+  --width 832 \
+  --num-frames 81 \
+  --fps 24 \
+  --num-inference-steps 40 \
+  --guidance-scale 4.0 \
+  --seed 42
+
+vllm generate \
+  --task i2v \
+  --model Wan-AI/Wan2.2-I2V-A14B-Diffusers \
+  --prompt "Animate this image with gentle camera motion" \
+  --input-image input.png \
+  --output output.mp4 \
+  --height 480 \
+  --width 832 \
+  --num-frames 81 \
+  --fps 24 \
+  --num-inference-steps 40 \
+  --guidance-scale 4.0 \
+  --seed 42
+```
+
 The offline CLI shares diffusion parallel and memory optimization flags with
 `vllm serve --omni` where they apply to local generation. For example:
 
 ```bash
 # Tensor parallelism
-vllm generate --omni --model Qwen/Qwen-Image \
+vllm generate --model Qwen/Qwen-Image \
   --prompt "A beautiful landscape painting" \
   --output output.png \
   --tensor-parallel-size 2
 
 # VAE memory optimization
-vllm generate --omni --model Qwen/Qwen-Image \
+vllm generate --model Qwen/Qwen-Image \
   --prompt "A beautiful landscape painting" \
   --output output.png \
   --vae-use-slicing --vae-use-tiling
@@ -91,6 +140,18 @@ with a consistent measurement scope:
 | Warm inference latency | HTTP/API overhead plus generation | Local command overhead plus generation |
 | VRAM | Server process remains resident | Process exits after generation |
 | Output | Should be reproducible with the same seed and sampling parameters, subject to backend determinism. |
+
+For a measured comparison, start the server first and record warm request
+latency from the client side. Track peak GPU memory in another terminal with
+`nvidia-smi` while running the same prompt and generation parameters through
+both entrypoints:
+
+```bash
+watch -n 0.5 nvidia-smi
+```
+
+Compare the saved images with the same seed and sampling parameters. Exact
+pixel equality can still depend on backend determinism and hardware kernels.
 
 ## API Calls
 

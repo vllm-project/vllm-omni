@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""E2E coverage for the `vllm generate --omni` CLI."""
+"""E2E coverage for the `vllm generate` CLI."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def test_vllm_generate_cli_writes_image(tmp_path):
     torch = pytest.importorskip("torch")
     if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
         pytest.skip("vllm generate CLI e2e requires at least one CUDA GPU.")
-    if importlib.util.find_spec("vllm.inputs.data") is None:
+    if importlib.util.find_spec("vllm.inputs") is None:
         pytest.skip("vllm generate CLI e2e requires a compatible vLLM installation.")
 
     output = tmp_path / "generated"
@@ -37,7 +37,6 @@ def test_vllm_generate_cli_writes_image(tmp_path):
             "-m",
             "vllm_omni.entrypoints.cli.main",
             "generate",
-            "--omni",
             "--model",
             MODEL,
             "--prompt",

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for the `vllm generate --omni` CLI subcommand.
+"""Tests for the `vllm generate` CLI subcommand.
 
 These tests load the production module directly from source while stubbing
 its heavy dependencies, so parser and command assertions exercise the real
@@ -23,6 +23,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _CLI_DIR = _REPO_ROOT / "vllm_omni" / "entrypoints" / "cli"
 _GENERATE_PATH = _CLI_DIR / "generate.py"
 _DIFFUSION_ARGS_PATH = _CLI_DIR / "diffusion_args.py"
+_MAIN_PATH = _CLI_DIR / "main.py"
 
 
 def _stub_package(monkeypatch: pytest.MonkeyPatch, name: str) -> types.ModuleType:
@@ -76,6 +77,18 @@ def _load_generate_module(monkeypatch: pytest.MonkeyPatch):
     spec = importlib.util.spec_from_file_location(
         "vllm_omni.entrypoints.cli.generate",
         _GENERATE_PATH,
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_main_module(monkeypatch: pytest.MonkeyPatch):
+    spec = importlib.util.spec_from_file_location(
+        "vllm_omni.entrypoints.cli.main",
+        _MAIN_PATH,
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -161,9 +174,12 @@ def _make_args(output: str, num_images: int = 1) -> argparse.Namespace:
         width=512,
         num_inference_steps=30,
         guidance_scale=4.0,
+        guidance_scale_2=None,
         cfg_scale=4.0,
         seed=123,
         num_images=num_images,
+        num_frames=81,
+        fps=24,
         tensor_parallel_size=2,
         ulysses_degree=None,
         ulysses_mode="strict",
@@ -177,6 +193,8 @@ def _make_args(output: str, num_images: int = 1) -> argparse.Namespace:
         enable_multithread_weight_load=True,
         num_weight_load_threads=4,
         enable_cpu_offload=False,
+        task="t2i",
+        input_image=[],
     )
 
 
@@ -210,6 +228,14 @@ def test_parser_registers_generate(generate_module):
     assert args.omni is True
 
 
+def test_generate_command_uses_omni_cli_without_omni_flag(monkeypatch):
+    main_module = _load_main_module(monkeypatch)
+
+    assert main_module._should_use_omni_cli(["vllm", "generate", "--model", "m"])
+    assert main_module._should_use_omni_cli(["vllm", "serve", "m", "--omni"])
+    assert not main_module._should_use_omni_cli(["vllm", "serve", "m"])
+
+
 def test_default_args(generate_module):
     parser = generate_module.FlexibleArgumentParser()
     subparsers = parser.add_subparsers(dest="subparser")
@@ -221,10 +247,15 @@ def test_default_args(generate_module):
     assert args.width == 1024
     assert args.num_inference_steps == 50
     assert args.guidance_scale == 4.0
+    assert args.guidance_scale_2 is None
     assert args.cfg_scale == 4.0
     assert args.seed == 42
     assert args.num_images == 1
-    assert args.output == "output.png"
+    assert args.num_frames == 81
+    assert args.fps == 24
+    assert args.task == "t2i"
+    assert args.input_image == []
+    assert args.output == "output"
     assert args.tensor_parallel_size == 1
     assert args.ulysses_degree is None
     assert args.ring_degree is None
@@ -344,6 +375,41 @@ def test_multi_image_output_without_suffix(generate_module, monkeypatch, tmp_pat
     assert (tmp_path / "result_0.png").exists()
     assert (tmp_path / "result_1.png").exists()
     assert (tmp_path / "result_2.png").exists()
+
+
+def test_image_to_video_passes_input_image_and_video_params(generate_module, monkeypatch, tmp_path):
+    input_image_path = tmp_path / "input.png"
+    PIL.Image.new("RGB", (32, 32), "white").save(input_image_path)
+    frames = [PIL.Image.new("RGB", (32, 32), color) for color in ["red", "green"]]
+    omni_cls = _install_cmd_stubs(
+        monkeypatch,
+        [SimpleNamespace(request_output=SimpleNamespace(images=[frames]))],
+    )
+    saved = {}
+    monkeypatch.setattr(
+        generate_module,
+        "_save_videos",
+        lambda videos, output, fps: saved.update(videos=videos, output=output, fps=fps),
+    )
+
+    args = _make_args(str(tmp_path / "result.mp4"))
+    args.task = "i2v"
+    args.input_image = [str(input_image_path)]
+    args.num_frames = 33
+    args.fps = 12
+    args.guidance_scale_2 = 3.0
+
+    generate_module.OmniGenerateCommand.cmd(args)
+
+    prompt = omni_cls.last_generate_args[0]
+    sampling_params = omni_cls.last_generate_args[1]
+    assert omni_cls.last_init_kwargs["mode"] == "image-to-video"
+    assert prompt["multi_modal_data"]["image"].size == (32, 32)
+    assert sampling_params.num_frames == 33
+    assert sampling_params.fps == 12
+    assert sampling_params.frame_rate == 12
+    assert sampling_params.guidance_scale_2 == 3.0
+    assert saved == {"videos": [frames], "output": str(tmp_path / "result.mp4"), "fps": 12}
 
 
 def test_no_output_raises(generate_module, monkeypatch, tmp_path):
