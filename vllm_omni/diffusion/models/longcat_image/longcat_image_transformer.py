@@ -384,9 +384,7 @@ class LongCatImageTransformerBlock(nn.Module):
         self.ff = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix=f"{prefix}.ff")
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff_context = FeedForward(
-            dim=dim, dim_out=dim, quant_config=quant_config, prefix=f"{prefix}.ff_context"
-        )
+        self.ff_context = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix=f"{prefix}.ff_context")
 
     def forward(
         self,
