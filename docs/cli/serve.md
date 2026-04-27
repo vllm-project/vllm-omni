@@ -12,9 +12,11 @@ The stage-based CLI is designed for deployments that require launching each pipe
   `vllm_omni/model_executor/stage_configs/`, the `--stage-configs-path` parameter remains mandatory.
 
 Example: Initializing Stage 0 (Orchestrator and API Server):
+The commands below show a common device mapping where Stage 0 uses GPU 0 and
+worker stages use GPU 1 via `CUDA_VISIBLE_DEVICES`.
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
     --port 8091 \
     --stage-id 0 \
     --omni-master-address 127.0.0.1 \
@@ -24,7 +26,7 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
 Example: Initializing a Headless Worker Stage (Stage 1):
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
     --stage-id 1 \
     --headless \
     --omni-master-address 127.0.0.1 \
@@ -46,7 +48,7 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
 the stage-based CLI permits the direct initialization of Stage 1 with explicit parameters:
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
     --stage-id 1 \
     --headless \
     --gpu-memory-utilization 0.5 \
