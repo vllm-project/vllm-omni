@@ -371,9 +371,15 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             bias=True,
         )
 
-        # Speaker encoder is only needed for Base voice cloning and may be missing in some checkpoints.
-        # Keep it optional to avoid strict weight-loading failures.
-        self.speaker_encoder: Qwen3TTSSpeakerEncoder | None = None
+        # Initialize speaker_encoder from config (random weights).
+        # For load_format: dummy this is the final state; for normal loading,
+        # load_weights() overwrites with real weights when the checkpoint
+        # provides speaker_encoder.* tensors. Constructing eagerly here
+        # (rather than lazily inside load_weights) ensures voice-cloning code
+        # paths work under load_format: dummy, which bypasses load_weights
+        # entirely (DummyModelLoader fills existing params in-place and never
+        # iterates a checkpoint).
+        self.speaker_encoder = Qwen3TTSSpeakerEncoder(self.config.speaker_encoder_config)
 
         # Code predictor uses an isolated vLLM config so its KV cache doesn't
         # pollute the main engine's static_forward_context (shallow-copy shares
@@ -1091,11 +1097,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         return wav_np, sr
 
     def _extract_speaker_embedding(self, wav: np.ndarray, sr: int) -> torch.Tensor:
-        if self.speaker_encoder is None:
-            raise ValueError(
-                "This checkpoint does not provide `speaker_encoder` weights; "
-                "cannot compute ref_spk_embedding from ref_audio."
-            )
         # vLLM workers do not automatically move arbitrary torch.nn.Modules to
         # CUDA. Ensure the speaker encoder is on the same device/dtype as the
         # main model before running it.
@@ -1637,9 +1638,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         loaded = loader.load_weights(_talker_and_collect_speaker(weights), mapper=self.hf_to_vllm_mapper)
 
         if speaker_weights:
-            if self.speaker_encoder is None:
-                self.speaker_encoder = Qwen3TTSSpeakerEncoder(self.config.speaker_encoder_config)
+            # speaker_encoder module is already constructed in __init__; here we
+            # only copy checkpoint tensors into its existing parameters.
             loaded |= loader.load_weights(speaker_weights, mapper=self.hf_to_vllm_mapper)
+        else:
+            # Some checkpoints do not include speaker_encoder weights; keep the
+            # eagerly initialized module and satisfy the strict loader check.
+            loaded |= {name for name, _ in self.named_parameters() if name.startswith("speaker_encoder.")}
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
         return loaded
 
