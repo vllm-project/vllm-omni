@@ -59,6 +59,7 @@ def mock_tokenizer(mocker):
     tokenizer.all_special_ids = []
     tokenizer.all_special_tokens = []
     tokenizer.vocab_size = 1
+    tokenizer.__len__.return_value = 1
     return tokenizer
 
 
