@@ -242,8 +242,7 @@ async def run_single_request(
                 if stage_0_first_output_ts is None:
                     stage_0_first_output_ts = time.perf_counter()
                 text_output = output.outputs[0].text
-                if output.finished:
-                    text_parts.append(text_output)
+                text_parts.append(text_output)
             elif omni_output.final_output_type == "audio":
                 mm_out = output.outputs[0].multimodal_output
                 if mm_out and "audio" in mm_out:
@@ -293,7 +292,7 @@ async def run_single_request(
     if text_parts:
         text_file = os.path.join(output_dir, f"{request_id}.txt")
         with open(text_file, "w", encoding="utf-8") as f:
-            f.write("\n".join(text_parts))
+            f.write("".join(text_parts))
         result["saved_files"].append(text_file)
         print(
             f"[Request {request_id}] Text saved to {text_file} "
@@ -393,6 +392,10 @@ async def run_all(args):
 
         # Use default sampling params from stage config (they are pre-configured
         # in the YAML for each stage).
+        #
+        # NOTE: Since we do not set the sampling params directly, .generate in
+        # will automatically set the output kind to delta, since this is what
+        # makes sense for most multimodal use-cases.
         sampling_params_list = None
 
         output_dir = args.output_dir

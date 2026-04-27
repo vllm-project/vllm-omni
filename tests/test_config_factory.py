@@ -701,7 +701,7 @@ stages:
 
 
 class TestPipelineDiscovery:
-    """Tests for the central pipeline registry (``pipeline_registry._VLLM_OMNI_PIPELINES``)."""
+    """Tests for the central pipeline registry (``pipeline_registry._OMNI_PIPELINES``)."""
 
     def test_registry_has_known_models(self):
         """Built-in pipelines are lazy-loaded from the central declaration

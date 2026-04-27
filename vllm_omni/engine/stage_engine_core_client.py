@@ -395,7 +395,7 @@ class StageEngineCoreClientBase:
 
         return [
             OmniTokensPrompt(
-                prompt_token_ids=so.outputs[0].token_ids,
+                prompt_token_ids=so.outputs[0].cumulative_token_ids,
                 multi_modal_data=(mm_data[so.request_id] if self.requires_multimodal_data else None),
             )
             for so in source_outputs

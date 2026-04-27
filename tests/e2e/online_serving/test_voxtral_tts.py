@@ -57,6 +57,24 @@ class TestVoxtralTTSFixedVoice:
             }
         )
 
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    def test_speech_english_streaming(self, omni_server, openai_client) -> None:
+        """Test basic streaming English TTS generation (PCM via streaming API)."""
+        openai_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": "Hello, how are you?",
+                "voice": "casual_female",
+                "language": "English",
+                "stream": True,
+                "response_format": "pcm",
+                "timeout": 120.0,
+                "min_audio_bytes": _MIN_AUDIO_BYTES_BASIC,
+            }
+        )
+
     @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100"}, num_cards=1)

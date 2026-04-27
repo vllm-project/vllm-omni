@@ -28,7 +28,6 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
 )
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.model_executor.stage_input_processors.glm_image import compute_max_tokens
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -216,7 +215,11 @@ def async_omni_test_client():
             ]
             default_sampling_params_list = [
                 SamplingParams(temperature=0.1),
-                OmniDiffusionSamplingParams(),
+                OmniDiffusionSamplingParams(
+                    num_inference_steps=4,
+                    guidance_scale=7.5,
+                    generator_device="cpu",
+                ),
             ]
             self.engine = SimpleNamespace(
                 stage_configs=stage_configs,
@@ -576,7 +579,11 @@ def test_multistage_images_async_omni_construction(async_omni_test_client):
 
 
 def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
-    """GLM-Image multistage requests must compute stage-0 max_tokens from size."""
+    """GLM-Image multistage: stage-0 gets target_h/w from requested size.
+
+    max_tokens comes from the deploy YAML default (upper-bound ceiling),
+    NOT computed dynamically from height/width.
+    """
 
     class FakeAsyncOmniClass(AsyncOmni):
         def __init__(self):
@@ -584,8 +591,9 @@ def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
                 SimpleNamespace(stage_type="llm", is_comprehension=True, model_arch="GlmImageForConditionalGeneration"),
                 SimpleNamespace(stage_type="diffusion", is_comprehension=False, model_arch="GlmImagePipeline"),
             ]
+            # YAML default max_tokens for GLM-Image AR stage (upper bound for 2048x2048 t2i)
             default_sampling_params_list = [
-                SamplingParams(temperature=0.1, seed=42),
+                SamplingParams(temperature=0.1, seed=42, max_tokens=4353),
                 OmniDiffusionSamplingParams(height=1024, width=1024),
             ]
             self.engine = SimpleNamespace(
@@ -646,7 +654,8 @@ def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
     captured = engine.captured_sampling_params_list
     assert captured is not None
     assert len(captured) == 2
-    assert captured[0].max_tokens == compute_max_tokens(1024, 1024, is_i2i=False)
+    # max_tokens comes from YAML default, not computed dynamically
+    assert captured[0].max_tokens == 4353
     assert captured[0].extra_args["target_h"] == 1024
     assert captured[0].extra_args["target_w"] == 1024
     assert captured[1].height == 1024
@@ -1161,9 +1170,10 @@ def test_image_edit_ignores_mock_like_multimodal_limit(async_omni_test_client):
     assert response.status_code == 200
     captured_prompt = engine.captured_prompt
     assert captured_prompt is not None
-    processed_images = captured_prompt["multi_modal_data"]["image"]
-    assert len(processed_images) == 1
-    assert processed_images[0].size == (16, 16)
+    # Multi-stage path uses "img2img" key for single reference image
+    processed_images = captured_prompt["multi_modal_data"]["img2img"]
+    assert isinstance(processed_images, Image.Image)
+    assert processed_images.size == (16, 16)
 
 
 def test_image_edit_parameter_pass(async_omni_test_client):
