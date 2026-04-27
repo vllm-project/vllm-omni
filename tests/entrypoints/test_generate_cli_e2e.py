@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""E2E coverage for the `vllm generate` CLI."""
+"""Subprocess coverage for the `vllm generate` CLI."""
 
 from __future__ import annotations
 
@@ -13,19 +13,22 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from vllm_omni.platforms import current_omni_platform
+
 MODEL = "riverclouds/qwen_image_random"
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.cuda
 def test_vllm_generate_cli_writes_image(tmp_path):
-    torch = pytest.importorskip("torch")
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
-        pytest.skip("vllm generate CLI e2e requires at least one CUDA GPU.")
+    if not current_omni_platform.is_cuda():
+        pytest.skip("vllm generate CLI subprocess test requires CUDA.")
+    if current_omni_platform.get_device_count() < 1:
+        pytest.skip("vllm generate CLI subprocess test requires at least one CUDA GPU.")
     if importlib.util.find_spec("vllm.inputs") is None:
-        pytest.skip("vllm generate CLI e2e requires a compatible vLLM installation.")
+        pytest.skip("vllm generate CLI subprocess test requires a compatible vLLM installation.")
 
     output = tmp_path / "generated"
     env = os.environ.copy()
