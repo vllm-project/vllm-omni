@@ -196,9 +196,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cfg-parallel-size", type=int, default=1, choices=[1, 2], help="CFG parallel size.")
     parser.add_argument("--tensor-parallel-size", type=int, default=1, help="Tensor parallelism size.")
 
-    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
-
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 
