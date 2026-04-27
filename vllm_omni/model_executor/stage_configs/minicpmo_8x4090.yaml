@@ -1,10 +1,10 @@
-# 3-stage config for MiniCPM-o-2.6 TTS: thinker → talker → code2wav
+# 3-stage config for MiniCPM-o-2.6 TTS: llm → tts → t2w
 # Adapted for 8x RTX 4090 (24GB each)
 #
 # GPU layout:
-#   Stage 0 (thinker): GPU 0,1,2,3 (4-way TP, ~35% mem each ≈ 8.5GB/card)
-#   Stage 1 (talker):  GPU 4 (80% mem ≈ 19GB)
-#   Stage 2 (code2wav): GPU 4 (20% mem ≈ 5GB, shared with talker)
+#   Stage 0 (llm): GPU 0,1,2,3 (4-way TP, ~35% mem each ≈ 8.5GB/card)
+#   Stage 1 (tts): GPU 4 (80% mem ≈ 19GB)
+#   Stage 2 (t2w): GPU 4 (20% mem ≈ 5GB, shared with tts)
 #
 stage_args:
   - stage_id: 0

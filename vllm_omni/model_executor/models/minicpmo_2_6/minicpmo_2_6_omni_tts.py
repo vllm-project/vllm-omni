@@ -208,9 +208,9 @@ class MiniCPMO26OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         return prompt_embeds[spk_start:spk_end]  # [num_spk_tokens, hidden_dim]
 
-    def _extract_tts_text(self, thinker_output_text: str) -> str:
-        """Extract TTS text content from thinker output (between <|tts_bos|> and <|tts_eos|>)."""
-        text = thinker_output_text
+    def _extract_tts_text(self, llm_output_text: str) -> str:
+        """Extract TTS text content from the LLM stage output (between <|tts_bos|> and <|tts_eos|>)."""
+        text = llm_output_text
         if self._tts_start_token in text:
             text = text.split(self._tts_start_token)[-1]
         if self._tts_end_token in text:
@@ -428,9 +428,9 @@ class MiniCPMO26OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         """Run full TTS pipeline.
 
         The additional_information (from stage_input_processor) carries:
-          - prompt_embeds: thinker hidden states for prompt portion
+          - prompt_embeds: LLM-stage hidden states for prompt portion
           - prompt_token_ids: list of prompt token IDs
-          - thinker_output_text: decoded text from thinker
+          - llm_output_text: decoded text from the LLM stage
         """
         self._lazy_init_assets()
 
@@ -439,8 +439,8 @@ class MiniCPMO26OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         prompt_embeds = additional_information.get("prompt_embeds")
         prompt_token_ids = additional_information.get("prompt_token_ids")
-        thinker_output_text_raw = additional_information.get("thinker_output_text", [""])
-        thinker_output_text = thinker_output_text_raw[0] if isinstance(thinker_output_text_raw, list) else thinker_output_text_raw
+        llm_output_text_raw = additional_information.get("llm_output_text", [""])
+        llm_output_text = llm_output_text_raw[0] if isinstance(llm_output_text_raw, list) else llm_output_text_raw
 
         # If data from thinker is available, extract spk_embeds and tts_text
         spk_embeds = None
@@ -449,8 +449,8 @@ class MiniCPMO26OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if prompt_embeds is not None and prompt_token_ids is not None:
             if isinstance(prompt_embeds, torch.Tensor):
                 spk_embeds = self._extract_spk_embeds(prompt_embeds, prompt_token_ids)
-        if thinker_output_text:
-            tts_text = self._extract_tts_text(thinker_output_text)
+        if llm_output_text:
+            tts_text = self._extract_tts_text(llm_output_text)
 
         if spk_embeds is None or not tts_text:
             logger.warning(

@@ -136,6 +136,13 @@ class OmniModelConfig(ModelConfig):
             video_pruning_rate=video_pruning_rate,
         )
 
+        # Align hf_config.architectures with model_arch so that downstream
+        # code (e.g. vllm's _get_model_architecture) which reads
+        # hf_config.architectures directly resolves the omni model class
+        # rather than the upstream HuggingFace architecture name.
+        if self.model_arch is not None and self.hf_config is not None:
+            self.hf_config.architectures = [self.model_arch]
+
         # Qwen3-TTS: infer codec frame rate from the model config for online serving.
         if self.codec_frame_rate_hz is None and self.model_arch == "Qwen3TTSTalkerForConditionalGenerationARVLLM":
             talker_cfg = getattr(self.hf_config, "talker_config", None)

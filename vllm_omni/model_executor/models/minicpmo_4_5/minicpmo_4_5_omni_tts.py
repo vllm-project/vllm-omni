@@ -10,6 +10,7 @@ Pipeline:
 """
 import io
 import logging
+import os
 import tempfile
 from typing import Iterable, Optional, Tuple
 
@@ -144,10 +145,25 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         inputs_embeds = torch.cat([spk_embeds, tts_embeds, text_eos, audio_bos], dim=0).unsqueeze(0)
         logger.info("generate_speech: inputs_embeds shape=%s", list(inputs_embeds.shape))
 
+        # Scale max_new_token with input text length to avoid mid-stream truncation on long
+        # responses (default 2048 can only cover ~300 text tokens at ~6x audio/text ratio).
+        # Empirically 511 text tokens → 1951 audio tokens (~3.8x) finishes cleanly, so use 10x
+        # as a safe upper bound with a floor of 2048 and a hard cap of 16384 to bound latency/mem.
+        num_text = int(tts_token_ids.shape[-1]) if tts_token_ids.ndim > 0 else 0
+        max_new_token = max(2048, min(16384, num_text * 10))
+
         eos_token = torch.tensor([tts.config.num_audio_tokens - 1], dtype=torch.long, device=device)
-        outputs = tts.generate(inputs_embeds=inputs_embeds, eos_token=eos_token, show_tqdm=False)
+        outputs = tts.generate(
+            inputs_embeds=inputs_embeds,
+            eos_token=eos_token,
+            max_new_token=max_new_token,
+            show_tqdm=False,
+        )
         generated_tokens = outputs.new_ids.squeeze(-1)
-        logger.info("generate_speech: generated %d audio tokens", generated_tokens.shape[-1])
+        logger.info(
+            "generate_speech: generated %d audio tokens (cap=%d, text_tokens=%d)",
+            generated_tokens.shape[-1], max_new_token, num_text,
+        )
 
         if self.audio_tokenizer is None:
             logger.warning("No audio_tokenizer")
@@ -171,14 +187,69 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         try:
             with torch.amp.autocast("cuda", enabled=False):
                 token_list = generated_tokens.squeeze(0).tolist()
-                wav_bytes = self.audio_tokenizer(token_list, prompt_wav_path)
+                num_tokens = len(token_list)
+
+                # For long outputs, the one-shot vocoder path
+                # (Token2wav.__call__ -> flow.inference) runs full O(N^2) self-
+                # attention over all audio tokens and OOMs on a 24GB card once
+                # N exceeds a few thousand (e.g. 4964 tokens needs ~3GiB for a
+                # single attention matmul). Switch to the chunked / streaming
+                # vocoder (set_stream_cache + stream) which truncates the flow
+                # attention caches to prompt_len + 100 steps on every chunk,
+                # keeping peak memory bounded regardless of total length.
+                STREAM_THRESHOLD = int(os.environ.get("MINICPMO45_TTS_STREAM_THRESHOLD", "2500"))  # ~100s @ 25Hz
+                CHUNK_SIZE = int(os.environ.get("MINICPMO45_TTS_STREAM_CHUNK", "50"))              # ~2s per chunk
+                MIN_TAIL = 6             # must exceed flow.pre_lookahead_len (typically 3)
+
+                if num_tokens <= STREAM_THRESHOLD:
+                    wav_bytes = self.audio_tokenizer(token_list, prompt_wav_path)
+                    waveform, sr = sf.read(io.BytesIO(wav_bytes))
+                    waveform = waveform.astype(np.float32)
+                else:
+                    # Build chunk boundaries, merging a too-small tail into the
+                    # previous chunk so every chunk satisfies MIN_TAIL.
+                    boundaries = []
+                    i = 0
+                    while i < num_tokens:
+                        end = min(i + CHUNK_SIZE, num_tokens)
+                        if 0 < num_tokens - end < MIN_TAIL:
+                            end = num_tokens
+                        boundaries.append((i, end))
+                        i = end
+
+                    logger.info(
+                        "generate_speech: streaming vocoder, %d tokens -> %d chunks (chunk=%d)",
+                        num_tokens, len(boundaries), CHUNK_SIZE,
+                    )
+
+                    stream_cache, hift_cache_dict = \
+                        self.audio_tokenizer.set_stream_cache(prompt_wav_path)
+                    self.audio_tokenizer.stream_cache = stream_cache
+                    self.audio_tokenizer.hift_cache_dict = hift_cache_dict
+
+                    try:
+                        pieces = []
+                        for idx, (s, e) in enumerate(boundaries):
+                            is_last = (idx == len(boundaries) - 1)
+                            wav_np = self.audio_tokenizer.stream(
+                                token_list[s:e],
+                                prompt_wav_path,
+                                last_chunk=is_last,
+                                return_waveform=True,
+                            )
+                            pieces.append(np.asarray(wav_np).reshape(-1))
+                        waveform = np.concatenate(pieces, axis=0).astype(np.float32)
+                        sr = 24000
+                    finally:
+                        # Free per-request streaming state so the next request starts clean
+                        self.audio_tokenizer.stream_cache = None
+                        self.audio_tokenizer.hift_cache_dict = {}
         finally:
             torch.set_default_dtype(prev_dtype)
             torchaudio.save = _orig_save
 
-        waveform, sr = sf.read(io.BytesIO(wav_bytes))
         logger.info("generate_speech: waveform %d samples, sr=%d", waveform.shape[0], sr)
-        return waveform.astype(np.float32)
+        return waveform
 
     def _generate_tokens(self, inputs_embeds: torch.Tensor, max_new_token: int = 2048) -> Optional[torch.Tensor]:
         """Autoregressive generation of audio tokens using the TTS LlamaModel."""
@@ -239,7 +310,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         tts_token_ids = additional_information.get("tts_token_ids")
         tts_hidden_states = additional_information.get("tts_hidden_states")
-        tts_text = additional_information.get("thinker_output_text", [""])
+        tts_text = additional_information.get("llm_output_text", [""])
         if isinstance(tts_text, list):
             tts_text = tts_text[0] if tts_text else ""
 

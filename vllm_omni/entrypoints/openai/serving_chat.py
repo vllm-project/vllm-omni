@@ -477,6 +477,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         tokenizer = renderer.get_tokenizer()
 
+        # For models that use mm_processor_kwargs.use_tts (e.g. MiniCPM-o 2.6),
+        # the TTS suffix tokens must be appended to the prompt. The renderer's
+        # multimodal processor handles this when multi_modal_data is present,
+        # but for text-only input the MM branch is skipped, so we inject here.
+        if mm_proc_kw.get("use_tts", False) and tokenizer is not None:
+            prompt_ids = engine_prompt.get("prompt_token_ids")
+            if prompt_ids is not None:
+                tts_tokens = ["<|spk_bos|>", "<|spk|>", "<|spk_eos|>", "<|tts_bos|>"]
+                tts_ids = tokenizer.convert_tokens_to_ids(tts_tokens)
+                unk = getattr(tokenizer, "unk_token_id", None)
+                if all(tid != unk for tid in tts_ids):
+                    ids_list = list(prompt_ids)
+                    if ids_list[-len(tts_ids):] != tts_ids:
+                        engine_prompt["prompt_token_ids"] = ids_list + tts_ids
+
         # tool parsing is done only if a tool_parser has been set and if
         # tool_choice is not "none" (if tool_choice is "none" but a tool_parser
         # is set, we want to prevent parsing a tool_call hallucinated by the LLM

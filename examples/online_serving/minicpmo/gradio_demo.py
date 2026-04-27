@@ -37,6 +37,31 @@ from PIL import Image
 MINICPMO45 = "MiniCPM-o-4.5"
 MINICPMO26 = "MiniCPM-o-2.6"
 
+# Default reference audio per model, relative to the model path. Used to build
+# the audio_assistant system prompt so that (a) the LLM adopts the "speak in
+# this voice" persona (matches the official MiniCPM-o demo) and (b) for 2.6
+# the speaker-embedding extraction has a real voice sample to condition on.
+_DEFAULT_REF_AUDIO = {
+    MINICPMO45: "assets/HT_ref_audio.wav",
+    MINICPMO26: "assets/demo.wav",
+}
+
+# audio_assistant prompt text, mirrors MiniCPMO.get_sys_prompt("audio_assistant")
+# in the MiniCPM-o-Demo reference implementation.
+_AUDIO_ASSISTANT_PROMPT = {
+    "zh": {
+        "prefix": "模仿音频样本的音色并生成新的内容。",
+        "suffix": (
+            "你的任务是用这种声音模式来当一个助手。请认真、高质量地回复用户的问题。"
+            "请用高自然度的方式和用户聊天。你是由面壁智能开发的人工智能助手：面壁小钢炮。"
+        ),
+    },
+    "en": {
+        "prefix": "Use the voice in the audio prompt to synthesize new content.",
+        "suffix": "You are a helpful assistant with the above voice style.",
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Media helpers
@@ -62,6 +87,33 @@ def audio_to_base64_data_url(audio_np: np.ndarray, sample_rate: int) -> str:
     sf.write(buf, audio_np, sample_rate, format="WAV")
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     return f"data:audio/wav;base64,{b64}"
+
+
+def ref_audio_to_data_url(path: str, target_sr: int = 16000, max_s: float | None = 8.0) -> str:
+    """Load a file, downmix to mono, resample to 16kHz, optionally truncate, and
+    return a data-URL usable as audio_url content in the chat API.
+
+    MiniCPM-o expects 16kHz mono audio input; long reference audios can waste
+    tokens so we cap at max_s seconds by default (3-10s is the recommended range).
+    """
+    data, sr = sf.read(path)
+    if data.ndim > 1:
+        data = data[:, 0]
+    data = data.astype(np.float32)
+    if sr != target_sr:
+        try:
+            import librosa
+            data = librosa.resample(data, orig_sr=sr, target_sr=target_sr)
+        except ImportError:
+            from math import gcd
+            g = gcd(sr, target_sr)
+            up, down = target_sr // g, sr // g
+            idx = (np.arange(len(data) * up) / up).astype(np.int64)
+            data = data[idx][::down]
+        sr = target_sr
+    if max_s is not None and len(data) > int(max_s * sr):
+        data = data[: int(max_s * sr)]
+    return audio_to_base64_data_url(data, sr)
 
 
 def video_to_base64_data_url(path: str) -> str:
@@ -136,6 +188,32 @@ class ModelEndpoint:
         self.api_base = api_base
         self.model_path = model_path
         self.client = OpenAI(api_key="EMPTY", base_url=api_base)
+        self._ref_audio_data_url: str | None = None
+
+    @property
+    def ref_audio_path(self) -> str | None:
+        rel = _DEFAULT_REF_AUDIO.get(self.name)
+        if not rel:
+            return None
+        full = os.path.join(self.model_path, rel)
+        return full if os.path.exists(full) else None
+
+    def get_ref_audio_data_url(self) -> str | None:
+        """Lazily load and cache the default reference audio as a 16kHz mono
+        data URL. Returns None if the reference audio file is missing."""
+        if self._ref_audio_data_url is not None:
+            return self._ref_audio_data_url
+        p = self.ref_audio_path
+        if not p:
+            print(f"[{self.name}] no default reference audio found; falling back to text-only system prompt")
+            return None
+        try:
+            self._ref_audio_data_url = ref_audio_to_data_url(p)
+            print(f"[{self.name}] loaded reference audio: {p}")
+        except Exception as e:
+            print(f"[{self.name}] failed to load reference audio {p}: {e}")
+            return None
+        return self._ref_audio_data_url
 
     def build_extras(self) -> dict[str, Any]:
         """Extra kwargs passed to chat.completions.create for this model.
@@ -159,6 +237,36 @@ class ModelEndpoint:
                 },
             }
         return {}
+
+
+# ---------------------------------------------------------------------------
+# System prompt (matches MiniCPMO.get_sys_prompt("audio_assistant") in the
+# official MiniCPM-o-Demo). When TTS is disabled we fall back to a plain
+# text-only system prompt.
+# ---------------------------------------------------------------------------
+
+def build_audio_assistant_system(
+    ref_audio_data_url: str | None,
+    language: str = "zh",
+) -> dict[str, Any]:
+    """Return an OpenAI-style system message carrying the reference audio."""
+    txt = _AUDIO_ASSISTANT_PROMPT.get(language, _AUDIO_ASSISTANT_PROMPT["zh"])
+    if ref_audio_data_url is None:
+        return {
+            "role": "system",
+            "content": (
+                "You are MiniCPM-o, a helpful multimodal assistant that can "
+                "understand images, audio and video, and respond in text and speech."
+            ),
+        }
+    return {
+        "role": "system",
+        "content": [
+            {"type": "text", "text": txt["prefix"]},
+            {"type": "audio_url", "audio_url": {"url": ref_audio_data_url}},
+            {"type": "text", "text": txt["suffix"]},
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -203,14 +311,20 @@ def run_inference(
         if user_prompt.strip():
             content.append({"type": "text", "text": user_prompt})
 
-        messages = [
-            {
+        if enable_tts:
+            ref_url = endpoint.get_ref_audio_data_url()
+            system_msg = build_audio_assistant_system(ref_url, language="zh")
+        else:
+            system_msg = {
                 "role": "system",
                 "content": (
                     "You are MiniCPM-o, a helpful multimodal assistant that can "
                     "understand images, audio and video, and respond in text and speech."
                 ),
-            },
+            }
+
+        messages = [
+            system_msg,
             {"role": "user", "content": content},
         ]
 
@@ -304,10 +418,10 @@ def build_interface(endpoints: dict[str, ModelEndpoint], default_model: str) -> 
             with gr.Column(scale=1):
                 tts_checkbox = gr.Checkbox(label="Generate speech output (TTS)", value=True)
                 max_tokens_slider = gr.Slider(
-                    label="Max tokens", minimum=32, maximum=2048, value=512, step=32
+                    label="Max tokens", minimum=32, maximum=4096, value=1024, step=32
                 )
                 temperature_slider = gr.Slider(
-                    label="Temperature", minimum=0.0, maximum=1.5, value=0.0, step=0.05
+                    label="Temperature", minimum=0.0, maximum=1.5, value=0.7, step=0.05
                 )
 
         with gr.Row(elem_classes="media-row"):

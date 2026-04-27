@@ -1,13 +1,13 @@
-# 3-stage config for MiniCPM-o-2.6 TTS: thinker → talker → code2wav
+# 3-stage config for MiniCPM-o-2.6 TTS: llm → tts → t2w
 #
-# Stage 0 (thinker): multimodal comprehension → text + hidden states
-# Stage 1 (talker):  ConditionalChatTTS + DVAE → mel spectrogram
-# Stage 2 (code2wav): Vocos vocoder → 24kHz audio waveform
+# Stage 0 (llm): multimodal comprehension → text + hidden states
+# Stage 1 (tts): ConditionalChatTTS + DVAE → mel spectrogram
+# Stage 2 (t2w): Vocos vocoder → 24kHz audio waveform
 #
 # Pipeline data flow:
-#   thinker → (prompt_embeds, prompt_token_ids, thinker_output_text) → talker
-#   talker  → (mel_spec) → code2wav
-#   code2wav → (waveform)
+#   llm → (prompt_embeds, prompt_token_ids, llm_output_text) → tts
+#   tts → (mel_spec) → t2w
+#   t2w → (waveform)
 #
 # Requires: 3 GPUs (or adjust devices to share)
 stage_args:

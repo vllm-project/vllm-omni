@@ -2823,9 +2823,7 @@ class MiniCPMO26OmniLLMProcessingInfo(BaseProcessingInfo):
     image_pattern = "(<image>./</image>)"
     video_pattern = "(<video>./</video>)"
 
-    def build_data_parser(self) -> "MultiModalDataParser":
-        # Moved from MiniCPMO26OmniLLMMultiModalProcessor._get_data_parser
-        # in vllm v0.16+ (see vllm/multimodal/processing/processor.py).
+    def get_data_parser(self) -> "MultiModalDataParser":
         return MiniCPMOMultiModalDataParser(
             target_sr=self.get_default_audio_sampling_rate()
         )

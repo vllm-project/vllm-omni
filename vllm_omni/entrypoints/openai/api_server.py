@@ -406,10 +406,24 @@ async def build_async_omni_from_stage_config(
 
     async_omni: EngineClient | None = None
 
-    if getattr(args, "trust_remote_code", False) and hasattr(args, "model"):
+    # Pre-load the model config so that HuggingFace registers
+    # `transformers_modules` in this process. Stage workers use
+    # trust_remote_code via their YAML engine_args, but the API server
+    # process also needs the dynamic modules for ZMQ pickle deserialization.
+    # Hide GPUs to prevent the custom config code from allocating CUDA memory.
+    if hasattr(args, "model") and args.model:
         try:
+            import os
             from transformers import AutoConfig
-            AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+            saved = os.environ.get("CUDA_VISIBLE_DEVICES")
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
+            try:
+                AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+            finally:
+                if saved is not None:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = saved
+                else:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         except Exception:
             pass
 

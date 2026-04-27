@@ -1,10 +1,10 @@
-# 3-stage config for MiniCPM-o-4.5 TTS: thinker → talker → token2wav
+# 3-stage config for MiniCPM-o-4.5 TTS: llm → tts → t2w
 # Adapted for 3 free RTX 4090 cards (physical GPUs 5, 6, 7 via CUDA_VISIBLE_DEVICES=5,6,7)
 #
 # Logical GPU layout (after CUDA_VISIBLE_DEVICES=5,6,7):
-#   Stage 0 (thinker): logical GPU 0,1 (2-way TP, ~55% mem each ≈ 13GB/card)
-#   Stage 1 (talker):  logical GPU 2 (60% mem)
-#   Stage 2 (token2wav): logical GPU 2 (20% mem, shared with talker)
+#   Stage 0 (llm): logical GPU 0,1 (2-way TP, ~55% mem each ≈ 13GB/card)
+#   Stage 1 (tts): logical GPU 2 (60% mem)
+#   Stage 2 (t2w): logical GPU 2 (20% mem, shared with tts)
 #
 stage_args:
   - stage_id: 0

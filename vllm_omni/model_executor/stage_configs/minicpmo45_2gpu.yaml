@@ -1,10 +1,10 @@
-# 2-GPU config for MiniCPM-o-4.5 TTS: thinker(TP=1) | talker + token2wav on GPU 1
-# Intended to run with CUDA_VISIBLE_DEVICES=<thinker_gpu>,<tts_gpu>
+# 2-GPU config for MiniCPM-o-4.5 TTS: llm(TP=1) | tts + t2w on GPU 1
+# Intended to run with CUDA_VISIBLE_DEVICES=<llm_gpu>,<tts_gpu>
 #
 # Logical GPU layout:
-#   Stage 0 (thinker): logical GPU 0 (~70% mem)
-#   Stage 1 (talker):  logical GPU 1 (~55% mem)
-#   Stage 2 (token2wav): logical GPU 1 (~20% mem, shared with talker)
+#   Stage 0 (llm): logical GPU 0 (~70% mem)
+#   Stage 1 (tts): logical GPU 1 (~55% mem)
+#   Stage 2 (t2w): logical GPU 1 (~20% mem, shared with tts)
 #
 stage_args:
   - stage_id: 0
