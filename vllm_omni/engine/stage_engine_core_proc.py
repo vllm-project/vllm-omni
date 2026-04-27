@@ -23,10 +23,12 @@ from vllm.utils.system_utils import (
     get_mp_context,
     set_process_title,
 )
-from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.engine.core import EngineCoreProc, EngineShutdownState
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
     EngineZmqAddresses,
+    SignalCallback,
     get_engine_zmq_addresses,
 )
 from vllm.v1.utils import shutdown
@@ -54,17 +56,8 @@ class StageEngineCoreProc(EngineCoreProc):
         **kwargs: Any,
     ) -> None:
         """Launch StageEngineCoreProc busy loop in background process."""
-        shutdown_requested = False
+        signal_callback: SignalCallback | None = None
         maybe_register_config_serialize_by_value()
-
-        def signal_handler(signum: int, frame: Any) -> None:
-            nonlocal shutdown_requested
-            if not shutdown_requested:
-                shutdown_requested = True
-                raise SystemExit()
-
-        signal.signal(signal.SIGTERM, signal_handler)
-        signal.signal(signal.SIGINT, signal_handler)
 
         engine_core: StageEngineCoreProc | None = None
         try:
@@ -88,6 +81,19 @@ class StageEngineCoreProc(EngineCoreProc):
                 engine_index=dp_rank,
                 **kwargs,
             )
+
+            def wakeup_engine() -> None:
+                engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+
+            signal_callback = SignalCallback(wakeup_engine)
+
+            def signal_handler(signum: int, frame: Any) -> None:
+                engine_core.shutdown_state = EngineShutdownState.REQUESTED
+                signal_callback.trigger()
+
+            signal.signal(signal.SIGTERM, signal_handler)
+            signal.signal(signal.SIGINT, signal_handler)
+
             engine_core.run_busy_loop()
 
         except SystemExit:
@@ -101,6 +107,10 @@ class StageEngineCoreProc(EngineCoreProc):
                 engine_core._send_engine_dead()
             raise
         finally:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            if signal_callback is not None:
+                signal_callback.stop()
             if engine_core is not None:
                 engine_core.shutdown()
 

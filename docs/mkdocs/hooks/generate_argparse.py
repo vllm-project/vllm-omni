@@ -121,6 +121,7 @@ def extract_omni_serve_subparser_init():
                         "FlexibleArgumentParser": _FlexibleArgumentParser,
                         "make_arg_parser": lambda parser: parser,  # no-op for doc
                         "_ensure_vllm_platform": lambda: None,  # no-op for doc
+                        "nullify_stage_engine_defaults": lambda parser: None,  # no-op for doc
                         "VLLM_SUBCMD_PARSER_EPILOG": "",
                         "logger": logger,
                         "DummySubparsers": DummySubparsers,

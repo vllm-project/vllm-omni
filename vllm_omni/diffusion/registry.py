@@ -5,6 +5,7 @@ import importlib
 
 import torch.nn as nn
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -13,6 +14,7 @@ from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 from vllm_omni.diffusion.utils.tf_utils import find_module_with_attr
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -242,6 +244,22 @@ _NO_CACHE_ACCELERATION = {
 }
 
 
+def _prepare_diffusion_quant_config(
+    od_config: OmniDiffusionConfig,
+    model_class: type[nn.Module],
+) -> None:
+    """Prepare diffusion quant config using vLLM-style model bindings."""
+    quant_config = od_config.quantization_config
+    if quant_config is None:
+        return
+    if hasattr(quant_config, "maybe_update_config"):
+        quant_config.maybe_update_config(od_config.model)
+    diffusion_packed_modules_mapping = current_omni_platform.get_diffusion_packed_modules_mapping(model_class)
+    if diffusion_packed_modules_mapping is not None:
+        model_class.packed_modules_mapping = diffusion_packed_modules_mapping
+    configure_quant_config(quant_config, model_class)
+
+
 def initialize_model(
     od_config: OmniDiffusionConfig,
 ) -> nn.Module:
@@ -264,6 +282,7 @@ def initialize_model(
     """
     model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
     if model_class is not None:
+        _prepare_diffusion_quant_config(od_config, model_class)
         model = model_class(od_config=od_config)
 
         vae_pp_size = od_config.parallel_config.vae_patch_parallel_size

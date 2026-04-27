@@ -14,7 +14,7 @@ from transformers.generation.utils import ALL_CACHE_NAMES, GenerationMixin
 from transformers.models.siglip2 import Siglip2VisionConfig, Siglip2VisionModel
 from transformers.utils.generic import ModelOutput
 from vllm.config.vllm import get_current_vllm_config
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.transformers_utils.config import get_config
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -64,6 +64,15 @@ def to_device(data, device):
 
 
 class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, DiffusionPipelineProfilerMixin):
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.": "",
+        },
+        orig_to_new_substr={
+            "mlp.gate.wg.": "mlp.gate.",
+            "gate_and_up_proj.": "gate_up_proj.",
+        },
+    )
     _PROFILER_TARGETS = [
         "model.forward",
         "model.layers[0].forward",

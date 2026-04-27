@@ -333,7 +333,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         raise ValueError("The number of prompts does not match the QPS or max_concurrency")
 
     args = ["--host", host, "--port", str(port)]
-    exclude_keys = {"request_rate", "baseline", "num_prompts", "max_concurrency"}
+    exclude_keys = {"request_rate", "baseline", "num_prompts", "max_concurrency", "task", "enabled", "eval_phase"}
 
     for key, value in params.items():
         if key in exclude_keys or value is None:
