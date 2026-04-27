@@ -1,0 +1,31 @@
+name: "codec_decoder"
+platform: "tensorrt_plan"
+max_batch_size: 32
+
+input [
+  {
+    name: "audio_codes"
+    data_type: TYPE_INT64
+    dims: [ -1, 16 ]
+  }
+]
+
+output [
+  {
+    name: "audio_values"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  }
+]
+
+dynamic_batching {
+  max_queue_delay_microseconds: 100
+  preferred_batch_size: [ 32 ]
+}
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+  }
+]
