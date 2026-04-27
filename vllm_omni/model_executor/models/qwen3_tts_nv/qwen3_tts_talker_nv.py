@@ -905,10 +905,9 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
         # ``text_embed + codec_embed``) would have a new address each call,
         # causing the replayed graph to read stale memory.
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
-        codes_num = self.code_predictor.num_code_groups - 1  # groups 1..N-1
         dtype = vllm_config.model_config.dtype
         self._out_codes = torch.zeros(
-            max_num_tokens, codes_num, dtype=torch.long
+            max_num_tokens, self.code_predictor.num_code_groups, dtype=torch.long
         )
         self._combined_embeddings = torch.zeros(
             max_num_tokens, config.hidden_size, dtype=dtype
@@ -1030,7 +1029,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
                 prev_hidden=self._prev_hidden_buffer[:num_tokens],
                 group0_tokens=input_ids,
             )
-            self._out_codes[:codes_1_15.shape[0]] = codes_1_15
+            self._out_codes[:codes_1_15.shape[0], 1:] = codes_1_15
             # Assemble decode embedding in-place on top of the (zero)
             # ``inputs_embeds`` produced by ``preprocess``: group-0 codec
             # embedding + tts_pad text embedding + sum of groups 1..N-1.
@@ -1057,7 +1056,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
             # restore original batch descriptor
             ctx.batch_descriptor = orig_batch_descriptor
             valid_dec_idx = decode_idx[:num_req]
-            self._out_codes[valid_dec_idx] = codes_1_15[:num_req]
+            self._out_codes[valid_dec_idx, 1:] = codes_1_15[:num_req]
             # Assemble decode embedding only at decode positions; prefill
             # positions keep the full prefill embedding produced by
             # ``preprocess``.
@@ -1082,6 +1081,9 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
             intermediate_tensors,
             combined_embeddings,
         )
+
+        # save input ids to the output codes
+        self._out_codes[:input_ids.shape[0], 0] = input_ids
 
         return hidden_states
 
