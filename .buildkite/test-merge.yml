@@ -55,6 +55,9 @@ steps:
               volumes:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
+  - group: ":card_index_dividers: Diffusion Test"
+    depends_on: upload-merge-pipeline
+    steps:
       - label: "Diffusion · LoRA Test"
         timeout_in_minutes: 30
         commands:
@@ -74,7 +77,7 @@ steps:
 
       - label: "Diffusion · Quantization Test"
         commands:
-          - timeout 30m pytest -sv tests/diffusion/quantization -m 'advanced_model and cuda' --run-level "advanced_model"
+          - timeout 30m pytest -sv tests/diffusion/quantization -m 'advanced_model and cuda and L4' --run-level "advanced_model"
         agents:
           queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
         plugins:
@@ -132,44 +135,63 @@ steps:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
 
-  - label: "Entrypoints Test"
-    timeout_in_minutes: 30
+  - group: ":card_index_dividers: Entrypoints Test"
     depends_on: upload-merge-pipeline
-    commands:
-      - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda" --run-level "advanced_model"
-    agents:
-      queue: "mithril-h100-pool"
-    plugins:
-      - kubernetes:
-          podSpec:
-            containers:
-              - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-                resources:
-                  limits:
-                    nvidia.com/gpu: 2
-                volumeMounts:
+    steps:
+      - label: "Entrypoint Test with H100"
+        timeout_in_minutes: 30
+        commands:
+          - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda and H100" --run-level "advanced_model"
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 2
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
                   - name: devshm
-                    mountPath: /dev/shm
+                    emptyDir:
+                      medium: Memory
                   - name: hf-cache
-                    mountPath: /root/.cache/huggingface
-                env:
-                  - name: HF_HOME
-                    value: /root/.cache/huggingface
-                  - name: HF_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: hf-token-secret
-                        key: token
-            nodeSelector:
-              node.kubernetes.io/instance-type: gpu-h100-sxm
-            volumes:
-              - name: devshm
-                emptyDir:
-                  medium: Memory
-              - name: hf-cache
-                hostPath:
-                  path: /mnt/hf-cache
-                  type: DirectoryOrCreate
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
+
+      - label: "Entrypoint Test with L4"
+        timeout_in_minutes: 30
+        commands:
+          - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda and L4" --run-level "advanced_model"
+        agents:
+          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
 
   - group: ":card_index_dividers: E2E Test"
     depends_on: upload-merge-pipeline

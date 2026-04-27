@@ -55,6 +55,12 @@ class QualityTestConfig:
     num_frames: int = 5  # only for t2v
     seed: int = 42
     gpu: str = "H100"  # minimum GPU requirement
+    tensor_parallel_size: int = 1
+    """Diffusion tensor parallel size (``Omni(..., tensor_parallel_size=...)``). >1 requires matching GPU count."""
+    enable_multithread_weight_load: bool = True
+    """If False, safetensor shards load sequentially (lower peak VRAM during load; slower)."""
+    num_weight_load_threads: int = 4
+    """Only used when ``enable_multithread_weight_load`` is True."""
 
 
 # Add new quantization methods / models here.
@@ -80,13 +86,18 @@ QUALITY_CONFIGS = [
     ),
     QualityTestConfig(
         id="fp8_qwen_image",
+        # Full ``Qwen/Qwen-Image`` needs multi-GPU tensor parallel (single 80GB often OOMs during load).
+        # 2× H100: disable multi-thread safetensor loading — parallel shard decode + FP8
+        # ``process_weights_after_loading`` can otherwise spike past 80GB per device.
         model="Qwen/Qwen-Image",
         quantization="fp8",
         task="t2i",
         prompt="a cup of coffee on a wooden table, morning light",
-        max_lpips=0.35,
-        seed=142,
+        max_lpips=0.20,
         num_inference_steps=20,
+        tensor_parallel_size=2,
+        enable_multithread_weight_load=False,
+        num_weight_load_threads=1,
     ),
 ]
 
@@ -194,32 +205,48 @@ def _unload(omni):
         torch.cuda.synchronize()
 
 
+def _omni_kwargs(config: QualityTestConfig) -> dict:
+    """Extra ``Omni`` kwargs (e.g. multi-GPU tensor parallel for large diffusion checkpoints)."""
+    d: dict = {}
+    if config.tensor_parallel_size > 1:
+        d["tensor_parallel_size"] = config.tensor_parallel_size
+    if not config.enable_multithread_weight_load:
+        d["enable_multithread_weight_load"] = False
+        d["num_weight_load_threads"] = max(1, config.num_weight_load_threads)
+    elif config.num_weight_load_threads != 4:
+        d["num_weight_load_threads"] = config.num_weight_load_threads
+    return d
+
+
+def _quality_case_marks(config: QualityTestConfig):
+    return hardware_marks(res={"cuda": "H100"}, num_cards=config.tensor_parallel_size)
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
-_marks = hardware_marks(res={"cuda": "H100"})
 
-
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
     "config",
-    [pytest.param(c, id=c.id, marks=_marks) for c in QUALITY_CONFIGS],
+    [pytest.param(c, id=c.id, marks=_quality_case_marks(c)) for c in QUALITY_CONFIGS],
 )
 def test_quantization_quality(config: QualityTestConfig):
     """Validate that quantized output stays within LPIPS threshold of BF16."""
     from vllm_omni.entrypoints.omni import Omni
 
     generate_fn = _generate_video if config.task == "t2v" else _generate_image
+    extra = _omni_kwargs(config)
 
     # --- BF16 baseline ---
-    omni_bl = Omni(model=config.model)
+    omni_bl = Omni(model=config.model, **extra)
     baseline_out, bl_mem = generate_fn(omni_bl, config)
     _unload(omni_bl)
 
     # --- Quantized ---
-    omni_qt = Omni(model=config.model, quantization_config=config.quantization)
+    omni_qt = Omni(model=config.model, quantization_config=config.quantization, **extra)
     quant_out, qt_mem = generate_fn(omni_qt, config)
     _unload(omni_qt)
 
@@ -232,6 +259,7 @@ def test_quantization_quality(config: QualityTestConfig):
     print(f"Quantization Quality: {config.id}")
     print(f"{'=' * 60}")
     print(f"  Model:         {config.model}")
+    print(f"  TP size:       {config.tensor_parallel_size}")
     print(f"  Method:        {config.quantization}")
     print(f"  LPIPS:         {lpips_score:.4f}  (threshold: {config.max_lpips})")
     print(f"  BF16 memory:   {bl_mem:.2f} GiB")
