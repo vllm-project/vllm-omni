@@ -1397,13 +1397,30 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
         self,
         input_ids: torch.Tensor,
         input_embeds: Optional[torch.Tensor],
+        *,
+        start: int = 0,
+        end: int = 0,
         **info_dict: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Build per-request ``(input_ids, inputs_embeds)`` for this step.
 
-        CustomVoice + non-streaming only. ``info_dict`` is the request's
-        ``additional_information`` plus runner keys (``start``, ``end``,
-        ``request_id``, and any previously stashed state).
+        CustomVoice + non-streaming only.
+
+        Args:
+            input_ids: This request's slice of the flat batch's token ids.
+            input_embeds: Corresponding slice of the flat-batch
+                ``inputs_embeds`` if the runner already populated one.
+            start: This request's start position in the flat batch
+                (``query_start_loc[req_index]``). Provided by the runner;
+                used to index :attr:`_prev_hidden_buffer` at decode.
+            end: This request's end position in the flat batch
+                (``start + sched_tokens``). Provided by the runner; not
+                used here directly (``input_ids.shape[0] == end - start``)
+                but accepted for runner-contract symmetry.
+            **info_dict: The request's ``additional_information`` plus
+                runner-provided ``request_id`` and any state previously
+                stashed by this method (e.g. ``talker_prompt_embeds``,
+                ``talker_prefill_offset``, ``last_talker_hidden``).
 
         Prefill (``span_len > 1``):
             On the first prefill call, builds the full prompt embedding once
@@ -1421,8 +1438,8 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
             group-0 token sampled by vLLM) is passed through unchanged.
             The previous-step backbone hidden (``last_talker_hidden``,
             produced by :meth:`postprocess`) is written into
-            :attr:`_prev_hidden_buffer` at this request's token offset for
-            the code predictor to read.
+            :attr:`_prev_hidden_buffer` at ``start`` for the code predictor
+            to read.
         """
         # Normalize: some runner paths still pass per-request state nested
         # under ``additional_information`` instead of flattened.
@@ -1446,7 +1463,6 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
 
         tc = self.config
         device = input_ids.device
-        start = int(info_dict.get("start", 0) or 0)
 
         # ----- Prefill -------------------------------------------------
         if span_len > 1:
