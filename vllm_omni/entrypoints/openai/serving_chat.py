@@ -296,7 +296,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
-        output_modalities = getattr(request, "modalities", self.engine_client.output_modalities)
+        # NOTE:
+        # - OpenAI python client flattens extra_body fields into model_extra.
+        # - Raw HTTP requests may keep them under request.extra_body.
+        # Keep modalities resolution tolerant so `--extra_body '{"modalities":["text"]}'`
+        # can reliably drive multi-stage routing.
+        request_extra_body = getattr(request, "extra_body", None) or request.model_extra or {}
+        output_modalities = getattr(request, "modalities", None)
+        if output_modalities is None:
+            output_modalities = request_extra_body.get("modalities")
+        if isinstance(output_modalities, str):
+            output_modalities = [output_modalities]
+        if output_modalities is not None:
+            output_modalities = [str(m).lower() for m in output_modalities]
         request.modalities = (
             output_modalities if output_modalities is not None else self.engine_client.output_modalities
         )
