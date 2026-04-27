@@ -20,9 +20,13 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationRequest,
     VideoGenerationResponse,
 )
+from vllm_omni.entrypoints.openai.stage_params import (
+    build_stage_sampling_params_list,
+    get_default_sampling_params_list,
+)
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import _encode_video_bytes, encode_video_base64
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 logger = init_logger(__name__)
 
@@ -322,7 +326,12 @@ class OmniOpenAIServingVideo:
 
         # Common generation logic for both paths
         engine_client = cast(AsyncOmni, self._engine_client)
-        sampling_params_list: list[OmniSamplingParams] = [gen_params for _ in stage_configs]
+        sampling_params_list = build_stage_sampling_params_list(
+            list(stage_configs),
+            get_default_sampling_params_list(engine_client),
+            diffusion_params=gen_params,
+            replace_diffusion_params=True,
+        )
 
         result = None
         async for output in engine_client.generate(

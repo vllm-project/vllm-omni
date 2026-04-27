@@ -17,6 +17,7 @@ from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.data_entry_keys import unflatten_payload
+from vllm_omni.engine.output_modality import DRAINABLE_MODALITIES
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -37,25 +38,29 @@ class OmniRequestState(RequestState):
     ):
         super().__init__(*args, **kwargs)
         # Omni-specific: multimodal output accumulation
-        self.mm_type: str | None = None
-        self.mm_accumulated: dict[str, Any] | None = None
+        # NOTE: Keys in mm_accumulated matter, because they dictate which
+        # outputs are drained (i.e., only drain modality keys, don't drain
+        # hidden states).
+        self.mm_accumulated: dict[str, Any] = {}
+
+    @staticmethod
+    def _to_cpu(x):
+        """Try to convert to CPU tensor if needed."""
+        # TODO: Make this more robust and unify with other payload
+        # building utils, we do this in multiple places.
+        if isinstance(x, torch.Tensor):
+            try:
+                return x.detach().to("cpu", non_blocking=True).contiguous()
+            except Exception:
+                return x
+        return x
 
     def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         if payload is None:
             return
+
+        mm_type = (mm_type or "").lower()
         try:
-            if mm_type:
-                self.mm_type = (mm_type or "").lower()
-
-            # Normalize incoming payload to dict on CPU
-            def _to_cpu(x):
-                if isinstance(x, torch.Tensor):
-                    try:
-                        return x.detach().to("cpu", non_blocking=True).contiguous()
-                    except Exception:
-                        return x
-                return x
-
             if isinstance(payload, dict):
                 # Keep payload flat (dotted keys like "hidden_states.layer_0")
                 # during accumulation so that all values are tensors/scalars and
@@ -63,7 +68,8 @@ class OmniRequestState(RequestState):
                 # later in _consolidate_multimodal_tensors after concatenation.
 
                 incoming: dict[str, Any] = {}
-                target_key = self.mm_type or "hidden"
+                # TODO (Alex): Clean up and simplify key management
+                target_key = mm_type or "hidden"
 
                 for k, v in payload.items():
                     if k == "model_outputs":
@@ -71,12 +77,12 @@ class OmniRequestState(RequestState):
                     elif k == "hidden" and target_key != "hidden":
                         k = target_key
 
-                    incoming[k] = _to_cpu(v)
+                    incoming[k] = self._to_cpu(v)
             else:
-                key = self.mm_type or "hidden"
-                incoming = {key: _to_cpu(payload)}
+                key = mm_type or "hidden"
+                incoming = {key: self._to_cpu(payload)}
 
-            if self.mm_accumulated is None:
+            if not self.mm_accumulated:
                 self.mm_accumulated = incoming
             else:
                 for k, v in incoming.items():
@@ -105,17 +111,26 @@ class OmniRequestState(RequestState):
             logger.exception("Error accumulating multimodal tensor")
 
     def _consolidate_multimodal_tensors(self) -> None:
-        """Consolidate accumulated tensor lists into single tensors via concatenation."""
-        if self.mm_accumulated is None:
+        """Consolidate accumulated tensor lists into single tensors via concatenation.
+
+        Only DELTA drains modality keys per-step, so they will never be lists here and
+        can be skipped.  For CUMULATIVE and FINAL_ONLY, modality keys accumulate across
+        steps and need consolidation.
+        """
+        if not self.mm_accumulated:
             return
+
+        skip_modality = self.output_kind == RequestOutputKind.DELTA
         try:
             for k, v in self.mm_accumulated.items():
+                if skip_modality and k in DRAINABLE_MODALITIES:
+                    continue
                 if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
                     try:
                         if k == "audio":
-                            # When the audio tensor shape is inconsistent, torch.cat will fail.
-                            # We need to use torch.cat in -1 dimension.
-                            continue
+                            # Audio chunks are usually 2D (i.e., 1, N); concatenate
+                            # on the last axis to preserve the channel dimension.
+                            self.mm_accumulated[k] = torch.cat(v, dim=-1)
                         elif k == "sr":
                             # Sample rate is a constant scalar, keep last value.
                             self.mm_accumulated[k] = v[-1]
@@ -182,13 +197,13 @@ class OmniRequestState(RequestState):
             )
 
         finished = finish_reason is not None
-        final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
+        is_final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
+        is_delta = self.output_kind == RequestOutputKind.DELTA
 
-        if not finished and final_only:
+        if not finished and is_final_only:
             return None
 
-        # Consolidate accumulated tensors when finishing.
-        if finished:
+        if finished or not is_delta:
             self._consolidate_multimodal_tensors()
 
         if self.stream_interval > 1:
@@ -205,7 +220,7 @@ class OmniRequestState(RequestState):
             ):
                 return None
 
-            if self.output_kind == RequestOutputKind.DELTA:
+            if is_delta:
                 # Send tokens from the offset in DELTA mode, otherwise all
                 # tokens are sent.
                 new_token_ids = self.detokenizer.output_token_ids[self.sent_tokens_offset :]
@@ -233,18 +248,26 @@ class OmniRequestState(RequestState):
     ) -> Any:
         # Reuse base text/logprobs logic, then annotate with pooling_result.
         base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason, routed_experts)
-        try:
-            if not hasattr(base_output, "multimodal_output"):
-                setattr(base_output, "multimodal_output", {})
-            if self.mm_accumulated is not None:
-                mm_out = getattr(base_output, "multimodal_output")
-                if isinstance(mm_out, dict):
-                    for k, v in self.mm_accumulated.items():
-                        mm_out[k] = v
-                else:
-                    setattr(base_output, "multimodal_output", self.mm_accumulated)
-        except Exception:
-            logger.exception("Error in _new_completion_output")
+
+        # Inter-stage processors need the full cumulative token sequence.
+        # In DELTA mode, base_output.token_ids only has the latest step's
+        # tokens, so we always store a cumulative copy here.
+        base_output.cumulative_token_ids = list(self.detokenizer.output_token_ids)
+
+        if not hasattr(base_output, "multimodal_output"):
+            setattr(base_output, "multimodal_output", {})
+        if self.mm_accumulated:
+            mm_out = getattr(base_output, "multimodal_output")
+            if isinstance(mm_out, dict):
+                for k, v in self.mm_accumulated.items():
+                    mm_out[k] = v
+            else:
+                setattr(base_output, "multimodal_output", self.mm_accumulated)
+
+        if self.output_kind == RequestOutputKind.DELTA:
+            for modality_key in DRAINABLE_MODALITIES:
+                self.mm_accumulated.pop(modality_key, None)
+
         return base_output
 
 

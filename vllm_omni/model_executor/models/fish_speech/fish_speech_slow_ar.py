@@ -652,6 +652,7 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         input_embeds: torch.Tensor,
         last_talker_hidden: torch.Tensor,
         text_step: torch.Tensor,
+        seed: int | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """GPU fast-path: run Fast AR to predict residual codebook codes.
@@ -680,6 +681,7 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
             temperature=0.8,
             top_k=30,
             top_p=0.9,
+            seed=seed,
         )  # [B, num_codebooks]
 
         # Add codebook embeddings to the input embedding (from preprocess).

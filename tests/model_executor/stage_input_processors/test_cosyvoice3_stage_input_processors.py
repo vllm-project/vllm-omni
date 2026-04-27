@@ -13,7 +13,7 @@ def _source_output(request_id: str, prompt_ids: list[int], out_ids: list[int], m
     return SimpleNamespace(
         request_id=request_id,
         prompt_token_ids=prompt_ids,
-        outputs=[SimpleNamespace(token_ids=out_ids, multimodal_output=mm)],
+        outputs=[SimpleNamespace(token_ids=out_ids, cumulative_token_ids=out_ids, multimodal_output=mm)],
     )
 
 

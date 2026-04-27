@@ -40,6 +40,7 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
     SpeechBatchItem,
     SpeechBatchItemResult,
 )
+from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     build_fish_text_only_prompt_ids,
     estimate_fish_voice_clone_prompt_len_from_normalized,
@@ -64,6 +65,7 @@ _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
 _VOXCPM_TTS_MODEL_STAGES = {"latent_generator", "vae"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
 _MING_TTS_MODEL_STAGES = {"ming_tts"}
+_MOSS_TTS_MODEL_STAGES = {"moss_tts_nano"}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -73,6 +75,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _VOXCPM_TTS_MODEL_STAGES
     | _VOXCPM2_TTS_MODEL_STAGES
     | _MING_TTS_MODEL_STAGES
+    | _MOSS_TTS_MODEL_STAGES
 )
 _TTS_LANGUAGES: set[str] = {
     "Auto",
@@ -323,6 +326,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "voxcpm" if has_vae_stage or model_stage == "vae" else "voxcpm2"
         if model_stage in _MING_TTS_MODEL_STAGES:
             return "ming_flash_omni_tts"
+        if model_stage in _MOSS_TTS_MODEL_STAGES:
+            return "moss_tts_nano"
         return None
 
     def _compute_max_instructions_length(self) -> int:
@@ -854,6 +859,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return None  # VoxCPM2 accepts any text input
         if self._tts_model_type == "ming_flash_omni_tts":
             return self._validate_ming_tts_request(request)
+        if self._tts_model_type == "moss_tts_nano":
+            return self._validate_moss_tts_request(request)
         return self._validate_qwen_tts_request(request)
 
     def _voxcpm2_encode(self, text: str) -> list[int]:
@@ -1108,6 +1115,42 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
 
         return None
+
+    def _validate_moss_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate MOSS-TTS-Nano request. Accepts optional ref_audio for voice cloning."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+        if request.ref_audio is not None:
+            fmt_err = self._validate_ref_audio_format(request.ref_audio)
+            if fmt_err:
+                return fmt_err
+            if not request.ref_text or not request.ref_text.strip():
+                return "Voice cloning requires 'ref_text' (transcript of the reference audio)"
+        return None
+
+    async def _build_moss_tts_params(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Build additional_information for MOSS-TTS-Nano.
+
+        Maps the standard /v1/audio/speech fields to MOSS-TTS-Nano's
+        additional_information keys (text, voice, mode, prompt_audio_array,
+        prompt_text, ...).  Values are wrapped in lists to match the
+        vllm-omni convention.  When ``request.ref_audio`` is provided, it is
+        resolved via MediaConnector and passed as a (wav_list, sample_rate)
+        tuple so the model owns temp-file lifecycle.
+        """
+        params: dict[str, Any] = {
+            "text": [request.input],
+        }
+        if request.voice is not None:
+            params["voice"] = [request.voice]
+        if request.ref_text is not None:
+            params["prompt_text"] = [request.ref_text]
+        if request.max_new_tokens is not None:
+            params["max_new_frames"] = [request.max_new_tokens]
+        if request.ref_audio is not None:
+            wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+            params["prompt_audio_array"] = [[wav_list, sr]]
+        return params
 
     def _validate_fish_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate Fish Speech request parameters. Returns error message or None.
@@ -1628,6 +1671,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
+        # If this is a streaming request, we need to coerce
+        # cumulative outputs to delta outputs; this ensures
+        # we don't emit redundant MM data & drain after emitting.
+        # list() makes a copy to avoid mutating the params.
+        sampling_params_list = list(self.engine_client.default_sampling_params_list)
+        sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
+
         if self._is_fish_speech:
             validation_error = self._validate_fish_tts_request(request)
             if validation_error:
@@ -1683,6 +1733,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             elif self._tts_model_type == "ming_flash_omni_tts":
                 prompt = self._build_ming_prompt(request)
                 tts_params = {}
+            elif self._tts_model_type == "moss_tts_nano":
+                tts_params = await self._build_moss_tts_params(request)
+                prompt = {"prompt_token_ids": [1], "additional_information": tts_params}
             else:
                 tts_params = self._build_tts_params(request)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
@@ -1732,6 +1785,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = "voxcpm2"
         elif self._tts_model_type == "ming_flash_omni_tts":
             model_type = "ming_flash_omni_tts"
+        elif self._tts_model_type == "moss_tts_nano":
+            model_type = "moss_tts_nano"
         elif self._is_tts:
             model_type = tts_params.get("task_type", ["unknown"])[0]
         else:
@@ -1742,8 +1797,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             request.input[:50] + "..." if len(request.input) > 50 else request.input,
             model_type,
         )
-
-        sampling_params_list = self.engine_client.default_sampling_params_list
 
         # CosyVoice3: set dynamic min/max tokens based on text length.
         # The official model requires min_token_text_ratio to prevent early
@@ -1790,6 +1843,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
             sampling_params_list[0].max_tokens = request.max_new_tokens
+
+        # Propagate per-request seed to sampling params so both Slow AR
+        # and Fast AR produce deterministic output for the same seed.
+        if request.seed is not None and sampling_params_list:
+            if not self._is_fish_speech:
+                logger.warning(
+                    "seed=%d requested but deterministic Fast AR seeding is "
+                    "only implemented for Fish Speech; other TTS models will "
+                    "use the seed for the main AR sampler only.",
+                    request.seed,
+                )
+            if sampling_params_list is self.engine_client.default_sampling_params_list:
+                import copy
+
+                sampling_params_list = copy.deepcopy(sampling_params_list)
+            sampling_params_list[0].seed = request.seed
 
         generator = self.engine_client.generate(
             prompt=prompt,
