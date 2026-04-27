@@ -9,6 +9,7 @@ Coverage:
 - Tensor-Parallel
 - Ulysses-SP
 - Ring-Attention
+- Layerwise Offloading
 
 assert_diffusion_response validates successful generation and the expected
 512x512 resolution.
@@ -31,7 +32,7 @@ PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 def _get_diffusion_feature_cases(model: str):
     """Return L4 diffusion feature cases for Bagel.
     TeaCache, Cache-DiT, CFG-Parallel, Tensor-Parallel,
-    Ulysses-SP, Ring-Attention.
+    Ulysses-SP, Ring-Attention, Layerwise Offloading.
     """
 
     return [
@@ -111,6 +112,15 @@ def _get_diffusion_feature_cases(model: str):
             id="sp_ring_2",
             marks=PARALLEL_FEATURE_MARKS,
         ),
+        # Layerwise Offloading (single-card)
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=["--enable-layerwise-offload"],
+            ),
+            id="single_card_layerwise_offload",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
     ]
 
 
@@ -132,6 +142,7 @@ def test_bagel(
     - Tensor-Parallel (size=2)
     - Ulysses-SP (degree=2)
     - Ring-Attention (degree=2)
+    - Layerwise Offloading
 
     Validation is delegated to assert_diffusion_response in tests/helpers/assertions.py,
     which checks output dimensions and basic correctness.

@@ -51,21 +51,31 @@ def seed_tts_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.fixture()
+def mock_tokenizer(mocker):
+    tokenizer = mocker.MagicMock()
+    tokenizer.encode = lambda text, **kw: [0] * len(text.split())
+    tokenizer.get_vocab.return_value = {"<pad>": 0}
+    tokenizer.all_special_ids = []
+    tokenizer.all_special_tokens = []
+    tokenizer.vocab_size = 1
+    tokenizer.__len__.return_value = 1
+    return tokenizer
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
 
-def test_seed_tts_text_dataset_omits_ref_audio(seed_tts_root, mocker):
+def test_seed_tts_text_dataset_omits_ref_audio(seed_tts_root, mock_tokenizer):
     ds = SeedTTSTextDataset(
         dataset_path=str(seed_tts_root),
         random_seed=0,
         locale="en",
         disable_shuffle=True,
     )
-    tokenizer = mocker.MagicMock()
-    tokenizer.encode = lambda text, **kw: [0] * len(text.split())
-    requests = ds.sample(tokenizer, num_requests=3)
+    requests = ds.sample(mock_tokenizer, num_requests=3)
     assert len(requests) == 3
     for req in requests:
         assert isinstance(req, SeedTTSTextSampleRequest)
@@ -91,16 +101,14 @@ def seed_tts_design_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_seed_tts_design_dataset_has_instructions(seed_tts_design_root, mocker):
+def test_seed_tts_design_dataset_has_instructions(seed_tts_design_root, mock_tokenizer):
     ds = SeedTTSDesignDataset(
         dataset_path=str(seed_tts_design_root),
         random_seed=0,
         locale="en",
         disable_shuffle=True,
     )
-    tokenizer = mocker.MagicMock()
-    tokenizer.encode = lambda text, **kw: [0] * len(text.split())
-    requests = ds.sample(tokenizer, num_requests=3)
+    requests = ds.sample(mock_tokenizer, num_requests=3)
     assert len(requests) == 3
     for req in requests:
         assert isinstance(req, SeedTTSDesignSampleRequest)
@@ -112,23 +120,25 @@ def test_seed_tts_design_dataset_has_instructions(seed_tts_design_root, mocker):
         assert req.seed_tts_ref_wav_path == ""
 
 
-def test_seed_tts_design_dataset_rejects_missing_description(seed_tts_design_root, mocker):
+def test_seed_tts_design_dataset_rejects_missing_description(seed_tts_design_root, mock_tokenizer):
     """Lines without a voice_description should be skipped."""
     locale_dir = seed_tts_design_root / "en"
-    (locale_dir / "meta.lst").write_text(
-        "bad001|||target text without description\nok001|||good target|A clear female voice.\n",
-        encoding="utf-8",
+    # The bad line has 4 fields, not 5, so will be filtered
+    meta = "bad|||target text without description\n" + "\n".join(
+        f"ok|||target text {i}|A clear female voice." for i in range(9)
     )
+    (locale_dir / "meta.lst").write_text(meta, encoding="utf-8")
     ds = SeedTTSDesignDataset(
         dataset_path=str(seed_tts_design_root),
         random_seed=0,
         locale="en",
         disable_shuffle=True,
     )
-    tokenizer = mocker.MagicMock()
-    tokenizer.encode = lambda text, **kw: [0] * len(text.split())
-    requests = ds.sample(tokenizer, num_requests=10)
-    assert len(requests) == 1  # only the valid row
+    requests = ds.sample(mock_tokenizer, num_requests=10, no_oversample=True)
+    assert len(requests) == 9  # since we filter the bad row out and don't oversample
+    for req in requests:
+        assert isinstance(req, SeedTTSDesignSampleRequest)
+        assert req.seed_tts_utterance_id == "ok"
 
 
 def test_attach_sets_seed_tts_row_even_without_extra_body():

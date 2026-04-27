@@ -759,7 +759,7 @@ class OmniDiffusionConfig:
 
         # Backwards-compatibility: map "quantization" to "quantization_config"
         # so callers using the old field name still work.
-        if "quantization" in kwargs and kwargs.get("quantization_config") is None:
+        if "quantization" in kwargs and kwargs.get("quantization_config", None) is None:
             kwargs["quantization_config"] = kwargs.pop("quantization")
         else:
             kwargs.pop("quantization", None)

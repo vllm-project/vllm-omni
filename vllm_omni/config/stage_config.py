@@ -274,9 +274,9 @@ class _LazyPipelineRegistry:
 
     def _get_lazy_map(self) -> dict[str, tuple[str, str]]:
         if self._lazy_map is None:
-            from vllm_omni.config.pipeline_registry import _VLLM_OMNI_PIPELINES
+            from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
 
-            self._lazy_map = _VLLM_OMNI_PIPELINES
+            self._lazy_map = _OMNI_PIPELINES
         return self._lazy_map
 
     def _load_lazy(self, model_type: str) -> PipelineConfig | None:
@@ -374,7 +374,7 @@ _PIPELINE_REGISTRY = _LazyPipelineRegistry()
 def register_pipeline(pipeline: PipelineConfig) -> None:
     """Register a pipeline config dynamically.
 
-    In-tree pipelines are declared in ``pipeline_registry._VLLM_OMNI_PIPELINES``
+    In-tree pipelines are declared in ``pipeline_registry._OMNI_PIPELINES``
     and loaded lazily; calling ``register_pipeline`` is only needed for
     out-of-tree plugins or tests that build a ``PipelineConfig`` at runtime.
     A dynamic registration overrides the central-registry entry with the same
@@ -439,7 +439,7 @@ class DeployConfig:
 
     # === Pipeline-wide engine settings (applied uniformly to every stage) ===
     trust_remote_code: bool = True
-    distributed_executor_backend: str = "mp"
+    distributed_executor_backend: str | None = None
     dtype: str | None = None
     quantization: str | None = None
     enable_prefix_caching: bool = False
