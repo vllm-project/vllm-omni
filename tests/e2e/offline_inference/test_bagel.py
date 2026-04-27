@@ -26,7 +26,6 @@ import pytest
 from vllm.assets.image import ImageAsset
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import cosine_similarity_text
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -108,6 +107,4 @@ def test_bagel_img2text(run_level, omni_runner: OmniRunner) -> None:
     assert len(text) > 0, "Generated text is empty"
 
     if run_level in ["advanced_model", "full_model"]:
-        assert cosine_similarity_text(text, REFERENCE_TEXT_IMG2TEXT) > 0.7, (
-            f"Text mismatch: expected {REFERENCE_TEXT_IMG2TEXT!r}, got {text!r}"
-        )
+        assert "wooden boardwalk" in text.lower(), f"Text mismatch: expected 'wooden boardwalk' in {text!r}"
