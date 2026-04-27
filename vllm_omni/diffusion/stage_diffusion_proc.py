@@ -521,6 +521,10 @@ class StageDiffusionProc:
 
         proc = cls(model, od_config)
         try:
+            from vllm_omni.logger import set_stage_context
+
+            set_stage_context(od_config.stage_id, "diffusion")
+
             proc.initialize()
 
             # Send READY via handshake socket

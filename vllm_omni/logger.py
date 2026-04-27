@@ -45,9 +45,14 @@ def _configure_vllm_omni_root_logger():
 
     vllm_omni_root.setLevel(logging.NOTSET)
 
-    injector = _StageContextInjector()
-    injector.addFilter(StageContextFilter())
-    vllm_omni_root.addHandler(injector)
+    # Install the stage-context filter on both vllm_omni and vllm loggers
+    # so that records emitted by vllm.* child loggers (e.g. model-loading,
+    # runtime) are also tagged with the stage context in stage subprocesses.
+    stage_filter = StageContextFilter()
+    for logger_obj in (vllm_omni_root, vllm_root):
+        injector = _StageContextInjector()
+        injector.addFilter(stage_filter)
+        logger_obj.addHandler(injector)
 
 
 _configure_vllm_omni_root_logger()

@@ -135,3 +135,28 @@ class TestStageLoggingIntegration:
         records = self._capture_from_vllm_omni("vllm_omni.test_integration", "no context here")
         assert len(records) == 1
         assert "[STAGE:" not in records[0].msg
+
+    @staticmethod
+    def _capture_from_vllm(logger_name: str, msg: str) -> list[logging.LogRecord]:
+        """Capture records emitted by a vllm.* child logger."""
+        captured: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                captured.append(record)
+
+        vllm_logger = logging.getLogger("vllm")
+        handler = _Capture()
+        vllm_logger.addHandler(handler)
+        try:
+            logging.getLogger(logger_name).info(msg)
+        finally:
+            vllm_logger.removeHandler(handler)
+        return captured
+
+    def test_vllm_logger_tagged_with_stage_context(self) -> None:
+        """Records from vllm.* loggers also get the [STAGE:] tag."""
+        set_stage_context(1, "talker")
+        records = self._capture_from_vllm("vllm.test_engine", "loading model weights")
+        assert len(records) == 1
+        assert "[STAGE:talker]" in records[0].msg
