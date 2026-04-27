@@ -85,6 +85,7 @@ class LongCatImageAttention(nn.Module):
         context_pre_only: bool | None = None,
         pre_only: bool = False,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.parallel_config = parallel_config
@@ -109,12 +110,16 @@ class LongCatImageAttention(nn.Module):
             total_num_heads=self.heads,
             bias=bias,
             quant_config=quant_config,
-            prefix="to_qkv",
+            prefix=f"{prefix}.to_qkv",
         )
 
         if not self.pre_only:
             self.to_out = RowParallelLinear(
-                self.inner_dim, self.out_dim, bias=out_bias, quant_config=quant_config, prefix="to_out"
+                self.inner_dim,
+                self.out_dim,
+                bias=out_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_out",
             )
 
         if self.added_kv_proj_dim is not None:
@@ -127,11 +132,15 @@ class LongCatImageAttention(nn.Module):
                 total_num_heads=self.heads,
                 bias=added_proj_bias,
                 quant_config=quant_config,
-                prefix="add_kv_proj",
+                prefix=f"{prefix}.add_kv_proj",
             )
 
             self.to_add_out = RowParallelLinear(
-                self.inner_dim, query_dim, bias=out_bias, quant_config=quant_config, prefix="to_add_out"
+                self.inner_dim,
+                query_dim,
+                bias=out_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_add_out",
             )
 
         self.attn = Attention(
@@ -349,6 +358,7 @@ class LongCatImageTransformerBlock(nn.Module):
         qk_norm: str = "rms_norm",
         eps: float = 1e-6,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -367,13 +377,16 @@ class LongCatImageTransformerBlock(nn.Module):
             bias=True,
             eps=eps,
             quant_config=quant_config,
+            prefix=f"{prefix}.attn",
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix="ff")
+        self.ff = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix=f"{prefix}.ff")
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff_context = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix="ff_context")
+        self.ff_context = FeedForward(
+            dim=dim, dim_out=dim, quant_config=quant_config, prefix=f"{prefix}.ff_context"
+        )
 
     def forward(
         self,
@@ -546,6 +559,7 @@ class LongCatImageSingleTransformerBlock(nn.Module):
         attention_head_dim: int,
         mlp_ratio: float = 4.0,
         quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
@@ -557,7 +571,7 @@ class LongCatImageSingleTransformerBlock(nn.Module):
             bias=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix="proj_mlp",
+            prefix=f"{prefix}.proj_mlp",
         )
         self.act_mlp = nn.GELU(approximate="tanh")
         self.proj_out = ReplicatedLinear(
@@ -566,7 +580,7 @@ class LongCatImageSingleTransformerBlock(nn.Module):
             bias=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix="proj_out",
+            prefix=f"{prefix}.proj_out",
         )
 
         # SP handling is delegated to LongCatImageAttention via text_seq_len kwarg
@@ -580,6 +594,7 @@ class LongCatImageSingleTransformerBlock(nn.Module):
             eps=1e-6,
             quant_config=quant_config,
             pre_only=True,
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -707,6 +722,7 @@ class LongCatImageTransformer2DModel(nn.Module):
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     quant_config=quant_config,
+                    prefix=f"transformer_blocks.{i}",
                 )
                 for i in range(num_layers)
             ]
@@ -720,20 +736,14 @@ class LongCatImageTransformer2DModel(nn.Module):
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     quant_config=quant_config,
+                    prefix=f"single_transformer_blocks.{i}",
                 )
                 for i in range(num_single_layers)
             ]
         )
 
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
-        self.proj_out = ReplicatedLinear(
-            self.inner_dim,
-            patch_size * patch_size * self.out_channels,
-            bias=True,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix="proj_out",
-        )
+        self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
 
         self.gradient_checkpointing = False
 
