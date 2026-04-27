@@ -307,6 +307,7 @@ class Wan22Pipeline(
     nn.Module, PipelineParallelMixin, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin
 ):
     supports_step_execution: ClassVar[bool] = True
+    supports_micro_step_execution: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -1036,7 +1037,7 @@ class Wan22Pipeline(
         if boundary_ratio is None and guidance_scale_2 is not None:
             raise ValueError("`guidance_scale_2` is only supported when `boundary_ratio` is set.")
 
-    # ── Step-execution protocol (SupportsStepExecution) ──
+    # ── Step-execution protocol (SupportsStepExecution) + Micro-step execution (SupportsMicroStepExecution) ──
 
     def _extract_prompts(
         self,

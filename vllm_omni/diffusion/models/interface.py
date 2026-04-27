@@ -87,3 +87,31 @@ def supports_step_execution(pipeline: object) -> bool:
     """Return whether `pipeline` implements :class:`SupportsStepExecution`."""
 
     return isinstance(pipeline, SupportsStepExecution)
+
+
+@runtime_checkable
+class SupportsMicroStepExecution(SupportsStepExecution, Protocol):
+    """Temporal-PP micro-step execution protocol.
+
+    Extends :class:`SupportsStepExecution` with the per-micro-step hooks
+    used by ``DiffusionModelRunner.execute_micro_step``:
+
+    - ``set_pp_recv_dict_buffers`` pre-registers PPGC dict channels for
+      this request to skip the blocking first-call schema exchange.
+    - ``prefetch_its`` pre-posts the next-step IT recv on the comms stream
+      so it overlaps with the current micro-step's compute.
+    """
+
+    supports_micro_step_execution: ClassVar[bool] = True
+
+    def set_pp_recv_dict_buffers(self, state: DiffusionRequestState, **kwargs: Any) -> None:
+        """Pre-register PP dict recv buffers and schema cache for this request."""
+
+    def prefetch_its(self, state: DiffusionRequestState, **kwargs: Any) -> None:
+        """Pre-post the next-step IT recv (no-op if not in temporal PP)."""
+
+
+def supports_micro_step_execution(pipeline: object) -> bool:
+    """Return whether `pipeline` implements :class:`SupportsMicroStepExecution`."""
+
+    return isinstance(pipeline, SupportsMicroStepExecution)
