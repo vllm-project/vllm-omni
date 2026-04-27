@@ -290,6 +290,14 @@ class TestOmniSleepMode:
             diffusion_engine.shutdown()
             logger.info("Cleanup complete, test exiting.")
 
+    @pytest.mark.skip(
+        reason=(
+            "Flaky/CI: dual AsyncOmni can fail with "
+            "RuntimeError: Orchestrator init failed, StageDiffusionProc died during handshake. "
+            "Re-enable when stable (no OOM on coordinated talker+diffusion). "
+            "Note: this test is fixture-free so skip does not init llm/diffusion engines."
+        )
+    )
     @pytest.mark.asyncio
     @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
     async def test_coordinated_cross_device(self, llm_engine: AsyncOmni, diffusion_engine: AsyncOmni):

@@ -42,7 +42,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 

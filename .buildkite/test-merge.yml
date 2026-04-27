@@ -75,22 +75,6 @@ steps:
               volumes:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
-      - label: "Diffusion · Quantization Test"
-        commands:
-          - timeout 30m pytest -sv tests/diffusion/quantization -m 'advanced_model and cuda and L4' --run-level "advanced_model"
-        agents:
-          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
-        plugins:
-          - docker#v5.2.0:
-              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-              always-pull: true
-              propagate-environment: true
-              environment:
-                - "HF_HOME=/fsx/hf_cache"
-                - "HF_TOKEN"
-              volumes:
-                - "/fsx/hf_cache:/fsx/hf_cache"
-
   - label: "Distributed Test"
     timeout_in_minutes: 60
     commands:
