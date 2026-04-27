@@ -643,14 +643,25 @@ class DiffusionEngine:
     def get_rpc_lock_stats(self) -> dict[str, float | int]:
         """Aggregated _rpc_lock acquisition stats since engine construction.
 
-        Returns a snapshot dict with keys ``count``, ``total_wait_ms``,
-        ``mean_wait_ms`` and ``max_wait_ms``. Both successful acquisitions
-        and timeout failures are counted, so the numbers reflect the full
-        contention surface seen by collective_rpc callers.
+        Returns a point-in-time snapshot dict with keys ``count``,
+        ``total_wait_ms``, ``mean_wait_ms`` and ``max_wait_ms``. Both
+        successful acquisitions and timed-out attempts are counted; the
+        timeout path contributes the partial wait duration up to the
+        timeout limit, so the numbers reflect the full contention
+        surface seen by ``collective_rpc`` callers (including those who
+        give up).
+
+        The returned dict is independent of subsequent counter updates;
+        repeated calls return increasing snapshots without holding the
+        primary ``_rpc_lock``. Safe to invoke from any thread.
 
         Intended as the headline observability number for the RFC #3158
-        DiffusionEngine RPC lock narrowing work; safe to call from any
-        thread.
+        DiffusionEngine RPC lock narrowing work, and exposed through
+        the diffusion stage clients (``StageDiffusionProc`` and
+        ``InlineStageDiffusionClient``) so that
+        ``collective_rpc_async("get_rpc_lock_stats")`` callers in the
+        multi-stage runtime can observe contention without owning the
+        engine instance directly.
         """
         with self._rpc_lock_stats_lock:
             count = self._rpc_lock_wait_count

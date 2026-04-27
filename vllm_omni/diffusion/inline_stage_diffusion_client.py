@@ -277,6 +277,17 @@ class InlineStageDiffusionClient:
                 profile_prefix,
             )
 
+        if method == "get_rpc_lock_stats":
+            # Engine-local observability hook. Resolved synchronously on
+            # the asyncio thread because the snapshot only reads three
+            # counter fields under a sub-microsecond lock and must not
+            # queue behind generation work in the single-worker
+            # executor — that would defeat the purpose of observability
+            # while the engine is contended. Workers are not
+            # DiffusionEngine instances, so the request is also never
+            # forwarded to them.
+            return self._engine.get_rpc_lock_stats()
+
         kwargs = kwargs or {}
 
         # LoRA methods
