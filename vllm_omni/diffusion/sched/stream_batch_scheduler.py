@@ -193,11 +193,17 @@ class StreamBatchScheduler(_BaseScheduler):
             return set()
 
         terminal: dict[str, DiffusionRequestStatus] = {}
+        terminal_errors: dict[str, str | None] = {}
 
         progress = self._chunk_progress.get(output.req_id)
         if progress is None:
             return set()
 
+        output_error = output.result.error if output.result is not None else None
+        if output_error is not None:
+            terminal[output.req_id] = DiffusionRequestStatus.FINISHED_ERROR
+            terminal_errors[output.req_id] = output_error
+            return self._finalize_update_from_output(sched_output, terminal, terminal_errors)
 
         chunk = self._find_chunk(progress, output.chunk_idx) if output.chunk_idx is not None else None
         if chunk is not None:
@@ -216,14 +222,12 @@ class StreamBatchScheduler(_BaseScheduler):
                         c for c in progress.in_flight if c.chunk_idx != last_chunk.chunk_idx
                     ]
                 else:
-                    last_chunk.is_active = False                       
-
-
+                    last_chunk.is_active = False
 
         if output.finished:
             terminal[output.req_id] = DiffusionRequestStatus.FINISHED_COMPLETED
 
-        return self._finalize_update_from_output(sched_output, terminal)
+        return self._finalize_update_from_output(sched_output, terminal, terminal_errors)
 
     @staticmethod
     def _find_chunk(progress: _ChunkProgress, chunk_idx: int) -> _InFlightChunk | None:
