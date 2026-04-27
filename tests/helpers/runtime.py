@@ -161,89 +161,6 @@ class OmniServerParams(NamedTuple):
     stage_init_timeout: int | None = None  # None: fixture supplies default (600 s)
 
 
-def run_omni_server(
-    request: Any,
-    run_level: str,
-    model_prefix: str,
-    omni_fixture_lock: threading.Lock,
-) -> Generator["OmniServer", Any, None]:
-    from tests.helpers.stage_config import modify_stage_config
-
-    with omni_fixture_lock:
-        params: OmniServerParams = request.param
-        model = model_prefix + params.model
-        port = params.port
-        stage_config_path = params.stage_config_path
-        if run_level in {"advanced_model", "full_model"} and stage_config_path is not None:
-            with open(stage_config_path, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f) or {}
-            # Strip ``load_format: dummy`` (CI overlay default) so advanced_model
-            # tests use real weights. New schema (``stages:``) writes the field
-            # flat at stage level; legacy schema (``stage_args:``) nests it as
-            # ``engine_args.load_format``. Handle both.
-            new_schema_stages = cfg.get("stages")
-            stage_key = "stages" if new_schema_stages is not None else "stage_args"
-            delete_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
-            stage_entries = cfg.get(stage_key, [])
-            stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
-            stage_config_path = modify_stage_config(
-                stage_config_path,
-                deletes={stage_key: {stage_id: [delete_path] for stage_id in stage_ids}},
-            )
-
-        server_args = params.server_args or []
-        if params.use_omni and params.stage_init_timeout is not None:
-            server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
-        else:
-            server_args = [*server_args, "--stage-init-timeout", "600"]
-        if params.init_timeout is not None:
-            server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
-        else:
-            server_args = [*server_args, "--init-timeout", "900"]
-        if params.use_stage_cli:
-            if not params.use_omni:
-                raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
-            if stage_config_path is None:
-                raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
-            server_args += ["--stage-configs-path", stage_config_path]
-
-            with OmniServerStageCli(
-                model,
-                stage_config_path,
-                server_args,
-                port=port,
-                env_dict=params.env_dict,
-            ) as server:
-                print("OmniServer started successfully")
-                yield server
-                print("OmniServer stopping...")
-        else:
-            if stage_config_path is not None:
-                server_args += ["--stage-configs-path", stage_config_path]
-
-            with (
-                OmniServer(
-                    model,
-                    server_args,
-                    port=port,
-                    env_dict=params.env_dict,
-                    use_omni=params.use_omni,
-                )
-                if port
-                else OmniServer(
-                    model,
-                    server_args,
-                    env_dict=params.env_dict,
-                    use_omni=params.use_omni,
-                )
-            ) as server:
-                print("OmniServer started successfully")
-                yield server
-                print("OmniServer stopping...")
-
-        print("OmniServer stopped")
-
-
 class OmniServer:
     """Omniserver for vLLM-Omni tests."""
 
@@ -1714,6 +1631,141 @@ class OmniRunnerHandler:
 
     def stop_profile(self, stages: list[int] | None = None) -> list[Any]:
         return self.runner.stop_profile(stages=stages)
+
+
+# ---------------------------------------------------------------------------
+# Pytest fixture helpers (used from ``tests.helpers.fixtures.runtime``; live here
+# to avoid importing ``tests.helpers.runtime`` from the plugin module at import time).
+# ---------------------------------------------------------------------------
+
+
+def _core_model_stage_config_path_with_dummy_load_format(stage_config_path: str | None, run_level: str) -> str | None:
+    """For ``core_model`` runs, patch every stage in the deploy YAML to ``load_format: dummy``."""
+    if run_level != "core_model" or stage_config_path is None:
+        return stage_config_path
+    from tests.helpers.stage_config import modify_stage_config
+
+    with open(stage_config_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    new_schema_stages = cfg.get("stages")
+    stage_key = "stages" if new_schema_stages is not None else "stage_args"
+    update_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
+    stage_entries = cfg.get(stage_key, [])
+    stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
+    return modify_stage_config(
+        stage_config_path,
+        updates={stage_key: {stage_id: {update_path: "dummy"} for stage_id in stage_ids}},
+    )
+
+
+def iter_omni_server(
+    request: Any,
+    run_level: str,
+    model_prefix: str,
+    omni_fixture_lock: threading.Lock,
+) -> Generator[Any, Any, None]:
+    """Start/stop an Omni HTTP server; used by ``omni_server`` / ``omni_server_function`` fixtures."""
+    from tests.helpers.stage_config import modify_stage_config
+
+    with omni_fixture_lock:
+        params: OmniServerParams = request.param
+        model = model_prefix + params.model
+        port = params.port
+        stage_config_path = params.stage_config_path
+        if run_level in {"advanced_model", "full_model"} and stage_config_path is not None:
+            with open(stage_config_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            new_schema_stages = cfg.get("stages")
+            stage_key = "stages" if new_schema_stages is not None else "stage_args"
+            delete_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
+            stage_entries = cfg.get(stage_key, [])
+            stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
+            stage_config_path = modify_stage_config(
+                stage_config_path,
+                deletes={stage_key: {stage_id: [delete_path] for stage_id in stage_ids}},
+            )
+
+        server_args = params.server_args or []
+        if params.use_omni and params.stage_init_timeout is not None:
+            server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
+        else:
+            server_args = [*server_args, "--stage-init-timeout", "600"]
+        if params.init_timeout is not None:
+            server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
+        else:
+            server_args = [*server_args, "--init-timeout", "900"]
+        if params.use_stage_cli:
+            if not params.use_omni:
+                raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
+            if stage_config_path is None:
+                raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
+            server_args += ["--stage-configs-path", stage_config_path]
+
+            with OmniServerStageCli(
+                model,
+                stage_config_path,
+                server_args,
+                port=port,
+                env_dict=params.env_dict,
+            ) as server:
+                print("OmniServer started successfully")
+                yield server
+                print("OmniServer stopping...")
+        else:
+            if stage_config_path is not None:
+                server_args += ["--stage-configs-path", stage_config_path]
+
+            with (
+                OmniServer(
+                    model,
+                    server_args,
+                    port=port,
+                    env_dict=params.env_dict,
+                    use_omni=params.use_omni,
+                )
+                if port
+                else OmniServer(
+                    model,
+                    server_args,
+                    env_dict=params.env_dict,
+                    use_omni=params.use_omni,
+                )
+            ) as server:
+                print("OmniServer started successfully")
+                yield server
+                print("OmniServer stopping...")
+
+        print("OmniServer stopped")
+
+
+def iter_omni_runner(
+    request: Any,
+    model_prefix: str,
+    run_level: str,
+    omni_fixture_lock: threading.Lock,
+) -> Generator[Any, None, None]:
+    """Yield an :class:`OmniRunner`; used by ``omni_runner`` / ``omni_runner_function`` fixtures."""
+    with omni_fixture_lock:
+        param = request.param
+        if not isinstance(param, (tuple, list)) or len(param) not in (2, 3):
+            raise ValueError(
+                "omni_runner param must be (model, stage_config_path) or "
+                "(model, stage_config_path, extra_omni_kwargs_dict)"
+            )
+        if len(param) == 2:
+            model, stage_config_path = param[0], param[1]
+            extra_omni_kwargs: dict = {}
+        else:
+            model, stage_config_path, extra = param[0], param[1], param[2]
+            extra_omni_kwargs = dict(extra) if extra is not None else {}
+        stage_config_path = _core_model_stage_config_path_with_dummy_load_format(stage_config_path, run_level)
+        model = model_prefix + model
+        with OmniRunner(model, seed=42, stage_configs_path=stage_config_path, **extra_omni_kwargs) as runner:
+            print("OmniRunner started successfully")
+            yield runner
+            print("OmniRunner stopping...")
+
+        print("OmniRunner stopped")
 
 
 __all__ = [

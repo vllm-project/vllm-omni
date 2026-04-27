@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""
-Entrypoint-level Omni Sleep Mode tests (VRAM/ACK) plus H100 multi-scenario e2e coverage.
-"""
+"""Omni sleep mode: entrypoint-level VRAM/ACK tests (L4) plus H100 multi-TP e2e."""
 
 import asyncio
 import logging
@@ -358,16 +356,16 @@ class TestOmniSleepMode:
 
 
 # ---------------------------------------------------------------------------
-# H100 (or MI325) e2e: BAGEL / pure diffusion, multi-TP — migrated from
-# tests/e2e/offline_inference/test_omni_sleep_mode.py
+# H100 (or MI325) e2e: BAGEL / pure diffusion, multi-TP
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.omni
+@pytest.mark.advanced_model
 @pytest.mark.parametrize("tp_size", [1])
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.asyncio
-async def test_diffusion_model_sleep_tp(tp_size):
+async def test_diffusion_model_sleep_tp(tp_size: int):
     """Two-stage BAGEL default config: warmup, sleep all, wake, verify generate."""
     if current_omni_platform.is_rocm():
         clean_gpu_envs()
@@ -390,7 +388,7 @@ async def test_diffusion_model_sleep_tp(tp_size):
         diff_sp = OmniDiffusionSamplingParams(num_inference_steps=2, height=256, width=256)
         llm_sp = SamplingParams()
 
-        async for _ in engine.generate("test", sampling_params=[llm_sp, diff_sp]):
+        async for _ in engine.generate("test", sampling_params_list=[llm_sp, diff_sp]):
             pass
 
         acks = await engine.sleep(level=2)
@@ -398,17 +396,20 @@ async def test_diffusion_model_sleep_tp(tp_size):
         assert all(s == "SUCCESS" for s in statuses), f"Sleep failed. Statuses: {statuses}"
 
         await engine.wake_up()
-        async for _ in engine.generate("verify", sampling_params=[llm_sp, diff_sp]):
+        async for _ in engine.generate("verify", sampling_params_list=[llm_sp, diff_sp]):
             pass
+
+        logger.info("Diffusion TP=%s lifecycle OK", tp_size)
     finally:
         engine.shutdown()
 
 
 @pytest.mark.omni
+@pytest.mark.advanced_model
 @pytest.mark.parametrize("tp_size", [1, 2])
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.asyncio
-async def test_multistage_sleep_h100(tp_size):
+async def test_multistage_sleep_h100(tp_size: int):
     """Explicit 2-stage (llm + diffusion) + connectors; sleep/wake both stages."""
     if current_omni_platform.is_rocm():
         clean_gpu_envs()
@@ -443,24 +444,25 @@ async def test_multistage_sleep_h100(tp_size):
     )
     try:
         sp = OmniDiffusionSamplingParams(num_inference_steps=2)
-        async for _ in engine.generate("warmup", sampling_params=[SamplingParams(), sp]):
+        async for _ in engine.generate("warmup", sampling_params_list=[SamplingParams(), sp]):
             pass
 
         acks = await engine.sleep(stage_ids=[0, 1], level=2)
         assert len(acks) == 2
 
         await engine.wake_up(stage_ids=[0, 1])
-        async for _ in engine.generate("verify", sampling_params=[SamplingParams(), sp]):
+        async for _ in engine.generate("verify", sampling_params_list=[SamplingParams(), sp]):
             pass
     finally:
         engine.shutdown()
 
 
 @pytest.mark.omni
+@pytest.mark.advanced_model
 @pytest.mark.parametrize("tp_size", [1, 2])
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.asyncio
-async def test_pure_diffusion_scenario(tp_size):
+async def test_pure_diffusion_scenario(tp_size: int):
     """Single-stage random diffusion: sleep, wake, generate."""
     if current_omni_platform.is_rocm():
         clean_gpu_envs()
@@ -477,7 +479,8 @@ async def test_pure_diffusion_scenario(tp_size):
     try:
         await engine.sleep(level=1)
         await engine.wake_up()
-        async for _ in engine.generate("test", sampling_params=[SamplingParams()]):
+        async for _ in engine.generate("test", sampling_params=SamplingParams()):
             pass
+        logger.info("Pure diffusion OK (TP=%s)", tp_size)
     finally:
         engine.shutdown()

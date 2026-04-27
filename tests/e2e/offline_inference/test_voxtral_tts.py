@@ -42,7 +42,8 @@ MIN_AUDIO_SAMPLES = 1000
 VOICE = "casual_female"
 TEST_TEXT = "Hello, how are you?"
 
-# (model, stage_config_path, extra_omni_kwargs) for ``@pytest.mark.parametrize("omni_runner", ..., indirect=True)``
+# (model, stage_config_path, extra_omni_kwargs) for indirect parametrize on
+# ``omni_runner_function`` (function-scoped: must exit before ``AsyncOmni`` test).
 _OMNI_RUNNER_PARAM = (
     MODEL,
     STAGE_CONFIG,
@@ -67,11 +68,11 @@ def _compose_request(model_name: str, text: str, voice: str) -> dict:
 
 @pytest.mark.advanced_model
 @pytest.mark.omni
-@pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True)
+@pytest.mark.parametrize("omni_runner_function", [_OMNI_RUNNER_PARAM], indirect=True)
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-def test_voxtral_tts_offline_basic(omni_runner: OmniRunner) -> None:
-    """Test basic Voxtral TTS offline inference with a voice preset."""
-    omni = omni_runner.omni
+def test_voxtral_tts_offline_basic(omni_runner_function: OmniRunner) -> None:
+    """Offline sync path; function-scoped runner so AsyncOmni test does not overlap a live Omni."""
+    omni = omni_runner_function.omni
     inputs = _compose_request(MODEL, TEST_TEXT, VOICE)
 
     sampling_params = SamplingParams(max_tokens=2500)

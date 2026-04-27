@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""vLLM layer bootstrap for ``tests/model_executor`` to reduce duplicate CustomOp issues."""
+"""Reserved for model_executor-only hooks.
 
-from __future__ import annotations
-
-import pytest
-
-from tests.model_executor.helpers import bootstrap_vllm_layer_custom_op_modules
-
-
-def pytest_configure(config: pytest.Config) -> None:
-    bootstrap_vllm_layer_custom_op_modules()
+vLLM custom-op bootstrap runs in the root :file:`tests/conftest.py` (at import
+time, before ``pytest_plugins``) so it always precedes any test module imports.
+A subdirectory :func:`pytest_configure` hook can be too late when pytest
+collects other packages first, which re-triggers
+``vllm::flashinfer_rotary_embedding``-style duplicate registrations.
+"""

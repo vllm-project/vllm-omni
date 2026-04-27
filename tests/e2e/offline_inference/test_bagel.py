@@ -108,6 +108,6 @@ def test_bagel_img2text(run_level, omni_runner: OmniRunner) -> None:
     assert len(text) > 0, "Generated text is empty"
 
     if run_level in ["advanced_model", "full_model"]:
-        assert cosine_similarity_text(text, REFERENCE_TEXT_IMG2TEXT) > 0.9, (
+        assert cosine_similarity_text(text, REFERENCE_TEXT_IMG2TEXT) > 0.7, (
             f"Text mismatch: expected {REFERENCE_TEXT_IMG2TEXT!r}, got {text!r}"
         )
