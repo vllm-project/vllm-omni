@@ -68,7 +68,10 @@ except Exception as exc:
 def get_prompt(prompt_type="text_only"):
     prompts = {
         "text_only": "What is the capital of China? Answer in 20 words.",
-        "audio": "What is recited in the audio?",
+        # Synthetic input repeats one word (see ``generate_synthetic_audio`` / ``phrase_text``).
+        # A long free-form answer makes TTS+Whisper differ from the text stream and fails
+        # ``assert_omni_response`` cosine similarity (see ``cosine_similarity_text`` + length_harmony).
+        "audio": "What one English word is repeated in the audio? Reply with that single word only.",
     }
     return prompts.get(prompt_type, prompts["text_only"])
 
@@ -86,7 +89,7 @@ def get_max_batch_size(size_type="few"):
 def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Test audio and text input processing and text/audio output generation via OpenAI API.
-    Deploy Setting: default yaml
+    Deploy Setting: mimo_audio.yaml; per-request ``sampling_params_list`` caps max_tokens (ASR vs text assert).
     Input Modal: text + audio
     Output Modal: text + audio
     Input Setting: stream=True
@@ -99,10 +102,12 @@ def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
         content_text=get_prompt("audio"),
     )
 
+    # Two stages (thinker + talker): cap generation for stable ``assert_omni_response`` text vs Whisper transcript.
     request_config = {
         "model": omni_server.model,
         "messages": messages,
         "stream": True,
+        "sampling_params_list": [{"max_tokens": 64}, {"max_tokens": 64}],
         "key_words": {
             "audio": ["test"],
         },
@@ -119,7 +124,7 @@ def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
 def test_text_to_text_001(omni_server, openai_client) -> None:
     """
     Test text input processing and text-only output generation via OpenAI API.
-    Deploy Setting: default yaml
+    Deploy Setting: mimo_audio.yaml
     Input Modal: text
     Output Modal: text
     Datasets: few requests
