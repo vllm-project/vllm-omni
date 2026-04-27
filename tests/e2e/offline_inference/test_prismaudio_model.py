@@ -237,9 +237,9 @@ def test_prismaudio_dummy_runtime_additional_information_uses_declared_feature_d
 
     assert len(payloads) == 2
     for payload in payloads:
-        assert tuple(payload["video_features"].shape) == (1, 1024)
-        assert tuple(payload["text_features"].shape) == (1, 1024)
-        assert tuple(payload["sync_features"].shape) == (1, 768)
+        assert tuple(payload["video_features"].shape) == (1, 1, 1024)
+        assert tuple(payload["text_features"].shape) == (1, 1, 1024)
+        assert tuple(payload["sync_features"].shape) == (1, 1, 768)
 
 
 def test_prismaudio_engine_dummy_warmup_uses_synthesized_conditioning() -> None:
@@ -274,9 +274,9 @@ def test_prismaudio_engine_dummy_warmup_uses_synthesized_conditioning() -> None:
     )
 
     assert len(conditioning) == 1
-    assert tuple(conditioning[0]["video_features"].shape) == (1, 1024)
-    assert tuple(conditioning[0]["text_features"].shape) == (1, 1024)
-    assert tuple(conditioning[0]["sync_features"].shape) == (1, 768)
+    assert tuple(conditioning[0]["video_features"].shape) == (1, 1, 1024)
+    assert tuple(conditioning[0]["text_features"].shape) == (1, 1, 1024)
+    assert tuple(conditioning[0]["sync_features"].shape) == (1, 1, 768)
 
 
 def test_prismaudio_load_weights_loads_runtime_checkpoints_from_empty_weight_iterator(tmp_path: Path) -> None:

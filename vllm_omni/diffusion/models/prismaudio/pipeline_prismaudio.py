@@ -588,7 +588,7 @@ class PrismAudioPipeline(nn.Module, SupportAudioOutput):
             payload: dict[str, torch.Tensor] = {}
             for feature_name in feature_names:
                 feature_width = expected_feature_dims.get(feature_name, 1)
-                payload[feature_name] = torch.zeros((1, int(feature_width)), dtype=torch.float32)
+                payload[feature_name] = torch.zeros((1, 1, int(feature_width)), dtype=torch.float32)
             dummy_payloads.append(payload)
         return dummy_payloads
 
