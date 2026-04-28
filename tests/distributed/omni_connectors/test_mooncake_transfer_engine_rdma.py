@@ -17,6 +17,7 @@ import time
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector import (
     ManagedBuffer,
     MooncakeTransferEngineConnector,
@@ -24,7 +25,7 @@ from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_c
 )
 
 # All tests in this file require Mooncake TransferEngine and an RDMA environment.
-pytestmark = [pytest.mark.parallel, pytest.mark.gpu]
+pytestmark = [pytest.mark.parallel, pytest.mark.core_model]
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -194,7 +195,7 @@ def _md5(tensor: torch.Tensor) -> str:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(TransferEngine is None, reason="Mooncake TransferEngine not available")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 class TestBasicConnector:
     """Verify connector initialization, put, cleanup, and health check."""
 
@@ -254,7 +255,7 @@ class TestBasicConnector:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(TransferEngine is None, reason="Mooncake TransferEngine not available")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 class TestEndToEnd:
     """E2E RDMA transfer: tensor, bytes, object, zero-copy, large payload, mixed types."""
 
@@ -447,7 +448,7 @@ class TestEndToEnd:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(TransferEngine is None, reason="Mooncake TransferEngine not available")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 class TestLifecycle:
     """Close, context manager, double-close safety."""
 
@@ -475,9 +476,7 @@ class TestLifecycle:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.cuda
-@pytest.mark.skipif(TransferEngine is None, reason="Mooncake TransferEngine not available")
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 class TestGPUPool:
     """GPU memory pool: initialization, put (CPU/GPU tensor), E2E transfer."""
 
@@ -521,12 +520,11 @@ class TestGPUPool:
 
 
 # ---------------------------------------------------------------------------
-# 5. Stress / Correctness tests (marked slow, skipped in quick CI)
+# 5. Stress / Correctness tests, slow
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.slow
-@pytest.mark.skipif(TransferEngine is None, reason="Mooncake TransferEngine not available")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 class TestStressCorrectness:
     """
     Slow but high-value regression tests: concurrent put+get with data
