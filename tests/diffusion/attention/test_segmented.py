@@ -103,6 +103,34 @@ def test_segmented_matches_full(spans, q_range, batch_size):
     torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
 
 
+def test_segmented_qstart_inside_span_asserts():
+    """q_start landing inside an image span must trip the guard assert in
+    build_segments rather than silently producing a negative-start slice."""
+    torch.manual_seed(0)
+    B, H, D, Sk = 1, 2, 16, 30
+    q_start, q_end = 15, 30
+    Sq = q_end - q_start
+
+    key = torch.randn(B, Sk, H, D, device=DEVICE)
+    value = torch.randn(B, Sk, H, D, device=DEVICE)
+    query = torch.randn(B, Sq, H, D, device=DEVICE)
+
+    q_positions = torch.arange(q_start, q_end, device=DEVICE).unsqueeze(0).repeat(B, 1)
+    image_spans = [[(10, 20)] for _ in range(B)]
+    softmax_scale = 1.0 / (D**0.5)
+
+    with pytest.raises(AssertionError, match=r"span .* must be within query range"):
+        segmented_attn(
+            query,
+            key,
+            value,
+            image_spans=image_spans,
+            q_global_positions=q_positions,
+            softmax_scale=softmax_scale,
+            attn_func=_sdpa_attn_func,
+        )
+
+
 def test_segmented_span_fully_before_qstart():
     torch.manual_seed(0)
     B, H, D, Sk = 1, 2, 16, 30
