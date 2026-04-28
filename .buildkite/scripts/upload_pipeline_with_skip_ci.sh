@@ -126,7 +126,9 @@ if skip:
 else:
     rep = "'true'"
     ready_rep = "'build.branch != \"main\" && build.pull_request.labels includes \"ready\"'"
-    merge_rep = "'(build.branch == \"main\" && build.env(\"NIGHTLY\") != \"1\") || (build.branch != \"main\" && build.pull_request.labels includes \"merge-test\")'"
+    # On main, skip L3 merge when L4 nightly (NIGHTLY=1) or L5 weekly (WEEKLY=1) so scheduled tiers do not
+    # also upload the full merge pipeline.
+    merge_rep = "'(build.branch == \"main\" && build.env(\"NIGHTLY\") != \"1\" && build.env(\"WEEKLY\") != \"1\") || (build.branch != \"main\" && build.pull_request.labels includes \"merge-test\")'"
 rendered = (
     continuation
     .replace("__IMAGE_BUILD_IF__", rep)
