@@ -69,8 +69,18 @@ docker cp "${WORKSPACE_DIR}/image_ingress_scheduler_single.py" \
   "${CONTAINER}:${CTR_ROOT}/server_ingress_plugin/image_ingress_scheduler_single.py"
 docker cp "${WORKSPACE_DIR}/patch_api_server_ingress_singlefile.py" \
   "${CONTAINER}:/tmp/patch_api_server_ingress_singlefile.py"
-docker cp "${WORKSPACE_DIR}/rr_vllm_http_proxy_timing.py" "${CONTAINER}:/tmp/rr_vllm_http_proxy_timing.py"
+if [ -f "${WORKSPACE_DIR}/rr_vllm_http_proxy_timing.py" ]; then
+  docker cp "${WORKSPACE_DIR}/rr_vllm_http_proxy_timing.py" "${CONTAINER}:/tmp/rr_vllm_http_proxy_timing.py"
+else
+  log "Proxy script not found at ${WORKSPACE_DIR}/rr_vllm_http_proxy_timing.py; installing no-op fallback in container"
+  docker exec "${CONTAINER}" bash -lc "cat > /tmp/rr_vllm_http_proxy_timing.py <<'PY'
+#!/usr/bin/env python3
+import sys
 
+print('rr_vllm_http_proxy_timing.py not found in workspace; skipping proxy startup', file=sys.stderr)
+PY
+chmod +x /tmp/rr_vllm_http_proxy_timing.py"
+fi
 log "Patch api_server.py inside container (runtime only, image unchanged)"
 docker exec "${CONTAINER}" bash -lc "cd ${CTR_ROOT} && python3 /tmp/patch_api_server_ingress_singlefile.py"
 
