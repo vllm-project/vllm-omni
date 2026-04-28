@@ -24,9 +24,13 @@ _OMNI_RUNNER_PARAM = (
 
 pytestmark = [
     pytest.mark.full_model,
-    pytest.mark.omni,
+    pytest.mark.tts,
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]
+
+_SKIP_ISSUE_3168 = pytest.mark.skip(
+    reason="https://github.com/vllm-project/vllm-omni/issues/3168",
+)
 
 SAMPLE_RATE = 48000
 
@@ -73,6 +77,7 @@ def _collect_audio(omni: Omni, request: dict) -> tuple[torch.Tensor, int]:
     raise AssertionError("No stage outputs received")
 
 
+@_SKIP_ISSUE_3168
 @hardware_test(res={"cuda": "L4"})
 def test_moss_tts_nano_english(omni_runner: OmniRunner) -> None:
     """English TTS produces non-empty 48 kHz stereo audio."""
@@ -84,6 +89,7 @@ def test_moss_tts_nano_english(omni_runner: OmniRunner) -> None:
     assert not torch.all(audio == 0), "Audio should not be all-zeros (silence)"
 
 
+@_SKIP_ISSUE_3168
 @hardware_test(res={"cuda": "L4"})
 def test_moss_tts_nano_chinese(omni_runner: OmniRunner) -> None:
     """Chinese TTS produces non-empty audio."""
@@ -95,6 +101,7 @@ def test_moss_tts_nano_chinese(omni_runner: OmniRunner) -> None:
     assert not torch.all(audio == 0)
 
 
+@_SKIP_ISSUE_3168
 @hardware_test(res={"cuda": "L4"})
 def test_moss_tts_nano_deterministic(omni_runner: OmniRunner) -> None:
     """Same seed produces identical waveforms."""
@@ -106,6 +113,7 @@ def test_moss_tts_nano_deterministic(omni_runner: OmniRunner) -> None:
     assert torch.allclose(audio1, audio2, atol=1e-4), "Waveforms should match with same seed"
 
 
+@_SKIP_ISSUE_3168
 @hardware_test(res={"cuda": "L4"})
 def test_moss_tts_nano_batch(omni_runner: OmniRunner) -> None:
     """Batch of two requests returns audio for each."""
@@ -125,6 +133,7 @@ def test_moss_tts_nano_batch(omni_runner: OmniRunner) -> None:
         assert audio.numel() > 0, f"Audio {i} is empty"
 
 
+@_SKIP_ISSUE_3168
 @hardware_test(res={"cuda": "L4"})
 def test_moss_tts_nano_voice_presets(omni_runner: OmniRunner) -> None:
     """Multiple built-in voice presets all produce valid audio."""

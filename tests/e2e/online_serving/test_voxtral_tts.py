@@ -41,7 +41,7 @@ class TestVoxtralTTSFixedVoice:
     """E2E tests for Voxtral TTS model."""
 
     @pytest.mark.core_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     def test_speech_english_basic(self, omni_server, openai_client) -> None:
         """Test basic English TTS generation."""
@@ -58,7 +58,7 @@ class TestVoxtralTTSFixedVoice:
         )
 
     @pytest.mark.core_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     def test_speech_english_streaming(self, omni_server, openai_client) -> None:
         """Test basic streaming English TTS generation (PCM via streaming API)."""
@@ -76,7 +76,7 @@ class TestVoxtralTTSFixedVoice:
         )
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     def test_speech_different_voices(self, omni_server, openai_client) -> None:
         """Test TTS with different voice presets."""
@@ -94,7 +94,7 @@ class TestVoxtralTTSFixedVoice:
             )
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     def test_speech_invalid_voice_rejected(self, omni_server, openai_client) -> None:
         """Request with a non-existent voice should be rejected (HTTP 200 with JSON or 4xx, depending on server)."""

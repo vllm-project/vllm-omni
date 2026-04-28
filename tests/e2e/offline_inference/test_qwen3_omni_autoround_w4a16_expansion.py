@@ -27,6 +27,10 @@ pytestmark = [
     pytest.mark.omni,
 ]
 
+_SKIP_ISSUE_3195 = pytest.mark.skip(
+    reason="https://github.com/vllm-project/vllm-omni/issues/3195",
+)
+
 QUANTIZED_MODEL = "Intel/Qwen3-Omni-30B-A3B-Instruct-int4-AutoRound"
 BASELINE_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
@@ -74,6 +78,7 @@ quant_params = [(QUANTIZED_MODEL, stage_config)]
 # ------------------------------------------------------------------
 
 
+@_SKIP_ISSUE_3195
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_text_to_text(omni_runner, omni_runner_handler):
@@ -92,6 +97,7 @@ def test_text_to_text(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
+@_SKIP_ISSUE_3195
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_audio_to_text(omni_runner, omni_runner_handler):
@@ -115,6 +121,7 @@ def test_audio_to_text(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
+@_SKIP_ISSUE_3195
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_image_to_text(omni_runner, omni_runner_handler):
@@ -136,6 +143,7 @@ def test_image_to_text(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
+@_SKIP_ISSUE_3195
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_video_to_text(omni_runner, omni_runner_handler):
@@ -157,6 +165,7 @@ def test_video_to_text(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
+@_SKIP_ISSUE_3195
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_video_to_audio(omni_runner, omni_runner_handler):
@@ -177,6 +186,7 @@ def test_video_to_audio(omni_runner, omni_runner_handler):
 # ------------------------------------------------------------------
 
 
+@_SKIP_ISSUE_3195
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_runner", quant_params, indirect=True)
 def test_mix_to_audio(omni_runner, omni_runner_handler):

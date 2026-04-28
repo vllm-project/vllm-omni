@@ -18,7 +18,7 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+pytestmark = [pytest.mark.full_model, pytest.mark.tts]
 
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 

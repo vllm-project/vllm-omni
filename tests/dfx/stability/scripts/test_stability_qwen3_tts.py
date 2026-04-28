@@ -35,6 +35,7 @@ benchmark_indices = create_benchmark_indices(BENCHMARK_CONFIGS, server_to_benchm
 
 
 @pytest.mark.slow
+@pytest.mark.tts
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.parametrize("stability_benchmark_params", benchmark_indices, indirect=True)
 def test_stability_qwen3_tts(omni_server, stability_benchmark_params):

@@ -67,7 +67,7 @@ def _compose_request(model_name: str, text: str, voice: str) -> dict:
 
 
 @pytest.mark.advanced_model
-@pytest.mark.omni
+@pytest.mark.tts
 @pytest.mark.parametrize("omni_runner_function", [_OMNI_RUNNER_PARAM], indirect=True)
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_voxtral_tts_offline_basic(omni_runner_function: OmniRunner) -> None:
@@ -111,7 +111,7 @@ def test_voxtral_tts_offline_basic(omni_runner_function: OmniRunner) -> None:
 
 
 @pytest.mark.advanced_model
-@pytest.mark.omni
+@pytest.mark.tts
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_voxtral_tts_offline_streaming():
     """Test AsyncOmni streaming inference for Voxtral TTS."""

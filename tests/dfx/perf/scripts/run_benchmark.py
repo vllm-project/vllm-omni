@@ -17,7 +17,7 @@ from tests.dfx.conftest import (
 )
 from tests.helpers.runtime import OmniServer
 
-pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+pytestmark = [pytest.mark.full_model]
 
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"

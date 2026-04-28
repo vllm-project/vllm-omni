@@ -26,7 +26,7 @@ try:
 except ImportError:
     _HAS_VOICE_CLONE = False
 
-pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+pytestmark = [pytest.mark.full_model, pytest.mark.tts]
 
 MODEL = "k2-fsa/OmniVoice"
 

@@ -19,7 +19,11 @@ from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
 # ``omni`` for all tests; 001/002 also get ``full_model`` via ``TestMossTtsNanoFull`` (003 is core+advanced only, no full_model).
-pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+pytestmark = [pytest.mark.full_model, pytest.mark.tts]
+
+_SKIP_ISSUE_3168 = pytest.mark.skip(
+    reason="https://github.com/vllm-project/vllm-omni/issues/3168",
+)
 
 MODEL = "OpenMOSS-Team/MOSS-TTS-Nano"
 
@@ -45,6 +49,7 @@ tts_server_params = [
 ]
 
 
+@_SKIP_ISSUE_3168
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_server, openai_client) -> None:
@@ -89,6 +94,7 @@ def test_text_to_audio_002(omni_server, openai_client) -> None:
     openai_client.send_audio_speech_request(request_config)
 
 
+@_SKIP_ISSUE_3168
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", tts_server_params, indirect=True)
 def test_text_to_audio_003(omni_server, openai_client) -> None:

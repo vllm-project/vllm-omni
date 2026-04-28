@@ -153,7 +153,7 @@ _OMNI_RUNNER_PARAMS = [
 ]
 pytestmark = [
     pytest.mark.full_model,
-    pytest.mark.omni,
+    pytest.mark.tts,
     pytest.mark.parametrize("omni_runner", _OMNI_RUNNER_PARAMS, indirect=True),
 ]
 

@@ -23,6 +23,10 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 pytestmark = [pytest.mark.omni, pytest.mark.full_model]
 
+_SKIP_NEED_4_H100_NOT_CI = pytest.mark.skip(
+    reason="Requires 4x H100 GPUs; skipped in CI for now.",
+)
+
 models = ["Jonathan1909/Ming-flash-omni-2.0"]
 
 
@@ -76,6 +80,7 @@ def get_max_batch_size(size_type="few"):
     return batch_sizes.get(size_type, 5)
 
 
+@_SKIP_NEED_4_H100_NOT_CI
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, openai_client) -> None:
@@ -101,6 +106,7 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
+@_SKIP_NEED_4_H100_NOT_CI
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_stream_001(omni_server, openai_client) -> None:
@@ -126,6 +132,7 @@ def test_text_to_text_stream_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
+@_SKIP_NEED_4_H100_NOT_CI
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_image_to_text_001(omni_server, openai_client) -> None:
@@ -152,6 +159,7 @@ def test_image_to_text_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
+@_SKIP_NEED_4_H100_NOT_CI
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_audio_to_text_001(omni_server, openai_client) -> None:
@@ -178,6 +186,7 @@ def test_audio_to_text_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
+@_SKIP_NEED_4_H100_NOT_CI
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_video_to_text_001(omni_server, openai_client) -> None:
@@ -204,6 +213,7 @@ def test_video_to_text_001(omni_server, openai_client) -> None:
     openai_client.send_omni_request(request_config)
 
 
+@_SKIP_NEED_4_H100_NOT_CI
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_mix_to_text_001(omni_server, openai_client) -> None:

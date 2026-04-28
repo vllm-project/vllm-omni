@@ -80,7 +80,7 @@ class TestSpeakerEmbeddingBase:
     """Speaker embedding tests against the 0.6B-Base model (supports Base task)."""
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speaker_embedding_produces_audio(self, omni_server) -> None:
         """speaker_embedding with Base task produces valid WAV audio."""
@@ -103,7 +103,7 @@ class TestSpeakerEmbeddingBase:
         assert len(response.content) > MIN_AUDIO_BYTES, f"Audio too small: {len(response.content)} bytes"
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speaker_embedding_pcm_not_silence(self, omni_server) -> None:
         """speaker_embedding PCM output contains real audio, not all-silence."""
@@ -125,7 +125,7 @@ class TestSpeakerEmbeddingBase:
         assert_not_silence(response.content)
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speaker_embedding_streaming(self, omni_server) -> None:
         """speaker_embedding works with streaming PCM output."""
@@ -149,7 +149,7 @@ class TestSpeakerEmbeddingBase:
         assert_not_silence(response.content)
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speaker_embedding_mutually_exclusive_with_ref_audio(self, omni_server) -> None:
         """Sending both speaker_embedding and ref_audio returns 400."""
@@ -169,7 +169,7 @@ class TestSpeakerEmbeddingBase:
         assert "mutually exclusive" in response.text
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_speaker_embedding_empty_rejected(self, omni_server) -> None:
         """Empty speaker_embedding list returns 400."""
@@ -196,7 +196,7 @@ class TestSpeakerEmbedding1_7B:
     """Speaker embedding tests against the 1.7B-Base model (2048-dim embeddings)."""
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_2048_dim_embedding_produces_audio(self, omni_server) -> None:
         """2048-dim speaker_embedding with 1.7B-Base model produces valid WAV audio."""
@@ -219,7 +219,7 @@ class TestSpeakerEmbedding1_7B:
         assert len(response.content) > MIN_AUDIO_BYTES, f"Audio too small: {len(response.content)} bytes"
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
     def test_1024_dim_on_1_7b_model_rejected_or_errors(self, omni_server) -> None:
         """1024-dim embedding on a 1.7B model (expects 2048) should fail gracefully."""

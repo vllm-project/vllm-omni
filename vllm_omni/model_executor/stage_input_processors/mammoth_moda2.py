@@ -19,9 +19,32 @@ def ar2dit(
     source_stage_id = engine_input_source[0]
     ar_outputs = stage_list[source_stage_id].engine_outputs
 
+    # Orchestrator passes ``req_state.prompt`` which is often the original user dict
+    # ``{"prompt": ..., "additional_information": {...}}``.  ``zip(outputs, dict)``
+    # iterates dict *keys* (strings), not rows — normalize to a list first.
+    if prompts is None:
+        raise ValueError("ar2dit: prompts is required")
+    if isinstance(prompts, str):
+        raise TypeError(
+            "ar2dit: prompts cannot be a bare string; expected dict or list of dicts "
+            "with additional_information from the stage-0 request."
+        )
+    prompt_list: list[Any] = list(prompts) if isinstance(prompts, list) else [prompts]
+
+    if len(prompt_list) != len(ar_outputs):
+        raise ValueError(f"ar2dit: prompt batch length ({len(prompt_list)}) != AR outputs ({len(ar_outputs)})")
+
     dit_inputs: list[OmniTokensPrompt] = []
-    for ar_output, prompt in zip(ar_outputs, prompts):
-        addi_info = prompt["additional_information"]
+    for ar_output, prompt in zip(ar_outputs, prompt_list):
+        if isinstance(prompt, dict):
+            addi_info = prompt.get("additional_information")
+        else:
+            addi_info = getattr(prompt, "additional_information", None)
+        if addi_info is None:
+            raise ValueError(
+                "ar2dit: missing additional_information on prompt; ensure stage-0 requests "
+                "include additional_information (omni_task, ar_width, image_height, ...)."
+            )
         image_height = addi_info["image_height"][0]
         image_width = addi_info["image_width"][0]
         text_guidance_scale = addi_info["text_guidance_scale"][0]

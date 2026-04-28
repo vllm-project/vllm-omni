@@ -88,7 +88,7 @@ class TestSpeechBatchE2E:
     """E2E tests for /v1/audio/speech/batch endpoint."""
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_basic_two_items(self, omni_server) -> None:
@@ -122,7 +122,7 @@ class TestSpeechBatchE2E:
             assert len(audio_bytes) > MIN_AUDIO_BYTES, f"Item {i}: audio too small ({len(audio_bytes)} bytes)"
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_single_item(self, omni_server) -> None:
@@ -144,7 +144,7 @@ class TestSpeechBatchE2E:
         assert data["results"][0]["status"] == "success"
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_per_item_voice_override(self, omni_server) -> None:
@@ -172,7 +172,7 @@ class TestSpeechBatchE2E:
             assert verify_wav_bytes(audio_bytes)
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_multiple_languages(self, omni_server) -> None:
@@ -197,7 +197,7 @@ class TestSpeechBatchE2E:
             assert len(audio_bytes) > MIN_AUDIO_BYTES
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_whisper_transcription(self, omni_server) -> None:
@@ -232,7 +232,7 @@ class TestSpeechBatchE2E:
             os.unlink(wav_path)
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_result_indices_ordered(self, omni_server) -> None:
@@ -259,7 +259,7 @@ class TestSpeechBatchValidation:
     """Validation / error-handling tests for the batch endpoint."""
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_empty_items_rejected(self, omni_server) -> None:
@@ -273,7 +273,7 @@ class TestSpeechBatchValidation:
         assert response.status_code in (400, 422)
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     @pytest.mark.parametrize("omni_server", default_server_params, indirect=True)
     def test_batch_exceeds_max_items(self, omni_server) -> None:
@@ -331,7 +331,7 @@ class TestSpeechBatchSize2:
     """E2E tests with max_batch_size=2 to verify true batched inference."""
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     @pytest.mark.parametrize("omni_server", batch2_server_params, indirect=True)
     def test_batch2_produces_valid_audio(self, omni_server) -> None:
@@ -368,7 +368,7 @@ class TestSpeechBatchSize2:
         print(f"\nBatch audio saved to: {output_dir}")
 
     @pytest.mark.advanced_model
-    @pytest.mark.omni
+    @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
     @pytest.mark.parametrize("omni_server", batch2_server_params, indirect=True)
     def test_batch2_vs_sequential_timing(self, omni_server) -> None:

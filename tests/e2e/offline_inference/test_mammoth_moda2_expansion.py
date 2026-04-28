@@ -4,10 +4,10 @@ End-to-end test for MammothModa2 text-to-image generation.
 Verifies that the AR->DiT pipeline produces an image tensor whose pixel values
 match a golden reference.
 
-Model weights: env var ``MAMMOTHMODA2_MODEL_PATH``
-  (default: <repo_root>/MammothModa2-Preview)
+Model Hub repo id: env var ``MAMMOTHMODA2_MODEL_PATH`` (must be a Hugging Face repo id;
+  default: ``bytedance-research/MammothModa2-Preview``)
 Stage config:  env var ``MAMMOTHMODA2_T2I_STAGE_CONFIG``
-  (default: vllm_omni/model_executor/stage_configs/mammoth_moda2.yaml)
+  (default: ``get_deploy_config_path("mammoth_moda2.yaml")`` → ``vllm_omni/deploy/mammoth_moda2.yaml``)
 
 Golden pixel file: ``tests/e2e/offline_inference/fixtures/mammoth_moda2_t2i_golden.json``
   Regenerate with: ``UPDATE_GOLDEN=1 pytest .../test_mammoth_moda2_expansion.py``
@@ -21,10 +21,12 @@ from pathlib import Path
 
 import pytest
 import torch
+from huggingface_hub import snapshot_download
 from vllm.sampling_params import SamplingParams
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -35,15 +37,8 @@ _VISION_START_TOKEN_ID = 151652  # "<|vision_start|>"
 _VISION_END_TOKEN_ID = 151653  # "<|vision_end|>"
 _AR_PATCH_SIZE = 16
 
-_STAGE_CONFIGS_DIR = Path(__file__).resolve().parents[3] / "vllm_omni" / "model_executor" / "stage_configs"
-MODEL_PATH = os.environ.get(
-    "MAMMOTHMODA2_MODEL_PATH",
-    str(Path(__file__).resolve().parents[3] / "MammothModa2-Preview"),
-)
-T2I_STAGE_CONFIG = os.environ.get(
-    "MAMMOTHMODA2_T2I_STAGE_CONFIG",
-    str(_STAGE_CONFIGS_DIR / "mammoth_moda2.yaml"),
-)
+MODEL_PATH = "bytedance-research/MammothModa2-Preview"
+T2I_STAGE_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
 
 _OMNI_RUNNER_PARAM = (MODEL_PATH, T2I_STAGE_CONFIG, {"trust_remote_code": True})
 
@@ -70,8 +65,9 @@ _PIXEL_SAMPLE_COORDS = [
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _load_t2i_gen_config(model_dir: str) -> dict:
-    cfg_path = Path(model_dir) / "t2i_generation_config.json"
+def _load_t2i_gen_config(repo_id: str) -> dict:
+    weights_dir = Path(snapshot_download(repo_id))
+    cfg_path = weights_dir / "t2i_generation_config.json"
     if not cfg_path.exists():
         pytest.skip(f"t2i_generation_config.json not found at {cfg_path}")
     with cfg_path.open() as f:
