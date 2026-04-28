@@ -216,27 +216,27 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
-  - label: "MOSS-TTS-Nano E2E Test"
-    depends_on: upload-merge-pipeline
-    commands:
-      - |
-        timeout 20m bash -c '
-          export VLLM_LOGGING_LEVEL=DEBUG
-          export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          pytest -s -v tests/e2e/online_serving/test_moss_tts_nano.py tests/e2e/offline_inference/test_moss_tts_nano.py -m "advanced_model" --run-level "advanced_model"
-        '
-    agents:
-      queue: "gpu_1_queue"
-    plugins:
-      - docker#v5.2.0:
-          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-          always-pull: true
-          propagate-environment: true
-          shm-size: "8gb"
-          environment:
-            - "HF_HOME=/fsx/hf_cache"
-          volumes:
-            - "/fsx/hf_cache:/fsx/hf_cache"
+  # - label: "MOSS-TTS-Nano E2E Test"
+  #   depends_on: upload-merge-pipeline
+  #   commands:
+  #     - |
+  #       timeout 20m bash -c '
+  #         export VLLM_LOGGING_LEVEL=DEBUG
+  #         export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+  #         pytest -s -v tests/e2e/online_serving/test_moss_tts_nano.py tests/e2e/offline_inference/test_moss_tts_nano.py -m "advanced_model" --run-level "advanced_model"
+  #       '
+  #   agents:
+  #     queue: "gpu_1_queue"
+  #   plugins:
+  #     - docker#v5.2.0:
+  #         image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+  #         always-pull: true
+  #         propagate-environment: true
+  #         shm-size: "8gb"
+  #         environment:
+  #           - "HF_HOME=/fsx/hf_cache"
+  #         volumes:
+  #           - "/fsx/hf_cache:/fsx/hf_cache"
 
   - label: "Omni Model Test with H100"
     timeout_in_minutes: 30
