@@ -492,39 +492,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         ref_sr = None
         if request.ref_audio is not None:
             ref_audio, ref_sr = await self._resolve_ref_audio(request.ref_audio)
-        # VoxCPM2 uses a text-prefix convention for style/voice instructions:
-        # the native CLI wraps the instruction in parens and prepends it.
-        # Mirror that here so `instructions` works through the OpenAI endpoint.
-        # The Hi-Fi Cloning mode (ref_audio + ref_text) + instructions combo
-        # is rejected upstream in `_validate_tts_request`, so by the time we
-        # reach this builder we can assume the combination is valid.
-        text = request.input
-        if request.instructions:
-            text = f"({request.instructions.strip()}){text}"
-        prompt = build_voxcpm2_prompt(
+        return build_voxcpm2_prompt(
             hf_config=self.engine_client.model_config.hf_config,
             tokenizer=self._voxcpm2_tokenizer,
             split_map=self._voxcpm2_split_map,
-            text=text,
+            text=request.input,
             ref_audio=ref_audio,
             ref_sr=ref_sr,
             ref_text=request.ref_text,
         )
-        # Per-request cfg_value threads via additional_information; the talker
-        # lifts it onto _RequestState in preprocess() and uses it in _run_cfm.
-        # Following the convention from #2338 (Voxtral TTS / cfg_alpha), the
-        # value is provided via the shared `extra_params` dict rather than as
-        # a top-level protocol field, keeping OpenAICreateSpeechRequest free
-        # of model-specific knobs.
-        if request.extra_params and "cfg_value" in request.extra_params:
-            try:
-                cfg_value = float(request.extra_params["cfg_value"])
-            except (TypeError, ValueError) as e:
-                raise ValueError(f"extra_params['cfg_value'] must be a number: {e}") from e
-            if not 0.1 <= cfg_value <= 10.0:
-                raise ValueError(f"extra_params['cfg_value']={cfg_value} out of range (0.1-10.0)")
-            prompt.setdefault("additional_information", {})["cfg_value"] = cfg_value
-        return prompt
 
     def _get_uploaded_audio_data(self, voice_name: str) -> str | None:
         """Get base64 encoded audio data for uploaded voice."""
@@ -880,27 +856,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if self._tts_model_type == "voxcpm":
             return self._validate_voxcpm_request(request)
         if self._tts_model_type == "voxcpm2":
-            # Hi-Fi Cloning mode (`ref_audio` + `ref_text`) does not use the
-            # control instruction. Upstream voxcpm CLI errors out on the same
-            # combination (src/voxcpm/cli.py:128-131: --control cannot be used
-            # together with --prompt-text); we surface a 400 to match instead
-            # of silently dropping user input.
-            if request.instructions and request.ref_text:
-                return (
-                    "`instructions` is incompatible with `ref_text` in Hi-Fi Cloning "
-                    "mode (the control instruction is ignored when ref_text is set)."
-                )
-            # Cap `instructions` length for parity with qwen3_tts / voxtral /
-            # fish_tts (prevents blowing the prefill budget via an unbounded
-            # parenthetical prefix). Upstream voxcpm has no cap; this is a
-            # serving-side safety net, see PR #3118 discussion.
-            if request.instructions and len(request.instructions) > self._max_instructions_length:
-                return (
-                    f"Instructions too long ({len(request.instructions)}/"
-                    f"{self._max_instructions_length} chars). Upstream voxcpm has no cap; "
-                    f"this limit prevents exceeding the prefill budget."
-                )
-            return None
+            return None  # VoxCPM2 accepts any text input
         if self._tts_model_type == "ming_flash_omni_tts":
             return self._validate_ming_tts_request(request)
         if self._tts_model_type == "moss_tts_nano":
@@ -1761,12 +1717,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.instructions:
                 prompt["instruct"] = request.instructions
         elif self._tts_model_type == "voxcpm2":
-            # Run the same validator the batch endpoint uses so single-request
-            # /v1/audio/speech enforces the instructions-length cap and any
-            # other voxcpm2-specific checks (e.g. Hi-Fi mode + instructions).
-            validation_error = self._validate_tts_request(request)
-            if validation_error:
-                raise ValueError(validation_error)
             prompt = await self._build_voxcpm2_prompt(request)
             tts_params = {}
         elif self._is_tts:
