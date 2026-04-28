@@ -10,7 +10,7 @@ steps:
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "omni-test"
     steps:
-      - label: ":full_moon: Omni · Function Test"
+      - label: ":full_moon: Omni · Function Test with H100"
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/e2e/ -m "full_model and H100 and omni" --run-level "full_model" --ignore=tests/e2e/accuracy
@@ -47,6 +47,25 @@ steps:
                     hostPath:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
+
+      - label: ":full_moon: Omni · Function Test with L4"
+        timeout_in_minutes: 90
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - pytest -s -v tests/e2e/*/test_qwen2_5_omni_expansion.py --run-level "core_model"
+        agents:
+          queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              shm-size: "8gb"
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
 
       - label: ":full_moon: Omni · Doc Test with L4"
         timeout_in_minutes: 90
@@ -205,7 +224,7 @@ steps:
         timeout_in_minutes: 90
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - pytest -s -v tests/e2e/ -m "full_model and L4 and omni" --run-level "full_model" --ignore=tests/e2e/accuracy
+          - pytest -s -v tests/e2e/ -m "full_model and L4 and omni" -k "not test_qwen2_5" --run-level "full_model" --ignore=tests/e2e/accuracy
         agents:
           queue: "gpu_1_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
         plugins:

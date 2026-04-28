@@ -274,9 +274,9 @@ class _LazyPipelineRegistry:
 
     def _get_lazy_map(self) -> dict[str, tuple[str, str]]:
         if self._lazy_map is None:
-            from vllm_omni.config.pipeline_registry import _VLLM_OMNI_PIPELINES
+            from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
 
-            self._lazy_map = _VLLM_OMNI_PIPELINES
+            self._lazy_map = _OMNI_PIPELINES
         return self._lazy_map
 
     def _load_lazy(self, model_type: str) -> PipelineConfig | None:
@@ -374,7 +374,7 @@ _PIPELINE_REGISTRY = _LazyPipelineRegistry()
 def register_pipeline(pipeline: PipelineConfig) -> None:
     """Register a pipeline config dynamically.
 
-    In-tree pipelines are declared in ``pipeline_registry._VLLM_OMNI_PIPELINES``
+    In-tree pipelines are declared in ``pipeline_registry._OMNI_PIPELINES``
     and loaded lazily; calling ``register_pipeline`` is only needed for
     out-of-tree plugins or tests that build a ``PipelineConfig`` at runtime.
     A dynamic registration overrides the central-registry entry with the same
@@ -439,7 +439,7 @@ class DeployConfig:
 
     # === Pipeline-wide engine settings (applied uniformly to every stage) ===
     trust_remote_code: bool = True
-    distributed_executor_backend: str = "mp"
+    distributed_executor_backend: str | None = None
     dtype: str | None = None
     quantization: str | None = None
     enable_prefix_caching: bool = False
@@ -601,23 +601,6 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     return DeployConfig(**kwargs)
 
 
-def _detect_platform() -> str | None:
-    """Return "npu", "rocm", "xpu", or None (CUDA default)."""
-    try:
-        from vllm.platforms import current_platform
-
-        name = current_platform.device_name.lower()
-        if "npu" in name:
-            return "npu"
-        if "rocm" in name or "amd" in name:
-            return "rocm"
-        if "xpu" in name:
-            return "xpu"
-    except Exception as e:
-        logger.debug("Platform auto-detect failed, falling back to CUDA: %s", e)
-    return None
-
-
 def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
     """Return ``(overrides, devices)`` from a platform stage entry.
 
@@ -636,7 +619,9 @@ def _apply_platform_overrides(
 ) -> DeployConfig:
     """Merge platform-specific stage overrides into deploy config."""
     if platform is None:
-        platform = _detect_platform()
+        from vllm_omni.platforms import current_omni_platform
+
+        platform = current_omni_platform.device_name.lower()
     if platform is None or deploy.platforms is None:
         return deploy
     platform_section = deploy.platforms.get(platform)
