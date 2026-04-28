@@ -377,5 +377,9 @@ class ImageIngressDispatcherService:
         )
         return await self._adapter.submit(payload)
 
-    async def _execute_batch(self, req_type: RequestType, payloads: list[ImageIngressPayload]) -> list[ImageIngressResult]:
+    async def _execute_batch(
+    self,
+    req_type: RequestType,
+    payloads: list[ImageIngressPayload],
+) -> list[ImageIngressResult]:
         return await self._batch_execute_fn(req_type, payloads)
