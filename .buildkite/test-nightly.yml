@@ -566,22 +566,23 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
-      - label: ":full_moon: Diffusion Batching Test"
-        timeout_in_minutes: 20
-        commands:
-          - pytest -s -v tests/diffusion/batching/test_diffusion_batching.py -m "diffusion" --run-level "full_model"
-        agents:
-          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
-        plugins:
-          - docker#v5.2.0:
-              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-              always-pull: true
-              propagate-environment: true
-              environment:
-                - "HF_HOME=/fsx/hf_cache"
-                - "HF_TOKEN"
-              volumes:
-                - "/fsx/hf_cache:/fsx/hf_cache"
+  - label: ":full_moon: Diffusion Batching Test"
+    if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "diffusion-x2iat-test"
+    timeout_in_minutes: 20
+    commands:
+      - pytest -s -v tests/diffusion/batching/test_diffusion_batching.py -m "diffusion" --run-level "full_model"
+    agents:
+      queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
 
   # Diffusion x2v only (Wan, HunyuanVideo, …). x2i/x2a/x2t live in the X2I group above, not here.
   - group: ":card_index_dividers: Diffusion X2V Model Test"

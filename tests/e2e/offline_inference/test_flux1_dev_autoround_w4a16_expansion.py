@@ -26,6 +26,10 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
+pytestmark = pytest.mark.skip(
+    reason="Current Hugging Face account is not yet authorized to access this model.",
+)
+
 QUANTIZED_MODEL = "vllm-project-org/FLUX.1-dev-AutoRound-w4a16"
 BASELINE_MODEL = "black-forest-labs/FLUX.1-dev"
 
