@@ -174,6 +174,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
+                
                 logger.debug(
                     "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
                     "should_ubatch: %s, num_tokens_across_dp: %s",
