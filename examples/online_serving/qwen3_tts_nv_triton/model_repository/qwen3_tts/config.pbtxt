@@ -40,10 +40,9 @@ instance_group [
     kind: KIND_GPU
   }
 ]
-# Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
 parameters {
   key: "vllm_model_path"
-  value: { string_value: "/workspace/server/examples/online_serving/qwen3_tts_nv_triton/Qwen3-TTS-12Hz-1.7B-CustomVoice" }
+  value: { string_value: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice" }
 }
 parameters {
   key: "default_speaker"
