@@ -83,7 +83,12 @@ class OpenAICreateSpeechRequest(BaseModel):
     )
     extra_params: dict[str, Any] | None = Field(
         default=None,
-        description=("Optional model-specific parameters passed directly to the model's extra_args."),
+        description=(
+            "Optional model-specific parameters passed directly to the model's extra_args. "
+            "VoxCPM2 reads `cfg_value` (float in 0.1-10.0; default 2.0) from this dict to set "
+            "the classifier-free guidance scale per request; Voxtral TTS reads `cfg_alpha` here "
+            "the same way."
+        ),
     )
 
     @field_validator("stream_format")
