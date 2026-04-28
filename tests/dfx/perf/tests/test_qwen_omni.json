@@ -316,7 +316,8 @@
         "test_name": "test_qwen3_omni_vllm_text",
         "server_params": {
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-            "use_omni": false
+            "use_omni": false,
+            "extra_cli_args": ["--no-enable-prefix-caching"]
         },
         "benchmark_params": [
             {
