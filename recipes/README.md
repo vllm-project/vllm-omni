@@ -27,6 +27,8 @@ recipes/
 
 - [`Qwen/Qwen3-Omni.md`](./Qwen/Qwen3-Omni.md): online serving recipe for
   multimodal chat on `1x A100 80GB`
+- [`Tencent-Hunyuan/HunyuanVideo.md`](./Tencent-Hunyuan/HunyuanVideo.md):
+  offline text-to-video recipe for HunyuanVideo-1.5 on `1x A100 80GB`
 - [`Wan-AI/Wan2.2-I2V.md`](./Wan-AI/Wan2.2-I2V.md): image-to-video serving
   recipe for Wan2.2 14B on `8x Ascend NPU (A2/A3)`
 - [`inclusionAI/Ming-flash-omni-2.0.md`](./inclusionAI/Ming-flash-omni-2.0.md):

@@ -1,4 +1,4 @@
-# HunyuanVideo-1.5 for text-to-video on 1x A100 80GB
+# HunyuanVideo-1.5 for text-to-video
 
 ## Summary
 
@@ -19,6 +19,10 @@ sample on one 80 GB A100.
   [`docs/user_guide/examples/offline_inference/text_to_video.md`](../../docs/user_guide/examples/offline_inference/text_to_video.md)
 - Related example under `examples/`:
   [`examples/offline_inference/text_to_video/text_to_video.py`](../../examples/offline_inference/text_to_video/text_to_video.py)
+- Related online serving examples:
+  [`examples/online_serving/text_to_video/run_server_hunyuan_video_15.sh`](../../examples/online_serving/text_to_video/run_server_hunyuan_video_15.sh)
+  and
+  [`examples/online_serving/text_to_video/run_curl_hunyuan_video_15.sh`](../../examples/online_serving/text_to_video/run_curl_hunyuan_video_15.sh)
 - Related issue or discussion:
   [RFC: add recipes folder](https://github.com/vllm-project/vllm-omni/issues/2645)
 
@@ -86,5 +90,9 @@ Saved generated video to hunyuan_video_15_output.mp4
 - Key flags: `--tensor-parallel-size 1` keeps the model on one GPU.
   `--vae-use-tiling` and `--vae-use-slicing` were used for the validated
   480p command.
+- Online serving: HunyuanVideo-1.5 T2V has online serving examples under
+  `examples/online_serving/text_to_video/`. This recipe remains scoped to the
+  offline command above because that was the path validated for this 1x A100
+  run.
 - Known limitations: This recipe covers only the 480p command with VAE tiling
   and slicing. The no-tiling/no-slicing and 720p variants are not covered here.
