@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import queue
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -163,6 +165,31 @@ class FakeAsyncOmniEngine:
 def _patch_engine(monkeypatch: pytest.MonkeyPatch, engine: FakeAsyncOmniEngine) -> None:
     monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", lambda *args, **kwargs: engine)
     monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
+
+
+def test_from_cli_args_only_nulls_untyped_override_fields(monkeypatch: pytest.MonkeyPatch):
+    from vllm_omni.entrypoints.omni import Omni
+
+    captured: dict[str, Any] = {}
+
+    def fake_engine(*args: Any, **kwargs: Any) -> FakeAsyncOmniEngine:
+        captured.update(kwargs)
+        return FakeAsyncOmniEngine()
+
+    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.AsyncOmniEngine", fake_engine)
+    monkeypatch.setattr("vllm_omni.entrypoints.omni_base.omni_snapshot_download", lambda model: model)
+    monkeypatch.setattr("sys.argv", ["prog"])
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--hsdp-shard-size", type=int, default=-1)
+    args = parser.parse_args([])
+    args.model = "fake-model"
+
+    Omni.from_cli_args(args, parser=parser)
+
+    assert captured["gpu_memory_utilization"] is None
+    assert captured["hsdp_shard_size"] == -1
 
 
 def _make_base():
@@ -331,6 +358,18 @@ def _enqueue_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> 
             "request_id": msg["request_id"],
             "stage_id": 0,
             "error": "engine boom",
+        }
+    )
+
+
+def _enqueue_fatal_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
+    engine.output_q.put_nowait(
+        {
+            "type": "error",
+            "fatal": True,
+            "request_id": msg["request_id"],
+            "stage_id": 2,
+            "error": "engine dead",
         }
     )
 
@@ -546,17 +585,21 @@ async def test_async_omni_abort_forwards_to_engine(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.asyncio
-async def test_async_omni_propagates_engine_error(monkeypatch: pytest.MonkeyPatch):
-    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META, on_add_request=_enqueue_error_message)
+async def test_async_omni_propagates_fatal_error_context(monkeypatch: pytest.MonkeyPatch):
+    engine = FakeAsyncOmniEngine(stage_metadata=THREE_STAGE_META, on_add_request=_enqueue_fatal_error_message)
     _patch_engine(monkeypatch, engine)
 
     app = AsyncOmni("dummy-model")
     try:
-        with pytest.raises(RuntimeError, match="engine boom"):
+        with pytest.raises(EngineDeadError, match="engine dead") as exc_info:
             async for _ in app.generate(prompt="hello", request_id="req-1"):
                 pass
     finally:
         app.shutdown()
+
+    assert isinstance(exc_info.value, OmniEngineDeadError)
+    assert str(exc_info.value) == "engine dead"
+    assert getattr(exc_info.value, "error_stage_id") == 2
 
 
 def test_omni_generate_py_generator_yields_final_outputs_for_each_request(monkeypatch: pytest.MonkeyPatch):

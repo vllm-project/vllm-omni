@@ -14,7 +14,7 @@ import multiprocessing as mp
 import os
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from vllm.logger import init_logger
@@ -29,6 +29,7 @@ from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.quantization.inc_config import OmniINCConfig
 
 logger = init_logger(__name__)
 
@@ -459,6 +460,11 @@ def build_vllm_config(
     )
     executor_class = Executor.get_class(vllm_config)
 
+    # Upgrade vanilla INCConfig to OmniINCConfig for multi-stage models.
+    upgraded = OmniINCConfig.maybe_upgrade(vllm_config.quant_config)
+    if upgraded is not vllm_config.quant_config:
+        vllm_config = replace(vllm_config, quant_config=upgraded)
+
     return vllm_config, executor_class
 
 
@@ -595,12 +601,22 @@ def release_device_locks(lock_fds: list[int]) -> None:
 
 
 def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> Any:
-    """Load omni transfer config from an explicit path or resolved model config."""
+    """Load omni transfer config from an explicit path or resolved model config.
+
+    Resolves ``base_config`` inheritance (CI overlay → base deploy YAML) so
+    that connectors defined in the base config are visible to the transfer
+    config parser.
+    """
     from vllm_omni.distributed.omni_connectors import load_omni_transfer_config
 
     try:
         resolved_config_path = config_path or resolve_model_config_path(model)
-        return load_omni_transfer_config(resolved_config_path)
+        if resolved_config_path is None:
+            return None
+        from vllm_omni.config.stage_config import resolve_deploy_yaml
+
+        resolved_dict = resolve_deploy_yaml(resolved_config_path)
+        return load_omni_transfer_config(config_dict=resolved_dict)
     except Exception as e:
         logger.warning("[stage_init] Failed to load transfer config: %s", e)
         return None

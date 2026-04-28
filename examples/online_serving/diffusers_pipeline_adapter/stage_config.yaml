@@ -1,0 +1,31 @@
+# Example stage config for diffusers backend
+# This config demonstrates serving Stable Diffusion 1.5 via the diffusers adapter.
+# Users should copy and modify this for their own models.
+
+model_type: diffusion
+
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    engine_args:
+      model_stage: diffusion
+      model: "stable-diffusion-v1-5/stable-diffusion-v1-5"
+      distributed_executor_backend: "mp"
+      # gpu_memory_utilization: 0.9
+      engine_output_type: image
+      # Select the HF diffusers adapter
+      diffusion_load_format: "diffusers"
+      # model_class_name: "DiffusersAdapterPipeline" # default when diffusion_load_format is diffusers
+      diffusers_load_kwargs:
+        # Passed to DiffusionPipeline.from_pretrained().
+        # Good for model-specific loading parameters not covered by OmniDiffusionConfig.
+        # During model load time, parameters here override their counterparts in the vLLM-Omni interface.
+        use_safetensors: true
+      diffusers_call_kwargs:
+        # Passed to pipeline.__call__().
+        # Good for model-specific sampling parameters not covered by OmniDiffusionSamplingParams.
+        # During request time, parameters here are overridden by the counterparts in OmniDiffusionSamplingParams.
+        num_inference_steps: 30
+        guidance_scale: 7.5
+    final_output: true
+    final_output_type: image

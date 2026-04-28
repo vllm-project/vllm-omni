@@ -318,7 +318,7 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         top = outputs[0]
         label = str(top.get("label", "")).lower()
         conf = float(top.get("score", 0.0))
-        if conf < 0.5:
+        if conf < 0.6:
             gender = "unknown"
         elif ("female" in label) or ("жен" in label):
             gender = "female"

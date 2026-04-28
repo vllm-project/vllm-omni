@@ -1,6 +1,7 @@
 import torch
 from vllm.inputs import TextPrompt
 
+from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 TALKER_CODEC_PAD_TOKEN_ID = 8292
@@ -32,17 +33,21 @@ def thinker2talker(
     for i, thinker_output in enumerate(thinker_outputs):
         output = thinker_output.outputs[0]
         prompt_token_ids = thinker_output.prompt_token_ids
-        thinker_output_ids = output.token_ids
+        thinker_output_ids = output.cumulative_token_ids
         prompt_token_ids_len = len(prompt_token_ids)
-        latent = output.multimodal_output["latent"]
+        mm: OmniPayload = output.multimodal_output
+        latent = mm["latent"]
         thinker_hidden_states = latent.clone().detach().to(latent.device)
         additional_information = {
-            "thinker_result": thinker_hidden_states[prompt_token_ids_len:].to(torch.float32),
-            "prompt_embeds": thinker_hidden_states[:prompt_token_ids_len].to(torch.float32),
-            "prompt_token_ids": prompt_token_ids,
-            "thinker_output_token_ids": thinker_output_ids,
-            "thinker_result_shape": list(thinker_hidden_states[prompt_token_ids_len:].shape),
-            "prompt_embeds_shape": list(thinker_hidden_states[:prompt_token_ids_len].shape),
+            "hidden_states": {
+                "output": thinker_hidden_states[prompt_token_ids_len:].to(torch.float32),
+                "output_shape": list(thinker_hidden_states[prompt_token_ids_len:].shape),
+            },
+            "embed": {
+                "prefill": thinker_hidden_states[:prompt_token_ids_len].to(torch.float32),
+                "prefill_shape": list(thinker_hidden_states[:prompt_token_ids_len].shape),
+            },
+            "ids": {"prompt": prompt_token_ids, "output": thinker_output_ids},
         }
         talker_inputs.append(
             OmniTokensPrompt(

@@ -41,6 +41,7 @@ class StageRequestStats:
     postprocess_time_ms: float = 0.0
     diffusion_metrics: dict[str, int] = None
     audio_generated_frames: int = 0
+    pipeline_timings: dict[str, float] | None = None
 
     @property
     def rx_mbps(self) -> float:
@@ -101,6 +102,7 @@ STAGE_EXCLUDE = {
     "rx_decode_time_ms",
     "rx_in_flight_time_ms",
     "final_output_type",
+    "pipeline_timings",
 }
 TRANSFER_EXCLUDE = {"from_stage", "to_stage", "request_id", "used_shm"}
 E2E_EXCLUDE = {"request_id"}
@@ -487,6 +489,15 @@ class OrchestratorAggregator:
             "e2e_avg_time_per_request_ms": float(e2e_avg_req),
             "e2e_avg_tokens_per_s": float(e2e_avg_tok),
         }
+        # Add average input preprocess time across all requests
+        preprocess_times = []
+        for _rid, evts in self.stage_events.items():
+            for evt in evts:
+                if evt.pipeline_timings and "preprocess_ms" in evt.pipeline_timings:
+                    preprocess_times.append(evt.pipeline_timings["preprocess_ms"])
+                    break  # only once per request
+        if preprocess_times:
+            overall_summary["input_preprocess_time_ms"] = sum(preprocess_times) / len(preprocess_times)
         # Add stage_wall_time_ms as separate fields for each stage
         for idx, wall_time in enumerate(stage_wall_time_ms):
             overall_summary[f"e2e_stage_{idx}_wall_time_ms"] = wall_time
@@ -534,11 +545,41 @@ class OrchestratorAggregator:
                         ),
                     )
 
-            # === Stage table (columns = stage_id) ===
+            # === [OmniTiming] concise per-request summary ===
             stage_evts = sorted(
                 self.stage_events.get(rid, []),
                 key=lambda e: e.stage_id if e.stage_id is not None else -1,
             )
+            pt = {}
+            if stage_evts:
+                pt = stage_evts[-1].pipeline_timings or {}
+            if pt or e2e_evt:
+                parts = [f"req={rid}"]
+                if e2e_evt:
+                    parts.append(f"total={e2e_evt.e2e_total_ms / 1000.0:.2f}s")
+                if "preprocess_ms" in pt:
+                    parts.append(f"preprocess={pt['preprocess_ms'] / 1000.0:.2f}s")
+                if e2e_evt:
+                    engine_ms = e2e_evt.e2e_total_ms - pt.get("preprocess_ms", 0.0)
+                    parts.append(f"engine={engine_ms / 1000.0:.2f}s")
+                stage_parts = []
+                for evt in stage_evts:
+                    sid = evt.stage_id if evt.stage_id is not None else "?"
+                    t = evt.stage_gen_time_ms / 1000.0
+                    stage_parts.append(f"{sid}:{t:.2f}s")
+                if stage_parts:
+                    parts.append(f"stages=[{','.join(stage_parts)}]")
+                transfer_parts = []
+                for te in self.transfer_events.values():
+                    if te.request_id == rid:
+                        transfer_parts.append(f"{te.from_stage}->{te.to_stage}={te.tx_time_ms:.2f}ms")
+                if transfer_parts:
+                    parts.append(f"transfers=[{','.join(transfer_parts)}]")
+                if "ar2diffusion_ms" in pt:
+                    parts.append(f"ar2diffusion={pt['ar2diffusion_ms']:.2f}ms")
+                logger.info("[OmniTiming] %s", " ".join(parts))
+
+            # === Stage table (columns = stage_id) ===
             # if any stage has diffusion_metrics, remove postprocess_time_ms field
             # because it is already included in diffusion_metrics
             local_exclude = STAGE_EXCLUDE.copy()

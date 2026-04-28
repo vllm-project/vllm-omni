@@ -82,6 +82,30 @@ class TestVoxtralTTSFixedVoice:
             f"Audio content too small ({len(response.content)} bytes), expected at least {MIN_AUDIO_BYTES} bytes"
         )
 
+    @pytest.mark.core_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    def test_speech_english_streaming(self, omni_server) -> None:
+        """Test basic streaming English TTS generation."""
+        url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech"
+        payload = {
+            "input": "Hello, how are you?",
+            "voice": "casual_female",
+            "language": "English",
+            "stream": True,
+            "response_format": "pcm",
+        }
+
+        with httpx.Client(timeout=120.0) as client:
+            with client.stream("POST", url, json=payload) as response:
+                assert response.status_code == 200
+                assert response.headers.get("content-type") == "audio/pcm"
+                total = sum(len(c) for c in response.iter_bytes())
+
+        assert total > MIN_AUDIO_BYTES, (
+            f"Streamed audio too small ({total} bytes), expected at least {MIN_AUDIO_BYTES} bytes"
+        )
+
     @pytest.mark.advanced_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "H100"}, num_cards=1)

@@ -84,6 +84,7 @@ test_params = [
             model=model,
             stage_config_path=get_async_chunk_config(default_path),
             use_stage_cli=True,
+            server_args=["--async-chunk"],
         ),
         id="async_chunk",
     ),
@@ -468,7 +469,6 @@ def test_speaker_001(omni_server, openai_client) -> None:
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-@pytest.mark.skip(reason="Known issue: occasional inaccuracy in voice recognition.")
 def test_speaker_002(omni_server, openai_client) -> None:
     """
     Input Modal: text only (one-word answer constraint).

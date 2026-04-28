@@ -7,7 +7,6 @@ import time
 import types
 import weakref
 from collections.abc import Sequence
-from pprint import pformat
 from typing import TYPE_CHECKING, Any, Literal
 
 import huggingface_hub
@@ -17,7 +16,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
-from vllm_omni.entrypoints.utils import detect_explicit_cli_keys, get_final_stage_id_for_e2e
+from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
@@ -26,6 +25,23 @@ if TYPE_CHECKING:
     from vllm_omni.engine.arg_utils import OmniEngineArgs
 
 logger = init_logger(__name__)
+
+
+class OmniEngineDeadError(EngineDeadError):
+    _DEFAULT_MESSAGE = EngineDeadError().args[0]
+    error_stage_id: int | None
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        error_stage_id: int | None = None,
+        suppress_context: bool = False,
+    ) -> None:
+        resolved_message = message or self._DEFAULT_MESSAGE
+        Exception.__init__(self, resolved_message)
+        self.__suppress_context__ = suppress_context
+        self.error_stage_id = error_stage_id
 
 
 def _weak_shutdown_engine(engine: AsyncOmniEngine) -> None:
@@ -79,38 +95,23 @@ class OmniBase(PDDisaggregationMixin):
         parser: argparse.ArgumentParser | None = None,
         **overrides: Any,
     ) -> OmniBase:
-        """Construct an ``Omni`` / ``AsyncOmni`` from an ``argparse.Namespace``.
+        """Build from argparse. If ``parser`` is passed and not yet nullified,
+        un-typed engine fields are reset to ``None``."""
+        kwargs: dict[str, Any] = {k: v for k, v in vars(args).items() if not k.startswith("_")}
 
-        Mirrors the ``EngineArgs.from_cli_args`` pattern used upstream and in
-        ``OmniEngineArgs.from_cli_args``. This is the recommended entry point
-        for any argparse-based caller (offline scripts, tests, CI): it
-        expands ``vars(args)`` into kwargs and automatically captures which
-        flags the user typed on the command line so that argparse defaults
-        do not silently override deploy YAML values.
+        if parser is not None and not getattr(parser, "_omni_nullified", False):
+            from vllm_omni.engine.arg_utils import (
+                deploy_override_field_names,
+            )
+            from vllm_omni.entrypoints.utils import detect_explicit_cli_keys
 
-        Passing ``parser`` is strongly recommended: without it, flag-to-dest
-        resolution falls back to a name-based heuristic that misidentifies
-        flags with ``dest=`` overrides, alias flags, and ``--disable-X`` /
-        ``store_false`` pairs. See :func:`detect_explicit_cli_keys`.
+            explicit = detect_explicit_cli_keys(sys.argv[1:], parser) or set()
+            override_dests = deploy_override_field_names()
+            for key in list(kwargs):
+                if key in override_dests and key not in explicit:
+                    kwargs[key] = None
 
-        Args:
-            args: Parsed argparse namespace from ``parser.parse_args()``.
-            parser: The argparse parser used to produce ``args``. When
-                provided, each user-typed flag is resolved to its real
-                ``dest`` via the parser's action table.
-            **overrides: Extra keyword arguments that take precedence over
-                attributes on ``args``.
-
-        Example::
-
-            parser = FlexibleArgumentParser()
-            parser.add_argument("--model", required=True)
-            args = parser.parse_args()
-            omni = Omni.from_cli_args(args, parser=parser)          # preferred
-            omni = Omni.from_cli_args(args, parser=parser, model="other")
-        """
-        kwargs: dict[str, Any] = {**vars(args), **overrides}
-        kwargs["_cli_explicit_keys"] = detect_explicit_cli_keys(sys.argv[1:], parser)
+        kwargs.update(overrides)
         return cls(**kwargs)
 
     def __init__(
@@ -119,9 +120,11 @@ class OmniBase(PDDisaggregationMixin):
         **kwargs: Any,
     ) -> None:
         engine_args: OmniEngineArgs | None = kwargs.pop("engine_args", None)
+
         stage_init_timeout = kwargs.pop("stage_init_timeout", 300)
         init_timeout = kwargs.pop("init_timeout", 600)
         log_stats = kwargs.pop("log_stats", False)
+        self._enable_ar_profiler = kwargs.pop("enable_ar_profiler", False)
         # NOTE: read-only lookup — must NOT pop. Popping here drops the key
         # before it reaches ``StageConfigFactory._create_from_registry``, so
         # ``--no-async-chunk`` (``async_chunk=False``) silently fails to
@@ -229,9 +232,14 @@ class OmniBase(PDDisaggregationMixin):
     def resolve_sampling_params_list(
         self,
         sampling_params_list: Sequence[Any] | Any | None,
+        allow_delta_coercion: bool = False,
     ) -> Sequence[Any]:
         if sampling_params_list is None:
             normalized = self.default_sampling_params_list
+            # Set the output kind to delta since no params were specified
+            if allow_delta_coercion:
+                normalized = coerce_param_message_types(list(normalized), is_streaming=True)
+
         elif isinstance(sampling_params_list, Sequence) and not isinstance(sampling_params_list, (str, bytes)):
             normalized = sampling_params_list
         elif self.num_stages == 1:
@@ -247,8 +255,6 @@ class OmniBase(PDDisaggregationMixin):
         try:
             if req_state is None or req_state.metrics is None:
                 return
-            summary = req_state.metrics.build_and_log_summary()
-            logger.info("[Summary] %s", pformat(summary, sort_dicts=False))
         except Exception:
             logger.exception(
                 "[%s] Failed to build/log summary for req=%s",
@@ -296,8 +302,12 @@ class OmniBase(PDDisaggregationMixin):
 
         if msg_type == "error":
             error_text = msg.get("error", "Orchestrator returned an error message")
+            stage_id = msg.get("stage_id")
             if msg.get("fatal"):
-                raise EngineDeadError(error_text)
+                raise OmniEngineDeadError(
+                    error_text,
+                    error_stage_id=stage_id,
+                )
             raise RuntimeError(error_text)
 
         if msg_type != "output":
@@ -352,7 +362,10 @@ class OmniBase(PDDisaggregationMixin):
         )
         # NOTE: O(n_stages) check for every error.
         if self.errored:
-            raise EngineDeadError(error_text)
+            raise OmniEngineDeadError(
+                error_text,
+                error_stage_id=stage_id,
+            )
         raise EngineGenerateError(error_text)
 
     def _process_single_result(
@@ -368,6 +381,30 @@ class OmniBase(PDDisaggregationMixin):
         engine_outputs = result.get("engine_outputs")
         stage_durations = getattr(result["engine_outputs"], "stage_durations", {})
         peak_memory_mb = getattr(result["engine_outputs"], "peak_memory_mb", 0.0)
+
+        # Merge AR stage timing from OrchestratorAggregator.stage_events
+        if self._enable_ar_profiler:
+            ar_events = metrics.stage_events.get(str(req_id), [])
+            for evt in ar_events:
+                if evt.stage_id != stage_id:
+                    stage_durations[f"ar_stage_{evt.stage_id}"] = evt.stage_gen_time_ms / 1000.0
+
+        # Merge pipeline timings from Orchestrator into stage_durations
+        _m = result.get("metrics")
+        if _m is not None and hasattr(_m, "pipeline_timings") and _m.pipeline_timings:
+            for key, value in _m.pipeline_timings.items():
+                if key not in stage_durations:
+                    stage_durations[key] = value
+
+        # Merge per-stage gen times into stage_durations
+        for evt in metrics.stage_events.get(str(req_id), []):
+            key = f"stage_{evt.stage_id}_gen_ms"
+            if key not in stage_durations:
+                stage_durations[key] = evt.stage_gen_time_ms
+        # Current stage gen time (not yet in stage_events at this point)
+        if _m is not None:
+            stage_durations.setdefault(f"stage_{stage_id}_gen_ms", _m.stage_gen_time_ms)
+
         finished = engine_outputs.finished
 
         submit_ts = result.get("stage_submit_ts")

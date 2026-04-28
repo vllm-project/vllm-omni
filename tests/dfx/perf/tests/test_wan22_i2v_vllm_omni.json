@@ -1,0 +1,107 @@
+[
+    {
+        "test_name": "test_wan22_i2v_single_device",
+        "description": "Single-device baseline",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+            "serve_args": {
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "832x480_frames81_steps4",
+                "dataset": "random",
+                "task": "i2v",
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "num-input-images": 1,
+                "seed": 42,
+                "enable-negative-prompt": true,
+                "random-request-config": [
+                    {
+                        "width": 832,
+                        "height": 480,
+                        "num_inference_steps": 4,
+                        "num_frames": 81,
+                        "fps": 16,
+                        "weight": 1
+                    }
+                ],
+                "baseline": {
+                    "throughput_qps": 0.034,
+                    "latency_mean": 26.0,
+                    "peak_memory_mb_mean": 80000
+                }
+            }
+        ]
+    },
+    {
+        "test_name": "test_wan22_i2v_usp2_vae_patch2_hsdp_slicing",
+        "description": "USP=2 + VAE patch parallel=2 + HSDP + VAE slicing",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+            "serve_args": {
+                "usp": 2,
+                "vae-patch-parallel-size": 2,
+                "use-hsdp": true,
+                "vae-use-slicing": true,
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "832x480_frames81_steps4",
+                "dataset": "random",
+                "task": "i2v",
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "num-input-images": 1,
+                "seed": 42,
+                "enable-negative-prompt": true,
+                "random-request-config": [
+                    {
+                        "width": 832,
+                        "height": 480,
+                        "num_inference_steps": 4,
+                        "num_frames": 81,
+                        "fps": 16,
+                        "weight": 1
+                    }
+                ],
+                "baseline": {
+                    "throughput_qps": 0.042,
+                    "latency_mean": 21.6,
+                    "peak_memory_mb_mean": 55300
+                }
+            },
+            {
+                "name": "1280x720_frames121_steps4",
+                "dataset": "random",
+                "task": "i2v",
+                "num-prompts": 10,
+                "max-concurrency": 1,
+                "num-input-images": 1,
+                "seed": 42,
+                "enable-negative-prompt": true,
+                "random-request-config": [
+                    {
+                        "width": 1280,
+                        "height": 720,
+                        "num_inference_steps": 4,
+                        "num_frames": 121,
+                        "fps": 16,
+                        "weight": 1
+                    }
+                ],
+                "baseline": {
+                    "throughput_qps": 0.0085,
+                    "latency_mean": 101.6,
+                    "peak_memory_mb_mean": 65200
+                }
+            }
+        ]
+    }
+]

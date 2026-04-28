@@ -10,6 +10,7 @@ nav:
       - Image Generation: serving/image_generation_api.md
       - Image Edit: serving/image_edit_api.md
       - Text to Speech: serving/speech_api.md
+      - Streaming Video Input: serving/video_stream_api.md
   - Examples:
     - examples/README.md
     - Offline Inference:
@@ -21,6 +22,7 @@ nav:
       - HunyuanImage-3.0 Image-to-Text Inference: user_guide/examples/offline_inference/hunyuan_image3.md
       - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
+      - InternVLA-A1: user_guide/examples/offline_inference/internvla_a1.md
       - MammothModa2-Preview: user_guide/examples/offline_inference/mammothmodal2_preview.md
       - MiMo-Audio Offline Inference: user_guide/examples/offline_inference/mimo_audio.md
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
@@ -34,6 +36,7 @@ nav:
     - Online Serving:
       - BAGEL-7B-MoT: user_guide/examples/online_serving/bagel.md
       - vLLM-Omni Helm Chart: user_guide/examples/online_serving/chart-helm.md
+      - Diffusers Backend Adapter Example: user_guide/examples/online_serving/diffusers_pipeline_adapter.md
       - Fish Speech S2 Pro: user_guide/examples/online_serving/fish_speech.md
       - GLM-Image Online Serving: user_guide/examples/online_serving/glm_image.md
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
@@ -64,6 +67,7 @@ nav:
         - FP8: user_guide/diffusion/quantization/fp8.md
         - Int8: user_guide/diffusion/quantization/int8.md
         - GGUF: user_guide/diffusion/quantization/gguf.md
+      - Attention Backends: user_guide/diffusion/attention_backends.md
       - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
       - Parallelism:
         - Overview: user_guide/diffusion/parallelism/overview.md
