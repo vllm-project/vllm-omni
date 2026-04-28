@@ -135,7 +135,13 @@ class _IngressBatchDrrAdapter:
         self.age_threshold_ms = max(1, _env_int("OMNI_INGRESS_DRR_AGE_THRESHOLD_MS", 400))
         self.age_bonus_factor = max(0.0, _env_float("OMNI_INGRESS_DRR_AGE_BONUS_FACTOR", 1.0))
         self.max_queues = max(0, _env_int("OMNI_INGRESS_DRR_MAX_QUEUES", 0))
-        self.default_budget_mode = os.environ.get("OMNI_INGRESS_DRR_DEFAULT_BUDGET_MODE", "weight_inv_cost").strip().lower()
+        self.default_budget_mode = (
+    os.environ.get(
+        "OMNI_INGRESS_DRR_DEFAULT_BUDGET_MODE", "weight_inv_cost"
+    )
+    .strip()
+    .lower()
+)
         if self.default_budget_mode not in {"inv_cost", "weight_inv_cost"}:
             self.default_budget_mode = "weight_inv_cost"
         self.queue_budget_overrides = {
