@@ -227,9 +227,10 @@ class _IngressBatchDrrAdapter:
             if self._closed:
                 raise RuntimeError("Ingress adapter is closed")
             if key not in self._queues and self.max_queues > 0 and len(self._queues) >= self.max_queues:
-                nearest = min(self._types.keys(), key=lambda k: abs(self._types[k].cost - req_type.cost))
-                key = nearest
-                req_type = self._types[nearest]
+                raise ValueError(
+                    "Ingress queue limit reached; refusing to remap request type "
+                    f"{key} (width={payload.width}, height={payload.height}, steps={payload.steps})"
+                )
             if key not in self._queues:
                 self._queues[key] = deque()
                 self._types[key] = req_type
