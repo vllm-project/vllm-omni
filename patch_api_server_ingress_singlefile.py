@@ -8,7 +8,10 @@ from pathlib import Path
 IMPORT_SENTINEL = "from server_ingress_plugin.image_ingress_scheduler_single import ("
 GLOBAL_SENTINEL = "_IMAGE_INGRESS_DISPATCHER = None"
 FUNC_SENTINEL = "async def _get_image_ingress_dispatcher(raw_request: Request):"
-ENABLE_SENTINEL = 'if os.environ.get("OMNI_INGRESS_BATCH_DRR_ENABLE", "0").strip().lower() in {"1", "true", "yes", "on"}:'
+ENABLE_SENTINEL = (
+    'if os.environ.get("OMNI_INGRESS_BATCH_DRR_ENABLE", "0")'
+    '.strip().lower() in {"1", "true", "yes", "on"}:'
+)
 
 
 IMPORT_BLOCK = """from server_ingress_plugin.image_ingress_scheduler_single import (
@@ -221,7 +224,11 @@ def patch_api_server(path: Path) -> None:
         text = text.replace(anchor, "\n\n" + HELPER_BLOCK + "\n# Image generation API endpoints\n", 1)
 
     if ENABLE_SENTINEL not in text:
-        func_sig = "async def generate_images(request: ImageGenerationRequest, raw_request: Request) -> ImageGenerationResponse:\n"
+        func_sig = (
+    "async def generate_images("
+    "request: ImageGenerationRequest, raw_request: Request"
+    ") -> ImageGenerationResponse:\n"
+)
         start = text.find(func_sig)
         if start < 0:
             raise RuntimeError("generate_images signature not found")
