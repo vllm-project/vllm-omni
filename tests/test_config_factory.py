@@ -93,6 +93,7 @@ class TestStageConfig:
         assert omega_config.engine_args.worker_type == "ar"
         assert omega_config.final_output is True
         assert omega_config.final_output_type == "text"
+        assert "max_num_seqs" not in omega_config.engine_args
         # Legacy field name for backward compatibility
         assert omega_config.engine_input_source == []
 

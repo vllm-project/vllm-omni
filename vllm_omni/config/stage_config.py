@@ -402,11 +402,11 @@ class StageDeployConfig:
     """
 
     stage_id: int
-    max_num_seqs: int = 64
+    max_num_seqs: int | None = None
     gpu_memory_utilization: float | None = None
     tensor_parallel_size: int | None = None
     enforce_eager: bool | None = None
-    max_num_batched_tokens: int = 32768
+    max_num_batched_tokens: int | None = None
     max_model_len: int | None = None
     async_scheduling: bool | None = None
     devices: str = "0"
@@ -446,7 +446,7 @@ class DeployConfig:
     pipeline: str | None = None
 
     # === Pipeline-wide engine settings (applied uniformly to every stage) ===
-    trust_remote_code: bool = True
+    trust_remote_code: bool | None = None
     distributed_executor_backend: str | None = None
     dtype: str | None = None
     quantization: str | None = None
@@ -902,8 +902,6 @@ class StageConfig:
             )
             effective_mbs = int(cli_mbs or legacy_mbs or 1)
             engine_args.setdefault("max_num_seqs", effective_mbs)
-
-        engine_args.setdefault("max_num_seqs", 1)
 
         # Build full config dict
         config_dict: dict[str, Any] = {
