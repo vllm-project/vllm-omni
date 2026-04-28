@@ -55,6 +55,7 @@ def build_segments(spans, q_positions, total_len):
             cur = a
 
         if cur < q_end:
+            assert a == cur and e <= q_end, f"span ({a}, {e}) must be within query range ({q_start}, {q_end})"
             segs.append(Segment(a, e, "image"))
             cur = e
 

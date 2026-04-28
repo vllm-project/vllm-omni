@@ -964,6 +964,8 @@ class HunyuanImage3Pipeline(
                 stop = image_slice.stop if image_slice.stop is not None else seq_len
                 assert start < stop, f"Invalid image slice: {image_slice}"
                 image_spans[i].append((int(start), int(stop)))
+            if image_spans[i]:
+                image_spans[i].sort(key=lambda x: x[0])
         attention_mask = attention_mask.unsqueeze(1)
         model_kwargs["image_spans"] = image_spans  # For segmented attention
         return attention_mask
