@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
+#
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved
 # Copyright 2026 The Qwen team, Alibaba Group.
 # Copyright 2024 The vLLM team.
 #
