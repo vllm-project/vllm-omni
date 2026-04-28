@@ -44,7 +44,6 @@ from vllm_omni.diffusion.ipc import pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
-from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
@@ -79,13 +78,15 @@ class DiffusionWorker:
         self.od_config = od_config
         self.device: torch.device | None = None
         self.vllm_config: VllmConfig | None = None
-        self.model_runner: DiffusionModelRunner | None = None
+        self.model_runner = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.lora_manager: DiffusionLoRAManager | None = None
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
-        # Create model runner
-        self.model_runner = DiffusionModelRunner(
+        # Create model runner using the platform-specified class
+        model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
+        model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
+        self.model_runner = model_runner_cls(
             vllm_config=self.vllm_config,
             od_config=self.od_config,
             device=self.device,
@@ -561,11 +562,14 @@ class WorkerProc:
         custom_pipeline_args: dict[str, Any] | None = None,
     ) -> DiffusionWorker:
         """Create a worker instance. Override in subclasses for different worker types."""
+        worker_cls_path = current_omni_platform.get_diffusion_worker_cls()
+        base_worker_class = resolve_obj_by_qualname(worker_cls_path)
         wrapper = WorkerWrapperBase(
             gpu_id=gpu_id,
             od_config=od_config,
             worker_extension_cls=worker_extension_cls,
             custom_pipeline_args=custom_pipeline_args,
+            base_worker_class=base_worker_class,
         )
         return wrapper
 
