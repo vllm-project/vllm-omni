@@ -592,6 +592,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         cudagraph_runtime_mode: CUDAGraphMode | None = None,
         force_attention: bool = False,
         uniform_decode: bool = False,
+        force_single_prefill_request: bool = False,
         allow_microbatching: bool = True,
         skip_eplb: bool = False,
         is_profile: bool = False,
@@ -617,6 +618,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             force_attention: If True, always create attention metadata. Used to
                 warm up attention backend when mode is NONE.
             uniform_decode: If True, the batch is a uniform decode batch.
+            force_single_prefill_request: If True, force one request to consume
+                all tokens. Useful to warm up long-prefill compile paths.
             skip_eplb: If True, skip EPLB state update.
             is_profile: If True, this is a profile run.
             create_mixed_batch: If True, create a mixed batch with both decode
@@ -657,7 +660,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         assert num_tokens <= self.max_num_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
         if create_mixed_batch:
-            assert not uniform_decode
+            assert not uniform_decode and not force_single_prefill_request
             # Create mixed batch:
             # first half decode tokens, second half one prefill
             num_decode_tokens = min(max_num_reqs - 1, num_tokens // 2)
@@ -669,11 +672,17 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Note: Overriding max_query_len to be the prefill tokens
             max_query_len = num_prefill_tokens
         elif uniform_decode:
-            assert not create_mixed_batch
+            assert not create_mixed_batch and not force_single_prefill_request
             num_reqs = min(max_num_reqs, cdiv(num_tokens, max_query_len))
             num_scheduled_tokens_list = [max_query_len] * num_reqs
             if num_tokens % max_query_len != 0:
                 num_scheduled_tokens_list[-1] = num_tokens % max_query_len
+        elif force_single_prefill_request:
+            # Keep one request with a long prompt to proactively compile the
+            # longest prefill path that first-token traffic will hit.
+            num_reqs = 1
+            num_scheduled_tokens_list = [num_tokens]
+            max_query_len = num_tokens
         else:
             num_reqs = min(num_tokens, max_num_reqs)
             min_tokens_per_req = num_tokens // num_reqs
@@ -1056,6 +1065,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         combined_hidden_states: dict[str, torch.Tensor] | None = None,
         combined_multimodal_outputs: dict[str, object] | None = None,
+        req_ids_filter: set[str] | None = None,
     ) -> None:
         """Process model-provided per-request updates and merge into model_intermediate_buffer."""
         try:
@@ -1063,6 +1073,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             # TODO(Peiqi): do we have a more elegant way to do this?
             if hasattr(self.model, "has_postprocess") and self.model.has_postprocess:
                 for req_index, req_id in enumerate(self.input_batch.req_ids):
+                    if req_ids_filter is not None and req_id not in req_ids_filter:
+                        continue
                     req_infos = self.model_intermediate_buffer.get(req_id, {})
                     if combined_hidden_states:
                         # Combined hidden states contains all hidden states for every request
