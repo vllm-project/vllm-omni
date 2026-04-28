@@ -257,7 +257,6 @@ steps:
         commands:
           - |
             timeout 20m bash -c "
-              pip install voxcpm
               export VLLM_LOGGING_LEVEL=DEBUG
               export VLLM_WORKER_MULTIPROC_METHOD=spawn
               pytest -s -v tests/e2e/offline_inference/test_voxcpm2.py -m 'core_model' --run-level 'core_model'
