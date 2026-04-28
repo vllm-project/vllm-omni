@@ -41,7 +41,9 @@ def omni_server(request: pytest.FixtureRequest):
         test_name, model, deploy_path, stage_overrides, extra_cli_args = request.param
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
-        server_args = list(timeout_args)
+        server_args: list[str] = []
+        if use_omni:
+            server_args += list(timeout_args)
         if deploy_path:
             server_args = ["--deploy-config", deploy_path] + server_args
         if stage_overrides:

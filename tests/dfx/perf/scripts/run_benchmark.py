@@ -69,7 +69,9 @@ def omni_server(request):
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
-        server_args = ["--stage-init-timeout", "600", "--init-timeout", "900"]
+        server_args: list[str] = []
+        if use_omni:
+            server_args += ["--stage-init-timeout", "600", "--init-timeout", "900"]
         # --deploy-config and --stage-overrides compose at the CLI (see vllm_omni/entrypoints/utils.py):
         # deploy-config sets the base; stage-overrides are applied on top. Both can be set.
         if stage_config_path:
