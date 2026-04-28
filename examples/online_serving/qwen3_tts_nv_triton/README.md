@@ -110,6 +110,16 @@ Numbers below are taken from a single RTX A6000 with the default
 `max_num_seqs` / engine config used in this example. Latencies are
 reported as `mean / p95` in milliseconds.
 
+> A couple of knobs that move the needle on performance:
+>
+> - **Tweak `max_queue_delay_microseconds`** in the codec's Triton
+>   `config.pbtxt` (dynamic batcher). A larger delay lets Triton form
+>   bigger codec batches before launching the GPU kernel, which raises
+>   utilization at the cost of a TTFA increase.
+> - **Increase the codec instance `count`** in the Triton instance group
+>   (e.g. from 1 to 2) to serve two codec instances on the same GPU.
+>   2 codec instances reach ~**35x RTF** on the same A6000 — see `model_repository/codec_decoder/config.pbtxt`.
+
 **End-to-end service** (`benchmark_service.py`, talker + codec):
 
 | Concurrency | Throughput (req/s) | RTF    | TTFA mean / p95 (ms) |
