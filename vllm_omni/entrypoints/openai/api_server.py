@@ -95,7 +95,11 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     parse_size,
     validate_layered_layers,
 )
-from vllm_omni.entrypoints.openai.protocol.audio import BatchSpeechRequest, OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.protocol.audio import (
+    BatchSpeechRequest,
+    OpenAICreateAudioGenerateRequest,
+    OpenAICreateSpeechRequest,
+)
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
@@ -112,6 +116,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
+from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
@@ -312,6 +317,9 @@ class _DiffusionServingModels:
     @property
     def base_model_paths(self) -> list[BaseModelPath]:
         return self._base_model_paths
+
+    def is_base_model(self, model_name: str) -> bool:
+        return any(p.name == model_name for p in self._base_model_paths)
 
     def __getattr__(self, name):
         return self._Unsupported(name)
@@ -581,10 +589,10 @@ async def omni_init_app_state(
 
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
+    model_name = served_model_names[0] if served_model_names else args.model
 
     # Pure Diffusion mode: use simplified initialization logic
     if is_pure_diffusion:
-        model_name = served_model_names[0] if served_model_names else args.model
         state.vllm_config = None
         state.diffusion_engine = engine_client
         state.openai_serving_models = _DiffusionServingModels(base_model_paths)
@@ -597,6 +605,16 @@ async def omni_init_app_state(
             model_name=model_name,
         )
 
+        # audio related
+        state.openai_serving_speech = None
+        state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate.for_diffusion(
+            engine_client,
+            state.openai_serving_models,
+            request_logger=request_logger,
+            model_name=model_name,
+        )
+
+        # video related
         diffusion_stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
         state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
@@ -906,7 +924,11 @@ async def omni_init_app_state(
     )
 
     state.openai_serving_speech = OmniOpenAIServingSpeech(
-        engine_client, state.openai_serving_models, request_logger=request_logger
+        engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
+    )
+
+    state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate(
+        engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
     )
 
     state.openai_streaming_speech = OmniStreamingSpeechHandler(
@@ -947,6 +969,10 @@ def Omnichat(request: Request) -> OmniOpenAIServingChat | None:
 
 def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
     return request.app.state.openai_serving_speech
+
+
+def OmniAudioGenerate(request: Request) -> OmniOpenAIServingAudioGenerate | None:
+    return getattr(request.app.state, "openai_serving_audio_generate", None)
 
 
 @router.post(
@@ -1111,6 +1137,40 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
         return _create_engine_error_json_response(raw_request, exc)
     except ValueError as e:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
+
+
+@router.post(
+    "/v1/audio/generate",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"content": {"audio/*": {}}},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+@load_aware_call
+async def create_audio_generate(request: OpenAICreateAudioGenerateRequest, raw_request: Request):
+    handler = OmniAudioGenerate(raw_request)
+    if handler is None:
+        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        if base_server is None:
+            raise HTTPException(
+                status_code=HTTPStatus.NOT_FOUND.value,
+                detail="The model does not support Audio Generate API",
+            )
+        return base_server.create_error_response(message="The model does not support Audio Generate API")
+    try:
+        result = await handler.create_audio_generate(request, raw_request)
+        if isinstance(result, ErrorResponse):
+            return JSONResponse(
+                content=result.model_dump(),
+                status_code=result.error.code if result.error else 400,
+            )
+        return result
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
 
