@@ -1,4 +1,4 @@
-# Qwen2.5-Omni for text and speech chat on 1x A100 80GB
+# Qwen2.5-Omni for text and audio output
 
 ## Summary
 

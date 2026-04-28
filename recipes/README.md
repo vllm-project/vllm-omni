@@ -25,6 +25,8 @@ recipes/
 
 ## Available Recipes
 
+- [`Qwen/Qwen2.5-Omni.md`](./Qwen/Qwen2.5-Omni.md): online serving recipe for
+  text and audio output on `1x A100 80GB`
 - [`Qwen/Qwen3-Omni.md`](./Qwen/Qwen3-Omni.md): online serving recipe for
   multimodal chat on `1x A100 80GB`
 - [`Wan-AI/Wan2.2-I2V.md`](./Wan-AI/Wan2.2-I2V.md): image-to-video serving
