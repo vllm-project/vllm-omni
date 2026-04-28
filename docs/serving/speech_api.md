@@ -5,6 +5,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-*`) -- Qwen3-based TTS with CustomVoice, VoiceDesign, and Base (voice cloning) task types. Output: 24 kHz.
 - **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
+- **VoxCPM2** (`openbmb/VoxCPM2`) -- Single-stage AR + DiT/CFM TTS. Three synthesis modes: Voice Design (text-only voice description), Controllable Cloning (reference audio + style instructions), and Hi-Fi Cloning (reference audio + transcript for tightest identity match; aka "Ultimate Cloning" in the Gradio demo). Output: 48 kHz.
 
 Each server instance runs a single model (specified at startup via `vllm serve <model> --omni`).
 
@@ -26,6 +27,9 @@ vllm serve fishaudio/s2-pro --omni --port 8091
 
 # Voxtral TTS
 vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8091
+
+# VoxCPM2
+vllm serve openbmb/VoxCPM2 --omni --port 8091
 ```
 
 ### Generate Speech
@@ -118,6 +122,16 @@ Content-Type: application/json
 | `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`) |
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
+
+#### VoxCPM2-specific Parameters
+
+VoxCPM2 reuses the shared `extra_params: dict` field (introduced in #2338 for Voxtral TTS) for model-specific knobs rather than adding new top-level fields:
+
+| Key (inside `extra_params`) | Type | Default | Description |
+|-----------------------------|------|---------|-------------|
+| `cfg_value` | float | 2.0 | Classifier-free guidance scale for the CFM decoder. Range `0.1`–`10.0`; typical useful range is `1.5`–`3.0`. Higher values track the text more strictly at the cost of naturalness. |
+
+Send as e.g. `{"input": "...", "extra_params": {"cfg_value": 2.5}}`. VoxCPM2 also reuses the standard `instructions`, `ref_audio`, and `ref_text` fields, see the mode table below for how they combine.
 
 ### Response Format
 
@@ -542,6 +556,64 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 | Model | Description |
 |-------|-------------|
 | `mistralai/Voxtral-4B-TTS-2603` | 3B AR + FlowMatching TTS. Supports text-to-speech with preset voices. |
+
+### VoxCPM2
+
+| Model | Description |
+|-------|-------------|
+| `openbmb/VoxCPM2` | Single-stage AR + DiT/CFM TTS. 48 kHz output, multilingual (primary EN/ZH, usable cross-lingual identity transfer via Ultimate Cloning). |
+
+VoxCPM2 exposes three synthesis modes through the same `/v1/audio/speech` endpoint — the mode is inferred from which fields are present in the request.
+
+| Mode | Required fields | Optional fields | Notes |
+|------|-----------------|-----------------|-------|
+| **Voice Design** | `input` | `instructions`, `extra_params.cfg_value` | Synthesize a voice from a text description alone. `instructions` is prepended to the target text as `(instructions)input` following `voxcpm.cli.build_final_text`. Both English and Chinese instructions are supported. |
+| **Controllable Cloning** | `input`, `ref_audio` | `instructions`, `extra_params.cfg_value` | Clone the reference speaker's timbre; use `instructions` to steer emotion, pace, or other style attributes while preserving identity. |
+| **Hi-Fi Cloning** | `input`, `ref_audio`, `ref_text` | `extra_params.cfg_value` | The model treats `ref_audio` + `ref_text` as a spoken prefix and continues from it. Reproduces every vocal nuance of the reference. Per the canonical VoxCPM2 docs, when Hi-Fi mode is enabled the control instruction is ignored; the server drops `instructions` in this mode automatically if present. |
+
+Reference audio guidelines: 16 kHz mono, at least 5 seconds recommended for a good clone (1 second hard minimum, 30 seconds hard maximum). Clean, non-reverberant speech; the same `ref_audio` can be reused across Controllable and Hi-Fi modes.
+
+Inline non-verbal tags in `input` are passed through as regular text and recognized by the model when present (for example `[laughing]`, `[sigh]`, `[Uhm]`, `[Question-ah]`). See the upstream [VoxCPM2 cookbook](https://voxcpm.readthedocs.io/en/latest/cookbook.html) for the full tag list and usage tips.
+
+**Examples**
+
+Voice Design (no reference, pure text description):
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Hello everyone. Today I want to talk about open source AI.",
+        "instructions": "A warm young woman with a gentle, friendly voice",
+        "extra_params": {"cfg_value": 2.5}
+    }' --output voice_design.wav
+```
+
+Controllable Cloning (reference audio + style instructions):
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Good morning, let me tell you a short story.",
+        "ref_audio": "https://example.com/reference.wav",
+        "instructions": "Warm storyteller, slow cadence, dramatic pauses",
+        "extra_params": {"cfg_value": 2.5}
+    }' --output controllable_cloning.wav
+```
+
+Hi-Fi Cloning (reference audio + transcript; tightest identity):
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "Welcome everyone. I will give a brief update on the project today.",
+        "ref_audio": "https://example.com/reference.wav",
+        "ref_text": "Transcript of what the reference speaker is saying in the reference clip.",
+        "extra_params": {"cfg_value": 2.5}
+    }' --output ultimate_cloning.wav
+```
 
 ## Error Responses
 

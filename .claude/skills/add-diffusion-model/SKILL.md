@@ -544,6 +544,15 @@ Pipelines without `SupportsModuleOffload` fall back to scanning
 well-known attribute names (`transformer`, `text_encoder`, `vae`,
 etc.), which fails for non-standard names.
 
+### Step 12: Performance Profiling
+
+After verifying correctness and implementing parallelism/caching, profile the model's performance to identify bottlenecks and ensure optimal execution.
+
+See the [Profiling Single-Stage Diffusion](../../../docs/contributing/profiling.md#3-profiling-single-stage-diffusion) guide for detailed instructions on:
+1. Using the PyTorch profiler (`profiler: "torch"`) to capture detailed CPU/CUDA traces.
+2. Using Nsight Systems (`nsys`) with `profiler: "cuda"` for low-overhead CUDA traces.
+3. Controlling profiling via `omni.start_profile()` and `omni.stop_profile()`.
+
 ---
 
 ## Iterative Development Tips
