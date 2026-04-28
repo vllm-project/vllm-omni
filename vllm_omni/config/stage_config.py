@@ -403,9 +403,9 @@ class StageDeployConfig:
 
     stage_id: int
     max_num_seqs: int = 64
-    gpu_memory_utilization: float = 0.9
-    tensor_parallel_size: int = 1
-    enforce_eager: bool = False
+    gpu_memory_utilization: float | None = None
+    tensor_parallel_size: int | None = None
+    enforce_eager: bool | None = None
     max_num_batched_tokens: int = 32768
     max_model_len: int | None = None
     async_scheduling: bool | None = None
@@ -414,6 +414,11 @@ class StageDeployConfig:
     input_connectors: dict[str, str] | None = None
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
+    profiler_config: dict[str, Any] | None = None
+    disable_hybrid_kv_cache_manager: bool | None = None
+    mm_processor_cache_gb: float | None = None
+    skip_mm_profiling: bool | None = None
+    enable_flashinfer_autotune: bool | None = None
     engine_extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -442,10 +447,13 @@ class DeployConfig:
     distributed_executor_backend: str | None = None
     dtype: str | None = None
     quantization: str | None = None
-    enable_prefix_caching: bool = False
+    enable_prefix_caching: bool | None = None
     enable_chunked_prefill: bool | None = None
-    data_parallel_size: int = 1
-    pipeline_parallel_size: int = 1
+    data_parallel_size: int | None = None
+    pipeline_parallel_size: int | None = None
+    config_format: str | None = None
+    load_format: str | None = None
+    tokenizer_mode: str | None = None
 
 
 _STAGE_NON_ENGINE_KEYS = frozenset(
@@ -686,6 +694,9 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "enable_chunked_prefill",
     "data_parallel_size",
     "pipeline_parallel_size",
+    "config_format",
+    "load_format",
+    "tokenizer_mode",
 )
 
 
