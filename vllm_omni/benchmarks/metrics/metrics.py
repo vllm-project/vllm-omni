@@ -188,10 +188,7 @@ def calculate_metrics(
             total_input += outputs[i].prompt_len
             tpot = 0
             if output_len > 1:
-                try:
-                    latency_minus_ttft = outputs[i].text_latency - outputs[i].ttft
-                except Exception:
-                    latency_minus_ttft = outputs[i].latency - outputs[i].ttft
+                latency_minus_ttft = outputs[i].text_latency - outputs[i].ttft
                 tpot = latency_minus_ttft / (output_len - 1)
                 tpots.append(tpot)
             # Note: if output_len <= 1, we regard tpot as 0 for goodput
