@@ -30,7 +30,6 @@ from transformers import AutoTokenizer, PretrainedConfig
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import ignore_torch_compile, support_torch_compile
 from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.distributed import get_pp_group
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
@@ -43,15 +42,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
-    PPMissingLayer,
     WeightsMapper,
     maybe_prefix,
 )
-from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -739,7 +735,7 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
 
 @ignore_torch_compile
 @support_torch_compile
-class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
+class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
     """Qwen3TTS Talker for conditional generation.
 
     Per-step flow:
@@ -848,17 +844,13 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
             )
 
         # Text-token embedding lives outside the backbone (Qwen3Model only
-        # owns the codec-vocab ``embed_tokens``). Only needed on the first
-        # PP rank where prefill prompt embeddings are assembled.
-        if get_pp_group().is_first_rank:
-            self.text_embedding = VocabParallelEmbedding(
-                config.text_vocab_size,
-                config.text_hidden_size,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "text_embedding"),
-            )
-        else:
-            self.text_embedding = PPMissingLayer()
+        # owns the codec-vocab ``embed_tokens``).
+        self.text_embedding = VocabParallelEmbedding(
+            config.text_vocab_size,
+            config.text_hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "text_embedding"),
+        )
 
         # Text projection MLP
         self.text_projection = Qwen3TTSTalkerResizeMLP(
@@ -879,25 +871,18 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
 
         # Group-0 prediction head + suppress mask (used by compute_logits
         # so vLLM's standard sampler can sample group-0).
-        if get_pp_group().is_last_rank:
-            self.codec_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "codec_head"),
-            )
-        else:
-            self.codec_head = PPMissingLayer()
+        self.codec_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "codec_head"),
+        )
 
         self.suppress_mask = nn.Parameter(
             torch.zeros(config.vocab_size, dtype=torch.bool),
             requires_grad=False,
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
-
-        self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors
-        )
 
         # Persistent buffers — addresses must be stable across CUDA graph
         # replays.  The piecewise CUDAGraphWrapper does NOT copy inputs on
@@ -982,10 +967,10 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
+        intermediate_tensors: Optional[Any] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         **_: Any,
-    ) -> Union[IntermediateTensors, torch.Tensor]:
+    ) -> torch.Tensor:
         """Forward pass: code predictor -> embedding -> backbone.
 
         ``inputs_embeds`` is produced by :meth:`preprocess`:
@@ -1013,11 +998,10 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
           positions, leaving prefill positions as the prefill embeds.
 
         Returns:
-            Non-last PP rank: IntermediateTensors.
-            Last PP rank: backbone ``hidden_states`` tensor. The codec
-            groups 1..N-1 produced inside this forward live in
-            :attr:`_out_codes` and are exposed to the runner via
-            :meth:`make_omni_output` (key ``"audio_codes"``).
+            Backbone ``hidden_states`` tensor. The codec groups 1..N-1
+            produced inside this forward live in :attr:`_out_codes` and
+            are exposed to the runner via :meth:`make_omni_output` (key
+            ``"audio_codes"``).
         """
         num_tokens = input_ids.shape[0]
         combined_embeddings = self._combined_embeddings[:num_tokens]
@@ -1106,9 +1090,9 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
 
     def make_omni_output(
         self,
-        model_outputs: Union[torch.Tensor, IntermediateTensors, OmniOutput],
+        model_outputs: Union[torch.Tensor, OmniOutput],
         **_: Any,
-    ) -> Union[OmniOutput, IntermediateTensors]:
+    ) -> OmniOutput:
         """Wrap backbone hidden states with the codec groups 1..N-1.
 
         The codes produced inside :meth:`forward` live in :attr:`_out_codes`;
@@ -1122,8 +1106,6 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
         by :meth:`preprocess` on the next decode step.
         """
         if isinstance(model_outputs, OmniOutput):
-            return model_outputs
-        if isinstance(model_outputs, IntermediateTensors):
             return model_outputs
 
         hidden = model_outputs
@@ -1596,10 +1578,10 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
         # are populated either in ``__init__`` (rotary inv_freq) or in
         # ``_init_runtime_buffers`` (suppress_mask).
         #
-        # ``model.embed_tokens`` is created by ``Qwen3Model`` on the first
-        # PP rank but is never invoked in this model — every prefill /
-        # decode step feeds the backbone via ``inputs_embeds`` assembled
-        # from ``code_predictor.codec_embedding`` and ``text_embedding``.
+        # ``model.embed_tokens`` is created by ``Qwen3Model`` but is never
+        # invoked in this model — every prefill / decode step feeds the
+        # backbone via ``inputs_embeds`` assembled from
+        # ``code_predictor.codec_embedding`` and ``text_embedding``.
         # Skip it from the strict-load check.
         loaded.add("suppress_mask")
         loaded.add("model.embed_tokens.weight")
@@ -1643,8 +1625,6 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module, SupportsPP):
         # Precompute ``text_proj(text_emb(tts_pad_token_id))`` — added
         # to ``codec_emb(group0)`` at every decode step; depends only on
         # frozen weights so we evaluate it once here.
-        if not get_pp_group().is_first_rank:
-            return  # text_embedding only lives on the first PP rank
         device = next(self.parameters()).device
         pad_id = int(hf.tts_pad_token_id)
         pad_ids = torch.tensor([[pad_id]], device=device, dtype=torch.long)
