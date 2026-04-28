@@ -58,44 +58,83 @@ async def _get_image_ingress_dispatcher(raw_request: Request):
 
         async def _batch_execute(req_type: RequestType, payloads: list) -> list[ImageIngressResult]:
             engine_client, _model_name, stage_configs = _get_engine_and_model(raw_request)
-            prompts = []
-            for p in payloads:
-                item = {"prompt": p.prompt}
-                if p.negative_prompt is not None:
-                    item["negative_prompt"] = p.negative_prompt
-                prompts.append(item)
 
-            gen_params = OmniDiffusionSamplingParams(
-                num_outputs_per_prompt=1,
-                width=req_type.width,
-                height=req_type.height,
-                num_inference_steps=req_type.steps,
-            )
-            # Use first request's optional controls for the batch.
-            if payloads and payloads[0].seed is not None:
-                gen_params.seed = payloads[0].seed
+            async def _run_same_n_group(group_payloads: list, num_outputs_per_prompt: int) -> list[ImageIngressResult]:
+                prompts = []
+                for p in group_payloads:
+                    item = {"prompt": p.prompt}
+                    if p.negative_prompt is not None:
+                        item["negative_prompt"] = p.negative_prompt
+                    prompts.append(item)
 
-            result = await _generate_with_async_omni(
-                engine_client=engine_client,
-                gen_params=gen_params,
-                stage_configs=stage_configs,
-                prompt=prompts,
-                request_id=f"img_ingress_batch-{random_uuid()}",
-            )
-            images = _extract_images_from_result(result) if result is not None else []
-            created = int(time.time())
+                gen_params = OmniDiffusionSamplingParams(
+                    num_outputs_per_prompt=max(1, int(num_outputs_per_prompt)),
+                    width=req_type.width,
+                    height=req_type.height,
+                    num_inference_steps=req_type.steps,
+                )
+                # Use first request's optional controls for the batch.
+                if group_payloads and group_payloads[0].seed is not None:
+                    gen_params.seed = group_payloads[0].seed
+
+                result = await _generate_with_async_omni(
+                    engine_client=engine_client,
+                    gen_params=gen_params,
+                    stage_configs=stage_configs,
+                    prompt=prompts,
+                    request_id=f"img_ingress_batch-{random_uuid()}",
+                )
+                images = _extract_images_from_result(result) if result is not None else []
+                created = int(time.time())
+                outputs: list[ImageIngressResult] = []
+                for idx, _p in enumerate(group_payloads):
+                    start = idx * num_outputs_per_prompt
+                    end = start + num_outputs_per_prompt
+                    if end <= len(images):
+                        outputs.append(
+                            ImageIngressResult(
+                                created=created,
+                                images_b64=[encode_image_base64(img) for img in images[start:end]],
+                            )
+                        )
+                    else:
+                        outputs.append(
+                            ImageIngressResult(
+                                created=created,
+                                images_b64=[encode_image_base64(img) for img in images[start:len(images)]],
+                                error=(
+                                    f"missing images for index={idx}, "
+                                    f"expected={num_outputs_per_prompt}, "
+                                    f"available={max(0, len(images) - start)}"
+                                ),
+                            )
+                        )
+                return outputs
+
+            grouped: dict[int, list[tuple[int, object]]] = {}
+            for idx, p in enumerate(payloads):
+                n = max(1, int(getattr(p, "n", 1) or 1))
+                grouped.setdefault(n, []).append((idx, p))
+
+            merged: list[ImageIngressResult | None] = [None] * len(payloads)
+            for n, nodes in grouped.items():
+                group_payloads = [p for _, p in nodes]
+                group_outputs = await _run_same_n_group(group_payloads, n)
+                for (orig_idx, _), out in zip(nodes, group_outputs, strict=True):
+                    merged[orig_idx] = out
+
             outputs: list[ImageIngressResult] = []
-            for idx, _p in enumerate(payloads):
-                if idx < len(images):
-                    outputs.append(ImageIngressResult(created=created, images_b64=[encode_image_base64(images[idx])]))
-                else:
+            for idx, item in enumerate(merged):
+                if item is None:
                     outputs.append(
                         ImageIngressResult(
-                            created=created,
+                            created=int(time.time()),
                             images_b64=[],
-                            error=f"missing image at index={idx}, total={len(images)}",
+                            error=f"missing merged output at index={idx}",
                         )
                     )
+                else:
+                    outputs.append(item)
             return outputs
 
         svc = ImageIngressDispatcherService(
@@ -113,6 +152,13 @@ async def _get_image_ingress_dispatcher(raw_request: Request):
 
 ENABLE_BLOCK = """
     if os.environ.get("OMNI_INGRESS_BATCH_DRR_ENABLE", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        _engine_client, model_name, _stage_configs = _get_engine_and_model(raw_request)
+        if request.model is not None and request.model != model_name:
+            logger.warning(
+                f"Model mismatch: request specifies '{request.model}' but "
+                f"server is running '{model_name}'. Using server model."
+            )
+
         if not isinstance(request.prompt, str):
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
@@ -124,10 +170,14 @@ ENABLE_BLOCK = """
         else:
             width, height = 1024, 1024
         steps = request.num_inference_steps if request.num_inference_steps is not None else 20
+        # Keep the same max-size protection as the standard generation flow when helper exists.
+        size_checker = globals().get("_check_max_generated_image_size")
+        if callable(size_checker):
+            size_checker(width, height)
 
         dispatcher = await _get_image_ingress_dispatcher(raw_request)
         ingress_result = await dispatcher.submit(
-            model=request.model or "/model",
+            model=model_name,
             prompt=request.prompt,
             negative_prompt=request.negative_prompt,
             width=width,
@@ -149,10 +199,14 @@ def patch_api_server(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
 
     if IMPORT_SENTINEL not in text:
-        anchor = "from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt\n"
-        if anchor not in text:
+        lines = text.splitlines(keepends=True)
+        for idx, line in enumerate(lines):
+            if line.startswith("from vllm_omni.inputs.data import "):
+                lines.insert(idx + 1, IMPORT_BLOCK + "\n")
+                text = "".join(lines)
+                break
+        else:
             raise RuntimeError("Import anchor not found")
-        text = text.replace(anchor, anchor + IMPORT_BLOCK + "\n", 1)
 
     if GLOBAL_SENTINEL not in text:
         anchor = "profiler_router = APIRouter()\n"
