@@ -1261,6 +1261,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
         tc = self.config  # talker config
         hf = self.hf_config  # parent Qwen3TTSConfig
         device = next(self.parameters()).device
+        speaker_key = speaker.lower().strip()
 
         input_ids = self.tokenizer(
             self._build_assistant_text(text),
@@ -1291,7 +1292,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
             and language.lower() in ("auto", "chinese")
         ):
             spk_is_dialect = getattr(tc, "spk_is_dialect", None) or {}
-            dialect = spk_is_dialect.get(speaker.lower())
+            dialect = spk_is_dialect.get(speaker_key)
             if isinstance(dialect, str) and dialect:
                 language_id = lang_map.get(dialect)
 
@@ -1323,14 +1324,13 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
         spk_map = {
             k.lower(): v for k, v in (getattr(tc, "spk_id", None) or {}).items()
         }
-        spk_lc = speaker.lower().strip()
-        if spk_lc not in spk_map:
+        if speaker_key not in spk_map:
             raise ValueError(
                 f"Unsupported CustomVoice speaker: {speaker!r} "
                 f"(known: {sorted(spk_map) or '<none>'})"
             )
         speaker_embed = self.code_predictor.codec_embedding(
-            torch.tensor([[spk_map[spk_lc]]], device=device, dtype=torch.long)
+            torch.tensor([[spk_map[speaker_key]]], device=device, dtype=torch.long)
         )
 
         codec_input = torch.cat(
