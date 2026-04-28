@@ -46,13 +46,11 @@ For more details on parallelism acceleration, see the [Parallelism Acceleration 
 ## Offline CLI Generation
 
 For one-shot local inference without starting an HTTP server, use
-`vllm generate` with the same model and generation controls. The CLI supports
-text-to-image (`t2i`), image-to-image (`i2i`), text-to-video (`t2v`), and
-image-to-video (`i2v`) diffusion tasks.
+`vllm generate` with the same model and generation controls. The offline CLI is
+currently scoped to text-to-image generation.
 
 ```bash
 vllm generate \
-  --task t2i \
   --model Qwen/Qwen-Image \
   --prompt "A beautiful landscape painting" \
   --output output.png \
@@ -60,52 +58,6 @@ vllm generate \
   --width 1024 \
   --num-inference-steps 50 \
   --cfg-scale 4.0 \
-  --guidance-scale 4.0 \
-  --seed 42
-```
-
-Image-conditioned tasks take one or more `--input-image` arguments:
-
-```bash
-vllm generate \
-  --task i2i \
-  --model Qwen/Qwen-Image-Edit \
-  --prompt "Turn this into a watercolor painting" \
-  --input-image input.png \
-  --output edited.png \
-  --num-inference-steps 50 \
-  --cfg-scale 4.0 \
-  --guidance-scale 4.0 \
-  --seed 42
-```
-
-Video tasks save MP4 output and accept `--num-frames` and `--fps`:
-
-```bash
-vllm generate \
-  --task t2v \
-  --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --prompt "A cinematic shot of waves crashing at sunset" \
-  --output output.mp4 \
-  --height 480 \
-  --width 832 \
-  --num-frames 81 \
-  --fps 24 \
-  --num-inference-steps 40 \
-  --guidance-scale 4.0 \
-  --seed 42
-
-vllm generate \
-  --task i2v \
-  --model Wan-AI/Wan2.2-I2V-A14B-Diffusers \
-  --prompt "Animate this image with gentle camera motion" \
-  --input-image input.png \
-  --output output.mp4 \
-  --height 480 \
-  --width 832 \
-  --num-frames 81 \
-  --fps 24 \
-  --num-inference-steps 40 \
   --guidance-scale 4.0 \
   --seed 42
 ```
