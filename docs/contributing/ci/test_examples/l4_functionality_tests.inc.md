@@ -1,6 +1,6 @@
 **Scope**
 
-For diffusion models, the L4 functionality test covers all or common *diffusion features* that are supported by this model, including several [parallelism acceleration methods](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/parallelism_acceleration/), [CPU offloading](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cpu_offload_diffusion/), [TeaCache](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/teacache/) and [Cache-DiT](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cache_dit_acceleration/) cache backends, [quantization methods](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/quantization/overview/).
+For diffusion models, the L4 functionality test covers all or common *diffusion features* that are supported by this model, including several [parallelism acceleration methods](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/parallelism_acceleration/), [CPU offloading](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cpu_offload_diffusion/), [TeaCache](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/teacache/) and [Cache-DiT](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cache_dit_acceleration/) cache backends, [quantization methods](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/quantization/overview/).
 
 **Test Case Design**
 
