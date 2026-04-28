@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.model_executor.stage_input_processors.minicpmo4_5 import (
     ASYNC_TTS_CHUNK_SIZE,
     TTS_BOS_ID,
@@ -82,12 +83,13 @@ def _tm():
     )
 
 
-def _req(rid, *, all_token_ids, prompt_token_ids=None, output_token_ids=None):
+def _req(rid, *, all_token_ids, prompt_token_ids=None, output_token_ids=None, additional_information=None):
     return SimpleNamespace(
         external_req_id=rid,
         all_token_ids=all_token_ids,
         prompt_token_ids=prompt_token_ids if prompt_token_ids is not None else all_token_ids,
         output_token_ids=output_token_ids if output_token_ids is not None else [],
+        additional_information=additional_information,
     )
 
 
@@ -158,6 +160,43 @@ def test_thinker2talker_async_chunk_starts_when_tts_bos_is_in_prompt():
     assert payload["llm_tokens"].tolist() == list(range(11, 11 + ASYNC_TTS_CHUNK_SIZE))
     assert tuple(payload["tts_hidden_states"].shape) == (ASYNC_TTS_CHUNK_SIZE, 8)
     assert bool(payload["finished"]) is False
+
+
+def test_thinker2talker_async_chunk_forwards_ref_audio_once():
+    tm = _tm()
+    ref_audio = {"wav": [0.1, -0.2, 0.3], "sr": 16000}
+    add_info = serialize_additional_information({"ref_audio": ref_audio})
+
+    first_payload = thinker2talker_async_chunk(
+        transfer_manager=tm,
+        pooling_output={"latent": torch.randn(ASYNC_TTS_CHUNK_SIZE, 8, dtype=torch.float32)},
+        request=_req(
+            "r",
+            all_token_ids=[100, TTS_BOS_ID] + list(range(11, 11 + ASYNC_TTS_CHUNK_SIZE)),
+            prompt_token_ids=[100, TTS_BOS_ID],
+            output_token_ids=list(range(11, 11 + ASYNC_TTS_CHUNK_SIZE)),
+            additional_information=add_info,
+        ),
+    )
+
+    assert first_payload is not None
+    assert first_payload["ref_audio"]["sr"] == 16000
+    assert first_payload["ref_audio"]["wav"] == pytest.approx([0.1, -0.2, 0.3], rel=1e-5, abs=1e-6)
+
+    second_payload = thinker2talker_async_chunk(
+        transfer_manager=tm,
+        pooling_output={"latent": torch.randn(ASYNC_TTS_CHUNK_SIZE, 8, dtype=torch.float32)},
+        request=_req(
+            "r",
+            all_token_ids=[100, TTS_BOS_ID] + list(range(11, 11 + 2 * ASYNC_TTS_CHUNK_SIZE)),
+            prompt_token_ids=[100, TTS_BOS_ID],
+            output_token_ids=list(range(11, 11 + 2 * ASYNC_TTS_CHUNK_SIZE)),
+            additional_information=add_info,
+        ),
+    )
+
+    assert second_payload is not None
+    assert "ref_audio" not in second_payload
 
 
 def test_thinker2talker_async_chunk_writes_debug_artifacts(tmp_path, monkeypatch):
@@ -343,6 +382,33 @@ def test_talker2code2wav_async_chunk_uses_output_token_delta():
     assert bool(payload["finished"]) is False
     assert payload["left_context_size"] == 0
     assert payload["code_predictor_codes"] == list(range(25))
+
+
+def test_talker2code2wav_async_chunk_forwards_ref_audio_once():
+    tm = _tm()
+    ref_audio = {"wav": [0.1, -0.2], "sr": 16000}
+    add_info = serialize_additional_information({"ref_audio": ref_audio})
+
+    first_payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        pooling_output={},
+        request=_req("r", all_token_ids=[101], output_token_ids=list(range(25)), additional_information=add_info),
+        is_finished=False,
+    )
+
+    assert first_payload is not None
+    assert first_payload["ref_audio"]["sr"] == 16000
+    assert first_payload["ref_audio"]["wav"] == pytest.approx([0.1, -0.2], rel=1e-5, abs=1e-6)
+
+    second_payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        pooling_output={},
+        request=_req("r", all_token_ids=[101], output_token_ids=list(range(50)), additional_information=add_info),
+        is_finished=False,
+    )
+
+    assert second_payload is not None
+    assert "ref_audio" not in second_payload
 
 
 def test_talker2code2wav_async_chunk_writes_debug_artifacts(tmp_path, monkeypatch):

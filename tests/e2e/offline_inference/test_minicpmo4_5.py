@@ -146,6 +146,7 @@ def _build_multimodal_text_prompt(
     video: np.ndarray | None = None,
     modalities: list[str] | None = None,
     system_prompt: str | None = None,
+    ref_audio_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if system_prompt is None:
         system_prompt = (
@@ -183,6 +184,8 @@ def _build_multimodal_text_prompt(
     }
     if multi_modal_data:
         prompt["multi_modal_data"] = multi_modal_data
+    if ref_audio_payload is not None:
+        prompt["additional_information"] = {"ref_audio": ref_audio_payload}
     return prompt
 
 
@@ -560,6 +563,42 @@ def test_minicpmo45_async_chunk_text_to_audio() -> None:
         if artifact_root:
             debug_root = Path(artifact_root) / "debug" / "minicpmo4_5_async_chunk"
             print(f"MiniCPM offline async_chunk debug artifact root: {debug_root}")
+
+        ref_audio_payload = _load_ref_audio_payload_from_env()
+        if ref_audio_payload is not None:
+            prompt_with_ref = _build_tts_prompt(
+                model_path,
+                "Please read this sentence aloud using the provided voice style: "
+                "vLLM Omni is running an async chunk MiniCPM reference audio speech test.",
+                ref_audio_payload=ref_audio_payload,
+            )
+            outputs_with_ref = list(
+                omni.generate(
+                    prompt_with_ref,
+                    sampling_params_list=omni.default_sampling_params_list,
+                    use_tqdm=False,
+                )
+            )
+
+            text_output_with_ref, audio_np_with_ref, sample_rate_with_ref, rms_with_ref = _assert_valid_audio_output(
+                outputs_with_ref,
+                label="async_chunk_text_to_audio_with_ref",
+            )
+            print(
+                f"MiniCPM offline async_chunk audio with ref: "
+                f"duration={audio_np_with_ref.size / sample_rate_with_ref:.2f}s "
+                f"sample_rate={sample_rate_with_ref} rms={rms_with_ref:.4f} "
+                f"text={text_output_with_ref!r}"
+            )
+            artifact_path_with_ref = _maybe_save_audio_artifact(
+                label="async_chunk_text_to_audio_with_ref",
+                audio_np=audio_np_with_ref,
+                sample_rate=sample_rate_with_ref,
+            )
+            if artifact_path_with_ref is not None:
+                print(f"MiniCPM offline async_chunk audio with ref artifact: {artifact_path_with_ref}")
+        else:
+            print("MiniCPM offline async_chunk audio with ref: skipped because no ref audio path was provided.")
     finally:
         _best_effort_close_omni(omni)
 
@@ -654,6 +693,42 @@ def test_minicpmo45_async_chunk_text_image_to_audio() -> None:
         if artifact_root:
             debug_root = Path(artifact_root) / "debug" / "minicpmo4_5_async_chunk"
             print(f"MiniCPM offline async_chunk image-audio debug artifact root: {debug_root}")
+
+        ref_audio_payload = _load_ref_audio_payload_from_env()
+        if ref_audio_payload is not None:
+            prompt_with_ref = _build_multimodal_text_prompt(
+                "Describe the image in one short spoken sentence using the provided voice style.",
+                image=image,
+                modalities=["audio"],
+                system_prompt=AUDIO_OUTPUT_SYSTEM_PROMPT,
+                ref_audio_payload=ref_audio_payload,
+            )
+            outputs_with_ref = list(
+                omni.generate(
+                    prompt_with_ref,
+                    sampling_params_list=omni.default_sampling_params_list,
+                    use_tqdm=False,
+                )
+            )
+            text_output_with_ref, audio_np_with_ref, sample_rate_with_ref, rms_with_ref = _assert_valid_audio_output(
+                outputs_with_ref,
+                label="async_chunk_text_image_to_audio_with_ref",
+            )
+            print(
+                f"MiniCPM offline async_chunk image-audio with ref: "
+                f"duration={audio_np_with_ref.size / sample_rate_with_ref:.2f}s "
+                f"sample_rate={sample_rate_with_ref} rms={rms_with_ref:.4f} "
+                f"text={text_output_with_ref!r}"
+            )
+            artifact_path_with_ref = _maybe_save_audio_artifact(
+                label="async_chunk_text_image_to_audio_with_ref",
+                audio_np=audio_np_with_ref,
+                sample_rate=sample_rate_with_ref,
+            )
+            if artifact_path_with_ref is not None:
+                print(f"MiniCPM offline async_chunk image-audio with ref artifact: {artifact_path_with_ref}")
+        else:
+            print("MiniCPM offline async_chunk image-audio with ref: skipped because no ref audio path was provided.")
     finally:
         _best_effort_close_omni(omni)
 
@@ -750,6 +825,42 @@ def test_minicpmo45_async_chunk_text_video_to_audio() -> None:
         if artifact_root:
             debug_root = Path(artifact_root) / "debug" / "minicpmo4_5_async_chunk"
             print(f"MiniCPM offline async_chunk video-audio debug artifact root: {debug_root}")
+
+        ref_audio_payload = _load_ref_audio_payload_from_env()
+        if ref_audio_payload is not None:
+            prompt_with_ref = _build_multimodal_text_prompt(
+                "Describe the video in one short spoken sentence using the provided voice style.",
+                video=video,
+                modalities=["audio"],
+                system_prompt=AUDIO_OUTPUT_SYSTEM_PROMPT,
+                ref_audio_payload=ref_audio_payload,
+            )
+            outputs_with_ref = list(
+                omni.generate(
+                    prompt_with_ref,
+                    sampling_params_list=omni.default_sampling_params_list,
+                    use_tqdm=False,
+                )
+            )
+            text_output_with_ref, audio_np_with_ref, sample_rate_with_ref, rms_with_ref = _assert_valid_audio_output(
+                outputs_with_ref,
+                label="async_chunk_text_video_to_audio_with_ref",
+            )
+            print(
+                f"MiniCPM offline async_chunk video-audio with ref: "
+                f"duration={audio_np_with_ref.size / sample_rate_with_ref:.2f}s "
+                f"sample_rate={sample_rate_with_ref} rms={rms_with_ref:.4f} "
+                f"text={text_output_with_ref!r}"
+            )
+            artifact_path_with_ref = _maybe_save_audio_artifact(
+                label="async_chunk_text_video_to_audio_with_ref",
+                audio_np=audio_np_with_ref,
+                sample_rate=sample_rate_with_ref,
+            )
+            if artifact_path_with_ref is not None:
+                print(f"MiniCPM offline async_chunk video-audio with ref artifact: {artifact_path_with_ref}")
+        else:
+            print("MiniCPM offline async_chunk video-audio with ref: skipped because no ref audio path was provided.")
     finally:
         _best_effort_close_omni(omni)
 

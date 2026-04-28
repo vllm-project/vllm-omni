@@ -13,6 +13,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 # Special token ids from the MiniCPM tokenizer config.
@@ -377,6 +378,7 @@ def _get_async_tts_state(transfer_manager: Any, request_id: str) -> dict[str, An
             "_kind": _ASYNC_TTS_STATE_KEY,
             "tts_started": False,
             "tts_closed": False,
+            "ref_audio_emitted": False,
             "hidden_size": None,
             "pending_unpaired_output_tokens": [],
             "pending_llm_tokens": [],
@@ -399,6 +401,8 @@ def _get_async_codec_state(transfer_manager: Any, request_id: str) -> dict[str, 
             "_kind": _ASYNC_CODEC_STATE_KEY,
             "emitted_output_tokens": 0,
             "pending_audio_tokens": [],
+            "ref_audio": None,
+            "ref_audio_emitted": False,
             "debug_chunk_index": 0,
             "debug_emitted_audio_tokens": [],
         }
@@ -612,6 +616,18 @@ def _extract_ref_audio_from_prompt(prompt: Any, index: int = 0) -> Any:
     return _canonicalize_ref_audio(raw_ref_audio)
 
 
+def _extract_ref_audio_from_request(request: Any) -> dict[str, Any] | None:
+    add_info = getattr(request, "additional_information", None)
+    if add_info is None:
+        return None
+
+    info = deserialize_additional_information(add_info)
+    raw_ref_audio = info.get("ref_audio")
+    if raw_ref_audio is None:
+        return None
+    return _canonicalize_ref_audio(raw_ref_audio)
+
+
 def _canonicalize_ref_audio(raw_ref_audio: Any) -> dict[str, Any]:
     if isinstance(raw_ref_audio, list) and len(raw_ref_audio) == 1:
         raw_ref_audio = raw_ref_audio[0]
@@ -645,6 +661,34 @@ def _canonicalize_ref_audio(raw_ref_audio: Any) -> dict[str, Any]:
         "wav": np.asarray(wav_np, dtype=np.float32).reshape(-1).tolist(),
         "sr": int(sr),
     }
+
+
+def _attach_ref_audio_once(
+    payload: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    request: Any,
+    request_id: str,
+    hook: str,
+) -> dict[str, Any]:
+    if state.get("ref_audio_emitted", False):
+        return payload
+
+    ref_audio = _extract_ref_audio_from_request(request)
+    if ref_audio is None:
+        return payload
+
+    payload["ref_audio"] = ref_audio
+    state["ref_audio_emitted"] = True
+    _log_ref_audio_debug(
+        hook,
+        {
+            "request_id": request_id,
+            "has_ref_audio": True,
+            "ref_audio": _summarize_ref_audio(ref_audio),
+        },
+    )
+    return payload
 
 
 def talker2code2wav(
@@ -878,14 +922,20 @@ def thinker2talker_async_chunk(
             state_after_append=state_after_append_snapshot,
             state_after_emit=_snapshot_async_tts_state(state),
         )
-        return {
-            "override_keys": ["llm_tokens", "tts_hidden_states"],
-            "llm_tokens": llm_tokens,
-            "tts_hidden_states": tts_hidden_states,
-            "async_tts_chunk_id": chunk_serial,
-            "global_request_id": request_id,
-            "finished": torch.tensor(True, dtype=torch.bool),
-        }
+        return _attach_ref_audio_once(
+            {
+                "override_keys": ["llm_tokens", "tts_hidden_states"],
+                "llm_tokens": llm_tokens,
+                "tts_hidden_states": tts_hidden_states,
+                "async_tts_chunk_id": chunk_serial,
+                "global_request_id": request_id,
+                "finished": torch.tensor(True, dtype=torch.bool),
+            },
+            state=state,
+            request=request,
+            request_id=request_id,
+            hook="thinker2talker_async_chunk_ref_audio",
+        )
 
     if pending_count < ASYNC_TTS_CHUNK_SIZE:
         _dump_async_tts_processor_step(
@@ -980,14 +1030,20 @@ def thinker2talker_async_chunk(
         state_after_append=state_after_append_snapshot,
         state_after_emit=_snapshot_async_tts_state(state),
     )
-    return {
-        "override_keys": ["llm_tokens", "tts_hidden_states"],
-        "llm_tokens": llm_tokens,
-        "tts_hidden_states": tts_hidden_states,
-        "async_tts_chunk_id": chunk_serial,
-        "global_request_id": request_id,
-        "finished": torch.tensor(False, dtype=torch.bool),
-    }
+    return _attach_ref_audio_once(
+        {
+            "override_keys": ["llm_tokens", "tts_hidden_states"],
+            "llm_tokens": llm_tokens,
+            "tts_hidden_states": tts_hidden_states,
+            "async_tts_chunk_id": chunk_serial,
+            "global_request_id": request_id,
+            "finished": torch.tensor(False, dtype=torch.bool),
+        },
+        state=state,
+        request=request,
+        request_id=request_id,
+        hook="thinker2talker_async_chunk_ref_audio",
+    )
 
 
 def talker2code2wav_async_chunk(
@@ -1003,6 +1059,10 @@ def talker2code2wav_async_chunk(
     chunk_size = int(cfg.get("codec_chunk_frames", 25))
     request_id = request.external_req_id
     state = _get_async_codec_state(transfer_manager, request_id)
+    if state.get("ref_audio") is None:
+        ref_audio = _extract_ref_audio_from_request(request)
+        if ref_audio is not None:
+            state["ref_audio"] = ref_audio
 
     output_token_ids = [int(tok) for tok in _ensure_list(getattr(request, "output_token_ids", None))]
     emitted_output_tokens = int(state.get("emitted_output_tokens", 0) or 0)
@@ -1040,12 +1100,24 @@ def talker2code2wav_async_chunk(
     if is_finished:
         transfer_manager.request_payload.pop(request_id, None)
 
-    return {
+    payload = {
         "code_predictor_codes": codes,
-        # Only left_context_size is forwarded into runtime_additional_information
-        # for Stage 2. Reuse it as a simple EOF marker:
+        # Stage 2 uses left_context_size as a simple EOF marker:
         #   0 -> more chunks expected
         #   1 -> final chunk / flush
         "left_context_size": 1 if is_finished else 0,
         "finished": torch.tensor(is_finished, dtype=torch.bool),
     }
+    ref_audio = state.get("ref_audio")
+    if ref_audio is not None and not state.get("ref_audio_emitted", False):
+        payload["ref_audio"] = ref_audio
+        state["ref_audio_emitted"] = True
+        _log_ref_audio_debug(
+            "talker2code2wav_async_chunk_ref_audio",
+            {
+                "request_id": request_id,
+                "has_ref_audio": True,
+                "ref_audio": _summarize_ref_audio(ref_audio),
+            },
+        )
+    return payload
