@@ -65,9 +65,9 @@ docker run -d --name "${CONTAINER}" \
 
 log "Copy plugin and patch scripts into container"
 docker exec "${CONTAINER}" bash -lc "mkdir -p ${CTR_ROOT}/server_ingress_plugin"
-docker cp "${WORKSPACE_DIR}/server_ingress_plugin/image_ingress_scheduler_single.py" \
+docker cp "${WORKSPACE_DIR}/image_ingress_scheduler_single.py" \
   "${CONTAINER}:${CTR_ROOT}/server_ingress_plugin/image_ingress_scheduler_single.py"
-docker cp "${WORKSPACE_DIR}/server_ingress_plugin/patch_api_server_ingress_singlefile.py" \
+docker cp "${WORKSPACE_DIR}/patch_api_server_ingress_singlefile.py" \
   "${CONTAINER}:/tmp/patch_api_server_ingress_singlefile.py"
 docker cp "${WORKSPACE_DIR}/rr_vllm_http_proxy_timing.py" "${CONTAINER}:/tmp/rr_vllm_http_proxy_timing.py"
 
