@@ -62,7 +62,8 @@ dev = [
     "scipy>=1.10.0",
     "funasr>=1.0.0",
     "lpips>=0.1.4", # for quantization fp8
-    "orjson>=3.11.7" # to make v1/embeddings API fast
+    "orjson>=3.11.7", # to make v1/embeddings API fast
+    "voxcpm>=2.0.2" # for voxcpm model test
 ]
 
 demo = [

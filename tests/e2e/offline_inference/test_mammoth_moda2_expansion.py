@@ -107,7 +107,7 @@ pytestmark = [
 ]
 
 
-@hardware_test(res={"cuda": "L4"})
+@hardware_test(res={"cuda": "H100"})
 def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     """
     End-to-end text-to-image generation with MammothModa2 (AR -> DiT).
