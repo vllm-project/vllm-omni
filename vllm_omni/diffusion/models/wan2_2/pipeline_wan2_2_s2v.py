@@ -517,10 +517,9 @@ class Wan22S2VPipeline(
         self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if hasattr(self.vae, "config") else 8
 
         # -- Resolution divisor for padding (VAE spatial scale × transformer patch size) --
-        # S2V uses patch_size=2 in patch_embedding (3D conv with stride 2 in spatial dims)
-        # Total divisor = vae_scale_factor_spatial × patch_size_spatial = 8 × 8 = 64
-        # (patch_size_spatial = 2 × 2 × 2 for three conv layers)
-        self.resolution_divisor = self.vae_scale_factor_spatial * 8  # 8 = 2^3 for patch embedding
+        # S2V uses patch_size=(1,2,2) in patch_embedding (3D conv with stride 2 in spatial dims)
+        # Total divisor = vae_scale_factor_spatial × patch_size_spatial = 8 × 2 = 16
+        self.resolution_divisor = self.vae_scale_factor_spatial * 2  # 2 from patch_size spatial stride
 
         # -- S2V specific config --
         # These mirror Wan2.2/wan/configs/wan_s2v_14B.py
