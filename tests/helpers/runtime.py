@@ -9,7 +9,9 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from collections.abc import Generator
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -118,6 +120,89 @@ class OmniServerParams(NamedTuple):
     use_stage_cli: bool = False
     init_timeout: int | None = None
     stage_init_timeout: int | None = None  # None: fixture supplies default (600 s)
+
+
+def run_omni_server(
+    request: Any,
+    run_level: str,
+    model_prefix: str,
+    omni_fixture_lock: threading.Lock,
+) -> Generator["OmniServer", Any, None]:
+    from tests.helpers.stage_config import modify_stage_config
+
+    with omni_fixture_lock:
+        params: OmniServerParams = request.param
+        model = model_prefix + params.model
+        port = params.port
+        stage_config_path = params.stage_config_path
+        if run_level in {"advanced_model", "full_model"} and stage_config_path is not None:
+            with open(stage_config_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            # Strip ``load_format: dummy`` (CI overlay default) so advanced_model
+            # tests use real weights. New schema (``stages:``) writes the field
+            # flat at stage level; legacy schema (``stage_args:``) nests it as
+            # ``engine_args.load_format``. Handle both.
+            new_schema_stages = cfg.get("stages")
+            stage_key = "stages" if new_schema_stages is not None else "stage_args"
+            delete_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
+            stage_entries = cfg.get(stage_key, [])
+            stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
+            stage_config_path = modify_stage_config(
+                stage_config_path,
+                deletes={stage_key: {stage_id: [delete_path] for stage_id in stage_ids}},
+            )
+
+        server_args = params.server_args or []
+        if params.use_omni and params.stage_init_timeout is not None:
+            server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
+        else:
+            server_args = [*server_args, "--stage-init-timeout", "600"]
+        if params.init_timeout is not None:
+            server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
+        else:
+            server_args = [*server_args, "--init-timeout", "900"]
+        if params.use_stage_cli:
+            if not params.use_omni:
+                raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
+            if stage_config_path is None:
+                raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
+            server_args += ["--stage-configs-path", stage_config_path]
+
+            with OmniServerStageCli(
+                model,
+                stage_config_path,
+                server_args,
+                port=port,
+                env_dict=params.env_dict,
+            ) as server:
+                print("OmniServer started successfully")
+                yield server
+                print("OmniServer stopping...")
+        else:
+            if stage_config_path is not None:
+                server_args += ["--stage-configs-path", stage_config_path]
+
+            with (
+                OmniServer(
+                    model,
+                    server_args,
+                    port=port,
+                    env_dict=params.env_dict,
+                    use_omni=params.use_omni,
+                )
+                if port
+                else OmniServer(
+                    model,
+                    server_args,
+                    env_dict=params.env_dict,
+                    use_omni=params.use_omni,
+                )
+            ) as server:
+                print("OmniServer started successfully")
+                yield server
+                print("OmniServer stopping...")
+
+        print("OmniServer stopped")
 
 
 class OmniServer:
@@ -620,6 +705,9 @@ class OpenAIClientHandler:
             mm = dict(extra_body.get("mm_processor_kwargs") or {})
             mm["use_audio_in_video"] = True
             extra_body["mm_processor_kwargs"] = mm
+        if "sampling_params_list" in request_config:
+            extra_body["sampling_params_list"] = request_config["sampling_params_list"]
+
         create_kwargs: dict[str, Any] = {
             "model": request_config.get("model"),
             "messages": request_config.get("messages"),

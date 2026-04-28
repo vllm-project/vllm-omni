@@ -28,7 +28,6 @@ from PIL import Image
 from pydantic import BaseModel, Field
 from starlette.datastructures import State
 from starlette.routing import Route
-from vllm import SamplingParams
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
 from vllm.entrypoints.chat_utils import load_chat_template
@@ -117,11 +116,16 @@ from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
+from vllm_omni.entrypoints.openai.serving_video_stream import OmniStreamingVideoHandler
+from vllm_omni.entrypoints.openai.stage_params import (
+    build_stage_sampling_params_list,
+    get_default_sampling_params_list,
+)
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 logger = init_logger(__name__)
 router = APIRouter()
@@ -606,6 +610,7 @@ async def omni_init_app_state(
             stage_configs=diffusion_stage_configs,
         )
         state.openai_streaming_speech = None
+        state.openai_streaming_video = None
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
@@ -906,6 +911,14 @@ async def omni_init_app_state(
 
     state.openai_streaming_speech = OmniStreamingSpeechHandler(
         speech_service=state.openai_serving_speech,
+    )
+    state.openai_streaming_video = (
+        OmniStreamingVideoHandler(
+            chat_service=state.openai_serving_chat,
+            engine_client=engine_client,
+        )
+        if state.openai_serving_chat is not None
+        else None
     )
     state.openai_serving_realtime = OpenAIServingRealtime(
         engine_client=engine_client,
@@ -1292,6 +1305,23 @@ async def streaming_speech(websocket: WebSocket):
     await handler.handle_session(websocket)
 
 
+@router.websocket("/v1/video/chat/stream")
+async def streaming_video_chat(websocket: WebSocket):
+    """WebSocket endpoint for streaming video input chat."""
+    handler = getattr(websocket.app.state, "openai_streaming_video", None)
+    if handler is None:
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": "Streaming video chat is not available",
+            }
+        )
+        await websocket.close()
+        return
+    await handler.handle_session(websocket)
+
+
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
@@ -1545,13 +1575,23 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
         logger.info(f"Successfully generated {len(images)} image(s)")
 
-        # Encode images to base64
-        image_data = [ImageData(b64_json=encode_image_base64(img), revised_prompt=None) for img in images]
+        # Determine output format (default to png)
+        output_format = _choose_output_format(request.output_format or "png", None)
 
-        return ImageGenerationResponse(
-            created=int(time.time()),
-            data=image_data,
-        )
+        # Encode images to base64 with the specified format
+        image_data = [
+            ImageData(b64_json=_encode_image_base64_with_compression(img, format=output_format), revised_prompt=None)
+            for img in images
+        ]
+
+        response_kwargs = {
+            "created": int(time.time()),
+            "data": image_data,
+            "output_format": output_format,
+        }
+        if request.size:
+            response_kwargs["size"] = size_str
+        return ImageGenerationResponse(**response_kwargs)
 
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
@@ -1756,20 +1796,85 @@ async def edit_images(
         _update_if_not_none(gen_params, "layers", layers)
         _update_if_not_none(gen_params, "resolution", resolution)
 
-        # 4. Generate images using AsyncOmni (multi-stage mode)
+        # 4. Generate images
         request_id = f"img_edit-{random_uuid()}"
         raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
         logger.info(f"Generating {n} image(s) {size_str}")
-        result = await _generate_with_async_omni(
-            engine_client=engine_client,
-            gen_params=gen_params,
-            stage_configs=stage_configs,
-            prompt=prompt,
-            request_id=request_id,
-        )
 
-        # 5. Extract images from result
-        images = _extract_images_from_result(result)
+        if len(stage_configs) > 1:
+            # Multi-stage pipeline (e.g. GLM-Image AR+Diffusion): route through
+            # the chat handler so the AR stage gets correct max_tokens and
+            # target_h/w (same path as /v1/images/generations).
+            chat_handler = getattr(raw_request.app.state, "openai_serving_chat", None)
+            if chat_handler is None:
+                raise HTTPException(
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                    detail="openai_serving_chat is not initialized for multi-stage image editing.",
+                )
+
+            # Encode input images to base64 for generate_diffusion_images.
+            import base64
+            import io as _io
+
+            ref_b64_list: list[str] = []
+            for _img in pil_images:
+                buf = _io.BytesIO()
+                _img.save(buf, format="PNG")
+                ref_b64_list.append(base64.b64encode(buf.getvalue()).decode())
+
+            effective_seed = seed if seed is not None else random.randint(0, MAX_UINT32_SEED)
+            extra_body: dict[str, Any] = {
+                "seed": effective_seed,
+                "num_outputs_per_prompt": n,
+            }
+            if width is not None:
+                extra_body["width"] = width
+            if height is not None:
+                extra_body["height"] = height
+            if negative_prompt is not None:
+                extra_body["negative_prompt"] = negative_prompt
+            if num_inference_steps is not None:
+                extra_body["num_inference_steps"] = num_inference_steps
+            if guidance_scale is not None:
+                extra_body["guidance_scale"] = guidance_scale
+            if strength is not None:
+                extra_body["strength"] = strength
+            if true_cfg_scale is not None:
+                extra_body["true_cfg_scale"] = true_cfg_scale
+            if layers is not None:
+                extra_body["layers"] = layers
+            if resolution is not None:
+                extra_body["resolution"] = resolution
+            if lora is not None:
+                # Validate LoRA, then pass through.
+                lora_dict = _get_lora_from_json_str(lora)
+                _parse_lora_request(lora_dict)
+                extra_body["lora"] = lora_dict
+
+            prompt_text = prompt.get("prompt", "")
+            generation_result = await chat_handler.generate_diffusion_images(
+                prompt=prompt_text,
+                extra_body=extra_body,
+                reference_images=ref_b64_list,
+                request_id=request_id,
+            )
+            if isinstance(generation_result, ErrorResponse):
+                raise HTTPException(
+                    status_code=generation_result.error.code if generation_result.error else 400,
+                    detail=generation_result.message,
+                )
+            images, _, _ = generation_result
+        else:
+            # Single-stage diffusion: use the direct path.
+            result = await _generate_with_async_omni(
+                engine_client=engine_client,
+                gen_params=gen_params,
+                stage_configs=stage_configs,
+                prompt=prompt,
+                request_id=request_id,
+            )
+            images = _extract_images_from_result(result)
+
         logger.info(f"Successfully generated {len(images)} image(s)")
 
         # Encode images to base64
@@ -1916,34 +2021,12 @@ async def _generate_with_async_omni(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
             detail="Stage configs not found. Start server with a multi-stage omni model.",
         )
-    default_params_list: list[OmniSamplingParams] | None = getattr(
-        engine_client,
-        "default_sampling_params_list",
-        None,
+    sampling_params_list = build_stage_sampling_params_list(
+        normalized_stage_configs,
+        get_default_sampling_params_list(engine_client),
+        diffusion_params=gen_params,
+        replace_diffusion_params=True,
     )
-    if not isinstance(default_params_list, list):
-        default_params_list = []
-    else:
-        default_params_list = list(default_params_list)
-
-    sampling_params_list: list[OmniSamplingParams] = []
-    for idx, stage_cfg in enumerate(normalized_stage_configs):
-        stage_type = get_stage_type(stage_cfg)
-        if stage_type == "diffusion":
-            sampling_params_list.append(gen_params)
-            continue
-
-        if idx < len(default_params_list):
-            default_stage_params = default_params_list[idx]
-        else:
-            default_stage_params = SamplingParams()
-
-        if hasattr(default_stage_params, "clone"):
-            try:
-                default_stage_params = default_stage_params.clone()
-            except Exception:
-                pass
-        sampling_params_list.append(default_stage_params)
 
     async for output in engine_client.generate(
         sampling_params_list=sampling_params_list,
@@ -2779,6 +2862,8 @@ if __name__ == "__main__":
 
     from vllm.entrypoints.openai.cli_args import make_arg_parser
 
+    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+
     parser = argparse.ArgumentParser(description="vLLM-Omni OpenAI-Compatible REST API server")
     parser = make_arg_parser(parser)
     registered_flags = set()
@@ -2790,6 +2875,7 @@ if __name__ == "__main__":
         parser.add_argument(
             "--enable-sleep-mode", action="store_true", default=False, help="Enable GPU memory pool for sleep mode."
         )
+    nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
     if not hasattr(args, "model_tag"):
         setattr(args, "model_tag", args.model)

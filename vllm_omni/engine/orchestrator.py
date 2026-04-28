@@ -33,6 +33,7 @@ from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
+from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
@@ -112,6 +113,9 @@ class OrchestratorRequestState:
     mm_features: list | None = None
 
     streaming: StreamingInputState = field(default_factory=lambda: StreamingInputState())
+
+    # Per-request pipeline timing accumulator (milliseconds)
+    pipeline_timings: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -624,6 +628,7 @@ class Orchestrator:
                 total_token=self._agg_total_tokens[stage_id],
                 total_gen_time_ms=self._agg_total_gen_time_ms[stage_id],
             ),
+            pipeline_timings=dict(req_state.pipeline_timings),
         )
 
     def _build_kv_sender_info(self, sender_stage_ids: list[int]) -> dict[int, dict[str, Any]] | None:
@@ -681,6 +686,7 @@ class Orchestrator:
                     False,
                 )
                 _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
+                req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
                 logger.info(
                     "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
                     req_id,
@@ -689,6 +695,32 @@ class Orchestrator:
                     next_stage_id,
                 )
                 if isinstance(diffusion_prompt, list):
+                    if not diffusion_prompt:
+                        error_output = OmniRequestOutput.from_error(
+                            req_id,
+                            f"Stage-{stage_id} produced no valid inputs for diffusion stage-{next_stage_id}",
+                        )
+                        logger.warning(
+                            "[Orchestrator] req=%s stage=%d produced empty diffusion inputs for stage=%d; "
+                            "routing terminal error output",
+                            req_id,
+                            stage_id,
+                            next_stage_id,
+                        )
+                        await self.output_async_queue.put(
+                            {
+                                "type": "output",
+                                "request_id": req_id,
+                                "stage_id": next_stage_id,
+                                "engine_outputs": error_output,
+                                "metrics": None,
+                                "finished": True,
+                            }
+                        )
+                        self._pd_kv_params.pop(req_id, None)
+                        self._cfg_tracker.cleanup_parent(req_id)
+                        self.request_states.pop(req_id, None)
+                        return
                     diffusion_prompt = diffusion_prompt[0]
             else:
                 diffusion_prompt = req_state.prompt
@@ -884,6 +916,15 @@ class Orchestrator:
         )
         req_state.streaming.enabled = is_streaming
         req_state.stage_submit_ts[stage_id] = _time.time()
+
+        # Per-request pipeline timings from caller thread
+        _enqueue_ts = msg.get("enqueue_ts", 0.0)
+        if _enqueue_ts > 0:
+            req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - _enqueue_ts) * 1000.0
+        _preprocess_ms = msg.get("preprocess_ms", 0.0)
+        if _preprocess_ms > 0:
+            req_state.pipeline_timings["preprocess_ms"] = _preprocess_ms
+
         self.request_states[request_id] = req_state
 
         # Stage-0 prompt is already a fully-formed OmniEngineCoreRequest

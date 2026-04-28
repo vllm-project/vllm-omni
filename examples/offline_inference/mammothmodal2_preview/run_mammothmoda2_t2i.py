@@ -29,6 +29,7 @@ from PIL import Image
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni import Omni
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -117,6 +118,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--out", type=str, default="output.png", help="Path to save the generated image.")
     p.add_argument("--trust-remote-code", action="store_true", help="Trust remote code when loading the model.")
+    nullify_stage_engine_defaults(p)
     args = p.parse_args()
     if not args.prompt:
         args.prompt = ["A stylish woman with sunglasses riding a motorcycle in NYC."]

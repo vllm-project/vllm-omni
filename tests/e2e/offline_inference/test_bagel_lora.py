@@ -17,13 +17,12 @@ Assertions:
 
 import json
 import os
+from pathlib import Path
 
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -33,13 +32,13 @@ from safetensors.torch import save_file
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
-from tests.helpers.stage_config import modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
 
 MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
-BAGEL_STAGE_CONFIG = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
+BAGEL_STAGE_CONFIG = get_deploy_config_path("ci/bagel.yaml")
 DEFAULT_PROMPT = "<|im_start|>A cute cat<|im_end|>"
 
 
@@ -48,14 +47,14 @@ DEFAULT_PROMPT = "<|im_start|>A cute cat<|im_end|>"
 # ---------------------------------------------------------------------------
 
 
-def _resolve_stage_config(config_path: str, run_level: str) -> str:
+def _resolve_deploy_config(config_path: str, run_level: str) -> str:
     if run_level == "advanced_model":
         return modify_stage_config(
             config_path,
             deletes={
-                "stage_args": {
-                    0: ["engine_args.load_format"],
-                    1: ["engine_args.load_format"],
+                "stages": {
+                    0: ["load_format"],
+                    1: ["load_format"],
                 }
             },
         )
@@ -153,7 +152,7 @@ def _make_file_lora_request(adapter_dir: Path) -> LoRARequest:
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
 def test_bagel_lora_scale_and_deactivation(run_level, tmp_path):
     """Validate LoRA effect, bounded perturbation, and clean deactivation."""
-    config_path = _resolve_stage_config(BAGEL_STAGE_CONFIG, run_level)
+    config_path = _resolve_deploy_config(BAGEL_STAGE_CONFIG, run_level)
     with OmniRunner(MODEL, stage_configs_path=config_path) as runner:
         omni = runner.omni
         lora_request = _make_file_lora_request(tmp_path / "bagel_lora")
@@ -188,9 +187,9 @@ def test_bagel_lora_scale_and_deactivation(run_level, tmp_path):
             f"LoRA scale has no effect: diff_1x={diff_1x:.2f}, diff_2x={diff_2x:.2f}"
         )
 
-        # (c) Output is not corrupted
+        # (c) Output is not corrupted (scale=2.0 can produce ~2x the diff of scale=1.0)
         assert diff_1x < 80, f"LoRA output looks corrupted: diff_1x={diff_1x}"
-        assert diff_2x < 80, f"LoRA output looks corrupted: diff_2x={diff_2x}"
+        assert diff_2x < 120, f"LoRA output looks corrupted: diff_2x={diff_2x}"
 
         # (d) Deactivation fully restores base model
         assert diff_restored == 0.0, f"Base model not restored after LoRA deactivation: diff={diff_restored}"

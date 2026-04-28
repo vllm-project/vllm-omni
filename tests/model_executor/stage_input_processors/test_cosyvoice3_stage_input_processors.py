@@ -13,7 +13,7 @@ def _source_output(request_id: str, prompt_ids: list[int], out_ids: list[int], m
     return SimpleNamespace(
         request_id=request_id,
         prompt_token_ids=prompt_ids,
-        outputs=[SimpleNamespace(token_ids=out_ids, multimodal_output=mm)],
+        outputs=[SimpleNamespace(token_ids=out_ids, cumulative_token_ids=out_ids, multimodal_output=mm)],
     )
 
 
@@ -58,8 +58,8 @@ def test_text2flow_supports_batched_source_outputs():
     assert len(outputs) == 2
     assert outputs[0]["prompt_token_ids"] == [1, 2, 3]
     assert outputs[1]["prompt_token_ids"] == [4, 5]
-    assert outputs[0]["additional_information"]["prefix_ids"] == [10, 11]
-    assert outputs[1]["additional_information"]["prefix_ids"] == [20, 21]
+    assert outputs[0]["additional_information"]["ids"]["prompt"] == [10, 11]
+    assert outputs[1]["additional_information"]["ids"]["prompt"] == [20, 21]
 
 
 def test_talker2code2wav_async_chunk_final_payload_uses_absolute_token_offset():
@@ -83,8 +83,8 @@ def test_talker2code2wav_async_chunk_final_payload_uses_absolute_token_offset():
     )
 
     assert payload is not None
-    assert payload["finished"].item() is True
-    assert payload["code_predictor_codes"] == [1, 2, 3]
+    assert payload["meta"]["finished"].item() is True
+    assert payload["codes"]["audio"] == [1, 2, 3]
     assert payload["token_offset"] == 0
     assert payload["left_context_size"] == 0
     assert payload["req_id"] == ["rid-0"]
@@ -111,8 +111,8 @@ def test_talker2code2wav_async_chunk_emits_eof_when_finished_without_valid_codes
     )
 
     assert payload is not None
-    assert payload["code_predictor_codes"] == []
-    assert payload["finished"].item() is True
+    assert payload["codes"]["audio"] == []
+    assert payload["meta"]["finished"].item() is True
 
 
 def test_talker2code2wav_async_chunk_does_not_reemit_without_new_tokens():
@@ -138,7 +138,7 @@ def test_talker2code2wav_async_chunk_does_not_reemit_without_new_tokens():
     )
 
     assert payload1 is not None
-    assert payload1["code_predictor_codes"] == [1, 2]
+    assert payload1["codes"]["audio"] == [1, 2]
     assert payload1["token_offset"] == 0
     assert payload2 is None
 
@@ -168,9 +168,9 @@ def test_talker2code2wav_async_chunk_waits_for_prelookahead_and_emits_cumulative
 
     assert payload_pending is None
     assert payload_ready is not None
-    assert payload_ready["code_predictor_codes"] == [1, 2, 3]
+    assert payload_ready["codes"]["audio"] == [1, 2, 3]
     assert payload_ready["token_offset"] == 0
-    assert payload_ready["finished"].item() is False
+    assert payload_ready["meta"]["finished"].item() is False
 
 
 def test_talker2code2wav_async_chunk_final_flush_uses_previous_token_offset():
@@ -197,12 +197,12 @@ def test_talker2code2wav_async_chunk_final_flush_uses_previous_token_offset():
     )
 
     assert payload_stream is not None
-    assert payload_stream["finished"].item() is False
-    assert payload_stream["code_predictor_codes"] == [3, 4, 5]
+    assert payload_stream["meta"]["finished"].item() is False
+    assert payload_stream["codes"]["audio"] == [3, 4, 5]
     assert payload_stream["token_offset"] == 0
     assert payload_final is not None
-    assert payload_final["finished"].item() is True
-    assert payload_final["code_predictor_codes"] == [3, 4, 5, 6]
+    assert payload_final["meta"]["finished"].item() is True
+    assert payload_final["codes"]["audio"] == [3, 4, 5, 6]
     assert payload_final["token_offset"] == 2
 
 
@@ -233,7 +233,7 @@ def test_talker2code2wav_async_chunk_respects_prompt_token_pad_on_first_chunk():
 
     assert payload_pending is None
     assert payload_ready is not None
-    assert payload_ready["code_predictor_codes"] == [8, 9, 10, 11]
+    assert payload_ready["codes"]["audio"] == [8, 9, 10, 11]
     assert payload_ready["token_offset"] == 0
 
 
@@ -260,8 +260,8 @@ def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio(
     )
 
     assert payload_stream is not None
-    assert payload_stream["finished"].item() is False
-    assert payload_stream["code_predictor_codes"] == [3, 4]
+    assert payload_stream["meta"]["finished"].item() is False
+    assert payload_stream["codes"]["audio"] == [3, 4]
     assert payload_final is not None
-    assert payload_final["finished"].item() is True
-    assert payload_final["code_predictor_codes"] == []
+    assert payload_final["meta"]["finished"].item() is True
+    assert payload_final["codes"]["audio"] == []

@@ -12,19 +12,80 @@ Please refer to [README.md](../../../README.md)
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
 ```
 
-The default deploy config at `vllm_omni/deploy/qwen3_omni_moe.yaml` is loaded
-automatically by the model registry — no `--deploy-config` flag needed for the
-common case. Async-chunk streaming is **enabled by default** in the bundled config.
-NPU / ROCm / XPU per-platform deltas are merged in automatically from the
-`platforms:` section of the same YAML.
+The default deployment configuration, situated at `vllm_omni/deploy/qwen3_omni_moe.yaml`, is resolved and loaded
+automatically via the model registry, obviating the `--deploy-config` flag in standard deployment topologies.
+Asynchronous chunk streaming operates as **enabled by default** within this bundled configuration.
+Additionally, NPU, ROCm, and XPU per-platform configuration deltas are deterministically merged from the
+`platforms`: section of the corresponding YAML.
 
-**Note:** The OpenAI-style **`/v1/realtime`** WebSocket (streaming PCM audio in, audio + transcription out) is **not supported** when `async_chunk` is enabled. Use the default omni layout or a stage config with `async_chunk: false` for realtime sessions.
+**Note:** The OpenAI-style **`/v1/realtime`** WebSocket interface (facilitating streaming PCM audio input alongside audio and transcription output)
+is currently **unsupported** while the `async_chunk` configuration attribute is enabled.
+It is requisite to instantiate the default omni architecture or utilize a deployment configuration specifying `async_chunk: false` to facilitate real-time streaming sessions.
 
-If you have a custom deploy YAML, point at it explicitly:
-
+To explicitly utilize a custom deployment YAML, mandate the configuration path accordingly:
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     --deploy-config /path/to/your_deploy_config.yaml
+```
+
+### Launch individual stages (stage-based CLI)
+
+Use the stage-based CLI when you want to run one stage per process.
+The example below pins Stage 0 to GPU 0 and Stage 1/2 to GPU 1 via
+`CUDA_VISIBLE_DEVICES`.
+
+**1. Stage 0 (Thinker + API server)**
+
+```bash
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --port 8091 \
+    --stage-id 0 \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+```
+
+**2. Stage 1 (Talker)**
+
+```bash
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --stage-id 1 \
+    --headless \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+```
+
+**3. Stage 2 (Code2Wav)**
+
+```bash
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --stage-id 2 \
+    --headless \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
+```
+
+Append `--deploy-config /path/to/your_deploy_config.yaml` to each node invocation if it is necessary
+to explicitly override the bundled deployment YAML schema.
+
+For standard **unified-process** launcher, stage-specific CLI configuration tuning is conventionally implemented
+via the `--stage-overrides` directive, as demonstrated below:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --stage-overrides '{"1": {"gpu_memory_utilization": 0.5}}'
+```
+
+Conversely, within the stage-based CLI paradigm, `--stage-overrides` modifiers are typically **unnecessary**
+for this category of optimization. Given that each instantiation strictly initiates a single functional stage,
+parameter flags can be systematically assigned directly onto that specific stage's command sequence:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+    --stage-id 1 \
+    --headless \
+    --gpu-memory-utilization 0.5 \
+    --omni-master-address 127.0.0.1 \
+    --omni-master-port 26000
 ```
 
 ### Tuning deployment parameters
@@ -92,6 +153,9 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
 
 Per-stage values are always treated as explicit and beat YAML defaults for
 the named stage. Other stages keep their YAML values.
+
+If you switch to the stage-based CLI, the same per-stage tuning can usually be
+passed directly on that stage's command instead of using `--stage-overrides`.
 
 #### 3. Custom deploy YAML
 
