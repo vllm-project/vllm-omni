@@ -185,8 +185,6 @@ class _RequestState:
     prefill_masks: tuple | None = None
     is_stopping: bool = False
     last_decoded_audio: torch.Tensor | None = None
-    # Per-request classifier-free guidance override (None -> talker default).
-    cfg_value: float | None = None
 
 
 @dataclasses.dataclass
@@ -892,8 +890,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         res_input = tts.fusion_concat_proj(torch.cat([lm_h, prev], dim=-1))
         return res_input, {"new_lm_hidden": lm_h}
 
-    def _run_cfm(self, dit_h: torch.Tensor, cond: torch.Tensor, cfg_value: float | None = None) -> torch.Tensor:
-        cfg = self._cfg_value if cfg_value is None else float(cfg_value)
+    def _run_cfm(self, dit_h: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         if self._cfm_buffers is not None:
             return _optimized_solve_euler(
                 self.tts.feat_decoder,
@@ -901,7 +898,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 self._patch_size,
                 cond,
                 self._inference_timesteps,
-                cfg,
+                self._cfg_value,
                 self._cfm_buffers,
                 cfg_cutoff_ratio=self._cfg_cutoff_ratio,
                 perf=self._perf,
@@ -911,7 +908,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             patch_size=self._patch_size,
             cond=cond,
             n_timesteps=self._inference_timesteps,
-            cfg_value=cfg,
+            cfg_value=self._cfg_value,
         ).transpose(1, 2)
 
     def _finish_prefill(self, state: _RequestState, meta: dict, res_out: torch.Tensor, dev: Any):
@@ -927,7 +924,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if self._enable_torch_compile:
             self._setup_torch_compile()
 
-        pred_feat = self._run_cfm(dit_h, prefix_feat_cond.transpose(1, 2).contiguous(), cfg_value=state.cfg_value)
+        pred_feat = self._run_cfm(dit_h, prefix_feat_cond.transpose(1, 2).contiguous())
 
         with torch.no_grad():
             curr_embed = tts.enc_to_lm_proj(tts.feat_encoder(pred_feat.unsqueeze(1))).squeeze(1)
@@ -960,7 +957,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if pfc.ndim == 2:
             pfc = pfc.unsqueeze(0)
 
-        pred_feat = self._run_cfm(dit_h, pfc.transpose(1, 2).contiguous(), cfg_value=state.cfg_value)
+        pred_feat = self._run_cfm(dit_h, pfc.transpose(1, 2).contiguous())
         next_embed = tts.enc_to_lm_proj(tts.feat_encoder(pred_feat.unsqueeze(1))).squeeze(1)
 
         state.precomputed_stop_logits = stop_fn(lm_h).detach()
@@ -1142,9 +1139,6 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             state.curr_prefix_feat_cond = None
             state.is_stopping = False
             state.last_decoded_audio = None
-
-            # Per-request cfg_value override (threaded via additional_information).
-            state.cfg_value = info_dict.get("cfg_value")
 
             # Voice clone / continuation
             ref_audio = info_dict.get("reference_audio") or info_dict.get("ref_audio")
