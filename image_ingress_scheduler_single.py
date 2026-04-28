@@ -7,8 +7,8 @@ import os
 import random
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Awaitable, Callable
 
 BASE_COST = 512 * 512 * 20
 
@@ -136,12 +136,8 @@ class _IngressBatchDrrAdapter:
         self.age_bonus_factor = max(0.0, _env_float("OMNI_INGRESS_DRR_AGE_BONUS_FACTOR", 1.0))
         self.max_queues = max(0, _env_int("OMNI_INGRESS_DRR_MAX_QUEUES", 0))
         self.default_budget_mode = (
-    os.environ.get(
-        "OMNI_INGRESS_DRR_DEFAULT_BUDGET_MODE", "weight_inv_cost"
-    )
-    .strip()
-    .lower()
-)
+            os.environ.get("OMNI_INGRESS_DRR_DEFAULT_BUDGET_MODE", "weight_inv_cost").strip().lower()
+        )
         if self.default_budget_mode not in {"inv_cost", "weight_inv_cost"}:
             self.default_budget_mode = "weight_inv_cost"
         self.queue_budget_overrides = {
@@ -378,8 +374,8 @@ class ImageIngressDispatcherService:
         return await self._adapter.submit(payload)
 
     async def _execute_batch(
-    self,
-    req_type: RequestType,
-    payloads: list[ImageIngressPayload],
-) -> list[ImageIngressResult]:
+        self,
+        req_type: RequestType,
+        payloads: list[ImageIngressPayload],
+    ) -> list[ImageIngressResult]:
         return await self._batch_execute_fn(req_type, payloads)
