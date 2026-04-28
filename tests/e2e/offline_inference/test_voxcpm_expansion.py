@@ -3,7 +3,6 @@
 
 """E2E test for VoxCPM offline inference."""
 
-import os
 from typing import Any
 
 import numpy as np
@@ -13,12 +12,6 @@ import torch
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
-
-if not os.environ.get("VLLM_OMNI_VOXCPM_CODE_PATH"):
-    pytest.importorskip(
-        "voxcpm",
-        reason="pip install voxcpm or set VLLM_OMNI_VOXCPM_CODE_PATH to VoxCPM repo `src`",
-    )
 
 VOXCPM_MODEL = "OpenBMB/VoxCPM1.5"
 STAGE_CONFIG = get_deploy_config_path("voxcpm.yaml")
