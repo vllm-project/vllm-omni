@@ -817,6 +817,17 @@ class TestDeployConfigLoading:
         assert deploy.connectors is not None
         assert deploy.platforms is not None
 
+        voxtral_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "voxtral_tts.yaml"
+        if voxtral_path.exists():
+            voxtral_deploy = load_deploy_config(voxtral_path)
+            assert voxtral_deploy.stages[0].config_format == "mistral"
+            assert voxtral_deploy.stages[0].load_format == "mistral"
+            assert voxtral_deploy.stages[0].tokenizer_mode == "mistral"
+            assert not any(
+                name in voxtral_deploy.stages[0].engine_extras
+                for name in ("config_format", "load_format", "tokenizer_mode")
+            )
+
     def test_merge_pipeline_deploy(self):
         from pathlib import Path
 
@@ -1011,7 +1022,8 @@ class TestBaseConfigInheritance:
         deploy = load_deploy_config(ci_path)
         assert len(deploy.stages) == 3
         # CI overrides
-        assert deploy.stages[0].engine_extras.get("load_format") == "dummy"
+        assert deploy.stages[0].load_format == "dummy"
+        assert "load_format" not in deploy.stages[0].engine_extras
         assert deploy.stages[0].max_num_seqs == 5
         # Inherited from base
         assert deploy.stages[0].gpu_memory_utilization == 0.9

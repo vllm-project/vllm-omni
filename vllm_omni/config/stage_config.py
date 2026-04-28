@@ -419,6 +419,9 @@ class StageDeployConfig:
     mm_processor_cache_gb: float | None = None
     skip_mm_profiling: bool | None = None
     enable_flashinfer_autotune: bool | None = None
+    config_format: str | None = None
+    load_format: str | None = None
+    tokenizer_mode: str | None = None
     engine_extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -451,9 +454,6 @@ class DeployConfig:
     enable_chunked_prefill: bool | None = None
     data_parallel_size: int | None = None
     pipeline_parallel_size: int | None = None
-    config_format: str | None = None
-    load_format: str | None = None
-    tokenizer_mode: str | None = None
 
 
 _STAGE_NON_ENGINE_KEYS = frozenset(
@@ -694,9 +694,6 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "enable_chunked_prefill",
     "data_parallel_size",
     "pipeline_parallel_size",
-    "config_format",
-    "load_format",
-    "tokenizer_mode",
 )
 
 
