@@ -80,6 +80,7 @@ def test_default_stage_config_defaults_nullified_parallel_size_kwargs():
             "pipeline_parallel_size": None,
             "data_parallel_size": None,
             "tensor_parallel_size": None,
+            "enable_expert_parallel": None,
             "enforce_eager": None,
         }
     )[0]
@@ -88,6 +89,7 @@ def test_default_stage_config_defaults_nullified_parallel_size_kwargs():
     assert parallel_config.pipeline_parallel_size == 1
     assert parallel_config.data_parallel_size == 1
     assert parallel_config.tensor_parallel_size == 1
+    assert parallel_config.enable_expert_parallel is False
     assert stage_cfg["engine_args"]["enforce_eager"] is False
 
 
