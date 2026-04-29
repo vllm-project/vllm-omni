@@ -4,6 +4,9 @@ See examples/online_serving/qwen3_omni/README.md
 """
 
 import os
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
 from pathlib import Path
 
 import pytest
@@ -21,8 +24,6 @@ from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
 pytestmark = [pytest.mark.full_model, pytest.mark.example, pytest.mark.omni]
-
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 

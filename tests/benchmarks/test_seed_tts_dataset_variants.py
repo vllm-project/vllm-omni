@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import types
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -167,3 +169,58 @@ def test_attach_sets_seed_tts_row_even_without_extra_body():
     row_pos = src.index("seed_tts_row")
     not_ex_pos = src.index("if not ex:")
     assert row_pos < not_ex_pos, "seed_tts_row must be set before 'if not ex: return'"
+
+
+def test_seed_tts_whisper_transcribe_passes_attention_mask(monkeypatch):
+    from vllm_omni.benchmarks.data_modules import seed_tts_eval
+
+    calls = {}
+
+    class FakeTensor:
+        def __init__(self, name: str):
+            self.name = name
+            self.device = None
+
+        def to(self, device):
+            self.device = device
+            return self
+
+    class FakeProcessor:
+        def __call__(self, wav, *, sampling_rate, return_tensors, return_attention_mask=False):
+            calls["return_attention_mask"] = return_attention_mask
+            assert sampling_rate == 16000
+            assert return_tensors == "pt"
+            assert len(wav) > 0
+            return types.SimpleNamespace(
+                input_features=FakeTensor("features"),
+                attention_mask=FakeTensor("mask") if return_attention_mask else None,
+            )
+
+        def get_decoder_prompt_ids(self, *, language, task):
+            assert language == "english"
+            assert task == "transcribe"
+            return [(1, 2)]
+
+        def batch_decode(self, predicted_ids, *, skip_special_tokens):
+            assert skip_special_tokens
+            assert predicted_ids == [[42]]
+            return ["hello"]
+
+    class FakeModel:
+        def generate(self, input_features, **kwargs):
+            calls["input_features"] = input_features
+            calls["generate_kwargs"] = kwargs
+            return [[42]]
+
+    monkeypatch.setattr(seed_tts_eval, "_ensure_en_asr", lambda: None)
+    monkeypatch.setattr(seed_tts_eval, "_en_processor", FakeProcessor())
+    monkeypatch.setattr(seed_tts_eval, "_en_model", FakeModel())
+    monkeypatch.setattr(seed_tts_eval, "_device", "cuda:1")
+
+    text = seed_tts_eval._transcribe_en_f32_16k(np.ones(1600, dtype=np.float32))
+
+    assert text == "hello"
+    assert calls["return_attention_mask"] is True
+    assert calls["input_features"].device == "cuda:1"
+    assert calls["generate_kwargs"]["attention_mask"].device == "cuda:1"
+    assert calls["generate_kwargs"]["forced_decoder_ids"] == [(1, 2)]

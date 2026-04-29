@@ -23,6 +23,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import Dist
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
@@ -195,6 +196,12 @@ class Wan22I2VPipeline(
 
         # Image encoder (CLIP) - optional, for Wan2.1-style I2V
         self.has_image_encoder = "image_encoder" in model_index and model_index["image_encoder"][0] is not None
+
+        # See ``hub_prefetch.py`` for the transformers v5 subfolder race.
+        subfolders = ["tokenizer", "text_encoder", "vae"]
+        if self.has_image_encoder:
+            subfolders.extend(["image_processor", "image_encoder"])
+        prefetch_subfolders(model, subfolders, local_files_only=local_files_only)
 
         if self.has_image_encoder:
             self.image_processor = CLIPImageProcessor.from_pretrained(

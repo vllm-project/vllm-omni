@@ -13,7 +13,6 @@ from tests.helpers.mark import hardware_marks
 
 pytestmark = [pytest.mark.full_model, pytest.mark.example, *hardware_marks(res={"cuda": "H100"})]
 
-
 T2I_SCRIPT = EXAMPLES / "offline_inference" / "text_to_image" / "text_to_image.py"
 README_PATH = T2I_SCRIPT.with_name("README.md")
 EXAMPLE_OUTPUT_SUBFOLDER = "example_offline_t2i"
