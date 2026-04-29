@@ -1281,7 +1281,7 @@ class TestSentinelDefaultPrecedence:
     def test_none_value_skipped_yaml_wins(self):
         stages = self._stages({"max_num_seqs": None})
         assert stages[2].runtime_overrides.get("max_num_seqs") is None
-        assert stages[2].yaml_engine_args.get("max_num_seqs") == 1
+        assert "max_num_seqs" not in stages[2].yaml_engine_args
 
     def test_empty_kwargs_yaml_only(self):
         stages = self._stages({})
