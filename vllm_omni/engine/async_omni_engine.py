@@ -41,9 +41,6 @@ from vllm_omni.diffusion.stage_diffusion_proc import (
     spawn_diffusion_proc,
 )
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
-    build_stage_connectors,
-    create_connectors_from_config,
-    get_stage_connector_config,
     resolve_omni_kv_config_for_stage,
 )
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -709,12 +706,6 @@ class AsyncOmniEngine:
         prepare_engine_environment()
         omni_transfer_config = load_omni_transfer_config_for_model(self.model, self.config_path)
 
-        # Connector instances are created AFTER all stage subprocesses have
-        # started (see below) so that allocating CUDA pool memory in the
-        # orchestrator process does not interfere with subprocess CUDA init.
-        self.omni_connectors: dict = {}
-        self.stage_receiver_connectors: list[dict] = [{} for _ in range(num_stages)]
-
         # ------------------------------------------------------------------ #
         # Single-stage mode: start OmniMasterServer before launching stages.  #
         # ------------------------------------------------------------------ #
@@ -898,30 +889,6 @@ class AsyncOmniEngine:
                     logger.exception("[AsyncOmniEngine] Failed to stop OmniMasterServer during stage-init cleanup")
             raise
 
-        # Initialize orchestrator-level sender connectors and per-stage receiver
-        # connectors AFTER all stage subprocesses have started.  This avoids
-        # interfering with subprocess CUDA context initialisation when the pool
-        # device is "cuda" (required for XGMI RDMA transfers).
-        if omni_transfer_config is not None and getattr(omni_transfer_config, "connectors", None):
-            try:
-                self.omni_connectors = create_connectors_from_config(omni_transfer_config.connectors)
-                logger.info(
-                    "[AsyncOmniEngine] Initialized %d sender connector(s): %s",
-                    len(self.omni_connectors),
-                    list(self.omni_connectors.keys()),
-                )
-                self.stage_receiver_connectors = []
-                for _sid in range(num_stages):
-                    _stage_cfg = get_stage_connector_config(omni_transfer_config, _sid)
-                    _receivers = build_stage_connectors(_sid, _stage_cfg)
-                    self.stage_receiver_connectors.append(_receivers or {})
-            except Exception:
-                logger.exception(
-                    "[AsyncOmniEngine] Connector initialization failed; falling back to ZMQ-only inter-stage transfer"
-                )
-                self.omni_connectors = {}
-                self.stage_receiver_connectors = [{} for _ in range(num_stages)]
-
         self.stage_clients = initialized_stage_clients
         self.output_processors = output_processors
         self.stage_vllm_configs = stage_vllm_configs
@@ -960,12 +927,6 @@ class AsyncOmniEngine:
 
             self._initialize_stages(stage_init_timeout)
 
-            # Attach receiver connectors to each stage engine client so that
-            # add_request_async can perform the mori GET before ZMQ dispatch.
-            for _sid, _sc in enumerate(self.stage_clients):
-                if isinstance(_sc, StageEngineCoreClientBase):
-                    _sc.receiver_connectors = self.stage_receiver_connectors[_sid]
-
             pd_config = self._detect_pd_config()
             orchestrator = Orchestrator(
                 request_async_queue=self.request_queue.async_q,
@@ -975,7 +936,6 @@ class AsyncOmniEngine:
                 stage_clients=self.stage_clients,
                 output_processors=self.output_processors,
                 stage_vllm_configs=self.stage_vllm_configs,
-                connectors=self.omni_connectors,
                 pd_config=pd_config,
             )
             if not startup_future.done():

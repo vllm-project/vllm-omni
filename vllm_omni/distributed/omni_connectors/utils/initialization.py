@@ -4,6 +4,7 @@
 """Utilities for OmniConnector configuration and validation."""
 
 import json
+import socket
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -27,6 +28,42 @@ KV_TRANSFER_PORT_OFFSET = 100
 # when TP > 1.  Must be larger than the maximum number of pipeline stages.
 # Formula: zmq_port = base + KV_TRANSFER_PORT_OFFSET + rank * STRIDE + stage
 KV_RANK_PORT_STRIDE = 16
+
+# Connector types that carry a ZMQ-based sender/receiver handshake and
+# therefore need per-edge endpoint derivation on the
+# ``OmniChunkTransferAdapter`` path.  Without this, a 3-stage intranode
+# pipeline would instantiate three co-located senders trying to bind the
+# same base ``zmq_port`` from yaml, and every receiver / dual-role
+# instance would start with no ``sender_host`` / ``sender_zmq_port`` and
+# therefore no way to reach its upstream listener.
+#
+# The orchestrator-level path (``create_connectors_from_config`` below)
+# has its own Mooncake-specific port adjustment for PD disaggregation
+# and is intentionally independent of this set.
+_ROLE_BOUND_ZMQ_CONNECTORS = frozenset({
+    "MoriTransferEngineConnector",
+    "MooncakeTransferEngineConnector",
+})
+
+
+def _detect_local_ip() -> str:
+    """Best-effort local IP for framework-level endpoint derivation.
+
+    Mirrors the connector-side ``_get_local_ip`` behaviour (used by
+    Mori/Mooncake when ``host: "auto"``) so that, on an intranode
+    pipeline, a sender's advertised listener host and its downstream
+    receiver's precomputed upstream host agree without an explicit
+    yaml setting.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"
 
 
 def initialize_connectors_from_config(
@@ -132,44 +169,178 @@ def create_connectors_from_config(
     return connectors
 
 
-def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, stage_id: str | int) -> dict[str, Any]:
-    """
-    Extract connector configurations relevant for a specific stage worker.
+def _primary_upstream_stage(incoming_edges: list[tuple[str, ConnectorSpec]]) -> str | None:
+    """Return the lowest-stage-id upstream edge id, or *None* if there are no
+    incoming edges.
 
-    Returns a dict compatible with worker initialization:
-    {
-        "from_stage_X": {
-            "spec": {
-                "name": "ConnectorName",
-                "extra": {...}
-            }
-        },
-        ...
-    }
+    Used by ``_inject_chunk_path_endpoints`` to pick which upstream sender a
+    dual / receiver instance should point at when a (future) fan-in topology
+    has more than one.  Linear pipelines have exactly one incoming edge so
+    the choice is unambiguous today; picking the sorted-first keeps behaviour
+    deterministic if fan-in is introduced later.
+    """
+    if not incoming_edges:
+        return None
+    try:
+        return sorted(incoming_edges, key=lambda e: int(e[0]))[0][0]
+    except (TypeError, ValueError):
+        return sorted(incoming_edges, key=lambda e: str(e[0]))[0][0]
+
+
+def _inject_chunk_path_endpoints(
+    extra: dict[str, Any],
+    connector_name: str,
+    role: str,
+    own_stage: str,
+    upstream_stage: str | None,
+) -> None:
+    """Compute per-edge ZMQ endpoints in-place for chunk-adapter connectors.
+
+    Populates, for role-bound ZMQ connectors listed in
+    ``_ROLE_BOUND_ZMQ_CONNECTORS``:
+
+    * ``zmq_port`` (sender / dual only): bind port for the local listener
+      = base_port + own_stage_id.  Offsetting by stage id prevents multiple
+      co-located stage listeners from all binding the same base port on a
+      single-node pipeline.
+    * ``sender_zmq_port`` (receiver / dual only): upstream sender's bind
+      port = base_port + upstream_stage_id.
+    * ``sender_host`` (receiver / dual only): defaults to the
+      framework-detected local IP when the yaml uses ``host: "auto"``,
+      or to the yaml's explicit ``host`` value otherwise -- so an
+      intranode receiver can locate its upstream sender without an
+      external handshake.
+
+    ``base_port`` is read from ``extra["zmq_port"]`` (default 50051).
+    Values already present in *extra* (explicit yaml override) are kept,
+    so cross-node deployments that already know the peer endpoint can
+    set ``sender_host`` / ``sender_zmq_port`` directly and are unaffected.
+
+    For non-role-bound connectors (``SharedMemoryConnector``,
+    ``YuanrongConnector``, ...) this function is a no-op.  Non-integer
+    stage ids (unusual pipeline keys such as ``"prefill"``) also return
+    without side effects.
+    """
+    if connector_name not in _ROLE_BOUND_ZMQ_CONNECTORS:
+        return
+    try:
+        own_stage_id = int(own_stage)
+    except (TypeError, ValueError):
+        return
+    base_port = int(extra.get("zmq_port", 50051))
+
+    if role in ("sender", "dual"):
+        extra["zmq_port"] = base_port + own_stage_id
+
+    if role in ("receiver", "dual") and upstream_stage is not None:
+        try:
+            upstream_stage_id = int(upstream_stage)
+        except (TypeError, ValueError):
+            upstream_stage_id = None
+        if upstream_stage_id is not None:
+            if "sender_zmq_port" not in extra or extra["sender_zmq_port"] is None:
+                extra["sender_zmq_port"] = base_port + upstream_stage_id
+        if not extra.get("sender_host"):
+            host_cfg = extra.get("host", "auto")
+            if isinstance(host_cfg, str) and host_cfg.lower() == "auto":
+                extra["sender_host"] = _detect_local_ip()
+            else:
+                extra["sender_host"] = host_cfg
+
+
+def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, stage_id: str | int) -> dict[str, Any]:
+    """Extract connector configurations relevant for a specific stage worker.
+
+    Returns a dict shape compatible with worker initialization::
+
+        {
+            "from_stage_X": {"spec": {"name": ..., "extra": {..., "role": ...}}},
+            "to_stage_Y":   {"spec": {"name": ..., "extra": {..., "role": ...}}},
+            ...
+        }
+
+    The per-stage role is chosen by looking at which edges the stage
+    participates in:
+
+    * stage has only outgoing edges -> ``role="sender"``
+    * stage has only incoming edges -> ``role="receiver"``
+    * stage has both (middle stage in a 3+ stage pipeline) ->
+      ``role="dual"``, and *both* the ``from_stage_*`` and
+      ``to_stage_*`` entries share the same composite extra (same
+      ``role``, same ``zmq_port``, same ``sender_host`` /
+      ``sender_zmq_port``) so that downstream flattening (e.g.
+      ``engine/stage_init_utils.get_stage_connector_spec`` returning
+      the first spec it sees) always recovers a self-consistent
+      per-stage connector config.
+
+    For role-bound ZMQ connectors (see ``_ROLE_BOUND_ZMQ_CONNECTORS``)
+    per-edge ``zmq_port`` / ``sender_host`` / ``sender_zmq_port`` are
+    pre-computed from the sender's stage id so a co-located intranode
+    pipeline does not need an external handshake.  Role-neutral
+    connectors (``SharedMemoryConnector``, ``YuanrongConnector``) are
+    unaffected by the endpoint injection but still receive the
+    direction-specific ``role`` key (connectors that ignore it keep
+    working verbatim).
+
+    The orchestrator-level ``build_stage_connectors`` only filters
+    ``from_stage_*`` keys, so orchestrator instantiation behaviour is
+    bit-for-bit unchanged.
     """
     if not transfer_config:
         return {}
 
-    stage_connectors_config = {}
     target_stage = str(stage_id)
 
-    # Iterate through all configured edges and inject direction-specific role.
-    # The shared edge-level ConnectorSpec is role-neutral; each stage gets
-    # the correct role ("sender" or "receiver") based on its position in
-    # the edge so that MooncakeTransferEngineConnector (and any future
-    # role-aware connector) initializes correctly.
-    for (from_stage, to_stage), spec in transfer_config.connectors.items():
-        if to_stage == target_stage:
-            # Incoming edge → this stage is the receiver
-            extra = dict(spec.extra) if spec.extra else {}
-            extra.setdefault("role", "receiver")
-            stage_connectors_config[f"from_stage_{from_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
-        elif from_stage == target_stage and target_stage == "0":
-            # Outgoing edge for stage 0 — included for async_chunk spec
-            # extraction (omni_stage.py), NOT for connector instantiation.
-            extra = dict(spec.extra) if spec.extra else {}
-            extra.setdefault("role", "sender")
-            stage_connectors_config[f"to_stage_{to_stage}"] = {"spec": {"name": spec.name, "extra": extra}}
+    incoming_edges: list[tuple[str, ConnectorSpec]] = [
+        (from_s, spec)
+        for (from_s, to_s), spec in transfer_config.connectors.items()
+        if to_s == target_stage
+    ]
+    outgoing_edges: list[tuple[str, ConnectorSpec]] = [
+        (to_s, spec)
+        for (from_s, to_s), spec in transfer_config.connectors.items()
+        if from_s == target_stage
+    ]
+
+    if not incoming_edges and not outgoing_edges:
+        return {}
+
+    if incoming_edges and outgoing_edges:
+        effective_role = "dual"
+    elif outgoing_edges:
+        effective_role = "sender"
+    else:
+        effective_role = "receiver"
+
+    upstream_stage = _primary_upstream_stage(incoming_edges)
+
+    stage_connectors_config: dict[str, Any] = {}
+
+    # Incoming edges -> this stage is at the ``to`` end.
+    for from_s, spec in incoming_edges:
+        extra = dict(spec.extra) if spec.extra else {}
+        extra.setdefault("role", effective_role)
+        _inject_chunk_path_endpoints(
+            extra,
+            connector_name=spec.name,
+            role=effective_role,
+            own_stage=target_stage,
+            upstream_stage=upstream_stage,
+        )
+        stage_connectors_config[f"from_stage_{from_s}"] = {"spec": {"name": spec.name, "extra": extra}}
+
+    # Outgoing edges -> this stage is at the ``from`` end.
+    for to_s, spec in outgoing_edges:
+        extra = dict(spec.extra) if spec.extra else {}
+        extra.setdefault("role", effective_role)
+        _inject_chunk_path_endpoints(
+            extra,
+            connector_name=spec.name,
+            role=effective_role,
+            own_stage=target_stage,
+            upstream_stage=upstream_stage,
+        )
+        stage_connectors_config[f"to_stage_{to_s}"] = {"spec": {"name": spec.name, "extra": extra}}
 
     return stage_connectors_config
 

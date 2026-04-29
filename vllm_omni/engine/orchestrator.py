@@ -142,7 +142,6 @@ class Orchestrator:
         stage_vllm_configs: list[Any],
         *,
         async_chunk: bool = False,
-        connectors: dict[tuple[str, str], Any] | None = None,
         pd_config: dict[str, Any] | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
@@ -155,9 +154,6 @@ class Orchestrator:
         self.stage_clients: list[Any] = stage_clients
         self.output_processors: list[Any] = output_processors
         self.stage_vllm_configs: list[Any] = stage_vllm_configs
-
-        # Sender-side omni connectors keyed by (from_stage, to_stage)
-        self.connectors: dict[tuple[str, str], Any] = connectors or {}
 
         # PD disaggregation state
         self._pd_pair: tuple[int, int] | None = None
@@ -726,51 +722,8 @@ class Orchestrator:
             )
             raise
 
-        # Connector key for this stage transition
-        connector_key = (str(stage_id), str(next_stage_id))
-        connector = self.connectors.get(connector_key)
-
         # Build and submit requests for each input
         for next_input in next_inputs:
-            # Try to offload large additional_information tensors via mori connector
-            # instead of serialising them through ZMQ.
-            if connector is not None:
-                raw_info = next_input.get("additional_information") if hasattr(next_input, "get") else None
-                if raw_info:
-                    try:
-                        success, _, meta = connector.put(
-                            str(stage_id),
-                            str(next_stage_id),
-                            req_id,
-                            {"engine_inputs": {"additional_information": raw_info}},
-                        )
-                        if success and meta:
-                            receiver = next_client.receiver_connectors.get(connector_key)
-                            if receiver is not None:
-                                next_client.pending_gets[req_id] = (
-                                    receiver,
-                                    meta,
-                                    str(stage_id),
-                                    str(next_stage_id),
-                                )
-                                # Keep additional_information in ZMQ payload as fallback.
-                                # If RDMA GET succeeds in add_request_async it will override;
-                                # otherwise the ZMQ-serialised version is used.
-                                logger.info(
-                                    "[Orchestrator] req=%s: connector PUT %s->%s (%d bytes)",
-                                    req_id,
-                                    stage_id,
-                                    next_stage_id,
-                                    meta.get("data_size", 0),
-                                )
-                    except Exception:
-                        logger.warning(
-                            "[Orchestrator] req=%s: connector PUT %s->%s failed; falling back to ZMQ serialisation",
-                            req_id,
-                            stage_id,
-                            next_stage_id,
-                        )
-
             # Only AR thinker stages consume encoder mm_features; downstream
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
             _ms = getattr(next_client, "model_stage", None)

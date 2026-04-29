@@ -1,0 +1,118 @@
+# Qwen3-Omni-MoE intra-node deploy using Mooncake transfer (benchmark companion).
+#
+# Sibling of ``qwen3_omni_moe_mori_intranode.yaml`` intended for
+# Mori-vs-Mooncake benchmark comparison on a single AMD Instinct MI300X
+# OAM node.  Pipeline topology and sampling params are identical to the
+# Mori yaml; only the connector definition and its backend-specific
+# knobs differ.
+#
+# Transport note (default: ``rdma`` via Mellanox + GPUDirect RDMA):
+#   ``MooncakeTransferEngineConnector`` forwards ``protocol`` to
+#   ``mooncake.engine.TransferEngine.initialize``.  The default here
+#   (``"rdma"``) drives Mooncake's RoCE/IB transport; on MI300X with
+#   ``memory_pool_device: "cuda"`` this ships tensors GPU-to-GPU via
+#   GPUDirect RDMA through the Mellanox HCAs.  This is the path
+#   end-to-end validated on this branch (three consecutive chat
+#   completions finish in 18.7 / 16.8 / 16.4 s with 93 per-chunk
+#   ``[RDMA GET]`` transfers at median ~0.7 ms on edge 0 -> 1).
+#
+# Switching to true XGMI:
+#   Mooncake PRs #1742 and #1550 add a first-class HIP transport that
+#   rides AMD Infinity Fabric XGMI directly, and expose it at the
+#   Python binding level via a ``xgmi -> hip`` normalization helper
+#   (so setting ``protocol: "xgmi"`` below asks for HIP).  Doing so
+#   requires:
+#     (a) a mooncake wheel built with ``-DUSE_HIP=ON`` and reinstalled
+#         into the container's Python env,
+#     (b) ``memory_pool_device: "cuda"`` (required for the HIP memory
+#         allocator), and
+#     (c) setting ``MC_FORCE_MNNVL=1`` in the vllm-omni launch env so
+#         ``TransferEngineImpl::init()`` installs the HIP transport
+#         instead of falling back to RDMA on boxes that also have
+#         HCAs discovered by the auto-topology scan.
+#   When all three are in place, Mooncake prints ``Selected HIP
+#   memory allocator`` at boot and subsequent transfers go over XGMI
+#   Infinity Fabric directly.  The RDMA default above is intentional
+#   until that full toolchain is validated end-to-end on this
+#   hardware.  Cross-node deployments must keep ``protocol: "rdma"``.
+#
+# Pipeline wiring (stage_id, execution_type, model_stage, input_sources,
+# custom processors, async-chunk builders) lives in
+# ``vllm_omni/model_executor/models/qwen3_omni/pipeline.py`` and is
+# merged into the stages below by the deploy loader.
+#
+# Usage:
+#   vllm-omni serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --log-stats \
+#     --deploy-config vllm_omni/deploy/qwen3_omni_moe_mooncake_intranode.yaml
+#
+# Dependencies: mooncake (``pip install mooncake``), torch-rocm>=2.9,
+# vllm-omni with #2383 deploy schema, ibverbs/RDMA NICs exposed via
+# /dev/infiniband.
+async_chunk: true
+
+connectors:
+  mooncake_connector:
+    name: MooncakeTransferEngineConnector
+    extra:
+      host: "auto"
+      zmq_port: 50051
+      protocol: "rdma"                # see transport note above; set "xgmi" to opt into HIP
+      device_name: ""                 # leave empty to honour $RDMA_DEVICE_NAME
+      memory_pool_size: 536870912     # 512 MB, matches Mori yaml
+      memory_pool_device: "cuda"      # required for HIP / XGMI memory allocator
+      # Chunk-transfer knobs consumed by talker2code2wav_async_chunk:
+      # 25 decoded codec frames per connector.put (~40 ms at 625 Hz
+      # codec rate) with a 25-frame left context to satisfy the
+      # code2wav receptive field.  Kept identical to the Mori yaml so
+      # accuracy stays comparable when swapping backends.
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+
+stages:
+  - stage_id: 0
+    gpu_memory_utilization: 0.9
+    enforce_eager: true               # ROCm override: avoid flashinfer autotune path
+    devices: "0"
+    output_connectors:
+      to_stage_1: mooncake_connector
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      top_k: 1
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.05
+
+  - stage_id: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    devices: "1"
+    input_connectors:
+      from_stage_0: mooncake_connector
+    output_connectors:
+      to_stage_2: mooncake_connector
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.05
+
+  - stage_id: 2
+    gpu_memory_utilization: 0.3
+    max_num_seqs: 1
+    enforce_eager: true
+    async_scheduling: false
+    # Codec prefill length (Q * num_frames) exceeds 32k default;
+    # matches qwen3_omni_moe.yaml code2wav sizing.
+    max_num_batched_tokens: 51200
+    devices: "2"
+    input_connectors:
+      from_stage_1: mooncake_connector
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.1

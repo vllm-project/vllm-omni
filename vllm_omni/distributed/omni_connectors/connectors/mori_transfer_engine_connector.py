@@ -259,6 +259,14 @@ class MoriTransferEngineConnector(OmniConnectorBase):
 
         self.config = config
 
+        # Stage id is read by OmniChunkTransferAdapter (process_pending_chunks /
+        # _send_single_request / _poll_single_request / ...) to decide whether
+        # this connector sits at the sender or receiver end of a stage pair.
+        # Kept parallel to ``SharedMemoryConnector`` and other OmniConnector
+        # implementations. Populated by ``build_stage_connectors`` via the
+        # ``stage_id`` key that ``get_connectors_config_for_stage`` injects.
+        self.stage_id = config.get("stage_id", -1)
+
         # ---- Host / ZMQ ----
         host_cfg = config.get("host", "127.0.0.1")
         if host_cfg.lower() == "auto":
@@ -301,15 +309,38 @@ class MoriTransferEngineConnector(OmniConnectorBase):
                 "XGMI is a GPU-to-GPU fabric and cannot address CPU memory."
             )
 
-        # ---- Sender info (receiver uses this when metadata=None) ----
+        # ---- Sender info (receiver / dual uses this when metadata=None) ----
         self.sender_host = config.get("sender_host", None)
         self.sender_zmq_port = config.get("sender_zmq_port", None)
 
         # ---- Role ----
+        # ``sender``   : binds the ZMQ listener, accepts ``put()``.
+        # ``receiver`` : no listener, only ``get()`` by querying an
+        #                upstream sender whose endpoint lives in
+        #                ``sender_host`` / ``sender_zmq_port``.
+        # ``dual``     : single instance that simultaneously binds a
+        #                listener (serves inbound pull requests from a
+        #                downstream receiver) AND maintains an upstream
+        #                endpoint (so its own ``get()`` can pull from an
+        #                upstream sender).  Used by middle stages on the
+        #                chunk_transfer_adapter path -- the adapter keeps
+        #                its historical "one connector per stage" model
+        #                (like ``SharedMemoryConnector``), and a dual
+        #                instance is how a role-bound RDMA connector
+        #                exposes put+get from the same object.  The role
+        #                is chosen by the framework (see
+        #                ``get_connectors_config_for_stage``) based on
+        #                whether the stage has incoming / outgoing edges;
+        #                ``MoriTransferEngineConnector`` itself does not
+        #                reverse-infer its deployment mode.
         role = str(config.get("role", "sender")).lower()
-        if role not in {"sender", "receiver"}:
-            raise ValueError(f"Invalid role={role!r} for MoriTransferEngineConnector. Expected 'sender' or 'receiver'.")
-        self.can_put = role == "sender"
+        if role not in {"sender", "receiver", "dual"}:
+            raise ValueError(
+                f"Invalid role={role!r} for MoriTransferEngineConnector. "
+                "Expected 'sender', 'receiver', or 'dual'."
+            )
+        self.role = role
+        self.can_put = role in ("sender", "dual")
 
         # ---- Mori IOEngine ----
         if self.device_name:
@@ -393,7 +424,14 @@ class MoriTransferEngineConnector(OmniConnectorBase):
                 raise RuntimeError(
                     f"MoriTransferEngineConnector failed to bind ZMQ on {self.host}:{self.zmq_port}: {self._bind_error}"
                 ) from self._bind_error
-            logger.info(f"MoriTransferEngineConnector SENDER ready (ZMQ on {self.host}:{self.zmq_port})")
+            if self.role == "dual":
+                logger.info(
+                    f"MoriTransferEngineConnector DUAL ready "
+                    f"(ZMQ listening on {self.host}:{self.zmq_port}, "
+                    f"upstream sender at {self.sender_host}:{self.sender_zmq_port})"
+                )
+            else:
+                logger.info(f"MoriTransferEngineConnector SENDER ready (ZMQ on {self.host}:{self.zmq_port})")
         else:
             if not self.sender_host or self.sender_host.lower() == "auto":
                 logger.info("MoriTransferEngineConnector RECEIVER: awaiting sender info via update_sender_info().")

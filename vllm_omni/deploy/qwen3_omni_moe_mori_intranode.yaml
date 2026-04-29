@@ -1,0 +1,104 @@
+# Qwen3-Omni-MoE intra-node deploy using Mori XGMI transfer.
+#
+# Targets a single AMD Instinct MI300X OAM node (8x GPU, 192GB HBM3,
+# gfx942).  Each stage occupies one dedicated GPU (3 GPUs total) and
+# stage-to-stage streaming chunks are shipped via Mori's RDMA IOEngine
+# (with ``backend_type: xgmi`` selecting the AMD Infinity Fabric
+# GPU-to-GPU direct path for intranode transfers).
+#
+# Pipeline wiring (stage_id, execution_type, model_stage, input_sources,
+# custom processors, async-chunk builders) lives in
+# ``vllm_omni/model_executor/models/qwen3_omni/pipeline.py`` and is
+# merged into the stages below by the deploy loader.
+#
+# Why this yaml exists:
+#   * On CUDA/H100 Qwen3-Omni-MoE ships via ``SharedMemoryConnector``
+#     (see ``qwen3_omni_moe.yaml``).  On MI300X the SHM path still works
+#     but XGMI RDMA can substantially reduce stage-transition latency
+#     for the thinker->talker hidden-state stream and the talker->code2wav
+#     codec-frame stream, both of which run in async-chunk mode.
+#   * This config swaps the connector definition to
+#     ``MoriTransferEngineConnector`` while keeping the pipeline topology,
+#     sampling params, and async_chunk=true gating identical to the CUDA
+#     deploy, so the chunk_transfer_adapter path (scheduler-owned
+#     background put/get threads) is fully exercised.
+#
+# Usage:
+#   vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --log-stats \
+#     --deploy-config vllm_omni/deploy/qwen3_omni_moe_mori_intranode.yaml
+#
+# Dependencies: mori (``pip install mori``), torch-rocm>=2.9, vllm-omni
+# with #2383 deploy schema, ibverbs/RDMA NICs exposed via /dev/infiniband.
+async_chunk: true
+
+connectors:
+  mori_connector:
+    name: MoriTransferEngineConnector
+    extra:
+      host: "auto"
+      zmq_port: 50051
+      backend_type: "xgmi"            # AMD Infinity Fabric GPU-to-GPU direct
+      device_name: ""                 # leave empty to honour $MORI_RDMA_DEVICES
+      memory_pool_size: 536870912     # 512 MB, matches Qwen2.5-Omni Mori deploy
+      memory_pool_device: "cuda"      # GPU memory required for XGMI RDMA transfers
+      xgmi_num_streams: 64
+      xgmi_num_events: 64
+      qp_per_transfer: 1
+      num_worker_threads: 1
+      post_batch_size: -1
+      # Chunk-transfer knobs consumed by talker2code2wav_async_chunk:
+      # 25 decoded codec frames per connector.put (~40 ms at 625 Hz
+      # codec rate) with a 25-frame left context to satisfy the
+      # code2wav receptive field.  Kept identical to the SHM deploy so
+      # accuracy stays comparable when swapping backends.
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+
+stages:
+  - stage_id: 0
+    gpu_memory_utilization: 0.9
+    enforce_eager: true               # ROCm override: avoid flashinfer autotune path
+    devices: "0"
+    output_connectors:
+      to_stage_1: mori_connector
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      top_k: 1
+      max_tokens: 2048
+      seed: 42
+      repetition_penalty: 1.05
+
+  - stage_id: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    devices: "1"
+    input_connectors:
+      from_stage_0: mori_connector
+    output_connectors:
+      to_stage_2: mori_connector
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.05
+
+  - stage_id: 2
+    gpu_memory_utilization: 0.3
+    max_num_seqs: 1
+    enforce_eager: true
+    async_scheduling: false
+    # Codec prefill length (Q * num_frames) exceeds 32k default;
+    # matches qwen3_omni_moe.yaml code2wav sizing.
+    max_num_batched_tokens: 51200
+    devices: "2"
+    input_connectors:
+      from_stage_1: mori_connector
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.1

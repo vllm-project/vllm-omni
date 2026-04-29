@@ -46,14 +46,24 @@ stages:
       from_stage_0: mori_connector
 ```
 
-A ready-to-run intra-node example for Qwen2.5-Omni on AMD MI300X lives at
-[`vllm_omni/deploy/qwen2_5_omni_mori_intranode.yaml`](../../../../vllm_omni/deploy/qwen2_5_omni_mori_intranode.yaml)
+A ready-to-run intra-node example for Qwen3-Omni-MoE on AMD MI300X lives
+at
+[`vllm_omni/deploy/qwen3_omni_moe_mori_intranode.yaml`](../../../../vllm_omni/deploy/qwen3_omni_moe_mori_intranode.yaml)
 and can be loaded with:
 
 ```bash
-vllm serve Qwen/Qwen2.5-Omni-7B --omni --log-stats \
-    --deploy-config vllm_omni/deploy/qwen2_5_omni_mori_intranode.yaml
+vllm-omni serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --log-stats \
+    --deploy-config vllm_omni/deploy/qwen3_omni_moe_mori_intranode.yaml
 ```
+
+The yaml wires `MoriTransferEngineConnector` (with `backend_type: xgmi`) to
+the chunk_transfer_adapter path (`async_chunk: true`) so stage-to-stage
+hidden-state and codec-frame streams ship GPU-to-GPU over AMD Infinity
+Fabric instead of SHM.  Qwen2.5-Omni + Mori is not yet functional on
+the chunk path: it needs `thinker2talker_async_chunk` /
+`talker2code2wav_async_chunk` input processors that do not exist yet
+(the orchestrator-level path the upstream PR originally targeted was
+lost during the entrypoints → engine refactor and removed in #1742).
 
 Parameters:
 
