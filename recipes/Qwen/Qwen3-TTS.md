@@ -48,8 +48,8 @@ serving. Add more sections for other hardware as community validation lands.
 - OS: Linux
 - Python: 3.10+
 - Driver / runtime: NVIDIA CUDA environment with an H100 or A100 80 GB GPU
-- vLLM version: Match the repository requirements for your checkout
-- vLLM-Omni version or commit: Use the commit you are deploying from
+- vLLM version: Match the repository requirements for your checkout: 0.19.x
+- vLLM-Omni version or commit: Use the commit you are deploying from: 0.19.x
 
 #### Command
 
