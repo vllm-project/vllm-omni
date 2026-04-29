@@ -45,7 +45,7 @@ All subsequent commands are run inside the container, from
 
 ```bash
 python3 export_codec.py \
-    --tokenizer-path Qwen/Qwen3-TTS-Tokenizer-12Hz \
+    --tokenizer-path /workspace/server/examples/online_serving/qwen3_tts_nv_triton/models--Qwen--Qwen3-TTS-Tokenizer-12Hz/snapshots/2069d3478828c9135fff015cd13613975dfa4ba8 \
     --trt-path model_repository/codec_decoder/1/model.plan \
     --trt-batch-profile 1 8 32
 ```
@@ -110,30 +110,20 @@ Numbers below are taken from a single RTX A6000 with the default
 `max_num_seqs` / engine config used in this example. Latencies are
 reported as `mean / p95` in milliseconds.
 
-> A couple of knobs that move the needle on performance:
->
-> - **Tweak `max_queue_delay_microseconds`** in the codec's Triton
->   `config.pbtxt` (dynamic batcher). A larger delay lets Triton form
->   bigger codec batches before launching the GPU kernel, which raises
->   utilization at the cost of a TTFA increase.
-> - **Increase the codec instance `count`** in the Triton instance group
->   (e.g. from 1 to 2) to serve two codec instances on the same GPU.
->   2 codec instances reach ~**35x RTF** on the same A6000 — see `model_repository/codec_decoder/config.pbtxt`.
-
 **End-to-end service** (`benchmark_service.py`, talker + codec):
 
 | Concurrency | Throughput (req/s) | RTF    | TTFA mean / p95 (ms) |
 | ----------: | -----------------: | -----: | -------------------: |
-|           1 |               0.85 |  4.39x |        62.4 / 65.1   |
-|           4 |               2.55 | 12.88x |       103.3 / 120.3  |
-|           8 |               3.82 | 19.96x |       143.1 / 165.4  |
-|          32 |               5.68 | 28.39x |       375.7 / 495.0  |
+|           1 |               1.14 |  4.71x |        72.8 / 76.9   |
+|           4 |               2.69 | 13.52x |       117.2 / 140.0  |
+|           8 |               4.42 | 21.33x |       161.8 / 189.5  |
+|          32 |               7.34 | 37.05x |       373.9 / 425.4  |
 
 **Talker only** (`benchmark_model.py`, codec tokens only, no waveform):
 
 | Concurrency | Throughput (req/s) | TTFT mean / p95 (ms) | ITL mean / p95 (ms) |
 | ----------: | -----------------: | -------------------: | ------------------: |
-|           1 |               0.66 |        16.55 / 19.00 |       17.12 / 18.81 |
-|           4 |               2.32 |        38.15 / 48.70 |       19.36 / 22.51 |
-|           8 |               3.76 |        47.29 / 53.66 |       23.23 / 29.94 |
-|          32 |               7.91 |       126.25 / 279.79 |       41.31 / 56.48 |
+|           1 |               0.73 |        28.32 / 31.28 |       15.44 / 16.70 |
+|           4 |               2.59 |        46.84 / 57.45 |       17.09 / 21.19 |
+|           8 |               4.39 |        55.85 / 64.12 |       19.87 / 26.98 |
+|          32 |               9.89 |       100.31 / 112.5 |       33.04 / 45.13 |

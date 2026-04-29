@@ -97,6 +97,7 @@ def _build_talker_only_stage_config(
     max_num_batched_tokens: int = 512,
     enforce_eager: bool = False,
     max_new_tokens: int = 2048,
+    distributed_executor_backend: str = "mp",
 ) -> dict:
     """Build a single-stage YAML dict containing only the NV AR talker."""
     engine_args: dict[str, Any] = {
@@ -104,14 +105,16 @@ def _build_talker_only_stage_config(
         "max_num_seqs": max_num_seqs,
         "model_arch": "Qwen3TTSTalkerForConditionalGenerationNv",
         "worker_type": "ar",
-        "scheduler_cls": "vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler",
+        "scheduler_cls": "vllm_omni.core.sched.async_omni_ar_scheduler.AsyncOmniARScheduler",
         "enforce_eager": enforce_eager,
         "trust_remote_code": True,
         "async_scheduling": True,
         "enable_prefix_caching": False,
         "engine_output_type": "latent",
         "gpu_memory_utilization": gpu_memory_utilization,
-        "distributed_executor_backend": "mp",
+        # "uni" runs the worker in-process (no shm_broadcast IPC); use "mp"
+        # only when TP/PP > 1 or you actually need a separate worker process.
+        "distributed_executor_backend": distributed_executor_backend,
         "max_num_batched_tokens": max_num_batched_tokens,
         "max_model_len": max_model_len,
     }
@@ -535,6 +538,7 @@ async def main(args):
         max_num_batched_tokens=args.max_num_batched_tokens,
         enforce_eager=args.enforce_eager,
         max_new_tokens=args.max_new_tokens,
+        distributed_executor_backend=args.distributed_executor_backend,
     )
     tmp_config_path = _write_temp_stage_config(stage_cfg)
 
@@ -708,6 +712,14 @@ def parse_args():
     engine.add_argument("--enforce-eager", action="store_true")
     engine.add_argument("--stage-init-timeout", type=int, default=300)
     engine.add_argument("--log-stats", action="store_true", default=False)
+    engine.add_argument(
+        "--distributed-executor-backend", type=str, default="uni",
+        choices=["uni", "mp", "ray"],
+        help="vLLM executor backend. 'uni' runs the worker in-process and "
+             "avoids the shm_broadcast IPC round-trips on every "
+             "execute_model/sample_tokens call (recommended for TP=1, "
+             "single GPU). Default: uni.",
+    )
 
     prof = parser.add_argument_group("profiling")
     prof.add_argument(

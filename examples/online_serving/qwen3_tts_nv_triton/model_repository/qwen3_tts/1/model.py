@@ -157,14 +157,17 @@ class TritonPythonModel:
                         "max_num_seqs": self.max_num_seqs,
                         "model_arch": "Qwen3TTSTalkerForConditionalGenerationNv",
                         "worker_type": "ar",
-                        "scheduler_cls": "vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler",
+                        "scheduler_cls": "vllm_omni.core.sched.async_omni_ar_scheduler.AsyncOmniARScheduler",
                         "enforce_eager": False,
                         "trust_remote_code": True,
                         "async_scheduling": True,
                         "enable_prefix_caching": False,
                         "engine_output_type": "latent",
                         "gpu_memory_utilization": self.gpu_memory_utilization,
-                        "distributed_executor_backend": "mp",
+                        # uni runs the worker in-process for TP=PP=1; avoids the
+                        # shm_broadcast IPC round-trip that the mp executor pays
+                        # on every execute_model / sample_tokens call.
+                        "distributed_executor_backend": "uni",
                         "max_num_batched_tokens": self.max_num_batched_tokens,
                         "max_model_len": self.max_model_len,
                     },
