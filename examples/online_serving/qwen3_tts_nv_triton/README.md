@@ -26,7 +26,7 @@ decoupled gRPC stream.
 ## 1. Build and run the Triton container
 
 ```bash
-cd examples/online_serving/qwen3_tts_triton
+cd examples/online_serving/qwen3_tts_nv_triton
 docker build -t qwen3tts_triton .
 docker run --rm -it --gpus all \
     --shm-size=8g \

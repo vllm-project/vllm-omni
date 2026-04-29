@@ -8,7 +8,7 @@ RUN apt-get update && \
 RUN pip install --no-cache-dir "vllm==0.19.0"
 
 # 3. Install vLLM-Omni from the fork/branch on top of upstream vLLM
-RUN git clone --single-branch --branch qwen3tts_refactor \
+RUN git clone --single-branch --branch vklimkov/qwen3tts_nv \
         https://github.com/vklimkov-nvidia/vllm-omni.git /tmp/vllm-omni && \
     cd /tmp/vllm-omni && \
     VLLM_OMNI_TARGET_DEVICE=cuda pip install --no-cache-dir . && \
@@ -20,14 +20,14 @@ RUN pip install -e /workspace/Qwen3-TTS/ --no-deps
 
 # 5. Install the Qwen3-TTS pieces not provided by vLLM/vLLM-Omni,
 #    and pin the transformers version required by Qwen3-TTS.
-RUN apt-get install -y python3-libnvinfer=10.15.1.29-1+cuda13.1
 RUN pip install --no-cache-dir \
-    "numpy==1.26.4" \
     onnxscript \
     librosa \
     sox \
-    onnx-graphsurgeon \
-    polygraphy>=0.49 \
-    "transformers==4.57.3"
+    onnx-graphsurgeon
+RUN pip intsall --no-cache-dir \
+    --force-reinstall --no-deps \
+    "transformers==4.57.3" \
+    "numpy==1.26.4"
 
 WORKDIR /workspace
