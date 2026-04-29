@@ -197,6 +197,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return instance
 
     def __init__(self, *args, **kwargs):
+        self.model_name = kwargs.pop("model_name", None)
         super().__init__(*args, **kwargs)
         # Initialize uploaded speakers storage (ephemeral — cleared on restart)
         speech_voice_samples_dir = os.environ.get("SPEECH_VOICE_SAMPLES", "/tmp/voice_samples")
@@ -1950,6 +1951,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if not request.input or not request.input.strip():
                 raise ValueError("Input text cannot be empty")
 
+            # Validate ref_audio format up-front so that bogus inputs return a
+            # 4xx instead of falling through to MediaConnector and surfacing as
+            # a 500 Internal Server Error (e.g. test_voice_clone_invalid_ref_audio_format).
+            if request.ref_audio is not None:
+                fmt_err = self._validate_ref_audio_format(request.ref_audio)
+                if fmt_err:
+                    return self._diffusion_error_response(fmt_err, status_code=400)
+
             request_id = f"speech-{random_uuid()}"
             prompt: dict[str, Any] = {"input": request.input}
             if request.ref_audio:
@@ -2016,16 +2025,28 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except (EngineGenerateError, EngineDeadError):
             raise  # Propagate to the global Omni exception handler
         except ValueError as e:
-            return self._diffusion_error_response(str(e))
+            # ValueError represents invalid client input (bad ref_audio URI,
+            # empty text, model-side validation failures forwarded as ValueError, ...).
+            # Return 400 to match `create_speech`'s `self.create_error_response(e)`
+            # default (HTTPStatus.BAD_REQUEST) rather than masking it as a 500.
+            return self._diffusion_error_response(str(e), status_code=400)
         except Exception as e:
             logger.exception("Diffusion speech generation failed: %s", e)
             return self._diffusion_error_response(f"Speech generation failed: {e}")
 
     @staticmethod
-    def _diffusion_error_response(message: str) -> Response:
-        """Create a JSON error response without depending on OpenAIServing."""
-        error_body = json.dumps({"error": {"message": message, "type": "server_error", "param": None, "code": 500}})
-        return Response(content=error_body, media_type="application/json", status_code=500)
+    def _diffusion_error_response(message: str, status_code: int = 500) -> Response:
+        """Create a JSON error response without depending on OpenAIServing.
+
+        Args:
+            message: Error message to surface to the client.
+            status_code: HTTP status code; defaults to 500. Pass a 4xx code for
+                client-input validation failures so the response semantics match
+                the OpenAI-compatible behavior used by ``create_speech``.
+        """
+        err_type = "BadRequestError" if 400 <= status_code < 500 else "server_error"
+        error_body = json.dumps({"error": {"message": message, "type": err_type, "param": None, "code": status_code}})
+        return Response(content=error_body, media_type="application/json", status_code=status_code)
 
     async def create_speech(
         self,
