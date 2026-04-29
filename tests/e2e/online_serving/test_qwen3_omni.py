@@ -178,7 +178,6 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
-@pytest.mark.skip(reason="# issue 3177")
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", prefix_test_params, indirect=True)
 def test_thinker_prefix_caching(omni_server, openai_client) -> None:
