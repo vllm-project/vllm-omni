@@ -476,11 +476,13 @@ class FishSpeechFastAR(nn.Module):
                     scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
                 if top_p < 1.0:
                     sorted_logits, sorted_indices = torch.sort(scaled, descending=True)
-                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                    sorted_indices_to_remove = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1, dtype=torch.float32), dim=-1)
+                    sorted_indices_to_remove = (
+                        cumulative_probs - F.softmax(sorted_logits, dim=-1, dtype=torch.float32) >= top_p
+                    )
                     sorted_logits[sorted_indices_to_remove] = float("-inf")
                     scaled = sorted_logits.scatter(1, sorted_indices, sorted_logits)
-                probs = F.softmax(scaled, dim=-1)
+                probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
                 next_ids = torch.multinomial(probs, num_samples=1, generator=generator)
             else:
                 next_ids = logits.argmax(dim=-1, keepdim=True)

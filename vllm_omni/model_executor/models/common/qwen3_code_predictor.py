@@ -686,12 +686,12 @@ class CodePredictorWrapper(nn.Module):
                     logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
                 if s_top_p < 1.0:
                     sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
-                    sorted_probs = F.softmax(sorted_logits, dim=-1)
+                    sorted_probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
                     cumulative_probs = sorted_probs.cumsum(dim=-1)
                     remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
                     sorted_logits[remove_mask] = float("-inf")
                     logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
-                probs = F.softmax(logits, dim=-1)
+                probs = F.softmax(logits, dim=-1, dtype=torch.float32)
                 code = torch.multinomial(probs, num_samples=1)
             else:
                 # "per_call" mode: temperature-scaled + top-k
@@ -700,7 +700,7 @@ class CodePredictorWrapper(nn.Module):
                     if top_k > 0:
                         topk_vals, _ = scaled.topk(top_k, dim=-1)
                         scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                    probs = F.softmax(scaled, dim=-1)
+                    probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
                     code = torch.multinomial(probs, num_samples=1)
                 else:
                     code = logits.argmax(dim=-1, keepdim=True)

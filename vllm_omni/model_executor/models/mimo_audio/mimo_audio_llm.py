@@ -83,7 +83,7 @@ class MiMoSampler:
         if self.top_p is not None and 0.0 < self.top_p <= 1.0:
             top_p = self.top_p if 0.0 < self.top_p <= 1.0 else 1.0
             sorted_logits, sorted_indices = torch.sort(scores)
-            cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+            cumulative_probs = sorted_logits.softmax(dim=-1, dtype=torch.float32).cumsum(dim=-1)
             sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
             sorted_indices_to_remove[:, -1] = 0
             indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
@@ -97,7 +97,7 @@ class MiMoSampler:
             scores[:, t] = float("-inf")
 
         if self.do_sample:
-            probs = scores.softmax(dim=-1)
+            probs = scores.softmax(dim=-1, dtype=torch.float32)
             return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
         return torch.argmax(scores, dim=-1)
@@ -125,7 +125,7 @@ class MiMoLocalSamplerTensor:
 
         if self.top_p is not None:
             sorted_logits, sorted_indices = torch.sort(scores)
-            cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+            cumulative_probs = sorted_logits.softmax(dim=-1, dtype=torch.float32).cumsum(dim=-1)
             sorted_indices_to_remove = cumulative_probs <= torch.sub(1, self.top_p[:, None])
             sorted_indices_to_remove[:, -1] = 0
             indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
