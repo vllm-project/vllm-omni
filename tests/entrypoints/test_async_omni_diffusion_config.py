@@ -4,6 +4,7 @@
 import pytest
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.config.stage_config import deploy_override_field_names
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand, _create_default_diffusion_stage_cfg
 
@@ -28,6 +29,15 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["vae_use_slicing"] is True
     assert engine_args["parallel_config"].ulysses_degree == 2
     assert engine_args["model_stage"] == "diffusion"
+
+
+def test_default_stage_config_ignores_none_deploy_overrides():
+    """Ensure nullified deploy override defaults do not alter diffusion defaults."""
+    baseline = AsyncOmniEngine._create_default_diffusion_stage_cfg({})[0]
+    nullified_overrides = {name: None for name in deploy_override_field_names()}
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(nullified_overrides)[0]
+
+    assert stage_cfg == baseline
 
 
 def test_default_cache_config_used_when_missing():

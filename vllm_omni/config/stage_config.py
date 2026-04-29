@@ -881,13 +881,15 @@ class StageConfig:
 
         # CLI overrides take precedence over YAML defaults
         for key, value in self.runtime_overrides.items():
+            if value is None:
+                continue
             if key not in ("devices", "max_batch_size"):
                 engine_args[key] = value
 
         # Build runtime config from YAML defaults + CLI overrides
         runtime: dict[str, Any] = dict(self.yaml_runtime)
         runtime.setdefault("process", True)
-        if "devices" in self.runtime_overrides:
+        if self.runtime_overrides.get("devices") is not None:
             runtime["devices"] = self.runtime_overrides["devices"]
 
         # Legacy compat: migrate runtime.max_batch_size → engine_args.max_num_seqs

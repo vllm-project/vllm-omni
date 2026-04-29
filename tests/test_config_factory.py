@@ -147,6 +147,24 @@ class TestStageConfig:
         omega_config = config.to_omegaconf()
         assert omega_config.engine_args.max_num_seqs == 32
 
+    def test_to_omegaconf_omits_none_deploy_overrides_for_engine_args(self):
+        """None deploy overrides must fall through to EngineArgs defaults."""
+        from vllm_omni.config.stage_config import deploy_override_field_names
+
+        config = StageConfig(
+            stage_id=0,
+            model_stage="thinker",
+            runtime_overrides={name: None for name in deploy_override_field_names()},
+        )
+
+        omega_config = config.to_omegaconf()
+        engine_args = dict(omega_config.engine_args)
+
+        assert "devices" not in engine_args
+        assert "max_batch_size" not in engine_args
+        for name in deploy_override_field_names() - {"devices"}:
+            assert name not in engine_args
+
 
 class TestModelPipeline:
     """Tests for ModelPipeline class."""
@@ -803,6 +821,40 @@ class TestPipelineRegistry:
 
 
 class TestDeployConfigLoading:
+    def test_deploy_override_fields_include_deploy_schema_fields(self):
+        from vllm_omni.config.stage_config import deploy_override_field_names
+
+        expected_fields = {
+            "async_chunk",
+            "async_scheduling",
+            "config_format",
+            "data_parallel_size",
+            "devices",
+            "disable_hybrid_kv_cache_manager",
+            "distributed_executor_backend",
+            "dtype",
+            "enable_chunked_prefill",
+            "enable_flashinfer_autotune",
+            "enable_prefix_caching",
+            "enforce_eager",
+            "gpu_memory_utilization",
+            "load_format",
+            "max_model_len",
+            "max_num_batched_tokens",
+            "max_num_seqs",
+            "mm_processor_cache_gb",
+            "pipeline_parallel_size",
+            "profiler_config",
+            "quantization",
+            "skip_mm_profiling",
+            "subtalker_sampling_params",
+            "tensor_parallel_size",
+            "tokenizer_mode",
+            "trust_remote_code",
+        }
+
+        assert expected_fields == deploy_override_field_names()
+
     def test_load_deploy_config(self):
         from pathlib import Path
 
