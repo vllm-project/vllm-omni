@@ -98,7 +98,7 @@ def _get_diffusion_feature_cases():
                 ],
             ),
             id="layerwise_hsdp",
-            marks=[*FOUR_CARD_MARKS, pytest.mark.skip(reason="issue #2435")],
+            marks=[*FOUR_CARD_MARKS],
         ),
     ]
 
