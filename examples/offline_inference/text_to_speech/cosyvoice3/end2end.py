@@ -40,6 +40,13 @@ def run_e2e():
     )
     parser.add_argument("--ref-audio", type=str, default="prompt.wav")
     parser.add_argument(
+        "--speaker-id",
+        type=str,
+        default=None,
+        help="Speaker ID from spk2info.pt for embedding-based inference. "
+        "When set, --ref-audio is ignored and no reference audio is needed.",
+    )
+    parser.add_argument(
         "--tokenizer",
         type=str,
         required=True,
@@ -66,7 +73,23 @@ def run_e2e():
     sampling_cfg = {"top_p": 0.8, "top_k": 25, "eos_token_id": 6561 + 1}
 
     print("Model initialized. Preparing inputs...")
-    if args.ref_audio:
+    if args.speaker_id:
+        # Embedding mode: use pre-stored speaker embedding from spk2info.pt
+        # A dummy audio is required to trigger the multimodal pipeline,
+        # but its content is ignored when speaker_id is set.
+        dummy_audio = (np.zeros(1600, dtype=np.float32), 16000)
+        prompts = {
+            "prompt": args.text,
+            "multi_modal_data": {
+                "audio": dummy_audio,
+            },
+            "mm_processor_kwargs": {
+                "speaker_id": args.speaker_id,
+                "prompt_text": args.prompt_text,
+            },
+        }
+        print(f"Using embedding mode with speaker_id='{args.speaker_id}'")
+    elif args.ref_audio:
         if not os.path.exists(args.ref_audio):
             raise FileNotFoundError(f"Audio file not found: {args.ref_audio}")
         # Load at native sample rate
@@ -82,19 +105,28 @@ def run_e2e():
             )
 
         audio_data = (audio_signal.astype(np.float32), sr)
+        prompts = {
+            "prompt": args.text,
+            "multi_modal_data": {
+                "audio": audio_data,
+            },
+            "mm_processor_kwargs": {
+                "prompt_text": args.prompt_text,
+                "sample_rate": audio_data[1],
+            },
+        }
     else:
         audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
-
-    prompts = {
-        "prompt": args.text,
-        "multi_modal_data": {
-            "audio": audio_data,
-        },
-        "mm_processor_kwargs": {
-            "prompt_text": args.prompt_text,
-            "sample_rate": audio_data[1],
-        },
-    }
+        prompts = {
+            "prompt": args.text,
+            "multi_modal_data": {
+                "audio": audio_data,
+            },
+            "mm_processor_kwargs": {
+                "prompt_text": args.prompt_text,
+                "sample_rate": audio_data[1],
+            },
+        }
 
     print(f"Generating for prompt: {args.text}")
 

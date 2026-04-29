@@ -106,6 +106,20 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         )
         self._cached_model_dir = model_dir
         self._speaker_cache = get_speaker_cache()
+        self._spk2info_cache: dict[str, dict] | None = None
+
+    def _load_spk2info(self, model_dir: str, config: CosyVoice3Config) -> dict:
+        """Load and cache spk2info.pt for embedding-based inference."""
+        if self._spk2info_cache is not None:
+            return self._spk2info_cache
+        spk2info_path = os.path.join(model_dir, config.spk2info_path)
+        if not os.path.exists(spk2info_path):
+            raise FileNotFoundError(
+                f"spk2info.pt not found at {spk2info_path}. Embedding mode requires spk2info.pt in the model directory."
+            )
+        self._spk2info_cache = torch.load(spk2info_path, map_location="cpu", weights_only=False)
+        logger.info("Loaded spk2info.pt with speakers: %s", list(self._spk2info_cache.keys()))
+        return self._spk2info_cache
 
     def _call_hf_processor(
         self,
@@ -132,6 +146,56 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
                 audio = audio[0], config.target_sr
 
         text_token, text_token_len = extract_text_token(prompt, self.tokenizer, config.allowed_special)
+
+        # ---- Embedding mode: use pre-stored speaker embedding ----
+        speaker_id = mm_kwargs.get("speaker_id")
+        if speaker_id is not None:
+            spk2info = self._load_spk2info(model_dir, config)
+            if speaker_id not in spk2info:
+                raise ValueError(
+                    f"Speaker '{speaker_id}' not found in spk2info.pt. Available speakers: {list(spk2info.keys())}"
+                )
+            embedding = spk2info[speaker_id]["embedding"]  # [1, 192]
+            if not isinstance(embedding, torch.Tensor):
+                embedding = torch.tensor(embedding)
+            if embedding.dim() == 1:
+                embedding = embedding.unsqueeze(0)
+
+            # Optional prompt_text for instruct prefix
+            prompt_text = mm_kwargs.get("prompt_text")
+            if prompt_text and isinstance(prompt_text, str):
+                prompt_text_token, prompt_text_token_len = extract_text_token(
+                    prompt_text, self.tokenizer, config.allowed_special
+                )
+                input_ids, _ = concat_text_with_prompt_ids(
+                    text_token, text_token_len, prompt_text_token, prompt_text_token_len
+                )
+            else:
+                input_ids = text_token
+
+            device = "cpu"
+            speech_token = torch.zeros([1, 0], dtype=torch.int32, device=device)
+            speech_feat = torch.zeros([1, 0, 80], dtype=torch.float32, device=device)
+            speech_token_len = torch.tensor([0], dtype=torch.int32, device=device)
+
+            logger.info(
+                "Embedding mode: speaker='%s', text_len=%d, embedding_shape=%s",
+                speaker_id,
+                input_ids.shape[1],
+                embedding.shape,
+            )
+
+            return BatchFeature(
+                {
+                    "input_ids": input_ids,
+                    "speech_feat": speech_feat,
+                    "speech_token": speech_token,
+                    "speech_token_len": [speech_token_len],
+                    "embedding": embedding,
+                }
+            )
+        # ---- End embedding mode ----
+
         if audio is None:
             # Text-only path for profiling/cache
             return BatchFeature({"input_ids": text_token, "input_len": [text_token_len]})
@@ -673,8 +737,13 @@ class CosyVoice3Model(
                 embed_tokens = self.model.llm.model.embed_tokens(input_ids)
                 sos = self.model.speech_embedding.weight[self.model.sos].reshape(1, -1)
                 task_id = self.model.speech_embedding.weight[self.model.task_id].reshape(1, -1)
-                prompt_speech_token_emb = multimodal_embeddings[0]
-                pstoken_len = prompt_speech_token_emb.shape[0]  # Get length from tensor shape
+                # Get speech token embeddings (may be empty for embedding mode)
+                if multimodal_embeddings is not None and len(multimodal_embeddings) > 0:
+                    prompt_speech_token_emb = multimodal_embeddings[0]
+                    pstoken_len = prompt_speech_token_emb.shape[0]
+                else:
+                    prompt_speech_token_emb = torch.empty(0, embed_tokens.shape[-1], device=embed_tokens.device)
+                    pstoken_len = 0
                 embed_tokens = torch.cat(
                     [sos, embed_tokens[2 + pstoken_len :], task_id, prompt_speech_token_emb], dim=0
                 )
