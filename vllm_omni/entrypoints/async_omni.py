@@ -869,8 +869,12 @@ class AsyncOmni(EngineClient, OmniBase):
         for result in results:
             if isinstance(result, dict) and result.get("todo"):
                 continue
-            if isinstance(result, list):
-                merged.update(result)
+            if isinstance(result, (list, set)):
+                for item in result:
+                    if isinstance(item, (list, set)):
+                        merged.update(item)
+                    elif isinstance(item, int):
+                        merged.add(item)
         return sorted(merged)
 
     async def pin_lora(self, adapter_id: int) -> bool:

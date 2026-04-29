@@ -45,6 +45,4 @@ class TestThinkerLogprobsConfig:
         """OmniModelRunnerOutput must carry logprobs field."""
         from vllm_omni.outputs import OmniModelRunnerOutput
 
-        assert hasattr(OmniModelRunnerOutput, "__dataclass_fields__") or hasattr(
-            OmniModelRunnerOutput, "logprobs"
-        )
+        assert hasattr(OmniModelRunnerOutput, "__dataclass_fields__") or hasattr(OmniModelRunnerOutput, "logprobs")

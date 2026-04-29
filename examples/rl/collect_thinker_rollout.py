@@ -28,8 +28,6 @@ These log_probs are the "old_log_probs" in GSPO/GRPO training:
     loss = -advantage * ratio
 """
 
-import json
-
 from openai import OpenAI
 
 # Connect to vLLM-Omni server

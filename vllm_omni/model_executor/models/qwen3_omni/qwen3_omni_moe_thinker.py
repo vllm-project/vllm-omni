@@ -1119,9 +1119,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self.vllm_config = vllm_config  # needed for torch compile forward context
         # thinker_config: Qwen3OmniMoeThinkerConfig = vllm_config.model_config.hf_config
         hf_config = vllm_config.model_config.hf_config
-        thinker_config: Qwen3OmniMoeThinkerConfig = (
-            getattr(hf_config, "thinker_config", None) or hf_config
-        )
+        thinker_config: Qwen3OmniMoeThinkerConfig = getattr(hf_config, "thinker_config", None) or hf_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
         self.config = thinker_config
@@ -1651,6 +1649,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
         self,
         input_tokens: list[int],
         mm_features: list[MultiModalFeatureSpec],
+        **kwargs,
     ) -> tuple[torch.Tensor, int]:
         """Compute M-RoPE input positions using mm_features directly."""
         seq_len = len(input_tokens)
