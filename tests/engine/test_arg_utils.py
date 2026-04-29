@@ -175,23 +175,29 @@ def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
 
 
 def test_stage_specific_text_config_override():
-    """Ensure dependent attributes are updated when using stage-specific config."""
+    """Stage swap must refresh hf_text_config, dependent attrs, and model_arch_config."""
     vllm_config = EngineArgs().create_model_config()
     vllm_config.disable_sliding_window = True
+    thinker_mac = vllm_config.model_arch_config
 
-    # Switch the created hf text config with a mock whose
-    # values we want to pull through the text config helper
-    stage_text_config = vllm_config.hf_text_config
+    talker_num_heads = max(2, thinker_mac.total_num_attention_heads // 2)
+    talker_num_kv_heads = max(1, talker_num_heads // 8)
+    talker_head_dim = 128
+    stage_text_config = SimpleNamespace(
+        sliding_window=4096,
+        attention_chunk_size=2048,
+        max_position_embeddings=4096,
+        num_attention_heads=talker_num_heads,
+        num_key_value_heads=talker_num_kv_heads,
+        head_dim=talker_head_dim,
+        hidden_size=talker_num_heads * talker_head_dim,
+        vocab_size=thinker_mac.vocab_size,
+        num_hidden_layers=4,
+    )
+
     vllm_config.hf_text_config = SimpleNamespace()
-    stage_text_config.sliding_window = 4096
-    stage_text_config.attention_chunk_size = 2048
+    vllm_config.hf_config.thinker_config = SimpleNamespace(get_text_config=lambda: stage_text_config)
 
-    # Move the stage config's text config getter & thinker config
-    mock_stage_config = SimpleNamespace(get_text_config=lambda: stage_text_config)
-    vllm_config.hf_config.thinker_config = mock_stage_config
-
-    # Ensure that create from a vLLM config correctly pulls the
-    # expected values off of the thinker config & swaps the text config
     omni_config = OmniModelConfig.from_vllm_model_config(
         vllm_config,
         hf_config_name="thinker_config",
@@ -201,6 +207,21 @@ def test_stage_specific_text_config_override():
     assert omni_config.attention_chunk_size == 2048
     assert omni_config.max_model_len == 4096
     assert omni_config.hf_text_config.sliding_window is None
+
+    stage_mac = omni_config.model_arch_config
+    assert stage_mac is not thinker_mac
+    assert stage_mac.total_num_attention_heads == talker_num_heads
+    assert stage_mac.total_num_kv_heads == talker_num_kv_heads
+    assert stage_mac.head_size == talker_head_dim
+
+    parallel_config = SimpleNamespace(
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        decode_context_parallel_size=1,
+    )
+    assert omni_config.get_num_attention_heads(parallel_config) == talker_num_heads
+    assert omni_config.get_num_kv_heads(parallel_config) == talker_num_kv_heads
+    assert omni_config.get_head_size() == talker_head_dim
 
 
 def test_stage_configs_path_field():

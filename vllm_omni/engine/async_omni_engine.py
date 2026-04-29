@@ -1032,6 +1032,7 @@ class AsyncOmniEngine:
         original_prompt = prompt
 
         stage_type = self.stage_metadata[0].get("stage_type")
+        _preprocess_ms = 0.0
         if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
             # Inject global_request_id into the raw prompt.
             if isinstance(prompt, dict):
@@ -1041,6 +1042,7 @@ class AsyncOmniEngine:
                     _inject_global_id(item, request_id)
 
             # Full input processing (tokenization, multimodal, etc.)
+            _t_preprocess = time.perf_counter()
             request = self.input_processor.process_inputs(
                 request_id=request_id,
                 prompt=prompt,
@@ -1054,6 +1056,7 @@ class AsyncOmniEngine:
                 data_parallel_rank=data_parallel_rank,
                 resumable=resumable,
             )
+            _preprocess_ms = (time.perf_counter() - _t_preprocess) * 1000.0
             # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
             # additional_information field in the prompt.
             request = _upgrade_to_omni_request(request, prompt)
@@ -1090,6 +1093,8 @@ class AsyncOmniEngine:
             "original_prompt": original_prompt,
             "sampling_params_list": effective_sampling_params_list,
             "final_stage_id": final_stage_id,
+            "preprocess_ms": _preprocess_ms,
+            "enqueue_ts": time.perf_counter(),
         }
 
     def _enqueue_cfg_companions(
@@ -1316,6 +1321,7 @@ class AsyncOmniEngine:
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
+            "enable_ar_profiler": kwargs.get("enable_ar_profiler", False),
             **(
                 {
                     "profiler_config": asdict(kwargs["profiler_config"])
@@ -1451,16 +1457,28 @@ class AsyncOmniEngine:
                 if lora_scale is not None:
                     if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
                         cfg.engine_args.lora_scale = lora_scale
-                # Prefer explicit quantization_config; fallback to legacy --quantization.
                 quantization_config = kwargs.get("quantization_config")
-                if quantization_config is None:
-                    quantization_config = kwargs.get("quantization")
                 if quantization_config is not None:
                     if (
                         not hasattr(cfg.engine_args, "quantization_config")
                         or cfg.engine_args.quantization_config is None
                     ):
                         cfg.engine_args.quantization_config = quantization_config
+                # Inject profiler flags for diffusion stages
+                for profiler_key in (
+                    "enable_diffusion_pipeline_profiler",
+                    "enable_ar_profiler",
+                ):
+                    val = kwargs.get(profiler_key)
+                    if val:
+                        if not hasattr(cfg.engine_args, profiler_key) or not getattr(
+                            cfg.engine_args, profiler_key, False
+                        ):
+                            setattr(cfg.engine_args, profiler_key, val)
+                quantization = kwargs.get("quantization")
+                if quantization is not None:
+                    if not hasattr(cfg.engine_args, "quantization") or cfg.engine_args.quantization is None:
+                        cfg.engine_args.quantization = quantization
             except Exception as e:
                 logger.warning("Failed to inject LoRA config for stage: %s", e)
 

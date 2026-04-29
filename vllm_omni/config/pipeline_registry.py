@@ -15,7 +15,13 @@ they just no longer need to self-register via ``register_pipeline(...)``.
 Adding a new pipeline:
     1. Define the ``PipelineConfig`` instance as a module-level variable in
        ``vllm_omni/.../pipeline.py``.
-    2. Add one line to ``_OMNI_PIPELINES`` or ``_DIFFUSION_PIPELINES`` below.
+    2. Add one line to ``_OMNI_PIPELINES`` below.
+
+Single-stage diffusion models continue to use the
+``_create_default_diffusion_stage_cfg`` fallback in
+``async_omni_engine.py`` — they don't need a registry entry. The empty
+``_DIFFUSION_PIPELINES`` placeholder previously here (#2915) was removed
+once #2987 (which would have populated it) was deferred.
 
 ``register_pipeline(config)`` in ``stage_config`` is still supported for
 out-of-tree plugins and tests that create pipelines at runtime; those override
@@ -79,13 +85,8 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.fish_speech.pipeline",
         "FISH_SPEECH_PIPELINE",
     ),
-}
-
-# --- Single-stage diffusion pipelines (populated in PR 3/N) ---
-_DIFFUSION_PIPELINES: dict[str, tuple[str, str]] = {}
-
-# Union view used by ``_LazyPipelineRegistry``; don't mutate at runtime.
-_VLLM_OMNI_PIPELINES: dict[str, tuple[str, str]] = {
-    **_OMNI_PIPELINES,
-    **_DIFFUSION_PIPELINES,
+    "moss_tts_nano": (
+        "vllm_omni.model_executor.models.moss_tts_nano.pipeline",
+        "MOSS_TTS_NANO_PIPELINE",
+    ),
 }

@@ -27,7 +27,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def _source_output(token_ids: list[int], mm_output: dict | None = None):
     """Create a minimal AR output mock."""
     return SimpleNamespace(
-        outputs=[SimpleNamespace(token_ids=token_ids)],
+        outputs=[SimpleNamespace(token_ids=token_ids, cumulative_token_ids=token_ids)],
         multimodal_output=mm_output,
     )
 
@@ -299,7 +299,7 @@ class TestAr2Diffusion:
     def test_i2i_with_mm_output(self):
         """Test image-to-image with prior_token_image_ids from AR model."""
         token_ids = list(range(1024)) + [16385]
-        mm_output = {"prior_token_image_ids": torch.tensor([1, 2, 3])}
+        mm_output = {"ids": {"prior_image": torch.tensor([1, 2, 3])}}
         stage_list = [_stage_with_outputs([_source_output(token_ids, mm_output)])]
 
         from PIL import Image

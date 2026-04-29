@@ -8,7 +8,7 @@ for type-safe multimodal output routing and tensor merging.
 from __future__ import annotations
 
 import re
-from enum import Enum, Flag, auto
+from enum import Enum, Flag, StrEnum, auto
 
 _MODALITY_ALIASES: dict[str, str] = {
     "speech": "audio",
@@ -19,6 +19,27 @@ _MODALITY_ALIASES: dict[str, str] = {
     "pixel_values": "image",
     "pixels": "image",
 }
+
+
+class OutputModalityNames(StrEnum):
+    """Keys for output modalities.
+
+    TODO: (Alex) Integrate this with the big-flag enum below + throughout the code
+    for better type safety (currently only used for output processor).
+    """
+
+    TEXT = "text"
+    IMAGE = "image"
+    AUDIO = "audio"
+    LATENT = "latent"
+
+
+# Specify which output modalities may be drained when handling delta messages.
+# For some types, e.g., latents, we need to be careful to ensure the full context
+# is passed as the stream yields due to assumptions in the I/O processing and model
+# when async chunk isn't enabled.
+NON_DRAINABLE_MODALITIES = {OutputModalityNames.TEXT, OutputModalityNames.LATENT}
+DRAINABLE_MODALITIES = {mod for mod in OutputModalityNames if mod not in NON_DRAINABLE_MODALITIES}
 
 
 class OutputModality(Flag):
