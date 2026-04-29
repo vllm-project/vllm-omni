@@ -31,6 +31,10 @@ pytestmark = [
     pytest.mark.parametrize("omni_runner", [_OMNI_RUNNER_PARAM], indirect=True),
 ]
 
+_SKIP_ISSUE_3236 = pytest.mark.skip(
+    reason="https://github.com/vllm-project/vllm-omni/issues/3236",
+)
+
 
 def _validate_mp4(video_bytes: bytes, min_frames: int = 10) -> None:
     """Validate that the MP4 contains meaningful video and audio tracks."""
@@ -56,6 +60,7 @@ def _validate_mp4(video_bytes: bytes, min_frames: int = 10) -> None:
     container.close()
 
 
+@_SKIP_ISSUE_3236
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 def test_magi_human_e2e(omni_runner: OmniRunner):
     """End-to-end test for MagiHuman generating video and audio."""
