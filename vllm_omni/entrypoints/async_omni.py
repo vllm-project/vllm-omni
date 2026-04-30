@@ -346,8 +346,6 @@ class AsyncOmni(EngineClient, OmniBase):
 
             logger.debug(f"[AsyncOmni] Request {request_id} completed")
 
-            self._log_summary_and_cleanup(request_id)
-
         except (asyncio.CancelledError, GeneratorExit):
             if input_stream_task is not None and not input_stream_task.done():
                 input_stream_task.cancel()
@@ -358,6 +356,8 @@ class AsyncOmni(EngineClient, OmniBase):
             await self.abort(request_id)
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
+        finally:
+            self._log_summary_and_cleanup(request_id)
 
     async def _add_streaming_input_request(
         self,
