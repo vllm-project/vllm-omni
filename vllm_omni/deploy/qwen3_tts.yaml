@@ -53,6 +53,7 @@ stages:
     max_num_seqs: 1
     gpu_memory_utilization: 0.3
     enforce_eager: true
+    enable_prefix_caching: false
     async_scheduling: true
     # Must be divisible by num_code_groups and cover (left_context + chunk).
     # Prefill length is Q * num_frames (e.g. 16 * 2148 = 34368); keep
