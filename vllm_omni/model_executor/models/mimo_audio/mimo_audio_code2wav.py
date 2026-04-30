@@ -486,10 +486,10 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
             return [ids]
 
         if runtime_additional_information and all(
-            isinstance(info.get("code_flat_numel"), int) and int(info["code_flat_numel"]) > 0
+            isinstance(info.get("meta", {}).get("code_flat_numel"), int) and int(info["meta"]["code_flat_numel"]) > 0
             for info in runtime_additional_information
         ):
-            sizes = [int(info["code_flat_numel"]) for info in runtime_additional_information]
+            sizes = [int(info["meta"]["code_flat_numel"]) for info in runtime_additional_information]
             if sum(sizes) == n:
                 parts: list[torch.Tensor] = []
                 offset = 0
@@ -517,11 +517,11 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         if not runtime_additional_information:
             return left_frames, chunk_frames
         for i in range(min(num_req, len(runtime_additional_information))):
-            info = runtime_additional_information[i]
-            if "left_context_size" in info:
-                left_frames[i] = int(info["left_context_size"])
-            if "codec_chunk_frames" in info:
-                chunk_frames[i] = int(info["codec_chunk_frames"])
+            meta = runtime_additional_information[i].get("meta", {})
+            if "left_context_size" in meta:
+                left_frames[i] = int(meta["left_context_size"])
+            if "codec_chunk_frames" in meta:
+                chunk_frames[i] = int(meta["codec_chunk_frames"])
         return left_frames, chunk_frames
 
     def chunked_decode_streaming(

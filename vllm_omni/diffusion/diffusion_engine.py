@@ -190,22 +190,21 @@ class DiffusionEngine:
 
         metrics = {
             "preprocess_time_ms": preprocess_time * 1000,
-            "diffusion_engine_exec_time_ms": (time.perf_counter() - diffusion_engine_start_time) * 1000,
-            "diffusion_engine_total_time_ms": exec_total_time * 1000,
+            "diffusion_engine_exec_time_ms": exec_total_time * 1000,
+            "diffusion_engine_total_time_ms": step_total_ms,
             "image_num": int(request.sampling_params.num_outputs_per_prompt),
             "resolution": int(request.sampling_params.resolution),
             "postprocess_time_ms": postprocess_time * 1000,
         }
-        if self.pre_process_func is not None:
-            metrics["preprocessing_time_ms"] = preprocess_time * 1000
 
         # Handle single request or multiple requests
+        is_audio_output = supports_audio_output(self.od_config.model_class_name)
         if len(request.prompts) == 1:
             # Single request: return single OmniRequestOutput
             prompt = request.prompts[0]
             request_id = request.request_ids[0] if request.request_ids else ""
 
-            if supports_audio_output(self.od_config.model_class_name):
+            if is_audio_output:
                 request_audio_payload = outputs[0] if len(outputs) == 1 else outputs
                 return [
                     OmniRequestOutput.from_diffusion(
@@ -265,7 +264,7 @@ class DiffusionEngine:
                 request_outputs = outputs[start_idx:end_idx] if output_idx < len(outputs) else []
                 output_idx = end_idx
 
-                if supports_audio_output(self.od_config.model_class_name):
+                if is_audio_output:
                     request_audio_payload = request_outputs[0] if len(request_outputs) == 1 else request_outputs
                     results.append(
                         OmniRequestOutput.from_diffusion(
@@ -416,9 +415,7 @@ class DiffusionEngine:
 
         if supports_audio_input(self.od_config.model_class_name):
             audio_sr = 16000
-            audio_duration_sec = 4
-            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(np.float32)
-            dummy_audio = audio_array[audio_sr * 1 : audio_sr * 3]
+            dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
         else:
             dummy_audio = None
 

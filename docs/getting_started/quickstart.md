@@ -19,10 +19,10 @@ uv venv --python 3.12 --seed
 source .venv/bin/activate
 
 # On CUDA
-uv pip install vllm==0.19.0 --torch-backend=auto
+uv pip install vllm==0.20.0 --torch-backend=auto
 
 # On ROCm
-uv pip install vllm==0.19.0+rocm700 --extra-index-url https://wheels.vllm.ai/rocm/0.19.0/rocm700
+uv pip install vllm==0.20.0+rocm700 --extra-index-url https://wheels.vllm.ai/rocm/0.20.0/rocm700
 
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni

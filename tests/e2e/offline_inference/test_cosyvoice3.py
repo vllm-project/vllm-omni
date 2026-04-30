@@ -13,10 +13,8 @@ verifies a stable reference recipe:
 from __future__ import annotations
 
 import functools
-import io
 import os
 from pathlib import Path
-from urllib.request import urlopen
 
 import numpy as np
 import pytest
@@ -25,6 +23,7 @@ from huggingface_hub import snapshot_download
 from vllm.sampling_params import SamplingParams
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import test_asset_path
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
@@ -33,7 +32,9 @@ from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokeni
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 MODEL_DIR_ENV = "VLLM_OMNI_COSYVOICE3_MODEL_DIR"
 
-REFERENCE_PROMPT_WAV_URL = "https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav"
+# Vendored under tests/assets/cosyvoice3/ so the test does not depend on
+# raw.githubusercontent.com being reachable from CI runners.
+REFERENCE_PROMPT_WAV_PATH = test_asset_path("cosyvoice3/zero_shot_prompt.wav")
 REFERENCE_PROMPT_TEXT = "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。"
 REFERENCE_SYNTH_TEXT = (
     "CosyVoice is undergoing a comprehensive upgrade, providing more accurate, "
@@ -51,9 +52,7 @@ ASYNC_CHUNK_MODES = [
 
 @functools.lru_cache(maxsize=1)
 def _load_reference_prompt_wav() -> tuple[np.ndarray, int]:
-    with urlopen(REFERENCE_PROMPT_WAV_URL, timeout=30) as resp:
-        data = resp.read()
-    audio, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=False)
+    audio, sr = sf.read(str(REFERENCE_PROMPT_WAV_PATH), dtype="float32", always_2d=False)
     if isinstance(audio, np.ndarray) and audio.ndim > 1:
         audio = np.mean(audio, axis=-1)
     return np.asarray(audio, dtype=np.float32), int(sr)

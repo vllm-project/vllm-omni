@@ -447,12 +447,16 @@ def generate_synthetic_image(
     *,
     force_regenerate: bool = False,
     cache_dir: Path | str | None = None,
+    seed: int | None = None,
 ) -> dict[str, Any]:
     """
     Random colored squares on white background. Caches JPEG by ``width`` /
     ``height`` unless ``force_regenerate`` is true. Cache root: ``cache_dir``
     if given, else the default temp subdirectory.
     """
+    if seed is not None:
+        random.seed(seed)
+
     root = _resolve_synthetic_media_cache_dir(cache_dir)
     root.mkdir(parents=True, exist_ok=True)
     cache_path = root / f"synth_image_w{width}_h{height}.jpg"
@@ -490,6 +494,33 @@ def generate_synthetic_image(
         "base64": base64.b64encode(image_bytes).decode("utf-8"),
         "file_path": str(cache_path.resolve()),
     }
+
+
+_TEST_ASSETS_ROOT = Path(__file__).resolve().parents[1] / "assets"
+
+_AUDIO_MIME_BY_SUFFIX = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+}
+
+
+def test_asset_path(relative_path: str | os.PathLike) -> Path:
+    """Resolve a path under ``tests/assets/`` to its absolute on-disk location."""
+    return _TEST_ASSETS_ROOT / Path(relative_path)
+
+
+def load_test_audio_data_url(relative_path: str | os.PathLike) -> str:
+    """Load a vendored test audio file under ``tests/assets/`` as a base64 data URL.
+
+    Used by tests that need real reference audio (e.g. voice cloning) without
+    relying on the server's ability to fetch external URLs at request time.
+    """
+    path = test_asset_path(relative_path)
+    mime = _AUDIO_MIME_BY_SUFFIX.get(path.suffix.lower(), "application/octet-stream")
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
 
 
 def decode_b64_image(b64: str):
@@ -649,5 +680,7 @@ __all__ = [
     "generate_synthetic_audio",
     "generate_synthetic_image",
     "generate_synthetic_video",
+    "load_test_audio_data_url",
     "preprocess_text",
+    "test_asset_path",
 ]
