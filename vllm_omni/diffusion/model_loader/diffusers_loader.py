@@ -26,6 +26,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     multi_thread_safetensors_weights_iterator,
     safetensors_weights_iterator,
 )
+from vllm.transformers_utils.repo_utils import file_exists
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -49,6 +50,8 @@ def _natural_sort_key(filepath: str) -> list:
 
 MODEL_INDEX = "model_index.json"
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
+TRANSFORMER_WEIGHTS_INDEX = "model.safetensors.index.json"
+INDEX_FILES = [DIFFUSION_MODEL_WEIGHTS_INDEX, TRANSFORMER_WEIGHTS_INDEX]
 
 
 class DiffusersPipelineLoader:
@@ -99,8 +102,22 @@ class DiffusersPipelineLoader:
         is_local = os.path.isdir(model_name_or_path)
         load_format = self.load_config.load_format
         use_safetensors = False
-        index_file = DIFFUSION_MODEL_WEIGHTS_INDEX
-        index_file_with_subfolder = f"{subfolder}/{index_file}" if subfolder else index_file
+        possible_index_files = [
+            f"{subfolder}/{index_file}" if subfolder is not None else index_file for index_file in INDEX_FILES
+        ]
+        available_index_file = list(
+            filter(lambda f: file_exists(model_name_or_path, f, revision=revision), possible_index_files)
+        )
+        if len(available_index_file) > 1:
+            raise ValueError(
+                f"Multiple index files found in {model_name_or_path} with subfolder {subfolder}: {available_index_file}"
+            )
+        index_file_with_subfolder = available_index_file[0] if len(available_index_file) == 1 else None
+        index_file = (
+            index_file_with_subfolder.split("/")[-1]
+            if index_file_with_subfolder and subfolder is not None
+            else index_file_with_subfolder
+        )
 
         # only hf is supported currently
         if load_format == "auto":
@@ -163,7 +180,7 @@ class DiffusersPipelineLoader:
             hf_weights_files = filter_duplicate_safetensors_files(
                 hf_weights_files,
                 filter_folder,
-                index_file,
+                index_file or "",
             )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
