@@ -28,7 +28,7 @@ from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -36,7 +36,6 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import Distribu
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
-from vllm_omni.diffusion.models.utils import create_transformers_model
 from vllm_omni.diffusion.models.z_image.z_image_transformer import (
     ZImageTransformer2DModel,
 )
@@ -172,23 +171,11 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
-                subfolder="text_encoder",
-                revision=od_config.revision,
-                prefix="text_encoder.",
-            ),
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
                 subfolder="transformer",
-                revision=od_config.revision,
+                revision=None,
                 prefix="transformer.",
                 fall_back_to_pt=True,
-            ),
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="vae",
-                revision=od_config.revision,
-                prefix="vae.",
-            ),
+            )
         ]
         self._execution_device = get_local_device()
         model = od_config.model
@@ -205,19 +192,12 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             model, subfolder="scheduler", local_files_only=local_files_only
         )
 
-        text_encoder_config = AutoConfig.from_pretrained(
+        self.text_encoder = AutoModel.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
-        )
-        self.text_encoder = create_transformers_model(
-            AutoModelForCausalLM,
-            od_config,
-            hf_config=text_encoder_config,
         ).to(self._execution_device)
-        if text_encoder_config.tie_word_embeddings:
-            self.text_encoder.lm_head.weight = self.text_encoder.get_input_embeddings().weight
-
-        vae_config = DistributedAutoencoderKL.load_config(model, subfolder="vae", local_files_only=local_files_only)
-        self.vae = DistributedAutoencoderKL.from_config(vae_config).to(self._execution_device)
+        self.vae = DistributedAutoencoderKL.from_pretrained(
+            model, subfolder="vae", local_files_only=local_files_only
+        ).to(self._execution_device)
         self.transformer = ZImageTransformer2DModel(quant_config=od_config.quantization_config)
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
 
