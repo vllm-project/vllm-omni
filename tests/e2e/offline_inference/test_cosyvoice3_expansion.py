@@ -23,7 +23,7 @@ from huggingface_hub import snapshot_download
 from vllm.sampling_params import SamplingParams
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import test_asset_path
+from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
@@ -34,7 +34,7 @@ MODEL_DIR_ENV = "VLLM_OMNI_COSYVOICE3_MODEL_DIR"
 
 # Vendored under tests/assets/cosyvoice3/ so the test does not depend on
 # raw.githubusercontent.com being reachable from CI runners.
-REFERENCE_PROMPT_WAV_PATH = test_asset_path("cosyvoice3/zero_shot_prompt.wav")
+REFERENCE_PROMPT_WAV_PATH = get_asset_path("cosyvoice3/zero_shot_prompt.wav")
 REFERENCE_PROMPT_TEXT = "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。"
 REFERENCE_SYNTH_TEXT = (
     "CosyVoice is undergoing a comprehensive upgrade, providing more accurate, "
