@@ -278,12 +278,14 @@ class TestHandleQueryErrors:
     @pytest.mark.asyncio
     async def test_query_returns_error_response(self):
         """create_chat_completion returns ErrorResponse → error forwarded."""
-        from vllm.entrypoints.openai.engine.protocol import ErrorResponse
+        from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
 
         err = ErrorResponse(
-            message="model overloaded",
-            type="server_error",
-            code=503,
+            error=ErrorInfo(
+                message="model overloaded",
+                type="server_error",
+                code=503,
+            ),
         )
 
         chat = AsyncMock()

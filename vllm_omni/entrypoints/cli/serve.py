@@ -718,7 +718,9 @@ def run_headless(args: argparse.Namespace) -> None:
             executor_class=executor_class,
             log_stats=log_stats,
         )
-        engine_manager.join_first()
+        # vllm>=0.19 renamed CoreEngineProcManager.join_first() to
+        # monitor_engine_liveness() (see upstream PR #35862).
+        engine_manager.monitor_engine_liveness()
     finally:
         logger.info("[Headless] Shutting down stage %d.", stage_id)
         if engine_manager is not None:

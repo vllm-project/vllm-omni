@@ -25,6 +25,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.model_metadata import QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
@@ -208,6 +209,18 @@ class QwenImageEditPlusPipeline(
 
         # Check if model is a local path
         local_files_only = os.path.exists(model)
+
+        # Defend against a transformers v5 multi-worker race where a peer
+        # worker's partially-written shard set makes our from_pretrained
+        # subfolder resolution fail with OSError (observed in Buildkite
+        # #1043 for Qwen/Qwen-Image-Edit-2509). snapshot_download takes a
+        # per-repo file lock so the first worker downloads and the rest
+        # wait on a warm cache before loading.
+        prefetch_subfolders(
+            model,
+            ["scheduler", "text_encoder", "vae", "tokenizer", "processor"],
+            local_files_only=local_files_only,
+        )
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only

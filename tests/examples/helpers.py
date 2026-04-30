@@ -351,3 +351,33 @@ def strip_trailing_audio_saved_line(text: str) -> str:
     while lines and lines[-1].strip().startswith("Audio saved to"):
         lines.pop()
     return "\n".join(lines).strip()
+
+
+def strip_audio_saved_to_lines(text: str) -> str:
+    """Remove every line starting with ``Audio saved to`` (streaming prints one per chunk).
+
+    Without this, :func:`extract_content_after_keyword` with ``content:`` and ``DOTALL``
+    keeps those lines inside the captured text segment.
+    """
+    lines = [ln for ln in text.splitlines() if not ln.strip().startswith("Audio saved to")]
+    return "\n".join(lines).strip()
+
+
+def extract_last_audio_saved_path(text: str) -> str:
+    """Return the filesystem path from the last ``Audio saved to`` line.
+
+    Non-streaming output has a single line; streaming prints one path per chunk.
+    Do not use :func:`extract_content_after_keyword` with ``Audio saved to`` for
+    streaming: greedy ``.+`` under ``DOTALL`` concatenates every path and body into one
+    invalid string (Linux ``File name too long`` when opening it as a path).
+    """
+    last_path: str | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Audio saved to"):
+            rest = stripped[len("Audio saved to") :].strip()
+            if rest:
+                last_path = rest
+    if last_path is None:
+        raise AssertionError("'Audio saved to' line with a path not found in command output")
+    return last_path

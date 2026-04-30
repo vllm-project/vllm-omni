@@ -15,13 +15,16 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 import pytest
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import load_test_audio_data_url
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 
-# Official CosyVoice zero-shot prompt audio and its transcript
-REF_AUDIO_URL = "https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav"
+# Official CosyVoice zero-shot prompt audio and its transcript. Vendored under
+# tests/assets/ so the server does not depend on raw.githubusercontent.com being
+# reachable at request time (same rationale as issue #3263 for Qwen3-TTS).
+REF_AUDIO_URL = load_test_audio_data_url("cosyvoice3/zero_shot_prompt.wav")
 REF_TEXT = "希望你以后能够做的比我还好呦。"
 
 
