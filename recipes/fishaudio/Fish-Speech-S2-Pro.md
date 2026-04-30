@@ -18,7 +18,13 @@ audio and supports voice cloning from reference audio.
 
 - User guide: [`docs/user_guide/examples/online_serving/fish_speech.md`](../../docs/user_guide/examples/online_serving/fish_speech.md)
 - Example guide: [`examples/online_serving/fish_speech/README.md`](../../examples/online_serving/fish_speech/README.md)
+- Related issue or discussion:
+  [RFC: add recipes folder](https://github.com/vllm-project/vllm-omni/issues/2645)
 
+## Hardware Support
+
+This recipe documents reference GPU configuration for Fish Speech S2 Pro.
+Other hardware and configurations are welcome as community validation lands.
 
 ## GPU
 
@@ -68,6 +74,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "response_format": "wav"
     }' --output output.wav
 ```
+[output.wav](https://github.com/user-attachments/files/27134970/output.wav)
 
 Voice cloning:
 
@@ -81,11 +88,15 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "ref_text": "Transcript of the reference audio."
     }' --output cloned.wav
 ```
+[reference.wav](https://github.com/user-attachments/files/27134971/reference.wav) <br>
+[cloned.wav](https://github.com/user-attachments/files/27134969/cloned.wav)
+
 
 
 #### Notes
 
-
-- Key flags: `--omni` is required;
+- Key flags: `--omni` is required.
 - Known limitations: Output audio is 44.1 kHz mono WAV. Voice cloning requires
   both `ref_audio` and `ref_text` parameters.
+- Memory usage: Model loads at ~48.3 GiB, peaks at ~48.9 GiB during inference
+  headroom for video frames and audio caches.
