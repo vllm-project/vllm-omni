@@ -28,12 +28,6 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
         model.init_distributed()
         return model
 
-    @classmethod
-    def from_config(cls, *args: Any, **kwargs: Any):
-        model = super().from_config(*args, **kwargs)
-        model.init_distributed()
-        return model
-
     def tile_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
         # mostly copy from AutoencoderKL
         overlap_size = int(self.tile_latent_min_size * (1 - self.tile_overlap_factor))
