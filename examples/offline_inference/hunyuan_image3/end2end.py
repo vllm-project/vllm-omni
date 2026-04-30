@@ -203,6 +203,7 @@ def main():
         if isinstance(sp, OmniDiffusionSamplingParams):
             sp.num_inference_steps = args.steps
             sp.guidance_scale = args.guidance_scale
+            sp.guidance_scale_provided = True
             if args.seed is not None:
                 sp.seed = args.seed
             if args.modality in ("text2img",):
