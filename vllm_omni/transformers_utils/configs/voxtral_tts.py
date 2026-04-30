@@ -16,8 +16,8 @@ class VoxtralTTSConfig(PretrainedConfig):
         audio_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(**kwargs)
-
+        # Assign before super().__init__: transformers/huggingface_hub validation
+        # (e.g. validate_token_ids → get_text_config) runs during base __init__.
         if isinstance(text_config, PretrainedConfig):
             self.text_config = text_config
         elif isinstance(text_config, dict):
@@ -26,9 +26,15 @@ class VoxtralTTSConfig(PretrainedConfig):
             self.text_config = PretrainedConfig()
 
         self.audio_config = audio_config or {}
+        super().__init__(**kwargs)
 
     def get_text_config(self, **kwargs: Any) -> PretrainedConfig:
-        return self.text_config
+        try:
+            return object.__getattribute__(self, "text_config")
+        except AttributeError:
+            tc = PretrainedConfig()
+            object.__setattr__(self, "text_config", tc)
+            return tc
 
 
 AutoConfig.register("voxtral_tts", VoxtralTTSConfig)

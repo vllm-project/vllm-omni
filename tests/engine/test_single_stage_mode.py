@@ -1137,13 +1137,20 @@ class TestLaunchDiffusionStage:
             "vllm_omni.engine.async_omni_engine.StageDiffusionClient.from_addresses",
             return_value=diffusion_client,
         )
+        mock_acquire_locks = mocker.patch(
+            "vllm_omni.engine.async_omni_engine.acquire_diffusion_device_locks",
+            return_value=[101],
+        )
+        mock_release_locks = mocker.patch("vllm_omni.engine.async_omni_engine.release_device_locks")
 
         result = engine._launch_diffusion_stage(
             stage_cfg=stage_cfg,
             metadata=metadata,
             omni_master_server=omni_master_server,
+            stage_init_timeout=60,
         )
 
+        mock_acquire_locks.assert_called_once_with(5, "diffusion-config", 60)
         mock_register.assert_called_once_with(
             omni_master_address="127.0.0.1",
             omni_master_port=25000,
@@ -1158,7 +1165,8 @@ class TestLaunchDiffusionStage:
             request_address="tcp://127.0.0.1:25002",
             response_address="tcp://127.0.0.1:25003",
         )
-        mock_handshake.assert_called_once_with(proc, "tcp://127.0.0.1:25001")
+        mock_handshake.assert_called_once_with(proc, "tcp://127.0.0.1:25001", 60)
+        mock_release_locks.assert_called_once_with([101])
         mock_from_addresses.assert_called_once_with(
             metadata,
             request_address="tcp://127.0.0.1:25002",
@@ -1205,7 +1213,7 @@ class TestCreateRemoteLlmStage:
 
         @contextmanager
         def fake_connect_cm(*args, **kwargs):
-            yield eng_mgr, coordinator, fake_addresses
+            yield eng_mgr, coordinator, fake_addresses, None
 
         mocker.patch(
             "vllm_omni.engine.async_omni_engine.build_engine_args_dict",
@@ -1265,7 +1273,7 @@ class TestCreateRemoteLlmStage:
 
         @contextmanager
         def fake_connect_cm(*args, **kwargs):
-            yield mocker.Mock(), mocker.Mock(), fake_addresses
+            yield mocker.Mock(), mocker.Mock(), fake_addresses, None
 
         mocker.patch(
             "vllm_omni.engine.async_omni_engine.build_engine_args_dict",
@@ -1329,7 +1337,7 @@ class TestCreateRemoteLlmStage:
 
         @contextmanager
         def boom(*args, **kwargs):
-            yield mocker.Mock(), mocker.Mock(), mocker.Mock()
+            yield mocker.Mock(), mocker.Mock(), mocker.Mock(), None
             raise RuntimeError("handshake failed")
 
         mocker.patch(
@@ -1402,7 +1410,7 @@ class TestConnectRemoteEngineCoresCoordinator:
             vllm_config=vllm_config,
             omni_master_server=omni_master_server,
             stage_id=7,
-        ) as (_, yielded_coordinator, yielded_addresses):
+        ) as (_, yielded_coordinator, yielded_addresses, _tensor_queue):
             assert yielded_coordinator is None
             assert yielded_addresses.coordinator_input == "tcp://coord-in"
             assert yielded_addresses.coordinator_output == "tcp://coord-out"
@@ -1439,7 +1447,7 @@ class TestConnectRemoteEngineCoresCoordinator:
             vllm_config=vllm_config,
             omni_master_server=omni_master_server,
             stage_id=7,
-        ) as (_, yielded_coordinator, yielded_addresses):
+        ) as (_, yielded_coordinator, yielded_addresses, _tensor_queue):
             assert yielded_coordinator is None
             assert yielded_addresses.coordinator_input is None
             assert yielded_addresses.coordinator_output is None

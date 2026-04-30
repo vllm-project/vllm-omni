@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import contextlib
 import io
 import json
@@ -15,6 +14,7 @@ from datetime import datetime
 from typing import Literal
 
 import aiohttp
+import pybase64 as base64
 from pydub import AudioSegment
 from tqdm.asyncio import tqdm
 from vllm.benchmarks import datasets
@@ -620,7 +620,8 @@ if "daily-omni" not in OPENAI_COMPATIBLE_BACKENDS:
 # ruff: noqa: E402
 # Prevent import order from causing patch failures
 from vllm.benchmarks import serve
-from vllm.benchmarks.serve import TaskType, calculate_metrics_for_embeddings, get_request, wait_for_endpoint
+from vllm.benchmarks.lib.ready_checker import wait_for_endpoint
+from vllm.benchmarks.serve import TaskType, calculate_metrics_for_embeddings, get_request
 
 from vllm_omni.benchmarks.metrics.metrics import MultiModalsBenchmarkMetrics, calculate_metrics
 

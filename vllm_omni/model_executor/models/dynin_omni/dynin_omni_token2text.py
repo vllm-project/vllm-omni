@@ -209,6 +209,66 @@ class DyninOmniToken2Text(DyninOmniStageBase):
     def _load_text_model(model_path: str, *, local_files_only: bool = False) -> Any:
         try:
             dynin_model_cls = get_dynin_modeling_attr("DyninOmniModelLM")
+            # Remote Dynin `DyninOmniConfig` may omit `use_cache`, but bundled
+            # `modeling_llada.forward` reads `self.config.use_cache` like a
+            # standard HF causal LM config (see kernel warmup / mmu_generate).
+            dynin_config_cls = get_dynin_modeling_attr("DyninOmniConfig")
+            if not getattr(dynin_config_cls, "_dynin_use_cache_shim_applied", False):
+                _orig_cfg_init = dynin_config_cls.__init__
+
+                def _cfg_init_shim(self, *args, **kwargs):
+                    _orig_cfg_init(self, *args, **kwargs)
+                    if not hasattr(self, "use_cache"):
+                        setattr(self, "use_cache", True)
+
+                dynin_config_cls.__init__ = _cfg_init_shim  # type: ignore[method-assign]
+                dynin_config_cls._dynin_use_cache_shim_applied = True
+            # transformers>=5.0 renamed the weight-tying manifest accessor from
+            # `_tied_weights_keys` (a class attribute) to `all_tied_weights_keys`
+            # (a property returning a {module_path: [tied_keys]} mapping) and
+            # invokes it during `from_pretrained -> caching_allocator_warmup
+            # -> get_total_byte_count`. Remote Dynin code pre-dates the rename,
+            # so patch a minimal shim onto the class if it's missing. Keeping
+            # the mapping empty is safe here — the root module has no weight
+            # tying; the real tied-weights (if any) live on nested submodules
+            # that transformers discovers via their own `_tied_weights_keys`.
+            if not hasattr(dynin_model_cls, "all_tied_weights_keys"):
+                dynin_model_cls.all_tied_weights_keys = property(lambda self: {})
+            # transformers>=5.0 also calls `get_total_byte_count` which does
+            # `len(model._tp_plan)`; PreTrainedModel's class default for
+            # `_tp_plan` is `None`, and unless `self.config.base_model_tp_plan`
+            # was populated during __init__ (via `post_init`) the instance
+            # attribute remains None, crashing with
+            # `TypeError: object of type 'NoneType' has no len()`. The remote
+            # Dynin model class bypasses that path, so shim an empty dict at
+            # the class level as a safe fallback (PreTrainedModel sets the
+            # instance attribute when the config actually carries a plan).
+            if getattr(dynin_model_cls, "_tp_plan", None) is None:
+                dynin_model_cls._tp_plan = {}
+            # transformers>=5.0 `_finalize_model_loading` calls
+            # `model.tie_weights(missing_keys=..., recompute_mapping=...)` while
+            # the remote Dynin code still defines `tie_weights(self)` with no
+            # keyword arguments, raising
+            # `TypeError: LLaDAModelLM.tie_weights() got an unexpected keyword
+            # argument 'missing_keys'`. Wrap the method once to silently drop
+            # the new kwargs; the remote implementation is a no-op w.r.t. the
+            # missing-keys bookkeeping transformers would otherwise perform.
+            _orig_tie_weights = dynin_model_cls.tie_weights
+            if not getattr(_orig_tie_weights, "_dynin_accepts_v5_kwargs", False):
+                _tie_sig = inspect.signature(_orig_tie_weights)
+                _tie_accepts_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in _tie_sig.parameters.values())
+                _tie_accepts_new_kwargs = _tie_accepts_var_kw or (
+                    "missing_keys" in _tie_sig.parameters and "recompute_mapping" in _tie_sig.parameters
+                )
+                if not _tie_accepts_new_kwargs:
+
+                    def _tie_weights_shim(self, *args, **kwargs):
+                        kwargs.pop("missing_keys", None)
+                        kwargs.pop("recompute_mapping", None)
+                        return _orig_tie_weights(self, *args, **kwargs)
+
+                    _tie_weights_shim._dynin_accepts_v5_kwargs = True  # type: ignore[attr-defined]
+                    dynin_model_cls.tie_weights = _tie_weights_shim
             try:
                 return dynin_model_cls.from_pretrained(
                     model_path,

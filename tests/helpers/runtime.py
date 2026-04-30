@@ -1084,7 +1084,14 @@ class OmniRunner:
         seed: int = 42,
         stage_init_timeout: int = 600,
         batch_timeout: int = 10,
-        init_timeout: int = 900,
+        # Bumped from 900s -> 1800s to give CI cold-cache loads of large
+        # diffusion models enough headroom (Buildkite #8418 hit a 6-second
+        # overrun loading Tongyi-MAI/Z-Image-Turbo: weights alone took 690s,
+        # the full stage was ready at ~896s, but the orchestrator wrapper
+        # finished at ~906s, just past the previous 900s ceiling). Engine
+        # production default in AsyncOmniEngine remains 600s; this only
+        # affects the test runner wrapper.
+        init_timeout: int = 1800,
         shm_threshold_bytes: int = 65536,
         log_stats: bool = False,
         stage_configs_path: str | None = None,

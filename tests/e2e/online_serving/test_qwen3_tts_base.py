@@ -15,12 +15,16 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 import pytest
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import load_test_audio_data_url
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 
-REF_AUDIO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone_2.wav"
+# Vendored under tests/assets/qwen3_tts/clone_2.wav so the server does not need
+# to fetch the reference audio over HTTPS at request time (CI runners in some
+# regions cannot reach the original Aliyun OSS host; see issue #3263).
+REF_AUDIO_URL = load_test_audio_data_url("qwen3_tts/clone_2.wav")
 REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 
 
