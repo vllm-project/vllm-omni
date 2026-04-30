@@ -30,7 +30,12 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
+)
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.adalayernorm import (
     AdaLayerNormContinuous,
     AdaLayerNormZero,
@@ -128,9 +133,11 @@ class FluxAttention(torch.nn.Module):
         pre_only: bool = False,
         quant_config: "QuantizationConfig | None" = None,
         prefix: str = "",
+        parallel_config: DiffusionParallelConfig | None = None,
     ):
         super().__init__()
 
+        self.parallel_config = parallel_config or DiffusionParallelConfig()
         self.head_dim = dim_head
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
         self.query_dim = query_dim
@@ -240,38 +247,145 @@ class FluxAttention(torch.nn.Module):
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
 
-            query = torch.cat([encoder_query, query], dim=1)
-            key = torch.cat([encoder_key, key], dim=1)
-            value = torch.cat([encoder_value, value], dim=1)
-
-        query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)  # [S, D/2]
-
-        attn_metadata = None
-        if attention_mask is not None:
-            if attention_mask.dim() == 3:
-                attention_mask = attention_mask.unsqueeze(1)
-            attn_metadata = AttentionMetadata(attn_mask=attention_mask)
-
-        hidden_states = self.attn(
-            query,
-            key,
-            value,
-            attn_metadata,
-        )
-        hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.to(query.dtype)
-
-        if encoder_hidden_states is not None:
-            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
-                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+            sp_size = self.parallel_config.sequence_parallel_size
+            use_sp_joint_attention = (
+                sp_size is not None
+                and sp_size > 1
+                and is_forward_context_available()
+                and not get_forward_context().split_text_embed_in_sp
             )
-            # Contiguous for FP8 quantization in RowParallelLinear
-            hidden_states = self.to_out[0](hidden_states.contiguous())
-            hidden_states = self.to_out[1](hidden_states)
-            encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
+
+            if use_sp_joint_attention and image_rotary_emb is not None:
+                cos, sin = image_rotary_emb
+                cos = cos.to(query.dtype)
+                sin = sin.to(query.dtype)
+                txt_len = encoder_query.shape[1]
+                txt_cos, img_cos = cos[:txt_len], cos[txt_len:]
+                txt_sin, img_sin = sin[:txt_len], sin[txt_len:]
+
+                query = self.rope(query, img_cos, img_sin)
+                key = self.rope(key, img_cos, img_sin)
+                encoder_query = self.rope(encoder_query, txt_cos, txt_sin)
+                encoder_key = self.rope(encoder_key, txt_cos, txt_sin)
+
+                attn_metadata = AttentionMetadata(
+                    joint_query=encoder_query,
+                    joint_key=encoder_key,
+                    joint_value=encoder_value,
+                    joint_strategy="front",
+                )
+                hidden_states_mask: torch.Tensor | None = kwargs.get("hidden_states_mask", None)
+                encoder_hidden_states_mask: torch.Tensor | None = kwargs.get("encoder_hidden_states_mask", None)
+                if hidden_states_mask is not None:
+                    attn_metadata.attn_mask = hidden_states_mask
+                if encoder_hidden_states_mask is not None:
+                    attn_metadata.joint_attn_mask = encoder_hidden_states_mask
+
+                hidden_states = self.attn(query, key, value, attn_metadata)
+                hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
+
+                txt_len = encoder_hidden_states.shape[1]
+                encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                    [txt_len, hidden_states.shape[1] - txt_len],
+                    dim=1,
+                )
+                hidden_states = self.to_out[0](hidden_states.contiguous())
+                hidden_states = self.to_out[1](hidden_states)
+                encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
+            else:
+                query = torch.cat([encoder_query, query], dim=1)
+                key = torch.cat([encoder_key, key], dim=1)
+                value = torch.cat([encoder_value, value], dim=1)
+
+                query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)  # [S, D/2]
+
+                attn_metadata = None
+                if attention_mask is not None:
+                    if attention_mask.dim() == 3:
+                        attention_mask = attention_mask.unsqueeze(1)
+                    attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+
+                hidden_states = self.attn(
+                    query,
+                    key,
+                    value,
+                    attn_metadata,
+                )
+                hidden_states = hidden_states.flatten(2, 3)
+                hidden_states = hidden_states.to(query.dtype)
+
+                encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                    [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+                )
+                # Contiguous for FP8 quantization in RowParallelLinear
+                hidden_states = self.to_out[0](hidden_states.contiguous())
+                hidden_states = self.to_out[1](hidden_states)
+                encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
 
             return hidden_states, encoder_hidden_states
         else:
+            sp_size = self.parallel_config.sequence_parallel_size
+            text_seq_len = kwargs.get("text_seq_len", None)
+            use_sp_single_stream = (
+                sp_size is not None
+                and sp_size > 1
+                and text_seq_len is not None
+                and is_forward_context_available()
+                and not get_forward_context().split_text_embed_in_sp
+            )
+
+            if use_sp_single_stream and image_rotary_emb is not None:
+                cos, sin = image_rotary_emb
+                cos = cos.to(query.dtype)
+                sin = sin.to(query.dtype)
+                txt_cos, img_cos = cos[:text_seq_len], cos[text_seq_len:]
+                txt_sin, img_sin = sin[:text_seq_len], sin[text_seq_len:]
+
+                img_query = query[:, text_seq_len:]
+                img_key = key[:, text_seq_len:]
+                img_value = value[:, text_seq_len:]
+                text_query = query[:, :text_seq_len]
+                text_key = key[:, :text_seq_len]
+                text_value = value[:, :text_seq_len]
+
+                img_query = self.rope(img_query, img_cos, img_sin)
+                img_key = self.rope(img_key, img_cos, img_sin)
+                text_query = self.rope(text_query, txt_cos, txt_sin)
+                text_key = self.rope(text_key, txt_cos, txt_sin)
+
+                attn_metadata = AttentionMetadata(
+                    joint_query=text_query,
+                    joint_key=text_key,
+                    joint_value=text_value,
+                    joint_strategy="front",
+                )
+                hidden_states_mask: torch.Tensor | None = kwargs.get("hidden_states_mask", None)
+                encoder_hidden_states_mask: torch.Tensor | None = kwargs.get("encoder_hidden_states_mask", None)
+                if hidden_states_mask is not None:
+                    attn_metadata.attn_mask = hidden_states_mask
+                if encoder_hidden_states_mask is not None:
+                    attn_metadata.joint_attn_mask = encoder_hidden_states_mask
+
+                hidden_states = self.attn(img_query, img_key, img_value, attn_metadata)
+                hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
+            else:
+                query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)  # [S, D/2]
+
+                attn_metadata = None
+                if attention_mask is not None:
+                    if attention_mask.dim() == 3:
+                        attention_mask = attention_mask.unsqueeze(1)
+                    attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+
+                hidden_states = self.attn(
+                    query,
+                    key,
+                    value,
+                    attn_metadata,
+                )
+                hidden_states = hidden_states.flatten(2, 3)
+                hidden_states = hidden_states.to(query.dtype)
+
             if get_tensor_model_parallel_world_size() > 1:
                 hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
             return hidden_states
@@ -287,12 +401,15 @@ class FluxTransformerBlock(nn.Module):
         eps: float = 1e-6,
         quant_config: "QuantizationConfig | None" = None,
         prefix: str = "",
+        parallel_config: DiffusionParallelConfig | None = None,
     ):
         super().__init__()
+        parallel_config = parallel_config or DiffusionParallelConfig()
         self.norm1 = AdaLayerNormZero(dim, quant_config=quant_config, prefix=f"{prefix}.norm1")
         self.norm1_context = AdaLayerNormZero(dim, quant_config=quant_config, prefix=f"{prefix}.norm1_context")
 
         self.attn = FluxAttention(
+            parallel_config=parallel_config,
             query_dim=dim,
             added_kv_proj_dim=dim,
             dim_head=attention_head_dim,
@@ -377,8 +494,10 @@ class FluxSingleTransformerBlock(nn.Module):
         mlp_ratio: float = 4.0,
         quant_config: "QuantizationConfig | None" = None,
         prefix: str = "",
+        parallel_config: DiffusionParallelConfig | None = None,
     ):
         super().__init__()
+        parallel_config = parallel_config or DiffusionParallelConfig()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
         # Modulation linear kept full precision; shift/scale/gate outputs
@@ -403,6 +522,7 @@ class FluxSingleTransformerBlock(nn.Module):
         )
 
         self.attn = FluxAttention(
+            parallel_config=parallel_config,
             query_dim=dim,
             dim_head=attention_head_dim,
             heads=num_attention_heads,
@@ -432,6 +552,7 @@ class FluxSingleTransformerBlock(nn.Module):
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
+            text_seq_len=text_seq_len,
             **joint_attention_kwargs,
         )
 
@@ -474,6 +595,23 @@ class FluxPosEmbed(nn.Module):
         freqs_cos = torch.cat(cos_out, dim=-1).to(ids.device)
         freqs_sin = torch.cat(sin_out, dim=-1).to(ids.device)
         return freqs_cos, freqs_sin
+
+
+class FluxRopePrepare(nn.Module):
+    """Prepare FLUX.1 RoPE pieces so SP can shard image positions only."""
+
+    def __init__(self, pos_embed: FluxPosEmbed):
+        super().__init__()
+        self.pos_embed = pos_embed
+
+    def forward(
+        self,
+        img_ids: torch.Tensor,
+        txt_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        txt_freqs_cos, txt_freqs_sin = self.pos_embed(txt_ids)
+        img_freqs_cos, img_freqs_sin = self.pos_embed(img_ids)
+        return txt_freqs_cos, txt_freqs_sin, img_freqs_cos, img_freqs_sin
 
 
 class FluxTransformer2DModel(nn.Module):
@@ -519,6 +657,16 @@ class FluxTransformer2DModel(nn.Module):
         return ("transformer_blocks" in name or "single_transformer_blocks" in name) and name.split(".")[-1].isdigit()
 
     _hsdp_shard_conditions = [_is_transformer_block]
+    _sp_plan = {
+        "": {
+            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
+        },
+        "rope_prepare": {
+            2: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
+            3: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
+        },
+        "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
         "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
@@ -547,7 +695,7 @@ class FluxTransformer2DModel(nn.Module):
             num_layers = model_config.num_layers
             self.parallel_config = od_config.parallel_config
         else:
-            self.parallel_config = None
+            self.parallel_config = DiffusionParallelConfig()
 
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
@@ -555,6 +703,7 @@ class FluxTransformer2DModel(nn.Module):
         self.guidance_embeds = guidance_embeds
 
         self.pos_embed = FluxPosEmbed(theta=theta, axes_dim=axes_dims_rope)
+        self.rope_prepare = FluxRopePrepare(self.pos_embed)
         text_time_guidance_cls = (
             CombinedTimestepGuidanceTextProjEmbeddings if guidance_embeds else CombinedTimestepTextProjEmbeddings
         )
@@ -571,6 +720,7 @@ class FluxTransformer2DModel(nn.Module):
         self.transformer_blocks = nn.ModuleList(
             [
                 FluxTransformerBlock(
+                    parallel_config=self.parallel_config,
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
@@ -584,6 +734,7 @@ class FluxTransformer2DModel(nn.Module):
         self.single_transformer_blocks = nn.ModuleList(
             [
                 FluxSingleTransformerBlock(
+                    parallel_config=self.parallel_config,
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
@@ -648,6 +799,11 @@ class FluxTransformer2DModel(nn.Module):
             `tuple` where the first element is the sample tensor.
         """
 
+        joint_attention_kwargs = joint_attention_kwargs or {}
+        sp_size = self.parallel_config.sequence_parallel_size
+        if sp_size is not None and sp_size > 1:
+            get_forward_context().split_text_embed_in_sp = False
+
         hidden_states = self.x_embedder(hidden_states)
         timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype) * 1000
 
@@ -674,12 +830,40 @@ class FluxTransformer2DModel(nn.Module):
             )
             img_ids = img_ids[0]
 
-        ids = torch.cat((txt_ids, img_ids), dim=0)
         if is_torch_npu_available():
-            freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
-            image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
+            txt_freqs_cos, txt_freqs_sin, img_freqs_cos, img_freqs_sin = self.rope_prepare(img_ids.cpu(), txt_ids.cpu())
+            txt_freqs_cos = txt_freqs_cos.npu()
+            txt_freqs_sin = txt_freqs_sin.npu()
+            img_freqs_cos = img_freqs_cos.npu()
+            img_freqs_sin = img_freqs_sin.npu()
         else:
-            image_rotary_emb = self.pos_embed(ids)
+            txt_freqs_cos, txt_freqs_sin, img_freqs_cos, img_freqs_sin = self.rope_prepare(img_ids, txt_ids)
+
+        image_rotary_emb = (
+            torch.cat([txt_freqs_cos, img_freqs_cos], dim=0),
+            torch.cat([txt_freqs_sin, img_freqs_sin], dim=0),
+        )
+
+        hidden_states_mask = None
+        if is_forward_context_available():
+            ctx = get_forward_context()
+        else:
+            ctx = None
+        if ctx is not None and ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+            batch_size = hidden_states.shape[0]
+            img_padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+            hidden_states_mask = torch.ones(
+                batch_size,
+                img_padded_seq_len,
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+            if hidden_states_mask.all():
+                hidden_states_mask = None
+
+        if hidden_states_mask is not None:
+            joint_attention_kwargs["hidden_states_mask"] = hidden_states_mask
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
@@ -751,6 +935,8 @@ class FluxTransformer2DModel(nn.Module):
 
 
 class FluxKontextTransformer2DModel(FluxTransformer2DModel):
+    _sp_plan = None
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig = None,
