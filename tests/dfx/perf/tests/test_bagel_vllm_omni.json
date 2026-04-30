@@ -12,7 +12,8 @@
         "tensor-parallel-size": 1,
         "cfg-parallel-size": 1,
         "gpu-memory-utilization": 0.98,
-        "max-model-len": 8192
+        "max-model-len": 8192,
+        "max-num-batched-tokens": 9216
       }
     },
     "benchmark_params": [
@@ -66,7 +67,8 @@
         "tensor-parallel-size": 1,
         "cfg-parallel-size": 1,
         "gpu-memory-utilization": 0.45,
-        "max-model-len": 8192
+        "max-model-len": 8192,
+        "max-num-batched-tokens": 9216
       }
     },
     "benchmark_params": [
@@ -119,7 +121,8 @@
         "no-async-chunk": true,
         "tensor-parallel-size": 2,
         "gpu-memory-utilization": 0.98,
-        "max-model-len": 8192
+        "max-model-len": 8192,
+        "max-num-batched-tokens": 9216
       }
     },
     "benchmark_params": [
