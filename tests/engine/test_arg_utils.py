@@ -251,7 +251,7 @@ def test_voxcpm_model_arch_injects_model_type_override(mocker):
 def test_strip_single_engine_args():
     """_strip_single_engine_args should remove EngineArgs fields but keep omni fields."""
     kwargs = {
-        # Parent EngineArgs fields — should be stripped
+        # Parent EngineArgs fields — stripped unless explicitly allowlisted
         "compilation_config": '{"cudagraph_mode": "FULL_AND_PIECEWISE"}',
         "tensor_parallel_size": 4,
         "gpu_memory_utilization": 0.9,
@@ -269,7 +269,7 @@ def test_strip_single_engine_args():
 
     # Stripped — parent EngineArgs fields
     assert "compilation_config" not in filtered
-    assert "tensor_parallel_size" not in filtered
+    assert filtered["tensor_parallel_size"] == 4
     assert "gpu_memory_utilization" not in filtered
     assert "model" not in filtered
 
@@ -299,15 +299,18 @@ def test_strip_single_engine_args_model_does_not_trigger_warning(mocker):
     mock_warn.assert_not_called()
 
     # When there *are* genuinely surprising overrides alongside model,
-    # the warning should mention them but not model.
+    # the warning should mention them but not model. Keep-listed fields such as
+    # tensor_parallel_size are intentionally passed through and should not warn.
     AsyncOmniEngine._strip_single_engine_args(
         {
             "model": "some/model",
+            "compilation_config": '{"cudagraph_mode": "FULL_AND_PIECEWISE"}',
             "tensor_parallel_size": 4,
             "custom_pipeline_args": {"pipeline_class": "my.Pipeline"},
         }
     )
     mock_warn.assert_called_once()
     warned_args = mock_warn.call_args[0][-1]  # the formatted arg list
-    assert "tensor_parallel_size" in warned_args
+    assert "compilation_config" in warned_args
+    assert "tensor_parallel_size" not in warned_args
     assert "model" not in warned_args

@@ -112,6 +112,13 @@ _PARENT_ARGS_KEEP: frozenset[str] = frozenset(
         "worker_extension_cls",
         "allowed_local_media_path",
         "allowed_media_domains",
+        # Legacy stage-config YAMLs may intentionally leave parallel or
+        # distributed knobs unspecified at the stage level and rely on
+        # top-level CLI values to fill them in during the per-stage merge.
+        # Keep these fields so stages that omit them can inherit CLI values,
+        # while stages with explicit YAML values still win because the legacy
+        # stage-config loader prefers stage-local engine args.
+        "tensor_parallel_size",
     }
 )
 
