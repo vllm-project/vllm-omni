@@ -604,7 +604,7 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
-      - label: ":full_moon: HunyuanImage3 · DiT Perf Test"
+      - label: ":full_moon: Diffusion X2I(&A&T) · HunyuanImage3 · DiT Perf Test"
         key: nightly-hunyuan-image3-performance
         soft_fail: true
         timeout_in_minutes: 120
