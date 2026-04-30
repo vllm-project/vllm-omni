@@ -108,7 +108,7 @@ def test_run_headless_registers_stage_once_and_launches_all_local_engines(mocker
     assert manager_kwargs["local_client"] is False
     assert manager_kwargs["handshake_address"] == "tcp://127.0.0.1:26001"
     assert manager_kwargs["log_stats"] is False
-    engine_manager.join_first.assert_called_once_with()
+    engine_manager.monitor_engine_liveness.assert_called_once_with()
     engine_manager.shutdown.assert_called_once_with()
 
 

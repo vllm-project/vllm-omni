@@ -430,10 +430,10 @@ def test_gpu_ar_model_runner_supplies_req_output_history_to_model_sampler():
     runner.input_batch = _DummyInputBatch()
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
-        sample=lambda logits, sampling_metadata: seen_histories.append(
-            [list(x) for x in sampling_metadata.output_token_ids]
-        )
-        or SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None),
+        sample=lambda logits, sampling_metadata: (
+            seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
+            or SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None)
+        ),
     )
     runner.sampler = lambda **_: (_ for _ in ()).throw(AssertionError("fallback sampler should not be used"))
 
@@ -470,10 +470,10 @@ def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
     runner.input_batch = _DummyInputBatch()
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
-        sample=lambda logits, sampling_metadata: seen_histories.append(
-            [list(x) for x in sampling_metadata.output_token_ids]
-        )
-        or SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None),
+        sample=lambda logits, sampling_metadata: (
+            seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
+            or SamplerOutput(sampled_token_ids=torch.tensor([[7]], dtype=torch.int32), logprobs_tensors=None)
+        ),
     )
     runner.sampler = lambda **_: (_ for _ in ()).throw(AssertionError("fallback sampler should not be used"))
 

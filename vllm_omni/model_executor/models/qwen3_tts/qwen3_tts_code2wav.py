@@ -42,6 +42,8 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._output_sample_rate: int | None = None
         self._total_upsample: int | None = None
         self._decoder_sliding_window: int | None = None
+        self._decode_chunk_frames = 300
+        self._decode_left_context_frames = 25
         self._logged_codec_stats = False
 
     @staticmethod
@@ -113,37 +115,40 @@ class Qwen3TTSCode2Wav(nn.Module):
         if hasattr(decoder, "precompute_snake_caches"):
             decoder.precompute_snake_caches()
 
+        chunk_frames = 0
+        left_frames = 0
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        extra_cfg = (
+            connector_cfg.get("extra", connector_cfg)
+            if isinstance(connector_cfg, dict)
+            else getattr(connector_cfg, "extra", None)
+        )
+        if isinstance(extra_cfg, dict):
+            chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
+            left_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
+            if getattr(model_cfg, "async_chunk", False) and chunk_frames > 0:
+                self._decode_chunk_frames = chunk_frames
+                self._decode_left_context_frames = left_frames if left_frames > 0 else 0
+
         if hasattr(decoder, "enable_cudagraph"):
             device = self._module_device(decoder)
             if device.type == "cuda":
                 try:
-                    chunk_frames = 0
-                    left_frames = 0
-
-                    model_cfg = getattr(self.vllm_config, "model_config", None)
-                    connector_cfg = getattr(model_cfg, "stage_connector_config", None)
-                    extra_cfg = (
-                        connector_cfg.get("extra", connector_cfg)
-                        if isinstance(connector_cfg, dict)
-                        else getattr(connector_cfg, "extra", None)
-                    )
-                    if isinstance(extra_cfg, dict):
-                        chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
-                        left_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
-                        if (
-                            chunk_frames > 0
-                            and left_frames > 0
-                            and self._decoder_sliding_window
-                            and left_frames < self._decoder_sliding_window
-                        ):
-                            logger.warning(
-                                "Qwen3-TTS streaming codec_left_context_frames=%d is smaller than "
-                                "decoder sliding_window=%d; chunk-boundary distortion may occur. "
-                                "Increase codec_left_context_frames to at least %d for streaming.",
-                                left_frames,
-                                self._decoder_sliding_window,
-                                self._decoder_sliding_window,
-                            )
+                    if (
+                        chunk_frames > 0
+                        and left_frames > 0
+                        and self._decoder_sliding_window
+                        and left_frames < self._decoder_sliding_window
+                    ):
+                        logger.warning(
+                            "Qwen3-TTS streaming codec_left_context_frames=%d is smaller than "
+                            "decoder sliding_window=%d; chunk-boundary distortion may occur. "
+                            "Increase codec_left_context_frames to at least %d for streaming.",
+                            left_frames,
+                            self._decoder_sliding_window,
+                            self._decoder_sliding_window,
+                        )
 
                     decoder.enable_cudagraph(
                         device=device,
@@ -297,7 +302,16 @@ class Qwen3TTSCode2Wav(nn.Module):
         wav_tensors: list[torch.Tensor] = []
         for codes_qf in valid_codes_qf:
             codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
-            wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
+            try:
+                wav = decoder.chunked_decode(
+                    codes_bqf,
+                    chunk_size=self._decode_chunk_frames,
+                    left_context_size=self._decode_left_context_frames,
+                )  # [1, 1, wav_len]
+            except TypeError:
+                # Unit-test fakes and older decoder shims may not accept the
+                # explicit chunk kwargs; production Qwen3-TTS decoders do.
+                wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
             wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
 
         audios: list[torch.Tensor] = [empty] * num_req
