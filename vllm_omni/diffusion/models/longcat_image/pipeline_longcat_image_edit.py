@@ -285,6 +285,7 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput, D
         )
 
     def _encode_prompt(self, prompt, image):
+        text_encoder_device = next(self.text_encoder.parameters()).device
         raw_vl_input = self.image_processor_vl(images=image, return_tensors="pt")
         pixel_values = raw_vl_input["pixel_values"]
         image_grid_thw = raw_vl_input["image_grid_thw"]
@@ -339,11 +340,11 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput, D
             (prefix_tokens_mask, text_tokens_and_mask.attention_mask[0], suffix_tokens_mask), dim=-1
         )
 
-        input_ids = input_ids.unsqueeze(0).to(self.device)
-        attention_mask = attention_mask.unsqueeze(0).to(self.device)
+        input_ids = input_ids.unsqueeze(0).to(text_encoder_device)
+        attention_mask = attention_mask.unsqueeze(0).to(text_encoder_device)
 
-        pixel_values = pixel_values.to(self.device)
-        image_grid_thw = image_grid_thw.to(self.device)
+        pixel_values = pixel_values.to(text_encoder_device)
+        image_grid_thw = image_grid_thw.to(text_encoder_device)
 
         text_output = self.text_encoder(
             input_ids=input_ids,
@@ -356,7 +357,7 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput, D
         # clone to have a contiguous tensor
         prompt_embeds = text_output.hidden_states[-1].detach()
         prompt_embeds = prompt_embeds[:, prefix_len:-suffix_len, :]
-        return prompt_embeds
+        return prompt_embeds.to(self.device)
 
     def encode_prompt(
         self,
