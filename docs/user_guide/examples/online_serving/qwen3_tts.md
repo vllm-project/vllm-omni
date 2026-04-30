@@ -19,12 +19,21 @@ Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/
 
 ## Gradio Demo
 
+!!! note "Gradio is an optional dependency"
+    The Gradio demo requires the `[demo]` extras. Install them first:
+
+    ```bash
+    pip install 'vllm-omni[demo]'
+    ```
+
+    Or, if installing from source: `pip install -e '.[demo]'`
+
 Two interactive Gradio demos are available, both supporting all 3 task types:
 
-| Demo | File | Transport | Streaming Quality |
-| ---- | ---- | --------- | ----------------- |
-| Standard | `gradio_demo.py` | HTTP chunked | May have small gaps between chunks |
-| FastRTC | `gradio_fastrtc_demo.py` | WebRTC | Gapless streaming (requires `pip install fastrtc`) |
+| Demo     | File                     | Transport    | Streaming Quality                                  |
+| -------- | ------------------------ | ------------ | -------------------------------------------------- |
+| Standard | `gradio_demo.py`         | HTTP chunked | May have small gaps between chunks                 |
+| FastRTC  | `gradio_fastrtc_demo.py` | WebRTC       | Gapless streaming (requires `pip install fastrtc`) |
 
 ```bash
 # Option 1: Launch server + Standard Gradio together
@@ -49,7 +58,7 @@ Then open http://localhost:7860 in your browser.
 ```bash
 # CustomVoice model (predefined speakers)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
@@ -57,7 +66,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
 
 # VoiceDesign model
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
@@ -65,7 +74,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
 
 # Base model (voice cloning)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
@@ -103,13 +112,13 @@ cd examples/online_serving/qwen3_tts
 # CustomVoice: Use predefined speaker
 python openai_speech_client.py \
     --text "你好，我是通义千问" \
-    --voice vivian \
+    --speaker vivian \
     --language Chinese
 
 # CustomVoice with style instruction
 python openai_speech_client.py \
     --text "今天天气真好" \
-    --voice ryan \
+    --speaker ryan \
     --instructions "用开心的语气说"
 
 # VoiceDesign: Describe the voice style
@@ -134,11 +143,11 @@ The Python client supports the following command-line arguments:
 - `--model` (or `-m`): Model name/path (default: `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`)
 - `--task-type` (or `-t`): TTS task type. Options: `CustomVoice`, `VoiceDesign`, `Base`
 - `--text`: Text to synthesize (required)
-- `--voice`: Speaker/voice name (default: `vivian`). Options: `vivian`, `ryan`, `aiden`, etc.
+- `--speaker`: Speaker name (default: `vivian`). Options: `vivian`, `ryan`, `aiden`, etc.
 - `--language`: Language. Options: `Auto`, `Chinese`, `English`, `Japanese`, `Korean`, `German`, `French`, `Russian`, `Portuguese`, `Spanish`, `Italian`
 - `--instructions`: Voice style/emotion instructions
-- `--ref-audio`: Reference audio file path or URL for voice cloning (Base task)
-- `--ref-text`: Reference audio transcript for voice cloning (Base task)
+- `--ref-audio`: Reference audio file path or URL for voice cloning (Base task). Local paths are automatically base64-encoded by the client before sending to the server.
+- `--ref-text`: Reference audio transcript for voice cloning (Base task).
 - `--response-format`: Audio output format (default: `wav`). Options: `wav`, `mp3`, `flac`, `pcm`, `aac`, `opus`
 - `--output` (or `-o`): Output audio file path (default: `tts_output.wav`)
 
@@ -202,14 +211,6 @@ with open("output.wav", "wb") as f:
     f.write(response.content)
 ```
 
-### FAQ
-
-If you encounter error about backend of librosa, try to install ffmpeg with command below.
-```
-sudo apt update
-sudo apt install ffmpeg
-```
-
 ## API Reference
 
 ### Voices Endpoint
@@ -228,11 +229,15 @@ List all available voices/speakers from the loaded model, including both built-i
       "consent": "user_consent_id",
       "created_at": 1738660000,
       "file_size": 1024000,
-      "mime_type": "audio/wav"
+      "mime_type": "audio/wav",
+      "ref_text": "The exact transcript of the audio sample.",
+      "speaker_description": "warm narrator"
     }
   ]
 }
 ```
+
+Fields `ref_text` and `speaker_description` are omitted per-entry when not provided at upload time.
 
 #### POST /v1/audio/voices
 
@@ -242,6 +247,8 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 - `audio_sample` (required): Audio file (max 10MB, supported formats: wav, mp3, flac, ogg, aac, webm, mp4)
 - `consent` (required): Consent recording ID
 - `name` (required): Name for the new voice
+- `ref_text` (optional): Transcript of the audio. Enables in-context voice cloning (higher quality).
+- `speaker_description` (optional): Free-form description of the voice (e.g. "warm narrator", "energetic presenter"). Stored as metadata.
 
 **Response Example:**
 ```json
@@ -252,17 +259,23 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
     "consent": "user_consent_id",
     "created_at": 1738660000,
     "mime_type": "audio/wav",
-    "file_size": 1024000
+    "file_size": 1024000,
+    "ref_text": "The exact transcript of the audio sample.",
+    "speaker_description": "warm narrator"
   }
 }
 ```
 
+Fields `ref_text` and `speaker_description` are omitted when not provided at upload time.
+
 **Usage Example:**
 ```bash
-curl -X POST http://localhost:8000/v1/audio/voices \
+curl -X POST http://localhost:8091/v1/audio/voices \
   -F "audio_sample=@/path/to/voice_sample.wav" \
   -F "consent=user_consent_id" \
-  -F "name=custom_voice_1"
+  -F "name=custom_voice_1" \
+  -F "ref_text=The exact transcript of the audio sample." \
+  -F "speaker_description=warm narrator"
 ```
 
 ### Endpoint
@@ -284,7 +297,7 @@ This endpoint follows the [OpenAI Audio Speech API](https://platform.openai.com/
     "task_type": "CustomVoice",
     "language": "Auto",
     "instructions": "Optional style instructions",
-    "ref_audio": "URL or base64 for voice cloning",
+    "ref_audio":  "HTTP URL, base64 data URL, or file:// URI for voice cloning",
     "ref_text": "Reference audio transcript",
     "x_vector_only_mode": false,
     "max_new_tokens": 2048
@@ -296,6 +309,12 @@ This endpoint follows the [OpenAI Audio Speech API](https://platform.openai.com/
 ### Response
 
 Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/wav`).
+
+### Voice and language (summary)
+
+- **Speaker**: Use the `voice` request field to select the speaker (e.g., `vivian`, `ryan`, `aiden`). List available speakers with `GET /v1/audio/voices`.
+- **Language**: Use the `language` field for the codec language tag (`Auto`, `Chinese`, `English`, etc.). Default is `Auto` for automatic detection.
+- **CustomVoice**: Requires a valid `voice` from the model’s speaker set. **VoiceDesign**: Use `instructions` to describe the voice. **Base**: Use `ref_audio` and `ref_text` for voice cloning.
 
 ## Parameters
 
@@ -311,24 +330,24 @@ Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/w
 
 ### vLLM-Omni Extension Parameters
 
-| Parameter        | Type   | Default       | Description                                                                  |
-| ---------------- | ------ | ------------- | ---------------------------------------------------------------------------- |
-| `task_type`      | string | "CustomVoice" | Task: CustomVoice, VoiceDesign, or Base                                      |
-| `language`       | string | "Auto"        | Language (see supported languages below)                                     |
-| `instructions`   | string | ""            | Voice style/emotion instructions                                             |
-| `max_new_tokens` | int    | 2048          | Maximum tokens to generate                                                   |
-| `initial_codec_chunk_frames` | int | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
-| `stream`         | bool   | false         | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`) |
+| Parameter                    | Type   | Default       | Description                                                                                                          |
+| ---------------------------- | ------ | ------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `task_type`                  | string | "CustomVoice" | Task: CustomVoice, VoiceDesign, or Base                                                                              |
+| `language`                   | string | "Auto"        | Language (see supported languages below)                                                                             |
+| `instructions`               | string | ""            | Voice style/emotion instructions                                                                                     |
+| `max_new_tokens`             | int    | 2048          | Maximum tokens to generate                                                                                           |
+| `initial_codec_chunk_frames` | int    | null          | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
+| `stream`                     | bool   | false         | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`)                                         |
 
 **Supported languages:** Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
 
 ### Voice Clone Parameters (Base task)
 
-| Parameter            | Type   | Required | Description                                  |
-| -------------------- | ------ | -------- | -------------------------------------------- |
-| `ref_audio`          | string | **Yes**  | Reference audio (URL or base64 data URL)     |
-| `ref_text`           | string | No       | Transcript of reference audio (for ICL mode) |
-| `x_vector_only_mode` | bool   | No       | Use speaker embedding only (no ICL)          |
+| Parameter            | Type   | Required | Description                                                                                     |
+| -------------------- | ------ | -------- | ----------------------------------------------------------------------------------------------- |
+| `ref_audio`          | string | **Yes**  | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`) |
+| `ref_text`           | string | No       | Transcript of reference audio (for ICL mode)                                                    |
+| `x_vector_only_mode` | bool   | No       | Use speaker embedding only (no ICL)                                                             |
 
 ## Streaming
 
@@ -351,6 +370,42 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 - `stream=true` requires `response_format="pcm"` (raw 16-bit signed PCM, 24 kHz mono).
 - `speed` adjustment is not supported when streaming.
 - Requires the server stage config to have `async_chunk: true` (default in `qwen3_tts.yaml`).
+
+## Streaming Text Input (WebSocket)
+
+The `/v1/audio/speech/stream` WebSocket endpoint accepts text incrementally, buffers and splits it at sentence boundaries, and generates audio per sentence.
+
+When `stream_audio=true`, each sentence is emitted as `audio.start`, one or more binary PCM frames, and `audio.done`.
+
+### Quick Start
+
+```bash
+python streaming_speech_client.py \
+    --text "Hello world. How are you? I am fine."
+
+python streaming_speech_client.py \
+    --text "Hello world. How are you? I am fine." \
+    --simulate-stt --stt-delay 0.1
+```
+
+### WebSocket Protocol
+
+Client -> Server:
+
+```jsonc
+{"type": "session.config", "voice": "Vivian", "task_type": "CustomVoice", "language": "Auto", "split_granularity": "sentence", "stream_audio": true, "response_format": "pcm"}
+{"type": "input.text", "text": "Hello, how are you? "}
+{"type": "input.done"}
+```
+
+Server -> Client:
+
+```jsonc
+{"type": "audio.start", "sentence_index": 0, "sentence_text": "Hello, how are you?", "format": "pcm", "sample_rate": 24000}
+// binary PCM frame(s)
+{"type": "audio.done", "sentence_index": 0, "total_bytes": 96000, "error": false}
+{"type": "session.done", "total_sentences": 1}
+```
 
 ## Limitations
 
@@ -385,6 +440,10 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 ??? abstract "run_server.sh"
     ``````sh
     --8<-- "examples/online_serving/qwen3_tts/run_server.sh"
+    ``````
+??? abstract "streaming_speech_client.py"
+    ``````py
+    --8<-- "examples/online_serving/qwen3_tts/streaming_speech_client.py"
     ``````
 ??? abstract "tts_common.py"
     ``````py

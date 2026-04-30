@@ -13,6 +13,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
 )
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
+from vllm.inputs import MultiModalDataDict
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader, maybe_remap_kv_scale_name
@@ -34,7 +35,6 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
-    MultiModalDataDict,
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
@@ -50,6 +50,7 @@ from vllm.multimodal.processing import (
     PromptUpdate,
     PromptUpdateDetails,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema
 
@@ -150,7 +151,6 @@ class MiMoLocalDecodeBuffer:
         dtype = next(model.hidden_states_downcast.parameters()).dtype
         hidden_size = model.local_config.hidden_size
 
-        self.pool = torch.cuda.graph_pool_handle()
         self.input_tensor = torch.zeros((max_batch_size, 1, hidden_size), dtype=dtype, device=device)
         self.sampler = MiMoLocalSamplerTensor(
             temperature=torch.ones(max_batch_size, dtype=torch.float32, device=device),
@@ -231,7 +231,7 @@ class MiMoLocalDecodeCudaGraph:
         cuda_graph = torch.cuda.CUDAGraph()
         if eager_run_first:
             model.base_local_forward(input_tensor, local_sampler=sampler)
-        with torch.cuda.graph(cuda_graph, buffer.pool):
+        with torch.cuda.graph(cuda_graph, pool=current_platform.get_global_graph_pool()):
             output_tensor = model.base_local_forward(input_tensor, local_sampler=sampler)
 
         return cls(
@@ -263,7 +263,6 @@ class MiMoInputLocalTransformerBuffer:
         hidden_size = model.input_local_config.hidden_size
         group_size = model.group_size
 
-        self.pool = torch.cuda.graph_pool_handle()
         self.input_tensor = torch.zeros((max_batch_size, group_size, hidden_size), dtype=dtype, device=device)
         self.lock = threading.Lock()
 
@@ -311,7 +310,7 @@ class MiMoInputLocalTransformerCudaGraph:
             out = model.input_local_transformer(inputs_embeds=input_tensor, return_dict=True, is_causal=False)
             _ = out.last_hidden_state
 
-        with torch.cuda.graph(cuda_graph, buffer.pool):
+        with torch.cuda.graph(cuda_graph, pool=current_platform.get_global_graph_pool()):
             out = model.input_local_transformer(inputs_embeds=input_tensor, return_dict=True, is_causal=False)
             output_tensor = out.last_hidden_state
 
@@ -520,13 +519,18 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
         vllm_config.model_config.hf_config = self.config
 
-        # Configure MRoPE parameters for multimodal rotary embeddings
+        # Configure MRoPE parameters for multimodal rotary embeddings.
+        # NOTE: In transformers >=5.x, `rope_scaling` is a property alias whose setter *replaces*
+        # `rope_parameters` wholesale. If we assign `rope_scaling = mrope_config` first, any
+        # pre-existing `rope_theta` key inside `rope_parameters` (standardized from the checkpoint's
+        # top-level `rope_theta`) is silently dropped, which breaks `Qwen2RotaryEmbedding`'s
+        # `compute_default_rope_parameters` (it reads `config.rope_parameters["rope_theta"]`).
+        # Update `rope_parameters` in-place instead so the standardized `rope_theta` is preserved.
         mrope_config = {
             "mrope_section": [16, 24, 24],
             "rope_type": "default",
             "type": "default",
         }
-        setattr(vllm_config.model_config.hf_config, "rope_scaling", mrope_config)
         vllm_config.model_config.hf_config.rope_parameters.update(mrope_config)
 
         self.model = init_vllm_registered_model(

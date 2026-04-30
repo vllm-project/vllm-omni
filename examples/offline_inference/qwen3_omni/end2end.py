@@ -9,7 +9,6 @@ import os
 import time
 from typing import NamedTuple
 
-import librosa
 import numpy as np
 import soundfile as sf
 import vllm
@@ -19,8 +18,10 @@ from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
+from vllm.multimodal.media.audio import load_audio
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 
 SEED = 42
@@ -129,7 +130,7 @@ def get_audio_query(question: str = None, audio_path: str | None = None, samplin
     if audio_path:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_signal, sr = load_audio(audio_path, sr=sampling_rate)
         audio_data = (audio_signal.astype(np.float32), sr)
     else:
         audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
@@ -183,7 +184,7 @@ def get_mixed_modalities_query(
     if audio_path:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_signal, sr = load_audio(audio_path, sr=sampling_rate)
         audio_data = (audio_signal.astype(np.float32), sr)
     else:
         audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
@@ -263,7 +264,7 @@ query_map = {
 
 
 def main(args):
-    model_name = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    model_name = args.model
     print("=" * 20, "\n", f"vllm version: {vllm.__version__}", "\n", "=" * 20)
 
     # Get paths from args
@@ -294,13 +295,7 @@ def main(args):
     else:
         query_result = query_func()
 
-    omni = Omni(
-        model=model_name,
-        stage_configs_path=args.stage_configs_path,
-        log_stats=args.log_stats,
-        stage_init_timeout=args.stage_init_timeout,
-        enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
-    )
+    omni = Omni.from_cli_args(args, model=model_name)
 
     thinker_sampling_params = SamplingParams(
         temperature=0.9,
@@ -333,11 +328,14 @@ def main(args):
         repetition_penalty=1.1,
     )
 
-    sampling_params_list = [
+    all_sampling_params = [
         thinker_sampling_params,
         talker_sampling_params,  # code predictor is integrated into talker for Qwen3 Omni
         code2wav_sampling_params,
     ]
+    # Match sampling params to the number of configured stages
+    num_stages = omni.num_stages
+    sampling_params_list = all_sampling_params[:num_stages]
 
     if args.txt_prompts is None:
         prompts = [query_result.inputs for _ in range(args.num_prompts)]
@@ -353,9 +351,9 @@ def main(args):
         for i, prompt in enumerate(prompts):
             prompt["modalities"] = output_modalities
 
-    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+    profiler_enabled = args.enable_profiler
     if profiler_enabled:
-        omni.start_profile(stages=[0])
+        omni.start_profile(stages=args.profiler_stages)
     omni_generator = omni.generate(prompts, sampling_params_list, py_generator=args.py_generator)
     # Determine output directory: prefer --output-dir; fallback to --output-wav
     output_dir = args.output_dir if getattr(args, "output_dir", None) else args.output_wav
@@ -405,7 +403,7 @@ def main(args):
         if profiler_enabled and processed_count >= total_requests:
             print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
             # Stop the profiler while workers are still alive
-            omni.stop_profile()
+            omni.stop_profile(stages=args.profiler_stages)
 
             print("[Info] Waiting 30s for workers to write trace files to disk...")
             time.sleep(30)
@@ -415,6 +413,12 @@ def main(args):
 
 def parse_args():
     parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        help="Model name or path.",
+    )
     parser.add_argument(
         "--query-type",
         "-q",
@@ -528,11 +532,26 @@ def parse_args():
         help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
     )
     parser.add_argument(
-        "--enable-diffusion-pipeline-profiler",
+        "--enable-profiler",
         action="store_true",
-        help="Enable diffusion pipeline profiler to display stage durations.",
+        default=False,
+        help="Enables profiling when set.",
+    )
+    parser.add_argument(
+        "--profiler-stages",
+        type=int,
+        nargs="*",
+        default=None,
+        help="List of stage IDs to profile. If not set, profiles all stages.",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="auto",
+        help="Model dtype (auto, half, float16, bfloat16, float, float32).",
     )
 
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

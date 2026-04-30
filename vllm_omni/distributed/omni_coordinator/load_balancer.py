@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import random
+import threading
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, TypedDict
@@ -26,11 +27,16 @@ class Task(TypedDict, total=False):
 class LoadBalancingPolicy(str, Enum):
     """Enumeration for load balancing policies.
 
-    Only ``RANDOM`` is implemented. Additional policies (e.g. round-robin,
-    least-connections) can be added in the future.
+    These policies are used by :class:`LoadBalancer` implementations to route
+    tasks to a subset of available instances.
+
+    TODO(NumberWan): Map enum values to balancer classes when OmniCoordinator
+    integration lands. Tracked in https://github.com/vllm-project/vllm-omni/pull/2448
     """
 
     RANDOM = "random"
+    ROUND_ROBIN = "round-robin"
+    LEAST_QUEUE_LENGTH = "least-queue-length"
 
 
 class LoadBalancer(ABC):
@@ -61,10 +67,10 @@ class LoadBalancer(ABC):
 class RandomBalancer(LoadBalancer):
     """Load balancer that selects an instance uniformly at random.
 
-    This is the initial and only policy supported. It intentionally ignores
-    the task payload and chooses a random index from the provided instance
-    list. More sophisticated policies (e.g. round-robin, least-connections)
-    can be implemented as additional subclasses of :class:`LoadBalancer`.
+    It intentionally ignores the task payload and chooses a random index from
+    the provided instance list. More sophisticated policies (e.g. round-robin,
+    least-queue-length) can be implemented as additional subclasses of
+    :class:`LoadBalancer`.
     """
 
     def select(self, task: Task, instances: list[InstanceInfo]) -> int:  # noqa: ARG002
@@ -74,9 +80,69 @@ class RandomBalancer(LoadBalancer):
         return random.randrange(len(instances))
 
 
+class RoundRobinBalancer(LoadBalancer):
+    """Load balancer that selects instances in a round-robin fashion.
+
+    This implementation keeps a running index modulo ``len(instances)``. It
+    therefore depends on the **order and stable meaning** of the ``instances``
+    list between calls. If the list length or ordering changes, the sequence
+    of picks may skip or repeat entries relative to a fixed set of backends.
+
+    When instance membership changes dynamically, callers should reset routing
+    state—for example by constructing a new ``RoundRobinBalancer`` or resetting
+    ``_next_index``—similar to rebuilding ``itertools.cycle`` after mutating
+    the instance list (as in vLLM's disaggregated proxy examples).
+
+    Concurrency: ``select`` is synchronous and is expected to run on the
+    coordinator asyncio event loop thread without ``await`` inside this
+    method, so a single invocation is not interleaved with another on that
+    thread. A :class:`threading.Lock` still serializes updates to
+    ``_next_index`` for callers that might invoke ``select`` from multiple
+    threads or alongside threaded infrastructure (e.g. ZMQ receive threads).
+    """
+
+    def __init__(self, start_index: int = 0) -> None:
+        self._next_index = start_index
+        self._lock = threading.Lock()
+
+    def select(self, task: Task, instances: list[InstanceInfo]) -> int:  # noqa: ARG002
+        if not instances:
+            raise ValueError("instances must not be empty")
+
+        n = len(instances)
+        with self._lock:
+            idx = self._next_index % n
+            self._next_index = (self._next_index + 1) % n
+        return idx
+
+
+class LeastQueueLengthBalancer(LoadBalancer):
+    """Select the instance with the smallest ``queue_length``.
+
+    If multiple instances share the same minimum queue length, one of them is
+    chosen uniformly at random.
+
+    Raises:
+        ValueError: If any instance has a negative ``queue_length``.
+    """
+
+    def select(self, task: Task, instances: list[InstanceInfo]) -> int:  # noqa: ARG002
+        if not instances:
+            raise ValueError("instances must not be empty")
+
+        queue_lengths = [inst.queue_length for inst in instances]
+        if any(q < 0 for q in queue_lengths):
+            raise ValueError("queue_length must be non-negative for all instances")
+        min_q = min(queue_lengths)
+        candidates = [i for i, q in enumerate(queue_lengths) if q == min_q]
+        return random.choice(candidates)
+
+
 __all__ = [
     "Task",
     "LoadBalancingPolicy",
     "LoadBalancer",
     "RandomBalancer",
+    "RoundRobinBalancer",
+    "LeastQueueLengthBalancer",
 ]

@@ -11,15 +11,6 @@ set -o pipefail
 export PYTHONPATH=".."
 
 # Print ROCm version
-echo "--- Confirming Clean Initial State"
-while true; do
-        sleep 3
-        if grep -q clean /opt/amdgpu/etc/gpu_state; then
-                echo "GPUs state is \"clean\""
-                break
-        fi
-done
-
 echo "--- ROCm info"
 rocminfo
 
@@ -51,28 +42,24 @@ cleanup_docker() {
 # Call the cleanup docker function
 cleanup_docker
 
-echo "--- Resetting GPUs"
-
-echo "reset" > /opt/amdgpu/etc/gpu_state
-
-while true; do
-        sleep 3
-        if grep -q clean /opt/amdgpu/etc/gpu_state; then
-                echo "GPUs state is \"clean\""
-                break
-        fi
-done
-
 echo "--- Pulling container"
-image_name="public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:${BUILDKITE_COMMIT}-rocm-omni"
+## Temporary change to use AMD Docker Hub to store the vllm-omni image
+# to bypass the rate limit issue with ECR Public Gallery.
+# Images are now stored in a separate repository for vllm-omni, instead of vllm-ci.
+# TODO: @tjtanaa point back to ECR Public Gallery
+# once the amd agents are configured to use ECR Public Gallery.
+# image_name="public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:${BUILDKITE_COMMIT}-rocm-omni"
+image_name="rocm/vllm-omni:${BUILDKITE_COMMIT}"
 container_name="rocm_${BUILDKITE_COMMIT}_$(tr -dc A-Za-z0-9 < /dev/urandom | head -c 10; echo)"
 
-# Install AWS CLI to authenticate to ECR Public Gallery to get higher rate limit for pulling images
-sudo apt-get update && sudo apt-get install -y awscli
-# Use safe docker login helper to prevent race conditions
-source "$(dirname "${BASH_SOURCE[0]}")/../docker_login_ecr_public.sh"
-safe_docker_login_ecr_public
-# Pull the container from ECR Public Gallery
+# TODO: @tjtanaa uncomment this once the amd agents are configured to use ECR Public Gallery.
+# # Install AWS CLI to authenticate to ECR Public Gallery to get higher rate limit for pulling images
+# sudo apt-get update && sudo apt-get install -y awscli
+##  Use safe docker login helper to prevent race conditions
+# source "$(dirname "${BASH_SOURCE[0]}")/../docker_login_ecr_public.sh"
+# safe_docker_login_ecr_public
+
+## Pull the container from AMD Docker Hub
 
 docker pull "${image_name}"
 
@@ -126,8 +113,6 @@ if [[ $commands == *"--shard-id="* ]]; then
         -e VLLM_ROCM_USE_AITER=0 \
         -e HIP_VISIBLE_DEVICES="${GPU}" \
         -e HF_TOKEN \
-        -e AWS_ACCESS_KEY_ID \
-        -e AWS_SECRET_ACCESS_KEY \
         -v "${HF_CACHE}:${HF_MOUNT}" \
         -e "HF_HOME=${HF_MOUNT}" \
         -e "PYTHONPATH=${MYPYTHONPATH}" \
@@ -160,8 +145,6 @@ else
           -e MIOPEN_DEBUG_CONV_GEMM=0 \
           -e VLLM_ROCM_USE_AITER=0 \
           -e HF_TOKEN \
-          -e AWS_ACCESS_KEY_ID \
-          -e AWS_SECRET_ACCESS_KEY \
           -v "${HF_CACHE}:${HF_MOUNT}" \
           -e "HF_HOME=${HF_MOUNT}" \
           -e "PYTHONPATH=${MYPYTHONPATH}" \

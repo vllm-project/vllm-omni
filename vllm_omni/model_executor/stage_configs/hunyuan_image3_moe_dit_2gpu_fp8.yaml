@@ -1,0 +1,32 @@
+# Stage config for running Hunyuan-Image3.0 DiT with FP8 online quantization.
+# The following config is for 2x H200 GPU.
+
+# Stage 0:  Diffusion (DiT + VAE)
+# This stage receives noise and timesteps and performs denoising + VAE decode
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    runtime:
+      devices: "0,1"
+      max_batch_size: 1
+    engine_args:
+      model_stage: dit
+      enforce_eager: true
+      trust_remote_code: true
+      distributed_executor_backend: "mp"
+      quantization: "fp8"
+      parallel_config:
+        tensor_parallel_size: 2
+        enable_expert_parallel: true
+      omni_kv_config:
+        need_recv_cache: true
+
+    final_output: true
+    final_output_type: image
+    is_comprehension: false
+    default_sampling_params:
+      seed: 42
+
+# Runtime edges
+runtime:
+  enabled: true

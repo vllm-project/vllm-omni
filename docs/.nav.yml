@@ -6,9 +6,12 @@ nav:
     - getting_started/installation/*
   - Serving:
     - OpenAI-Compatible API:
+      - Diffusion Chat API: serving/diffusion_chat_api.md
       - Image Generation: serving/image_generation_api.md
       - Image Edit: serving/image_edit_api.md
       - Text to Speech: serving/speech_api.md
+      - Audio Generation: serving/audio_generate_api.md
+      - Streaming Video Input: serving/video_stream_api.md
   - Examples:
     - examples/README.md
     - Offline Inference:
@@ -20,6 +23,7 @@ nav:
       - HunyuanImage-3.0 Image-to-Text Inference: user_guide/examples/offline_inference/hunyuan_image3.md
       - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
+      - InternVLA-A1: user_guide/examples/offline_inference/internvla_a1.md
       - MammothModa2-Preview: user_guide/examples/offline_inference/mammothmodal2_preview.md
       - MiMo-Audio Offline Inference: user_guide/examples/offline_inference/mimo_audio.md
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
@@ -28,10 +32,12 @@ nav:
       - Text-To-Audio: user_guide/examples/offline_inference/text_to_audio.md
       - Text-To-Image: user_guide/examples/offline_inference/text_to_image.md
       - Text-To-Video: user_guide/examples/offline_inference/text_to_video.md
+      - Voxtral TTS Offline Inference: user_guide/examples/offline_inference/voxtral_tts.md
       - X-To-Video-Audio: user_guide/examples/offline_inference/x_to_video_audio.md
     - Online Serving:
       - BAGEL-7B-MoT: user_guide/examples/online_serving/bagel.md
       - vLLM-Omni Helm Chart: user_guide/examples/online_serving/chart-helm.md
+      - Diffusers Backend Adapter Example: user_guide/examples/online_serving/diffusers_pipeline_adapter.md
       - Fish Speech S2 Pro: user_guide/examples/online_serving/fish_speech.md
       - GLM-Image Online Serving: user_guide/examples/online_serving/glm_image.md
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
@@ -52,25 +58,37 @@ nav:
   - Features:
     - Sleep Mode: features/sleep_mode.md
     - Diffusion Features:
-      - Acceleration Overview: user_guide/diffusion_acceleration.md
-      - TeaCache: user_guide/diffusion/teacache.md
-      - Cache-DiT: user_guide/diffusion/cache_dit_acceleration.md
-      - Quantization:
-        - Overview: user_guide/diffusion/quantization/overview.md
-        - FP8: user_guide/diffusion/quantization/fp8.md
-        - Int8: user_guide/diffusion/quantization/int8.md
-        - GGUF: user_guide/diffusion/quantization/gguf.md
-      - Step Execution: user_guide/diffusion/step_execution.md
-      - Parallelism Acceleration: user_guide/diffusion/parallelism_acceleration.md
+      - Overview: user_guide/diffusion_features.md
+      - Feature Compatibility: user_guide/feature_compatibility.md
+      - Cache Acceleration:
+        - TeaCache: user_guide/diffusion/cache_acceleration/teacache.md
+        - Cache-DiT: user_guide/diffusion/cache_acceleration/cache_dit.md
+      - Attention Backends: user_guide/diffusion/attention_backends.md
+      - Frame Interpolation: user_guide/diffusion/frame_interpolation.md
+      - Parallelism:
+        - Overview: user_guide/diffusion/parallelism/overview.md
+        - CFG Parallel: user_guide/diffusion/parallelism/cfg_parallel.md
+        - Expert Parallel: user_guide/diffusion/parallelism/expert_parallel.md
+        - Hybrid Sharded Data Parallel: user_guide/diffusion/parallelism/hsdp.md
+        - Sequence Parallel: user_guide/diffusion/parallelism/sequence_parallel.md
+        - Tensor Parallel: user_guide/diffusion/parallelism/tensor_parallel.md
+        - VAE Patch Parallel: user_guide/diffusion/parallelism/vae_patch_parallel.md
       - CPU Offloading: user_guide/diffusion/cpu_offload_diffusion.md
       - LoRA: user_guide/diffusion/lora.md
-      - Hybrid Sharded Data Parallel: design/feature/hsdp.md
       - Custom Pipeline: features/custom_pipeline.md
+      - Step Execution: user_guide/diffusion/step_execution.md
+    - Quantization:
+      - Overview: user_guide/quantization/overview.md
+      - Online Quantization: user_guide/quantization/online.md
+      - FP8 W8A8: user_guide/quantization/fp8.md
+      - Int8 W8A8: user_guide/quantization/int8.md
+      - GGUF: user_guide/quantization/gguf.md
+      - AutoRound: user_guide/quantization/autoround.md
+      - msModelSlim: user_guide/quantization/msmodelslim.md
     - ComfyUI: features/comfyui.md
 - Developer Guide:
   - General:
     - contributing/README.md
-    - pr_reviewer.md
     - glob: contributing/*
       flatten_single_child_sections: true
   - Model Implementation:
@@ -86,12 +104,16 @@ nav:
       - design/feature/disaggregated_inference.md
       - design/feature/ray_based_execution.md
       - design/feature/omni_connectors/
+      - design/feature/prefix_caching.md
       - design/feature/cfg_parallel.md
+      - design/feature/expert_parallel.md
       - design/feature/sequence_parallel.md
       - design/feature/tensor_parallel.md
+      - design/feature/vae_parallel.md
+      - design/feature/hsdp.md
       - design/feature/cache_dit.md
       - design/feature/teacache.md
-      - design/feature/async_chunk_design.md
+      - design/feature/async_chunk.md
       - design/feature/vae_parallel.md
       - design/feature/diffusion_step_execution.md
     - Module Design:

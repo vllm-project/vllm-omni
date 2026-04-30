@@ -182,7 +182,9 @@ def apply_mooncake_connector_patch() -> bool:
     PatchedClass = _create_patched_mooncake_connector()
 
     _mc_module.MooncakeConnector = PatchedClass
-    for _, module in sys.modules.items():
+    # Snapshot sys.modules: hasattr() may trigger lazy submodule imports that
+    # mutate sys.modules during iteration.
+    for _, module in list(sys.modules.items()):
         if hasattr(module, "MooncakeConnector") and module.MooncakeConnector is _OriginalClass:
             module.MooncakeConnector = PatchedClass
 

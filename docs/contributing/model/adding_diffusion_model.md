@@ -653,25 +653,7 @@ For a fair comparison, keep the same **prompt**, **seed**, **resolution**, **num
 
 To ensure project maintainability and sustainable development, please submit test code (unit tests, system tests, or end-to-end tests) alongside their code changes.
 
-For comprehensive testing guidelines and the definition of test levels (L1-L5), please refer to the [Test File Structure and Style Guide](../ci/tests_style.md).
-The following tests are required to add:
-
-- L4 test of the model's full *functionality* (i.e., all the *diffusion features* that are supported by this model), including several [parallelism acceleration methods](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/parallelism_acceleration/), [CPU offloading](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cpu_offload_diffusion/), [TeaCache](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/teacache/) and [Cache-DiT](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cache_dit_acceleration/) cache backends, [quantization methods](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/quantization/overview/).
-  - Test cases: Currently all the features are available in online serving mode. Hence, only need to add `tests/e2e/online_serving/test_{model}_expansion.py`. The following test cases shall cover all features:
-    - 1 GPU: TeaCache & GGUF (or fallback to FP8, or disable it) & Layer-wise CPU offloading (or fallback to Module-wise)
-    - 2 GPUs: Cache-DiT & FP8 (or fallback to GGUF, or disable it) & Ulysses = 2
-    - 2 GPUs: Cache-DiT & GGUF (or fallback to FP8, or disable it) & Ring = 2
-    - 2 GPUs: TeaCache & FP8 (or fallback to GGUF, or disable it) & CFG Parallel = 2
-    - 2 GPUs: Cache-DiT & FP8 (or fallback to GGUF, or disable it) & Tensor Parallel = 2 & VAE Patch Parallel = 2
-    - 2 GPUs: Cache-DiT & GGUF (or fallback to FP8, or disable it) & HSDP = 2 & VAE Patch Parallel = 2
-  - Validation: test that the multimodal output files of your model have the correct shapes.
-  - Test marks: always add `advanced_model` and `diffusion`. Add `parallel` and GPU-related marks if needed. Ref: [Markers for Tests](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/ci/tests_markers/)
-  - To maximize code reuse, you may refer to
-    - `tests/conftest.py` for `omni_server` and `openai_client` fixtures, `generate_synthetic_image` and `assert_XXX_valid` helper.
-    - `tests/utils.py` for `@hardware_test(...)` and `hardware_marks`.
-    - [Parametrizing tests (pytest doc)](https://docs.pytest.org/en/stable/example/parametrize.html) to reuse test function implementation for different cases.
-  - Doc: add a concise dostring for each test function.
-  - Reference L4 test implementation: [tests/e2e/online_serving/test_qwen_image_edit_expansion.py](https://github.com/vllm-project/vllm-omni/blob/main/tests/e2e/online_serving/test_qwen_image_edit_expansion.py).
+For comprehensive testing guidelines and the definition of test levels (L1-L5), please refer to the [Multi-Level Automated Testing System Documentation](../ci/CI_5levels.md). You are at least required to add an L4 *functionality* test described in that document.
 
 ---
 
@@ -820,7 +802,7 @@ omni = Omni(model="your-model", enable_layerwise_offload=True)
 
 ```python
 class WanTransformer3DModel(nn.Module):
-    _layerwise_offload_blocks_attr = "blocks"  # Attribute name containing transformer blocks
+    _layerwise_offload_blocks_attrs = ["blocks"]  # Attribute name containing transformer blocks
 
     def __init__(self):
         self.blocks = nn.ModuleList([...])  # Transformer blocks
@@ -831,16 +813,16 @@ class WanTransformer3DModel(nn.Module):
 
 ---
 
-### Diffusion Timing (Performance Profiling)
+### Diffusion Pipeline Profiler (Performance Profiling)
 When adapting a new diffusion model, it is often useful to analyze the latency of key components such as text encoding, diffusion denoising, and VAE decoding.
 vLLM-Omni provides a timing utility via `DiffusionPipelineProfilerMixin` to help developers quickly identify performance bottlenecks.
 
 !!! info
-      `DiffusionPipelineProfilerMixin` is different from using `torch.profiler` for diffusion models, as introduced in this [tutorial](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/profiling.md#3-profiling-diffusion-models). `DiffusionPipelineProfilerMixin` only prints the timing information of multiple functions (such as `vae.decode`), while `torch.profiler` saves detailed GPU/CPU computation time, call/execution steps.
+      `DiffusionPipelineProfilerMixin` is different from using `torch.profiler` for diffusion models, as introduced in this [tutorial](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/profiling.md). `DiffusionPipelineProfilerMixin` only prints the timing information of multiple functions (such as `vae.decode`), while `torch.profiler` saves detailed GPU/CPU computation time, call/execution steps.
 
 This tool automatically measures the execution time of selected pipeline modules and prints the results in the logs.
 
-**Enabling Diffusion Timing**
+**Enabling Diffusion Pipeline Profiler**
 
 
 Enable timing by setting:
@@ -861,7 +843,7 @@ If not specified, the default targets are used:
 **Adding DiffusionPipelineProfilerMixin to a Pipeline**
 To enable timing support in your pipeline, inherit from DiffusionPipelineProfilerMixin.
 ```python
-from vllm_omni.diffusion.utils.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.profiler import DiffusionPipelineProfilerMixin
 
 class YourModelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     # Optional: Specify custom timing targets
@@ -880,7 +862,9 @@ class YourModelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         ...
 
         # initialize timing profiler
-        self.setup_diffusion_pipeline_profiler(enable_diffusion_pipeline_profiler)
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 ```
 The mixin dynamically wraps selected methods and records their execution time during inference.
 
@@ -924,9 +908,9 @@ tokenizer.forward
 
 When enabled, timing logs appear like this:
 ```
-[DiffusionTiming] text_encoder.forward took 0.018s
-[DiffusionTiming] diffuse took 2.412s
-[DiffusionTiming] vae.decode took 0.063s
+[DiffusionPipelineProfiler] text_encoder.forward took 0.018s
+[DiffusionPipelineProfiler] diffuse took 2.412s
+[DiffusionPipelineProfiler] vae.decode took 0.063s
 ```
 These measurements help identify bottlenecks during model adaptation and optimization
 

@@ -25,8 +25,12 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+)
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -68,16 +72,27 @@ def patchify(imgs, p):
 
 
 class MLPconnector(nn.Module):
-    def __init__(self, input_dim, output_dim, activation="gelu_pytorch_tanh"):
+    def __init__(
+        self,
+        input_dim,
+        output_dim,
+        activation="gelu_pytorch_tanh",
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         super().__init__()
-        self.fc1 = ColumnParallelLinear(input_dim, output_dim, bias=True, gather_output=False)
+        self.fc1 = ColumnParallelLinear(
+            input_dim, output_dim, bias=True, gather_output=False, quant_config=quant_config, prefix=f"{prefix}.fc1"
+        )
         if activation == "gelu":
             self.act = nn.GELU()
         elif activation == "gelu_pytorch_tanh":
             self.act = nn.GELU(approximate="tanh")
         else:
             self.act = nn.ReLU()
-        self.fc2 = RowParallelLinear(output_dim, output_dim, bias=True, input_is_parallel=True)
+        self.fc2 = RowParallelLinear(
+            output_dim, output_dim, bias=True, input_is_parallel=True, quant_config=quant_config, prefix=f"{prefix}.fc2"
+        )
 
     def forward(self, x):
         x_parallel, _ = self.fc1(x)
@@ -99,17 +114,32 @@ class BagelRotaryEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        if config.rope_scaling is not None:
-            # Delegate to HF's rope-scaling helpers for non-default types.
+        # transformers>=5.0 stores rope params under ``rope_parameters`` and
+        # always populates ``rope_scaling`` (even for the default type), so we
+        # infer ``rope_type`` from either and fall back to "default".
+        rope_scaling = getattr(config, "rope_scaling", None) or {}
+        rope_parameters = getattr(config, "rope_parameters", None) or {}
+        rope_type = (
+            rope_scaling.get("rope_type") or rope_scaling.get("type") or rope_parameters.get("rope_type") or "default"
+        )
+
+        if rope_type == "default":
+            # transformers>=5.0 removed the 'default' entry from
+            # ROPE_INIT_FUNCTIONS; use the plain sinusoidal formula.
+            rope_theta = (
+                getattr(config, "rope_theta", None)
+                or rope_parameters.get("rope_theta")
+                or rope_scaling.get("rope_theta")
+                or 10000.0
+            )
+            dim = config.hidden_size // config.num_attention_heads
+            inv_freq = 1.0 / (rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+            self.attention_scaling = 1.0
+        else:
             from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-            rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type", "default"))
             rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
             inv_freq, self.attention_scaling = rope_init_fn(config, device=None)
-        else:
-            dim = config.hidden_size // config.num_attention_heads
-            inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-            self.attention_scaling = 1.0
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -139,33 +169,32 @@ class BagelMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str = "silu",
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
-        self.gate_proj = ColumnParallelLinear(
+        self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
-            intermediate_size,
+            [intermediate_size, intermediate_size],
             bias=False,
-            gather_output=False,
-        )
-        self.up_proj = ColumnParallelLinear(
-            hidden_size,
-            intermediate_size,
-            bias=False,
-            gather_output=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             input_is_parallel=True,
             bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported.")
         self.act_fn = nn.SiLU()
 
     def forward(self, x):
-        gate, _ = self.gate_proj(x)
-        up, _ = self.up_proj(x)
+        gate_up, _ = self.gate_up_proj(x)
+        gate, up = gate_up.chunk(2, dim=-1)
         x = self.act_fn(gate) * up
         x, _ = self.down_proj(x)
         return x
@@ -273,7 +302,14 @@ class PackedAttentionMoT(nn.Module):
       - qkv_proj_moe_gen : stacks q_proj_moe_gen + k_proj_moe_gen + v_proj_moe_gen (gen vae)
     """
 
-    def __init__(self, config, layer_idx: int | None = None, parallel_config: DiffusionParallelConfig | None = None):
+    def __init__(
+        self,
+        config,
+        layer_idx: int | None = None,
+        parallel_config: DiffusionParallelConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
@@ -300,11 +336,15 @@ class PackedAttentionMoT(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj",
         )
 
         # Generation mode MoE projections (stacked q/k/v)
@@ -314,11 +354,15 @@ class PackedAttentionMoT(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=True,
+            quant_config=quant_config,
+            prefix=f"{prefix}.qkv_proj_moe_gen",
         )
         self.o_proj_moe_gen = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.o_proj_moe_gen",
         )
 
         # QK normalization
@@ -607,14 +651,30 @@ class Qwen2MoTDecoderLayer(nn.Module):
         layer_idx: int | None = None,
         attn_module: type[nn.Module] | None = PackedAttentionMoT,
         parallel_config: DiffusionParallelConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = attn_module(config, layer_idx, parallel_config=parallel_config)
+        self.self_attn = attn_module(
+            config, layer_idx, parallel_config=parallel_config, quant_config=quant_config, prefix=f"{prefix}.self_attn"
+        )
 
-        self.mlp = BagelMLP(config.hidden_size, config.intermediate_size, config.hidden_act)
-        self.mlp_moe_gen = BagelMLP(config.hidden_size, config.intermediate_size, config.hidden_act)
+        self.mlp = BagelMLP(
+            config.hidden_size,
+            config.intermediate_size,
+            config.hidden_act,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
+        self.mlp_moe_gen = BagelMLP(
+            config.hidden_size,
+            config.intermediate_size,
+            config.hidden_act,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp_moe_gen",
+        )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm_moe_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -693,7 +753,15 @@ class Qwen2MoTDecoderLayer(nn.Module):
 
 
 class Qwen2MoTModel(Qwen2PreTrainedModel):
-    def __init__(self, config, parallel_config: DiffusionParallelConfig | None = None):
+    _layerwise_offload_blocks_attrs = ["layers"]
+
+    def __init__(
+        self,
+        config,
+        parallel_config: DiffusionParallelConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -702,7 +770,14 @@ class Qwen2MoTModel(Qwen2PreTrainedModel):
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [
-                Qwen2MoTDecoderLayer(config, layer_idx, attn_module=PackedAttentionMoT, parallel_config=parallel_config)
+                Qwen2MoTDecoderLayer(
+                    config,
+                    layer_idx,
+                    attn_module=PackedAttentionMoT,
+                    parallel_config=parallel_config,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.layers.{layer_idx}",
+                )
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -784,10 +859,19 @@ class Qwen2MoTModel(Qwen2PreTrainedModel):
 class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config, parallel_config: DiffusionParallelConfig | None = None):
+    def __init__(
+        self,
+        config,
+        parallel_config: DiffusionParallelConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         super().__init__(config)
-        self.model = Qwen2MoTModel(config, parallel_config=parallel_config)
+        self.model = Qwen2MoTModel(
+            config, parallel_config=parallel_config, quant_config=quant_config, prefix=f"{prefix}.model"
+        )
         self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -797,6 +881,12 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
 
     def set_decoder(self, decoder):
         self.model = decoder
@@ -855,27 +945,38 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
+            # MLP gate/up projections — fused into MergedColumnParallelLinear.
+            # HF checkpoints store separate gate_proj / up_proj weights;
+            # these entries remap them to the fused gate_up_proj parameter.
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
         ]
+        self.stacked_params_mapping = stacked_params_mapping
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            loaded = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict.get(name)
+                stacked_name = name.replace(weight_name, param_name)
+                param = params_dict.get(stacked_name)
                 if param is None:
                     break
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
+                name = stacked_name
+                loaded = True
                 break
-            else:
+
+            if not loaded:
                 param = params_dict.get(name)
                 if param is None:
                     continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
             loaded_params.add(name)
 
         return loaded_params
@@ -1001,6 +1102,8 @@ class Bagel(nn.Module):
         vit_model,
         config: BagelConfig,
         parallel_config: DiffusionParallelConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.language_model = language_model
@@ -1026,7 +1129,13 @@ class Bagel(nn.Module):
             self.vit_patch_size = config.vit_config.patch_size
             self.vit_max_num_patch_per_side = config.vit_max_num_patch_per_side
             self.vit_hidden_size = config.vit_config.hidden_size
-            self.connector = MLPconnector(self.vit_hidden_size, self.hidden_size, config.connector_act)
+            self.connector = MLPconnector(
+                self.vit_hidden_size,
+                self.hidden_size,
+                config.connector_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.connector",
+            )
             self.vit_pos_embed = PositionEmbedding(self.vit_max_num_patch_per_side, self.hidden_size)
 
         self.get_flattened_position_ids = get_flattened_position_ids_extrapolate
@@ -1122,7 +1231,7 @@ class Bagel(nn.Module):
             packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
             curr += curr_kvlen
 
-            text_ids = tokenizer.encode(prompt)
+            text_ids = tokenizer.encode(prompt, add_special_tokens=False)
             text_ids = [new_token_ids["bos_token_id"]] + text_ids + [new_token_ids["eos_token_id"]]
             text_token_lens.append(len(text_ids))
             packed_text_ids.extend(text_ids)
@@ -1534,9 +1643,109 @@ class Bagel(nn.Module):
         num_layers = len(caches[0].key_cache)
         merged = NaiveCache(num_layers)
         for layer_idx in range(num_layers):
-            merged.key_cache[layer_idx] = torch.cat([c.key_cache[layer_idx] for c in caches], dim=0)
-            merged.value_cache[layer_idx] = torch.cat([c.value_cache[layer_idx] for c in caches], dim=0)
+            key_parts = [c.key_cache[layer_idx] for c in caches if c.key_cache[layer_idx] is not None]
+            val_parts = [c.value_cache[layer_idx] for c in caches if c.value_cache[layer_idx] is not None]
+            merged.key_cache[layer_idx] = torch.cat(key_parts, dim=0) if key_parts else None
+            merged.value_cache[layer_idx] = torch.cat(val_parts, dim=0) if val_parts else None
         return merged
+
+    def prepare_start_tokens(self, curr_kvlens, curr_rope, new_token_ids):
+        """Prepare start tokens for autoregressive text generation.
+
+        Ported from the original BAGEL ``Bagel.prepare_start_tokens``.
+        """
+        packed_start_tokens, packed_key_value_indexes = list(), list()
+        packed_query_position_ids = list()
+
+        curr = 0
+        for curr_kvlen, curr_position_id in zip(curr_kvlens, curr_rope):
+            packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+            packed_start_tokens.append(new_token_ids["bos_token_id"])
+            packed_query_position_ids.append(curr_position_id)
+            curr += curr_kvlen
+
+        generation_input = {
+            "packed_start_tokens": torch.tensor(packed_start_tokens, dtype=torch.long),
+            "packed_query_position_ids": torch.tensor(packed_query_position_ids, dtype=torch.long),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+        }
+        return generation_input
+
+    @torch.no_grad()
+    def generate_text(
+        self,
+        past_key_values: NaiveCache,
+        packed_key_value_indexes: torch.LongTensor,
+        key_values_lens: torch.IntTensor,
+        packed_start_tokens: torch.LongTensor,
+        packed_query_position_ids: torch.LongTensor,
+        max_length: int,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        end_token_id: int | None = None,
+    ):
+        """Autoregressive text generation (ported from original BAGEL).
+
+        Decodes tokens one at a time, appending to ``past_key_values``
+        until ``max_length`` is reached or ``end_token_id`` is generated.
+        """
+        step = 0
+        generated_sequence = []
+        curr_tokens = packed_start_tokens
+        while step < max_length:
+            generated_sequence.append(curr_tokens)
+            packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
+            query_lens = torch.ones_like(curr_tokens)
+            packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
+                0,
+                len(key_values_lens),
+                device=key_values_lens.device,
+                dtype=key_values_lens.dtype,
+            )
+
+            uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
+            for i in range(len(uppacked)):
+                uppacked[i] += i
+            packed_key_value_indexes = torch.cat(uppacked, dim=0)
+
+            output = self.language_model(
+                packed_query_sequence=packed_text_embedding,
+                query_lens=query_lens,
+                packed_query_position_ids=packed_query_position_ids,
+                packed_query_indexes=packed_query_indexes,
+                past_key_values=past_key_values,
+                key_values_lens=key_values_lens,
+                packed_key_value_indexes=packed_key_value_indexes,
+                update_past_key_values=True,
+                is_causal=True,
+                mode="und",
+            )
+            past_key_values = output.past_key_values
+            packed_query_sequence = output.packed_query_sequence
+            pred_logits = self.language_model.lm_head(packed_query_sequence)
+
+            if do_sample:
+                probs = nn.functional.softmax(pred_logits / temperature, dim=-1)
+                curr_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                curr_tokens = torch.argmax(pred_logits, dim=-1)
+
+            uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
+            for i in range(len(uppacked)):
+                uppacked[i] = torch.cat(
+                    [uppacked[i], torch.tensor([uppacked[i][-1] + 1], device=uppacked[i].device)], dim=0
+                )
+            packed_key_value_indexes = torch.cat(uppacked, dim=0)
+            key_values_lens = key_values_lens + 1
+            packed_query_position_ids = packed_query_position_ids + 1
+            step += 1
+
+            if end_token_id is not None and curr_tokens[0] == end_token_id:
+                break
+
+        output_device = generated_sequence[0].device
+        return torch.stack([i.to(output_device) for i in generated_sequence], dim=0)
 
     def generate_image(
         self,
@@ -1570,6 +1779,9 @@ class Bagel(nn.Module):
         cfg_img_past_key_values: NaiveCache | None = None,
         cfg_img_key_values_lens: torch.IntTensor | None = None,
         cfg_img_packed_key_value_indexes: torch.LongTensor | None = None,
+        return_trajectory_latents: bool = False,
+        scheduler: object | None = None,
+        scheduler_kwargs: dict | None = None,
     ):
         x_t = packed_init_noises
 
@@ -1577,6 +1789,14 @@ class Bagel(nn.Module):
         timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
         dts = timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]
+
+        # Optional trajectory recording for RL rollout data collection
+        trajectory_latents: list[torch.Tensor] | None = [] if return_trajectory_latents else None
+        trajectory_timesteps: list[torch.Tensor] | None = [] if return_trajectory_latents else None
+        trajectory_log_probs: list[torch.Tensor] | None = (
+            [] if (return_trajectory_latents and scheduler is not None) else None
+        )
+        _sched_kw = scheduler_kwargs or {}
 
         use_cfg_text = cfg_text_scale > 1.0
         use_cfg_img = cfg_img_scale > 1.0
@@ -1614,6 +1834,9 @@ class Bagel(nn.Module):
                 cfg_img_past_key_values=cfg_img_past_key_values,
                 cfg_img_key_values_lens=cfg_img_key_values_lens,
                 cfg_img_packed_key_value_indexes=cfg_img_packed_key_value_indexes,
+                return_trajectory_latents=return_trajectory_latents,
+                scheduler=scheduler,
+                scheduler_kwargs=scheduler_kwargs,
             )
 
         # ── SP + CFG: sequential single-branch forwards ──
@@ -1635,7 +1858,7 @@ class Bagel(nn.Module):
                     packed_seqlens=packed_seqlens,
                 )
 
-                v_t = self._forward_flow_single_branch(
+                v_t = self.forward_single_branch(
                     **common,
                     packed_indexes=packed_indexes,
                     packed_position_ids=packed_position_ids,
@@ -1645,7 +1868,7 @@ class Bagel(nn.Module):
                 )
 
                 if cfg_text_scale_ > 1.0:
-                    cfg_text_v_t = self._forward_flow_single_branch(
+                    cfg_text_v_t = self.forward_single_branch(
                         **common,
                         packed_indexes=cfg_text_packed_query_indexes,
                         packed_position_ids=cfg_text_packed_position_ids,
@@ -1655,7 +1878,7 @@ class Bagel(nn.Module):
                     )
                     cfg_img_v_t = None
                     if cfg_img_scale_ > 1.0:
-                        cfg_img_v_t = self._forward_flow_single_branch(
+                        cfg_img_v_t = self.forward_single_branch(
                             **common,
                             packed_indexes=cfg_img_packed_query_indexes,
                             packed_position_ids=cfg_img_packed_position_ids,
@@ -1673,16 +1896,25 @@ class Bagel(nn.Module):
                         cfg_renorm_min,
                     )
 
-                x_t = x_t - v_t.to(x_t.device) * dts[i]
+                if scheduler is not None:
+                    out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
+                    x_t = out.prev_sample
+                    if trajectory_log_probs is not None and out.log_prob is not None:
+                        trajectory_log_probs.append(out.log_prob)
+                else:
+                    x_t = x_t - v_t.to(x_t.device) * dts[i]
+                if return_trajectory_latents:
+                    trajectory_latents.append(x_t.clone())
+                    trajectory_timesteps.append(timesteps[i] - dts[i])
 
             unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-            return unpacked_latent
+            return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
         # ── SP without CFG: direct single-branch loop ──
         if use_sp:
             for i, t in enumerate(timesteps):
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
-                v_t = self._forward_flow_single_branch(
+                v_t = self.forward_single_branch(
                     x_t=x_t,
                     timestep=timestep,
                     packed_vae_token_indexes=packed_vae_token_indexes,
@@ -1696,10 +1928,20 @@ class Bagel(nn.Module):
                     past_key_values=past_key_values,
                     packed_key_value_indexes=packed_key_value_indexes,
                 )
-                x_t = x_t - v_t.to(x_t.device) * dts[i]
+                if scheduler is not None:
+                    out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
+                    x_t = out.prev_sample
+                    out_log_prob = getattr(out, "log_prob", None)
+                    if trajectory_log_probs is not None and out_log_prob is not None:
+                        trajectory_log_probs.append(out_log_prob)
+                else:
+                    x_t = x_t - v_t.to(x_t.device) * dts[i]
+                if return_trajectory_latents:
+                    trajectory_latents.append(x_t.clone())
+                    trajectory_timesteps.append(timesteps[i] - dts[i])
 
             unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-            return unpacked_latent
+            return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
         # ── Batched CFG mode (cfg_parallel_size=1, no SP) ──
         cfg_batched = None
@@ -1765,7 +2007,7 @@ class Bagel(nn.Module):
             else:
                 cfg_text_scale_ = 1.0
                 cfg_img_scale_ = 1.0
-            v_t = self._forward_flow(
+            v_t = self.forward(
                 x_t=x_t,
                 timestep=timestep,
                 packed_vae_token_indexes=packed_vae_token_indexes,
@@ -1785,10 +2027,19 @@ class Bagel(nn.Module):
                 cfg_batched=cfg_batched,
             )
 
-            x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
+            if scheduler is not None:
+                out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
+                x_t = out.prev_sample
+                if trajectory_log_probs is not None and out.log_prob is not None:
+                    trajectory_log_probs.append(out.log_prob)
+            else:
+                x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
+            if return_trajectory_latents:
+                trajectory_latents.append(x_t.clone())
+                trajectory_timesteps.append(timesteps[i] - dts[i])
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-        return unpacked_latent
+        return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
     def _generate_image_parallel(
         self,
@@ -1820,6 +2071,9 @@ class Bagel(nn.Module):
         cfg_img_past_key_values: NaiveCache | None,
         cfg_img_key_values_lens: torch.IntTensor | None,
         cfg_img_packed_key_value_indexes: torch.LongTensor | None,
+        return_trajectory_latents: bool = False,
+        scheduler: object | None = None,
+        scheduler_kwargs: dict | None = None,
     ):
         """CFG parallel denoising loop: each rank computes one CFG branch.
 
@@ -1876,13 +2130,20 @@ class Bagel(nn.Module):
         else:
             raise RuntimeError(f"Unexpected cfg_rank={cfg_rank} for Bagel 3-branch CFG parallel")
 
+        trajectory_latents: list[torch.Tensor] | None = [] if return_trajectory_latents else None
+        trajectory_timesteps: list[torch.Tensor] | None = [] if return_trajectory_latents else None
+        trajectory_log_probs: list[torch.Tensor] | None = (
+            [] if (return_trajectory_latents and scheduler is not None) else None
+        )
+        _sched_kw = scheduler_kwargs or {}
+
         for i, t in enumerate(timesteps):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             use_cfg_this_step = t > cfg_interval[0] and t <= cfg_interval[1] and cfg_text_scale > 1.0
 
             if use_cfg_this_step:
                 # CFG interval: each rank computes its own branch
-                local_v_t = self._forward_flow_single_branch(
+                local_v_t = self.forward_single_branch(
                     x_t=x_t,
                     timestep=timestep,
                     packed_vae_token_indexes=packed_vae_token_indexes,
@@ -1909,7 +2170,7 @@ class Bagel(nn.Module):
                 )
             else:
                 # Outside CFG interval: all ranks compute with gen inputs, no comm
-                v_t = self._forward_flow_single_branch(
+                v_t = self.forward_single_branch(
                     x_t=x_t,
                     timestep=timestep,
                     packed_vae_token_indexes=packed_vae_token_indexes,
@@ -1924,10 +2185,19 @@ class Bagel(nn.Module):
                     packed_key_value_indexes=packed_key_value_indexes,
                 )
 
-            x_t = x_t - v_t.to(x_t.device) * dts[i]
+            if scheduler is not None:
+                out = scheduler.step(v_t.to(x_t.device), timesteps[i], x_t, dts[i], **_sched_kw)
+                x_t = out.prev_sample
+                if trajectory_log_probs is not None and out.log_prob is not None:
+                    trajectory_log_probs.append(out.log_prob)
+            else:
+                x_t = x_t - v_t.to(x_t.device) * dts[i]
+            if return_trajectory_latents:
+                trajectory_latents.append(x_t.clone())
+                trajectory_timesteps.append(timesteps[i] - dts[i])
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
-        return unpacked_latent
+        return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
     @staticmethod
     def _combine_cfg(
@@ -1982,7 +2252,7 @@ class Bagel(nn.Module):
 
         return v_t
 
-    def _forward_flow_single_branch(
+    def forward_single_branch(
         self,
         x_t: torch.Tensor,
         timestep: torch.LongTensor,
@@ -2112,7 +2382,7 @@ class Bagel(nn.Module):
         v_t = v_t[packed_vae_token_indexes]
         return v_t
 
-    def _forward_flow(
+    def forward(
         self,
         x_t: torch.Tensor,
         timestep: torch.LongTensor,

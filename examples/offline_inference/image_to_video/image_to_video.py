@@ -33,9 +33,10 @@ Usage:
 """
 
 import argparse
-import os
+import json
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import PIL.Image
@@ -46,6 +47,16 @@ from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
+
+
+def parse_profiler_config(value: str) -> dict[str, Any]:
+    try:
+        config = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {e}") from e
+    if not isinstance(config, dict):
+        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
+    return config
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,6 +94,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--flow-shift", type=float, default=5.0, help="Scheduler flow_shift (5.0 for 720p, 12.0 for 480p)."
+    )
+    parser.add_argument(
+        "--sample-solver",
+        type=str,
+        default="unipc",
+        choices=["unipc", "euler"],
+        help="Sampling solver for Wan2.2 pipelines. Use 'euler' for Lightning/Distill setups.",
     )
     parser.add_argument("--output", type=str, default="i2v_output.mp4", help="Path to save the video (mp4).")
     parser.add_argument("--fps", type=int, default=None, help="Frames per second for the output video.")
@@ -146,7 +164,7 @@ def parse_args() -> argparse.Namespace:
         "--audio-sample-rate",
         type=int,
         default=24000,
-        help="Sample rate for audio output when saved (default: 24000 for LTX2).",
+        help="Sample rate for audio output when saved (default: 24000).",
     )
     parser.add_argument(
         "--cache-backend",
@@ -187,6 +205,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
+    parser.add_argument(
+        "--profiler-config",
+        type=parse_profiler_config,
+        default=None,
+        help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
+    )
+    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 
@@ -267,8 +294,7 @@ def main():
             "rel_l1_thresh": 0.2,
         }
 
-    # Check if profiling is requested via environment variable
-    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+    profiler_enabled = args.profiler_config is not None
     parallel_config = DiffusionParallelConfig(
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
@@ -293,6 +319,7 @@ def main():
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
+        profiler_config=args.profiler_config,
     )
 
     if profiler_enabled:
@@ -305,6 +332,7 @@ def main():
     print(f"  Model: {args.model}")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Frames: {args.num_frames}")
+    print(f"  Solver: {args.sample_solver}")
     print(
         f"  Parallel configuration: cfg_parallel_size={args.cfg_parallel_size},"
         f" tensor_parallel_size={args.tensor_parallel_size}, vae_patch_parallel_size={args.vae_patch_parallel_size}"
@@ -326,9 +354,14 @@ def main():
             generator=generator,
             guidance_scale=guidance_scale,
             guidance_scale_2=args.guidance_scale_high,
+            boundary_ratio=args.boundary_ratio,
             num_inference_steps=num_inference_steps,
             num_frames=num_frames,
             frame_rate=frame_rate,
+            extra_args={
+                "sample_solver": args.sample_solver,
+                "flow_shift": args.flow_shift,
+            },
         ),
     )
     generation_end = time.perf_counter()
@@ -471,15 +504,9 @@ def main():
 
     video_array = _ensure_frame_list(video_array)
 
-    use_ltx2_export = is_ltx2
-    encode_video = None
-    if use_ltx2_export:
-        try:
-            from diffusers.pipelines.ltx2.export_utils import encode_video
-        except ImportError:
-            encode_video = None
+    if audio is not None:
+        from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 
-    if use_ltx2_export and encode_video is not None:
         if isinstance(video_array, list):
             frames_np = np.stack(video_array, axis=0)
         elif isinstance(video_array, np.ndarray):
@@ -490,29 +517,24 @@ def main():
         if frames_np.ndim == 4 and frames_np.shape[-1] == 4:
             frames_np = frames_np[..., :3]
 
-        frames_np = np.clip(frames_np, 0.0, 1.0)
-        frames_u8 = (frames_np * 255).round().clip(0, 255).astype("uint8")
-        video_tensor = torch.from_numpy(frames_u8)
+        frames_u8 = (np.clip(frames_np, 0.0, 1.0) * 255).round().clip(0, 255).astype("uint8")
 
-        audio_out = None
-        if audio is not None:
-            if isinstance(audio, list):
-                audio = audio[0] if audio else None
-            if isinstance(audio, np.ndarray):
-                audio = torch.from_numpy(audio)
-            if isinstance(audio, torch.Tensor):
-                audio_out = audio
-                if audio_out.dim() > 1:
-                    audio_out = audio_out[0]
-                audio_out = audio_out.float().cpu()
+        audio_np = audio
+        if isinstance(audio_np, list):
+            audio_np = audio_np[0] if audio_np else None
+        if isinstance(audio_np, torch.Tensor):
+            audio_np = audio_np.detach().cpu().float().numpy()
+        if isinstance(audio_np, np.ndarray):
+            audio_np = np.squeeze(audio_np).astype(np.float32)
 
-        encode_video(
-            video_tensor,
-            fps=fps,
-            audio=audio_out,
-            audio_sample_rate=args.audio_sample_rate if audio_out is not None else None,
-            output_path=str(output_path),
+        video_bytes = mux_video_audio_bytes(
+            frames_u8,
+            audio_np,
+            fps=float(fps),
+            audio_sample_rate=args.audio_sample_rate,
         )
+        with open(str(output_path), "wb") as f:
+            f.write(video_bytes)
     else:
         export_to_video(video_array, str(output_path), fps=fps)
     print(f"Saved generated video to {output_path}")

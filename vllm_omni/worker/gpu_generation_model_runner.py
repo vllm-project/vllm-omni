@@ -23,6 +23,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
@@ -39,11 +40,12 @@ from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = logging.getLogger(__name__)
 
 
-class GPUGenerationModelRunner(OmniGPUModelRunner):
+class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     """Generation model runner for vLLM-Omni (non-autoregressive).
 
     - Reuses GPUModelRunner preparation, multimodal handling, and TP/PP/DP glue.
@@ -94,8 +96,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             else:
                 logger.error("RoutedExpertsCapturer not initialized.")
 
-        if scheduler_output.preempted_req_ids and has_kv_transfer_group():
-            get_kv_transfer_group().handle_preemptions(scheduler_output.preempted_req_ids)
+        if has_kv_transfer_group():
+            kv_connector_metadata = scheduler_output.kv_connector_metadata
+            if kv_connector_metadata is not None:
+                get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
@@ -104,7 +108,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         ):
             if self.model_config.async_chunk and num_scheduled_tokens:
                 self._update_request_states(scheduler_output)
-            self._update_states(scheduler_output)
+            deferred_state_corrections_fn = self._update_states(scheduler_output)
             if not scheduler_output.total_num_scheduled_tokens:
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
@@ -309,6 +313,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             slot_mappings,  # OMNI: pass slot_mappings for upstream v1 API compatibility
         )
         self.kv_connector_output = kv_connector_output
+
+        if deferred_state_corrections_fn:
+            deferred_state_corrections_fn()
+
         return None
 
     @torch.inference_mode()
@@ -513,7 +521,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             # mm encoder dummy run may need to add in the future.
             return torch.tensor([]), torch.tensor([])
 
-        assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
+        assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.is_valid_runtime_mode()
 
         # If cudagraph_mode.decode_mode() == FULL and
         # cudagraph_mode.separate_routine(). This means that we are using
@@ -617,11 +625,15 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
 
         # OMNI: Get slot mappings before building attention metadata
         slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-            num_tokens_padded=num_tokens,
+            num_tokens_padded=num_tokens_padded,
             num_reqs_padded=num_reqs_padded,
             num_tokens_unpadded=num_tokens_unpadded,
             ubatch_slices=ubatch_slices_padded,
         )
+
+        if slot_mappings_by_group is not None:
+            for sm in slot_mappings_by_group.values():
+                sm.fill_(-1)
 
         with self.synchronize_input_prep():
             # If force_attention is True, we always capture attention.
@@ -630,19 +642,21 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 if profile_seq_lens is not None:
                     seq_lens = profile_seq_lens  # type: ignore[assignment]
                 elif create_mixed_batch:
-                    # In the mixed batch mode (used for FI warmup), we use
-                    # shorter sequence lengths to run faster.
-                    # TODO(luka) better system for describing dummy batches
-                    seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]  # type: ignore[assignment]
+                    seq_lens = torch.tensor(  # type: ignore[assignment]
+                        [1] * num_decode_tokens + [num_prefill_tokens + 1],
+                        dtype=torch.int,
+                    )
                 else:
                     seq_lens = max_query_len  # type: ignore[assignment]
-                self.seq_lens.np[:num_reqs] = seq_lens
-                self.seq_lens.np[num_reqs:] = 0
-                self.seq_lens.copy_to_gpu()
+                self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
+                self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+                self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
 
-                cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
+                cum_num_tokens = self._get_cumsum_and_arange(num_scheduled_tokens, self.query_pos.np)
                 self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
                 self.query_start_loc.copy_to_gpu()
+
+                self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
                 attn_metadata, _ = self._build_attention_metadata(
@@ -696,7 +710,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             elif self.uses_xdrope_dim > 0:
                 positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
-                positions = self.positions.gpu[:num_tokens_padded]
+                positions = self.positions[:num_tokens_padded]
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None
@@ -751,7 +765,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             ):
                 assert isinstance(
                     self.drafter,
-                    EagleProposer | DraftModelProposer | ExtractHiddenStatesProposer,
+                    EagleProposer | DFlashProposer | DraftModelProposer | ExtractHiddenStatesProposer,
                 )
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.

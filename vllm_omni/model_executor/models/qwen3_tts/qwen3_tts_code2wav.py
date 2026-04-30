@@ -41,6 +41,9 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._num_quantizers: int | None = None
         self._output_sample_rate: int | None = None
         self._total_upsample: int | None = None
+        self._decoder_sliding_window: int | None = None
+        self._decode_chunk_frames = 300
+        self._decode_left_context_frames = 25
         self._logged_codec_stats = False
 
     @staticmethod
@@ -106,28 +109,46 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._num_quantizers = num_q
         self._output_sample_rate = out_sr
         self._total_upsample = int(decoder.total_upsample)
+        self._decoder_sliding_window = int(getattr(dec_cfg, "sliding_window", 0) or 0)
 
         # Precompute SnakeBeta exp caches (benefits both Triton and eager paths)
         if hasattr(decoder, "precompute_snake_caches"):
             decoder.precompute_snake_caches()
 
+        chunk_frames = 0
+        left_frames = 0
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        extra_cfg = (
+            connector_cfg.get("extra", connector_cfg)
+            if isinstance(connector_cfg, dict)
+            else getattr(connector_cfg, "extra", None)
+        )
+        if isinstance(extra_cfg, dict):
+            chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
+            left_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
+            if getattr(model_cfg, "async_chunk", False) and chunk_frames > 0:
+                self._decode_chunk_frames = chunk_frames
+                self._decode_left_context_frames = left_frames if left_frames > 0 else 0
+
         if hasattr(decoder, "enable_cudagraph"):
             device = self._module_device(decoder)
             if device.type == "cuda":
                 try:
-                    chunk_frames = 0
-                    left_frames = 0
-
-                    model_cfg = getattr(self.vllm_config, "model_config", None)
-                    connector_cfg = getattr(model_cfg, "stage_connector_config", None)
-                    extra_cfg = (
-                        connector_cfg.get("extra", connector_cfg)
-                        if isinstance(connector_cfg, dict)
-                        else getattr(connector_cfg, "extra", None)
-                    )
-                    if isinstance(extra_cfg, dict):
-                        chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
-                        left_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
+                    if (
+                        chunk_frames > 0
+                        and left_frames > 0
+                        and self._decoder_sliding_window
+                        and left_frames < self._decoder_sliding_window
+                    ):
+                        logger.warning(
+                            "Qwen3-TTS streaming codec_left_context_frames=%d is smaller than "
+                            "decoder sliding_window=%d; chunk-boundary distortion may occur. "
+                            "Increase codec_left_context_frames to at least %d for streaming.",
+                            left_frames,
+                            self._decoder_sliding_window,
+                            self._decoder_sliding_window,
+                        )
 
                     decoder.enable_cudagraph(
                         device=device,
@@ -218,8 +239,15 @@ class Qwen3TTSCode2Wav(nn.Module):
             for i, info in enumerate(runtime_additional_information):
                 if i >= len(left_context_size):
                     break
-                if "left_context_size" in info:
-                    left_context_size[i] = info["left_context_size"]
+                meta = info.get("meta", {})
+                if "left_context_size" in meta:
+                    # left_context_size may come through serialization as an int, [int], or tensor([int]).
+                    value = meta["left_context_size"]
+                    if isinstance(value, list):
+                        value = value[0] if value else 0
+                    if isinstance(value, torch.Tensor):
+                        value = value.reshape(-1)[0].item() if value.numel() > 0 else 0
+                    left_context_size[i] = int(value)
         for i, req_ids in enumerate(request_ids_list):
             if req_ids.numel() < 1:
                 parsed.append((0, 0))
@@ -230,8 +258,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             if n == 0 or n % q != 0:
                 if n > 0:
                     logger.warning(
-                        "Code2Wav input_ids length %d not divisible by num_quantizers %d, "
-                        "likely a warmup run; returning empty audio.",
+                        "Code2Wav input_ids length %d not divisible by num_quantizers %d; skipping malformed request.",
                         n,
                         q,
                     )
@@ -275,7 +302,16 @@ class Qwen3TTSCode2Wav(nn.Module):
         wav_tensors: list[torch.Tensor] = []
         for codes_qf in valid_codes_qf:
             codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
-            wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
+            try:
+                wav = decoder.chunked_decode(
+                    codes_bqf,
+                    chunk_size=self._decode_chunk_frames,
+                    left_context_size=self._decode_left_context_frames,
+                )  # [1, 1, wav_len]
+            except TypeError:
+                # Unit-test fakes and older decoder shims may not accept the
+                # explicit chunk kwargs; production Qwen3-TTS decoders do.
+                wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
             wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
 
         audios: list[torch.Tensor] = [empty] * num_req
@@ -284,24 +320,17 @@ class Qwen3TTSCode2Wav(nn.Module):
         for j, idx in enumerate(valid_indices):
             ctx_frames, actual_frames = parsed[idx]
             wav = wav_tensors[j]
-            if ctx_frames > 0:
-                # Proportional trim matching the official HF implementation:
-                # the decoder output length may not be exactly frames * upsample
-                # so compute cut as a proportion of total decoded length.
-                cut = int(ctx_frames / max(actual_frames, 1) * wav.shape[0])
-                if cut < wav.shape[0]:
-                    wav = wav[cut:]
-                else:
-                    logger.warning(
-                        "Context trim %d >= decoded length %d; returning empty audio.",
-                        cut,
-                        wav.shape[0],
-                    )
-                    continue
-            else:
-                expected_len = actual_frames * upsample
-                if wav.shape[0] > expected_len:
-                    wav = wav[:expected_len]
+            # Slice on exact codec-frame boundaries instead of proportionally.
+            start = max(0, ctx_frames * upsample)
+            end = max(start, actual_frames * upsample)
+            if start >= wav.shape[0]:
+                logger.warning(
+                    "Context trim start %d >= decoded length %d; returning empty audio.",
+                    start,
+                    wav.shape[0],
+                )
+                continue
+            wav = wav[start : min(end, wav.shape[0])]
             if wav.shape[0] > 0:
                 audios[idx] = wav.to(dtype=torch.float32).reshape(-1)
 
@@ -310,12 +339,18 @@ class Qwen3TTSCode2Wav(nn.Module):
             multimodal_outputs={"model_outputs": audios, "sr": srs},
         )
 
-    def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
+    def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
 
+        if isinstance(model_outputs, tuple) and len(model_outputs) == len(OmniOutput._fields):
+            return OmniOutput(*model_outputs)
+
         if not (isinstance(model_outputs, tuple) and len(model_outputs) == 2):
-            raise TypeError(f"Qwen3TTSCode2Wav expected (audio_tensor, sr) outputs, got {type(model_outputs)}")
+            raise TypeError(
+                "Qwen3TTSCode2Wav expected OmniOutput, OmniOutput tuple, "
+                f"or (audio_tensor, sr) outputs, got {type(model_outputs)}"
+            )
 
         audio_tensor, sr = model_outputs
         return OmniOutput(

@@ -224,6 +224,7 @@ class OmniStreamingSpeechHandler:
             ref_audio=config.ref_audio,
             ref_text=config.ref_text,
             x_vector_only_mode=config.x_vector_only_mode,
+            speaker_embedding=config.speaker_embedding,
             stream=config.stream_audio,
         )
 

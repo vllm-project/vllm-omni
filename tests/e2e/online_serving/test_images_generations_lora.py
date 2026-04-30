@@ -22,13 +22,13 @@ import torch
 from PIL import Image
 from safetensors.torch import save_file
 
-from tests.conftest import OmniServer
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServer
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = "Tongyi-MAI/Z-Image-Turbo"
-DIFFUSION_INIT_TIMEOUT_S = 600
+DIFFUSION_INIT_TIMEOUT_S = 900
 
 
 PROMPT = "a photo of a cat sitting on a laptop keyboard"

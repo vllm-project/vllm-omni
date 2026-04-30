@@ -37,6 +37,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,
 )
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
 try:
     import flash_attn
@@ -99,9 +100,28 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         talker_config: Qwen3OmniMoeTalkerConfig = vllm_config.model_config.hf_config
-        talker_config.text_config.rope_parameters = talker_config.text_config.rope_scaling
-        talker_config.text_config.rope_parameters["rope_theta"] = talker_config.text_config.rope_theta
-        self.quant_config = vllm_config.quant_config
+        rope_params = getattr(talker_config.text_config, "rope_scaling", None)
+        if rope_params is None:
+            rope_params = getattr(talker_config.text_config, "rope_parameters", None) or {}
+        rope_params = dict(rope_params)
+        # In transformers <5.0.0, rope_theta is a top-level config attribute
+        # (e.g. config.text_config.rope_theta = 1000000.0).
+        # In transformers >=5.0.0 (PR #39847), rope_theta moved inside the
+        # rope_parameters dict (e.g. config.text_config.rope_parameters =
+        # {"rope_theta": 1000000.0, "rope_type": "default"}).
+        # Use setdefault so we never overwrite a value already present.
+        # Precedence: rope_params["rope_theta"] (already set)
+        #           > text_config.rope_theta (transformers <5.0.0 top-level attr)
+        #           > 1000000 (Qwen3 Omni default)
+        rope_params.setdefault(
+            "rope_theta",
+            getattr(talker_config.text_config, "rope_theta", 1000000),
+        )
+        talker_config.text_config.rope_parameters = rope_params
+        quant_config = vllm_config.quant_config
+        if isinstance(quant_config, ComponentQuantizationConfig):
+            quant_config = quant_config.resolve("talker")
+        self.quant_config = quant_config
         self.prefix = prefix
         self.vllm_config = vllm_config
         self.config = talker_config

@@ -62,6 +62,21 @@ def pytorch_attn_forward(
     if op_type == "flash" and q.dtype == torch.float32:
         op_type = "efficient"
 
+    # Volta (V100, sm70) does not have native bf16 support for the efficient
+    # SDPA kernel. When running Ring attention in bf16 on such GPUs, the
+    # efficient kernel can fail with "cutlassF: no kernel found to launch".
+    #
+    # We keep the overall model in bf16 for numerical stability, but cast
+    # the attention inputs to fp16 for the SDPA call. The output is cast
+    # back to bf16 to match the caller's expected dtype.
+    orig_dtype = q.dtype
+    if q.is_cuda and q.dtype == torch.bfloat16 and op_type == "efficient":
+        major_cc, _minor_cc = torch.cuda.get_device_capability(q.device)
+        if major_cc < 8:
+            q = q.to(torch.float16)
+            k = k.to(torch.float16)
+            v = v.to(torch.float16)
+
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
@@ -90,7 +105,13 @@ def pytorch_attn_forward(
         raise ValueError(f"Invalid op_type: {op_type}")
 
     out = out.transpose(1, 2)
-    lse = lse.to(q.dtype)
+    # Keep LSE in fp32 for numerical stability when accumulating across ring
+    # steps (update_out_and_lse uses sigmoid/logsigmoid on LSE diffs).
+    # Casting LSE down to fp16/bf16 can introduce NaNs on some GPUs/shapes.
+    lse = lse.to(torch.float32)
+
+    if out.dtype != orig_dtype:
+        out = out.to(orig_dtype)
 
     return out, lse
 

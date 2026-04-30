@@ -25,6 +25,7 @@ class OmniTransferAdapterBase:
         self._pending_load_reqs = deque()
         # Requests that have successfully retrieved data
         self._finished_load_reqs = set()
+        self._cancelled_load_reqs: set[str] = set()
 
         # Requests that are waiting to be saved
         self._pending_save_reqs = deque()
@@ -60,6 +61,9 @@ class OmniTransferAdapterBase:
                     break
                 request = self._pending_load_reqs.popleft()
                 request_id = request.request_id
+                if request_id in self._cancelled_load_reqs:
+                    self._cancelled_load_reqs.discard(request_id)
+                    continue
                 self.request_ids_mapping[request_id] = request.external_req_id
                 try:
                     is_success = self._poll_single_request(request)

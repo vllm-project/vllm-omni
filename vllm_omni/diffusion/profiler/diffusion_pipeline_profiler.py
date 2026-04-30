@@ -1,4 +1,5 @@
 import functools
+import re
 import time
 from collections.abc import Callable
 from threading import Lock
@@ -30,9 +31,16 @@ def profiler(name: str, func: Callable, instance: Any) -> Callable:
             logger.info(f"[DiffusionPipelineProfiler] {name} took {duration:.6f}s")
             # record the profiling data: duration of stages
             with instance._profiler_lock:
-                instance._stage_durations[name] = duration
+                instance._stage_durations[name] = instance._stage_durations.get(name, 0.0) + duration
 
     return wrapper
+
+
+def _parse_part(part: str) -> tuple[str, int | None]:
+    """Parse 'att[num]' into ('att', num)."""
+    if m := re.compile(r"(\w+)\[(\d+)\]").fullmatch(part):
+        return m.group(1), int(m.group(2))
+    return part, None
 
 
 def _get_attribute_by_path(obj: Any, path: str) -> tuple[Any, str]:
@@ -41,9 +49,13 @@ def _get_attribute_by_path(obj: Any, path: str) -> tuple[Any, str]:
     current = obj
 
     for part in parts[:-1]:
-        current = getattr(current, part, None)
+        attr, idx = _parse_part(part)
+
+        current = getattr(current, attr, None)
         if current is None:
             return None, None
+        if idx is not None:
+            current = current[idx]
 
     return current, parts[-1]
 

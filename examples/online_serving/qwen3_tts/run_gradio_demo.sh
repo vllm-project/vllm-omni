@@ -127,12 +127,11 @@ echo "Starting vLLM server..."
 LOG_FILE="/tmp/vllm_tts_server_${SERVER_PORT}.log"
 
 vllm-omni serve "$MODEL" \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --host "$SERVER_HOST" \
     --port "$SERVER_PORT" \
     --gpu-memory-utilization 0.9 \
     --trust-remote-code \
-    --enforce-eager \
     --omni 2>&1 | tee "$LOG_FILE" &
 SERVER_PID=$!
 
@@ -180,7 +179,7 @@ fi
 echo ""
 echo "Starting Gradio demo..."
 cd "$SCRIPT_DIR"
-GRADIO_CMD=("python" "gradio_demo.py" "--api-base" "$API_BASE" "--ip" "$GRADIO_IP" "--port" "$GRADIO_PORT")
+GRADIO_CMD=("python" "gradio_demo.py" "--api-base" "$API_BASE" "--host" "$GRADIO_IP" "--port" "$GRADIO_PORT")
 if [ "$GRADIO_SHARE" = true ]; then
     GRADIO_CMD+=("--share")
 fi

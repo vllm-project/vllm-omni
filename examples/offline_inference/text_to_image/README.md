@@ -29,10 +29,12 @@ This folder provides several entrypoints for experimenting with text-to-image di
 | `AIDC-AI/Ovis-Image-7B` | 1024 x 1024 | 71.8 | 17.1 |
 | `OmniGen2/OmniGen2` |  1024 x 1024 | 20.1 | 14.7 |
 | `stabilityai/stable-diffusion-3.5-medium` | 1024 x 1024 | 20.1 | 15.6 |
-| `black-forest-labs/FLUX.1-dev` | 1024 x 1024 | 77.6 | 31.4 |
+| `black-forest-labs/FLUX.1-dev` | 1024 x 1024 | 33.9 | 31.4 |
+| `black-forest-labs/FLUX.1-schnell` | 1024 x 1024 | 33.9 | 31.4 |
 | `black-forest-labs/FLUX.2-klein-4B` | 1024 x 1024 | 72.7 | 14.9 |
 | `black-forest-labs/FLUX.2-klein-9B` | 1024 x 1024 | 37.1 | 32.3 |
 | `black-forest-labs/FLUX.2-dev` | 1024 x 1024 | 65.7 | >80 (CPU offload required) |
+| `HunyuanImage-3.0` | 1024 x 1024 | 80.0 (TP≥3)  | 160 |
 
 !!! info
 *Peak VRAM:  based on basic single-card usage, batch size =1, without any acceleration/optimization features. FLUX.2-dev requires `--enable-cpu-offload` on a single 80 GiB GPU.
@@ -84,9 +86,14 @@ python text_to_image.py \
 | `--vae-use-slicing` | flag | off | Enable VAE slicing for memory optimization |
 | `--vae-use-tiling` | flag | off | Enable VAE tiling for memory optimization |
 | `--cfg-parallel-size` | int | `1` | Set to `2` to enable CFG Parallel |
+| `--ulysses-degree` | int | `1` | Ulysses sequence parallel degree for multi-GPU inference |
+| `--ring-degree` | int | `1` | Ring sequence parallel degree for hybrid Ulysses + Ring inference |
+| `--ulysses-mode` | str | `"strict"` | Ulysses SP mode: `"strict"` or `"advanced_uaa"` |
 | `--enable-cpu-offload` | flag | off | Enable CPU offloading for diffusion models |
 | `--lora-path` | str | — | Path to PEFT LoRA adapter folder |
 | `--lora-scale` | float | `1.0` | Scale factor for LoRA weights |
+| `--use-system-prompt` | str | `None` | System prompt preset: `en_unified`, `en_vanilla`, `en_recaption`, `en_think_recaption`, `dynamic`, `None`, or custom text. Recommended: `en_unified`. Only for HunyuanImage-3.0.|
+| `--system-prompt` | str | `None` | Custom system prompt text. Only used when `--use-system-prompt` is set to `custom`. Only for HunyuanImage-3.0.|
 
 **NextStep-1.1 specific arguments:**
 
@@ -119,6 +126,19 @@ python text_to_image.py \
 ```
 
 `Tongyi-MAI/Z-Image-Turbo` is a distilled version of Z-Image. Distilled diffusion models usually require less number of inference steps (4~9), and Classifier-Free Guidance (CFG) is usually NOT applied. Similar distilled models are `black-forest-labs/FLUX.2-klein-4B` and `black-forest-labs/FLUX.2-klein-9B`.
+
+Advanced UAA example (requires 2 GPUs):
+
+```bash
+python text_to_image.py \
+  --model Tongyi-MAI/Z-Image-Turbo \
+  --prompt "a cup of coffee on the table" \
+  --ulysses-degree 2 \
+  --ulysses-mode advanced_uaa \
+  --height 1024 \
+  --width 1024 \
+  --output outputs/coffee_hybrid.png
+```
 
 ### NextStep Models
 
@@ -228,7 +248,7 @@ python examples/offline_inference/text_to_image/text_to_image.py \
 #### CFG Parallel
 
 Set `--cfg-parallel-size 2` to enable CFG Parallel for faster inference on multi-GPU setups.
-See more examples in the [diffusion acceleration user guide](../../../docs/user_guide/diffusion_acceleration.md#using-cfg-parallel).
+See more examples in the [cfg_parallel user guide](../../../docs/user_guide/parallelism/cfg_parallel.md#using-cfg-parallel).
 
 #### LoRA
 
