@@ -61,6 +61,7 @@ class OmniCoordinator:
 
         self._publish_min_interval: float = 0.1  # seconds
         self._pending_broadcast: bool = False
+        self._pending_lock = threading.Lock()
 
         self._running = True
         self._closed = False
@@ -84,13 +85,13 @@ class OmniCoordinator:
         """Add a new instance based on an incoming event."""
         with self._lock:
             self._add_new_instance_locked(event)
-        self.publish_instance_list_update()
+        self._schedule_broadcast()
 
     def update_instance_info(self, event: InstanceEvent) -> None:
         """Update an existing instance based on an incoming event."""
         with self._lock:
             self._update_instance_info_locked(event)
-        self.publish_instance_list_update()
+        self._schedule_broadcast()
 
     def remove_instance(self, event: InstanceEvent) -> None:
         """Mark an instance as removed / down based on an incoming event.
@@ -101,10 +102,15 @@ class OmniCoordinator:
         """
         with self._lock:
             self._remove_instance_locked(event)
-        self.publish_instance_list_update()
+        self._schedule_broadcast()
 
-    def publish_instance_list_update(self) -> None:
-        """Publish the current active instance list to all subscribers."""
+    def publish_instance_list_update(self) -> bool:
+        """Publish the current active instance list to all subscribers.
+
+        Returns:
+            True if the PUB send succeeded, False if it was dropped (e.g.
+            socket not ready when using ``zmq.NOBLOCK``).
+        """
         active_list = self.get_active_instances()
         payload = asdict(active_list)
         data = json.dumps(payload).encode("utf-8")
@@ -113,20 +119,18 @@ class OmniCoordinator:
             try:
                 # PUB socket is best-effort; drop update if not ready.
                 self._pub.send(data, flags=zmq.NOBLOCK)
+                return True
             except (zmq.Again, zmq.ZMQError):
                 # Silently ignore send failures; next update will catch up.
-                return
+                return False
 
-    def _schedule_broadcast(self, force: bool) -> None:
-        """Schedule a broadcast, optionally bypassing throttling.
+    def _schedule_broadcast(self) -> None:
+        """Request a broadcast to be flushed by the periodic loop.
 
-        When ``force`` is True, publish immediately. Otherwise, mark a pending
-        broadcast that will be flushed by the periodic loop at most once per
-        ``_publish_min_interval``.
+        All broadcast requests are coalesced via ``_pending_broadcast`` and
+        flushed at most once per ``_publish_min_interval``.
         """
-        if force:
-            self.publish_instance_list_update()
-        else:
+        with self._pending_lock:
             self._pending_broadcast = True
 
     def _mark_instance_error_locked(self, info: InstanceInfo) -> None:
@@ -152,8 +156,8 @@ class OmniCoordinator:
             for input_addr in to_delete:
                 del self._instances[input_addr]
         if timed_out:
-            # Instance liveness changed; force immediate broadcast.
-            self._schedule_broadcast(force=True)
+            # Instance liveness changed; request broadcast.
+            self._schedule_broadcast()
 
     def close(self) -> None:
         """Shut down background threads and close all ZMQ sockets."""
@@ -228,9 +232,9 @@ class OmniCoordinator:
     def _periodic_loop(self) -> None:
         """Periodic loop to check heartbeat timeouts and flush broadcasts.
 
-        Heartbeat timeouts are checked on their original cadence, while
-        queue_length / non-liveness updates are coalesced and flushed at
-        most once per ``_publish_min_interval``.
+        Heartbeat timeouts are checked on their original cadence, while all
+        broadcast requests are coalesced and flushed at most once per
+        ``_publish_min_interval``.
         """
         heartbeat_interval = max(1.0, min(self._heartbeat_timeout / 2.0, 5.0))
         loop_interval = self._publish_min_interval
@@ -243,9 +247,18 @@ class OmniCoordinator:
                 self._check_heartbeat_timeouts()
                 last_heartbeat_check = now
 
-            if self._pending_broadcast:
-                self.publish_instance_list_update()
-                self._pending_broadcast = False
+            with self._pending_lock:
+                has_pending_broadcast = self._pending_broadcast
+
+            if not has_pending_broadcast:
+                if self._stop_event.wait(timeout=loop_interval):
+                    break
+                continue
+
+            # Publish outside lock. Clear pending only on success.
+            if self.publish_instance_list_update():
+                with self._pending_lock:
+                    self._pending_broadcast = False
 
             if self._stop_event.wait(timeout=loop_interval):
                 break
@@ -267,27 +280,23 @@ class OmniCoordinator:
                             info.status = StageStatus.UP
                             promote = True
                 if promote:
-                    self._schedule_broadcast(force=True)
+                    self._schedule_broadcast()
                 return
 
             # Check-and-act under single lock to avoid TOCTOU race (duplicate
             # registration when concurrent events arrive for the same instance).
             with self._lock:
-                force_broadcast = False
                 if input_addr not in self._instances:
                     self._add_new_instance_locked(event)
-                    force_broadcast = True
                 else:
                     if event.status == StageStatus.DOWN:
                         self._remove_instance_locked(event)
-                        force_broadcast = True
                     else:
                         self._update_instance_info_locked(event)
 
-            # New instances / DOWN events are broadcast immediately; other
-            # updates (e.g. queue_length changes) are throttled via the
-            # periodic loop.
-            self._schedule_broadcast(force=force_broadcast)
+            # Any non-heartbeat state change that affects the active list
+            # is coalesced and flushed via the periodic loop.
+            self._schedule_broadcast()
         except (KeyError, ValueError, TypeError) as e:
             logger.warning("Dropping malformed event: %s", e)
 

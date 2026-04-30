@@ -5,7 +5,10 @@ from pydantic import ConfigDict, TypeAdapter
 from vllm.config import ModelConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
-from vllm.transformers_utils.config import get_hf_text_config
+from vllm.transformers_utils.config import (
+    get_hf_text_config,
+    thinker_uses_mrope,
+)
 from vllm.transformers_utils.model_arch_config_convertor import (
     ModelArchConfigConvertorBase,
 )
@@ -146,6 +149,18 @@ class OmniModelConfig(ModelConfig):
         return super().architectures
 
     @property
+    def uses_mrope(self) -> bool:
+        if self.hf_config_name is not None:
+            # talker_config/thinker_config/etc
+            stage_config = getattr(self.hf_config, self.hf_config_name, None)
+            if stage_config is None:
+                # Check the named sub-config's text_config directly.
+                # Handles mrope resolution of stage-specific cls
+                # (e.g., talker runs as a standalone cls)
+                return thinker_uses_mrope(self.hf_config)
+        return super().uses_mrope
+
+    @property
     def embedding_size(self):
         if self.hf_config_name is not None:
             stage_config = getattr(self.hf_config, self.hf_config_name, None)
@@ -210,6 +225,12 @@ class OmniModelConfig(ModelConfig):
         new_hf_text_config = self.draw_hf_text_config()
         if new_hf_text_config is not self.hf_text_config:
             self.hf_text_config = new_hf_text_config
+            # Recalculate model_arch_config since it derives head counts,
+            # hidden size, etc. from hf_text_config.  Without this the
+            # FlashAttentionMetadataBuilder uses the wrong num_heads_q /
+            # num_heads_kv (from the thinker) for talker stages, causing
+            # FA3 scheduler_metadata shape mismatches at runtime.
+            self.model_arch_config = self.get_model_arch_config()
             # Recalculate dependent attributes
             self.attention_chunk_size = getattr(self.hf_text_config, "attention_chunk_size", None)
             # Recalculate max_model_len since it depends on hf_text_config

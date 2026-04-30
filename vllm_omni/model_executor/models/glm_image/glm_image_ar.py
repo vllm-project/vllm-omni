@@ -330,6 +330,13 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
     - Grid dimension calculation for M-RoPE position encoding
     """
 
+    def _cached_apply_hf_processor(self, inputs, timing_ctx):
+        # i2i: prompt text must be modified based on mm data presence,
+        # and grid computation requires all images together — bypass cache.
+        if inputs.mm_data_items.get_all_counts().get("image", 0) > 0:
+            return self._apply_hf_processor(inputs, timing_ctx)
+        return super()._cached_apply_hf_processor(inputs, timing_ctx)
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -678,7 +685,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
             try:
                 mrope_grid_thw = self._build_generation_grids(hf_processor_mm_kwargs)
                 mm_processed_data["mrope_image_grid_thw"] = mrope_grid_thw
-                logger.info(
+                logger.debug(
                     "_apply_hf_processor_main t2i: mrope_image_grid_thw=%s",
                     mrope_grid_thw.tolist(),
                 )
@@ -786,7 +793,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         hf_config = self.info.get_hf_config()
         image_token_id = getattr(hf_config, "image_token_id", 167855)
         image_token_count = prompt_ids.count(image_token_id)
-        logger.info(
+        logger.debug(
             "_apply_hf_processor_main i2i(HF): num_images=%s, prompt_len=%s, image_token_count=%s, "
             "source_grid_shape=%s, mrope_grid_shape=%s",
             num_images,
@@ -2321,13 +2328,13 @@ class GlmImageModel(nn.Module):
                 upsampled_token_ids.append(tokens_upsampled.view(-1))
 
             prior_token_image_ids_info = {
-                "prior_token_image_ids": upsampled_token_ids,
+                "ids": {"prior_image": upsampled_token_ids},
                 "image_grid_thw": image_grid_thw.tolist(),
             }
 
             # Debug: log prior_token_image_ids_info
             shapes = [t.shape for t in upsampled_token_ids]
-            logger.info(
+            logger.debug(
                 f"[GlmImageModel.forward] Built prior_token_image_ids_info: "
                 f"num_images={len(upsampled_token_ids)}, shapes={shapes}, "
                 f"image_grid_thw={image_grid_thw.tolist()}"
@@ -2533,13 +2540,11 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         # image_grid_thw is NOT included because:
         # 1. vLLM's pooling_output expects dict[str, torch.Tensor], not mixed types
         # 2. ar2diffusion doesn't need it - the grid info is already encoded in tensor shape
-        prior_token_info = {
-            "prior_token_image_ids": upsampled_token_ids,
-        }
+        prior_token_info = {"ids": {"prior_image": upsampled_token_ids}}
 
         # Debug: log prior_token_info
         shapes = [t.shape for t in upsampled_token_ids]
-        logger.info(
+        logger.debug(
             f"[_process_image_input] Built prior_token_info: "
             f"num_images={len(upsampled_token_ids)}, shapes={shapes}, "
             f"image_grid_thw={image_grid_thw.tolist()}"

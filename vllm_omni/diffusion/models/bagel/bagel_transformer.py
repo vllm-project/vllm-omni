@@ -114,17 +114,32 @@ class BagelRotaryEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        if config.rope_scaling is not None:
-            # Delegate to HF's rope-scaling helpers for non-default types.
+        # transformers>=5.0 stores rope params under ``rope_parameters`` and
+        # always populates ``rope_scaling`` (even for the default type), so we
+        # infer ``rope_type`` from either and fall back to "default".
+        rope_scaling = getattr(config, "rope_scaling", None) or {}
+        rope_parameters = getattr(config, "rope_parameters", None) or {}
+        rope_type = (
+            rope_scaling.get("rope_type") or rope_scaling.get("type") or rope_parameters.get("rope_type") or "default"
+        )
+
+        if rope_type == "default":
+            # transformers>=5.0 removed the 'default' entry from
+            # ROPE_INIT_FUNCTIONS; use the plain sinusoidal formula.
+            rope_theta = (
+                getattr(config, "rope_theta", None)
+                or rope_parameters.get("rope_theta")
+                or rope_scaling.get("rope_theta")
+                or 10000.0
+            )
+            dim = config.hidden_size // config.num_attention_heads
+            inv_freq = 1.0 / (rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+            self.attention_scaling = 1.0
+        else:
             from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-            rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type", "default"))
             rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
             inv_freq, self.attention_scaling = rope_init_fn(config, device=None)
-        else:
-            dim = config.hidden_size // config.num_attention_heads
-            inv_freq = 1.0 / (config.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-            self.attention_scaling = 1.0
 
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -738,6 +753,8 @@ class Qwen2MoTDecoderLayer(nn.Module):
 
 
 class Qwen2MoTModel(Qwen2PreTrainedModel):
+    _layerwise_offload_blocks_attrs = ["layers"]
+
     def __init__(
         self,
         config,

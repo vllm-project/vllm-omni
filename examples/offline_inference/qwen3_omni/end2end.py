@@ -21,6 +21,7 @@ from vllm.multimodal.image import convert_image_mode
 from vllm.multimodal.media.audio import load_audio
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 
 SEED = 42
@@ -550,6 +551,7 @@ def parse_args():
         help="Model dtype (auto, half, float16, bfloat16, float, float32).",
     )
 
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

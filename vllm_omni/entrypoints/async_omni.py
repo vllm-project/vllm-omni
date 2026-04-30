@@ -27,7 +27,11 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
-from vllm_omni.entrypoints.omni_base import OmniBase
+from vllm_omni.entrypoints.omni_base import (
+    OmniBase,
+    OmniEngineDeadError,
+)
+from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -37,7 +41,7 @@ if TYPE_CHECKING:
     from vllm.tokenizers import TokenizerLike
     from vllm.v1.engine import PauseMode
 
-    from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
+    from vllm_omni.inputs.data import OmniPromptType
 
 logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
@@ -275,7 +279,13 @@ class AsyncOmni(EngineClient, OmniBase):
                 and not isinstance(sampling_params_list, (str, bytes))
             ):
                 sampling_params_list = self._maybe_expand_sampling_params(list(sampling_params_list))
-            sampling_params_list = self.resolve_sampling_params_list(sampling_params_list)
+
+            # Set the output kind to delta output if sampling params were omitted,
+            # since AsyncOmni is typically used for streaming.
+            sampling_params_list = self.resolve_sampling_params_list(
+                sampling_params_list,
+                allow_delta_coercion=True,
+            )
 
             # Track per-request metrics
             wall_start_ts = time.time()
@@ -363,14 +373,14 @@ class AsyncOmni(EngineClient, OmniBase):
         # only check thinker's sampling params now
         stage0_params = sampling_params_list[0]
         self._validate_streaming_input_sampling_params(stage0_params)
-
         req_state = self.request_states[request_id]
+        has_submitted_first_chunk = False
 
+        # NOTE: InputProcessor in vLLM should generally do this too, but for
+        # now we do it defensively. TODO (Alex) ensure clones/copying are optimized
         if not stage0_params.skip_clone:
             stage0_params = stage0_params.clone()
             stage0_params.skip_clone = True
-
-        has_submitted_first_chunk = False
 
         async def handle_inputs() -> None:
             nonlocal has_submitted_first_chunk
@@ -494,7 +504,10 @@ class AsyncOmni(EngineClient, OmniBase):
             stage_id = result.get("stage_id", 0)
 
             if result.get("type") == "error" and result.get("fatal"):
-                raise EngineDeadError(result.get("error", ""))
+                raise OmniEngineDeadError(
+                    result.get("error", ""),
+                    error_stage_id=result.get("stage_id"),
+                )
 
             # Check for errors
             if "error" in result:
@@ -580,6 +593,18 @@ class AsyncOmni(EngineClient, OmniBase):
 
             except asyncio.CancelledError:
                 raise
+            except OmniEngineDeadError as e:
+                logger.error("[AsyncOmni] Engine dead: %s", e)
+                for req_state in list(self.request_states.values()):
+                    error_msg = {
+                        "type": "error",
+                        "error": str(e),
+                        "fatal": True,
+                        "request_id": req_state.request_id,
+                    }
+                    if e.error_stage_id is not None:
+                        error_msg["stage_id"] = e.error_stage_id
+                    await req_state.queue.put(error_msg)
             except EngineDeadError as e:
                 logger.error("[AsyncOmni] Engine dead: %s", e)
                 for req_state in list(self.request_states.values()):
@@ -884,7 +909,7 @@ class AsyncOmni(EngineClient, OmniBase):
     @property
     def dead_error(self) -> BaseException:
         """EngineClient abstract property implementation."""
-        return EngineDeadError()
+        return OmniEngineDeadError()
 
     # ==================== EngineClient Interface ====================
 

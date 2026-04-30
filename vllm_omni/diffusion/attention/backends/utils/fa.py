@@ -16,8 +16,11 @@ from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
+from vllm.logger import init_logger
 
 from vllm_omni.platforms import current_omni_platform
+
+logger = init_logger(__name__)
 
 # Flash Attention function detection with fallback chain
 flash_attn_func = None
@@ -41,7 +44,7 @@ elif current_omni_platform.is_xpu():
         pass
 elif current_omni_platform.is_musa():
     try:
-        from mate import flash_attn_varlen_func  # noqa: F401
+        from flash_attn_interface import flash_attn_func, flash_attn_varlen_func  # noqa: F401
     except (ImportError, ModuleNotFoundError):
         pass
 else:
@@ -81,9 +84,38 @@ HAS_FLASH_ATTN = flash_attn_func is not None or flash_attn_varlen_func is not No
 
 
 @lru_cache(maxsize=1)
-def is_mate_available() -> bool:
-    """Check if MATE (MUSA Flash Attention) is available."""
-    return current_omni_platform.is_musa() and flash_attn_varlen_func is not None
+def is_flash_attn_installed() -> bool:
+    """Return whether a Flash Attention backend package is importable.
+
+    Shared by CUDA/ROCm/MUSA platforms.
+    """
+    try:
+        # Check for any FA backend: FA3 (fa3_fwd_interface, flash_attn_interface) or FA2 (flash_attn)
+        # Try FA3 from fa3-fwd PyPI package
+        try:
+            import fa3_fwd_interface  # noqa: F401
+
+            return True
+        except (ImportError, ModuleNotFoundError):
+            pass
+
+        # Try FA3 from flash-attention source build
+        try:
+            import flash_attn_interface  # noqa: F401
+
+            return True
+        except (ImportError, ModuleNotFoundError):
+            pass
+
+        # Try FA2 from flash-attn package
+        from flash_attn import __version__
+
+        if __version__ < "2.6.0":
+            raise ImportError("install flash_attn >= 2.6.0")
+        return True
+    except (ImportError, ModuleNotFoundError):
+        logger.warning("No Flash Attention backend found, using pytorch SDPA implementation")
+        return False
 
 
 def _index_first_axis(tensor, indices):

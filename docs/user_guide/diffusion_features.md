@@ -59,7 +59,7 @@ Memory optimization methods help reduce GPU memory usage, enabling inference on 
 | Method | Description | Best For |
 |--------|-------------|----------|
 | **[CPU Offload](diffusion/cpu_offload_diffusion.md)** | Offloads model components to CPU memory | Limited VRAM, large models on consumer GPUs |
-| **[Quantization](diffusion/quantization/overview.md)** | Reduces DiT layers from BF16 to FP8/INT8/etc. | Limited VRAM, minimal accuracy loss    |
+| **[Quantization](quantization/overview.md)** | Reduces transformer stages from BF16 to FP8/INT8/etc. | Limited VRAM, minimal accuracy loss    |
 | **[VAE Patch Parallelism](diffusion/parallelism/vae_patch_parallel.md)** | Distributes VAE decode tiling across GPUs | High-resolution generation with reduced VAE memory peak |
 
 ### Extensions
@@ -86,9 +86,9 @@ Execution modes control how the diffusion pipeline processes denoise steps.
 
 | Method | Configuration | Description | Best For |
 |--------|--------------|-------------|----------|
-| **[FP8](diffusion/quantization/fp8.md)** | `quantization="fp8"` | FP8 W8A8 on Ada/Hopper, weight-only on older GPUs | Memory reduction, inference speedup |
-| **[INT8](diffusion/quantization/int8.md)** | `quantization="int8"` | INT8 weight-only, no calibration or pre-quantized checkpoint needed | Memory reduction, broad GPU compatibility |
-| **[GGUF](diffusion/quantization/gguf.md)** | `quantization="gguf"` | Native GGUF transformer-only weights (Q4, Q8, etc.) | Memory reduction on consumer GPUs |
+| **[FP8](quantization/fp8.md)** | `quantization="fp8"` | FP8 W8A8 on validated transformer stages | Memory reduction, inference speedup |
+| **[INT8](quantization/int8.md)** | `quantization="int8"` | INT8 W8A8 on validated transformer stages | Memory reduction, broad GPU compatibility |
+| **[GGUF](quantization/gguf.md)** | `quantization="gguf"` | Native GGUF transformer-only weights (Q4, Q8, etc.) | Memory reduction on consumer GPUs |
 
 ## Supported Models
 
@@ -101,14 +101,14 @@ The following tables show which models support each feature:
 > Notes:
 
 > 1. CPU Offload has two methods: Module-wise (default for models with DiT + text encoder) and Layerwise. The tables below show **Layerwise support** only.
-> 2. The **💾Quantization** column is collapsed for readability. See [Quantization Overview](diffusion/quantization/overview.md) for per-method (FP8, GGUF, …) and per-model support details.
+> 2. The **💾Quantization** column is collapsed for readability. See [Quantization Overview](quantization/overview.md) for per-method and per-model support details.
 
 ### ImageGen
 
 | Model | ⚡TeaCache | ⚡Cache-DiT | 🔀SP (Ulysses & Ring) | 🔀CFG-Parallel | 🔀Tensor-Parallel | 🔀HSDP | 💾CPU Offload (Layerwise) | 💾VAE-Patch-Parallel | 💾Quantization | 🔄Step Execution |
 |-------|:----------:|:-----------:|:---------------------:|:--------------:|:-----------------:|:------:|:------------------------:|:--------------------:|:--------------:|:----------------:|
-| **Bagel** | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **FLUX.1-dev** | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
+| **Bagel** | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅  | ❌ | ❌ | ❌ |
+| **FLUX.1-dev** | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
 | **FLUX.1-schnell** | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
 | **FLUX.2-klein** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
 | **FLUX.1-Kontext-dev** | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
@@ -141,6 +141,7 @@ The following tables show which models support each feature:
 | **Wan2.2** | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ (encode/decode) | ❌ | ❌ |
 | **Wan2.1-VACE** | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ (decode) | ❌ | ❌ |
 | **LTX-2** | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| **LTX-2.3** | ❌ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | **Helios** | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
 | **HunyuanVideo-1.5 T2V I2V** | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ (decode) | ✅ | ❌ |
 | **DreamID-Omni** | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
@@ -148,7 +149,7 @@ The following tables show which models support each feature:
 **Frame Interpolation Support**
 
 - **Supported**: Wan2.2 text-to-video, image-to-video, and TI2V pipelines
-- **Not supported**: Wan2.1-VACE, LTX-2, Helios, HunyuanVideo-1.5, DreamID-Omni
+- **Not supported**: Wan2.1-VACE, LTX-2, LTX-2.3, Helios, HunyuanVideo-1.5, DreamID-Omni
 
 ### AudioGen
 
@@ -260,7 +261,7 @@ Measured on NVIDIA H800:
 
 - **[CPU Offload Guide](diffusion/cpu_offload_diffusion.md)** - Offload model components to CPU, reduce GPU memory usage
 - **[VAE Patch Parallelism Guide](diffusion/parallelism/vae_patch_parallel.md)** - Distribute VAE decode tiling across GPUs for high-resolution images
-- **[Quantization Overview](diffusion/quantization/overview.md)** - Overview of quantization methods for diffusion models
+- **[Quantization Overview](quantization/overview.md)** - Overview of quantization methods for diffusion, multi-stage omni/TTS, and multi-stage diffusion models
 
 **Extensions:**
 

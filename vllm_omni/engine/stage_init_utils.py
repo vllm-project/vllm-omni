@@ -600,13 +600,49 @@ def release_device_locks(lock_fds: list[int]) -> None:
             pass
 
 
+def acquire_diffusion_device_locks(
+    stage_id: int,
+    od_config: Any,
+    stage_init_timeout: int,
+) -> list[int]:
+    """Acquire init locks for the GPU set used by a diffusion stage.
+
+    Diffusion stages express their device count via ``OmniDiffusionConfig``'s
+    ``parallel_config.world_size`` rather than the LLM-style
+    ``tensor_parallel_size`` knob, so adapt to the shape that
+    ``acquire_device_locks`` understands.
+    """
+    parallel_config = getattr(od_config, "parallel_config", None)
+    world_size = getattr(parallel_config, "world_size", 1)
+    try:
+        world_size = max(1, int(world_size))
+    except (TypeError, ValueError):
+        world_size = 1
+
+    return acquire_device_locks(
+        stage_id,
+        {"tensor_parallel_size": world_size},
+        stage_init_timeout,
+    )
+
+
 def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> Any:
-    """Load omni transfer config from an explicit path or resolved model config."""
+    """Load omni transfer config from an explicit path or resolved model config.
+
+    Resolves ``base_config`` inheritance (CI overlay → base deploy YAML) so
+    that connectors defined in the base config are visible to the transfer
+    config parser.
+    """
     from vllm_omni.distributed.omni_connectors import load_omni_transfer_config
 
     try:
         resolved_config_path = config_path or resolve_model_config_path(model)
-        return load_omni_transfer_config(resolved_config_path)
+        if resolved_config_path is None:
+            return None
+        from vllm_omni.config.stage_config import resolve_deploy_yaml
+
+        resolved_dict = resolve_deploy_yaml(resolved_config_path)
+        return load_omni_transfer_config(config_dict=resolved_dict)
     except Exception as e:
         logger.warning("[stage_init] Failed to load transfer config: %s", e)
         return None

@@ -24,6 +24,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.qwen_image.autoencoder_kl_qwenimage import (
     AutoencoderKLQwenImage,
@@ -216,6 +217,14 @@ class QwenImageLayeredPipeline(nn.Module, SupportImageInput, QwenImageCFGParalle
         model = od_config.model
         # Check if model is a local path
         local_files_only = os.path.exists(model)
+
+        # See pipeline_qwen_image_edit_plus: guard against transformers v5
+        # multi-worker race on partial subfolder shard sets (Buildkite #1043).
+        prefetch_subfolders(
+            model,
+            ["scheduler", "text_encoder", "vae", "tokenizer", "processor"],
+            local_files_only=local_files_only,
+        )
 
         # modules keep same as transformers & diffusers
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(

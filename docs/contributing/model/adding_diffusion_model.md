@@ -813,16 +813,16 @@ class WanTransformer3DModel(nn.Module):
 
 ---
 
-### Diffusion Timing (Performance Profiling)
+### Diffusion Pipeline Profiler (Performance Profiling)
 When adapting a new diffusion model, it is often useful to analyze the latency of key components such as text encoding, diffusion denoising, and VAE decoding.
 vLLM-Omni provides a timing utility via `DiffusionPipelineProfilerMixin` to help developers quickly identify performance bottlenecks.
 
 !!! info
-      `DiffusionPipelineProfilerMixin` is different from using `torch.profiler` for diffusion models, as introduced in this [tutorial](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/profiling.md#3-profiling-diffusion-models). `DiffusionPipelineProfilerMixin` only prints the timing information of multiple functions (such as `vae.decode`), while `torch.profiler` saves detailed GPU/CPU computation time, call/execution steps.
+      `DiffusionPipelineProfilerMixin` is different from using `torch.profiler` for diffusion models, as introduced in this [tutorial](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/profiling.md). `DiffusionPipelineProfilerMixin` only prints the timing information of multiple functions (such as `vae.decode`), while `torch.profiler` saves detailed GPU/CPU computation time, call/execution steps.
 
 This tool automatically measures the execution time of selected pipeline modules and prints the results in the logs.
 
-**Enabling Diffusion Timing**
+**Enabling Diffusion Pipeline Profiler**
 
 
 Enable timing by setting:
@@ -843,7 +843,7 @@ If not specified, the default targets are used:
 **Adding DiffusionPipelineProfilerMixin to a Pipeline**
 To enable timing support in your pipeline, inherit from DiffusionPipelineProfilerMixin.
 ```python
-from vllm_omni.diffusion.utils.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.profiler import DiffusionPipelineProfilerMixin
 
 class YourModelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
     # Optional: Specify custom timing targets
@@ -862,7 +862,9 @@ class YourModelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         ...
 
         # initialize timing profiler
-        self.setup_diffusion_pipeline_profiler(enable_diffusion_pipeline_profiler)
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 ```
 The mixin dynamically wraps selected methods and records their execution time during inference.
 
@@ -906,9 +908,9 @@ tokenizer.forward
 
 When enabled, timing logs appear like this:
 ```
-[DiffusionTiming] text_encoder.forward took 0.018s
-[DiffusionTiming] diffuse took 2.412s
-[DiffusionTiming] vae.decode took 0.063s
+[DiffusionPipelineProfiler] text_encoder.forward took 0.018s
+[DiffusionPipelineProfiler] diffuse took 2.412s
+[DiffusionPipelineProfiler] vae.decode took 0.063s
 ```
 These measurements help identify bottlenecks during model adaptation and optimization
 

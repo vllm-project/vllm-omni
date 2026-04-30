@@ -24,6 +24,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
@@ -37,6 +38,7 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
+from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
@@ -772,7 +774,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             if use_gpu_toks:
                 assert isinstance(
                     self.drafter,
-                    EagleProposer | DraftModelProposer | ExtractHiddenStatesProposer,
+                    EagleProposer | DFlashProposer | DraftModelProposer | ExtractHiddenStatesProposer,
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
@@ -811,7 +813,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 logits,
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
-                spec_decode_metadata,
             )
 
         if propose_drafts_after_bookkeeping:
@@ -854,7 +855,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
         # Otherwise we don't have the mm CPU data yet, so we still need to build it
         if self.omni_prefix_cache is None:
-            mm_cpu = build_mm_cpu(multimodal_outputs)
+            mm_cpu = build_mm_cpu(flatten_payload(multimodal_outputs))
 
         self._process_additional_information_updates(
             hidden_states,
@@ -909,7 +910,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                             seq_len=seq_len,
                         )
                 payload.update(mm_payload)
-            pooler_output.append(payload)
+            # Flatten nested dicts to dotted keys so pooling_output
+            # stays dict[str, torch.Tensor] for msgspec serialization.
+            pooler_output.append(flatten_payload(payload))
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()

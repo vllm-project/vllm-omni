@@ -33,6 +33,8 @@ def add_daily_omni_cli_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Root directory of extracted Daily-Omni videos (contents of Videos.tar: "
         "each video_id in its own subdir with {video_id}_video.mp4). "
+        "If omitted, Videos.tar is downloaded from the Hugging Face dataset repo on first multimodal "
+        "request. "
         "When using file URLs, you MUST start the vLLM server with "
         "--allowed-local-media-path set to this same directory (or a parent), "
         "otherwise requests fail with 'Cannot load local files without "
@@ -116,7 +118,7 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
         default=False,
         help="Keep synthesized audio as 24 kHz mono PCM for WER (works with "
         "--backend openai-audio-speech or openai-chat-omni). Scoring follows "
-        "BytedanceSpeech/seed-tts-eval (Whisper-large-v3 / Paraformer-zh + jiwer). "
+        "zhaochenyang20/seed-tts-eval (Whisper-large-v3 / Paraformer-zh + jiwer). "
         "Sets SEED_TTS_WER_EVAL=1. Install: pip install 'vllm-omni[seed-tts-eval]'. "
         "Optional: SEED_TTS_EVAL_DEVICE, SEED_TTS_HF_WHISPER_MODEL.",
     )
@@ -145,7 +147,9 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
 
         for action in parser._actions:
             if action.dest == "dataset_name" and action.choices is not None:
-                extra = [c for c in ("daily-omni", "seed-tts") if c not in action.choices]
+                extra = [
+                    c for c in ("daily-omni", "seed-tts", "seed-tts-text", "seed-tts-design") if c not in action.choices
+                ]
                 if extra:
                     action.choices = list(action.choices) + extra
 

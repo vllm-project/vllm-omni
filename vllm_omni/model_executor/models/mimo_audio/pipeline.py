@@ -16,8 +16,10 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
 )
+from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import NO_INTERLEAVE_NEXT_TOKEN_ID
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.mimo_audio"
+_IM_END_TOKEN_ID = 151645
 
 MIMO_AUDIO_PIPELINE = PipelineConfig(
     model_type="mimo_audio",
@@ -25,7 +27,7 @@ MIMO_AUDIO_PIPELINE = PipelineConfig(
     # ``model_executor/models/registry.py``; it resolves to the internal
     # class ``MiMoAudioForConditionalGeneration`` in ``mimo_audio.py``.
     model_arch="MiMoAudioModel",
-    hf_architectures=("MiMoAudioModel",),
+    hf_architectures=("MiMoAudioModel", "MiMoV2ASRForCausalLM"),
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -37,7 +39,13 @@ MIMO_AUDIO_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=(f"{_PROC}.llm2code2wav_async_chunk"),
-            sampling_constraints={"detokenize": True},
+            sampling_constraints={
+                "detokenize": True,
+                # Stop once the speech/text interleaved span ends. Code2Wav
+                # also treats this token as the audio boundary; without this
+                # the text stream can continue after audio has already ended.
+                "stop_token_ids": [NO_INTERLEAVE_NEXT_TOKEN_ID, _IM_END_TOKEN_ID],
+            },
         ),
         StagePipelineConfig(
             stage_id=1,

@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Any
 
 import torch
+import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.platforms import Platform
 
@@ -72,6 +73,13 @@ class OmniPlatform(Platform):
         return None
 
     @classmethod
+    def get_diffusion_packed_modules_mapping(
+        cls,
+        model_class: type[nn.Module],
+    ) -> dict[str, list[str]] | None:
+        return None
+
+    @classmethod
     def get_diffusion_attn_backend_cls(
         cls,
         selected_backend: str | None,
@@ -96,6 +104,11 @@ class OmniPlatform(Platform):
     def supports_torch_inductor(cls) -> bool:
         """Check if the platform supports torch.compile with inductor backend."""
         raise NotImplementedError
+
+    @classmethod
+    def has_flash_attn_package(cls) -> bool:
+        """Check if a Flash Attention package is available and usable on this platform."""
+        return False
 
     @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
