@@ -112,12 +112,7 @@ class DiffusersPipelineLoader:
             raise ValueError(
                 f"Multiple index files found in {model_name_or_path} with subfolder {subfolder}: {available_index_file}"
             )
-        index_file_with_subfolder = available_index_file[0] if len(available_index_file) == 1 else None
-        index_file = (
-            index_file_with_subfolder.split("/")[-1]
-            if index_file_with_subfolder and subfolder is not None
-            else index_file_with_subfolder
-        )
+        index_file = available_index_file[0] if len(available_index_file) == 1 else ""
 
         # only hf is supported currently
         if load_format == "auto":
@@ -135,19 +130,20 @@ class DiffusersPipelineLoader:
         if allow_patterns_overrides is not None:
             allow_patterns = allow_patterns_overrides
 
-        if subfolder is not None:
-            allow_patterns = [f"{subfolder}/{pattern}" for pattern in allow_patterns]
-
         if not is_local:
             hf_folder = download_weights_from_hf(
                 model_name_or_path,
                 self.load_config.download_dir,
                 allow_patterns,
                 revision,
+                subfolder=subfolder,
                 ignore_patterns=self.load_config.ignore_patterns,
             )
         else:
             hf_folder = model_name_or_path
+
+        if subfolder is not None:
+            hf_folder = os.path.join(hf_folder, subfolder)
 
         hf_weights_files: list[str] = []
         for pattern in allow_patterns:
@@ -166,22 +162,12 @@ class DiffusersPipelineLoader:
             if not is_local:
                 download_safetensors_index_file_from_hf(
                     model_name_or_path,
-                    index_file_with_subfolder,
-                    self.load_config.download_dir,
-                    revision,
+                    index_file,
+                    cache_dir=self.load_config.download_dir,
+                    subfolder=subfolder,
+                    revision=revision,
                 )
-            # Some diffusers pipelines keep component weights under a
-            # subfolder (e.g. "transformer/") and the corresponding index file
-            # uses filenames relative to that subfolder. vLLM's
-            # `filter_duplicate_safetensors_files` expects weight_map entries
-            # to be relative to the `hf_folder` we pass in, so we point it to
-            # the component subfolder to avoid filtering out all shards.
-            filter_folder = os.path.join(hf_folder, subfolder) if subfolder is not None else hf_folder
-            hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files,
-                filter_folder,
-                index_file or "",
-            )
+            hf_weights_files = filter_duplicate_safetensors_files(hf_weights_files, hf_folder, index_file)
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
