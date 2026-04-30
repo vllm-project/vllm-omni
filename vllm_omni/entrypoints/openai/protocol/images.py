@@ -139,6 +139,12 @@ class ImageGenerationRequest(BaseModel):
     vae_use_slicing: bool | None = Field(default=False, description="Enable VAE slicing")
     vae_use_tiling: bool | None = Field(default=False, description="Enable VAE tiling")
 
+    # Output format for generated images
+    output_format: str | None = Field(
+        default=None,
+        description="Output image format: 'png', 'jpeg', or 'webp'. Defaults to 'png'.",
+    )
+
 
 class ImageData(BaseModel):
     """Single generated image data"""

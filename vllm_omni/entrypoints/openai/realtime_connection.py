@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 from collections.abc import AsyncGenerator
+from typing import cast
 from uuid import uuid4
 
 import numpy as np
@@ -11,6 +12,9 @@ from vllm.entrypoints.openai.engine.protocol import UsageInfo
 from vllm.entrypoints.openai.realtime.connection import RealtimeConnection as VllmRealtimeConnection
 from vllm.entrypoints.openai.realtime.protocol import TranscriptionDelta, TranscriptionDone
 from vllm.logger import init_logger
+
+from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.utils import coerce_param_message_types
 
 logger = init_logger(__name__)
 
@@ -24,8 +28,7 @@ class RealtimeConnection(VllmRealtimeConnection):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Last audio buffer seen for this realtime generation (cumulative or concatenation
-        # of increments); used to turn server cumulative PCM into true deltas.
+        self.engine = cast(AsyncOmni, self.serving.engine_client)
         self._realtime_audio_ref: np.ndarray | None = None
 
     async def start_generation(self):
@@ -115,41 +118,48 @@ class RealtimeConnection(VllmRealtimeConnection):
         sent_audio = False
         audio_done_sent = False
         full_text = ""
-        sent_text_len = 0
         prompt_token_ids_len = 0
         completion_tokens_len = 0
         self._realtime_audio_ref = None
 
+        # Coerce cumulative outputs to delta outputs; this ensures
+        # we don't emit redundant MM data & drain after emitting.
+        sampling_params_list = list(self.engine.default_sampling_params_list)
+        sampling_params_list = coerce_param_message_types(
+            sampling_params_list,
+            is_streaming=True,
+        )
+
         try:
-            result_gen = self.serving.engine_client.generate(
+            result_gen = self.engine.generate(
                 prompt=streaming_input_gen,
                 request_id=request_id,
+                sampling_params_list=sampling_params_list,
             )
 
             async for output in result_gen:
+                # Handle delta texts; this is very similar to the client from vLLM
                 if output.outputs and len(output.outputs) > 0:
-                    output0 = output.outputs[0]
-                    token_ids = list(output0.token_ids)
-                    if token_ids:
-                        input_stream.put_nowait(token_ids)
-                        # token_ids are cumulative per request
-                        completion_tokens_len = len(token_ids)
+                    first_output = output.outputs[0]
+                    new_token_ids = list(first_output.token_ids)
+                    new_tokens_len = len(new_token_ids)
+
                     if not prompt_token_ids_len and output.prompt_token_ids:
                         prompt_token_ids_len = len(output.prompt_token_ids)
-                    cumulative_text = output0.text or ""
-                    if cumulative_text:
-                        if len(cumulative_text) >= sent_text_len:
-                            delta_text = cumulative_text[sent_text_len:]
-                        else:
-                            delta_text = cumulative_text
-                        sent_text_len = len(cumulative_text)
-                        full_text = cumulative_text
-                    else:
-                        delta_text = ""
 
+                    if new_tokens_len:
+                        input_stream.put_nowait(new_token_ids)
+
+                    delta_text = first_output.text or ""
+                    full_text += delta_text
+
+                    # append output to input if there was any delta text
                     if delta_text:
                         await self.send(TranscriptionDelta(delta=delta_text))
 
+                    completion_tokens_len += new_tokens_len
+
+                # Handle audio chunking; this is Omni specific
                 audio_chunks, sample_rate = self._extract_audio_chunks(output)
 
                 for chunk in audio_chunks:

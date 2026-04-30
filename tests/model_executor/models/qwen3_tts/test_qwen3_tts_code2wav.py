@@ -44,7 +44,7 @@ def test_forward_trims_context_on_exact_frame_boundaries():
 
     out = model.forward(
         input_ids=torch.arange(12, dtype=torch.long),
-        runtime_additional_information=[{"left_context_size": 2}],
+        runtime_additional_information=[{"meta": {"left_context_size": 2}}],
     )
 
     audio = out.multimodal_outputs["model_outputs"][0]
@@ -57,7 +57,7 @@ def test_forward_trims_trailing_padding_without_context():
 
     out = model.forward(
         input_ids=torch.arange(12, dtype=torch.long),
-        runtime_additional_information=[{"left_context_size": 0}],
+        runtime_additional_information=[{"meta": {"left_context_size": 0}}],
     )
 
     audio = out.multimodal_outputs["model_outputs"][0]

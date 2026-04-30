@@ -35,6 +35,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.z_image.z_image_transformer import (
     ZImageTransformer2DModel,
 )
@@ -179,6 +180,14 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self._execution_device = get_local_device()
         model = od_config.model
         local_files_only = os.path.exists(model)
+
+        # See ``hub_prefetch.py`` for the transformers v5 subfolder race.
+        prefetch_subfolders(
+            model,
+            ["scheduler", "text_encoder", "vae", "tokenizer"],
+            local_files_only=local_files_only,
+        )
+
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
