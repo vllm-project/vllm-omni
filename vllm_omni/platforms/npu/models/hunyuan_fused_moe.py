@@ -103,6 +103,9 @@ def prepare_hunyuan_fused_moe_runtime() -> None:
     _ensure_forward_context_attr("flash_comm_v1_enabled", bool, False)
 
 
+# NOTE: As of v0.20,0 vLLM has folded SharedFusedMoE -> FusedMoE and removed the class.
+# Since AscendSharedFusedMoE is a subclass of SharedFusedMoE, we should be careful
+# to ensure that this is updated correctly.
 class AscendHunyuanFusedMoE(AscendSharedFusedMoE):
     def __init__(self, *, prefix: str = "", **kwargs: Any) -> None:
         super().__init__(prefix=prefix, **kwargs)

@@ -20,6 +20,7 @@ stages:
     max_num_batched_tokens: 4096
     max_model_len: 4096
     devices: "0"
+    trust_remote_code: true
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

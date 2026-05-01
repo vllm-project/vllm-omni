@@ -7,7 +7,9 @@ steps:
   grade: Blocking
   commands:
     - export VLLM_ROCM_USE_AITER=0
-    - "timeout 20m pytest -v -s -m 'core_model and cpu' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
+    # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
+    # that is not supported on CPU
+    - "timeout 20m pytest -vvvv -s -m 'core_model and cpu' --ignore=tests/diffusion/cache/test_teacache_extractors.py --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
 
 - label: "Voxtral TTS CUDA Unit Test"
   agent_pool: mi325_1

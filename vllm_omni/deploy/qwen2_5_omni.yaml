@@ -22,6 +22,7 @@ stages:
     max_num_seqs: 1
     gpu_memory_utilization: 0.8
     enforce_eager: true
+    enable_prefix_caching: false
     mm_processor_cache_gb: 0
     devices: "0"
     default_sampling_params:
@@ -49,6 +50,7 @@ stages:
     max_num_seqs: 1
     gpu_memory_utilization: 0.15
     enforce_eager: true
+    enable_prefix_caching: false
     enable_flashinfer_autotune: false
     async_scheduling: false
     devices: "0"

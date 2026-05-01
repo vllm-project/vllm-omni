@@ -24,6 +24,7 @@ stages:
     max_num_seqs: 32
     gpu_memory_utilization: 0.8
     enforce_eager: false
+    enable_prefix_caching: false
     async_scheduling: true
     max_model_len: 4096
     devices: "0"
@@ -48,6 +49,7 @@ stages:
     max_num_seqs: 32
     gpu_memory_utilization: 0.1
     enforce_eager: true
+    enable_prefix_caching: false
     async_scheduling: false
     max_num_batched_tokens: 65536
     max_model_len: 65536

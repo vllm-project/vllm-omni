@@ -71,9 +71,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ulysses-degree", type=int, default=1, help="Ulysses SP degree.")
     parser.add_argument("--ring-degree", type=int, default=1, help="Ring attention degree.")
     parser.add_argument("--cfg-parallel-size", type=int, default=1, choices=[1, 2], help="CFG parallel size.")
-    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
-
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

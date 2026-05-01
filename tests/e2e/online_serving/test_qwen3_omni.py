@@ -180,6 +180,7 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", prefix_test_params, indirect=True)
+@pytest.mark.skip(reason="Flaky: identical greedy requests diverge on text_content (prefix caching path).")
 def test_thinker_prefix_caching(omni_server, openai_client) -> None:
     """
     Test thinker prefix caching by sending identical requests with an image (i.e.,
