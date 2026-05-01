@@ -1,23 +1,44 @@
 # Text-To-Video
 
-A unified script for text-to-video generation. Supports multiple models with model-aware defaults.
+Generate videos from text prompts using vLLM-Omni's diffusion and video pipeline entrypoints.
 
-## Supported Models
+- `text_to_video.py`: command-line script for single video generation with model-aware defaults and advanced options.
 
-| Model | Default Resolution | Default Frames | Default Steps | Guidance | VRAM (BF16) |
-|---|---|---|---|---|---|
-| `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
-| `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
-| `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
+## Table of Contents
 
-## Local CLI Usage
+- [Overview](#overview)
+- [Quick Start](#quick-start)
+- [Key Arguments](#key-arguments)
+- [More CLI Examples](#more-cli-examples)
+- [FAQ](#faq)
 
-### Wan2.2 (default)
+## Overview
+
+This folder provides a unified CLI script for text-to-video generation using vLLM-Omni diffusion/video pipelines. The script selects practical defaults for supported model families while still exposing common sampling, memory, and parallelism options.
+
+### Supported Models
+
+| Model | Default Resolution | Default Frames | Default Steps | Guidance | VRAM Notes |
+| ----- | ------------------ | -------------- | ------------- | -------- | ---------- |
+| `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720 x 1280 | 81 | 40 | 4.0 | Around 60 GiB BF16 for basic single-card usage |
+| `Lightricks/LTX-2` | 512 x 768 | 121 | 40 | 4.0 | Memory use depends on frame count, tensor parallelism, and audio export |
+| `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480 x 832 | 121 | 50 | 6.0 | Plan for an 80 GiB GPU for conservative single-card usage |
+| `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720 x 1280 | 121 | 50 | 6.0 | Use FP8 and VAE tiling for 720p single-card runs |
+
+!!! info
+
+    VRAM notes are conservative estimates for basic generation and can vary with driver, dependency versions, frame count, resolution, and memory optimization flags.
+
+Default model: `Wan-AI/Wan2.2-T2V-A14B-Diffusers`
+
+## Quick Start
+
+### Local CLI Usage
 
 ```bash
 python text_to_video.py \
   --prompt "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage." \
-  --negative-prompt "<optional quality filter>" \
+  --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
   --height 480 \
   --width 832 \
   --num-frames 33 \
@@ -29,11 +50,62 @@ python text_to_video.py \
   --output t2v_out.mp4
 ```
 
-LTX2 example:
+## Key Arguments
+
+**Common arguments:**
+
+| Argument | Type | Default | Description |
+| -------- | ---- | ------- | ----------- |
+| `--model` | str | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Diffusers model ID or local path |
+| `--prompt` | str | `"A serene lakeside sunrise with mist over the water."` | Text description for video generation |
+| `--seed` | int | `42` | Integer seed for deterministic sampling |
+| `--height` / `--width` | int | model-specific | Output video resolution in pixels |
+| `--num-frames` | int | model-specific | Number of generated frames |
+| `--num-inference-steps` | int | model-specific | Diffusion sampling steps |
+| `--guidance-scale` | float | model-specific | Classifier-free guidance scale |
+| `--fps` | int | model-specific | Frames per second for the saved MP4 |
+| `--output` | str | model-specific | Path to save the generated video |
+| `--vae-use-slicing` | flag | off | Enable VAE slicing for memory optimization |
+| `--vae-use-tiling` | flag | off | Enable VAE tiling for memory optimization |
+| `--cfg-parallel-size` | int | `1` | Set to `2` to enable CFG Parallel |
+| `--tensor-parallel-size` | int | `1` | Tensor parallel size for models that support TP, such as LTX2 |
+| `--ulysses-degree` | int | `1` | Ulysses sequence parallel degree |
+| `--ring-degree` | int | `1` | Ring sequence parallel degree |
+| `--enable-cpu-offload` | flag | off | Enable CPU offloading for diffusion models |
+| `--enable-layerwise-offload` | flag | off | Enable layerwise offloading on DiT modules |
+| `--frame-rate` | float | `None` | Optional generation frame rate for pipelines that require it, such as LTX2 |
+| `--audio-sample-rate` | int | `24000` | Audio sample rate when the pipeline returns audio |
+| `--quantization` | str | `None` | Quantization method: `fp8` or `gguf` |
+| `--flow-shift` | float | model-specific | Scheduler `flow_shift` parameter |
+
+**Wan2.2-specific arguments:**
+
+| Argument | Type | Default | Description |
+| -------- | ---- | ------- | ----------- |
+| `--negative-prompt` | str | `""` | Artifacts or visual qualities to suppress |
+| `--guidance-scale-high` | float | `None` | Separate CFG scale for the high-noise stage |
+| `--boundary-ratio` | float | `None` | Boundary split ratio for low/high DiT; Wan2.2 default is `0.875` |
+| `--flow-shift` | float | model-specific | Recommended values: `5.0` for 720p, `12.0` for 480p |
+| `--cache-backend` | str | `None` | Use `cache_dit` to enable the Cache-DiT acceleration backend |
+| `--enable-cache-dit-summary` | flag | off | Print Cache-DiT summary logging after diffusion forward passes |
+
+**HunyuanVideo-1.5 optimal configs:**
+
+| Variant | `--flow-shift` | `--guidance-scale` | `--num-inference-steps` |
+| ------- | -------------- | ------------------ | ----------------------- |
+| 480p T2V | `5.0` | `6.0` | `50` |
+| 720p T2V | `9.0` | `6.0` | `50` |
+| 480p I2V | `5.0` | `6.0` | `50` |
+| 720p I2V | `7.0` | `6.0` | `50` |
+| CFG-distilled | same as variant | `1.0` | `50` |
+
+## More CLI Examples
+
+### LTX2
 
 ```bash
 python text_to_video.py \
-  --model "Lightricks/LTX-2" \
+  --model Lightricks/LTX-2 \
   --prompt "A cinematic close-up of ocean waves at golden hour." \
   --negative-prompt "worst quality, inconsistent motion, blurry, jittery, distorted" \
   --height 512 \
@@ -45,7 +117,7 @@ python text_to_video.py \
   --output ltx2_out.mp4
 ```
 
-### HunyuanVideo-1.5 (480p)
+### HunyuanVideo-1.5 480p
 
 ```bash
 python text_to_video.py \
@@ -61,7 +133,7 @@ python text_to_video.py \
   --output hunyuan_video_15_output.mp4
 ```
 
-### HunyuanVideo-1.5 (720p)
+### HunyuanVideo-1.5 720p
 
 ```bash
 python text_to_video.py \
@@ -84,61 +156,30 @@ python text_to_video.py \
   --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v \
   --prompt "A dog running across a field of golden wheat." \
   --quantization fp8 \
-  --height 480 --width 832 --num-frames 121 \
-  --guidance-scale 6.0 --flow-shift 5.0 \
+  --height 480 \
+  --width 832 \
+  --num-frames 121 \
+  --guidance-scale 6.0 \
+  --flow-shift 5.0 \
   --output hunyuan_fp8.mp4
 ```
 
-Quick test (smaller resolution, fewer frames):
+### Quick Test
 
 ```bash
 python text_to_video.py \
   --model hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v \
   --prompt "A serene lakeside sunrise with mist over the water." \
-  --height 320 --width 576 --num-frames 17 --num-inference-steps 30 \
+  --height 320 \
+  --width 576 \
+  --num-frames 17 \
+  --num-inference-steps 30 \
   --flow-shift 5.0 \
   --output quick_test.mp4
 ```
 
-## Key Arguments
+## FAQ
 
-### Common
+**What should I try if generation runs out of memory?**
 
-- `--model`: Diffusers model ID or local path.
-- `--prompt`: text description (string).
-- `--height/--width`: output resolution. Default depends on model.
-- `--num-frames`: number of frames. Default depends on model.
-- `--guidance-scale`: CFG scale. Default depends on model.
-- `--num-inference-steps`: sampling steps. Default depends on model.
-- `--fps`: frames per second for the saved MP4.
-- `--output`: path to save the generated video.
-- `--vae-use-slicing`: enable VAE slicing for memory optimization.
-- `--vae-use-tiling`: enable VAE tiling for memory optimization.
-- `--cfg-parallel-size`: set it to 2 to enable CFG Parallel. See more examples in [`user_guide`](../../../docs/user_guide/diffusion/parallelism_acceleration.md#cfg-parallel).
-- `--tensor-parallel-size`: tensor parallel size (effective for models that support TP, e.g. LTX2).
-- `--enable-cpu-offload`: enable CPU offloading for diffusion models.
-- `--enable-layerwise-offload`: enable layerwise offloading on DiT modules.
-- `--frame-rate`: generation FPS for pipelines that require it (e.g., LTX2).
-- `--audio-sample-rate`: audio sample rate for embedded audio (when the pipeline returns audio).
-- `--quantization`: quantization method (`fp8` for FP8, `gguf` for GGUF).
-- `--flow-shift`: scheduler flow_shift parameter.
-
-### Wan2.2-specific
-
-- `--negative-prompt`: artifacts to suppress.
-- `--guidance-scale-high`: separate CFG scale for high-noise stage.
-- `--boundary-ratio`: boundary split for low/high DiT (default 0.875).
-- `--flow-shift`: scheduler flow_shift (5.0 for 720p, 12.0 for 480p).
-- `--cache-backend`: `cache_dit` for acceleration.
-
-### HunyuanVideo-1.5 Optimal Configs
-
-| Variant | flow_shift | guidance_scale | steps |
-|---------|-----------|----------------|-------|
-| 480p T2V | 5.0 | 6.0 | 50 |
-| 720p T2V | 9.0 | 6.0 | 50 |
-| 480p I2V | 5.0 | 6.0 | 50 |
-| 720p I2V | 7.0 | 6.0 | 50 |
-| CFG-distilled | (same) | 1.0 | 50 |
-
-> If you encounter OOM errors, try `--vae-use-slicing`, `--vae-use-tiling`, `--enable-cpu-offload`, or `--quantization fp8`.
+Try one or more memory-saving options: `--vae-use-slicing`, `--vae-use-tiling`, `--enable-cpu-offload`, or `--quantization fp8`. For quick smoke tests, use a smaller resolution and fewer frames, such as the Quick Test example above.
