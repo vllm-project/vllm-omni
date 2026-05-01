@@ -23,6 +23,7 @@ connectors:
 stages:
   - stage_id: 0
     gpu_memory_utilization: 0.9
+    enable_prefix_caching: false
     devices: "0"
     default_sampling_params:
       temperature: 0.4
@@ -34,6 +35,7 @@ stages:
 
   - stage_id: 1
     gpu_memory_utilization: 0.6
+    enable_prefix_caching: false
     devices: "1"
     input_connectors:
       from_stage_0: connector_of_shared_memory
@@ -47,6 +49,7 @@ stages:
   - stage_id: 2
     gpu_memory_utilization: 0.1
     enforce_eager: true
+    enable_prefix_caching: false
     async_scheduling: false
     max_num_batched_tokens: 51200
     devices: "1"

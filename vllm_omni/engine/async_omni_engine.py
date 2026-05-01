@@ -1324,6 +1324,9 @@ class AsyncOmniEngine:
 
         num_devices = max(1, int(parallel_config.world_size))
         devices = ",".join(str(i) for i in range(num_devices))
+        enforce_eager = kwargs.get("enforce_eager")
+        if enforce_eager is None:
+            enforce_eager = False
 
         stage_engine_args = {
             "max_num_seqs": 1,
@@ -1337,7 +1340,7 @@ class AsyncOmniEngine:
             "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
-            "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
+            "enforce_eager": enforce_eager,
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),

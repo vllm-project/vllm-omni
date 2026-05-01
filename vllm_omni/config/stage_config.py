@@ -402,11 +402,11 @@ class StageDeployConfig:
     """
 
     stage_id: int
-    max_num_seqs: int = 64
-    gpu_memory_utilization: float = 0.9
-    tensor_parallel_size: int = 1
-    enforce_eager: bool = False
-    max_num_batched_tokens: int = 32768
+    max_num_seqs: int | None = None
+    gpu_memory_utilization: float | None = None
+    tensor_parallel_size: int | None = None
+    enforce_eager: bool | None = None
+    max_num_batched_tokens: int | None = None
     max_model_len: int | None = None
     async_scheduling: bool | None = None
     devices: str = "0"
@@ -414,6 +414,14 @@ class StageDeployConfig:
     input_connectors: dict[str, str] | None = None
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
+    profiler_config: dict[str, Any] | None = None
+    disable_hybrid_kv_cache_manager: bool | None = None
+    mm_processor_cache_gb: float | None = None
+    skip_mm_profiling: bool | None = None
+    enable_flashinfer_autotune: bool | None = None
+    config_format: str | None = None
+    load_format: str | None = None
+    tokenizer_mode: str | None = None
     engine_extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -438,14 +446,14 @@ class DeployConfig:
     pipeline: str | None = None
 
     # === Pipeline-wide engine settings (applied uniformly to every stage) ===
-    trust_remote_code: bool = True
+    trust_remote_code: bool | None = None
     distributed_executor_backend: str | None = None
     dtype: str | None = None
     quantization: str | None = None
-    enable_prefix_caching: bool = False
+    enable_prefix_caching: bool | None = None
     enable_chunked_prefill: bool | None = None
-    data_parallel_size: int = 1
-    pipeline_parallel_size: int = 1
+    data_parallel_size: int | None = None
+    pipeline_parallel_size: int | None = None
 
 
 _STAGE_NON_ENGINE_KEYS = frozenset(
@@ -689,6 +697,18 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
 )
 
 
+def deploy_override_field_names() -> frozenset[str]:
+    """Return deploy-schema fields whose CLI defaults must not override YAML."""
+    return (
+        frozenset(_STAGE_DEPLOY_FIELDS)
+        | frozenset(_PIPELINE_WIDE_ENGINE_FIELDS)
+        | {
+            "async_chunk",
+            "devices",
+        }
+    )
+
+
 def _build_engine_args(
     ps: StagePipelineConfig,
     ds: StageDeployConfig | None,
@@ -861,13 +881,15 @@ class StageConfig:
 
         # CLI overrides take precedence over YAML defaults
         for key, value in self.runtime_overrides.items():
+            if value is None:
+                continue
             if key not in ("devices", "max_batch_size"):
                 engine_args[key] = value
 
         # Build runtime config from YAML defaults + CLI overrides
         runtime: dict[str, Any] = dict(self.yaml_runtime)
         runtime.setdefault("process", True)
-        if "devices" in self.runtime_overrides:
+        if self.runtime_overrides.get("devices") is not None:
             runtime["devices"] = self.runtime_overrides["devices"]
 
         # Legacy compat: migrate runtime.max_batch_size → engine_args.max_num_seqs
@@ -882,8 +904,6 @@ class StageConfig:
             )
             effective_mbs = int(cli_mbs or legacy_mbs or 1)
             engine_args.setdefault("max_num_seqs", effective_mbs)
-
-        engine_args.setdefault("max_num_seqs", 1)
 
         # Build full config dict
         config_dict: dict[str, Any] = {
