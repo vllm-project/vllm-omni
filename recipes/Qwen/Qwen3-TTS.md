@@ -11,8 +11,8 @@
 ## When to use this recipe
 
 Use this recipe when you want a known-good starting point for serving Qwen3-TTS
-models with vLLM-Omni on a single 80 GB GPU and validate the deployment with the
-existing TTS client examples in this repository.
+models with vLLM-Omni and validate the deployment with the existing TTS client
+examples in this repository.
 
 Qwen3-TTS supports three task types, each backed by a dedicated model checkpoint:
 
@@ -34,24 +34,13 @@ Smaller 0.6B variants are also available for `CustomVoice` and `Base`.
 - Related issue or discussion:
   [RFC: add recipes folder](https://github.com/vllm-project/vllm-omni/issues/2645)
 
-## Hardware Support
-
-This recipe currently documents one tested reference configuration for CUDA GPU
-serving. Add more sections for other hardware as community validation lands.
-
-## GPU
-
-### 1x H100/A100 80GB
-
-#### Environment
+## Environment
 
 - OS: Linux
 - Python: 3.10+
-- Driver / runtime: NVIDIA CUDA environment with an H100 or A100 80 GB GPU
-- vLLM version: Match the repository requirements for your checkout: 0.19.x
-- vLLM-Omni version or commit: Use the commit you are deploying from: 0.19.x
+- vLLM / vLLM-Omni: use versions from your current checkout, >=0.20.0
 
-#### Command
+## Command
 
 Start the server from the repository root. Pick the model that matches your
 task type:
@@ -91,7 +80,7 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --omni --port 8091 --trust-remote-code
 ```
 
-#### Verification
+## Verification
 
 **Quick smoke test with curl (CustomVoice):**
 
@@ -170,7 +159,7 @@ python examples/offline_inference/qwen3_tts/end2end.py --query-type CustomVoice
 python examples/offline_inference/qwen3_tts/end2end.py --query-type CustomVoice --streaming
 ```
 
-#### Notes
+## Notes
 
 - Memory usage: The deploy config allocates `gpu_memory_utilization: 0.3` per stage (talker + code2wav share a single GPU). For the 0.6B variants or constrained GPUs, adjust via `--gpu-memory-utilization`.
 - Key flags: `--omni` is required. `--deploy-config` points to the bundled two-stage pipeline config.
