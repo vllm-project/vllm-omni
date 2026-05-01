@@ -253,6 +253,27 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._build_fish_speech_prompt_async = make_async(self._build_fish_speech_prompt, executor=self._tts_executor)
         self._estimate_prompt_len_async = make_async(self._estimate_prompt_len, executor=self._tts_executor)
 
+    def _get_qwen_tts_expected_speaker_embedding_dim(self) -> int | None:
+        """Return the loaded Qwen3-TTS speaker embedding dim, if known.
+
+        The user-provided speaker embedding is concatenated directly with
+        talker codec embeddings, so the real compatibility requirement is the
+        talker hidden size.
+        """
+        if self._tts_model_type != "qwen3_tts":
+            return None
+        hf_config = self.engine_client.model_config.hf_config
+        talker_config = hf_config.talker_config
+        return int(talker_config.hidden_size)
+
+    def _validate_qwen_tts_speaker_embedding_dim(self, emb_dim: int) -> str | None:
+        expected_dim = self._get_qwen_tts_expected_speaker_embedding_dim()
+        if expected_dim is None:
+            return None
+        if emb_dim != expected_dim:
+            return f"speaker_embedding has {emb_dim} dimensions; expected {expected_dim} for the loaded Qwen3-TTS model"
+        return None
+
     def _load_codec_frame_rate(self) -> float | None:
         """Load codec frame rate from speech tokenizer config for prompt length estimation."""
         try:
@@ -757,11 +778,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
 
         emb_dim = len(embedding)
-        if emb_dim not in {1024, 2048}:
-            logger.warning(
-                "speaker_embedding has %d dimensions; expected 1024 (0.6B) or 2048 (1.7B)",
-                emb_dim,
-            )
+        dim_err = self._validate_qwen_tts_speaker_embedding_dim(emb_dim)
+        if dim_err is not None:
+            raise ValueError(dim_err)
 
         voice_name_lower = name.lower()
         if voice_name_lower in self.uploaded_speakers:
@@ -1032,15 +1051,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # Base task validation so callers don't need to pass it explicitly.
             request.x_vector_only_mode = True
             emb_len = len(request.speaker_embedding)
-            # ECAPA-TDNN produces 1024-dim (0.6B) or 2048-dim (1.7B)
-            expected_dims = {1024, 2048}
-            if emb_len not in expected_dims:
-                logger.warning(
-                    "speaker_embedding has %d dimensions; expected 1024 "
-                    "(0.6B model) or 2048 (1.7B model). Wrong dimensions "
-                    "will likely result in errors or degraded quality.",
-                    emb_len,
-                )
+            dim_err = self._validate_qwen_tts_speaker_embedding_dim(emb_len)
+            if dim_err is not None:
+                return dim_err
         # Validate Base task requirements
         if task_type == "Base":
             if request.voice is None:
