@@ -21,7 +21,6 @@
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
 import logging
-import math
 from functools import cached_property
 from queue import Queue
 from threading import Lock
@@ -32,6 +31,8 @@ import torch.nn.functional as F
 from transformers import PreTrainedTokenizerBase, Qwen2Config, Qwen2Model, StaticCache
 from vllm.logger import init_logger
 from x_transformers.x_transformers import RotaryEmbedding, apply_rotary_pos_emb
+
+from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
 
 from .audio_vae import AudioVAE
 
@@ -231,34 +232,6 @@ class FinalLayer(nn.Module):
         return x
 
 
-class SinusPositionEmbedding(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, x: torch.Tensor, scale: float = 1000) -> torch.Tensor:
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device).float() * -emb)
-        emb = scale * x.unsqueeze(1) * emb.unsqueeze(0)
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
-
-
-class TimestepEmbedder(nn.Module):
-    def __init__(self, dim: int, freq_embed_dim: int = 256):
-        super().__init__()
-        self.time_embed = SinusPositionEmbedding(freq_embed_dim)
-        self.time_mlp = nn.Sequential(nn.Linear(freq_embed_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
-
-    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
-        time_hidden = self.time_embed(timestep)
-        time_hidden = time_hidden.to(timestep.dtype)
-        time = self.time_mlp(time_hidden)
-        return time
-
-
 class CondEmbedder(nn.Module):
     """Embeds LLM hidden states with optional CFG dropout."""
 
@@ -288,7 +261,7 @@ class DiT(nn.Module):
         self.out_channels = in_channels
         self.num_heads = num_heads
 
-        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.t_embedder = DiTTimestepEmbedding(hidden_size)
         self.x_embedder = nn.Linear(in_channels, hidden_size)
         self.c_embedder = CondEmbedder(llm_cond_dim, hidden_size)
         if "spk_dim" in kwargs:

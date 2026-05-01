@@ -13,7 +13,7 @@ vLLM-Omni current recommends the steps in under setup through Docker Images.
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
-uv pip install vllm==0.20.0+rocm700 --extra-index-url https://wheels.vllm.ai/rocm/0.20.0/rocm700
+uv pip install vllm==0.20.0+rocm721 --extra-index-url https://wheels.vllm.ai/rocm/0.20.0/rocm721
 ```
 
 #### Installation of vLLM-Omni
@@ -37,10 +37,10 @@ uv pip install onnxruntime-rocm
 If you do not need to modify source code of vLLM, you can directly install the stable 0.20.0 release version of the library
 
 ```bash
-uv pip install vllm==0.20.0+rocm700 --extra-index-url https://wheels.vllm.ai/rocm/0.20.0/rocm700
+uv pip install vllm==0.20.0+rocm721 --extra-index-url https://wheels.vllm.ai/rocm/0.20.0/rocm721
 ```
 
-The pre-built 0.20.0 vLLM wheel targets ROCm 7.0. If you need a different ROCm stack or want to reuse an existing PyTorch installation, build vLLM from source instead.
+The pre-built 0.20.0 vLLM wheel targets ROCm 7.2.1. If you need a different ROCm stack or want to reuse an existing PyTorch installation, build vLLM from source instead.
 
 #### Installation of vLLM-Omni
 Since vllm-omni is rapidly evolving, it's recommended to install it from source

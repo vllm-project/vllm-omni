@@ -2,6 +2,7 @@
 
 import base64
 import concurrent.futures
+import errno
 import io
 import json
 import os
@@ -56,10 +57,37 @@ except Exception:  # pragma: no cover
         return None
 
 
-def get_open_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
+    """Return a local TCP port that is suitable for binding a new listener.
+
+    A single ``bind(host, 0)`` / close cycle leaves a race where another process can
+    take the same port number before PyTorch/vLLM bind it, yielding
+    ``EADDRINUSE`` / ``DistNetworkError``. We therefore:
+
+    #. Allocate an ephemeral port on *host*.
+    #. Immediately attempt ``bind(host, port)`` again. If that fails with
+       ``errno.EADDRINUSE``, retry from step 1.
+
+    Raises ``RuntimeError`` if no free port is found after *max_attempts* (e.g. port
+    exhaustion under heavy parallel tests).
+    """
+    last_exc: OSError | None = None
+    for _ in range(max_attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, 0))
+            port = int(s.getsockname()[1])
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind((host, port))
+        except OSError as exc:
+            last_exc = exc
+            if exc.errno == errno.EADDRINUSE:
+                continue
+            raise
+        return port
+    raise RuntimeError(
+        f"Could not obtain a free TCP port on {host!r} after {max_attempts} attempts (last error: {last_exc!r})"
+    ) from last_exc
 
 
 def dummy_messages_from_mix_data(

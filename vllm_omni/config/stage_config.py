@@ -1009,6 +1009,8 @@ class StageConfigFactory:
             cli_overrides = {}
 
         trust_remote_code = cli_overrides.get("trust_remote_code", True)
+        if trust_remote_code is None:
+            trust_remote_code = False
 
         # --- New path: check pipeline registry by model_type first ---
         model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
@@ -1352,8 +1354,8 @@ class StageConfigFactory:
 
             hf_config = get_config(model, trust_remote_code=trust_remote_code)
             return hf_config.model_type, hf_config
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"`get_config` failed for {e}; Falling back to raw config.json path")
 
         # Fallback: read config.json directly for custom model types that
         # are not registered with transformers (e.g. qwen3_tts).
@@ -1390,8 +1392,8 @@ class StageConfigFactory:
                             class_name,
                         )
                         return pipeline_cfg.model_type, None
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to detect model type for diffusers-style models: {e}")
 
         # Final fallback: some models (e.g. CosyVoice3) ship an empty
         # config.json and rely on naming conventions. Match the model path

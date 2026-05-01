@@ -385,9 +385,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             raise
 
     def check_health(self) -> None:
-        self._ensure_open()
         if self.is_failed:
             raise EngineDeadError()
+        self._ensure_open()
         for p in self._processes:
             if not p.is_alive():
                 self.is_failed = True
