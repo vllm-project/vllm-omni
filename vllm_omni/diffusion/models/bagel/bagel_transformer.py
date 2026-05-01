@@ -7,7 +7,6 @@
 # Original file was released under Apache-2.0, with the full license text
 # available at https://github.com/huggingface/transformers/blob/main/LICENSE.
 
-import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -49,6 +48,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
 
 def patchify(imgs, p):
@@ -1041,28 +1041,8 @@ class TimestepEmbedder(nn.Module):
         )
         self.frequency_embedding_size = frequency_embedding_size
 
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        """
-        Create sinusoidal timestep embeddings.
-        :param t: a 1-D Tensor of N indices, one per batch element.
-                          These may be fractional.
-        :param dim: the dimension of the output.
-        :param max_period: controls the minimum frequency of the embeddings.
-        :return: an (N, D) Tensor of positional embeddings.
-        """
-        half = dim // 2
-        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
-            device=t.device
-        )
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
     def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
 
@@ -1842,6 +1822,8 @@ class Bagel(nn.Module):
         # ── SP + CFG: sequential single-branch forwards ──
         use_sp = self._sp_size > 1
         if use_sp and use_cfg_text:
+            if return_trajectory_latents and len(timesteps) > 0:
+                trajectory_latents.append(x_t.clone())
             for i, t in enumerate(timesteps):
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
                 in_cfg_window = t > cfg_interval[0] and t <= cfg_interval[1]
@@ -1905,13 +1887,15 @@ class Bagel(nn.Module):
                     x_t = x_t - v_t.to(x_t.device) * dts[i]
                 if return_trajectory_latents:
                     trajectory_latents.append(x_t.clone())
-                    trajectory_timesteps.append(timesteps[i] - dts[i])
+                    trajectory_timesteps.append(timesteps[i])
 
             unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
             return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
 
         # ── SP without CFG: direct single-branch loop ──
         if use_sp:
+            if return_trajectory_latents and len(timesteps) > 0:
+                trajectory_latents.append(x_t.clone())
             for i, t in enumerate(timesteps):
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
                 v_t = self.forward_single_branch(
@@ -1938,7 +1922,7 @@ class Bagel(nn.Module):
                     x_t = x_t - v_t.to(x_t.device) * dts[i]
                 if return_trajectory_latents:
                     trajectory_latents.append(x_t.clone())
-                    trajectory_timesteps.append(timesteps[i] - dts[i])
+                    trajectory_timesteps.append(timesteps[i])
 
             unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
             return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
@@ -1999,6 +1983,9 @@ class Bagel(nn.Module):
                 "merged_cache": self._merge_naive_caches(branches_cache),
             }
 
+        if return_trajectory_latents and len(timesteps) > 0:
+            trajectory_latents.append(x_t.clone())
+
         for i, t in enumerate(timesteps):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             if t > cfg_interval[0] and t <= cfg_interval[1]:
@@ -2036,7 +2023,7 @@ class Bagel(nn.Module):
                 x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
             if return_trajectory_latents:
                 trajectory_latents.append(x_t.clone())
-                trajectory_timesteps.append(timesteps[i] - dts[i])
+                trajectory_timesteps.append(timesteps[i])
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
@@ -2137,6 +2124,9 @@ class Bagel(nn.Module):
         )
         _sched_kw = scheduler_kwargs or {}
 
+        if return_trajectory_latents and len(timesteps) > 0:
+            trajectory_latents.append(x_t.clone())
+
         for i, t in enumerate(timesteps):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             use_cfg_this_step = t > cfg_interval[0] and t <= cfg_interval[1] and cfg_text_scale > 1.0
@@ -2194,7 +2184,7 @@ class Bagel(nn.Module):
                 x_t = x_t - v_t.to(x_t.device) * dts[i]
             if return_trajectory_latents:
                 trajectory_latents.append(x_t.clone())
-                trajectory_timesteps.append(timesteps[i] - dts[i])
+                trajectory_timesteps.append(timesteps[i])
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent, trajectory_latents, trajectory_timesteps, trajectory_log_probs
