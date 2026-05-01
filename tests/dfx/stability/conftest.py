@@ -35,20 +35,22 @@ def omni_server(request: pytest.FixtureRequest):
     """Start OmniServer for stability tests, with per-module timeout override."""
     timeout_args = getattr(request.module, "STABILITY_SERVER_TIMEOUT_ARGS", DEFAULT_STABILITY_SERVER_TIMEOUT_ARGS)
     with _omni_server_lock:
-        # Same 5-tuple and CLI composition as ``tests/dfx/perf/scripts/run_benchmark.py`` on main;
+        # Same tuple and CLI composition as ``tests/dfx/perf/scripts/run_benchmark.py``;
         # ``serve_args`` from JSON are folded into ``extra_cli_args`` inside
         # ``create_unique_server_params``.
-        test_name, model, deploy_path, stage_overrides, extra_cli_args = request.param
+        test_name, model, deploy_path, stage_overrides, extra_cli_args, use_omni = request.param
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
-        server_args = list(timeout_args)
+        server_args: list[str] = []
+        if use_omni:
+            server_args += list(timeout_args)
         if deploy_path:
             server_args = ["--deploy-config", deploy_path] + server_args
         if stage_overrides:
             server_args = ["--stage-overrides", stage_overrides] + server_args
         if extra_cli_args:
             server_args = list(extra_cli_args) + server_args
-        with OmniServer(model, server_args) as server:
+        with OmniServer(model, server_args, use_omni=use_omni) as server:
             server.test_name = test_name
             print("OmniServer started successfully")
             yield server

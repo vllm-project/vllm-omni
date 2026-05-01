@@ -70,17 +70,17 @@ def _build_serve_args(serve_args: Any) -> list[str]:
 def create_unique_server_params(
     configs: list[dict[str, Any]],
     stage_configs_dir: Path,
-) -> list[tuple[str, str, str | None, str | None, tuple[str, ...]]]:
-    """Return one row per unique server configuration (same 5-tuple shape as upstream).
+) -> list[tuple[str, str, str | None, str | None, tuple[str, ...], bool]]:
+    """Return one row per unique server configuration.
 
-    ``(test_name, model, deploy_yaml_path, stage_overrides_json, extra_cli_args)``.
+    ``(test_name, model, deploy_yaml_path, stage_overrides_json, extra_cli_args, use_omni)``.
 
     JSON ``server_params.serve_args`` (dict/list) is expanded via ``_build_serve_args``
     and **prepended** to ``extra_cli_args`` so perf / stability ``omni_server`` fixtures
     stay identical to main while still honoring ``serve_args`` in benchmark JSON.
     """
-    unique_params: list[tuple[str, str, str | None, str | None, tuple[str, ...]]] = []
-    seen: set[tuple[str, str, str | None, str | None, tuple[str, ...]]] = set()
+    unique_params: list[tuple[str, str, str | None, str | None, tuple[str, ...], bool]] = []
+    seen: set[tuple[str, str, str | None, str | None, tuple[str, ...], bool]] = set()
     for config in configs:
         test_name = config["test_name"]
         server_params = config["server_params"]
@@ -104,8 +104,16 @@ def create_unique_server_params(
         serve_flat = _build_serve_args(server_params.get("serve_args"))
         raw_extra = tuple(server_params.get("extra_cli_args") or ())
         extra_cli_args = tuple(serve_flat) + raw_extra
+        use_omni = bool(server_params.get("use_omni", True))
 
-        server_param = (test_name, model, stage_config_path, stage_overrides_json, extra_cli_args)
+        server_param = (
+            test_name,
+            model,
+            stage_config_path,
+            stage_overrides_json,
+            extra_cli_args,
+            use_omni,
+        )
         if server_param not in seen:
             seen.add(server_param)
             unique_params.append(server_param)
@@ -145,8 +153,9 @@ def create_reliability_omni_server_params(
             model=model,
             stage_config_path=stage_config_path,
             server_args=server_args_by_name.get(test_name),
+            use_omni=use_omni,
         )
-        for test_name, model, stage_config_path, _stage_overrides_json, _extra_cli_args in unique_params
+        for test_name, model, stage_config_path, _stage_overrides_json, _extra_cli_args, use_omni in unique_params
     ]
 
 
