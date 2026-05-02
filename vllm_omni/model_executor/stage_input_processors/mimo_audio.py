@@ -114,7 +114,7 @@ def _to_code_tensor(codes: Any) -> torch.Tensor | None:
 
 def llm2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any],
+    pooling_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
 ) -> dict[str, Any] | None:
@@ -132,7 +132,13 @@ def llm2code2wav_async_chunk(
 
     request_id = getattr(request, "external_req_id", None)
 
-    po_codes = pooling_output.get("codes", {})
+    if isinstance(pooling_output, dict):
+        po_codes = pooling_output.get("codes", {})
+    elif not is_finished:
+        return None
+    else:
+        po_codes = {}
+
     if "audio" not in po_codes:
         if is_finished:
             return _flush_remaining_codes(transfer_manager, request_id, chunk_size, left_context_size)
