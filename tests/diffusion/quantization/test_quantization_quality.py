@@ -39,6 +39,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -67,11 +68,11 @@ class QualityTestConfig:
     """Defines a single quantization quality test case."""
 
     id: str  # pytest ID, e.g. "fp8_z_image"
-    task: str  # "t2i" or "t2v"
+    task: str  # "t2i", "t2v", or "i2i"
     prompt: str  # generation prompt
     max_lpips: float  # fail threshold — higher = more lenient
     model: str | None = None  # HF model name
-    quantization: str | dict[str, object] | None = None  # quantization method/config, e.g. "fp8"
+    quantization: str | dict[str, Any] | None = None  # quantization method/config, e.g. "fp8"
     baseline_model: str | None = None  # explicit BF16/local baseline path
     quantized_model: str | None = None  # explicit quantized/local model path
     height: int = 1024
@@ -203,6 +204,24 @@ QUALITY_CONFIGS = [
         num_frames=25,
         num_inference_steps=8,
     ),
+    QualityTestConfig(
+        id="fp8_qwen_image_edit_text_encoder",
+        model="Qwen/Qwen-Image-Edit",
+        quantization={
+            "text_encoder": {"method": "fp8"},
+            "transformer": None,
+            "vae": None,
+        },
+        task="i2i",
+        prompt=(
+            "Restyle the input image into a painterly oil artwork with warm colors while preserving the main structure."
+        ),
+        max_lpips=0.15,
+        height=512,
+        width=512,
+        seed=42,
+        num_inference_steps=20,
+    ),
 ]
 
 
@@ -242,7 +261,7 @@ def _maybe_save_output(output_dir: Path | None, config: QualityTestConfig, label
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    if config.task == "t2i":
+    if isinstance(output, Image.Image):
         output.save(_output_path(output_dir, config, label, ".png"))
         return
 
@@ -256,6 +275,10 @@ def _maybe_save_output(output_dir: Path | None, config: QualityTestConfig, label
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _output_peak_memory_gib(output) -> float:
+    return float(getattr(output, "peak_memory_mb", 0.0)) / 1024
 
 
 def _generate_image(omni, config: QualityTestConfig):
@@ -279,8 +302,8 @@ def _generate_image(omni, config: QualityTestConfig):
         ),
     )
 
-    peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
     first = outputs[0]
+    peak_mem = _output_peak_memory_gib(first)
     if hasattr(first, "images") and first.images:
         return first.images[0], peak_mem
     inner = first.request_output
@@ -312,8 +335,8 @@ def _generate_video(omni, config: QualityTestConfig):
         ),
     )
 
-    peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
     first = outputs[0]
+    peak_mem = _output_peak_memory_gib(first)
     if hasattr(first, "request_output") and isinstance(first.request_output, list):
         inner = first.request_output[0]
         if isinstance(inner, OmniRequestOutput) and hasattr(inner, "images"):
@@ -351,6 +374,39 @@ def _generate_video(omni, config: QualityTestConfig):
     return frames_array, peak_mem
 
 
+def _generate_image_edit(omni, config: QualityTestConfig, input_image: Image.Image):
+    """Generate an edited image, return (PIL.Image, peak_mem_gib)."""
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.platforms import current_omni_platform
+
+    generator = torch.Generator(
+        device=current_omni_platform.device_type,
+    ).manual_seed(config.seed)
+    outputs = omni.generate(
+        {
+            "prompt": config.prompt,
+            "negative_prompt": "low quality, blurry, artifacts, distortion",
+            "multi_modal_data": {"image": input_image},
+        },
+        OmniDiffusionSamplingParams(
+            height=config.height,
+            width=config.width,
+            generator=generator,
+            num_inference_steps=config.num_inference_steps,
+            true_cfg_scale=4.0,
+        ),
+    )
+
+    first = outputs[0]
+    peak_mem = _output_peak_memory_gib(first)
+    if hasattr(first, "images") and first.images:
+        return first.images[0], peak_mem
+    inner = first.request_output
+    if inner is not None and hasattr(inner, "images") and inner.images:
+        return inner.images[0], peak_mem
+    raise ValueError("Could not extract image from output.")
+
+
 def _compute_lpips(baseline, quantized, task: str) -> float:
     """Compute LPIPS between baseline and quantized outputs."""
     from benchmarks.diffusion.quantization_quality import (
@@ -358,7 +414,7 @@ def _compute_lpips(baseline, quantized, task: str) -> float:
         compute_lpips_video,
     )
 
-    if task == "t2i":
+    if task in ("t2i", "i2i"):
         return compute_lpips_images([baseline], [quantized])[0]
     return compute_lpips_video(baseline, quantized)
 
@@ -452,14 +508,25 @@ def _quality_param(c: QualityTestConfig):
     "config",
     [_quality_param(c) for c in _all_quality_configs()],
 )
-def test_quantization_quality(config: QualityTestConfig):
+def test_quantization_quality(config: QualityTestConfig, request: pytest.FixtureRequest):
     """Validate that quantized output stays within LPIPS threshold of BF16."""
     from vllm_omni.entrypoints.omni import Omni
 
-    generate_fn = _generate_video if config.task == "t2v" else _generate_image
+    if config.task == "t2v":
+        generate_fn = _generate_video
+    elif config.task == "i2i":
+        input_image = request.getfixturevalue("qwen_bear_image")
+
+        def _generate_image_edit_wrapper(omni, cfg):
+            return _generate_image_edit(omni, cfg, input_image)
+
+        generate_fn = _generate_image_edit_wrapper
+    else:
+        generate_fn = _generate_image
 
     # --- BF16 baseline ---
     omni_bl = Omni(model=config.baseline_ref())
+
     baseline_out, bl_mem = generate_fn(omni_bl, config)
     omni_bl.shutdown()
     del omni_bl
@@ -472,6 +539,7 @@ def test_quantization_quality(config: QualityTestConfig):
         omni_qt = Omni(model=config.quantized_ref())
     else:
         omni_qt = Omni(model=config.quantized_ref(), quantization_config=quantization)
+
     quant_out, qt_mem = generate_fn(omni_qt, config)
     omni_qt.shutdown()
     del omni_qt

@@ -21,13 +21,13 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwen2VLProcessor
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from transformers import AutoConfig, AutoModelForImageTextToText, Qwen2Tokenizer, Qwen2VLProcessor
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
+from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
     QwenImageCFGParallelMixin,
@@ -36,6 +36,7 @@ from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import calculate_
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
+from vllm_omni.diffusion.models.utils import create_transformers_model
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
@@ -233,57 +234,73 @@ class QwenImageEditPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMi
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
+                subfolder="text_encoder",
+                revision=od_config.revision,
+                prefix="text_encoder.",
+            ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
                 subfolder="transformer",
-                revision=None,
+                revision=od_config.revision,
                 prefix="transformer.",
                 fall_back_to_pt=True,
-            )
+            ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="vae",
+                revision=od_config.revision,
+                prefix="vae.",
+            ),
         ]
         self.device = get_local_device()
         model = od_config.model
 
+        # weight mapping from HuggingFace model keys to vLLM model keys
+        self.hf_to_vllm_mapper = WeightsMapper(
+            orig_to_new_substr={
+                "text_encoder.visual.": "text_encoder.model.visual.",
+                "text_encoder.model.layers.": "text_encoder.model.language_model.layers.",
+                "text_encoder.model.norm.": "text_encoder.model.language_model.norm.",
+                "text_encoder.model.embed_tokens.": "text_encoder.model.language_model.embed_tokens.",
+                "text_encoder.model.rotary_emb.": "text_encoder.model.language_model.rotary_emb.",
+            }
+        )
+
         # Check if model is a local path
-        local_files_only = os.path.isdir(model)
+        local_files_only = os.path.exists(model)
 
         # See pipeline_qwen_image_edit_plus: guard against transformers v5
         # multi-worker race on partial subfolder shard sets (Buildkite #1043).
-        qwen_subfolders = ["scheduler", "text_encoder", "vae", "tokenizer", "processor"]
         prefetch_subfolders(
             model,
-            qwen_subfolders,
+            ["scheduler", "text_encoder", "vae", "tokenizer", "processor"],
+            local_files_only=local_files_only,
         )
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        # ``from_pretrained_with_prefetch`` re-prefetches and retries on a
-        # half-written cache (missing-shard ``OSError`` *and* the default
-        # -config size-mismatch ``RuntimeError`` that ``retry_on_missing_shard``
-        # could not recover) instead of crashing the worker.
-        self.text_encoder = from_pretrained_with_prefetch(
-            Qwen2_5_VLForConditionalGeneration.from_pretrained,
-            model,
-            subfolder="text_encoder",
-            prefetch_list=qwen_subfolders,
-            local_files_only=local_files_only,
-        ).to(self.device)
+        text_encoder_config = AutoConfig.from_pretrained(
+            model, subfolder="text_encoder", revision=od_config.revision, local_files_only=local_files_only
+        )
+        self.text_encoder = create_transformers_model(
+            AutoModelForImageTextToText, od_config, text_encoder_config, root_prefix="text_encoder"
+        )
+        if text_encoder_config.tie_word_embeddings:
+            self.text_encoder.lm_head.weight = self.text_encoder.get_input_embeddings().weight
 
-        self.vae = from_pretrained_with_prefetch(
-            AutoencoderKLQwenImage.from_pretrained,
-            model,
-            subfolder="vae",
-            prefetch_list=qwen_subfolders,
-            local_files_only=local_files_only,
-        ).to(self.device)
+        self.vae_config = AutoencoderKLQwenImage.load_config(
+            model, subfolder="vae", revision=od_config.revision, local_files_only=local_files_only
+        )
+        self.vae = AutoencoderKLQwenImage.from_config(self.vae_config).to(self.device)
+
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
         self.transformer = QwenImageTransformer2DModel(od_config=od_config, **transformer_kwargs)
-        self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
-        self.processor = from_pretrained_with_prefetch(
-            Qwen2VLProcessor.from_pretrained,
-            model,
-            subfolder="processor",
-            prefetch_list=qwen_subfolders,
-            local_files_only=local_files_only,
+        self.tokenizer = Qwen2Tokenizer.from_pretrained(
+            model, subfolder="tokenizer", revision=od_config.revision, local_files_only=local_files_only
+        )
+        self.processor = Qwen2VLProcessor.from_pretrained(
+            model, subfolder="processor", revision=od_config.revision, local_files_only=local_files_only
         )
 
         self.stage = None
@@ -889,4 +906,4 @@ class QwenImageEditPipeline(nn.Module, SupportImageInput, QwenImageCFGParallelMi
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
