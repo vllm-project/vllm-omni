@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+import requests
 import torch
+from PIL import Image
 
-from tests.conftest import OmniServer, OmniServerParams
+from tests.helpers.runtime import OmniServer, OmniServerParams
 
 
 def pytest_addoption(parser):
@@ -183,16 +185,26 @@ def accuracy_artifact_root() -> Path:
     return root
 
 
-def reset_artifact_dir(path: Path) -> Path:
-    if path.exists():
-        shutil.rmtree(path)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+@pytest.fixture(scope="session")
+def qwen_bear_image(accuracy_artifact_root: Path) -> Image.Image:
+    """Download the Qwen bear image from the URL and save it to the accuracy artifact root."""
+    QWEN_BEAR_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/qwen-bear.png"
+    response = requests.get(QWEN_BEAR_IMAGE_URL, timeout=60)
+    response.raise_for_status()
+    image = Image.open(BytesIO(response.content)).convert("RGB")
+    image.save(accuracy_artifact_root / "qwen_bear.png")
+    return image
 
 
-def infer_model_label(model: str) -> str:
-    label = Path(model.rstrip("/\\")).name or "model"
-    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in label)
+@pytest.fixture(scope="session")
+def rabbit_image(accuracy_artifact_root: Path) -> Image.Image:
+    """Download the rabbit image from the URL and save it to the accuracy artifact root."""
+    RABBIT_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/rabbit.png"
+    response = requests.get(RABBIT_IMAGE_URL, timeout=60)
+    response.raise_for_status()
+    image = Image.open(BytesIO(response.content)).convert("RGB")
+    image.save(accuracy_artifact_root / "rabbit.png")
+    return image
 
 
 def _build_accuracy_server_config(

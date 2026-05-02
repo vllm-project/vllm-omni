@@ -41,7 +41,17 @@ class MiMoAudioForConditionalGeneration(torch.nn.Module):
 class DummyTalkerMTP(torch.nn.Module):
     """A fake talker_mtp module for deterministic CPU testing."""
 
-    def forward(self, req_input_ids, req_embeds, last_talker_hidden, text_step):
+    def forward(
+        self,
+        req_input_ids,
+        req_embeds,
+        last_talker_hidden,
+        text_step,
+        do_sample=None,
+        temperature=None,
+        top_k=None,
+        top_p=None,
+    ):
         # Deterministic behavior:
         # - output embeds = input embeds + 1
         # - output codes = [[0], [1], ...]
@@ -49,6 +59,36 @@ class DummyTalkerMTP(torch.nn.Module):
         new_embeds = req_embeds + 1.0
         codes = torch.arange(bsz, dtype=torch.int64).view(bsz, 1)
         return new_embeds, codes
+
+
+class CaptureTalkerMTP(torch.nn.Module):
+    """A fake talker_mtp module that records sampling kwargs."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def forward(
+        self,
+        req_input_ids,
+        req_embeds,
+        last_talker_hidden,
+        text_step,
+        do_sample=None,
+        temperature=None,
+        top_k=None,
+        top_p=None,
+    ):
+        self.calls.append(
+            {
+                "do_sample": do_sample,
+                "temperature": temperature,
+                "top_k": top_k,
+                "top_p": top_p,
+            }
+        )
+        codes = torch.zeros((req_embeds.shape[0], 1), dtype=torch.int64)
+        return req_embeds, codes
 
 
 @contextmanager
@@ -79,8 +119,8 @@ def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
     runner.text_step = DummyBuffer(torch.zeros((bsz, hidden_size), dtype=torch.float32))
 
     runner.talker_mtp = DummyTalkerMTP()
-    runner.model = SimpleNamespace(talker_mtp_output_key="code_predictor_codes")
-    runner.vllm_config = object()
+    runner.model = SimpleNamespace(talker_mtp_output_key=("codes", "audio"))
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace())
 
     # Provide a minimal implementation that returns the expected 4-tuple.
     def _determine_batch_execution_and_padding(**kwargs):
@@ -148,8 +188,8 @@ def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
     # Validate per-request additional_information_cpu was updated
     info_r1 = runner.requests["r1"].additional_information_cpu
     info_r2 = runner.requests["r2"].additional_information_cpu
-    assert int(info_r1["code_predictor_codes"][0, 0]) == 0
-    assert int(info_r2["code_predictor_codes"][0, 0]) == 1
+    assert int(info_r1["codes"]["audio"][0, 0]) == 0
+    assert int(info_r2["codes"]["audio"][0, 0]) == 1
 
 
 def test_talker_mtp_forward_cpu_empty_batch_noop(monkeypatch):
@@ -166,6 +206,43 @@ def test_talker_mtp_forward_cpu_empty_batch_noop(monkeypatch):
 
     # Ensure no changes were made
     assert torch.allclose(inputs_embeds, before)
+
+
+def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker(monkeypatch):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
+
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.talker_mtp = CaptureTalkerMTP()
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            subtalker_sampling_params={
+                "do_sample": False,
+                "temperature": 0.2,
+                "top_k": 9,
+                "top_p": 0.55,
+            }
+        )
+    )
+
+    def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
+        batch_desc = SimpleNamespace(num_tokens=int(num_tokens))
+        return (False, batch_desc, None, None, None)
+
+    monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
+
+    inputs_embeds = torch.zeros((2, 4), dtype=torch.float32)
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1"], inputs_embeds)
+
+    assert runner.talker_mtp.calls == [
+        {
+            "do_sample": False,
+            "temperature": 0.2,
+            "top_k": 9,
+            "top_p": 0.55,
+        }
+    ]
 
 
 def test_update_intermediate_buffer_writes_to_buffer_and_setattr(monkeypatch):

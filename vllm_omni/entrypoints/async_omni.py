@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -24,20 +25,83 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.diffusion.data import OmniACK, OmniSleepTask, OmniWakeTask
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
-from vllm_omni.entrypoints.omni_base import OmniBase
+from vllm_omni.entrypoints.omni_base import (
+    OmniBase,
+    OmniEngineDeadError,
+)
+from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
     from vllm.inputs.preprocess import InputPreprocessor
     from vllm.tokenizers import TokenizerLike
     from vllm.v1.engine import PauseMode
 
-    from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
+    from vllm_omni.inputs.data import OmniPromptType
 
 logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
+
+
+class AsyncEventResolver:
+    """
+    A generic signal aggregator designed for synchronized handshakes in
+    distributed or multi-stage environments. Supports waiting for a specified
+    number (expected_count) of worker signals in both inline and multiprocess modes.
+    """
+
+    def __init__(self, orchestrator=None):
+        self._pending_tasks: dict[str, dict] = {}
+        self.orchestrator = orchestrator
+        self._lock = asyncio.Lock()
+
+    def watch_task(self, task_id: str, expected_count: int = 1) -> asyncio.Future:
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._pending_tasks[task_id] = {
+            "future": fut,
+            "expected_count": expected_count,
+            "received": [],
+            "start_time": time.time(),
+        }
+        return fut
+
+    async def resolve(self, ack: OmniACK):
+        tid = getattr(ack, "task_id", None)
+
+        if tid is None and isinstance(ack, dict):
+            tid = ack.get("task_id")
+
+        async with self._lock:
+            task_info = self._pending_tasks.get(tid)
+            if task_info is None:
+                logger.warning(f"Received stray ACK for task_id {tid}. Task might have timed out.")
+                return
+
+            task_info["received"].append(ack)
+            current_count = len(task_info["received"])
+            expected = task_info["expected_count"]
+
+            orchestrator = self.orchestrator
+            if orchestrator and hasattr(orchestrator, "metrics") and orchestrator.metrics:
+                freed = getattr(ack, "freed_bytes", 0)
+                if freed == 0 and isinstance(ack, dict):
+                    freed = ack.get("freed_bytes", 0)
+                orchestrator.metrics.record_vram_reclaimed(freed)
+
+            logger.info(f"[Resolver] Task {tid} progress: {current_count}/{expected} ACKs received.")
+
+            if current_count >= expected:
+                self._pending_tasks.pop(tid)
+                fut = task_info["future"]
+                if not fut.done():
+                    elapsed = time.time() - task_info["start_time"]
+                    logger.info(f"[Resolver] Task {tid} completed successfully in {elapsed:.2f}s.")
+                    fut.set_result(task_info["received"])
 
 
 class AsyncOmni(EngineClient, OmniBase):
@@ -76,9 +140,8 @@ class AsyncOmni(EngineClient, OmniBase):
         self._paused: bool = False
         self._is_sleeping: bool = False
         self.final_output_task: asyncio.Task | None = None
-
+        self.event_resolver = AsyncEventResolver(orchestrator=self)
         self.config_path = self.engine.config_path
-        self.stage_configs = self.engine.stage_configs
         self.tts_max_instructions_length = kwargs.get("tts_max_instructions_length", None)
         self.input_processor = self.engine.input_processor
 
@@ -209,7 +272,20 @@ class AsyncOmni(EngineClient, OmniBase):
             # Start final output dispatcher on the first call to generate()
             self._final_output_handler()
 
-            sampling_params_list = self.resolve_sampling_params_list(sampling_params_list)
+            # Expand sampling params for PD disaggregation (user may provide N-1 params)
+            if (
+                sampling_params_list is not None
+                and isinstance(sampling_params_list, Sequence)
+                and not isinstance(sampling_params_list, (str, bytes))
+            ):
+                sampling_params_list = self._maybe_expand_sampling_params(list(sampling_params_list))
+
+            # Set the output kind to delta output if sampling params were omitted,
+            # since AsyncOmni is typically used for streaming.
+            sampling_params_list = self.resolve_sampling_params_list(
+                sampling_params_list,
+                allow_delta_coercion=True,
+            )
 
             # Track per-request metrics
             wall_start_ts = time.time()
@@ -228,20 +304,27 @@ class AsyncOmni(EngineClient, OmniBase):
             req_state.metrics = metrics
             self.request_states[request_id] = req_state
 
+            # PD disaggregation: modify prefill-stage sampling params per request
+            req_sp_list = list(sampling_params_list)
+            pd_pair = self._get_pd_separation_pair()
+            if pd_pair is not None:
+                p_id = pd_pair[0]
+                req_sp_list[p_id] = self._prepare_prefill_sampling_params(request_id, req_sp_list[p_id])
+
             # Add request(s) to stage 0. For streaming inputs, submit
             # chunks incrementally through streaming_update.
             if isinstance(prompt, AsyncGenerator):
                 input_stream_task = await self._add_streaming_input_request(
                     request_id=request_id,
                     input_stream=prompt,
-                    sampling_params_list=sampling_params_list,
+                    sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id_for_e2e,
                 )
             else:
                 await self.engine.add_request_async(
                     request_id=request_id,
                     prompt=prompt,
-                    sampling_params_list=sampling_params_list,
+                    sampling_params_list=req_sp_list,
                     final_stage_id=final_stage_id_for_e2e,
                 )
             submit_ts = time.time()
@@ -290,15 +373,14 @@ class AsyncOmni(EngineClient, OmniBase):
         # only check thinker's sampling params now
         stage0_params = sampling_params_list[0]
         self._validate_streaming_input_sampling_params(stage0_params)
-
         req_state = self.request_states[request_id]
+        has_submitted_first_chunk = False
 
+        # NOTE: InputProcessor in vLLM should generally do this too, but for
+        # now we do it defensively. TODO (Alex) ensure clones/copying are optimized
         if not stage0_params.skip_clone:
             stage0_params = stage0_params.clone()
             stage0_params.skip_clone = True
-        stage0_params.output_kind = RequestOutputKind.DELTA
-
-        has_submitted_first_chunk = False
 
         async def handle_inputs() -> None:
             nonlocal has_submitted_first_chunk
@@ -421,6 +503,12 @@ class AsyncOmni(EngineClient, OmniBase):
 
             stage_id = result.get("stage_id", 0)
 
+            if result.get("type") == "error" and result.get("fatal"):
+                raise OmniEngineDeadError(
+                    result.get("error", ""),
+                    error_stage_id=result.get("stage_id"),
+                )
+
             # Check for errors
             if "error" in result:
                 logger.error(
@@ -430,6 +518,8 @@ class AsyncOmni(EngineClient, OmniBase):
                     result["error"],
                 )
                 raise RuntimeError(result)
+
+            self._check_engine_output_error(result, request_id, stage_id)
 
             # Process the result (constructs OmniRequestOutput)
             output_to_yield = self._process_single_result(
@@ -476,6 +566,22 @@ class AsyncOmni(EngineClient, OmniBase):
                         await asyncio.sleep(_FINAL_OUTPUT_IDLE_SLEEP_S)
                         continue
 
+                    if isinstance(msg, dict) and msg.get("type") == "ack":
+                        ack_data = msg.get("ack")
+                        tid = getattr(ack_data, "task_id", "unknown")
+                        logger.info(f"[{self._name}] Intercepted wrapped ACK for task {tid}")
+                        await self.event_resolver.resolve(ack_data)
+                        continue
+                    if isinstance(msg, OmniACK):
+                        logger.info(f"[{self._name}] Intercepted raw ACK object: {msg.task_id}")
+                        await self.event_resolver.resolve(msg)
+                        continue
+                    if hasattr(msg, "task_id"):
+                        tid = getattr(msg, "task_id")
+                        logger.info(f"[{self._name}] Intercepted task-ID object: {tid}")
+                        await self.event_resolver.resolve(msg)
+                        continue
+
                     should_continue, _, stage_id, req_state = self._handle_output_message(msg)
                     if should_continue:
                         continue
@@ -487,6 +593,28 @@ class AsyncOmni(EngineClient, OmniBase):
 
             except asyncio.CancelledError:
                 raise
+            except OmniEngineDeadError as e:
+                logger.error("[AsyncOmni] Engine dead: %s", e)
+                for req_state in list(self.request_states.values()):
+                    error_msg = {
+                        "type": "error",
+                        "error": str(e),
+                        "fatal": True,
+                        "request_id": req_state.request_id,
+                    }
+                    if e.error_stage_id is not None:
+                        error_msg["stage_id"] = e.error_stage_id
+                    await req_state.queue.put(error_msg)
+            except EngineDeadError as e:
+                logger.error("[AsyncOmni] Engine dead: %s", e)
+                for req_state in list(self.request_states.values()):
+                    error_msg = {
+                        "type": "error",
+                        "error": str(e),
+                        "fatal": True,
+                        "request_id": req_state.request_id,
+                    }
+                    await req_state.queue.put(error_msg)
             except Exception as e:
                 logger.exception("[AsyncOmni] final_output_loop failed.")
                 for req_state in list(self.request_states.values()):
@@ -642,21 +770,68 @@ class AsyncOmni(EngineClient, OmniBase):
         logger.warning("[AsyncOmni] reset_prefix_cache not yet supported with Orchestrator process")
         return True
 
-    async def sleep(self, level: int = 1, mode: PauseMode = "abort") -> None:
-        """Sleep all stages.
+    async def sleep(
+        self, stage_ids: list[int] | None = None, level: int = 2, mode: PauseMode = "abort"
+    ) -> list[OmniACK]:
+        self._final_output_handler()
+        if stage_ids is None:
+            stage_ids = list(range(len(self.engine.stage_clients)))
+        total_workers = 0
+        for sid in stage_ids:
+            client = self.engine.stage_clients[sid]
+            # During the Diffusion phase, regardless of the TP amount,
+            # currently only a summary ACK is reported at Rank 0.
+            if getattr(client, "stage_type", "") == "diffusion":
+                total_workers += 1
+            else:
+                config = self.engine.stage_vllm_configs[sid]
+                actual_tp = config.parallel_config.tensor_parallel_size if config else 1
+                total_workers += actual_tp
 
-        Best-effort: unsupported stages will emit a TODO result.
-        """
+        task_id = str(uuid.uuid4())
+        self.event_resolver.watch_task(task_id, expected_count=total_workers)
+        logger.info(f"[{self._name}] Sleep initiated (Task: {task_id}). Awaiting {total_workers} ACKs...")
+        task = OmniSleepTask(level=level, task_id=task_id)
+        rpc_results = await self.collective_rpc(method="handle_sleep_task", args=(task,), stage_ids=stage_ids)
+        final_acks = []
+        for stage_res in rpc_results:
+            worker_acks = stage_res if isinstance(stage_res, list) else [stage_res]
+            for ack in worker_acks:
+                if ack is not None:
+                    await self.event_resolver.resolve(ack)
+                    final_acks.append(ack)
         self._is_sleeping = True
-        await self.collective_rpc(method="sleep", args=(level,))
+        return final_acks
 
-    async def wake_up(self, tags: list[str] | None = None) -> None:
-        """Wake up all stages.
-
-        Best-effort: unsupported stages will emit a TODO result.
-        """
+    async def wake_up(self, stage_ids: list[int] | None = None, tags: list[str] | None = None) -> list[OmniACK]:
+        self._final_output_handler()
+        if stage_ids is None:
+            stage_ids = list(range(len(self.engine.stage_clients)))
+        total_workers = 0
+        for sid in stage_ids:
+            client = self.engine.stage_clients[sid]
+            if getattr(client, "stage_type", "") == "diffusion":
+                total_workers += 1
+            else:
+                config = self.engine.stage_vllm_configs[sid]
+                total_workers += config.parallel_config.tensor_parallel_size if config else 1
+        task_id = str(uuid.uuid4())
+        self.event_resolver.watch_task(task_id, expected_count=total_workers)
+        logger.info(f"[{self._name}] Wake-up initiated (Task: {task_id}). Awaiting {total_workers} ACKs...")
+        task = OmniWakeTask(tags=tags, task_id=task_id)
+        rpc_results = await self.collective_rpc(method="handle_wake_task", args=(task,), stage_ids=stage_ids)
+        final_acks = []
+        for stage_res in rpc_results:
+            worker_acks = stage_res if isinstance(stage_res, list) else [stage_res]
+            for ack in worker_acks:
+                if ack is not None:
+                    await self.event_resolver.resolve(ack)
+                    final_acks.append(ack)
+        current_omni_platform.synchronize()
+        await asyncio.sleep(0.1)
         self._is_sleeping = False
-        await self.collective_rpc(method="wake_up", args=(tags,))
+        logger.info(f"[{self._name}] All {len(final_acks)}/{total_workers} workers reported WARM for task {task_id}.")
+        return final_acks
 
     async def is_sleeping(self) -> bool:
         """Return whether all stages are sleeping.
@@ -706,12 +881,25 @@ class AsyncOmni(EngineClient, OmniBase):
     @property
     def is_running(self) -> bool:
         """Check if the engine is running."""
-        return self.final_output_task is not None and not self.final_output_task.done()
+        orchestrator_alive = self.engine.is_alive()
+        task_alive = self.final_output_task is not None and not self.final_output_task.done()
+        return orchestrator_alive and task_alive
 
     @property
     def errored(self) -> bool:
-        """Whether orchestrator thread has stopped unexpectedly."""
-        return not self.engine.is_alive()
+        """Whether the engine is in a non-recoverable error state.
+
+        Delegates to ``OmniBase.errored`` which checks the orchestrator
+        thread and all stage clients.  Redeclared here to satisfy the
+        ``EngineClient`` abstract-property requirement (Python's ABC
+        mechanism does not resolve abstract methods from sibling MRO
+        entries).
+        """
+        return OmniBase.errored.fget(self)  # type: ignore[union-attr]
+
+    @property
+    def _name(self) -> str:
+        return "AsyncOrchestrator"
 
     @property
     def is_stopped(self) -> bool:
@@ -721,7 +909,7 @@ class AsyncOmni(EngineClient, OmniBase):
     @property
     def dead_error(self) -> BaseException:
         """EngineClient abstract property implementation."""
-        return EngineDeadError()
+        return OmniEngineDeadError()
 
     # ==================== EngineClient Interface ====================
 

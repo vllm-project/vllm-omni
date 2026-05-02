@@ -13,7 +13,7 @@ import torch
 from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin

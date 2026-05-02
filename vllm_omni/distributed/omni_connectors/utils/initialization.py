@@ -23,6 +23,11 @@ logger = get_connector_logger(__name__)
 # collide with request-forwarding endpoints that share the same base port.
 KV_TRANSFER_PORT_OFFSET = 100
 
+# Port stride between TP ranks so each worker binds a unique ZMQ port
+# when TP > 1.  Must be larger than the maximum number of pipeline stages.
+# Formula: zmq_port = base + KV_TRANSFER_PORT_OFFSET + rank * STRIDE + stage
+KV_RANK_PORT_STRIDE = 16
+
 
 def initialize_connectors_from_config(
     config_path: str | Path | None = None,
@@ -200,6 +205,19 @@ def load_omni_transfer_config(
 
     if config_dict is None:
         return None
+
+    # Normalize new-schema (top-level ``connectors`` + ``stages``) into the
+    # legacy ``runtime.connectors`` + ``stage_args`` shape the parser reads.
+    if "stages" in config_dict and "stage_args" not in config_dict:
+        normalized: dict[str, Any] = dict(config_dict)
+        runtime = dict(normalized.get("runtime") or {})
+        if "connectors" in normalized and "connectors" not in runtime:
+            runtime["connectors"] = normalized["connectors"]
+        if "edges" in normalized and "edges" not in runtime:
+            runtime["edges"] = normalized["edges"]
+        normalized["runtime"] = runtime
+        normalized["stage_args"] = normalized["stages"]
+        config_dict = normalized
 
     # Parse connectors
     connectors = {}

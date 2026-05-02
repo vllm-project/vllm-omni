@@ -34,6 +34,20 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
         return "vllm_omni/model_executor/stage_configs"
 
     @classmethod
+    def has_flash_attn_package(cls) -> bool:
+        from vllm_omni.diffusion.attention.backends.utils.fa import is_flash_attn_installed
+
+        # Turing/Tesla/T4 GPUs don't support flash attention well
+        gpu_name = cls.get_device_name()
+        if "Turing" in gpu_name or "Tesla" in gpu_name or "T4" in gpu_name:
+            return False
+
+        if not is_flash_attn_installed():
+            return False
+
+        return True
+
+    @classmethod
     def get_diffusion_attn_backend_cls(
         cls,
         selected_backend: str | None,

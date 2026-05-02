@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from .patch_diffusers import patch_wan_rms_norm
 from .pipeline_wan2_2 import (
     Wan22Pipeline,
+    WanT2VDMD2Pipeline,
     create_transformer_from_config,
     get_wan22_post_process_func,
     get_wan22_pre_process_func,
@@ -11,6 +13,7 @@ from .pipeline_wan2_2 import (
 )
 from .pipeline_wan2_2_i2v import (
     Wan22I2VPipeline,
+    WanI2VDMD2Pipeline,
     get_wan22_i2v_post_process_func,
     get_wan22_i2v_pre_process_func,
 )
@@ -28,6 +31,7 @@ from .wan2_2_transformer import WanTransformer3DModel
 from .wan2_2_vace_transformer import VaceWanTransformerBlock, WanVACETransformer3DModel
 
 __all__ = [
+    "WanT2VDMD2Pipeline",
     "Wan22Pipeline",
     "get_wan22_post_process_func",
     "get_wan22_pre_process_func",
@@ -35,6 +39,7 @@ __all__ = [
     "load_transformer_config",
     "create_transformer_from_config",
     "Wan22I2VPipeline",
+    "WanI2VDMD2Pipeline",
     "get_wan22_i2v_post_process_func",
     "get_wan22_i2v_pre_process_func",
     "Wan22TI2VPipeline",
@@ -47,3 +52,5 @@ __all__ = [
     "VaceWanTransformerBlock",
     "WanVACETransformer3DModel",
 ]
+
+patch_wan_rms_norm()

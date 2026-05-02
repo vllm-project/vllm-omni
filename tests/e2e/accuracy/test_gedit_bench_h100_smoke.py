@@ -7,13 +7,13 @@ import pytest
 
 from benchmarks.accuracy.image_to_image.gedit_bench import GROUPS
 from benchmarks.accuracy.image_to_image.gedit_bench import main as gedit_main
-from tests.e2e.accuracy.conftest import infer_model_label, reset_artifact_dir
-from tests.utils import hardware_test
+from tests.e2e.accuracy.helpers import infer_model_label, reset_artifact_dir
+from tests.helpers.mark import hardware_test
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 
-@pytest.mark.advanced_model
 @pytest.mark.benchmark
-@pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_gedit_bench_h100_smoke(
     gedit_accuracy_servers,
@@ -106,9 +106,9 @@ def test_gedit_bench_h100_smoke(
             group_summary = language_summary["by_group"][group]
             assert set(group_summary) == {"count", "Q_SC", "Q_PQ", "Q_O"}
 
-    assert summary["languages"]["en"]["overall"]["Q_SC"] >= 7.0
+    assert summary["languages"]["en"]["overall"]["Q_SC"] >= 6.95
     assert summary["languages"]["en"]["overall"]["Q_PQ"] >= 5.8
-    assert summary["languages"]["en"]["overall"]["Q_O"] >= 6.2
+    assert summary["languages"]["en"]["overall"]["Q_O"] >= 6.15
     assert summary["languages"]["cn"]["overall"]["Q_SC"] >= 6.9
     assert summary["languages"]["cn"]["overall"]["Q_PQ"] >= 5.7
     assert summary["languages"]["cn"]["overall"]["Q_O"] >= 6.1

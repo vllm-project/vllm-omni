@@ -32,6 +32,7 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig
 from vllm_omni.diffusion.model_loader.gguf_adapters import get_gguf_adapter
+from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.registry import initialize_model
 
 if TYPE_CHECKING:
@@ -257,11 +258,14 @@ class DiffusersPipelineLoader:
         self,
         od_config: OmniDiffusionConfig,
         load_device: str,
-        load_format: str = "default",
+        load_format: str | None = "default",
         custom_pipeline_name: str | None = None,
         device: torch.device | None = None,
     ) -> nn.Module:
         """Load a model with the given configurations."""
+        if load_format is None:
+            load_format = "default"
+
         # CPU offload + FP8: load weights on device for FP8 quantization
         if load_device == "cpu" and od_config.quantization_config is not None:
             load_device = device.type
@@ -277,11 +281,21 @@ class DiffusersPipelineLoader:
                 with target_device:
                     if load_format == "default":
                         model = initialize_model(od_config)
+                    elif load_format == "diffusers":
+                        model = DiffusersAdapterPipeline(od_config=od_config, device=target_device)
                     elif load_format == "custom_pipeline":
                         model_cls = resolve_obj_by_qualname(custom_pipeline_name)
                         model = model_cls(od_config=od_config)
+                    else:
+                        # 'dummy' format should not call this function at all
+                        raise ValueError(f"Unknown load_format: {load_format}")
                 logger.debug("Loading weights on %s ...", load_device)
-                if self._is_gguf_quantization(od_config):
+                if load_format == "diffusers":
+                    # DiffusersAdapterPipeline.load_weights() calls
+                    # DiffusionPipeline.from_pretrained() internally — it does
+                    # NOT use our native (customized) pipeline classes.
+                    cast(DiffusersAdapterPipeline, model).load_weights()
+                elif self._is_gguf_quantization(od_config):
                     self._load_weights_with_gguf(model, od_config)
                 else:
                     # Quantization does not happen in `load_weights` but after it

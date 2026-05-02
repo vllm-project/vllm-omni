@@ -7,6 +7,7 @@ explicitly patch values that differ from vLLM.
 import argparse
 import inspect
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from pydantic import ValidationError
@@ -38,21 +39,28 @@ def test_default_stage_id_is_concrete_int():
     assert cfg.stage_id == 0
 
 
-def test_multimodal_kwarg_overrides():
+def test_multimodal_kwarg_overrides(mocker):
     """Ensure that overrides in the multimodal config are preserved."""
-    # Get a different value than the default for a multimodal field
     sig = inspect.signature(OmniEngineArgs)
     default_mm_cache = sig.parameters["mm_processor_cache_gb"].default
     override_val = default_mm_cache + 1
 
-    # NOTE: This needs to be a model that resolves to supports_multimodal=True
-    # in vLLM, otherwise we won't have an MM config
+    fake_model_config = SimpleNamespace(
+        multimodal_config=SimpleNamespace(mm_processor_cache_gb=override_val),
+    )
+
+    def _fake_parent_create_model_config(self):
+        assert self.mm_processor_cache_gb == override_val
+        return fake_model_config
+
+    mocker.patch.object(EngineArgs, "create_model_config", _fake_parent_create_model_config)
+    mocker.patch.object(OmniModelConfig, "from_vllm_model_config", side_effect=lambda model_config, **_: model_config)
+
     cfg = OmniEngineArgs(
         model="Qwen/Qwen2-VL-2B-Instruct",
         mm_processor_cache_gb=override_val,
     ).create_model_config()
 
-    # Ensure that the override was applied correctly
     assert cfg.multimodal_config is not None
     assert cfg.multimodal_config.mm_processor_cache_gb == override_val
 
@@ -131,24 +139,65 @@ def test_from_cli_args_picks_up_stage_configs_path():
     assert args.custom_pipeline_args is None
 
 
+def test_qwen3_tts_code2wav_injects_max_position_embeddings(monkeypatch):
+    """Ensure Code2Wav mirrors stage max_model_len into nested HF overrides.
+
+    Qwen3-TTS Code2Wav is a pure decoder stage whose runtime max_model_len can
+    legitimately exceed the base checkpoint's default text max length. Recent
+    vLLM validates these values during ModelConfig creation, so we inject
+    ``talker_config.max_position_embeddings`` before delegating to vLLM.
+    """
+    captured: dict[str, object] = {}
+    baseline_config = Mock()
+
+    def fake_create_model_config(self):
+        captured["hf_overrides"] = self.hf_overrides
+        return baseline_config
+
+    monkeypatch.setattr(EngineArgs, "create_model_config", fake_create_model_config)
+    monkeypatch.setattr(
+        OmniModelConfig,
+        "from_vllm_model_config",
+        classmethod(lambda cls, model_config, **omni_kwargs: model_config),
+    )
+
+    OmniEngineArgs(
+        model_arch="Qwen3TTSCode2Wav",
+        max_model_len=65536,
+    ).create_model_config()
+
+    assert captured["hf_overrides"] == {
+        "architectures": ["Qwen3TTSCode2Wav"],
+        "talker_config": {
+            "max_position_embeddings": 65536,
+        },
+    }
+
+
 def test_stage_specific_text_config_override():
-    """Ensure dependent attributes are updated when using stage-specific config."""
+    """Stage swap must refresh hf_text_config, dependent attrs, and model_arch_config."""
     vllm_config = EngineArgs().create_model_config()
     vllm_config.disable_sliding_window = True
+    thinker_mac = vllm_config.model_arch_config
 
-    # Switch the created hf text config with a mock whose
-    # values we want to pull through the text config helper
-    stage_text_config = vllm_config.hf_text_config
+    talker_num_heads = max(2, thinker_mac.total_num_attention_heads // 2)
+    talker_num_kv_heads = max(1, talker_num_heads // 8)
+    talker_head_dim = 128
+    stage_text_config = SimpleNamespace(
+        sliding_window=4096,
+        attention_chunk_size=2048,
+        max_position_embeddings=4096,
+        num_attention_heads=talker_num_heads,
+        num_key_value_heads=talker_num_kv_heads,
+        head_dim=talker_head_dim,
+        hidden_size=talker_num_heads * talker_head_dim,
+        vocab_size=thinker_mac.vocab_size,
+        num_hidden_layers=4,
+    )
+
     vllm_config.hf_text_config = SimpleNamespace()
-    stage_text_config.sliding_window = 4096
-    stage_text_config.attention_chunk_size = 2048
+    vllm_config.hf_config.thinker_config = SimpleNamespace(get_text_config=lambda: stage_text_config)
 
-    # Move the stage config's text config getter & thinker config
-    mock_stage_config = SimpleNamespace(get_text_config=lambda: stage_text_config)
-    vllm_config.hf_config.thinker_config = mock_stage_config
-
-    # Ensure that create from a vLLM config correctly pulls the
-    # expected values off of the thinker config & swaps the text config
     omni_config = OmniModelConfig.from_vllm_model_config(
         vllm_config,
         hf_config_name="thinker_config",
@@ -159,6 +208,21 @@ def test_stage_specific_text_config_override():
     assert omni_config.max_model_len == 4096
     assert omni_config.hf_text_config.sliding_window is None
 
+    stage_mac = omni_config.model_arch_config
+    assert stage_mac is not thinker_mac
+    assert stage_mac.total_num_attention_heads == talker_num_heads
+    assert stage_mac.total_num_kv_heads == talker_num_kv_heads
+    assert stage_mac.head_size == talker_head_dim
+
+    parallel_config = SimpleNamespace(
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+        decode_context_parallel_size=1,
+    )
+    assert omni_config.get_num_attention_heads(parallel_config) == talker_num_heads
+    assert omni_config.get_num_kv_heads(parallel_config) == talker_num_kv_heads
+    assert omni_config.get_head_size() == talker_head_dim
+
 
 def test_stage_configs_path_field():
     """OmniEngineArgs with stage_configs_path should construct without error."""
@@ -166,10 +230,28 @@ def test_stage_configs_path_field():
     assert args.stage_configs_path == "/some/path.yaml"
 
 
+def test_voxcpm_model_arch_injects_model_type_override(mocker):
+    """Ensure VoxCPM model_arch injects hf_overrides for config resolution."""
+    mocker.patch.object(OmniEngineArgs, "_ensure_omni_models_registered", return_value=True)
+    mocker.patch.object(OmniEngineArgs, "_patch_empty_hf_config")
+    mocker.patch.object(EngineArgs, "create_model_config", return_value=Mock())
+    mocker.patch.object(OmniModelConfig, "from_vllm_model_config", return_value=Mock())
+
+    args = OmniEngineArgs(
+        model="OpenBMB/VoxCPM1.5",
+        model_arch="VoxCPMForConditionalGeneration",
+    )
+    args.create_model_config()
+
+    assert args.hf_overrides["architectures"] == ["VoxCPMForConditionalGeneration"]
+    assert args.hf_overrides["model_type"] == "voxcpm"
+    args._patch_empty_hf_config.assert_called_once_with("voxcpm")
+
+
 def test_strip_single_engine_args():
     """_strip_single_engine_args should remove EngineArgs fields but keep omni fields."""
     kwargs = {
-        # Parent EngineArgs fields — should be stripped
+        # Parent EngineArgs fields — stripped unless explicitly allowlisted
         "compilation_config": '{"cudagraph_mode": "FULL_AND_PIECEWISE"}',
         "tensor_parallel_size": 4,
         "gpu_memory_utilization": 0.9,
@@ -187,7 +269,7 @@ def test_strip_single_engine_args():
 
     # Stripped — parent EngineArgs fields
     assert "compilation_config" not in filtered
-    assert "tensor_parallel_size" not in filtered
+    assert filtered["tensor_parallel_size"] == 4
     assert "gpu_memory_utilization" not in filtered
     assert "model" not in filtered
 
@@ -217,15 +299,18 @@ def test_strip_single_engine_args_model_does_not_trigger_warning(mocker):
     mock_warn.assert_not_called()
 
     # When there *are* genuinely surprising overrides alongside model,
-    # the warning should mention them but not model.
+    # the warning should mention them but not model. Keep-listed fields such as
+    # tensor_parallel_size are intentionally passed through and should not warn.
     AsyncOmniEngine._strip_single_engine_args(
         {
             "model": "some/model",
+            "compilation_config": '{"cudagraph_mode": "FULL_AND_PIECEWISE"}',
             "tensor_parallel_size": 4,
             "custom_pipeline_args": {"pipeline_class": "my.Pipeline"},
         }
     )
     mock_warn.assert_called_once()
     warned_args = mock_warn.call_args[0][-1]  # the formatted arg list
-    assert "tensor_parallel_size" in warned_args
+    assert "compilation_config" in warned_args
+    assert "tensor_parallel_size" not in warned_args
     assert "model" not in warned_args

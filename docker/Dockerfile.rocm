@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.19.0
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.20.0
 FROM ${BASE_IMAGE} AS base
 
 # Declare a variable to know if we want to use the nightly build or the stable build.
@@ -21,7 +21,7 @@ WORKDIR ${COMMON_WORKDIR}
 # Need to include ffmpeg because vllm rocm upstream docker image
 # does not include it.
 RUN apt-get update && \
-    apt-get install -y espeak-ng ffmpeg git sox libsox-fmt-all jq && \
+    apt-get install -y espeak-ng ffmpeg git jq && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 

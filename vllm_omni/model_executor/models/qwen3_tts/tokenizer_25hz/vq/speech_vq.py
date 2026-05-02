@@ -17,17 +17,17 @@ import operator
 from itertools import accumulate
 
 import onnxruntime
-import sox
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio.compliance.kaldi as kaldi
 from torch import Tensor
 
-from vllm_omni.utils.audio import mel_filter_bank
+from vllm_omni.model_executor.models.whisper_utils import Conv1d, ConvTranspose1d
+from vllm_omni.utils.audio import mel_filter_bank, peak_normalize
 
 from .core_vq import DistributedGroupResidualVectorQuantization
-from .whisper_encoder import Conv1d, ConvTranspose1d, WhisperEncoder
+from .whisper_encoder import WhisperEncoder
 
 
 def dynamic_range_compression_torch(x, c=1, clip_val=1e-5):
@@ -153,9 +153,6 @@ class XVectorExtractor(nn.Module):
             audio_codec_with_xvector, sess_options=option, providers=providers
         )
 
-        self.tfm = sox.Transformer()
-        self.tfm.norm(db_level=-6)
-
         self.mel_ext = MelSpectrogramFeatures(
             filter_length=1024,
             hop_length=160,
@@ -183,8 +180,7 @@ class XVectorExtractor(nn.Module):
         return norm_embedding.numpy(), ref_mel.permute(0, 2, 1).squeeze(0).numpy()
 
     def sox_norm(self, audio):
-        wav_norm = self.tfm.build_array(input_array=audio, sample_rate_in=16000)
-        return wav_norm
+        return peak_normalize(audio, db_level=-6)
 
 
 class WhisperEncoderVQ(WhisperEncoder):

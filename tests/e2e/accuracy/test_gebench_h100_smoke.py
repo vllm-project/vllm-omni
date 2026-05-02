@@ -6,13 +6,13 @@ from pathlib import Path
 import pytest
 
 from benchmarks.accuracy.text_to_image.gbench import main as gbench_main
-from tests.e2e.accuracy.conftest import infer_model_label, reset_artifact_dir
-from tests.utils import hardware_test
+from tests.e2e.accuracy.helpers import infer_model_label, reset_artifact_dir
+from tests.helpers.mark import hardware_test
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 
-@pytest.mark.advanced_model
 @pytest.mark.benchmark
-@pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 def test_gebench_h100_smoke(
     gebench_accuracy_servers,

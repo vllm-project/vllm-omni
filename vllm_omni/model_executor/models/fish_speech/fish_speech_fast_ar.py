@@ -400,6 +400,7 @@ class FishSpeechFastAR(nn.Module):
         temperature: float = 0.8,
         top_k: int = 30,
         top_p: float = 0.9,
+        seed: int | None = None,
     ) -> torch.Tensor:
         """Predict residual codebook codes 0..num_codebooks-1 autoregressively.
 
@@ -443,6 +444,12 @@ class FishSpeechFastAR(nn.Module):
         use_sampling = do_sample and temperature > 0
         inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
 
+        # Create a seeded generator for deterministic residual codebook sampling.
+        generator = None
+        if seed is not None and use_sampling:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(seed)
+
         # Residual codebook size (1024) vs semantic codebook size (4096).
         # The fast_output head has codebook_size (4096) outputs, but residual
         # codebooks only have 1024 entries.  Truncate logits for steps > 0.
@@ -474,7 +481,7 @@ class FishSpeechFastAR(nn.Module):
                     sorted_logits[sorted_indices_to_remove] = float("-inf")
                     scaled = sorted_logits.scatter(1, sorted_indices, sorted_logits)
                 probs = F.softmax(scaled, dim=-1)
-                next_ids = torch.multinomial(probs, num_samples=1)
+                next_ids = torch.multinomial(probs, num_samples=1, generator=generator)
             else:
                 next_ids = logits.argmax(dim=-1, keepdim=True)
 

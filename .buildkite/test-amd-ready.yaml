@@ -7,7 +7,9 @@ steps:
   grade: Blocking
   commands:
     - export VLLM_ROCM_USE_AITER=0
-    - "timeout 20m pytest -v -s -m 'core_model and cpu' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
+    # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
+    # that is not supported on CPU
+    - "timeout 20m pytest -vvvv -s -m 'core_model and cpu' --ignore=tests/diffusion/cache/test_teacache_extractors.py --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
 
 - label: "Voxtral TTS CUDA Unit Test"
   agent_pool: mi325_1
@@ -111,19 +113,6 @@ steps:
       timeout 15m bash -c '
               pytest -s -v tests/engine/test_async_omni_engine_abort.py
       '
-
-
-# NOTE: This test is not running any thing. It is skipped and deselected.
-# Currently it is = 1 skipped, 1 deselected, 17 warnings in 0.03s ======
-# - label: "Omni Model Test Qwen2-5-Omni"
-#   agent_pool: mi325_2
-#   depends_on: amd-build
-#   mirror_hardwares: [amdproduction]
-#   grade: Blocking
-#   commands:
-#     - export VLLM_LOGGING_LEVEL=DEBUG
-#     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-#     - timeout 20m pytest -s -v tests/e2e/offline_inference/test_qwen2_5_omni.py -m "core_model" --run-level "core_model"
 
 # - label: "Omni Model Test Qwen3-Omni"
 #   agent_pool: mi325_2

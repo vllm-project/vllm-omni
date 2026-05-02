@@ -1,0 +1,48 @@
+# BAGEL-7B-MoT deploy: CUDA defaults, verified on NVIDIA A100 (80GB).
+#
+# Stage 0 (Thinker) and Stage 1 (DiT) share a single GPU by default.
+# For dual-GPU setups, set stage 1 devices to "1".
+#
+# Fields omitted from a stage fall back to StageDeployConfig dataclass
+# defaults (see vllm_omni/config/stage_config.py).
+
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 3
+    gpu_memory_utilization: 0.45
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      top_k: 1
+      max_tokens: 2048
+      seed: 52
+      detokenize: true
+      repetition_penalty: 1.05
+
+  - stage_id: 1
+    max_num_seqs: 1
+    enforce_eager: true
+    devices: "0"
+    input_connectors:
+      from_stage_0: shared_memory_connector
+    default_sampling_params:
+      seed: 52
+
+connectors:
+  shared_memory_connector:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+
+  rdma_connector:
+    name: MooncakeTransferEngineConnector
+    extra:
+      host: "auto"
+      zmq_port: 50051
+      protocol: "rdma"
+      device_name: ""
+      memory_pool_size: 4294967296
+      memory_pool_device: "cpu"

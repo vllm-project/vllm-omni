@@ -7,9 +7,31 @@ import argparse
 import pytest
 from pytest_mock import MockerFixture
 
-from vllm_omni.entrypoints.cli.serve import run_headless
+from vllm_omni.entrypoints.cli.serve import OmniServeCommand, run_headless
+from vllm_omni.entrypoints.utils import detect_explicit_cli_keys
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_serve_parser_accepts_no_async_chunk_and_marks_it_explicit() -> None:
+    """``--no-async-chunk`` should parse to ``async_chunk=False`` and mark the
+    shared deploy-level dest as explicitly provided by the user."""
+    try:
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+    except Exception as exc:
+        pytest.skip(f"Cannot build parser in this environment: {exc}")
+
+    root = FlexibleArgumentParser()
+    subparsers = root.add_subparsers(dest="subcommand")
+    cmd = OmniServeCommand()
+    serve_parser = cmd.subparser_init(subparsers)
+
+    argv = ["serve", "fake-model", "--omni", "--no-async-chunk"]
+    args = root.parse_args(argv)
+
+    assert args.async_chunk is False
+    explicit = detect_explicit_cli_keys(argv, serve_parser)
+    assert "async_chunk" in explicit
 
 
 def _make_headless_args() -> argparse.Namespace:
@@ -86,7 +108,7 @@ def test_run_headless_registers_stage_once_and_launches_all_local_engines(mocker
     assert manager_kwargs["local_client"] is False
     assert manager_kwargs["handshake_address"] == "tcp://127.0.0.1:26001"
     assert manager_kwargs["log_stats"] is False
-    engine_manager.join_first.assert_called_once_with()
+    engine_manager.monitor_engine_liveness.assert_called_once_with()
     engine_manager.shutdown.assert_called_once_with()
 
 

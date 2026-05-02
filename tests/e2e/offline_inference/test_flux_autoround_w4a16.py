@@ -14,8 +14,9 @@ import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
-from tests.conftest import OmniRunner
-from tests.utils import DeviceMemoryMonitor, hardware_test
+from tests.helpers.env import DeviceMemoryMonitor
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform

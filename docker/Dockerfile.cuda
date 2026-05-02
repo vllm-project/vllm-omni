@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=vllm/vllm-openai:v0.19.0
+ARG BASE_IMAGE=vllm/vllm-openai:v0.20.0
 FROM ${BASE_IMAGE}
 
 ARG COMMON_WORKDIR=/app
@@ -7,7 +7,7 @@ WORKDIR ${COMMON_WORKDIR}
 
 # Step 1: Setup - Install system dependencies
 RUN apt-get update && \
-    apt-get install -y git sox libsox-fmt-all jq && \
+    apt-get install -y git jq && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 

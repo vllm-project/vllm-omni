@@ -65,6 +65,12 @@ def parse_args():
         default=None,
         help="Text matching --prompt-audio for continuation mode.",
     )
+    parser.add_argument(
+        "--ref-text",
+        type=str,
+        default=None,
+        help="Optional transcript of --reference-audio (enables ref_continuation mode).",
+    )
     return parser.parse_args()
 
 
@@ -74,16 +80,20 @@ def extract_audio(multimodal_output: dict) -> torch.Tensor:
     The output processor concatenates per-step delta tensors under
     ``model_outputs``.  Falls back to ``audio`` for backwards compat.
     """
-    audio = multimodal_output.get("model_outputs") or multimodal_output.get("audio")
+    audio = multimodal_output.get("model_outputs")
+    if audio is None:
+        audio = multimodal_output.get("audio")
     if audio is None:
         raise ValueError(f"No audio key in multimodal_output: {list(multimodal_output.keys())}")
 
     if isinstance(audio, list):
-        # Take the last valid tensor (most complete audio)
+        # Defensive: usually the output processor consolidates into a single
+        # tensor at request completion, but concatenate here too in case the
+        # caller consumes intermediate (pre-consolidation) outputs.
         valid = [torch.as_tensor(a).float().cpu().reshape(-1) for a in audio if a is not None]
         if not valid:
             raise ValueError("Audio list is empty or all elements are None.")
-        return valid[-1]
+        return torch.cat(valid, dim=0) if len(valid) > 1 else valid[0]
 
     return torch.as_tensor(audio).float().cpu().reshape(-1)
 
@@ -99,24 +109,40 @@ def main():
         stage_configs_path=args.stage_configs_path,
     )
 
-    additional: dict = {}
-    if args.reference_audio:
-        additional["reference_audio"] = args.reference_audio
-    if args.prompt_audio and args.prompt_text:
-        additional["prompt_audio"] = args.prompt_audio
-        additional["prompt_text"] = args.prompt_text
+    from transformers import AutoTokenizer
 
-    prompt: dict = {"prompt": args.text}
-    if additional:
-        prompt["additional_information"] = additional
+    from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
+        build_cjk_split_map,
+        build_voxcpm2_prompt,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    split_map = build_cjk_split_map(tokenizer)
+    hf_config = engine.engine.stage_vllm_configs[0].model_config.hf_config
+
+    ref_audio_arg = args.reference_audio or args.prompt_audio
+    ref_text_arg = args.ref_text or args.prompt_text
+    ref_wav, ref_sr = (None, None)
+    if ref_audio_arg:
+        ref_wav_arr, ref_sr = sf.read(ref_audio_arg)
+        ref_wav = ref_wav_arr.mean(axis=-1).tolist() if ref_wav_arr.ndim > 1 else ref_wav_arr.tolist()
+
+    prompt = build_voxcpm2_prompt(
+        hf_config=hf_config,
+        tokenizer=tokenizer,
+        split_map=split_map,
+        text=args.text,
+        ref_audio=ref_wav,
+        ref_sr=ref_sr,
+        ref_text=ref_text_arg,
+    )
 
     print(f"Model       : {args.model}")
     print(f"Text        : {args.text}")
-    if args.reference_audio:
-        print(f"Ref audio   : {args.reference_audio}")
-    if args.prompt_audio:
-        print(f"Prompt audio: {args.prompt_audio}")
-        print(f"Prompt text : {args.prompt_text}")
+    if ref_audio_arg:
+        print(f"Ref audio   : {ref_audio_arg}")
+    if ref_text_arg:
+        print(f"Ref text    : {ref_text_arg}")
     print(f"Output dir  : {output_dir}")
 
     t_start = time.perf_counter()

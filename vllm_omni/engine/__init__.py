@@ -79,6 +79,10 @@ class OmniEngineCoreRequest(EngineCoreRequest):
 
 class OmniEngineCoreOutput(EngineCoreOutput):
     pooling_output: dict[str, torch.Tensor] | None = None
+    # Finished flag for streaming input segment
+    is_segment_finished: bool | None = False
+    # Streaming update prompt length
+    new_prompt_len_snapshot: int | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

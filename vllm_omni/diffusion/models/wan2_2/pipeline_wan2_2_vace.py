@@ -176,6 +176,62 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         """Build VACE transformer directly from config dict."""
         return create_vace_transformer_from_config(config)
 
+    def diffuse(
+        self,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None,
+        guidance_scale: float,
+        dtype: torch.dtype,
+        attention_kwargs: dict[str, object],
+        vace_context: torch.Tensor | None,
+        vace_context_scale: float,
+    ) -> torch.Tensor:
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for t in timesteps:
+                self._current_timestep = t
+                latent_model_input = latents.to(dtype)
+                timestep = t.expand(latents.shape[0])
+
+                do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+
+                positive_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep,
+                    "encoder_hidden_states": prompt_embeds,
+                    "attention_kwargs": attention_kwargs,
+                    "vace_context": vace_context,
+                    "vace_context_scale": vace_context_scale,
+                    "return_dict": False,
+                }
+                negative_kwargs = (
+                    {
+                        "hidden_states": latent_model_input,
+                        "timestep": timestep,
+                        "encoder_hidden_states": negative_prompt_embeds,
+                        "attention_kwargs": attention_kwargs,
+                        "vace_context": vace_context,
+                        "vace_context_scale": vace_context_scale,
+                        "return_dict": False,
+                    }
+                    if do_true_cfg
+                    else None
+                )
+
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg=do_true_cfg,
+                    true_cfg_scale=guidance_scale,
+                    positive_kwargs=positive_kwargs,
+                    negative_kwargs=negative_kwargs,
+                    cfg_normalize=False,
+                )
+
+                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                pbar.update()
+
+        return latents
+
     def check_inputs(
         self,
         prompt,
@@ -569,48 +625,17 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 
-        # Denoising loop
-        with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
-                self._current_timestep = t
-                latent_model_input = latents.to(dtype)
-                timestep = t.expand(latents.shape[0])
-
-                do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
-
-                positive_kwargs = {
-                    "hidden_states": latent_model_input,
-                    "timestep": timestep,
-                    "encoder_hidden_states": prompt_embeds,
-                    "attention_kwargs": attention_kwargs,
-                    "vace_context": vace_context,
-                    "vace_context_scale": vace_context_scale,
-                    "return_dict": False,
-                }
-                negative_kwargs = (
-                    {
-                        "hidden_states": latent_model_input,
-                        "timestep": timestep,
-                        "encoder_hidden_states": negative_prompt_embeds,
-                        "attention_kwargs": attention_kwargs,
-                        "vace_context": vace_context,
-                        "vace_context_scale": vace_context_scale,
-                        "return_dict": False,
-                    }
-                    if do_true_cfg
-                    else None
-                )
-
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_true_cfg,
-                    true_cfg_scale=guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    cfg_normalize=False,
-                )
-
-                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
-                pbar.update()
+        latents = self.diffuse(
+            latents=latents,
+            timesteps=timesteps,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            guidance_scale=guidance_scale,
+            dtype=dtype,
+            attention_kwargs=attention_kwargs,
+            vace_context=vace_context,
+            vace_context_scale=vace_context_scale,
+        )
 
         self._current_timestep = None
 

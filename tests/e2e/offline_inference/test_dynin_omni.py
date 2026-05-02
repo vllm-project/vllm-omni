@@ -18,7 +18,7 @@ import pytest
 import torch
 from transformers import AutoTokenizer
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"

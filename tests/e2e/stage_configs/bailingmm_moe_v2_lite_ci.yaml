@@ -1,0 +1,75 @@
+# CI stage config for Ming-flash-omni-2.0 thinker+talker pipeline.
+# Stage 0: Thinker (multimodal understanding -> text generation)
+# Stage 1: Talker (text -> audio waveform via CFM + AudioVAE)
+#
+# The following config has been verified on 4x H100-80G GPUs
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      devices: "0,1,2,3"
+      max_batch_size: 1
+    engine_args:
+      model_stage: thinker
+      model_arch: MingFlashOmniForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.74
+      enforce_eager: false
+      trust_remote_code: true
+      # Ming Thinker -> talker bridge reads detokenised text from
+      # source_output.outputs[0].text (not hidden states).
+      engine_output_type: text
+      distributed_executor_backend: "mp"
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+      max_model_len: 32768
+      tensor_parallel_size: 4
+      hf_config_name: llm_config
+      load_format: dummy
+      mm_processor_cache_gb: 0
+      compilation_config:
+        pass_config:
+          # Disable fused all-reduce to avoid a vllm/flashinfer version mismatch.
+          fuse_allreduce_rms: false
+    final_output: true
+    final_output_type: text
+    is_comprehension: true
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 0.9
+      max_tokens: 100
+      repetition_penalty: 1.05
+      seed: 42
+      detokenize: true
+      ignore_eos: false
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "3"
+      max_batch_size: 1
+    engine_args:
+      model_stage: ming_tts
+      model_arch: MingFlashOmniTalkerForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.18
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: audio
+      enable_prefix_caching: false
+      max_num_batched_tokens: 1000000
+      tokenizer_subdir: talker/llm
+      # The HF repo ships BailingMM2Config (thinker-only) at root;
+      # OmniModelConfig treats that as "stage does not share outer mrope".
+      hf_config_name: talker_config
+      load_format: dummy
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.ming_flash_omni.thinker2talker
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+      seed: 42

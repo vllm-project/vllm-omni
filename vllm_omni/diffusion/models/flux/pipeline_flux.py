@@ -30,6 +30,7 @@ from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixi
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = logging.getLogger(__name__)
@@ -106,7 +107,11 @@ class FluxPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipe
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
-        self.transformer = FluxTransformer2DModel(od_config=od_config, quant_config=od_config.quantization_config)
+
+        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, FluxTransformer2DModel)
+        self.transformer = FluxTransformer2DModel(
+            **transformer_kwargs, od_config=od_config, quant_config=od_config.quantization_config
+        )
 
         self.tokenizer = CLIPTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
         self.tokenizer_2 = T5TokenizerFast.from_pretrained(

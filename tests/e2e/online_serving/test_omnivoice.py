@@ -17,8 +17,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-from tests.conftest import OmniServerParams, generate_synthetic_audio
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import generate_synthetic_audio
+from tests.helpers.runtime import OmniServerParams
 
 try:
     from transformers import HiggsAudioV2TokenizerModel  # noqa: F401

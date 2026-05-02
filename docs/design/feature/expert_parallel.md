@@ -207,9 +207,9 @@ Complete examples in the codebase:
 
 | Model | Path | Pattern | Notes |
 |-------|------|---------|-------|
-| **HunyuanImage3.0** | `vllm_omni/diffusion/models/hunyuan_image_3/hunyuan_image_3_transformer.py` | Standard EP | Full implementation with validation |
+| **HunyuanImage3.0** | `vllm_omni/diffusion/models/hunyuan_image3/hunyuan_image3_transformer.py` | Standard EP | Full implementation with validation |
 | **EP Tests** | `vllm-omni/tests/e2e/offline_inference/test_expert_parallel.py` | E2E testing | EP correctness and performance |
-| **Constraint Tests** | `vllm-omni/tests/diffusion/models/hunyuan_image_3/test_hunyuan_fused_moe.py` | Unit testing | Validation logic |
+| **Constraint Tests** | `vllm-omni/tests/diffusion/models/hunyuan_image3/test_hunyuan_fused_moe.py` | Unit testing | Validation logic |
 
 ---
 ## Summary

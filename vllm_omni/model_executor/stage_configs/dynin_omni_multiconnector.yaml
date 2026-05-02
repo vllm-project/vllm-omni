@@ -71,9 +71,6 @@ stage_args:
 # Top-level runtime config (concise): default windows and stage edges
 runtime:
   enabled: true
-  defaults:
-    window_size: -1             # Simplified: trigger downstream only after full upstream completion
-    max_inflight: 1             # Simplified: process serially within each stage
   ####
   # same as Qwen2.5_omni version
   # Distributed connectors configuration (optional)
@@ -108,7 +105,5 @@ runtime:
   edges:
     - from: 0
       to: 1
-      window_size: -1
     - from: 1
       to: 2
-      window_size: -1

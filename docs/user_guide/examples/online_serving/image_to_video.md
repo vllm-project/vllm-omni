@@ -72,6 +72,9 @@ curl -X POST http://localhost:8091/v1/videos/sync \
   -F "guidance_scale_2=1.0" \
   -F "boundary_ratio=0.875" \
   -F "flow_shift=12.0" \
+  -F "enable_frame_interpolation=true" \
+  -F "frame_interpolation_exp=1" \
+  -F "frame_interpolation_scale=1.0" \
   -F "seed=42" \
   -o sync_i2v_output.mp4
 ```
@@ -114,6 +117,9 @@ create_response=$(curl -s http://localhost:8091/v1/videos \
   -F "guidance_scale_2=1.0" \
   -F "boundary_ratio=0.875" \
   -F "flow_shift=12.0" \
+  -F "enable_frame_interpolation=true" \
+  -F "frame_interpolation_exp=1" \
+  -F "frame_interpolation_scale=1.0" \
   -F "seed=42")
 
 video_id=$(echo "$create_response" | jq -r '.id')
@@ -172,7 +178,33 @@ curl -X POST http://localhost:8091/v1/videos \
   -F "guidance_scale_2=1.0" \
   -F "boundary_ratio=0.875" \
   -F "flow_shift=12.0" \
+  -F "enable_frame_interpolation=true" \
+  -F "frame_interpolation_exp=1" \
+  -F "frame_interpolation_scale=1.0" \
   -F "seed=42"
+```
+
+Frame interpolation is also available for supported Wan2.2 I2V requests. See
+[Frame Interpolation](../../diffusion/frame_interpolation.md) for worker-side
+execution details and feature constraints.
+
+### Frame Interpolation Example
+
+```bash
+curl -X POST http://localhost:8091/v1/videos/sync \
+  -F "prompt=A bear playing with yarn, smooth motion" \
+  -F "input_reference=@/path/to/qwen-bear.png" \
+  -F "width=832" \
+  -F "height=480" \
+  -F "num_frames=33" \
+  -F "fps=16" \
+  -F "num_inference_steps=40" \
+  -F "guidance_scale=1.0" \
+  -F "guidance_scale_2=1.0" \
+  -F "enable_frame_interpolation=true" \
+  -F "frame_interpolation_exp=1" \
+  -F "frame_interpolation_scale=1.0" \
+  -o sync_i2v_interpolated.mp4
 ```
 
 ## Create Response Format

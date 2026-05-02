@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from .load_balancer import (
+    LeastQueueLengthBalancer,
     LoadBalancer,
     LoadBalancingPolicy,
     RandomBalancer,
+    RoundRobinBalancer,
     Task,
 )
 from .messages import InstanceEvent, InstanceInfo, InstanceList, StageStatus
@@ -24,4 +26,6 @@ __all__ = [
     "LoadBalancer",
     "LoadBalancingPolicy",
     "RandomBalancer",
+    "RoundRobinBalancer",
+    "LeastQueueLengthBalancer",
 ]

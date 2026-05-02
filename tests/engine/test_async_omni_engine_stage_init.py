@@ -100,10 +100,11 @@ def test_initialize_stages_passes_stage_init_timeout_to_diffusion_handshake(monk
     engine.log_stats = False
     engine.model = "dummy-model"
     engine.config_path = "dummy-config"
-    engine.num_stages = 1
+    engine.num_stages = 2
     engine.async_chunk = False
     engine.diffusion_batch_size = 1
     engine.single_stage_mode = False
+    engine._omni_master_server = None
     engine.stage_configs = [types.SimpleNamespace(stage_id=0, stage_type="diffusion", engine_args={})]
 
     metadata = types.SimpleNamespace(
@@ -182,6 +183,7 @@ def test_launch_llm_stage_passes_stage_init_timeout_to_complete_stage_handshake(
     engine.model = "dummy-model"
     engine.single_stage_mode = False
     engine._omni_master_server = None
+    engine.stage_configs = []
 
     metadata = types.SimpleNamespace(stage_id=0, runtime_cfg={"devices": "0"})
     fake_vllm_config = types.SimpleNamespace()
@@ -237,6 +239,7 @@ def test_launch_llm_stage_releases_launch_lock_before_complete_stage_handshake(m
     engine.model = "dummy-model"
     engine.single_stage_mode = False
     engine._omni_master_server = None
+    engine.stage_configs = []
 
     fake_vllm_config = types.SimpleNamespace()
     fake_addresses = types.SimpleNamespace()
@@ -377,3 +380,70 @@ def test_attach_llm_stage_uses_omni_input_preprocessor(monkeypatch):
     assert input_processor is not None
     assert isinstance(input_processor.input_preprocessor, DummyOmniInputPreprocessor)
     assert input_processor.input_preprocessor.renderer is input_processor.renderer
+
+
+def test_inject_kv_stage_info_infers_sender_tp_topology():
+    from vllm_omni.engine.stage_init_utils import inject_kv_stage_info
+
+    stage0 = types.SimpleNamespace(
+        stage_id=0,
+        engine_args={
+            "tensor_parallel_size": 4,
+            "omni_kv_config": {
+                "need_send_cache": True,
+                "omni_from_stage": "0",
+                "omni_to_stage": "1",
+            },
+        },
+        engine_input_source=[],
+    )
+    stage1 = types.SimpleNamespace(
+        stage_id=1,
+        engine_args={
+            "parallel_config": {
+                "tensor_parallel_size": 2,
+                "cfg_parallel_size": 1,
+            },
+            "omni_kv_config": {"need_recv_cache": True},
+        },
+        engine_input_source=[0],
+    )
+
+    inject_kv_stage_info(stage0, 0, [stage0, stage1])
+
+    assert stage0.engine_args["omni_kv_config"]["stage_id"] == 0
+    assert stage0.engine_args["omni_kv_config"]["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
+
+
+def test_inject_kv_stage_info_infers_receiver_tp_topology():
+    from vllm_omni.engine.stage_init_utils import inject_kv_stage_info
+
+    stage0 = types.SimpleNamespace(
+        stage_id=0,
+        engine_args={
+            "tensor_parallel_size": 4,
+            "omni_kv_config": {"need_send_cache": True},
+        },
+        engine_input_source=[],
+    )
+    stage1 = types.SimpleNamespace(
+        stage_id=1,
+        engine_args={
+            "parallel_config": {
+                "tensor_parallel_size": 2,
+                "cfg_parallel_size": 1,
+            },
+            "omni_kv_config": {
+                "need_recv_cache": True,
+                "omni_from_stage": "0",
+                "omni_to_stage": "1",
+            },
+        },
+        engine_input_source=[0],
+    )
+
+    inject_kv_stage_info(stage1, 1, [stage0, stage1])
+
+    assert stage1.engine_args["omni_kv_config"]["stage_id"] == 1
+    assert stage1.engine_args["omni_kv_config"]["engine_input_source"] == [0]
+    assert stage1.engine_args["omni_kv_config"]["rank_mapping"] == {"from_tp": 4, "to_tp": 2}

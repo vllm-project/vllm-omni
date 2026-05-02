@@ -53,19 +53,34 @@ from vllm_omni.diffusion.models.bagel.pipeline_bagel import default_ae_params
 
 
 class OmniBagelProcessor(BagelProcessor):
+    # transformers>=5.0 ProcessorMixin.get_attributes() only scans the leaf
+    # class's __dict__ for ``<attribute>_class`` hints; redeclare them here
+    # so from_pretrained() correctly sets ``self.image_processor`` and
+    # ``self.tokenizer`` on the OmniBagelProcessor instance.
+    image_processor_class = "SiglipImageProcessor"
+    tokenizer_class = "AutoTokenizer"
+
     def __call__(self, text=None, images=None, **kwargs):
         is_img2img = kwargs.pop("is_img2img", False)
 
         if is_img2img and images is not None:
-            image_kwargs = kwargs.copy()
+            # transformers>=5.0 enforces strict kwarg typing on image
+            # processors, so split generic kwargs into text/image buckets
+            # via the standard ProcessorMixin helper before dispatch.
+            from vllm.transformers_utils.processors.bagel import BagelProcessorKwargs
+
+            output_kwargs = self._merge_kwargs(
+                BagelProcessorKwargs,
+                tokenizer_init_kwargs=self.tokenizer.init_kwargs,
+                **kwargs,
+            )
+            image_kwargs = dict(output_kwargs["images_kwargs"])
             image_kwargs["do_resize"] = False
             image_kwargs["do_rescale"] = True
-            if "return_tensors" not in image_kwargs:
-                image_kwargs["return_tensors"] = "pt"
-
+            image_kwargs.setdefault("return_tensors", "pt")
             pixel_values = self.image_processor(images, **image_kwargs)
 
-            text_inputs = self.tokenizer(text, **kwargs) if text is not None else None
+            text_inputs = self.tokenizer(text, **output_kwargs["text_kwargs"]) if text is not None else None
 
             if pixel_values is not None and text_inputs is not None:
                 combined = dict(text_inputs)
@@ -203,6 +218,13 @@ class OmniBagelDataParser(MultiModalDataParser):
 class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingInfo]):
     IMG2IMG_PLACEHOLDER = "<|fim_middle|>"
 
+    @staticmethod
+    def _mm_kwargs_for_bagel_img2img_hf(mm_kwargs: Mapping[str, object]) -> dict[str, object]:
+        # OpenAI / GLM-style serving may pass target_h/target_w for output grid sizing.
+        # BagelProcessor does not accept these in img2img mode; strip here so callers
+        # (e.g. serving_chat) can stay model-agnostic.
+        return {k: v for k, v in mm_kwargs.items() if k not in ("target_h", "target_w")}
+
     def _cached_apply_hf_processor(self, inputs, timing_ctx):
         # img2img: prompt text must be modified based on mm data presence,
         # so text and mm data cannot be tokenized separately — bypass cache.
@@ -248,7 +270,7 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
             if "images" in img2img_data:
                 del img2img_data["images"]
             img2img_data["images"] = img2img_data.pop("pixel_values_img2img")
-            kwargs_img2img = dict(mm_kwargs)
+            kwargs_img2img = self._mm_kwargs_for_bagel_img2img_hf(mm_kwargs)
             kwargs_img2img["is_img2img"] = True
             out_img2img = super()._call_hf_processor(prompt, img2img_data, kwargs_img2img, tok_kwargs)
             if "pixel_values" in out_img2img:
@@ -262,7 +284,7 @@ class OmniBagelMultiModalProcessor(BaseMultiModalProcessor[OmniBagelProcessingIn
         elif has_img2img:
             mm_data = dict(mm_data)
             mm_data["images"] = mm_data.pop("pixel_values_img2img")
-            mm_kwargs = dict(mm_kwargs)
+            mm_kwargs = self._mm_kwargs_for_bagel_img2img_hf(mm_kwargs)
             mm_kwargs["is_img2img"] = True
             outputs = super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
             if "pixel_values" in outputs:
@@ -581,6 +603,9 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 existing = self._ropes_metadata.get(rid)
                 if existing and "image_shape" in existing and "image_shape" not in meta:
                     continue
+                ropes = meta.get("ropes")
+                if ropes:
+                    meta["ropes"] = [int(r.item()) if isinstance(r, torch.Tensor) else r for r in ropes]
                 self._ropes_metadata[rid] = meta
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
@@ -724,7 +749,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 positions = self._adjust_positions_for_img2img(positions, input_ids)
                 use_mot = True
             else:
-                rope = int(positions[seq_len - 1].item()) + 1
+                rope = positions[seq_len - 1] + 1
                 self._ropes_pending.append({"ropes": [rope]})
 
         if use_mot:

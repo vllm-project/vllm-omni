@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Any
 
 import torch
+import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.platforms import Platform
 
@@ -64,11 +65,18 @@ class OmniPlatform(Platform):
     @classmethod
     def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:
         if op_name == "hunyuan_fused_moe":
-            return "vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
+            return "vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
         raise NotImplementedError(f"Unsupported diffusion model op: {op_name}")
 
     @classmethod
     def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:
+        return None
+
+    @classmethod
+    def get_diffusion_packed_modules_mapping(
+        cls,
+        model_class: type[nn.Module],
+    ) -> dict[str, list[str]] | None:
         return None
 
     @classmethod
@@ -96,6 +104,11 @@ class OmniPlatform(Platform):
     def supports_torch_inductor(cls) -> bool:
         """Check if the platform supports torch.compile with inductor backend."""
         raise NotImplementedError
+
+    @classmethod
+    def has_flash_attn_package(cls) -> bool:
+        """Check if a Flash Attention package is available and usable on this platform."""
+        return False
 
     @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:

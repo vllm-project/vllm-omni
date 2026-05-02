@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 async def run_streaming(inputs, sampling_params_list, model_name, args, output_dir):
     async_omni = AsyncOmni(
         model=model_name,
-        stage_configs_path=args.stage_configs_path,
+        deploy_config=args.deploy_config,
         log_stats=args.log_stats,
     )
 
@@ -192,7 +192,7 @@ def run_non_streaming(inputs, sampling_params_list, model_name, args, output_dir
     llm = Omni(
         model=model_name,
         log_stats=args.log_stats,
-        stage_configs_path=args.stage_configs_path,
+        deploy_config=args.deploy_config,
     )
 
     if args.profiling_mode:
@@ -253,10 +253,11 @@ def parse_args() -> Namespace:
         help="Directory to write output wav files.",
     )
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         type=str,
         default=None,
-        help="Path to stage configs YAML. Auto-resolved from model if not set.",
+        help="Override the deploy config path. If unset, auto-loads "
+        "vllm_omni/deploy/voxtral_tts.yaml based on the HF model_type.",
     )
     parser.add_argument(
         "--num-prompts", type=int, default=1, help="Number of replicate prompts to run for measuring performance"
@@ -296,6 +297,12 @@ def parse_args() -> Namespace:
         type=str,
         default=None,
         help="Voice to use instead of audio file.",
+    )
+    parser.add_argument(
+        "--cfg-alpha",
+        type=float,
+        default=None,
+        help="CFG alpha for flow-matching guidance (default: use value from stage config, typically 1.2).",
     )
     return parser.parse_args()
 
@@ -348,8 +355,13 @@ def main(args: Any) -> None:
 
     inputs = compose_request(model_name, text_chunk, audio_prompt_file, args)
 
+    extra_args = {}
+    if args.cfg_alpha is not None:
+        extra_args["cfg_alpha"] = args.cfg_alpha
+
     sampling_params = SamplingParams(
         max_tokens=max_num_tokens,
+        extra_args=extra_args if extra_args else None,
     )
     sampling_params_list = [
         sampling_params,

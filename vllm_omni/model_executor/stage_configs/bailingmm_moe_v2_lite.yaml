@@ -1,0 +1,46 @@
+# Stage config for Ming-flash-omni-2.0
+# Stage 0: Thinker (Multimodal understanding + text generation)
+# Stage 1a: Image Generator (Text embeddings -> PIL image)
+# Stage 1b: Talker (Text embeddings -> audio waveform)
+
+async_chunk: false
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      devices: "0,1,2,3"
+      max_batch_size: 1
+    engine_args:
+      model_stage: thinker
+      model_arch: MingFlashOmniForConditionalGeneration
+      # tokenizer_subdir: talker/llm
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.9
+      enforce_eager: false
+      trust_remote_code: true
+      engine_output_type: latent
+      distributed_executor_backend: "mp"
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+      tensor_parallel_size: 4  # Use 4 GPUs for MoE model
+      # pipeline_parallel_size: 4
+      hf_config_name: llm_config
+      compilation_config:
+        pass_config:
+          # there's a version mismatch regarding vllm and flashinfer
+          # disable fuse allreduce for now
+          fuse_allreduce_rms: false
+    final_output: true  # Can output text directly
+    final_output_type: text
+    is_comprehension: true
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      max_tokens: 2048
+      repetition_penalty: 1.05
+      seed: 42
+      detokenize: true
+
+  # Future Stage 1a: Image Generator (Optional - not yet implemented)
+  # Future Stage 1b: Talker/TTS (Optional - not yet implemented)

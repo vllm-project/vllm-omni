@@ -227,6 +227,9 @@ def _encode_video_bytes(
         frames_np *= 255.0
         frames_u8 = np.round(frames_np).astype(np.uint8)
 
+    # Ensure contiguous memory layout for faster PyAV muxing
+    frames_u8 = np.ascontiguousarray(frames_u8)
+
     audio_np = _coerce_audio_to_numpy(audio) if audio is not None else None
 
     return mux_video_audio_bytes(

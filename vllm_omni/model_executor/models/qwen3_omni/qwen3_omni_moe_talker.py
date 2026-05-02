@@ -100,11 +100,23 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         talker_config: Qwen3OmniMoeTalkerConfig = vllm_config.model_config.hf_config
-        rope_params = talker_config.text_config.rope_scaling
+        rope_params = getattr(talker_config.text_config, "rope_scaling", None)
         if rope_params is None:
-            # Newer transformers use rope_parameters instead of rope_scaling
             rope_params = getattr(talker_config.text_config, "rope_parameters", None) or {}
-        rope_params["rope_theta"] = talker_config.text_config.rope_theta
+        rope_params = dict(rope_params)
+        # In transformers <5.0.0, rope_theta is a top-level config attribute
+        # (e.g. config.text_config.rope_theta = 1000000.0).
+        # In transformers >=5.0.0 (PR #39847), rope_theta moved inside the
+        # rope_parameters dict (e.g. config.text_config.rope_parameters =
+        # {"rope_theta": 1000000.0, "rope_type": "default"}).
+        # Use setdefault so we never overwrite a value already present.
+        # Precedence: rope_params["rope_theta"] (already set)
+        #           > text_config.rope_theta (transformers <5.0.0 top-level attr)
+        #           > 1000000 (Qwen3 Omni default)
+        rope_params.setdefault(
+            "rope_theta",
+            getattr(talker_config.text_config, "rope_theta", 1000000),
+        )
         talker_config.text_config.rope_parameters = rope_params
         quant_config = vllm_config.quant_config
         if isinstance(quant_config, ComponentQuantizationConfig):
@@ -477,7 +489,7 @@ class Qwen3OmniMoeModel(Qwen3MoeLLMForCausalLM):
     """
     Qwen3 Omni MoE Talker language model.
 
-    Extends Qwen3MoeLLMForCausalLM (which already uses SharedFusedMoE with
+    Extends Qwen3MoeLLMForCausalLM (which already uses FusedMoE with
     shared-expert support) and replaces the text embedding / LM head with a
     codec embedding so the talker operates over audio-codec tokens instead
     of text tokens.

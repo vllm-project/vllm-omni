@@ -301,7 +301,10 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         # Load transformer (DiT)
         logger.info("Loading GlmImageTransformer2DModel (DiT)...")
-        self.transformer = GlmImageTransformer2DModel(od_config=od_config)
+        self.transformer = GlmImageTransformer2DModel(
+            od_config=od_config,
+            quant_config=od_config.quantization_config,
+        )
 
         # Weight sources for DiT loading
         self.weights_sources = [
@@ -712,6 +715,14 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             if img is not None:
                 preprocessed_images = [img]
 
+        # Priority: prompt dict (from ar2diffusion) > sampling_params
+        # ar2diffusion returns adjusted height/width that matches prior_token_ids
+        if not isinstance(first_prompt, str):
+            ar_height = first_prompt.get("height")
+            ar_width = first_prompt.get("width")
+        else:
+            ar_height = ar_width = None
+
         img_height = req.sampling_params.height
         img_width = req.sampling_params.width
 
@@ -719,11 +730,18 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         # Treat that as t2i warmup to avoid requiring i2i-only KV-cache inputs.
         is_image_edit = (preprocessed_images is not None) and (not is_dummy_warmup)
 
-        # Use image dimensions as default if available
-        height = req.sampling_params.height or img_height or self.default_sample_size * self.vae_scale_factor
-        width = req.sampling_params.width or img_width or self.default_sample_size * self.vae_scale_factor
+        # Use prompt dict dimensions (from ar2diffusion) as priority, then sampling_params
+        height = (
+            ar_height or req.sampling_params.height or img_height or self.default_sample_size * self.vae_scale_factor
+        )
+        width = ar_width or req.sampling_params.width or img_width or self.default_sample_size * self.vae_scale_factor
         num_inference_steps = req.sampling_params.num_inference_steps or 50
         guidance_scale = req.sampling_params.guidance_scale or 1.5
+
+        # Ensure dimensions are multiples of vae_scale_factor * patch_size
+        multiple_of = self.vae_scale_factor * self._patch_size
+        height = height // multiple_of * multiple_of
+        width = width // multiple_of * multiple_of
 
         self.check_inputs(prompt=prompt, height=height, width=width, prompt_embeds=prompt_embeds)
 
@@ -753,6 +771,20 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 prior_token_id = prior_token_id.to(device=self.device, dtype=torch.long)
             if prior_token_id.dim() == 1:
                 prior_token_id = prior_token_id.unsqueeze(0)
+
+            # Validate that prior_token_id seq_len matches dimensions
+            prior_seq_len = prior_token_id.shape[1]
+            expected_seq_len = (height // self.vae_scale_factor // self._patch_size) * (
+                width // self.vae_scale_factor // self._patch_size
+            )
+            if prior_seq_len != expected_seq_len:
+                raise ValueError(
+                    f"prior_token_ids seq_len ({prior_seq_len}) doesn't match dimensions "
+                    f"({height}x{width}, expected seq_len={expected_seq_len}). "
+                    f"This indicates a mismatch between AR output and Diffusion input. "
+                    f"Please ensure ar2diffusion returns correct height/width."
+                )
+
             prior_token_image_ids = None
             if external_prior_image_ids is not None:
                 if isinstance(external_prior_image_ids, torch.Tensor):

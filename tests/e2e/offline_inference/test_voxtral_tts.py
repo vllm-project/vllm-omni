@@ -29,14 +29,13 @@ from mistral_common.protocol.speech.request import SpeechRequest
 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 from vllm import SamplingParams
 
-from tests.conftest import OmniRunner, modify_stage_config
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 MODEL = "mistralai/Voxtral-4B-TTS-2603"
-STAGE_CONFIG = str(
-    Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / "voxtral_tts.yaml"
-)
+STAGE_CONFIG = get_deploy_config_path("voxtral_tts.yaml")
 SAMPLE_RATE = 24000
 # Minimum expected audio samples for a short sentence (~0.04s of 24kHz audio)
 MIN_AUDIO_SAMPLES = 1000
@@ -65,9 +64,9 @@ def _resolve_stage_config(run_level: str) -> str:
         return modify_stage_config(
             STAGE_CONFIG,
             deletes={
-                "stage_args": {
-                    0: ["engine_args.load_format"],
-                    1: ["engine_args.load_format"],
+                "stages": {
+                    0: ["load_format"],
+                    1: ["load_format"],
                 }
             },
         )

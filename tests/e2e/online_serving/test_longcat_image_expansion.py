@@ -13,13 +13,10 @@ This validates:
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-    dummy_messages_from_mix_data,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 TEXT_TO_IMAGE_PROMPT = (
     "A cinematic illustration of a cat typing on a silver laptop, soft window light, highly detailed."
@@ -56,8 +53,6 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases("meituan-longcat/LongCat-Image"),
