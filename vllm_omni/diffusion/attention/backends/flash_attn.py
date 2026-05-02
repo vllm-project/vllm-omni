@@ -10,13 +10,6 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.backends.utils.fa import (
-    HAS_FLASH_ATTN,
-    _pad_input,
-    _unpad_input,
-    _upad_input,
-    flash_attn_varlen_func,
-)
 
 logger = init_logger(__name__)
 
@@ -68,6 +61,13 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
+        from vllm_omni.diffusion.attention.backends.utils.fa import (
+            _pad_input,
+            _unpad_input,
+            _upad_input,
+            flash_attn_varlen_func,
+        )
+
         assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
         query_length = query.size(1)
         q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
@@ -104,6 +104,10 @@ class FlashAttentionImpl(AttentionImpl):
         https://github.com/vllm-project/vllm/blob/v0.20.0/vllm/vllm_flash_attn/flash_attn_interface.py#L176
         https://github.com/vllm-project/vllm/blob/v0.20.0/vllm/_xpu_ops.py#L310
         """
+        from vllm_omni.diffusion.attention.backends.utils.fa import (
+            flash_attn_varlen_func,
+        )
+
         batch_size, q_len = query.size()[:2]
         cu_seqlens = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
         # b s ... -> (b s) ...
@@ -134,6 +138,10 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
         """CUDA/ROCm/MUSA flash attention implementation."""
+        from vllm_omni.diffusion.attention.backends.utils.fa import (
+            HAS_FLASH_ATTN,
+        )
+
         if not HAS_FLASH_ATTN:
             raise ImportError(
                 "FlashAttentionBackend requires Flash Attention. "
@@ -165,6 +173,10 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
         """XPU flash attention implementation."""
+        from vllm_omni.diffusion.attention.backends.utils.fa import (
+            HAS_FLASH_ATTN,
+        )
+
         if not HAS_FLASH_ATTN:
             raise ImportError(
                 "FlashAttentionBackend requires Flash Attention. "

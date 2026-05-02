@@ -56,20 +56,20 @@ else:
         pass
 
     # Fallback: Try FA3 from flash-attention source build
-    if flash_attn_func is None:
+    if flash_attn_varlen_func is None:
         try:
             from flash_attn_interface import flash_attn_varlen_func  # noqa: F401
         except (ImportError, ModuleNotFoundError):
             pass
 
     # Fallback: Try FA2 from flash-attn package (try multiple import paths)
-    if flash_attn_func is None:
+    if flash_attn_varlen_func is None:
         try:
             from flash_attn import flash_attn_varlen_func  # noqa: F401
         except (ImportError, ModuleNotFoundError):
             pass
 
-    if flash_attn_func is None:
+    if flash_attn_varlen_func is None:
         try:
             from flash_attn.flash_attn_interface import (  # noqa: F401
                 flash_attn_varlen_func,
@@ -79,7 +79,7 @@ else:
 
     # Fallback: Try vLLM's encapsulated flash attention dispatcher
     # TODO discuss priority and remove potentially redundant fallbacks
-    if flash_attn_func is None:
+    if flash_attn_varlen_func is None:
         try:
             from vllm.vllm_flash_attn import (  # noqa: F401
                 flash_attn_varlen_func,
