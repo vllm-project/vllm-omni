@@ -26,7 +26,7 @@ path, including English TTS, Chinese TTS, and a raw `curl` smoke test.
 ## Hardware Support
 
 This recipe documents the tested GPU configuration for OmniVoice online
-serving on 1x NVIDIA L20 48GB. 
+serving on 1x NVIDIA L20 48GB.
 Other hardware and configurations are welcome as community validation lands.
 
 
