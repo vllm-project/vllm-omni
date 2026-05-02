@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+
 import torch
 from vllm.logger import init_logger
 
@@ -8,6 +9,13 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
+)
+from vllm_omni.diffusion.attention.backends.utils.fa import (
+    HAS_FLASH_ATTN,
+    _pad_input,
+    _unpad_input,
+    _upad_input,
+    flash_attn_varlen_func,
 )
 
 logger = init_logger(__name__)
@@ -60,13 +68,6 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        from vllm_omni.diffusion.attention.backends.utils.fa import (
-            _pad_input,
-            _unpad_input,
-            _upad_input,
-            flash_attn_varlen_func,
-        )
-
         assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
         query_length = query.size(1)
         q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
@@ -89,6 +90,42 @@ class FlashAttentionImpl(AttentionImpl):
         out_unpad = self._unwrap_flash_output(out_unpad)
         return _pad_input(out_unpad, indices_q, query.size(0), query_length)
 
+    def _forward_varlen_dense(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        """Common wrapper for calling flash_attn_varlen_func for XPU and CUDA in vLLM.
+
+        NOTE: careful to keep the kwargs on these aligned and to pass everything as a keyword
+        argument, because some of the args differ positionally at the moment.
+
+        https://github.com/vllm-project/vllm/blob/v0.20.0/vllm/vllm_flash_attn/flash_attn_interface.py#L176
+        https://github.com/vllm-project/vllm/blob/v0.20.0/vllm/_xpu_ops.py#L310
+        """
+        batch_size, q_len = query.size()[:2]
+        cu_seqlens = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
+        # b s ... -> (b s) ...
+        query = query.flatten(0, 1)
+        key = key.flatten(0, 1)
+        value = value.flatten(0, 1)
+
+        out = flash_attn_varlen_func(
+            q=query,
+            k=key,
+            v=value,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=q_len,
+            max_seqlen_k=q_len,
+            causal=self.causal,
+            softmax_scale=self.softmax_scale,
+        )
+        out = self._unwrap_flash_output(out)
+        # (b s) h d -> b s h d
+        return out.reshape(batch_size, q_len, *out.shape[1:])
+
     def forward_cuda(
         self,
         query: torch.Tensor,
@@ -97,11 +134,6 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
         """CUDA/ROCm/MUSA flash attention implementation."""
-        from vllm_omni.diffusion.attention.backends.utils.fa import (
-            HAS_FLASH_ATTN,
-            flash_attn_func,
-        )
-
         if not HAS_FLASH_ATTN:
             raise ImportError(
                 "FlashAttentionBackend requires Flash Attention. "
@@ -119,14 +151,11 @@ class FlashAttentionImpl(AttentionImpl):
                 attention_mask,
             )
 
-        out = flash_attn_func(
+        return self._forward_varlen_dense(
             query,
             key,
             value,
-            causal=self.causal,
-            softmax_scale=self.softmax_scale,
         )
-        return self._unwrap_flash_output(out)
 
     def forward_xpu(
         self,
@@ -136,11 +165,6 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
         """XPU flash attention implementation."""
-        from vllm_omni.diffusion.attention.backends.utils.fa import (
-            HAS_FLASH_ATTN,
-            flash_attn_varlen_func,
-        )
-
         if not HAS_FLASH_ATTN:
             raise ImportError(
                 "FlashAttentionBackend requires Flash Attention. "
@@ -158,27 +182,11 @@ class FlashAttentionImpl(AttentionImpl):
                 attention_mask,
             )
 
-        batch_size, q_len = query.size()[:2]
-        cu_seqlens = torch.arange(0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=query.device)
-        # b s ... -> (b s) ...
-        query = query.flatten(0, 1)
-        key = key.flatten(0, 1)
-        value = value.flatten(0, 1)
-
-        out = flash_attn_varlen_func(
+        return self._forward_varlen_dense(
             query,
             key,
             value,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=q_len,
-            max_seqlen_k=q_len,
-            causal=self.causal,
-            softmax_scale=self.softmax_scale,
         )
-        out = self._unwrap_flash_output(out)
-        # (b s) h d -> b s h d
-        return out.reshape(batch_size, q_len, *out.shape[1:])
 
     def forward_npu(
         self,

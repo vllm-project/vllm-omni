@@ -408,13 +408,31 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         )
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
-        self._tts: nn.Module | None = None
+        # Eager-init tts_model so it registers in self.state_dict() before vLLM's
+        # post-__init__ profiling claims the remaining GPU memory for KV cache.
+        # Required for load_format=dummy: DummyModelLoader only randomizes
+        # already-registered nn.Parameters.
+        # NOTE: from_pretrained() is unconditional, so load_format=dummy still pays
+        # the checkpoint download/read cost at construction time; DummyModelLoader
+        # will then randomize the just-loaded _tts params — this is intended.
+        model_path = vllm_config.model_config.model
+        VoxCPM = import_voxcpm2_core()
+        native = VoxCPM.from_pretrained(model_path, load_denoiser=False, optimize=False)
+        self._tts: nn.Module = native.tts_model.to("cuda")
+        self._side_dtype = self._tts.fusion_concat_proj.weight.dtype
         self._device = "cuda"
-        self._side_dtype = torch.bfloat16
-
-        self._patch_size = getattr(self.config, "patch_size", 4)
-        self._feat_dim = getattr(self.config, "feat_dim", 64)
+        self._patch_size = self._tts.patch_size
+        self._feat_dim = self._tts.feat_dim
         self._sample_rate = getattr(self.config, "sample_rate", 48000)
+
+        # base_lm/residual_lm in native tts_model duplicate self.model and
+        # self.residual_model: copy residual weights over, drop both submodules.
+        self.residual_model.load_weights_from_native(self._tts.residual_lm)
+        del self._tts.base_lm
+        self._tts.base_lm = None
+        del self._tts.residual_lm
+        self._tts.residual_lm = None
+        torch.cuda.empty_cache()
 
         self._inference_timesteps = 10
         self._cfg_value = 2.0
@@ -452,7 +470,6 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
     @property
     def tts(self) -> nn.Module:
-        assert self._tts is not None, "Model not loaded yet"
         return self._tts
 
     # -------------------- request state management --------------------
@@ -1264,25 +1281,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(_base_lm_only(weights), mapper=self.hf_to_vllm_mapper)
 
-        model_path = self.vllm_config.model_config.model
-        VoxCPM = import_voxcpm2_core()
-        native = VoxCPM.from_pretrained(model_path, load_denoiser=False, optimize=False)
-        self._tts = native.tts_model.to("cuda")
-        self._side_dtype = self._tts.fusion_concat_proj.weight.dtype
-        self._device = "cuda"
-        self._patch_size = self._tts.patch_size
-        self._feat_dim = self._tts.feat_dim
-
-        n = self.residual_model.load_weights_from_native(self._tts.residual_lm)
-        for name, _ in self.residual_model.named_parameters():
-            loaded.add(f"residual_model.{name}")
-        logger.info("VoxCPM2: loaded %d params into paged residual_model", n)
-
-        del self._tts.base_lm
-        self._tts.base_lm = None
-        del self._tts.residual_lm
-        self._tts.residual_lm = None
-        torch.cuda.empty_cache()
+        # _tts and residual_model are constructed and populated eagerly in
+        # __init__ via VoxCPM.from_pretrained; here we only need to mark their
+        # params as loaded so AutoWeightsLoader's strict check doesn't flag
+        # them as missing from the checkpoint.
+        loaded |= {name for name, _ in self.named_parameters() if name.startswith(("_tts.", "residual_model."))}
 
         logger.info(
             "Loaded VoxCPM2 (patch=%d, feat_dim=%d, dtype=%s)", self._patch_size, self._feat_dim, self._side_dtype
