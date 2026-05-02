@@ -18,8 +18,6 @@ path, including English TTS, Chinese TTS, and a raw `curl` smoke test.
 
 ## References
 
-- User guide:
-  [`docs/user_guide/examples/online_serving/omnivoice.md`](../../docs/user_guide/examples/online_serving/omnivoice.md)
 - Online serving example:
   [`examples/online_serving/omnivoice`](../../examples/online_serving/omnivoice)
 - Related issue:
