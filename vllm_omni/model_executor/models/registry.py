@@ -174,6 +174,12 @@ _OMNI_MODELS = {
         "VoxtralTTSAudioGenerationForConditionalGeneration",
     ),
     "VoxtralTTSAudioTokenizer": ("voxtral_tts", "voxtral_tts_audio_tokenizer", "VoxtralTTSAudioTokenizer"),
+    ## VibeVoice TTS
+    "VibeVoiceTTSForConditionalGeneration": (
+        "vibevoice_tts",
+        "vibevoice_tts",
+        "VibeVoiceTTSForConditionalGeneration",
+    ),
     ## MOSS-TTS-Nano
     "MossTTSNanoForCausalLM": (
         "moss_tts_nano",

@@ -657,9 +657,9 @@ class TestTTSMethods:
 
     def test_is_tts_detection_no_stage(self, speech_server):
         """Test TTS model detection when no TTS stage exists."""
-        # Fixture creates server with stage_configs = [] -> _is_tts should be False
-        assert speech_server._is_tts is False
+        # Fixture creates server with stage_configs = [] -> no TTS stage detected
         assert speech_server._tts_stage is None
+        assert speech_server._tts_model_type is None
 
     def test_is_tts_detection_with_tts_stage(self, mocker: MockerFixture):
         """Test TTS model detection when TTS stage exists."""
@@ -682,8 +682,8 @@ class TestTTSMethods:
             request_logger=mocker.MagicMock(),
         )
 
-        assert server._is_tts is True
         assert server._tts_stage is mock_stage
+        assert server._tts_model_type == "qwen3_tts"
 
     def test_prepare_speech_rejects_non_tts_omni_model(self, mocker: MockerFixture):
         """Multi-stage omni models (e.g. Qwen3-Omni) must not use /v1/audio/speech."""
@@ -735,6 +735,34 @@ class TestTTSMethods:
         # CustomVoice without voice on model with no speakers -> also rejected
         req = OpenAICreateSpeechRequest(input="Hello")
         assert "does not support CustomVoice" in speech_server._validate_tts_request(req)
+
+    def test_validate_vibevoice_tts_request(self, speech_server):
+        speech_server._tts_model_type = "vibevoice_tts"
+        speech_server.uploaded_speakers = {"clone_voice": {"name": "clone_voice"}}
+
+        assert speech_server._validate_tts_request(OpenAICreateSpeechRequest(input="hello")) is None
+
+        req = OpenAICreateSpeechRequest(
+            input="hello",
+            task_type="Base",
+            language="English",
+            instructions="warm",
+            ref_text="sample",
+            x_vector_only_mode=True,
+        )
+        assert speech_server._validate_tts_request(req) is None
+
+        req = OpenAICreateSpeechRequest(input="hello", voice="missing_voice")
+        assert "uploaded voice samples only" in speech_server._validate_tts_request(req)
+
+        req = OpenAICreateSpeechRequest(input="hello", voice="clone_voice")
+        assert speech_server._validate_tts_request(req) is None
+
+    def test_load_supported_speakers_missing_talker_config(self, speech_server):
+        speech_server._tts_model_type = None
+        speech_server.engine_client.model_config.hf_config = SimpleNamespace()
+
+        assert speech_server._load_supported_speakers() == set()
 
     def test_validate_tts_request_task_types(self, speech_server):
         """Test task-specific validation."""
@@ -1009,6 +1037,38 @@ class TestTTSMethods:
         assert params["task_type"] == ["Base"]
         assert params["ref_text"] == ["Hello world transcript"]
         assert params["voice_created_at"] == [1711234567.89]
+
+    def test_build_vibevoice_prompt(self, speech_server, mocker: MockerFixture):
+        class FakeProcessor:
+            def __init__(self):
+                self.audio_processor = SimpleNamespace(sampling_rate=24000)
+
+            def __call__(self, *, text, voice_samples, padding, return_tensors):
+                assert text == "Speaker 1: hello world"
+                assert padding is False
+                assert return_tensors is None
+                assert len(voice_samples) == 1
+                return {
+                    "input_ids": [[11, 12, 13, 14]],
+                    "speech_input_mask": [[False, True, True, False]],
+                }
+
+        speech_server._tts_model_type = "vibevoice_tts"
+        mocker.patch.object(speech_server, "_get_vibevoice_processor", return_value=FakeProcessor())
+        mocker.patch.object(
+            speech_server,
+            "_resolve_vibevoice_voice_samples",
+            mocker.AsyncMock(return_value=[{"samples": [0.0] * 6400, "sample_rate": 16000}]),
+        )
+
+        req = OpenAICreateSpeechRequest(input="hello world")
+        prompt = asyncio.run(speech_server._build_vibevoice_prompt(req))
+
+        assert "prompt_token_ids" in prompt
+        assert "additional_information" in prompt
+        assert prompt["additional_information"]["voice_samples"][0]["sample_rate"] == 24000
+        assert prompt["prompt_token_ids"] == [11, 12, 13, 14]
+        assert sum(prompt["additional_information"]["speech_input_mask"]) == 2
 
     def test_build_tts_params_without_uploaded_voice(self, speech_server):
         """Test _build_tts_params does not auto-set ref_audio for non-uploaded voices."""
@@ -2230,17 +2290,16 @@ def cosyvoice3_server(mocker: MockerFixture):
 class TestCosyVoice3Serving:
     def test_cosyvoice3_model_type_detection(self, cosyvoice3_server):
         assert cosyvoice3_server._tts_model_type == "cosyvoice3"
-        assert cosyvoice3_server._is_tts is True
-        assert cosyvoice3_server._is_cosyvoice3 is True
+        assert cosyvoice3_server._tts_stage is not None
 
     def test_cosyvoice3_stage_registered(self):
         from vllm_omni.entrypoints.openai.serving_speech import (
-            _COSYVOICE3_TTS_MODEL_STAGES,
             _TTS_MODEL_STAGES,
+            _TTS_MODEL_TYPE_BY_STAGE,
         )
 
-        assert "cosyvoice3_talker" in _COSYVOICE3_TTS_MODEL_STAGES
         assert "cosyvoice3_talker" in _TTS_MODEL_STAGES
+        assert _TTS_MODEL_TYPE_BY_STAGE["cosyvoice3_talker"] == "cosyvoice3"
 
     def test_validate_cosyvoice3_empty_input(self, cosyvoice3_server):
         request = OpenAICreateSpeechRequest(input="", ref_audio="data:audio/wav;base64,abc", ref_text="hello")
