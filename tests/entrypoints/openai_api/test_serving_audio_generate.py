@@ -1,13 +1,18 @@
 # tests/entrypoints/openai_api/test_serving_audio_generate.py
+import json
 import logging
 from inspect import Signature, signature
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import torch
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
+from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
+from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai.protocol.audio import (
     CreateAudio,
     OpenAICreateAudioGenerateRequest,
@@ -471,6 +476,50 @@ class TestErrorHandling:
         resp = await server.create_audio_generate(req)
 
         assert "Audio generation failed" in resp.error.message
+
+    @pytest.mark.asyncio
+    async def test_api_server_engine_error_response_includes_request_and_stage_id(self):
+        handler = MagicMock()
+        handler.create_audio_generate = AsyncMock(
+            side_effect=OmniEngineDeadError(
+                "engine dead",
+                error_stage_id=2,
+            )
+        )
+
+        app = FastAPI()
+        app.state.openai_serving_audio_generate = handler
+        app.state.engine_client = SimpleNamespace(
+            engine=SimpleNamespace(is_alive=lambda: False),
+            errored=True,
+        )
+        app.state.server = SimpleNamespace()
+        scope = {
+            "type": "http",
+            "app": app,
+            "method": "POST",
+            "path": "/v1/audio/generate",
+            "headers": [],
+            "query_string": b"",
+            "client": ("127.0.0.1", 12345),
+            "server": ("testserver", 80),
+            "scheme": "http",
+        }
+        raw_request = Request(scope)
+        raw_request.state.request_metadata = SimpleNamespace(request_id="audio-gen-req-1")
+        request = OpenAICreateAudioGenerateRequest(input="Hello")
+
+        with patch.object(api_server_module, "terminate_if_errored") as terminate_mock:
+            response = await api_server_module.create_audio_generate(request, raw_request)
+
+        assert isinstance(response, JSONResponse)
+        assert response.status_code == 500
+        payload = json.loads(response.body)
+        assert payload["error"]["message"] == "engine dead"
+        assert payload["error"]["code"] == 500
+        assert payload["error"]["request_id"] == "audio-gen-req-1"
+        assert payload["error"]["error_stage_id"] == 2
+        terminate_mock.assert_called_once()
 
 
 # End-to-End via TestClient
