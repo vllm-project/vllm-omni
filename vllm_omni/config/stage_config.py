@@ -401,14 +401,16 @@ class StageDeployConfig:
     the top level of ``DeployConfig`` and propagated to every stage.
     """
 
-    # Stage identity and GPU placement.
+    # Stage identity.
     stage_id: int
-    devices: str = "0"
+
+    # GPU resources and parallelism.
+    devices: str | None = None
+    tensor_parallel_size: int | None = None
 
     # Scheduler and memory-capacity knobs passed to vLLM engine args.
     max_num_seqs: int | None = None
     gpu_memory_utilization: float | None = None
-    tensor_parallel_size: int | None = None
     enforce_eager: bool | None = None
     max_num_batched_tokens: int | None = None
     max_model_len: int | None = None
@@ -484,10 +486,10 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     """Parse a single stage entry from deploy YAML into StageDeployConfig."""
     if "engine_args" in stage_data:
         engine_args = dict(stage_data["engine_args"])
-        devices = stage_data.get("runtime", {}).get("devices", stage_data.get("devices", "0"))
+        devices = stage_data.get("runtime", {}).get("devices", stage_data.get("devices"))
     else:
         engine_args = {k: v for k, v in stage_data.items() if k not in _STAGE_NON_ENGINE_KEYS and k != "stage_id"}
-        devices = stage_data.get("devices", "0")
+        devices = stage_data.get("devices")
 
     kwargs: dict[str, Any] = {"stage_id": stage_data["stage_id"], "devices": devices}
     for name, f in _STAGE_DEPLOY_FIELDS.items():
@@ -827,7 +829,7 @@ def merge_pipeline_deploy(
         engine_args = _build_engine_args(ps, ds, pipeline, deploy, next_stage_proc)
         extras = _build_extras(ps, ds)
         runtime: dict[str, Any] = {"process": True}
-        if ds is not None:
+        if ds is not None and ds.devices is not None:
             runtime["devices"] = ds.devices
 
         result.append(
