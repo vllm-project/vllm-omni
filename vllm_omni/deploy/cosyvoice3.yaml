@@ -27,9 +27,11 @@ connectors:
 
 stages:
   - stage_id: 0
+    max_num_batched_tokens: 32768
     max_num_seqs: 1
     gpu_memory_utilization: 0.4
     enforce_eager: true
+    trust_remote_code: true
     devices: "0"
     output_connectors:
       to_stage_1: connector_of_shared_memory
@@ -40,19 +42,23 @@ stages:
       # near-identity repetition penalty forces vLLM to track
       # output_token_ids for RAS (stop-token logit logsumexp).
       repetition_penalty: 1.0001
+    disable_hybrid_kv_cache_manager: true
     enable_prefix_caching: false
     mm_processor_cache_gb: 0
     skip_mm_profiling: true
 
   - stage_id: 1
+    max_num_batched_tokens: 32768
     max_num_seqs: 1
     gpu_memory_utilization: 0.2
     enforce_eager: true
+    trust_remote_code: true
     max_model_len: 32768
     devices: "0"
     input_connectors:
       from_stage_0: connector_of_shared_memory
     default_sampling_params:
       max_tokens: 2048
+    disable_hybrid_kv_cache_manager: true
     enable_prefix_caching: false
     skip_mm_profiling: true

@@ -16,6 +16,7 @@ async_chunk: false
 
 stages:
   - stage_id: 0
+    max_num_batched_tokens: 32768
     max_num_seqs: 1
     enforce_eager: true
     trust_remote_code: true
