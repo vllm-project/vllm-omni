@@ -22,6 +22,18 @@ _DIFFUSERS_CLASS_TO_CONFIG: dict[str, str] = {
     "GlmImagePipeline": "glm_image",
 }
 
+_MODEL_TYPE_TO_CONFIG: dict[str, str] = {
+    # Tuna-2 upstream uses variant names in scripts/configs rather than a
+    # stable HF model_type yet. Route the known names to one vLLM-Omni config.
+    "tuna": "tuna",
+    "tuna2": "tuna",
+    "tuna_2": "tuna",
+    "tuna_2_pixel": "tuna",
+    "tuna2_pixel": "tuna",
+    "tuna_2r_pixel": "tuna",
+    "tuna2r_pixel": "tuna",
+}
+
 
 def inject_omni_kv_config(stage: Any, omni_conn_cfg: dict[str, Any], omni_from: str, omni_to: str) -> None:
     """Inject connector configuration into stage engine arguments."""
@@ -96,12 +108,7 @@ def _filter_dict_like_object(obj: dict | Any) -> dict:
             return True
         return isinstance(
             value,
-            (
-                types.FunctionType,
-                types.MethodType,
-                types.BuiltinFunctionType,
-                types.BuiltinMethodType,
-            ),
+            types.FunctionType | types.MethodType | types.BuiltinFunctionType | types.BuiltinMethodType,
         )
 
     result = {}
@@ -169,10 +176,10 @@ def _convert_dataclasses_to_dict(obj: Any) -> Any:
     if callable(obj):
         return None
     # Handle lists and tuples (recurse into items)
-    if isinstance(obj, (list, tuple)):
+    if isinstance(obj, list | tuple):
         return type(obj)(_convert_dataclasses_to_dict(item) for item in obj if not callable(item))
     # Try to convert any dict-like object (has keys/values methods) to dict
-    if hasattr(obj, "keys") and hasattr(obj, "values") and not isinstance(obj, (str, bytes)):
+    if hasattr(obj, "keys") and hasattr(obj, "values") and not isinstance(obj, str | bytes):
         try:
             return _filter_dict_like_object(obj)
         except (TypeError, ValueError, AttributeError):
@@ -261,6 +268,7 @@ def resolve_model_config_path(model: str) -> str:
         normalized_model_type = _DIFFUSERS_CLASS_TO_CONFIG[model_type]
     else:
         normalized_model_type = model_type.replace("-", "_")
+        normalized_model_type = _MODEL_TYPE_TO_CONFIG.get(normalized_model_type, normalized_model_type)
     model_type_str = f"{normalized_model_type}.yaml"
     complete_config_path = PROJECT_ROOT / default_config_path / model_type_str
     if os.path.exists(complete_config_path):
@@ -555,7 +563,7 @@ def filter_dataclass_kwargs(cls: Any, kwargs: dict) -> dict:
         if origin in (list, tuple, set):
             args = get_args(annotation)
             inner = args[0] if args else None
-            if isinstance(value, (list, tuple, set)):
+            if isinstance(value, list | tuple | set):
                 return type(value)(_filter_value(v, inner) for v in value)
             return value
 

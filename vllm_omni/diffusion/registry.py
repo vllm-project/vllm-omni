@@ -103,6 +103,11 @@ _DIFFUSION_MODELS = {
         "pipeline_bagel",
         "BagelPipeline",
     ),
+    "TunaExternalPipeline": (
+        "tuna",
+        "pipeline_tuna",
+        "TunaExternalPipeline",
+    ),
     "LongCatImageEditPipeline": (
         "longcat_image",
         "pipeline_longcat_image_edit",
@@ -361,6 +366,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
+    "TunaExternalPipeline": "get_tuna_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "FluxKontextPipeline": "get_flux_kontext_post_process_func",

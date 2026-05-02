@@ -238,6 +238,13 @@ class StageConfigFactory:
         "glm-image": "glm_image",
         "cosyvoice3": "cosyvoice3",
         "mammothmoda2": "mammoth_moda2",
+        "tuna": "tuna",
+        "tuna2": "tuna",
+        "tuna_2": "tuna",
+        "tuna_2_pixel": "tuna",
+        "tuna2_pixel": "tuna",
+        "tuna_2r_pixel": "tuna",
+        "tuna2r_pixel": "tuna",
     }
 
     # Fallback: map HF architecture class names to pipeline dirs.

@@ -622,3 +622,8 @@ class TestArchitectureFallback:
     def test_mimo_audio_in_pipeline_models(self):
         """Test that mimo_audio is registered in PIPELINE_MODELS."""
         assert "mimo_audio" in StageConfigFactory.PIPELINE_MODELS
+
+    def test_tuna_aliases_in_pipeline_models(self):
+        """Test that Tuna/Tuna-2 model_type aliases use one pipeline dir."""
+        assert StageConfigFactory.PIPELINE_MODELS["tuna"] == "tuna"
+        assert StageConfigFactory.PIPELINE_MODELS["tuna_2_pixel"] == "tuna"

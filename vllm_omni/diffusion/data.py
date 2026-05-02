@@ -511,12 +511,12 @@ class OmniDiffusionConfig:
     @property
     def is_moe(self) -> bool:
         num_experts = self.tf_model_config.get("num_experts", None)
-        if not isinstance(num_experts, (list, tuple, int)):
+        if not isinstance(num_experts, list | tuple | int):
             return False
         if isinstance(num_experts, int):
             return num_experts > 0
 
-        if isinstance(num_experts, (list, tuple)):
+        if isinstance(num_experts, list | tuple):
             return any(isinstance(n, int) and n > 0 for n in num_experts)
 
         return False
@@ -695,8 +695,22 @@ class OmniDiffusionConfig:
             model_type = cfg.get("model_type")
             architectures = cfg.get("architectures") or []
 
+            normalized_model_type = str(model_type or "").replace("-", "_").lower()
+
             if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
                 self.model_class_name = "BagelPipeline"
+                self.tf_model_config = TransformerConfig()
+                self.update_multimodal_support()
+            elif normalized_model_type in {
+                "tuna",
+                "tuna2",
+                "tuna_2",
+                "tuna_2_pixel",
+                "tuna2_pixel",
+                "tuna_2r_pixel",
+                "tuna2r_pixel",
+            } or any(str(arch).startswith("Tuna") for arch in architectures):
+                self.model_class_name = "TunaExternalPipeline"
                 self.tf_model_config = TransformerConfig()
                 self.update_multimodal_support()
             elif model_type == "nextstep":
