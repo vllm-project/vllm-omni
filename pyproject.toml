@@ -228,6 +228,10 @@ extend-ignore-identifiers-re = [
     ".*nin.*",
     ".*[Oo]no_[Aa]nna.*",
     ".*cann.*",
+    ".*[Nn][Dd]3.*",
+]
+extend-ignore-re = [
+    "\\.\\.\\.n,d->\\.\\.\\.nd",
 ]
 [tool.typos.default.extend-words]
 ue = "ue"

@@ -165,6 +165,11 @@ _DIFFUSION_MODELS = {
         "pipeline_flux2_klein",
         "Flux2KleinPipeline",
     ),
+    "ErnieImagePipeline": (
+        "ernie_image",
+        "pipeline_ernie_image",
+        "ErnieImagePipeline",
+    ),
     "NextStep11Pipeline": (
         "nextstep_1_1",
         "pipeline_nextstep_1_1",
@@ -431,6 +436,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "FluxKontextPipeline": "get_flux_kontext_post_process_func",
     "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
+    "ErnieImagePipeline": "get_ernie_image_post_process_func",
     "NextStep11Pipeline": "get_nextstep11_post_process_func",
     "FluxPipeline": "get_flux_post_process_func",
     "OmniGen2Pipeline": "get_omnigen2_post_process_func",
