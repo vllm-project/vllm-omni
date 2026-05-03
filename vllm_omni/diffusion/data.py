@@ -96,17 +96,20 @@ class DiffusionParallelConfig:
         assert self.ulysses_degree > 0, "Ulysses degree must be > 0"
         assert self.ring_degree > 0, "Ring degree must be > 0"
         assert self.cfg_parallel_size > 0, "CFG parallel size must be > 0"
-        assert self.cfg_parallel_size in [1, 2, 3], (
-            f"CFG parallel size must be 1, 2, or 3, but got {self.cfg_parallel_size}"
-        )
+        assert self.cfg_parallel_size in [
+            1,
+            2,
+            3,
+        ], f"CFG parallel size must be 1, 2, or 3, but got {self.cfg_parallel_size}"
         assert self.vae_patch_parallel_size > 0, "VAE patch parallel size must be > 0"
         assert self.sequence_parallel_size == self.ulysses_degree * self.ring_degree, (
             "Sequence parallel size must be equal to the product of ulysses degree and ring degree,"
             f" but got {self.sequence_parallel_size} != {self.ulysses_degree} * {self.ring_degree}"
         )
-        assert self.ulysses_mode in {"strict", "advanced_uaa"}, (
-            f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
-        )
+        assert self.ulysses_mode in {
+            "strict",
+            "advanced_uaa",
+        }, f"ulysses_mode must be one of {{'strict','advanced_uaa'}}, but got {self.ulysses_mode!r}."
 
         # Validate HSDP configuration
         if self.use_hsdp:
@@ -525,12 +528,12 @@ class OmniDiffusionConfig:
     @property
     def is_moe(self) -> bool:
         num_experts = self.tf_model_config.get("num_experts", None)
-        if not isinstance(num_experts, (list, tuple, int)):
+        if not isinstance(num_experts, list | tuple | int):
             return False
         if isinstance(num_experts, int):
             return num_experts > 0
 
-        if isinstance(num_experts, (list, tuple)):
+        if isinstance(num_experts, list | tuple):
             return any(isinstance(n, int) and n > 0 for n in num_experts)
 
         return False
@@ -733,13 +736,27 @@ class OmniDiffusionConfig:
                 model_type = cfg.get("model_type")
                 architectures = cfg.get("architectures") or []
 
-                if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
-                    self.model_class_name = "BagelPipeline"
-                    self.tf_model_config = TransformerConfig()
-                    self.update_multimodal_support()
-                elif model_type == "nextstep":
-                    if self.model_class_name is None:
-                        self.model_class_name = "NextStep11Pipeline"
+            normalized_model_type = str(model_type or "").replace("-", "_").lower()
+
+            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                self.model_class_name = "BagelPipeline"
+                self.tf_model_config = TransformerConfig()
+                self.update_multimodal_support()
+            elif normalized_model_type in {
+                "tuna",
+                "tuna2",
+                "tuna_2",
+                "tuna_2_pixel",
+                "tuna2_pixel",
+                "tuna_2r_pixel",
+                "tuna2r_pixel",
+            } or any(str(arch).startswith("Tuna") for arch in architectures):
+                self.model_class_name = "TunaExternalPipeline"
+                self.tf_model_config = TransformerConfig()
+                self.update_multimodal_support()
+            elif model_type == "nextstep":
+                if self.model_class_name is None:
+                    self.model_class_name = "NextStep11Pipeline"
                     self.tf_model_config = TransformerConfig()
                     self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:

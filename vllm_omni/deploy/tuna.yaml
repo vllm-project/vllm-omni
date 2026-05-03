@@ -1,0 +1,17 @@
+# Tuna/Tuna-2 single-stage deploy placeholder.
+#
+# Upstream Tuna-2 currently publishes code and expects local `.pt` checkpoints
+# driven through its Hydra CLI. This config lets vLLM-Omni recognize Tuna model
+# metadata and route startup to a dedicated pipeline entrypoint with a clear
+# integration message until a stable checkpoint/runtime contract is available.
+
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    devices: "0"
+    engine_extras:
+      model_class_name: TunaExternalPipeline
+      custom_pipeline_args:
+        variant: none_encoder

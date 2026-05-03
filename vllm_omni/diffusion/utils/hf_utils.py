@@ -27,6 +27,27 @@ def _looks_like_bagel(model_name: str) -> bool:
         return False
 
 
+def _looks_like_tuna(model_name: str) -> bool:
+    """Best-effort detection for Tuna/Tuna-2 unified image models."""
+    try:
+        cfg = get_hf_file_to_dict("config.json", model_name)
+        model_type = str(cfg.get("model_type", "")).replace("-", "_").lower()
+        if model_type in {
+            "tuna",
+            "tuna2",
+            "tuna_2",
+            "tuna_2_pixel",
+            "tuna2_pixel",
+            "tuna_2r_pixel",
+            "tuna2r_pixel",
+        }:
+            return True
+        architectures = cfg.get("architectures") or []
+        return any(str(arch).startswith("Tuna") for arch in architectures)
+    except Exception:
+        return False
+
+
 @lru_cache
 def is_diffusion_model(model_name: str) -> bool:
     """Check if a model is a diffusion model.
@@ -74,4 +95,4 @@ def is_diffusion_model(model_name: str) -> bool:
 
         # Bagel is not a diffusers pipeline (no model_index.json), but is still a
         # diffusion-style model in vllm-omni. Detect it via config.json.
-    return _looks_like_bagel(model_name)
+    return _looks_like_bagel(model_name) or _looks_like_tuna(model_name)

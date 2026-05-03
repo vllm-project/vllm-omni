@@ -1,0 +1,25 @@
+# Tuna/Tuna-2 single-stage diffusion placeholder.
+#
+# Upstream Tuna-2 currently publishes code and expects local `.pt` checkpoints
+# driven through its Hydra CLI. This config lets vLLM-Omni recognize Tuna model
+# metadata and route startup to a dedicated pipeline entrypoint with a clear
+# integration message until a stable checkpoint/runtime contract is available.
+
+stage_args:
+  - stage_id: 0
+    stage_type: diffusion
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: diffusion
+      model_class_name: TunaExternalPipeline
+      trust_remote_code: true
+      distributed_executor_backend: "mp"
+      custom_pipeline_args:
+        variant: none_encoder
+    final_output: true
+    final_output_type: image
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 50
+      guidance_scale: 3.0
