@@ -31,6 +31,8 @@ recipes/
   recipe for Wan2.2 14B on `8x Ascend NPU (A2/A3)`
 - [`inclusionAI/Ming-flash-omni-2.0.md`](./inclusionAI/Ming-flash-omni-2.0.md):
   online serving recipe for multimodal chat (`4x H100 80GB`) and standalone TTS (`1x H100 80GB`)
+- [`Baidu/ERNIE-Image.md`](./Baidu/ERNIE-Image.md): text-to-image serving
+  online serving recipe for ERNIE-Image 8B on `1x RTX 4090 24GB` or `2x RTX 4090 24GB`
 - [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md): online serving recipe for TTS on `1x A800 80GB`
 
 Within a single recipe file, include different hardware support sections such
