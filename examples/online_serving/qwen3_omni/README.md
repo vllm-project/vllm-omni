@@ -479,6 +479,14 @@ The convenience script launches both the vLLM server and Gradio demo together:
 ./run_gradio_demo.sh --model Qwen/Qwen3-Omni-30B-A3B-Instruct --server-port 8091 --gradio-port 7861
 ```
 
+If your server was launched from a local checkpoint path, you can pass that
+same local path to the script. The demo now auto-detects the built-in
+Qwen3-Omni sampling config from the model basename:
+
+```bash
+./run_gradio_demo.sh --model /path/to/Qwen3-Omni-30B-A3B-Instruct --server-port 8091 --gradio-port 7861
+```
+
 This script will:
 1. Start the vLLM server in the background
 2. Wait for the server to be ready
@@ -515,11 +523,16 @@ In a separate terminal:
 python gradio_demo.py --model Qwen/Qwen3-Omni-30B-A3B-Instruct --api-base http://localhost:8091/v1 --port 7861
 ```
 
+This also works when `--model` is a local checkpoint path as long as the path
+basename matches a supported model family, for example
+`/path/to/Qwen3-Omni-30B-A3B-Instruct`.
+
 Then open `http://localhost:7861/` on your local browser to interact with the web UI.
 
 The gradio script supports the following arguments:
 
 - `--model`: Model name/path (should match the server model)
+- `--model-config-key`: Optional built-in config key for demo-side sampling defaults. Useful when `--model` is a custom alias or local path that cannot be auto-detected.
 - `--api-base`: Base URL for the vLLM API server (default: http://localhost:8091/v1)
 - `--ip`: Host/IP for Gradio server (default: 127.0.0.1)
 - `--port`: Port for Gradio server (default: 7861)

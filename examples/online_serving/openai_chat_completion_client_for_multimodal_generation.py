@@ -1,9 +1,8 @@
 import base64
 import concurrent.futures
-import os
 from typing import NamedTuple
 
-import requests
+from examples.online_serving.multimodal_data_utils import path_or_url_to_url
 from openai import OpenAI
 from vllm.assets.audio import AudioAsset
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -24,24 +23,6 @@ def make_audio_output_filename(request_id: str | None, index: int) -> str:
     return f"audio_{safe_request_id}_{index}.wav"
 
 
-def encode_base64_content_from_url(content_url: str) -> str:
-    """Encode a content retrieved from a remote url to base64 format."""
-
-    with requests.get(content_url) as response:
-        response.raise_for_status()
-        result = base64.b64encode(response.content).decode("utf-8")
-
-    return result
-
-
-def encode_base64_content_from_file(file_path: str) -> str:
-    """Encode a local file to base64 format."""
-    with open(file_path, "rb") as f:
-        content = f.read()
-        result = base64.b64encode(content).decode("utf-8")
-    return result
-
-
 def get_video_url_from_path(video_path: str | None) -> str:
     """Convert a video path (local file or URL) to a video URL format for the API.
 
@@ -49,36 +30,11 @@ def get_video_url_from_path(video_path: str | None) -> str:
     If video_path is a local file path, encodes it to base64 data URL.
     If video_path is a URL, returns it as-is.
     """
-    if not video_path:
-        # Default video URL
-        return "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4"
-
-    # Check if it's a URL (starts with http:// or https://)
-    if video_path.startswith(("http://", "https://")):
-        return video_path
-
-    # Otherwise, treat it as a local file path
-    if not os.path.exists(video_path):
-        raise FileNotFoundError(f"Video file not found: {video_path}")
-
-    # Detect video MIME type from file extension
-    video_path_lower = video_path.lower()
-    if video_path_lower.endswith(".mp4"):
-        mime_type = "video/mp4"
-    elif video_path_lower.endswith(".webm"):
-        mime_type = "video/webm"
-    elif video_path_lower.endswith(".mov"):
-        mime_type = "video/quicktime"
-    elif video_path_lower.endswith(".avi"):
-        mime_type = "video/x-msvideo"
-    elif video_path_lower.endswith(".mkv"):
-        mime_type = "video/x-matroska"
-    else:
-        # Default to mp4 if extension is unknown
-        mime_type = "video/mp4"
-
-    video_base64 = encode_base64_content_from_file(video_path)
-    return f"data:{mime_type};base64,{video_base64}"
+    return path_or_url_to_url(
+        video_path,
+        media_kind="video",
+        default_url="https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4",
+    )
 
 
 def get_image_url_from_path(image_path: str | None) -> str:
@@ -88,34 +44,11 @@ def get_image_url_from_path(image_path: str | None) -> str:
     If image_path is a local file path, encodes it to base64 data URL.
     If image_path is a URL, returns it as-is.
     """
-    if not image_path:
-        # Default image URL
-        return "https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/cherry_blossom.jpg"
-
-    # Check if it's a URL (starts with http:// or https://)
-    if image_path.startswith(("http://", "https://")):
-        return image_path
-
-    # Otherwise, treat it as a local file path
-    if not os.path.exists(image_path):
-        raise FileNotFoundError(f"Image file not found: {image_path}")
-
-    # Detect image MIME type from file extension
-    image_path_lower = image_path.lower()
-    if image_path_lower.endswith((".jpg", ".jpeg")):
-        mime_type = "image/jpeg"
-    elif image_path_lower.endswith(".png"):
-        mime_type = "image/png"
-    elif image_path_lower.endswith(".gif"):
-        mime_type = "image/gif"
-    elif image_path_lower.endswith(".webp"):
-        mime_type = "image/webp"
-    else:
-        # Default to jpeg if extension is unknown
-        mime_type = "image/jpeg"
-
-    image_base64 = encode_base64_content_from_file(image_path)
-    return f"data:{mime_type};base64,{image_base64}"
+    return path_or_url_to_url(
+        image_path,
+        media_kind="image",
+        default_url="https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/cherry_blossom.jpg",
+    )
 
 
 def get_audio_url_from_path(audio_path: str | None) -> str:
@@ -125,36 +58,11 @@ def get_audio_url_from_path(audio_path: str | None) -> str:
     If audio_path is a local file path, encodes it to base64 data URL.
     If audio_path is a URL, returns it as-is.
     """
-    if not audio_path:
-        # Default audio URL
-        return AudioAsset("mary_had_lamb").url
-
-    # Check if it's a URL (starts with http:// or https://)
-    if audio_path.startswith(("http://", "https://")):
-        return audio_path
-
-    # Otherwise, treat it as a local file path
-    if not os.path.exists(audio_path):
-        raise FileNotFoundError(f"Audio file not found: {audio_path}")
-
-    # Detect audio MIME type from file extension
-    audio_path_lower = audio_path.lower()
-    if audio_path_lower.endswith((".mp3", ".mpeg")):
-        mime_type = "audio/mpeg"
-    elif audio_path_lower.endswith(".wav"):
-        mime_type = "audio/wav"
-    elif audio_path_lower.endswith(".ogg"):
-        mime_type = "audio/ogg"
-    elif audio_path_lower.endswith(".flac"):
-        mime_type = "audio/flac"
-    elif audio_path_lower.endswith(".m4a"):
-        mime_type = "audio/mp4"
-    else:
-        # Default to wav if extension is unknown
-        mime_type = "audio/wav"
-
-    audio_base64 = encode_base64_content_from_file(audio_path)
-    return f"data:{mime_type};base64,{audio_base64}"
+    return path_or_url_to_url(
+        audio_path,
+        media_kind="audio",
+        default_url=AudioAsset("mary_had_lamb").url,
+    )
 
 
 def get_system_prompt():

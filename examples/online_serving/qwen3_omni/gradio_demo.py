@@ -13,6 +13,11 @@ except ImportError:
 import numpy as np
 import soundfile as sf
 import torch
+from examples.online_serving.multimodal_data_utils import (
+    audio_array_to_wav_data_url,
+    local_path_to_data_url,
+    pil_image_to_jpeg_data_url,
+)
 from openai import OpenAI
 from PIL import Image
 
@@ -69,7 +74,15 @@ def parse_args():
     parser.add_argument(
         "--model",
         default="Qwen/Qwen3-Omni-30B-A3B-Instruct",
-        help="Model name/path (should match the server model).",
+        help="Model name/path sent to the server for inference.",
+    )
+    parser.add_argument(
+        "--model-config-key",
+        default=None,
+        help=(
+            "Optional key used to select demo-side sampling defaults. "
+            "Defaults to auto-detecting a supported config from --model."
+        ),
     )
     parser.add_argument(
         "--api-base",
@@ -101,63 +114,50 @@ def build_sampling_params_dict(seed: int, model_key: str) -> list[dict]:
     return sampling_params
 
 
-def image_to_base64_data_url(image: Image.Image) -> str:
-    """Convert PIL Image to base64 data URL."""
-    buffered = io.BytesIO()
-    # Convert to RGB if needed
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-    image.save(buffered, format="JPEG")
-    img_bytes = buffered.getvalue()
-    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-    return f"data:image/jpeg;base64,{img_b64}"
+def resolve_model_config_key(model_arg: str, explicit_key: str | None = None) -> str:
+    """Resolve which built-in sampling config should back the demo.
 
+    The API server may be launched with either a Hugging Face model name or a
+    local path. The demo only needs a stable config key to choose stage-wise
+    sampling defaults, so we infer that key from the provided model string.
+    """
+    if explicit_key is not None:
+        if explicit_key not in SUPPORTED_MODELS:
+            raise ValueError(
+                f"Unsupported --model-config-key '{explicit_key}'. "
+                f"Supported keys: {tuple(SUPPORTED_MODELS)}"
+            )
+        return explicit_key
 
-def audio_to_base64_data_url(audio_data: tuple[np.ndarray, int]) -> str:
-    """Convert audio (numpy array, sample_rate) to base64 data URL."""
-    audio_np, sample_rate = audio_data
-    # Convert to int16 format for WAV
-    if audio_np.dtype != np.int16:
-        # Normalize to [-1, 1] range if needed
-        if audio_np.dtype == np.float32 or audio_np.dtype == np.float64:
-            audio_np = np.clip(audio_np, -1.0, 1.0)
-            audio_np = (audio_np * 32767).astype(np.int16)
-        else:
-            audio_np = audio_np.astype(np.int16)
+    candidates: list[str] = []
 
-    # Write to WAV bytes
-    buffered = io.BytesIO()
-    sf.write(buffered, audio_np, sample_rate, format="WAV")
-    wav_bytes = buffered.getvalue()
-    wav_b64 = base64.b64encode(wav_bytes).decode("utf-8")
-    return f"data:audio/wav;base64,{wav_b64}"
+    if model_arg in SUPPORTED_MODELS:
+        candidates.append(model_arg)
 
+    last_two_segments = "/".join(Path(model_arg).parts[-2:])
+    if last_two_segments in SUPPORTED_MODELS and last_two_segments not in candidates:
+        candidates.append(last_two_segments)
 
-def video_to_base64_data_url(video_file: str) -> str:
-    """Convert video file to base64 data URL."""
-    video_path = Path(video_file)
-    if not video_path.exists():
-        raise FileNotFoundError(f"Video file not found: {video_file}")
+    model_basename = Path(model_arg).name
+    basename_matches = [key for key in SUPPORTED_MODELS if Path(key).name == model_basename]
+    for key in basename_matches:
+        if key not in candidates:
+            candidates.append(key)
 
-    # Detect MIME type from extension
-    video_path_lower = str(video_path).lower()
-    if video_path_lower.endswith(".mp4"):
-        mime_type = "video/mp4"
-    elif video_path_lower.endswith(".webm"):
-        mime_type = "video/webm"
-    elif video_path_lower.endswith(".mov"):
-        mime_type = "video/quicktime"
-    elif video_path_lower.endswith(".avi"):
-        mime_type = "video/x-msvideo"
-    elif video_path_lower.endswith(".mkv"):
-        mime_type = "video/x-matroska"
-    else:
-        mime_type = "video/mp4"
+    if len(candidates) == 1:
+        return candidates[0]
 
-    with open(video_path, "rb") as f:
-        video_bytes = f.read()
-    video_b64 = base64.b64encode(video_bytes).decode("utf-8")
-    return f"data:{mime_type};base64,{video_b64}"
+    if not candidates:
+        raise ValueError(
+            f"Could not infer a supported model config for '{model_arg}'. "
+            f"Supported keys: {tuple(SUPPORTED_MODELS)}. "
+            "If you are serving a local path, pass --model-config-key explicitly."
+        )
+
+    raise ValueError(
+        f"Ambiguous model config for '{model_arg}': {candidates}. "
+        "Pass --model-config-key explicitly."
+    )
 
 
 def process_audio_file(
@@ -260,7 +260,7 @@ def run_inference_api(
         # Process audio
         audio_data = process_audio_file(audio_file)
         if audio_data is not None:
-            audio_url = audio_to_base64_data_url(audio_data)
+            audio_url = audio_array_to_wav_data_url(audio_data)
             content_list.append(
                 {
                     "type": "audio_url",
@@ -272,7 +272,7 @@ def run_inference_api(
         if image_file is not None:
             image_data = process_image_file(image_file)
             if image_data is not None:
-                image_url = image_to_base64_data_url(image_data)
+                image_url = pil_image_to_jpeg_data_url(image_data)
                 content_list.append(
                     {
                         "type": "image_url",
@@ -283,7 +283,7 @@ def run_inference_api(
         # Process video
         mm_processor_kwargs = {}
         if video_file is not None:
-            video_url = video_to_base64_data_url(video_file)
+            video_url = local_path_to_data_url(video_file, media_kind="video")
             video_content = {
                 "type": "video_url",
                 "video_url": {"url": video_url},
@@ -550,11 +550,7 @@ def build_interface(
 
 def main():
     args = parse_args()
-
-    model_name = "/".join(args.model.split("/")[-2:])
-    assert model_name in SUPPORTED_MODELS, (
-        f"Unsupported model '{model_name}'. Supported models: {SUPPORTED_MODELS.keys()}"
-    )
+    model_config_key = resolve_model_config_key(args.model, args.model_config_key)
 
     # Initialize OpenAI client
     print(f"Connecting to API server at: {args.api_base}")
@@ -563,9 +559,10 @@ def main():
         base_url=args.api_base,
     )
     print("✓ Connected to API server")
+    print(f"Using sampling config: {model_config_key}")
 
     # Build sampling params
-    sampling_params_dict = build_sampling_params_dict(SEED, model_name)
+    sampling_params_dict = build_sampling_params_dict(SEED, model_config_key)
 
     demo = build_interface(
         client,

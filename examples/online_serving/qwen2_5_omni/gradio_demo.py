@@ -13,6 +13,11 @@ except ImportError:
 import numpy as np
 import soundfile as sf
 import torch
+from examples.online_serving.multimodal_data_utils import (
+    audio_array_to_wav_data_url,
+    local_path_to_data_url,
+    pil_image_to_jpeg_data_url,
+)
 from openai import OpenAI
 from PIL import Image
 
@@ -104,65 +109,6 @@ def build_sampling_params_dict(seed: int, model_key: str) -> list[dict]:
         params["seed"] = seed
         sampling_params.append(params)
     return sampling_params
-
-
-def image_to_base64_data_url(image: Image.Image) -> str:
-    """Convert PIL Image to base64 data URL."""
-    buffered = io.BytesIO()
-    # Convert to RGB if needed
-    if image.mode != "RGB":
-        image = image.convert("RGB")
-    image.save(buffered, format="JPEG")
-    img_bytes = buffered.getvalue()
-    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-    return f"data:image/jpeg;base64,{img_b64}"
-
-
-def audio_to_base64_data_url(audio_data: tuple[np.ndarray, int]) -> str:
-    """Convert audio (numpy array, sample_rate) to base64 data URL."""
-    audio_np, sample_rate = audio_data
-    # Convert to int16 format for WAV
-    if audio_np.dtype != np.int16:
-        # Normalize to [-1, 1] range if needed
-        if audio_np.dtype == np.float32 or audio_np.dtype == np.float64:
-            audio_np = np.clip(audio_np, -1.0, 1.0)
-            audio_np = (audio_np * 32767).astype(np.int16)
-        else:
-            audio_np = audio_np.astype(np.int16)
-
-    # Write to WAV bytes
-    buffered = io.BytesIO()
-    sf.write(buffered, audio_np, sample_rate, format="WAV")
-    wav_bytes = buffered.getvalue()
-    wav_b64 = base64.b64encode(wav_bytes).decode("utf-8")
-    return f"data:audio/wav;base64,{wav_b64}"
-
-
-def video_to_base64_data_url(video_file: str) -> str:
-    """Convert video file to base64 data URL."""
-    video_path = Path(video_file)
-    if not video_path.exists():
-        raise FileNotFoundError(f"Video file not found: {video_file}")
-
-    # Detect MIME type from extension
-    video_path_lower = str(video_path).lower()
-    if video_path_lower.endswith(".mp4"):
-        mime_type = "video/mp4"
-    elif video_path_lower.endswith(".webm"):
-        mime_type = "video/webm"
-    elif video_path_lower.endswith(".mov"):
-        mime_type = "video/quicktime"
-    elif video_path_lower.endswith(".avi"):
-        mime_type = "video/x-msvideo"
-    elif video_path_lower.endswith(".mkv"):
-        mime_type = "video/x-matroska"
-    else:
-        mime_type = "video/mp4"
-
-    with open(video_path, "rb") as f:
-        video_bytes = f.read()
-    video_b64 = base64.b64encode(video_bytes).decode("utf-8")
-    return f"data:{mime_type};base64,{video_b64}"
 
 
 def process_audio_file(
@@ -266,7 +212,7 @@ def run_inference_api(
         # Process audio
         audio_data = process_audio_file(audio_file)
         if audio_data is not None:
-            audio_url = audio_to_base64_data_url(audio_data)
+            audio_url = audio_array_to_wav_data_url(audio_data)
             content_list.append(
                 {
                     "type": "audio_url",
@@ -278,7 +224,7 @@ def run_inference_api(
         if image_file is not None:
             image_data = process_image_file(image_file)
             if image_data is not None:
-                image_url = image_to_base64_data_url(image_data)
+                image_url = pil_image_to_jpeg_data_url(image_data)
                 content_list.append(
                     {
                         "type": "image_url",
@@ -289,7 +235,7 @@ def run_inference_api(
         # Process video
         mm_processor_kwargs = {}
         if video_file is not None:
-            video_url = video_to_base64_data_url(video_file)
+            video_url = local_path_to_data_url(video_file, media_kind="video")
             video_content = {
                 "type": "video_url",
                 "video_url": {"url": video_url},
