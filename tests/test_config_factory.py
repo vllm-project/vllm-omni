@@ -827,6 +827,7 @@ class TestDeployConfigLoading:
         expected_fields = {
             "async_chunk",
             "async_scheduling",
+            "compilation_config",
             "config_format",
             "data_parallel_size",
             "devices",
@@ -880,6 +881,12 @@ class TestDeployConfigLoading:
                 name in voxtral_deploy.stages[0].engine_extras
                 for name in ("config_format", "load_format", "tokenizer_mode")
             )
+
+        ming_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni.yaml"
+        if ming_path.exists():
+            ming_deploy = load_deploy_config(ming_path)
+            assert ming_deploy.stages[0].compilation_config == {"pass_config": {"fuse_allreduce_rms": False}}
+            assert "compilation_config" not in ming_deploy.stages[0].engine_extras
 
     def test_merge_pipeline_deploy(self):
         from pathlib import Path

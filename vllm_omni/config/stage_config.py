@@ -419,6 +419,7 @@ class StageDeployConfig:
     mm_processor_cache_gb: float | None = None
 
     # Profiling, tokenizer/config parsing, and model-loading behavior.
+    compilation_config: dict[str, Any] | None = None
     profiler_config: dict[str, Any] | None = None
     skip_mm_profiling: bool | None = None
     enable_flashinfer_autotune: bool | None = None
