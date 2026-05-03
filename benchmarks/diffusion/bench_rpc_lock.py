@@ -109,6 +109,15 @@ def main():
         f"min={min(narrow_times):8.2f}  max={max(narrow_times):8.2f}"
     )
     print(f"\n  Speedup if narrowing is safe: {wide_mean / narrow_mean:.0f}x faster RPC response")
+    print(
+        "\n  NOTE: This is a synthetic upper bound. ``execute_fn`` is modelled as\n"
+        "  ``time.sleep`` which holds the GIL for the requested duration. Real GPU\n"
+        "  work releases the GIL while waiting on CUDA / NCCL, so the wide-lock\n"
+        "  contention seen in production is typically smaller than this benchmark\n"
+        "  reports. Use this number as an upper-bound motivation for narrowing,\n"
+        "  not as a literal speedup expectation. Real-world measurement is\n"
+        "  scoped for the Step B narrowing PR (RFC #3158)."
+    )
 
 
 if __name__ == "__main__":
