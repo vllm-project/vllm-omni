@@ -204,52 +204,6 @@ def test_load_poll_ar_request_additional_information_concats_tensors(build_adapt
     assert request.additional_information["meta"]["finished"].item() is True
 
 
-def test_update_request_payload_preserves_omitted_ref_audio(build_adapter):
-    adapter, _ = build_adapter()
-    ref_audio = {"wav": [0.1, -0.2], "sr": 16000}
-
-    adapter._update_request_payload(
-        "ext",
-        {
-            "h": torch.tensor([[1.0]]),
-            "ref_audio": ref_audio,
-            "finished": False,
-        },
-    )
-    merged = adapter._update_request_payload(
-        "ext",
-        {
-            "h": torch.tensor([[2.0]]),
-            "finished": False,
-        },
-    )
-
-    assert torch.equal(merged["h"], torch.tensor([[1.0], [2.0]]))
-    assert merged["ref_audio"] == ref_audio
-
-
-def test_generation_load_forwards_ref_audio_metadata(build_adapter):
-    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
-    request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
-    ref_audio = {"wav": [0.1, -0.2], "sr": 16000}
-
-    adapter.load_async(request)
-    connector.get.return_value = (
-        {
-            "code_predictor_codes": [1, 2, 3],
-            "left_context_size": 0,
-            "ref_audio": ref_audio,
-            "finished": False,
-        },
-        16,
-    )
-    adapter._poll_single_request(request)
-
-    assert request.prompt_token_ids == [1, 2, 3]
-    assert request.additional_information["left_context_size"] == 0
-    assert request.additional_information["ref_audio"] == ref_audio
-
-
 def test_process_and_restore_queues(build_adapter):
     adapter, _ = build_adapter(stage_id=1, max_num_seqs=8)
     waiting_req = _req("w1", RequestStatus.WAITING)

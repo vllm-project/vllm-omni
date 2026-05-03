@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-import json
 import os
 import sys
 import tempfile
@@ -9,7 +8,6 @@ import types
 from collections.abc import Iterable
 from typing import Any
 
-import librosa
 import numpy as np
 import soundfile as sf
 import torch
@@ -17,12 +15,18 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
+from vllm.multimodal.audio import AudioResampler
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
 
-DEBUG_REF_AUDIO_ENV = "VLLM_OMNI_MINICPMO45_DEBUG_REF_AUDIO"
+
+def _resample_audio(audio: np.ndarray, *, orig_sr: int, target_sr: int) -> np.ndarray:
+    if int(orig_sr) == int(target_sr):
+        return np.asarray(audio, dtype=np.float32)
+    resampler = AudioResampler(target_sr=int(target_sr))
+    return np.asarray(resampler.resample(np.asarray(audio, dtype=np.float32), orig_sr=int(orig_sr)), dtype=np.float32)
 
 
 def _setup_cosyvoice2_alias() -> None:
@@ -168,7 +172,7 @@ class MiniCPMToken2wavCore:
             audio_np = audio_np.mean(axis=-1)
         audio_np = audio_np.reshape(-1)
         if int(sample_rate) != int(sr):
-            audio_np = librosa.resample(y=audio_np, orig_sr=int(sample_rate), target_sr=int(sr))
+            audio_np = _resample_audio(audio_np, orig_sr=int(sample_rate), target_sr=int(sr))
         return torch.from_numpy(np.asarray(audio_np, dtype=np.float32))
 
     @staticmethod
@@ -179,7 +183,7 @@ class MiniCPMToken2wavCore:
             audio_np = audio_np.mean(axis=-1)
         audio_np = audio_np.reshape(-1)
         if int(sample_rate) != 24000:
-            audio_np = librosa.resample(y=audio_np, orig_sr=int(sample_rate), target_sr=24000)
+            audio_np = _resample_audio(audio_np, orig_sr=int(sample_rate), target_sr=24000)
         return torch.from_numpy(np.asarray(audio_np, dtype=np.float32)).unsqueeze(0)
 
     def _prepare_prompt(
@@ -357,9 +361,6 @@ class MiniCPMO4_5Code2Wav(nn.Module):
     Non-async Stage 2 wrapper around the official ``stepaudio2.Token2wav``
     decoder. This stage consumes the finished talker token ids directly and
     returns waveform tensors for the final audio output.
-
-    In async-chunk mode, the model keeps per-request Token2wav streaming state
-    locally and consumes only the newly arrived talker token chunk each step.
     """
 
     input_modalities = "audio"
@@ -389,46 +390,6 @@ class MiniCPMO4_5Code2Wav(nn.Module):
         self._output_sample_rate = 24000
         self._audio_prompt_sample_rate = int(getattr(self.config, "audio_tokenizer_sample_rate", 16000))
         self._audio_eos_token_id = int(getattr(self.config, "num_audio_tokens", 1)) - 1
-        connector_cfg = getattr(vllm_config.model_config, "stage_connector_config", None)
-        if isinstance(connector_cfg, dict):
-            connector_extra = connector_cfg.get("extra", connector_cfg) or {}
-        else:
-            connector_extra = getattr(connector_cfg, "extra", {}) or {}
-        self._codec_chunk_frames = int(connector_extra.get("codec_chunk_frames", 25))
-        self._stream_pre_lookahead = 3
-        self._stream_prefix_silence_tokens = 3
-        self._stream_silence_token_id = 4218
-        self._async_stream_state: dict[str, Any] | None = None
-
-    def _debug_ref_audio_enabled(self) -> bool:
-        return os.environ.get(DEBUG_REF_AUDIO_ENV, "").strip() == "1"
-
-    def _summarize_ref_audio(self, ref_audio: object | None) -> dict[str, Any] | None:
-        if not isinstance(ref_audio, dict):
-            return None
-        wav = np.asarray(ref_audio.get("wav", []), dtype=np.float32).reshape(-1)
-        sr = int(ref_audio.get("sr", 0) or 0)
-        return {
-            "sample_rate": sr,
-            "num_samples": int(wav.shape[0]),
-            "duration_sec": float(wav.shape[0] / max(sr, 1)),
-        }
-
-    def _log_ref_audio_debug(self, hook: str, payload: dict[str, Any]) -> None:
-        if not self._debug_ref_audio_enabled():
-            return
-        logger.info(
-            "MiniCPM ref-audio-debug %s",
-            json.dumps({"hook": hook, **payload}, ensure_ascii=False, sort_keys=True),
-        )
-
-    @staticmethod
-    def _info_flag(value: Any) -> bool:
-        if isinstance(value, torch.Tensor):
-            if value.numel() == 0:
-                return False
-            return bool(value.reshape(-1)[0].item())
-        return bool(value)
 
     def embed_multimodal(self, **kwargs: Any) -> list[torch.Tensor]:
         if not kwargs:
@@ -542,9 +503,8 @@ class MiniCPMO4_5Code2Wav(nn.Module):
         wav_np = np.asarray(wav_np, dtype=np.float32).reshape(-1)
         return wav_np, sr
 
-    def _write_prompt_wav(self, ref_audio: object | None, *, request_index: int | None = None) -> str | None:
+    def _write_prompt_wav(self, ref_audio: object | None) -> str | None:
         target_sr = self._audio_prompt_sample_rate
-        using_ref_audio = ref_audio is not None
         if ref_audio is None:
             # stepaudio2.Token2wav still routes through prompt conditioning even
             # when the caller conceptually has no reference audio. Provide a
@@ -557,30 +517,18 @@ class MiniCPMO4_5Code2Wav(nn.Module):
             if wav_np.size == 0:
                 raise ValueError("MiniCPM ref_audio is empty.")
             if sr != target_sr:
-                wav_np = librosa.resample(y=wav_np.astype(np.float32), orig_sr=sr, target_sr=target_sr)
+                wav_np = _resample_audio(wav_np.astype(np.float32), orig_sr=sr, target_sr=target_sr)
                 sr = target_sr
 
         with tempfile.NamedTemporaryFile(prefix="minicpm_ref_", suffix=".wav", delete=False) as f:
             prompt_wav_path = f.name
         sf.write(prompt_wav_path, wav_np, sr)
-        self._log_ref_audio_debug(
-            "code2wav_write_prompt_wav",
-            {
-                "request_index": request_index,
-                "using_ref_audio": using_ref_audio,
-                "using_silent_fallback": not using_ref_audio,
-                "prompt_audio_sample_rate": int(sr),
-                "prompt_audio_num_samples": int(wav_np.shape[0]),
-            },
-        )
         return prompt_wav_path
 
     def _decode_one(
         self,
         token_ids: torch.Tensor | list[int],
         ref_audio: object | None,
-        *,
-        request_index: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.reshape(-1).tolist()
@@ -595,17 +543,7 @@ class MiniCPMO4_5Code2Wav(nn.Module):
 
         assert self._token2wav is not None
 
-        self._log_ref_audio_debug(
-            "code2wav_decode_one",
-            {
-                "request_index": request_index,
-                "token_count_after_trim": len(token_ids),
-                "has_ref_audio": ref_audio is not None,
-                "ref_audio": self._summarize_ref_audio(ref_audio),
-            },
-        )
-
-        prompt_wav_path = self._write_prompt_wav(ref_audio, request_index=request_index)
+        prompt_wav_path = self._write_prompt_wav(ref_audio)
         try:
             # stepaudio2.Token2wav caches the prompt-derived conditioning on the
             # instance. Clear it so each request uses its own reference audio
@@ -627,122 +565,6 @@ class MiniCPMO4_5Code2Wav(nn.Module):
         sr_tensor = torch.tensor(int(sr), dtype=torch.int32)
         return audio_tensor, sr_tensor
 
-    def _reset_async_stream_state(self) -> None:
-        self._async_stream_state = None
-        if self._token2wav is None:
-            return
-        self._token2wav.cache = None
-        self._token2wav.stream_cache = None
-        self._token2wav.hift_cache_dict = {}
-
-    def _init_async_stream_state(
-        self,
-        ref_audio: object | None,
-        *,
-        request_index: int | None = None,
-    ) -> dict[str, Any]:
-        assert self._token2wav is not None
-
-        prompt_wav_path = self._write_prompt_wav(ref_audio, request_index=request_index)
-        try:
-            self._token2wav.cache = None
-            stream_cache, hift_cache_dict = self._token2wav.set_stream_cache(prompt_wav_path)
-            prompt_cache = self._token2wav.cache
-        finally:
-            if prompt_wav_path is not None:
-                try:
-                    os.unlink(prompt_wav_path)
-                except OSError:
-                    logger.warning("Failed to remove temporary MiniCPM prompt wav: %s", prompt_wav_path)
-
-        state = {
-            "prompt_cache": prompt_cache,
-            "stream_cache": stream_cache,
-            "hift_cache_dict": hift_cache_dict,
-            "buffer": [self._stream_silence_token_id] * self._stream_prefix_silence_tokens,
-        }
-        self._async_stream_state = state
-        return state
-
-    def _run_async_stream_decode(
-        self,
-        state: dict[str, Any],
-        token_chunk: list[int],
-        *,
-        last_chunk: bool,
-    ) -> torch.Tensor:
-        assert self._token2wav is not None
-
-        self._token2wav.cache = state["prompt_cache"]
-        self._token2wav.stream_cache = state["stream_cache"]
-        self._token2wav.hift_cache_dict = state["hift_cache_dict"]
-        waveform_chunk = self._token2wav.stream(
-            token_chunk,
-            prompt_wav=None,
-            last_chunk=last_chunk,
-            return_waveform=True,
-        )
-        state["stream_cache"] = self._token2wav.stream_cache
-        state["hift_cache_dict"] = self._token2wav.hift_cache_dict
-
-        waveform_np = np.asarray(waveform_chunk, dtype=np.float32).reshape(-1)
-        return torch.from_numpy(waveform_np).to(dtype=torch.float32)
-
-    def _decode_one_async_chunk(
-        self,
-        token_ids: torch.Tensor | list[int],
-        ref_audio: object | None,
-        *,
-        finished: bool,
-        request_index: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if isinstance(token_ids, torch.Tensor):
-            token_ids = token_ids.reshape(-1).tolist()
-        else:
-            token_ids = list(token_ids)
-
-        while token_ids and token_ids[-1] == self._audio_eos_token_id:
-            token_ids.pop()
-
-        state = self._async_stream_state
-        if state is None and not token_ids and finished:
-            return torch.zeros((0,), dtype=torch.float32), torch.tensor(self._output_sample_rate, dtype=torch.int32)
-        if state is None:
-            state = self._init_async_stream_state(ref_audio, request_index=request_index)
-
-        state["buffer"].extend(int(tok) for tok in token_ids)
-        waveform_chunks: list[torch.Tensor] = []
-        chunk_trigger = self._codec_chunk_frames + self._stream_pre_lookahead
-
-        if len(state["buffer"]) >= chunk_trigger:
-            waveform_chunks.append(
-                self._run_async_stream_decode(
-                    state,
-                    list(state["buffer"][:chunk_trigger]),
-                    last_chunk=finished,
-                )
-            )
-            state["buffer"] = state["buffer"][self._codec_chunk_frames :]
-
-        if finished:
-            if state["buffer"]:
-                waveform_chunks.append(
-                    self._run_async_stream_decode(
-                        state,
-                        list(state["buffer"]),
-                        last_chunk=True,
-                    )
-                )
-                state["buffer"] = []
-            self._reset_async_stream_state()
-
-        if waveform_chunks:
-            audio_tensor = torch.cat(waveform_chunks, dim=0).to(dtype=torch.float32)
-        else:
-            audio_tensor = torch.zeros((0,), dtype=torch.float32)
-
-        return audio_tensor, torch.tensor(self._output_sample_rate, dtype=torch.int32)
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return set()
 
@@ -761,96 +583,23 @@ class MiniCPMO4_5Code2Wav(nn.Module):
         sr_tensor = torch.tensor(self._output_sample_rate, dtype=torch.int32)
         if runtime_additional_information is None:
             runtime_additional_information = kwargs.get("runtime_additional_information")
-        is_async_chunk = bool(getattr(self.vllm_config.model_config, "async_chunk", False))
-        has_async_terminal_flush = False
-        if is_async_chunk and runtime_additional_information:
-            for info in runtime_additional_information:
-                if not isinstance(info, dict):
-                    continue
-                left_context_size = info.get("left_context_size", 0)
-                if isinstance(left_context_size, torch.Tensor):
-                    left_context_size = (
-                        int(left_context_size.reshape(-1)[0].item()) if left_context_size.numel() > 0 else 0
-                    )
-                if int(left_context_size or 0) > 0:
-                    has_async_terminal_flush = True
-                    break
 
-        if (input_ids is None or input_ids.numel() == 0) and not has_async_terminal_flush:
+        if input_ids is None or input_ids.numel() == 0:
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
             )
 
         self._ensure_token2wav_loaded()
-        if input_ids is None:
-            ids = torch.empty((0,), dtype=torch.long)
-        else:
-            ids = input_ids.reshape(-1).to(dtype=torch.long)
+        ids = input_ids.reshape(-1).to(dtype=torch.long)
         seq_token_counts = kwargs.get("seq_token_counts")
         request_ids_list = self._split_request_ids(ids, seq_token_counts)
-        self._log_ref_audio_debug(
-            "code2wav_forward_batch",
-            {
-                "num_requests": len(request_ids_list),
-                "seq_token_counts": seq_token_counts,
-                "has_model_intermediate_buffer": model_intermediate_buffer is not None,
-                "model_intermediate_buffer_len": len(model_intermediate_buffer) if model_intermediate_buffer else 0,
-                "has_runtime_additional_information": runtime_additional_information is not None,
-                "runtime_additional_information_len": (
-                    len(runtime_additional_information) if runtime_additional_information else 0
-                ),
-                "async_chunk": is_async_chunk,
-            },
-        )
 
         audios: list[torch.Tensor] = []
         srs: list[torch.Tensor] = []
-        if is_async_chunk and len(request_ids_list) != 1:
-            raise RuntimeError(
-                f"MiniCPM async code2wav only supports batch=1 single-session streaming, got {len(request_ids_list)}."
-            )
         for i, req_ids in enumerate(request_ids_list):
-            info = (
-                runtime_additional_information[i]
-                if runtime_additional_information is not None and i < len(runtime_additional_information)
-                else None
-            )
             ref_audio = self._extract_ref_audio(model_intermediate_buffer, i)
-            self._log_ref_audio_debug(
-                "code2wav_forward_request",
-                {
-                    "request_index": i,
-                    "token_count": int(req_ids.numel()),
-                    "model_intermediate_buffer_keys": (
-                        sorted(model_intermediate_buffer[i].keys())
-                        if model_intermediate_buffer is not None
-                        and i < len(model_intermediate_buffer)
-                        and isinstance(model_intermediate_buffer[i], dict)
-                        else None
-                    ),
-                    "runtime_additional_information_keys": sorted(info.keys()) if isinstance(info, dict) else None,
-                    "has_ref_audio": ref_audio is not None,
-                    "ref_audio": self._summarize_ref_audio(ref_audio),
-                },
-            )
-            if is_async_chunk:
-                finished = False
-                if isinstance(info, dict):
-                    left_context_size = info.get("left_context_size", 0)
-                    if isinstance(left_context_size, torch.Tensor):
-                        left_context_size = (
-                            int(left_context_size.reshape(-1)[0].item()) if left_context_size.numel() > 0 else 0
-                        )
-                    finished = int(left_context_size or 0) > 0
-                audio_tensor, sr = self._decode_one_async_chunk(
-                    req_ids,
-                    ref_audio,
-                    finished=finished,
-                    request_index=i,
-                )
-            else:
-                audio_tensor, sr = self._decode_one(req_ids, ref_audio, request_index=i)
+            audio_tensor, sr = self._decode_one(req_ids, ref_audio)
             audios.append(audio_tensor)
             srs.append(sr)
 

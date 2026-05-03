@@ -24,11 +24,6 @@ def _minimal_model():
     model._output_sample_rate = 24000
     model._audio_prompt_sample_rate = 16000
     model._audio_eos_token_id = 6561
-    model._codec_chunk_frames = 25
-    model._stream_pre_lookahead = 3
-    model._stream_prefix_silence_tokens = 3
-    model._stream_silence_token_id = 4218
-    model._async_stream_state = None
     return model
 
 
@@ -69,83 +64,6 @@ def test_forward_splits_batched_requests_and_decodes_independently(monkeypatch):
     assert out.multimodal_outputs["model_outputs"][0].tolist() == [1.0]
     assert out.multimodal_outputs["model_outputs"][1].tolist() == [2.0]
     assert [int(x.item()) for x in out.multimodal_outputs["sr"]] == [24001, 24002]
-
-
-def test_forward_async_chunk_keeps_stream_state_and_trims_placeholder(tmp_path, monkeypatch):
-    model = _minimal_model()
-    model.vllm_config.model_config.async_chunk = True
-    monkeypatch.setattr(model, "_ensure_token2wav_loaded", lambda: None)
-
-    prompt_wav = tmp_path / "prompt.wav"
-    sf.write(prompt_wav, [0.1, -0.1], 16000)
-    monkeypatch.setattr(model, "_write_prompt_wav", lambda *_args, **_kwargs: str(prompt_wav))
-
-    class FakeToken2wav:
-        def __init__(self):
-            self.cache = None
-            self.stream_cache = None
-            self.hift_cache_dict = {}
-            self.stream_calls = []
-
-        def set_stream_cache(self, prompt_wav_path):
-            self.cache = ("prompt-cache", prompt_wav_path)
-            return {"stream": 0}, {"hift": 0}
-
-        def stream(self, generated_speech_tokens, prompt_wav=None, last_chunk=False, return_waveform=False):
-            self.stream_calls.append((list(generated_speech_tokens), prompt_wav, last_chunk, return_waveform))
-            self.stream_cache = {"stream": len(self.stream_calls)}
-            self.hift_cache_dict = {"hift": len(self.stream_calls)}
-            return [[float(len(generated_speech_tokens))]]
-
-    fake = FakeToken2wav()
-    model._token2wav = fake
-
-    first = model.forward(
-        input_ids=torch.tensor(list(range(25)), dtype=torch.long),
-        seq_token_counts=[30],
-        model_intermediate_buffer=[
-            {
-                "ref_audio": {"wav": [0.1, -0.1], "sr": 16000},
-            }
-        ],
-        runtime_additional_information=[{"left_context_size": 0}],
-    )
-
-    assert fake.stream_calls == [
-        ([4218, 4218, 4218] + list(range(25)), None, False, True),
-    ]
-    assert first.multimodal_outputs["model_outputs"][0].tolist() == [28.0]
-    assert model._async_stream_state is not None
-
-    second = model.forward(
-        input_ids=torch.empty((0,), dtype=torch.long),
-        seq_token_counts=[0],
-        model_intermediate_buffer=[
-            {
-                "ref_audio": {"wav": [0.1, -0.1], "sr": 16000},
-            }
-        ],
-        runtime_additional_information=[{"left_context_size": 1}],
-    )
-
-    assert fake.stream_calls[-1] == ([22, 23, 24], None, True, True)
-    assert second.multimodal_outputs["model_outputs"][0].tolist() == [3.0]
-    assert model._async_stream_state is None
-
-
-def test_forward_async_chunk_rejects_batched_requests(monkeypatch):
-    model = _minimal_model()
-    model.vllm_config.model_config.async_chunk = True
-    monkeypatch.setattr(model, "_ensure_token2wav_loaded", lambda: None)
-    model._token2wav = SimpleNamespace()
-
-    with pytest.raises(RuntimeError, match="batch=1 single-session streaming"):
-        model.forward(
-            input_ids=torch.tensor([1, 2, 3, 4], dtype=torch.long),
-            seq_token_counts=[2, 2],
-            model_intermediate_buffer=[{}, {}],
-            runtime_additional_information=[{"left_context_size": 0}, {"left_context_size": 0}],
-        )
 
 
 def test_decode_one_writes_prompt_wav_and_strips_trailing_eos(tmp_path):

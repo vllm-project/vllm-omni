@@ -181,9 +181,7 @@ AGENTS.md
 .cursor/
 
 # scripts
-/scripts/*
-!/scripts/modal_wan22_fun.py
-!/scripts/modal_minicpm_o45_vllm.py
+/scripts/
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

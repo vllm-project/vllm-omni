@@ -20,12 +20,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-import librosa
 import numpy as np
 import pytest
 import soundfile as sf
 
-from tests.conftest import (
+from tests.helpers.media import (
     generate_synthetic_audio,
     generate_synthetic_image,
     generate_synthetic_video,
@@ -36,7 +35,6 @@ MODEL = "openbmb/MiniCPM-o-4_5"
 ARTIFACT_DIR_ENV = "MINICPMO45_E2E_OUTPUT_DIR"
 REF_AUDIO_PATH_ENV = "MINICPMO45_REF_AUDIO_PATH"
 SYNTHETIC_MEDIA_SEED_ENV = "MINICPMO45_SYNTHETIC_MEDIA_SEED"
-ASYNC_LONG_AUDIO_MIN_SECONDS = 10.0
 AUDIO_OUTPUT_SYSTEM_PROMPT = (
     "When audio output is requested, reply with speech only and follow any requested length constraints."
 )
@@ -45,16 +43,6 @@ AUDIO_OUTPUT_SYSTEM_PROMPT = (
 def get_stage_config() -> str:
     return str(
         Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / "minicpmo.yaml"
-    )
-
-
-def get_async_chunk_stage_config() -> str:
-    return str(
-        Path(__file__).parent.parent.parent.parent
-        / "vllm_omni"
-        / "model_executor"
-        / "stage_configs"
-        / "minicpmo_async_chunk.yaml"
     )
 
 
@@ -85,8 +73,11 @@ def _load_ref_audio_payload_from_env() -> dict[str, Any] | None:
     if not path.is_file():
         raise FileNotFoundError(f"MiniCPM ref audio file not found: {path}")
 
-    wav, sr = librosa.load(path, sr=None, mono=True)
-    wav_np = np.asarray(wav, dtype=np.float32).reshape(-1)
+    wav, sr = sf.read(path, dtype="float32", always_2d=False)
+    wav_np = np.asarray(wav, dtype=np.float32)
+    if wav_np.ndim > 1:
+        wav_np = wav_np.mean(axis=-1)
+    wav_np = wav_np.reshape(-1)
     if wav_np.size == 0:
         raise ValueError(f"MiniCPM ref audio file is empty: {path}")
 
@@ -429,9 +420,10 @@ def test_minicpmo45_text_to_audio_with_and_without_ref() -> None:
     )
 
     try:
+        tts_text = "Please read this sentence aloud: vLLM Omni is testing MiniCPM text to audio generation."
         prompt_no_ref = _build_tts_prompt(
             model_path,
-            "Please read this sentence aloud: vLLM Omni is testing MiniCPM text to audio generation.",
+            tts_text,
         )
         outputs_no_ref = list(
             omni.generate(
@@ -441,7 +433,7 @@ def test_minicpmo45_text_to_audio_with_and_without_ref() -> None:
             )
         )
 
-        _, audio_np_no_ref, sample_rate_no_ref, rms_no_ref = _assert_valid_audio_output(
+        text_output_no_ref, audio_np_no_ref, sample_rate_no_ref, rms_no_ref = _assert_valid_audio_output(
             outputs_no_ref,
             label="no_ref",
         )
@@ -457,13 +449,19 @@ def test_minicpmo45_text_to_audio_with_and_without_ref() -> None:
         )
         if artifact_path_no_ref is not None:
             print(f"MiniCPM offline audio artifact (no_ref): {artifact_path_no_ref}")
+        if text_output_no_ref is not None:
+            text_artifact_path_no_ref = _maybe_save_text_artifact(
+                label="no_ref",
+                text=text_output_no_ref,
+            )
+            if text_artifact_path_no_ref is not None:
+                print(f"MiniCPM offline audio text artifact (no_ref): {text_artifact_path_no_ref}")
 
         ref_audio_payload = _load_ref_audio_payload_from_env()
         if ref_audio_payload is not None:
             prompt_with_ref = _build_tts_prompt(
                 model_path,
-                "Please read this sentence aloud using the provided voice style: "
-                "vLLM Omni is testing MiniCPM text to audio generation with reference audio.",
+                tts_text,
                 ref_audio_payload=ref_audio_payload,
             )
             outputs_with_ref = list(
@@ -474,7 +472,7 @@ def test_minicpmo45_text_to_audio_with_and_without_ref() -> None:
                 )
             )
 
-            _, audio_np_with_ref, sample_rate_with_ref, rms_with_ref = _assert_valid_audio_output(
+            text_output_with_ref, audio_np_with_ref, sample_rate_with_ref, rms_with_ref = _assert_valid_audio_output(
                 outputs_with_ref,
                 label="with_ref",
             )
@@ -490,469 +488,15 @@ def test_minicpmo45_text_to_audio_with_and_without_ref() -> None:
             )
             if artifact_path_with_ref is not None:
                 print(f"MiniCPM offline audio artifact (with_ref): {artifact_path_with_ref}")
+            if text_output_with_ref is not None:
+                text_artifact_path_with_ref = _maybe_save_text_artifact(
+                    label="with_ref",
+                    text=text_output_with_ref,
+                )
+                if text_artifact_path_with_ref is not None:
+                    print(f"MiniCPM offline audio text artifact (with_ref): {text_artifact_path_with_ref}")
         else:
             print("MiniCPM offline audio (with_ref): skipped because no ref audio path was provided.")
-    finally:
-        _best_effort_close_omni(omni)
-
-
-@pytest.mark.advanced_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-def test_minicpmo45_async_chunk_text_to_audio() -> None:
-    from vllm_omni.entrypoints.omni import Omni
-
-    model_path = _resolve_model_path()
-    omni = Omni(
-        model=model_path,
-        stage_configs_path=get_async_chunk_stage_config(),
-        trust_remote_code=True,
-        log_stats=True,
-        stage_init_timeout=20 * 60,
-        init_timeout=30 * 60,
-    )
-
-    try:
-        prompt = _build_tts_prompt(
-            model_path,
-            "Please read this single long sentence aloud exactly once without shortening it: "
-            "vLLM Omni is running an async chunk MiniCPM speech test, and this sentence intentionally "
-            "includes enough detail about streaming text to audio generation, multimodal reasoning, "
-            "stage connectors, careful debugging, and stable speech synthesis behavior to last well "
-            "over ten seconds when spoken at a natural pace.",
-        )
-        outputs = list(
-            omni.generate(
-                prompt,
-                sampling_params_list=omni.default_sampling_params_list,
-                use_tqdm=False,
-            )
-        )
-
-        text_output, audio_np, sample_rate, rms = _assert_valid_audio_output(
-            outputs,
-            label="async_chunk_text_to_audio",
-        )
-        duration_s = _assert_audio_duration_at_least(
-            audio_np,
-            sample_rate,
-            minimum_seconds=ASYNC_LONG_AUDIO_MIN_SECONDS,
-            label="async_chunk_text_to_audio",
-        )
-        assert text_output is not None
-
-        print(f"MiniCPM offline async_chunk audio: duration={duration_s:.2f}s sample_rate={sample_rate} rms={rms:.4f}")
-        print(f"MiniCPM offline async_chunk thinker text: {text_output}")
-
-        artifact_path = _maybe_save_audio_artifact(
-            label="async_chunk_text_to_audio",
-            audio_np=audio_np,
-            sample_rate=sample_rate,
-        )
-        if artifact_path is not None:
-            print(f"MiniCPM offline async_chunk audio artifact: {artifact_path}")
-
-        text_artifact_path = _maybe_save_text_artifact(
-            label="async_chunk_text_to_audio",
-            text=text_output,
-        )
-        if text_artifact_path is not None:
-            print(f"MiniCPM offline async_chunk text artifact: {text_artifact_path}")
-
-        artifact_root = os.environ.get(ARTIFACT_DIR_ENV, "").strip()
-        if artifact_root:
-            debug_root = Path(artifact_root) / "debug" / "minicpmo4_5_async_chunk"
-            print(f"MiniCPM offline async_chunk debug artifact root: {debug_root}")
-
-        ref_audio_payload = _load_ref_audio_payload_from_env()
-        if ref_audio_payload is not None:
-            prompt_with_ref = _build_tts_prompt(
-                model_path,
-                "Please read this sentence aloud using the provided voice style: "
-                "vLLM Omni is running an async chunk MiniCPM reference audio speech test.",
-                ref_audio_payload=ref_audio_payload,
-            )
-            outputs_with_ref = list(
-                omni.generate(
-                    prompt_with_ref,
-                    sampling_params_list=omni.default_sampling_params_list,
-                    use_tqdm=False,
-                )
-            )
-
-            text_output_with_ref, audio_np_with_ref, sample_rate_with_ref, rms_with_ref = _assert_valid_audio_output(
-                outputs_with_ref,
-                label="async_chunk_text_to_audio_with_ref",
-            )
-            print(
-                f"MiniCPM offline async_chunk audio with ref: "
-                f"duration={audio_np_with_ref.size / sample_rate_with_ref:.2f}s "
-                f"sample_rate={sample_rate_with_ref} rms={rms_with_ref:.4f} "
-                f"text={text_output_with_ref!r}"
-            )
-            artifact_path_with_ref = _maybe_save_audio_artifact(
-                label="async_chunk_text_to_audio_with_ref",
-                audio_np=audio_np_with_ref,
-                sample_rate=sample_rate_with_ref,
-            )
-            if artifact_path_with_ref is not None:
-                print(f"MiniCPM offline async_chunk audio with ref artifact: {artifact_path_with_ref}")
-        else:
-            print("MiniCPM offline async_chunk audio with ref: skipped because no ref audio path was provided.")
-    finally:
-        _best_effort_close_omni(omni)
-
-
-@pytest.mark.advanced_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-def test_minicpmo45_async_chunk_text_image_to_audio() -> None:
-    from vllm_omni.entrypoints.omni import Omni
-
-    model_path = _resolve_model_path()
-    omni = Omni(
-        model=model_path,
-        stage_configs_path=get_async_chunk_stage_config(),
-        trust_remote_code=True,
-        log_stats=True,
-        stage_init_timeout=20 * 60,
-        init_timeout=30 * 60,
-    )
-
-    try:
-        media_seed = _maybe_seed_synthetic_media(label="async_chunk_text_image_to_audio")
-        image = generate_synthetic_image(224, 224)["np_array"]
-        image_sha256 = _array_sha256(image)
-        print(f"MiniCPM offline async_chunk input image sha256: {image_sha256}")
-        metadata_path = _maybe_save_json_artifact(
-            label="async_chunk_text_image_to_audio_input",
-            payload={
-                "media_seed": media_seed,
-                "image_sha256": image_sha256,
-                "image_shape": list(image.shape),
-            },
-        )
-        if metadata_path is not None:
-            print(f"MiniCPM offline async_chunk image input metadata artifact: {metadata_path}")
-        image_artifact_path = _maybe_save_image_artifact(
-            label="async_chunk_text_image_to_audio_input",
-            image_np=image,
-        )
-        if image_artifact_path is not None:
-            print(f"MiniCPM offline async_chunk image input artifact: {image_artifact_path}")
-        prompt = _build_multimodal_text_prompt(
-            "Describe the image in one single detailed spoken sentence of at least sixty words, "
-            "mentioning every visible shape, its color, its approximate size, its position "
-            "relative to the other shapes, the plain background, and the overall layout, and keep "
-            "the answer natural but long enough to last more than ten seconds.",
-            image=image,
-            modalities=["audio"],
-            system_prompt=AUDIO_OUTPUT_SYSTEM_PROMPT,
-        )
-
-        outputs = list(
-            omni.generate(
-                prompt,
-                sampling_params_list=omni.default_sampling_params_list,
-                use_tqdm=False,
-            )
-        )
-
-        text_output, audio_np, sample_rate, rms = _assert_valid_audio_output(
-            outputs,
-            label="async_chunk_text_image_to_audio",
-        )
-        duration_s = _assert_audio_duration_at_least(
-            audio_np,
-            sample_rate,
-            minimum_seconds=ASYNC_LONG_AUDIO_MIN_SECONDS,
-            label="async_chunk_text_image_to_audio",
-        )
-        print(
-            f"MiniCPM offline async_chunk image-audio output: duration={duration_s:.2f}s "
-            f"sample_rate={sample_rate} rms={rms:.4f} text={text_output!r}"
-        )
-
-        artifact_path = _maybe_save_audio_artifact(
-            label="async_chunk_text_image_to_audio",
-            audio_np=audio_np,
-            sample_rate=sample_rate,
-        )
-        if artifact_path is not None:
-            print(f"MiniCPM offline async_chunk image-audio artifact: {artifact_path}")
-
-        if text_output is not None:
-            text_artifact_path = _maybe_save_text_artifact(
-                label="async_chunk_text_image_to_audio",
-                text=text_output,
-            )
-            if text_artifact_path is not None:
-                print(f"MiniCPM offline async_chunk image-audio text artifact: {text_artifact_path}")
-
-        artifact_root = os.environ.get(ARTIFACT_DIR_ENV, "").strip()
-        if artifact_root:
-            debug_root = Path(artifact_root) / "debug" / "minicpmo4_5_async_chunk"
-            print(f"MiniCPM offline async_chunk image-audio debug artifact root: {debug_root}")
-
-        ref_audio_payload = _load_ref_audio_payload_from_env()
-        if ref_audio_payload is not None:
-            prompt_with_ref = _build_multimodal_text_prompt(
-                "Describe the image in one short spoken sentence using the provided voice style.",
-                image=image,
-                modalities=["audio"],
-                system_prompt=AUDIO_OUTPUT_SYSTEM_PROMPT,
-                ref_audio_payload=ref_audio_payload,
-            )
-            outputs_with_ref = list(
-                omni.generate(
-                    prompt_with_ref,
-                    sampling_params_list=omni.default_sampling_params_list,
-                    use_tqdm=False,
-                )
-            )
-            text_output_with_ref, audio_np_with_ref, sample_rate_with_ref, rms_with_ref = _assert_valid_audio_output(
-                outputs_with_ref,
-                label="async_chunk_text_image_to_audio_with_ref",
-            )
-            print(
-                f"MiniCPM offline async_chunk image-audio with ref: "
-                f"duration={audio_np_with_ref.size / sample_rate_with_ref:.2f}s "
-                f"sample_rate={sample_rate_with_ref} rms={rms_with_ref:.4f} "
-                f"text={text_output_with_ref!r}"
-            )
-            artifact_path_with_ref = _maybe_save_audio_artifact(
-                label="async_chunk_text_image_to_audio_with_ref",
-                audio_np=audio_np_with_ref,
-                sample_rate=sample_rate_with_ref,
-            )
-            if artifact_path_with_ref is not None:
-                print(f"MiniCPM offline async_chunk image-audio with ref artifact: {artifact_path_with_ref}")
-        else:
-            print("MiniCPM offline async_chunk image-audio with ref: skipped because no ref audio path was provided.")
-    finally:
-        _best_effort_close_omni(omni)
-
-
-@pytest.mark.advanced_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-def test_minicpmo45_async_chunk_text_video_to_audio() -> None:
-    from vllm_omni.entrypoints.omni import Omni
-
-    model_path = _resolve_model_path()
-    omni = Omni(
-        model=model_path,
-        stage_configs_path=get_async_chunk_stage_config(),
-        trust_remote_code=True,
-        log_stats=True,
-        stage_init_timeout=20 * 60,
-        init_timeout=30 * 60,
-    )
-
-    try:
-        media_seed = _maybe_seed_synthetic_media(label="async_chunk_text_video_to_audio")
-        video = generate_synthetic_video(64, 64, 30)["np_array"]
-        video_sha256 = _array_sha256(video)
-        first_frame_sha256 = _array_sha256(video[0])
-        print(f"MiniCPM offline async_chunk input video sha256: {video_sha256} first_frame_sha256={first_frame_sha256}")
-        metadata_path = _maybe_save_json_artifact(
-            label="async_chunk_text_video_to_audio_input",
-            payload={
-                "media_seed": media_seed,
-                "video_sha256": video_sha256,
-                "video_shape": list(video.shape),
-                "first_frame_sha256": first_frame_sha256,
-            },
-        )
-        if metadata_path is not None:
-            print(f"MiniCPM offline async_chunk video input metadata artifact: {metadata_path}")
-        first_frame_path = _maybe_save_image_artifact(
-            label="async_chunk_text_video_to_audio_input_first_frame",
-            image_np=video[0],
-        )
-        if first_frame_path is not None:
-            print(f"MiniCPM offline async_chunk video first-frame artifact: {first_frame_path}")
-        prompt = _build_multimodal_text_prompt(
-            "Describe the video in one single detailed spoken sentence of at least sixty words, "
-            "covering the moving objects, their colors, their approximate sizes, the direction and "
-            "pattern of their motion over time, the dark background, and the overall scene, and "
-            "keep the answer natural but long enough to last more than ten seconds.",
-            video=video,
-            modalities=["audio"],
-            system_prompt=AUDIO_OUTPUT_SYSTEM_PROMPT,
-        )
-
-        outputs = list(
-            omni.generate(
-                prompt,
-                sampling_params_list=omni.default_sampling_params_list,
-                use_tqdm=False,
-            )
-        )
-
-        text_output, audio_np, sample_rate, rms = _assert_valid_audio_output(
-            outputs,
-            label="async_chunk_text_video_to_audio",
-        )
-        duration_s = _assert_audio_duration_at_least(
-            audio_np,
-            sample_rate,
-            minimum_seconds=ASYNC_LONG_AUDIO_MIN_SECONDS,
-            label="async_chunk_text_video_to_audio",
-        )
-        print(
-            f"MiniCPM offline async_chunk video-audio output: duration={duration_s:.2f}s "
-            f"sample_rate={sample_rate} rms={rms:.4f} text={text_output!r}"
-        )
-
-        artifact_path = _maybe_save_audio_artifact(
-            label="async_chunk_text_video_to_audio",
-            audio_np=audio_np,
-            sample_rate=sample_rate,
-        )
-        if artifact_path is not None:
-            print(f"MiniCPM offline async_chunk video-audio artifact: {artifact_path}")
-
-        if text_output is not None:
-            text_artifact_path = _maybe_save_text_artifact(
-                label="async_chunk_text_video_to_audio",
-                text=text_output,
-            )
-            if text_artifact_path is not None:
-                print(f"MiniCPM offline async_chunk video-audio text artifact: {text_artifact_path}")
-
-        artifact_root = os.environ.get(ARTIFACT_DIR_ENV, "").strip()
-        if artifact_root:
-            debug_root = Path(artifact_root) / "debug" / "minicpmo4_5_async_chunk"
-            print(f"MiniCPM offline async_chunk video-audio debug artifact root: {debug_root}")
-
-        ref_audio_payload = _load_ref_audio_payload_from_env()
-        if ref_audio_payload is not None:
-            prompt_with_ref = _build_multimodal_text_prompt(
-                "Describe the video in one short spoken sentence using the provided voice style.",
-                video=video,
-                modalities=["audio"],
-                system_prompt=AUDIO_OUTPUT_SYSTEM_PROMPT,
-                ref_audio_payload=ref_audio_payload,
-            )
-            outputs_with_ref = list(
-                omni.generate(
-                    prompt_with_ref,
-                    sampling_params_list=omni.default_sampling_params_list,
-                    use_tqdm=False,
-                )
-            )
-            text_output_with_ref, audio_np_with_ref, sample_rate_with_ref, rms_with_ref = _assert_valid_audio_output(
-                outputs_with_ref,
-                label="async_chunk_text_video_to_audio_with_ref",
-            )
-            print(
-                f"MiniCPM offline async_chunk video-audio with ref: "
-                f"duration={audio_np_with_ref.size / sample_rate_with_ref:.2f}s "
-                f"sample_rate={sample_rate_with_ref} rms={rms_with_ref:.4f} "
-                f"text={text_output_with_ref!r}"
-            )
-            artifact_path_with_ref = _maybe_save_audio_artifact(
-                label="async_chunk_text_video_to_audio_with_ref",
-                audio_np=audio_np_with_ref,
-                sample_rate=sample_rate_with_ref,
-            )
-            if artifact_path_with_ref is not None:
-                print(f"MiniCPM offline async_chunk video-audio with ref artifact: {artifact_path_with_ref}")
-        else:
-            print("MiniCPM offline async_chunk video-audio with ref: skipped because no ref audio path was provided.")
-    finally:
-        _best_effort_close_omni(omni)
-
-
-@pytest.mark.advanced_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-def test_minicpmo45_async_chunk_text_image_to_text() -> None:
-    from vllm_omni.entrypoints.omni import Omni
-
-    model_path = _resolve_model_path()
-    omni = Omni(
-        model=model_path,
-        stage_configs_path=get_async_chunk_stage_config(),
-        trust_remote_code=True,
-        log_stats=True,
-        stage_init_timeout=20 * 60,
-        init_timeout=30 * 60,
-    )
-
-    try:
-        image = generate_synthetic_image(224, 224)["np_array"]
-        prompt = _build_multimodal_text_prompt(
-            "Describe the image briefly in one short sentence.",
-            image=image,
-            modalities=["text"],
-        )
-
-        outputs = list(
-            omni.generate(
-                prompt,
-                sampling_params_list=omni.default_sampling_params_list,
-                use_tqdm=False,
-            )
-        )
-
-        text_output = _assert_valid_text_output(outputs, label="async_chunk_text_image_to_text")
-        print(f"MiniCPM offline async_chunk image-text output: {text_output}")
-
-        text_artifact_path = _maybe_save_text_artifact(
-            label="async_chunk_text_image_to_text",
-            text=text_output,
-        )
-        if text_artifact_path is not None:
-            print(f"MiniCPM offline async_chunk image-text artifact: {text_artifact_path}")
-    finally:
-        _best_effort_close_omni(omni)
-
-
-@pytest.mark.advanced_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-def test_minicpmo45_async_chunk_text_audio_to_text() -> None:
-    from vllm_omni.entrypoints.omni import Omni
-
-    model_path = _resolve_model_path()
-    omni = Omni(
-        model=model_path,
-        stage_configs_path=get_async_chunk_stage_config(),
-        trust_remote_code=True,
-        log_stats=True,
-        stage_init_timeout=20 * 60,
-        init_timeout=30 * 60,
-    )
-
-    try:
-        audio = generate_synthetic_audio(1, 1, 16000)["np_array"]
-        if len(audio.shape) == 2:
-            audio = audio.squeeze(-1)
-        prompt = _build_multimodal_text_prompt(
-            "What is being spoken in the audio? Answer briefly.",
-            audio=(audio, 16000),
-            modalities=["text"],
-        )
-
-        outputs = list(
-            omni.generate(
-                prompt,
-                sampling_params_list=omni.default_sampling_params_list,
-                use_tqdm=False,
-            )
-        )
-
-        text_output = _assert_valid_text_output(outputs, label="async_chunk_text_audio_to_text")
-        print(f"MiniCPM offline async_chunk audio-text output: {text_output}")
-
-        text_artifact_path = _maybe_save_text_artifact(
-            label="async_chunk_text_audio_to_text",
-            text=text_output,
-        )
-        if text_artifact_path is not None:
-            print(f"MiniCPM offline async_chunk audio-text artifact: {text_artifact_path}")
     finally:
         _best_effort_close_omni(omni)
 
@@ -1091,14 +635,15 @@ def test_minicpmo45_text_image_to_audio() -> None:
 
     try:
         image = generate_synthetic_image(224, 224)["np_array"]
+        prompt_text = "Describe the image briefly in one short spoken sentence."
+        system_prompt = (
+            "You are MiniCPM, a helpful multimodal assistant. When audio output is requested, reply with speech only."
+        )
         prompt = _build_multimodal_text_prompt(
-            "Describe the image briefly in one short spoken sentence.",
+            prompt_text,
             image=image,
             modalities=["audio"],
-            system_prompt=(
-                "You are MiniCPM, a helpful multimodal assistant. "
-                "When audio output is requested, reply with speech only."
-            ),
+            system_prompt=system_prompt,
         )
 
         outputs = list(
@@ -1124,6 +669,55 @@ def test_minicpmo45_text_image_to_audio() -> None:
         )
         if artifact_path is not None:
             print(f"MiniCPM offline image-audio artifact: {artifact_path}")
+        if text_output is not None:
+            text_artifact_path = _maybe_save_text_artifact(
+                label="text_image_to_audio",
+                text=text_output,
+            )
+            if text_artifact_path is not None:
+                print(f"MiniCPM offline image-audio text artifact: {text_artifact_path}")
+
+        ref_audio_payload = _load_ref_audio_payload_from_env()
+        if ref_audio_payload is not None:
+            prompt_with_ref = _build_multimodal_text_prompt(
+                prompt_text,
+                image=image,
+                modalities=["audio"],
+                system_prompt=system_prompt,
+                ref_audio_payload=ref_audio_payload,
+            )
+            outputs_with_ref = list(
+                omni.generate(
+                    prompt_with_ref,
+                    sampling_params_list=omni.default_sampling_params_list,
+                    use_tqdm=False,
+                )
+            )
+
+            text_output_with_ref, audio_np_with_ref, sample_rate_with_ref, rms_with_ref = _assert_valid_audio_output(
+                outputs_with_ref,
+                label="text_image_to_audio_with_ref",
+            )
+            print(
+                f"MiniCPM offline image-audio with ref: duration={audio_np_with_ref.size / sample_rate_with_ref:.2f}s "
+                f"sample_rate={sample_rate_with_ref} rms={rms_with_ref:.4f} text={text_output_with_ref!r}"
+            )
+            artifact_path_with_ref = _maybe_save_audio_artifact(
+                label="text_image_to_audio_with_ref",
+                audio_np=audio_np_with_ref,
+                sample_rate=sample_rate_with_ref,
+            )
+            if artifact_path_with_ref is not None:
+                print(f"MiniCPM offline image-audio with ref artifact: {artifact_path_with_ref}")
+            if text_output_with_ref is not None:
+                text_artifact_path_with_ref = _maybe_save_text_artifact(
+                    label="text_image_to_audio_with_ref",
+                    text=text_output_with_ref,
+                )
+                if text_artifact_path_with_ref is not None:
+                    print(f"MiniCPM offline image-audio with ref text artifact: {text_artifact_path_with_ref}")
+        else:
+            print("MiniCPM offline image-audio with ref: skipped because no ref audio path was provided.")
     finally:
         _best_effort_close_omni(omni)
 
@@ -1146,14 +740,15 @@ def test_minicpmo45_text_video_to_audio() -> None:
 
     try:
         video = generate_synthetic_video(64, 64, 30)["np_array"]
+        prompt_text = "Describe the video briefly in one short spoken sentence."
+        system_prompt = (
+            "You are MiniCPM, a helpful multimodal assistant. When audio output is requested, reply with speech only."
+        )
         prompt = _build_multimodal_text_prompt(
-            "Describe the video briefly in one short spoken sentence.",
+            prompt_text,
             video=video,
             modalities=["audio"],
-            system_prompt=(
-                "You are MiniCPM, a helpful multimodal assistant. "
-                "When audio output is requested, reply with speech only."
-            ),
+            system_prompt=system_prompt,
         )
 
         outputs = list(
@@ -1179,5 +774,54 @@ def test_minicpmo45_text_video_to_audio() -> None:
         )
         if artifact_path is not None:
             print(f"MiniCPM offline video-audio artifact: {artifact_path}")
+        if text_output is not None:
+            text_artifact_path = _maybe_save_text_artifact(
+                label="text_video_to_audio",
+                text=text_output,
+            )
+            if text_artifact_path is not None:
+                print(f"MiniCPM offline video-audio text artifact: {text_artifact_path}")
+
+        ref_audio_payload = _load_ref_audio_payload_from_env()
+        if ref_audio_payload is not None:
+            prompt_with_ref = _build_multimodal_text_prompt(
+                prompt_text,
+                video=video,
+                modalities=["audio"],
+                system_prompt=system_prompt,
+                ref_audio_payload=ref_audio_payload,
+            )
+            outputs_with_ref = list(
+                omni.generate(
+                    prompt_with_ref,
+                    sampling_params_list=omni.default_sampling_params_list,
+                    use_tqdm=False,
+                )
+            )
+
+            text_output_with_ref, audio_np_with_ref, sample_rate_with_ref, rms_with_ref = _assert_valid_audio_output(
+                outputs_with_ref,
+                label="text_video_to_audio_with_ref",
+            )
+            print(
+                f"MiniCPM offline video-audio with ref: duration={audio_np_with_ref.size / sample_rate_with_ref:.2f}s "
+                f"sample_rate={sample_rate_with_ref} rms={rms_with_ref:.4f} text={text_output_with_ref!r}"
+            )
+            artifact_path_with_ref = _maybe_save_audio_artifact(
+                label="text_video_to_audio_with_ref",
+                audio_np=audio_np_with_ref,
+                sample_rate=sample_rate_with_ref,
+            )
+            if artifact_path_with_ref is not None:
+                print(f"MiniCPM offline video-audio with ref artifact: {artifact_path_with_ref}")
+            if text_output_with_ref is not None:
+                text_artifact_path_with_ref = _maybe_save_text_artifact(
+                    label="text_video_to_audio_with_ref",
+                    text=text_output_with_ref,
+                )
+                if text_artifact_path_with_ref is not None:
+                    print(f"MiniCPM offline video-audio with ref text artifact: {text_artifact_path_with_ref}")
+        else:
+            print("MiniCPM offline video-audio with ref: skipped because no ref audio path was provided.")
     finally:
         _best_effort_close_omni(omni)

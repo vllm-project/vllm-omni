@@ -6,11 +6,11 @@ import io
 import os
 from pathlib import Path
 
-import librosa
 import numpy as np
 import pytest
 import soundfile as sf
 import torch
+from vllm.multimodal.audio import AudioResampler
 
 from vllm_omni.model_executor.models.minicpmo4_5.minicpmo4_5_code2wav import MiniCPMToken2wavCore
 
@@ -22,6 +22,13 @@ pytestmark = [
     pytest.mark.cuda,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
+
+
+def _resample_audio(audio: np.ndarray, *, orig_sr: int, target_sr: int) -> np.ndarray:
+    if int(orig_sr) == int(target_sr):
+        return np.asarray(audio, dtype=np.float32)
+    resampler = AudioResampler(target_sr=int(target_sr))
+    return np.asarray(resampler.resample(np.asarray(audio, dtype=np.float32), orig_sr=int(orig_sr)), dtype=np.float32)
 
 
 def _resolve_assets_dir() -> Path:
@@ -72,7 +79,7 @@ def _patch_upstream_audio_io(monkeypatch: pytest.MonkeyPatch) -> None:
             audio_np = audio_np.mean(axis=-1)
         audio_np = audio_np.reshape(-1)
         if int(sample_rate) != int(sr):
-            audio_np = librosa.resample(y=audio_np, orig_sr=int(sample_rate), target_sr=int(sr))
+            audio_np = _resample_audio(audio_np, orig_sr=int(sample_rate), target_sr=int(sr))
         return torch.from_numpy(np.asarray(audio_np, dtype=np.float32))
 
     def torchaudio_load(file: str | None, *args, **kwargs) -> tuple[torch.Tensor, int]:

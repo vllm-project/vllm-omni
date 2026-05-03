@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-E2E Online tests for MiniCPM-o 4.5 with async-chunk enabled.
+E2E Online tests for MiniCPM-o 4.5 with the default non-async stage config.
 """
 
 import os
@@ -10,12 +10,11 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import (
-    OmniServerParams,
-    dummy_messages_from_mix_data,
+from tests.helpers.media import (
     generate_synthetic_image,
     generate_synthetic_video,
 )
+from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.utils import hardware_test
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -37,11 +36,7 @@ CHAT_TEMPLATE_PATH = str(
 
 def get_stage_config() -> str:
     return str(
-        Path(__file__).parent.parent.parent.parent
-        / "vllm_omni"
-        / "model_executor"
-        / "stage_configs"
-        / "minicpmo_async_chunk.yaml"
+        Path(__file__).parent.parent.parent.parent / "vllm_omni" / "model_executor" / "stage_configs" / "minicpmo.yaml"
     )
 
 
@@ -141,7 +136,7 @@ minicpmo_server_params = [
                 "openai",
             ],
         ),
-        id="async_chunk",
+        id="minicpmo",
     )
 ]
 
