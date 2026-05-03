@@ -273,6 +273,7 @@ class AsyncOmniEngine:
         single_stage_mode: bool = False,
         **kwargs: Any,
     ) -> None:
+        init_start_time = time.monotonic()
         self.model = model
         self.diffusion_batch_size = diffusion_batch_size
         startup_timeout = int(init_timeout)
@@ -336,6 +337,14 @@ class AsyncOmniEngine:
         self._shutdown_called = False
         self._weak_finalizer: weakref.finalize | None = None
         self._rpc_lock = threading.Lock()
+        self._startup_metrics_lock = threading.Lock()
+        self._startup_metrics: dict[str, Any] = {
+            "model": model,
+            "num_stages": self.num_stages,
+            "async_chunk": self.async_chunk,
+            "single_stage_mode": self.single_stage_mode,
+            "stages": {},
+        }
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
 
@@ -364,7 +373,26 @@ class AsyncOmniEngine:
             self.rpc_output_queue,
         )
 
+        self._record_startup_metric("engine_init_total_ms", (time.monotonic() - init_start_time) * 1000.0)
+        self._log_startup_summary()
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
+
+    def _record_startup_metric(self, name: str, value_ms: float) -> None:
+        with self._startup_metrics_lock:
+            self._startup_metrics[name] = round(value_ms, 3)
+
+    def _record_stage_startup_metric(self, stage_id: int, name: str, value: Any) -> None:
+        with self._startup_metrics_lock:
+            stage_metrics = self._startup_metrics.setdefault("stages", {}).setdefault(str(stage_id), {})
+            stage_metrics[name] = round(value, 3) if isinstance(value, float) else value
+
+    def get_startup_metrics(self) -> dict[str, Any]:
+        with self._startup_metrics_lock:
+            return json.loads(json.dumps(self._startup_metrics))
+
+    def _log_startup_summary(self) -> None:
+        startup_summary = self.get_startup_metrics()
+        logger.info("[AsyncOmniEngine][StartupSummary] %s", json.dumps(startup_summary, sort_keys=True))
 
     def _launch_llm_stage(
         self,
@@ -376,6 +404,7 @@ class AsyncOmniEngine:
         omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None] = (None, None, None),
     ) -> StartedLlmStage:
         """Launch one LLM stage to READY state in a helper thread."""
+        launch_start_time = time.monotonic()
         started_stage: StartedLlmStage | None = None
         lock_fds: list[int] = []
         device_control_env = current_omni_platform.device_control_env_var
@@ -471,6 +500,11 @@ class AsyncOmniEngine:
                     assert handshake_address is not None
                     complete_stage_handshake(proc, handshake_address, addresses, vllm_config, stage_init_timeout)
                 logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
+                self._record_stage_startup_metric(
+                    metadata.stage_id,
+                    "engine_startup_ms",
+                    (time.monotonic() - launch_start_time) * 1000.0,
+                )
 
             assert started_stage is not None
             return started_stage
@@ -491,6 +525,7 @@ class AsyncOmniEngine:
         omni_master_server: OmniMasterServer,
     ) -> StartedLlmStage:
         """Attach to a remote engine core and wait for its startup handshake."""
+        launch_start_time = time.monotonic()
         started_stage: StartedLlmStage | None = None
         try:
             raw_stage_cfg = omni_master_server.get_stage_config(
@@ -529,6 +564,11 @@ class AsyncOmniEngine:
                     addresses=addresses,
                 )
             logger.info("[AsyncOmniEngine] Stage %s remote engine startup completed", metadata.stage_id)
+            self._record_stage_startup_metric(
+                metadata.stage_id,
+                "remote_engine_startup_ms",
+                (time.monotonic() - launch_start_time) * 1000.0,
+            )
             assert started_stage is not None
             return started_stage
         except Exception:
@@ -543,6 +583,7 @@ class AsyncOmniEngine:
         omni_master_server: OmniMasterServer,
     ) -> StageDiffusionClient:
         """Launch a local diffusion stage on OmniMasterServer-allocated sockets."""
+        launch_start_time = time.monotonic()
         proc = None
         try:
             od_config = build_diffusion_config(self.model, stage_cfg, metadata)
@@ -569,6 +610,11 @@ class AsyncOmniEngine:
                 "[AsyncOmniEngine] Stage %s diffusion startup completed",
                 metadata.stage_id,
             )
+            self._record_stage_startup_metric(
+                metadata.stage_id,
+                "diffusion_startup_ms",
+                (time.monotonic() - launch_start_time) * 1000.0,
+            )
             return StageDiffusionClient.from_addresses(
                 metadata,
                 request_address=request_address,
@@ -588,6 +634,7 @@ class AsyncOmniEngine:
         omni_master_server: OmniMasterServer,
     ) -> StageDiffusionClient:
         """Attach to a remote diffusion stage registered with OmniMasterServer."""
+        launch_start_time = time.monotonic()
         remote_stage_cfg = OmegaConf.create(
             omni_master_server.get_stage_config(
                 metadata.stage_id,
@@ -599,6 +646,11 @@ class AsyncOmniEngine:
         logger.info(
             "[AsyncOmniEngine] Stage %s remote diffusion startup completed",
             metadata.stage_id,
+        )
+        self._record_stage_startup_metric(
+            metadata.stage_id,
+            "remote_diffusion_startup_ms",
+            (time.monotonic() - launch_start_time) * 1000.0,
         )
         return StageDiffusionClient.from_addresses(
             remote_metadata,
@@ -612,6 +664,7 @@ class AsyncOmniEngine:
         started: StartedLlmStage,
     ) -> tuple[Any, Any, Any, InputProcessor | None]:
         """Attach a READY LLM stage to the orchestrator event loop."""
+        attach_start_time = time.monotonic()
 
         client_addresses: dict[str, str] = {
             "input_address": started.addresses.inputs[0],
@@ -677,10 +730,12 @@ class AsyncOmniEngine:
             raise
 
         logger.info("[AsyncOmniEngine] Stage %s initialized", started.stage_id)
+        self._record_stage_startup_metric(started.stage_id, "attach_ms", (time.monotonic() - attach_start_time) * 1000.0)
         return stage_client, output_processor, started.vllm_config, input_processor
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
         """Initialize stage clients/processors in orchestrator thread and assign to self."""
+        init_start_time = time.monotonic()
         device_control_env = current_omni_platform.device_control_env_var
 
         num_stages = self.num_stages
@@ -692,6 +747,7 @@ class AsyncOmniEngine:
         llm_launch_futures: dict[int, concurrent.futures.Future[StartedLlmStage]] = {}
         started_llm_stages: dict[int, StartedLlmStage] = {}
         llm_stage_launch_lock = threading.Lock()
+        stage_start_times: dict[int, float] = {}
 
         async_chunk = self.async_chunk
         prompt_expand_func = None
@@ -741,6 +797,8 @@ class AsyncOmniEngine:
                 for stage_idx, stage_cfg in enumerate(self.stage_configs):
                     metadata = extract_stage_metadata(stage_cfg)
                     configured_stage_id = metadata.stage_id
+                    stage_start_times[stage_idx] = time.monotonic()
+                    self._record_stage_startup_metric(configured_stage_id, "stage_type", metadata.stage_type)
                     logger.info("[AsyncOmniEngine] Initializing stage %s", configured_stage_id)
                     if metadata.prompt_expand_func is not None:
                         prompt_expand_func = metadata.prompt_expand_func
@@ -802,6 +860,11 @@ class AsyncOmniEngine:
                                     configured_stage_id,
                                     self.diffusion_batch_size,
                                 )
+                                self._record_stage_startup_metric(
+                                    configured_stage_id,
+                                    "total_init_ms",
+                                    (time.monotonic() - stage_start_times[stage_idx]) * 1000.0,
+                                )
                             finally:
                                 if previous_visible_devices is None:
                                     current_omni_platform.unset_device_control_env_var()
@@ -861,6 +924,12 @@ class AsyncOmniEngine:
                     stage_vllm_configs[stage_idx] = vllm_config
                     if stage0_input_processor is not None:
                         input_processor = stage0_input_processor
+                    stage_id = started_llm_stages[stage_idx].stage_id
+                    self._record_stage_startup_metric(
+                        stage_id,
+                        "total_init_ms",
+                        (time.monotonic() - stage_start_times[stage_idx]) * 1000.0,
+                    )
 
             initialized_stage_clients, default_sampling_params_list, stage_metadata = finalize_initialized_stages(
                 stage_clients,
@@ -901,12 +970,15 @@ class AsyncOmniEngine:
 
         self.default_sampling_params_list = default_sampling_params_list
         self.stage_metadata = stage_metadata
+        self._record_startup_metric("stage_init_total_ms", (time.monotonic() - init_start_time) * 1000.0)
 
     def _initialize_janus_queues(self) -> None:
         """Initialize janus queues inside orchestrator thread loop context."""
+        queue_init_start_time = time.monotonic()
         self.request_queue = janus.Queue()
         self.output_queue = janus.Queue()
         self.rpc_output_queue = janus.Queue()
+        self._record_startup_metric("janus_queue_init_ms", (time.monotonic() - queue_init_start_time) * 1000.0)
         logger.debug("[AsyncOmniEngine] janus queues initialized in orchestrator thread loop")
 
     def _bootstrap_orchestrator(
@@ -915,6 +987,7 @@ class AsyncOmniEngine:
         startup_future: concurrent.futures.Future,
     ) -> None:
         """Create loop, initialize stages, then run Orchestrator."""
+        bootstrap_start_time = time.monotonic()
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -934,6 +1007,7 @@ class AsyncOmniEngine:
                 stage_vllm_configs=self.stage_vllm_configs,
                 pd_config=pd_config,
             )
+            self._record_startup_metric("orchestrator_bootstrap_ms", (time.monotonic() - bootstrap_start_time) * 1000.0)
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
             await orchestrator.run()
