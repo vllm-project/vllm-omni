@@ -105,14 +105,14 @@ class DiffusersPipelineLoader:
         possible_index_files = [
             f"{subfolder}/{index_file}" if subfolder is not None else index_file for index_file in INDEX_FILES
         ]
-        available_index_file = list(
-            filter(lambda f: file_exists(model_name_or_path, f, revision=revision), possible_index_files)
-        )
+        available_index_file = [
+            f for f in possible_index_files if file_exists(model_name_or_path, f, revision=revision)
+        ]
         if len(available_index_file) > 1:
             raise ValueError(
                 f"Multiple index files found in {model_name_or_path} with subfolder {subfolder}: {available_index_file}"
             )
-        index_file = available_index_file[0] if len(available_index_file) == 1 else ""
+        index_file = available_index_file[0] if available_index_file else ""
 
         # only hf is supported currently
         if load_format == "auto":
