@@ -255,6 +255,7 @@ class OmniBase(PDDisaggregationMixin):
         try:
             if req_state is None or req_state.metrics is None:
                 return
+            req_state.metrics.build_and_log_summary()
         except Exception:
             logger.exception(
                 "[%s] Failed to build/log summary for req=%s",

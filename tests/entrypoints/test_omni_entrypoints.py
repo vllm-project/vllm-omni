@@ -201,6 +201,17 @@ def _make_base():
     return obj
 
 
+def test_log_summary_and_cleanup_builds_summary_and_clears_state() -> None:
+    app = _make_base()
+    metrics = MagicMock()
+    app.request_states["req-1"] = SimpleNamespace(metrics=metrics)
+
+    app._log_summary_and_cleanup("req-1")
+
+    metrics.build_and_log_summary.assert_called_once_with()
+    assert "req-1" not in app.request_states
+
+
 def _stage_spec(
     stage_id: int,
     *,
