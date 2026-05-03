@@ -29,7 +29,6 @@ This recipe documents the tested GPU configuration for OmniVoice online
 serving on 1x NVIDIA L20 48GB.
 Other hardware and configurations are welcome as community validation lands.
 
-
 ## GPU
 
 ### 1x NVIDIA L20 48GB
@@ -68,18 +67,10 @@ uv pip install "huggingface-hub>=0.34.0,<1.0"
 hf download k2-fsa/OmniVoice --cache-dir $HF_HOME/hub --max-workers 8
 ```
 
-Observed download result:
+After download, the model cache should contain:
 
 ```text
-Downloaded model: k2-fsa/OmniVoice
-Download command:
-hf download k2-fsa/OmniVoice --cache-dir $HF_HOME/hub --max-workers 8
-
-HF_ENDPOINT=https://hf-mirror.com
-HF_HOME=/home/ecs-user/hf_cache
-
-Cache check:
-/home/ecs-user/hf_cache/hub/models--k2-fsa--OmniVoice
+$HF_HOME/hub/models--k2-fsa--OmniVoice
 ```
 
 #### Command
