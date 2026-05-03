@@ -95,6 +95,16 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _STARTUP_POLL_INTERVAL_S = 1.0
+_DEFAULT_STARTUP_POLICY = "default"
+_SUPPORTED_STARTUP_POLICIES: frozenset[str] = frozenset(
+    {
+        _DEFAULT_STARTUP_POLICY,
+        "all-eager",
+        "comprehension-eager",
+        "shared-device-eager",
+        "critical-path-eager",
+    }
+)
 
 
 # ============================================================================
@@ -279,6 +289,8 @@ class AsyncOmniEngine:
         startup_timeout = int(init_timeout)
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
+        self._startup_policy = _DEFAULT_STARTUP_POLICY
+        self._startup_policy_stage_plan: dict[int, str] = {}
 
         # Merge tracked engine_args fields into kwargs; explicit kwargs take priority.
         if engine_args is not None:
@@ -342,6 +354,7 @@ class AsyncOmniEngine:
             "model": model,
             "num_stages": self.num_stages,
             "async_chunk": self.async_chunk,
+            "startup_policy": self._startup_policy,
             "single_stage_mode": self.single_stage_mode,
             "stages": {},
         }
@@ -377,9 +390,9 @@ class AsyncOmniEngine:
         self._log_startup_summary()
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
 
-    def _record_startup_metric(self, name: str, value_ms: float) -> None:
+    def _record_startup_metric(self, name: str, value: Any) -> None:
         with self._startup_metrics_lock:
-            self._startup_metrics[name] = round(value_ms, 3)
+            self._startup_metrics[name] = round(value, 3) if isinstance(value, float) else value
 
     def _record_stage_startup_metric(self, stage_id: int, name: str, value: Any) -> None:
         with self._startup_metrics_lock:
@@ -389,6 +402,77 @@ class AsyncOmniEngine:
     def get_startup_metrics(self) -> dict[str, Any]:
         with self._startup_metrics_lock:
             return json.loads(json.dumps(self._startup_metrics))
+
+    @staticmethod
+    def _normalize_startup_policy(startup_policy: str | None) -> str:
+        if startup_policy is None:
+            return _DEFAULT_STARTUP_POLICY
+        normalized = str(startup_policy).strip().lower()
+        if normalized not in _SUPPORTED_STARTUP_POLICIES:
+            raise ValueError(
+                f"Unsupported startup_policy={startup_policy!r}. "
+                f"Expected one of: {sorted(_SUPPORTED_STARTUP_POLICIES)}"
+            )
+        return normalized
+
+    @staticmethod
+    def _stage_runtime_devices(stage_cfg: Any) -> tuple[str, ...]:
+        runtime_cfg = getattr(stage_cfg, "runtime", None)
+        devices = getattr(runtime_cfg, "devices", None)
+        if devices is None and hasattr(runtime_cfg, "get"):
+            devices = runtime_cfg.get("devices")
+        if devices is None:
+            return ()
+        if isinstance(devices, str):
+            return (devices,)
+        return tuple(str(device) for device in devices)
+
+    @classmethod
+    def _apply_stage_startup_policy(
+        cls,
+        stage_configs: Sequence[Any],
+        startup_policy: str | None,
+    ) -> tuple[str, dict[int, str]]:
+        normalized_policy = cls._normalize_startup_policy(startup_policy)
+        if normalized_policy == _DEFAULT_STARTUP_POLICY:
+            return normalized_policy, {}
+
+        device_refcounts: dict[str, int] = {}
+        for stage_cfg in stage_configs:
+            for device in cls._stage_runtime_devices(stage_cfg):
+                device_refcounts[device] = device_refcounts.get(device, 0) + 1
+
+        applied_stage_plan: dict[int, str] = {}
+        for stage_cfg in stage_configs:
+            metadata = extract_stage_metadata(stage_cfg)
+            stage_id = metadata.stage_id
+            is_comprehension = bool(metadata.is_comprehension or stage_id == 0)
+            shared_devices = tuple(
+                device for device in cls._stage_runtime_devices(stage_cfg) if device_refcounts.get(device, 0) > 1
+            )
+
+            reason: str | None = None
+            if normalized_policy == "all-eager":
+                reason = "all-eager"
+            elif normalized_policy == "comprehension-eager" and is_comprehension:
+                reason = "comprehension-stage"
+            elif normalized_policy == "shared-device-eager" and shared_devices:
+                reason = f"shared-device:{','.join(shared_devices)}"
+            elif normalized_policy == "critical-path-eager":
+                if is_comprehension:
+                    reason = "comprehension-stage"
+                elif shared_devices:
+                    reason = f"shared-device:{','.join(shared_devices)}"
+
+            if reason is None:
+                continue
+
+            if not hasattr(stage_cfg, "engine_args") or stage_cfg.engine_args is None:
+                stage_cfg.engine_args = OmegaConf.create({})
+            stage_cfg.engine_args.enforce_eager = True
+            applied_stage_plan[stage_id] = reason
+
+        return normalized_policy, applied_stage_plan
 
     def _log_startup_summary(self) -> None:
         startup_summary = self.get_startup_metrics()
@@ -799,6 +883,18 @@ class AsyncOmniEngine:
                     configured_stage_id = metadata.stage_id
                     stage_start_times[stage_idx] = time.monotonic()
                     self._record_stage_startup_metric(configured_stage_id, "stage_type", metadata.stage_type)
+                    self._record_stage_startup_metric(
+                        configured_stage_id,
+                        "effective_enforce_eager",
+                        bool(getattr(stage_cfg.engine_args, "enforce_eager", False)),
+                    )
+                    stage_policy_reason = self._startup_policy_stage_plan.get(configured_stage_id)
+                    if stage_policy_reason is not None:
+                        self._record_stage_startup_metric(
+                            configured_stage_id,
+                            "startup_policy_reason",
+                            stage_policy_reason,
+                        )
                     logger.info("[AsyncOmniEngine] Initializing stage %s", configured_stage_id)
                     if metadata.prompt_expand_func is not None:
                         prompt_expand_func = metadata.prompt_expand_func
@@ -1507,6 +1603,19 @@ class AsyncOmniEngine:
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
         )
+
+        startup_policy, stage_plan = self._apply_stage_startup_policy(
+            stage_configs,
+            kwargs.get("startup_policy"),
+        )
+        self._startup_policy = startup_policy
+        self._startup_policy_stage_plan = stage_plan
+        if startup_policy != _DEFAULT_STARTUP_POLICY:
+            logger.info(
+                "[AsyncOmniEngine] Applied startup policy %s to stage(s): %s",
+                startup_policy,
+                {stage_id: stage_plan[stage_id] for stage_id in sorted(stage_plan)},
+            )
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
         for cfg in stage_configs:

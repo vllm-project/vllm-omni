@@ -182,6 +182,20 @@ class OmniServeCommand(CLISubcommand):
             help="Override the deploy YAML's ``async_chunk:`` bool. Unset leaves the YAML value in force.",
         )
         omni_config_group.add_argument(
+            "--startup-policy",
+            type=str,
+            default=None,
+            choices=[
+                "default",
+                "all-eager",
+                "comprehension-eager",
+                "shared-device-eager",
+                "critical-path-eager",
+            ],
+            help="Apply a stage-aware cold-start policy. This rewrites selected "
+            "stages to `enforce_eager=true` without editing the deploy YAML.",
+        )
+        omni_config_group.add_argument(
             "--stage-id",
             type=int,
             default=None,

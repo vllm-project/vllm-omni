@@ -123,6 +123,10 @@ class OmniEngineArgs(EngineArgs):
         output_modalities: Optional list of output modality names to enable
             (e.g. ["text", "audio"]). If None, all modalities supported by
             the model are used.
+        startup_policy: Optional cold-start policy that can rewrite
+            per-stage startup behavior (for example, setting
+            ``enforce_eager`` only on selected stages). ``None`` keeps the
+            deploy config unchanged.
         log_stats: Whether to log engine statistics. Defaults to False.
         custom_pipeline_args: Dictionary of arguments for custom pipeline
             initialization (e.g., ``{"pipeline_class": "my.Module"}``).
@@ -164,6 +168,7 @@ class OmniEngineArgs(EngineArgs):
     omni_master_port: int | None = None
     stage_configs_path: str | None = None
     output_modalities: list[str] | None = None
+    startup_policy: str | None = None
     log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
@@ -430,6 +435,7 @@ class OrchestratorArgs:
 
     # === Observability ===
     log_stats: bool = False
+    startup_policy: str | None = None
 
     # === Headless Mode (also forwarded to engine — see SHARED_FIELDS) ===
     stage_id: int | None = None
@@ -452,6 +458,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "model",  # orch: detect model_type; engine: load weights
         "stage_id",  # orch: route (headless); engine: identity
         "log_stats",  # both want the flag
+        "startup_policy",  # orch: stage-aware startup rewrite; engine: consume in AsyncOmniEngine
         "stage_configs_path",  # orch: load legacy YAML; engine: may reference for validation
     }
 )

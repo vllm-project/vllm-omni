@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from omegaconf import OmegaConf
 from pydantic import ValidationError
 from transformers import PretrainedConfig
 from vllm.engine.arg_utils import EngineArgs
@@ -311,3 +312,52 @@ def test_strip_single_engine_args_model_does_not_trigger_warning(mocker):
     warned_args = mock_warn.call_args[0][-1]  # the formatted arg list
     assert "tensor_parallel_size" in warned_args
     assert "model" not in warned_args
+
+
+def _stage_cfg(stage_id: int, *, devices: list[str], is_comprehension: bool = False):
+    return SimpleNamespace(
+        stage_id=stage_id,
+        stage_type="llm",
+        runtime=OmegaConf.create({"devices": devices}),
+        engine_args=OmegaConf.create({}),
+        default_sampling_params=OmegaConf.create({}),
+        is_comprehension=is_comprehension,
+        final_output=False,
+        final_output_type=None,
+        engine_input_source=[],
+    )
+
+
+def test_apply_stage_startup_policy_comprehension_eager():
+    stage_configs = [
+        _stage_cfg(0, devices=["cuda:0"], is_comprehension=True),
+        _stage_cfg(1, devices=["cuda:1"]),
+        _stage_cfg(2, devices=["cuda:2"]),
+    ]
+
+    policy, plan = AsyncOmniEngine._apply_stage_startup_policy(stage_configs, "comprehension-eager")
+
+    assert policy == "comprehension-eager"
+    assert plan == {0: "comprehension-stage"}
+    assert stage_configs[0].engine_args.enforce_eager is True
+    assert not hasattr(stage_configs[1].engine_args, "enforce_eager")
+    assert not hasattr(stage_configs[2].engine_args, "enforce_eager")
+
+
+def test_apply_stage_startup_policy_shared_device_eager():
+    stage_configs = [
+        _stage_cfg(0, devices=["cuda:0"], is_comprehension=True),
+        _stage_cfg(1, devices=["cuda:1"]),
+        _stage_cfg(2, devices=["cuda:1"]),
+    ]
+
+    policy, plan = AsyncOmniEngine._apply_stage_startup_policy(stage_configs, "shared-device-eager")
+
+    assert policy == "shared-device-eager"
+    assert plan == {
+        1: "shared-device:cuda:1",
+        2: "shared-device:cuda:1",
+    }
+    assert not hasattr(stage_configs[0].engine_args, "enforce_eager")
+    assert stage_configs[1].engine_args.enforce_eager is True
+    assert stage_configs[2].engine_args.enforce_eager is True
