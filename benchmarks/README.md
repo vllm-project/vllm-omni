@@ -14,6 +14,8 @@ This document explains the benchmark architecture across all benchmark assets in
 
 ## Directory layout
 - `benchmarks/build_dataset/` — dataset prep utilities (e.g., SeedTTS top100).
+- `benchmarks/minicpmo4_5/` — MiniCPM-o 4.5 text/image/video-to-audio latency
+  and RTF benchmark comparing vLLM-Omni with the HuggingFace reference path.
 - `benchmarks/<model>/vllm_omni/` — vLLM-Omni pipeline benchmarks, logs, outputs.
 - `benchmarks/accuracy/` — accuracy benchmark integrations that adapt external
   benchmark suites to vLLM-Omni serving and evaluation flows.
