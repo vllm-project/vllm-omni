@@ -853,18 +853,53 @@ class TestTTSMethods:
         result = speech_server._validate_tts_request(req)
         assert "non-empty" in result
 
-    def test_speaker_embedding_wrong_dims_accepted(self, speech_server):
-        """Non-standard dimensions pass validation (warning only, not an error)."""
-        emb = [0.1] * 512  # not 1024 or 2048
+    def test_speaker_embedding_wrong_dims_rejected(self, speech_server):
+        """speaker_embedding dimensions must match the loaded Qwen3-TTS model."""
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(hidden_size=2048),
+            )
+        )
+
+        emb = [0.1] * 1024
         req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=emb, x_vector_only_mode=True)
         result = speech_server._validate_tts_request(req)
-        assert result is None
+        assert "speaker_embedding has 1024 dimensions" in result
+        assert "expected 2048" in result
 
     def test_speaker_embedding_2048_dims_accepted(self, speech_server):
         """2048-dim embedding (1.7B model) is accepted without warning."""
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(hidden_size=2048),
+            )
+        )
+
         emb = [0.1] * 2048
         req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=emb, x_vector_only_mode=True)
         assert speech_server._validate_tts_request(req) is None
+
+    def test_upload_voice_embedding_wrong_dims_rejected(self, speech_server):
+        """Embedding uploads must match the loaded Qwen3-TTS model before being stored."""
+        import json
+
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(hidden_size=2048),
+            )
+        )
+
+        with pytest.raises(ValueError, match="expected 2048"):
+            asyncio.run(
+                speech_server.upload_voice_embedding(
+                    embedding_json=json.dumps([0.0] * 1024),
+                    consent="consent",
+                    name="bad_emb_voice",
+                )
+            )
 
     def test_base_task_requires_ref_audio_or_speaker_embedding(self, speech_server):
         """Base task without ref_audio or speaker_embedding is rejected."""

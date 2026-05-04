@@ -3,7 +3,7 @@
 This example runs **Ming-flash-omni-2.0 talker-only** offline inference with:
 
 - `model`: `Jonathan1909/Ming-flash-omni-2.0`
-- `stage config`: `vllm_omni/model_executor/stage_configs/ming_flash_omni_tts.yaml`
+- `deploy config`: `vllm_omni/deploy/ming_flash_omni_tts.yaml`
 
 It follows the Ming cookbook parameter style:
 
@@ -37,7 +37,7 @@ python examples/offline_inference/ming_flash_omni_tts/end2end.py --case basic
 - `--text`: override default text in the selected case
 - `--output`: custom output wav path
 - `--model`: local model path or HF repo id
-- `--stage-configs-path`: custom talker stage config path
+- `--deploy-config`: custom talker deploy YAML path
 - `--log-stats`: enable runtime stats logs
 
 ## Notes

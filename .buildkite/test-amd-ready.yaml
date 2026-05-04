@@ -7,7 +7,9 @@ steps:
   grade: Blocking
   commands:
     - export VLLM_ROCM_USE_AITER=0
-    - "timeout 20m pytest -v -s -m 'core_model and cpu' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
+    # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
+    # that is not supported on CPU
+    - "timeout 20m pytest -vvvv -s -m 'core_model and cpu' --ignore=tests/diffusion/cache/test_teacache_extractors.py --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
 
 - label: "Voxtral TTS CUDA Unit Test"
   agent_pool: mi325_1
@@ -70,6 +72,17 @@ steps:
 #     - export VLLM_LOGGING_LEVEL=DEBUG
 #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
 #     - timeout 20m pytest -s -v tests/e2e/offline_inference/test_stable_audio_expansion.py -m "advanced_model and diffusion and L4" --run-level advanced_model
+
+- label: "AudioX Online Test"
+  agent_pool: mi325_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - export GPU_ARCHS=gfx942
+    - export VLLM_LOGGING_LEVEL=DEBUG
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - timeout 20m pytest -s -v tests/e2e/online_serving/test_audiox_online.py
 
 - label: "Diffusion Cache Backend Test"
   agent_pool: mi325_1

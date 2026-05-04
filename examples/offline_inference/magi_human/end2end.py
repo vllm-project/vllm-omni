@@ -24,9 +24,6 @@ def parse_args():
     parser.add_argument("--width", type=int, default=448, help="Video width.")
     parser.add_argument("--num-inference-steps", type=int, default=8, help="Number of denoising steps.")
     parser.add_argument("--seed", type=int, default=52, help="Random seed for generation.")
-    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
-
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 
