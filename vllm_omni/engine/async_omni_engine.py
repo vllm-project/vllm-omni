@@ -496,14 +496,32 @@ class AsyncOmniEngine:
             proc = None
             handshake_address = None
             with ExitStack() as launch_stack:
+                launch_lock_wait_start = time.monotonic()
                 with llm_stage_launch_lock:
+                    self._record_stage_startup_metric(
+                        metadata.stage_id,
+                        "launch_lock_wait_ms",
+                        (time.monotonic() - launch_lock_wait_start) * 1000.0,
+                    )
                     previous_visible_devices = os.environ.get(device_control_env)
                     try:
+                        device_setup_start = time.monotonic()
                         setup_stage_devices(metadata.stage_id, metadata.runtime_cfg)
+                        self._record_stage_startup_metric(
+                            metadata.stage_id,
+                            "device_setup_ms",
+                            (time.monotonic() - device_setup_start) * 1000.0,
+                        )
+                        engine_args_build_start = time.monotonic()
                         engine_args_dict = build_engine_args_dict(
                             stage_cfg,
                             self.model,
                             stage_connector_spec=stage_connector_spec,
+                        )
+                        self._record_stage_startup_metric(
+                            metadata.stage_id,
+                            "engine_args_build_ms",
+                            (time.monotonic() - engine_args_build_start) * 1000.0,
                         )
                         omni_conn_cfg, omni_from, omni_to = omni_kv_connector
                         if omni_conn_cfg:
@@ -521,17 +539,30 @@ class AsyncOmniEngine:
                                 metadata.stage_id,
                                 self.stage_configs,
                             )
+                        config_build_start = time.monotonic()
                         vllm_config, executor_class = build_vllm_config(
                             stage_cfg,
                             self.model,
                             stage_connector_spec=stage_connector_spec,
                             engine_args_dict=engine_args_dict,
                         )
+                        self._record_stage_startup_metric(
+                            metadata.stage_id,
+                            "vllm_config_build_ms",
+                            (time.monotonic() - config_build_start) * 1000.0,
+                        )
+                        device_lock_wait_start = time.monotonic()
                         lock_fds = acquire_device_locks(
                             metadata.stage_id,
                             engine_args_dict,
                             stage_init_timeout,
                         )
+                        self._record_stage_startup_metric(
+                            metadata.stage_id,
+                            "device_lock_wait_ms",
+                            (time.monotonic() - device_lock_wait_start) * 1000.0,
+                        )
+                        spawn_start = time.monotonic()
                         if self.single_stage_mode and self._omni_master_server is not None:
                             engine_manager, coordinator, addresses = launch_stack.enter_context(
                                 launch_omni_core_engines(
@@ -566,6 +597,11 @@ class AsyncOmniEngine:
                                 addresses=addresses,
                                 proc=proc,
                             )
+                        self._record_stage_startup_metric(
+                            metadata.stage_id,
+                            "proc_spawn_ms",
+                            (time.monotonic() - spawn_start) * 1000.0,
+                        )
                         logger.info("[AsyncOmniEngine] Stage %s engine launch started", metadata.stage_id)
                     finally:
                         if previous_visible_devices is None:
@@ -582,7 +618,13 @@ class AsyncOmniEngine:
                 else:
                     assert proc is not None
                     assert handshake_address is not None
+                    handshake_start = time.monotonic()
                     complete_stage_handshake(proc, handshake_address, addresses, vllm_config, stage_init_timeout)
+                    self._record_stage_startup_metric(
+                        metadata.stage_id,
+                        "handshake_ms",
+                        (time.monotonic() - handshake_start) * 1000.0,
+                    )
                 logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
                 self._record_stage_startup_metric(
                     metadata.stage_id,
@@ -758,6 +800,7 @@ class AsyncOmniEngine:
             client_addresses["stats_update_address"] = started.addresses.frontend_stats_publish_address
 
         try:
+            client_attach_start = time.monotonic()
             stage_client = StageEngineCoreClientBase.make_async_mp_client(
                 vllm_config=started.vllm_config,
                 executor_class=started.executor_class,
@@ -770,21 +813,38 @@ class AsyncOmniEngine:
             started.proc = None
             started.engine_manager = None
             started.coordinator = None
+            self._record_stage_startup_metric(
+                started.stage_id,
+                "client_attach_ms",
+                (time.monotonic() - client_attach_start) * 1000.0,
+            )
         except Exception:
             close_started_llm_stage(started)
             raise
 
         try:
+            tokenizer_load_start = time.monotonic()
             if started.vllm_config.model_config.skip_tokenizer_init:
                 tokenizer = None
             else:
                 tokenizer = cached_tokenizer_from_config(
                     model_config=started.vllm_config.model_config,
                 )
+            self._record_stage_startup_metric(
+                started.stage_id,
+                "tokenizer_load_ms",
+                (time.monotonic() - tokenizer_load_start) * 1000.0,
+            )
+            output_processor_start = time.monotonic()
             output_processor = MultimodalOutputProcessor(
                 tokenizer=tokenizer,
                 log_stats=False,
                 engine_core_output_type=started.metadata.engine_output_type,
+            )
+            self._record_stage_startup_metric(
+                started.stage_id,
+                "output_processor_init_ms",
+                (time.monotonic() - output_processor_start) * 1000.0,
             )
             input_processor = None
             if started.stage_id == 0:
@@ -794,6 +854,7 @@ class AsyncOmniEngine:
                 # to raise ValueError. Patch it to return None so
                 # InputProcessor doesn't crash.
                 _patch_generation_config_if_needed(started.vllm_config.model_config)
+                input_processor_start = time.monotonic()
                 input_processor = InputProcessor(vllm_config=started.vllm_config)
                 # Use omni preprocessor so text-only prompts with
                 # mm_processor_kwargs (e.g. GLM-Image t2i target_h/target_w)
@@ -801,6 +862,11 @@ class AsyncOmniEngine:
                 input_processor.input_preprocessor = OmniInputPreprocessor(
                     vllm_config=started.vllm_config,
                     renderer=input_processor.renderer,
+                )
+                self._record_stage_startup_metric(
+                    started.stage_id,
+                    "input_processor_init_ms",
+                    (time.monotonic() - input_processor_start) * 1000.0,
                 )
         except Exception:
             try:
