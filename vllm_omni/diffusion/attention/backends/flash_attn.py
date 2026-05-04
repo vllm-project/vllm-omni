@@ -140,6 +140,7 @@ class FlashAttentionImpl(AttentionImpl):
         """CUDA/ROCm/MUSA flash attention implementation."""
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             HAS_FLASH_ATTN,
+            flash_attn_func,
         )
 
         if not HAS_FLASH_ATTN:
@@ -159,11 +160,15 @@ class FlashAttentionImpl(AttentionImpl):
                 attention_mask,
             )
 
-        return self._forward_varlen_dense(
+        # Dense case for CUDA – use the dedicated non‑varlen function
+        out = flash_attn_func(
             query,
             key,
             value,
+            causal=self.causal,
+            softmax_scale=self.softmax_scale,
         )
+        return self._unwrap_flash_output(out)
 
     def forward_xpu(
         self,
