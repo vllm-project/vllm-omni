@@ -12,10 +12,10 @@ pip install --no-build-isolation 'minicpmo-utils[all]'
 pip install soundfile pillow
 ```
 
-The default stage config is:
+The default deploy config is:
 
 ```text
-vllm_omni/model_executor/stage_configs/minicpmo.yaml
+vllm_omni/deploy/minicpmo4_5.yaml
 ```
 
 The default config places the thinker stage on GPU 0 and the talker/code2wav
@@ -64,7 +64,7 @@ bash examples/offline_inference/minicpmo4_5/run_video_to_audio.sh
 ```bash
 python examples/offline_inference/minicpmo4_5/end2end.py \
   --model-path openbmb/MiniCPM-o-4_5 \
-  --stage-configs-path vllm_omni/model_executor/stage_configs/minicpmo.yaml \
+  --deploy-config vllm_omni/deploy/minicpmo4_5.yaml \
   --query-type use_image \
   --modalities audio \
   --output-wav minicpmo45_image_to_audio.wav
@@ -79,14 +79,14 @@ Supported query types:
 | `use_video` | Video + text | Audio |
 
 Set `--modalities text` to request text output, or `--modalities text,audio`
-to request both text and audio when supported by the stage config.
+to request both text and audio when supported by the deploy config.
 
 ## Notes
 
 - The text-to-audio path uses MiniCPM's TTS chat template through
   `tokenizer.apply_chat_template(..., use_tts_template=True)`.
 - The image/video-to-audio paths use the MiniCPM prompt prefix expected by the
-  current non-async stage config.
+  current non-async deploy config.
 - The public `py_generator=True` API closes `Omni` after iteration. This example
   uses the normal one-request `generate` path and closes the engine explicitly at
   the end.

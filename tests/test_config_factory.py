@@ -710,6 +710,7 @@ class TestPipelineDiscovery:
         assert "qwen2_5_omni" in _PIPELINE_REGISTRY
         assert "qwen3_omni_moe" in _PIPELINE_REGISTRY
         assert "qwen3_tts" in _PIPELINE_REGISTRY
+        assert "minicpmo4_5" in _PIPELINE_REGISTRY
 
     def test_registry_loads_pipeline_on_getitem(self):
         """Looking up a registered model_type returns the matching PipelineConfig."""
@@ -995,6 +996,81 @@ class TestQwen3TTSPipeline:
             "top_k": 32,
             "top_p": 1.0,
         }
+
+
+class TestMiniCPMO4_5Pipeline:
+    def test_registered(self):
+        import vllm_omni.model_executor.models.minicpmo4_5.pipeline  # noqa: F401
+
+        p = _PIPELINE_REGISTRY.get("minicpmo4_5")
+        assert p is not None
+        assert p.model_arch == "MiniCPMO4_5ForConditionalGeneration"
+        assert p.hf_architectures == ("MiniCPMO",)
+        assert len(p.stages) == 3
+        assert p.validate() == []
+
+    def test_thinker(self):
+        import vllm_omni.model_executor.models.minicpmo4_5.pipeline  # noqa: F401
+
+        s = _PIPELINE_REGISTRY["minicpmo4_5"].get_stage(0)
+        assert s.model_stage == "thinker"
+        assert s.execution_type == StageExecutionType.LLM_AR
+        assert s.owns_tokenizer is True
+        assert s.requires_multimodal_data is True
+        assert s.engine_output_type == "latent"
+        assert s.sampling_constraints["detokenize"] is True
+
+    def test_talker(self):
+        import vllm_omni.model_executor.models.minicpmo4_5.pipeline  # noqa: F401
+
+        s = _PIPELINE_REGISTRY["minicpmo4_5"].get_stage(1)
+        assert s.input_sources == (0,)
+        assert s.hf_config_name == "tts_config"
+        assert s.sampling_constraints["detokenize"] is False
+        assert s.sampling_constraints["stop_token_ids"] == [6561]
+        assert s.custom_process_input_func is not None
+
+    def test_code2wav(self):
+        import vllm_omni.model_executor.models.minicpmo4_5.pipeline  # noqa: F401
+
+        s = _PIPELINE_REGISTRY["minicpmo4_5"].get_stage(2)
+        assert s.execution_type == StageExecutionType.LLM_GENERATION
+        assert s.final_output_type == "audio"
+        assert s.hf_config_name == "tts_config"
+        assert s.engine_output_type == "audio"
+        assert s.custom_process_input_func is not None
+
+    def test_deploy_yaml_merges_with_pipeline(self):
+        import vllm_omni.model_executor.models.minicpmo4_5.pipeline  # noqa: F401
+        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "minicpmo4_5.yaml"
+        if not deploy_path.exists():
+            pytest.skip("minicpmo4_5 deploy yaml not found")
+
+        deploy = load_deploy_config(deploy_path)
+        pipeline = _PIPELINE_REGISTRY["minicpmo4_5"]
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert len(stages) == 3
+        assert deploy.async_chunk is False
+        assert stages[0].yaml_runtime["devices"] == "0"
+        assert stages[0].yaml_engine_args["model_arch"] == "MiniCPMO4_5ForConditionalGeneration"
+        assert stages[0].yaml_engine_args["max_num_batched_tokens"] == 4096
+        assert stages[0].yaml_engine_args["mm_processor_cache_gb"] == 0
+        assert stages[0].yaml_engine_args["async_chunk"] is False
+        assert stages[0].yaml_extras["default_sampling_params"]["detokenize"] is True
+
+        assert stages[1].custom_process_input_func.endswith("thinker2talker")
+        assert stages[1].hf_config_name == "tts_config"
+        assert stages[1].yaml_engine_args["distributed_executor_backend"] == "mp"
+        assert stages[1].yaml_extras["default_sampling_params"]["temperature"] == 0.9
+        assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
+
+        assert stages[2].custom_process_input_func.endswith("talker2code2wav")
+        assert stages[2].worker_type == "generation"
+        assert stages[2].yaml_engine_args["max_num_batched_tokens"] == 1000000
+        assert stages[2].yaml_extras["default_sampling_params"]["max_tokens"] == 65536
 
 
 class TestMingFlashOmniPipeline:

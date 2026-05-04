@@ -83,6 +83,8 @@ passes the same `CUDA_VISIBLE_DEVICES` value to both subprocesses.
 - **RTF**: latency divided by generated audio duration. Lower is better.
 - **Audio duration**: generated audio samples divided by sample rate.
 - **Output text tokens**: generated text token count when text output is exposed.
+- **Peak VRAM**: per-mode peak `nvidia-smi memory.used` for the visible GPUs,
+  plus total peak and delta from the mode's baseline sample.
 
 The benchmark intentionally reports full-response latency instead of TTFT. The
 current non-async MiniCPM path does not expose a reliable time-to-first-audio
@@ -97,7 +99,8 @@ minicpmo45_bench_YYYYMMDD_HHMMSS.json
 ```
 
 The report includes CUDA device metadata, aggregate latency/RTF statistics, and
-per-request errors with exception type and traceback when a request fails.
+per-mode peak VRAM usage. Per-request errors include exception type and
+traceback when a request fails.
 
 ## Notes
 

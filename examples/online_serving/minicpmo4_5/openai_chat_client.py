@@ -17,7 +17,7 @@ MODEL = "openbmb/MiniCPM-o-4_5"
 QueryType = Literal["text", "use_image", "use_video"]
 
 DEFAULT_PROMPTS: dict[QueryType, str] = {
-    "text": "Please read this sentence aloud: vLLM Omni is testing MiniCPM online serving.",
+    "text": "Please read this sentence aloud: vLLM Omni is testing MiniCPM text to audio generation.",
     "use_image": "Describe the image in one short spoken sentence.",
     "use_video": "Describe the video in one short spoken sentence.",
 }
@@ -57,8 +57,8 @@ def _system_message() -> dict[str, Any]:
             {
                 "type": "text",
                 "text": (
-                    "You are MiniCPM, a helpful multimodal assistant. "
-                    "When audio output is requested, reply with speech only."
+                    "When audio output is requested, reply with speech only "
+                    "and follow any requested length constraints."
                 ),
             }
         ],

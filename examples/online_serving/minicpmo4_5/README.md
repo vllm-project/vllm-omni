@@ -12,7 +12,7 @@ pip install --no-build-isolation 'minicpmo-utils[all]'
 pip install openai
 ```
 
-The default stage config places the thinker stage on GPU 0 and the
+The default deploy config places the thinker stage on GPU 0 and the
 talker/code2wav stages on GPU 1. Use two visible GPUs:
 
 ```bash
@@ -33,7 +33,7 @@ Equivalent command:
 vllm-omni serve openbmb/MiniCPM-o-4_5 \
   --omni \
   --port 8091 \
-  --stage-configs-path vllm_omni/model_executor/stage_configs/minicpmo.yaml \
+  --deploy-config vllm_omni/deploy/minicpmo4_5.yaml \
   --chat-template vllm_omni/model_executor/models/minicpmo4_5/chat_template.jinja \
   --chat-template-content-format openai \
   --trust-remote-code
@@ -78,6 +78,9 @@ Text to audio:
 bash examples/online_serving/minicpmo4_5/run_curl_text_to_audio.sh
 ```
 
+The text curl helper requests both `text` and `audio` modalities and writes the
+returned assistant text next to the WAV file for debugging.
+
 Image to audio:
 
 ```bash
@@ -96,7 +99,7 @@ For audio output, include both `modalities` and the MiniCPM TTS template kwargs:
 
 ```json
 {
-  "modalities": ["audio"],
+  "modalities": ["text", "audio"],
   "chat_template_kwargs": {
     "use_tts_template": true,
     "enable_thinking": false
@@ -112,5 +115,5 @@ body; raw curl JSON should not wrap them in an `extra_body` object.
 
 - The examples save the first audio response to a WAV file.
 - For local image/video files, the clients send data URLs to the server.
-- The default non-async stage config is intended for full-response latency and
+- The default non-async deploy config is intended for full-response latency and
   audio generation tests, not true time-to-first-audio-chunk measurements.

@@ -20,7 +20,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MODEL = "openbmb/MiniCPM-o-4_5"
-DEFAULT_STAGE_CONFIG = REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "minicpmo.yaml"
+DEFAULT_DEPLOY_CONFIG = REPO_ROOT / "vllm_omni" / "deploy" / "minicpmo4_5.yaml"
 
 QueryType = Literal["text", "use_image", "use_video"]
 
@@ -54,12 +54,12 @@ def _parse_modalities(value: str) -> list[str]:
     return modalities
 
 
-def _build_tts_prompt(model_path: str, text: str) -> dict[str, Any]:
+def _build_tts_prompt(model_path: str, text: str, system_prompt: str) -> dict[str, Any]:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     messages = [
-        {"role": "system", "content": AUDIO_OUTPUT_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": text},
     ]
     tokenized = tokenizer.apply_chat_template(
@@ -75,15 +75,13 @@ def _build_tts_prompt(model_path: str, text: str) -> dict[str, Any]:
     }
 
 
-def _build_text_prompt(text: str, modalities: list[str]) -> dict[str, Any]:
+def _build_text_prompt(text: str, modalities: list[str], system_prompt: str) -> dict[str, Any]:
     assistant_prefix = "<|im_start|>assistant\n"
     if "audio" in modalities:
         assistant_prefix += "<think>\n\n</think>\n\n<|tts_bos|>"
     return {
         "prompt": (
-            f"<|im_start|>system\n{AUDIO_OUTPUT_SYSTEM_PROMPT}<|im_end|>\n"
-            f"<|im_start|>user\n{text}<|im_end|>\n"
-            f"{assistant_prefix}"
+            f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{text}<|im_end|>\n{assistant_prefix}"
         ),
         "modalities": modalities,
     }
@@ -185,8 +183,9 @@ def _build_multimodal_prompt(
     video_path: str | None,
     seed: int,
     num_video_frames: int,
+    system_prompt: str,
 ) -> dict[str, Any]:
-    prompt = _build_text_prompt(text, modalities)
+    prompt = _build_text_prompt(text, modalities, system_prompt)
     user_content = ""
     multi_modal_data: dict[str, Any] = {}
 
@@ -203,9 +202,7 @@ def _build_multimodal_prompt(
         assistant_prefix += "<think>\n\n</think>\n\n<|tts_bos|>"
 
     prompt["prompt"] = (
-        f"<|im_start|>system\n{AUDIO_OUTPUT_SYSTEM_PROMPT}<|im_end|>\n"
-        f"<|im_start|>user\n{user_content}<|im_end|>\n"
-        f"{assistant_prefix}"
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_content}<|im_end|>\n{assistant_prefix}"
     )
     if multi_modal_data:
         prompt["multi_modal_data"] = multi_modal_data
@@ -216,9 +213,9 @@ def _build_prompt(args: argparse.Namespace, modalities: list[str]) -> dict[str, 
     query_type: QueryType = args.query_type
     prompt_text = args.prompt or DEFAULT_PROMPTS[query_type]
     if query_type == "text" and modalities == ["audio"]:
-        return _build_tts_prompt(args.model_path, prompt_text)
+        return _build_tts_prompt(args.model_path, prompt_text, args.system_prompt)
     if query_type == "text":
-        return _build_text_prompt(prompt_text, modalities)
+        return _build_text_prompt(prompt_text, modalities, args.system_prompt)
     return _build_multimodal_prompt(
         query_type,
         prompt_text,
@@ -227,6 +224,7 @@ def _build_prompt(args: argparse.Namespace, modalities: list[str]) -> dict[str, 
         video_path=args.video_path,
         seed=args.seed,
         num_video_frames=args.num_video_frames,
+        system_prompt=args.system_prompt,
     )
 
 
@@ -283,9 +281,11 @@ def _extract_text_and_audio(outputs: list[Any]) -> tuple[str, np.ndarray | None,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", default=MODEL)
-    parser.add_argument("--stage-configs-path", default=str(DEFAULT_STAGE_CONFIG))
+    parser.add_argument("--deploy-config", default=str(DEFAULT_DEPLOY_CONFIG))
+    parser.add_argument("--stage-configs-path", help="Legacy stage config YAML. Overrides --deploy-config when set.")
     parser.add_argument("--query-type", choices=["text", "use_image", "use_video"], default="text")
     parser.add_argument("--prompt")
+    parser.add_argument("--system-prompt", default=AUDIO_OUTPUT_SYSTEM_PROMPT)
     parser.add_argument("--image-path")
     parser.add_argument("--video-path")
     parser.add_argument("--num-video-frames", type=int, default=30)
@@ -299,6 +299,9 @@ def main() -> None:
     parser.add_argument("--init-timeout", type=int, default=30 * 60)
     args = parser.parse_args()
 
+    if args.stage_configs_path and args.deploy_config:
+        args.deploy_config = None
+
     if args.cuda_visible_devices:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
 
@@ -307,14 +310,19 @@ def main() -> None:
 
     from vllm_omni.entrypoints.omni import Omni
 
-    omni = Omni(
-        model=args.model_path,
-        stage_configs_path=args.stage_configs_path,
-        trust_remote_code=True,
-        log_stats=args.log_stats,
-        stage_init_timeout=args.stage_init_timeout,
-        init_timeout=args.init_timeout,
-    )
+    omni_kwargs = {
+        "model": args.model_path,
+        "trust_remote_code": True,
+        "log_stats": args.log_stats,
+        "stage_init_timeout": args.stage_init_timeout,
+        "init_timeout": args.init_timeout,
+    }
+    if args.stage_configs_path:
+        omni_kwargs["stage_configs_path"] = args.stage_configs_path
+    else:
+        omni_kwargs["deploy_config"] = args.deploy_config
+
+    omni = Omni(**omni_kwargs)
     try:
         start = time.perf_counter()
         outputs = omni.generate(prompt, use_tqdm=False)

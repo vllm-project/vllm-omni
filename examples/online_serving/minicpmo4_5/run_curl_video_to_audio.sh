@@ -36,8 +36,8 @@ payload = {
                 {
                     "type": "text",
                     "text": (
-                        "You are MiniCPM, a helpful multimodal assistant. "
-                        "When audio output is requested, reply with speech only."
+                        "When audio output is requested, reply with speech only "
+                        "and follow any requested length constraints."
                     ),
                 }
             ],

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MODEL="${MODEL:-openbmb/MiniCPM-o-4_5}"
-STAGE_CONFIG="${STAGE_CONFIG:-vllm_omni/model_executor/stage_configs/minicpmo.yaml}"
+DEPLOY_CONFIG="${DEPLOY_CONFIG:-vllm_omni/deploy/minicpmo4_5.yaml}"
 OUTPUT="${OUTPUT:-minicpmo45_image_to_audio.wav}"
 IMAGE_ARGS=()
 
@@ -12,7 +12,7 @@ fi
 
 python examples/offline_inference/minicpmo4_5/end2end.py \
   --model-path "${MODEL}" \
-  --stage-configs-path "${STAGE_CONFIG}" \
+  --deploy-config "${DEPLOY_CONFIG}" \
   --query-type use_image \
   --modalities audio \
   --output-wav "${OUTPUT}" \

@@ -4,17 +4,19 @@ set -euo pipefail
 SERVER="${SERVER:-http://localhost:8091}"
 MODEL="${MODEL:-openbmb/MiniCPM-o-4_5}"
 OUTPUT="${OUTPUT:-minicpmo45_text_to_audio.wav}"
-PROMPT="${1:-Please read this sentence aloud: vLLM Omni is testing MiniCPM online serving.}"
+TEXT_OUTPUT="${TEXT_OUTPUT:-${OUTPUT%.*}.txt}"
+PROMPT="${1:-${PROMPT:-Please read this sentence aloud: vLLM Omni is testing MiniCPM text to audio generation.}}"
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-When audio output is requested, reply with speech only and follow any requested length constraints.}"
 REQUEST_JSON="$(mktemp)"
 RESPONSE_JSON="$(mktemp)"
 AUDIO_B64="$(mktemp)"
 trap 'rm -f "${REQUEST_JSON}" "${RESPONSE_JSON}" "${AUDIO_B64}"' EXIT
 
-python3 - "${MODEL}" "${PROMPT}" "${REQUEST_JSON}" <<'PY'
+python3 - "${MODEL}" "${PROMPT}" "${SYSTEM_PROMPT}" "${REQUEST_JSON}" <<'PY'
 import json
 import sys
 
-model, prompt, output_path = sys.argv[1:]
+model, prompt, system_prompt, output_path = sys.argv[1:]
 payload = {
     "model": model,
     "messages": [
@@ -23,16 +25,13 @@ payload = {
             "content": [
                 {
                     "type": "text",
-                    "text": (
-                        "You are MiniCPM, a helpful multimodal assistant. "
-                        "When audio output is requested, reply with speech only."
-                    ),
+                    "text": system_prompt,
                 }
             ],
         },
         {"role": "user", "content": [{"type": "text", "text": prompt}]},
     ],
-    "modalities": ["audio"],
+    "modalities": ["text", "audio"],
     "chat_template_kwargs": {
         "use_tts_template": True,
         "enable_thinking": False,
@@ -60,5 +59,7 @@ if [[ ! -s "${AUDIO_B64}" ]]; then
 fi
 
 base64 -d "${AUDIO_B64}" > "${OUTPUT}"
+jq -r '[.choices[]?.message.content // empty][0] // empty' "${RESPONSE_JSON}" > "${TEXT_OUTPUT}"
 
 echo "Audio saved to ${OUTPUT}"
+echo "Text saved to ${TEXT_OUTPUT}"

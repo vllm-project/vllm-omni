@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Benchmark MiniCPM-o 4.5 text/image/video → audio generation.
 
-Measures request latency, generated audio duration, and RTF (real-time factor)
-across two modes: non_async and HuggingFace reference.
+Measures request latency, generated audio duration, RTF (real-time factor), and
+GPU memory across two modes: non_async and HuggingFace reference.
 
 No Modal dependency — runs on any GPU machine with vllm-omni installed.
 
@@ -18,8 +18,10 @@ import argparse
 import json
 import os
 import random
+import subprocess
 import sys
 import textwrap
+import threading
 import time
 import traceback
 import uuid
@@ -110,6 +112,7 @@ class BenchmarkResult:
     median_rtf: float
     std_rtf: float
     mean_output_text_tokens: float
+    peak_vram_usage: dict[str, Any] = field(default_factory=dict)
     per_request: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -286,8 +289,6 @@ def _cuda_info() -> dict[str, Any]:
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
     }
     try:
-        import subprocess
-
         proc = subprocess.run(
             [
                 "nvidia-smi",
@@ -321,6 +322,244 @@ def _print_cuda_info() -> None:
         print(f"  gpu:{device['index']}: {device['name']} uuid={device['uuid']}")
     if "error" in info:
         print(f"CUDA diagnostics error: {info['error']}")
+
+
+def _query_gpu_memory() -> list[dict[str, Any]]:
+    visible_devices = _parse_visible_device_filter(os.environ.get("CUDA_VISIBLE_DEVICES", ""))
+    proc = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=index,name,uuid,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    devices = []
+    for line in proc.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",", maxsplit=4)]
+        if len(parts) != 5:
+            continue
+        index, name, uuid_, memory_used_mb, memory_total_mb = parts
+        if visible_devices and not _matches_visible_device_filter(index, uuid_, visible_devices):
+            continue
+        devices.append(
+            {
+                "index": index,
+                "name": name,
+                "uuid": uuid_,
+                "memory_used_mb": int(memory_used_mb),
+                "memory_total_mb": int(memory_total_mb),
+            }
+        )
+    return devices
+
+
+def _parse_visible_device_filter(value: str) -> set[str]:
+    if not value:
+        return set()
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
+def _matches_visible_device_filter(index: str, uuid_: str, visible_devices: set[str]) -> bool:
+    return index in visible_devices or uuid_ in visible_devices
+
+
+class PeakVramMonitor:
+    def __init__(self, interval_s: float, *, enabled: bool = True) -> None:
+        self.interval_s = max(float(interval_s), 0.05)
+        self.enabled = enabled
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self._baseline_by_key: dict[str, dict[str, Any]] = {}
+        self._peak_by_key: dict[str, dict[str, Any]] = {}
+        self._sample_count = 0
+        self._start_time = 0.0
+        self._end_time = 0.0
+        self._error = ""
+
+    def __enter__(self) -> PeakVramMonitor:
+        self._start_time = time.perf_counter()
+        if not self.enabled:
+            self._error = "disabled"
+            return self
+
+        try:
+            self._record_sample(_query_gpu_memory(), is_baseline=True)
+        except Exception as exc:
+            self._error = f"{type(exc).__name__}: {exc!r}"
+            self._end_time = time.perf_counter()
+            return self
+
+        self._thread = threading.Thread(target=self._run, name="peak-vram-monitor", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.enabled and not self._error:
+            try:
+                self._record_sample(_query_gpu_memory(), is_baseline=False)
+            except Exception as sample_exc:
+                self._error = f"{type(sample_exc).__name__}: {sample_exc!r}"
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(self.interval_s * 2, 1.0))
+        self._end_time = time.perf_counter()
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self.interval_s):
+            try:
+                self._record_sample(_query_gpu_memory(), is_baseline=False)
+            except Exception as exc:
+                with self._lock:
+                    if not self._error:
+                        self._error = f"{type(exc).__name__}: {exc!r}"
+                return
+
+    def _record_sample(self, devices: list[dict[str, Any]], *, is_baseline: bool) -> None:
+        with self._lock:
+            self._sample_count += 1
+            for device in devices:
+                key = str(device.get("uuid") or device.get("index"))
+                current = dict(device)
+                if is_baseline or key not in self._baseline_by_key:
+                    self._baseline_by_key[key] = current
+                previous_peak = self._peak_by_key.get(key)
+                if previous_peak is None or current["memory_used_mb"] > previous_peak["memory_used_mb"]:
+                    self._peak_by_key[key] = current
+
+    def result(self) -> dict[str, Any]:
+        with self._lock:
+            baseline_by_key = {key: dict(value) for key, value in self._baseline_by_key.items()}
+            peak_by_key = {key: dict(value) for key, value in self._peak_by_key.items()}
+            sample_count = self._sample_count
+            error = self._error
+
+        devices = []
+        for key, peak in sorted(peak_by_key.items(), key=lambda item: int(item[1].get("index", 0))):
+            baseline = baseline_by_key.get(key, {})
+            baseline_used = int(baseline.get("memory_used_mb", 0))
+            peak_used = int(peak["memory_used_mb"])
+            devices.append(
+                {
+                    "index": peak.get("index", ""),
+                    "name": peak.get("name", ""),
+                    "uuid": peak.get("uuid", ""),
+                    "baseline_memory_used_mb": baseline_used,
+                    "peak_memory_used_mb": peak_used,
+                    "peak_delta_memory_used_mb": peak_used - baseline_used,
+                    "memory_total_mb": peak.get("memory_total_mb", 0),
+                }
+            )
+
+        return {
+            "backend": "nvidia-smi",
+            "scope": "visible_devices",
+            "available": bool(self.enabled and devices and not error),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+            "sample_interval_s": self.interval_s,
+            "sample_count": sample_count,
+            "duration_s": round((self._end_time or time.perf_counter()) - self._start_time, 3),
+            "peak_total_memory_used_mb": sum(int(device["peak_memory_used_mb"]) for device in devices),
+            "peak_total_delta_memory_used_mb": sum(int(device["peak_delta_memory_used_mb"]) for device in devices),
+            "devices": devices,
+            "error": error,
+        }
+
+
+class TorchAllocatedMemoryMonitor:
+    """Track current-process PyTorch peak allocated memory.
+
+    This intentionally mirrors torch.cuda.max_memory_allocated(). For vLLM
+    multi-process stages, it only observes allocations in this benchmark driver
+    process, not child worker processes.
+    """
+
+    def __init__(self, *, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self._start_time = 0.0
+        self._end_time = 0.0
+        self._error = ""
+        self._devices: list[dict[str, Any]] = []
+
+    def __enter__(self) -> TorchAllocatedMemoryMonitor:
+        self._start_time = time.perf_counter()
+        if not self.enabled:
+            self._error = "disabled"
+            return self
+
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                self._error = "torch cuda unavailable"
+                return self
+            for device_index in range(torch.cuda.device_count()):
+                with torch.cuda.device(device_index):
+                    torch.empty(0, device="cuda")
+                    torch.cuda.reset_peak_memory_stats()
+        except Exception as exc:
+            self._error = f"{type(exc).__name__}: {exc!r}"
+            self._end_time = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self.enabled and not self._error:
+            try:
+                import torch
+
+                devices = []
+                for device_index in range(torch.cuda.device_count()):
+                    with torch.cuda.device(device_index):
+                        torch.cuda.synchronize()
+                        props = torch.cuda.get_device_properties(device_index)
+                        peak_mb = int(torch.cuda.max_memory_allocated() / (1024**2))
+                    devices.append(
+                        {
+                            "index": str(device_index),
+                            "name": props.name,
+                            "uuid": "",
+                            "baseline_memory_used_mb": 0,
+                            "peak_memory_used_mb": peak_mb,
+                            "peak_delta_memory_used_mb": peak_mb,
+                            "memory_total_mb": int(props.total_memory / (1024**2)),
+                        }
+                    )
+                self._devices = devices
+            except Exception as sample_exc:
+                self._error = f"{type(sample_exc).__name__}: {sample_exc!r}"
+        self._end_time = time.perf_counter()
+
+    def result(self) -> dict[str, Any]:
+        devices = list(self._devices)
+        return {
+            "backend": "torch.cuda.max_memory_allocated",
+            "scope": "current_process",
+            "available": bool(self.enabled and devices and not self._error),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+            "sample_interval_s": 0.0,
+            "sample_count": 1 if devices else 0,
+            "duration_s": round((self._end_time or time.perf_counter()) - self._start_time, 3),
+            "peak_total_memory_used_mb": sum(int(device["peak_memory_used_mb"]) for device in devices),
+            "peak_total_delta_memory_used_mb": sum(int(device["peak_delta_memory_used_mb"]) for device in devices),
+            "devices": devices,
+            "error": self._error,
+        }
+
+
+def _create_memory_monitor(
+    backend: str,
+    *,
+    interval_s: float,
+    enabled: bool,
+) -> PeakVramMonitor | TorchAllocatedMemoryMonitor:
+    if backend == "none":
+        return PeakVramMonitor(interval_s, enabled=False)
+    if backend == "torch-allocated":
+        return TorchAllocatedMemoryMonitor(enabled=enabled)
+    return PeakVramMonitor(interval_s, enabled=enabled)
 
 
 # ---------------------------------------------------------------------------
@@ -791,10 +1030,16 @@ def _percentile(values: list[float], p: float) -> float:
     return float(np.percentile(values, p))
 
 
-def aggregate(results: list[RequestResult], mode_label: str) -> BenchmarkResult:
+def aggregate(
+    results: list[RequestResult],
+    mode_label: str,
+    *,
+    peak_vram_usage: dict[str, Any] | None = None,
+) -> BenchmarkResult:
     """Aggregate per-request results into summary statistics."""
     succeeded = [r for r in results if r.success]
     failed = [r for r in results if not r.success]
+    peak_vram_usage = peak_vram_usage or {}
 
     if not succeeded:
         return BenchmarkResult(
@@ -813,6 +1058,7 @@ def aggregate(results: list[RequestResult], mode_label: str) -> BenchmarkResult:
             median_rtf=0.0,
             std_rtf=0.0,
             mean_output_text_tokens=0.0,
+            peak_vram_usage=peak_vram_usage,
             per_request=[_result_to_dict(r) for r in results],
         )
 
@@ -836,6 +1082,7 @@ def aggregate(results: list[RequestResult], mode_label: str) -> BenchmarkResult:
         median_rtf=float(np.median(rtfs)),
         std_rtf=float(np.std(rtfs)),
         mean_output_text_tokens=float(np.mean(output_text_tokens)),
+        peak_vram_usage=peak_vram_usage,
         per_request=[_result_to_dict(r) for r in results],
     )
 
@@ -872,15 +1119,32 @@ def _print_separator() -> None:
     print("-" * 78)
 
 
+def _peak_vram_total_mb(peak_vram_usage: dict[str, Any]) -> int:
+    return int(peak_vram_usage.get("peak_total_memory_used_mb") or 0)
+
+
+def _format_peak_vram(peak_vram_usage: dict[str, Any]) -> str:
+    devices = peak_vram_usage.get("devices") or []
+    if not devices:
+        error = peak_vram_usage.get("error")
+        return f"unavailable ({error})" if error else "unavailable"
+    backend = peak_vram_usage.get("backend") or "unknown"
+    scope = peak_vram_usage.get("scope") or "unknown"
+    parts = [f"gpu:{device.get('index')}={int(device.get('peak_memory_used_mb') or 0)}MiB" for device in devices]
+    total = _peak_vram_total_mb(peak_vram_usage)
+    delta = int(peak_vram_usage.get("peak_total_delta_memory_used_mb") or 0)
+    return f"{backend} ({scope}): {', '.join(parts)} total={total}MiB delta={delta}MiB"
+
+
 def print_summary_table(all_results: list[BenchmarkResult]) -> None:
     _print_separator()
-    print(f"{'Mode':<16} {'#OK':>4} {'#FAIL':>5} {'Latency(ms)':>12} {'RTF':>7} {'TxtTok':>8}")
+    print(f"{'Mode':<16} {'#OK':>4} {'#FAIL':>5} {'Latency(ms)':>12} {'RTF':>7} {'TxtTok':>8} {'PeakVRAM':>10}")
     _print_separator()
     for br in all_results:
         print(
             f"{br.mode:<16} {br.completed:>4} {br.failed:>5} "
             f"{br.mean_latency_ms:>12.0f} {br.mean_rtf:>7.2f} "
-            f"{br.mean_output_text_tokens:>8.1f}"
+            f"{br.mean_output_text_tokens:>8.1f} {_peak_vram_total_mb(br.peak_vram_usage):>10}"
         )
     _print_separator()
 
@@ -936,6 +1200,7 @@ def save_json_report(
                 "median_rtf": round(br.median_rtf, 3),
                 "std_rtf": round(br.std_rtf, 3),
                 "mean_output_text_tokens": round(br.mean_output_text_tokens, 1),
+                "peak_vram_usage": br.peak_vram_usage,
                 "per_request": br.per_request,
             }
             for br in all_results
@@ -1051,6 +1316,26 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--vram-sample-interval",
+        type=float,
+        default=0.5,
+        help="Seconds between nvidia-smi peak VRAM samples per benchmark mode (default: 0.5).",
+    )
+    parser.add_argument(
+        "--memory-monitor",
+        choices=("nvidia-smi", "torch-allocated", "none"),
+        default="nvidia-smi",
+        help=(
+            "Memory metric backend. nvidia-smi reports full visible-device memory.used; "
+            "torch-allocated reports current-process torch.cuda.max_memory_allocated()."
+        ),
+    )
+    parser.add_argument(
+        "--disable-vram-monitor",
+        action="store_true",
+        help="Disable peak memory monitoring.",
+    )
+    parser.add_argument(
         "--skip-vllm-omni",
         action="store_true",
         help="Skip vLLM-Omni benchmarks (only run HF).",
@@ -1094,32 +1379,40 @@ def main() -> None:
         print(f"=== Running {mode} benchmark ===")
         t0 = time.perf_counter()
 
-        if mode == "hf":
-            results = run_hf_bench(
-                model_path,
-                modalities=modalities,
-                num_repeats=args.num_repeats,
-                seed=args.seed,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-            )
-        elif mode == "non_async":
-            results = run_vllm_omni_bench(
-                model_path,
-                non_async_config,
-                mode_label="non_async",
-                modalities=modalities,
-                num_repeats=args.num_repeats,
-                seed=args.seed,
-            )
-        else:
-            print(f"Unknown mode: {mode}, skipping.")
-            continue
+        memory_backend = "none" if args.disable_vram_monitor else args.memory_monitor
+        with _create_memory_monitor(
+            memory_backend,
+            interval_s=args.vram_sample_interval,
+            enabled=not args.disable_vram_monitor,
+        ) as vram_monitor:
+            if mode == "hf":
+                results = run_hf_bench(
+                    model_path,
+                    modalities=modalities,
+                    num_repeats=args.num_repeats,
+                    seed=args.seed,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                )
+            elif mode == "non_async":
+                results = run_vllm_omni_bench(
+                    model_path,
+                    non_async_config,
+                    mode_label="non_async",
+                    modalities=modalities,
+                    num_repeats=args.num_repeats,
+                    seed=args.seed,
+                )
+            else:
+                print(f"Unknown mode: {mode}, skipping.")
+                continue
+        peak_vram_usage = vram_monitor.result()
 
         elapsed = time.perf_counter() - t0
         print(f"  Completed in {elapsed:.0f}s\n")
+        print(f"  Peak VRAM: {_format_peak_vram(peak_vram_usage)}\n")
 
-        agg = aggregate(results, mode)
+        agg = aggregate(results, mode, peak_vram_usage=peak_vram_usage)
         all_aggregated.append(agg)
 
     print_summary_table(all_aggregated)
