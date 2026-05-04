@@ -1,0 +1,50 @@
+# Cheers (UMM) deploy: AR (stage 0) + Diffusion (stage 1).
+# Topology declared in vllm_omni/model_executor/models/cheers/pipeline.py.
+#
+# Fields omitted from a stage fall back to StageDeployConfig dataclass
+# defaults (see vllm_omni/config/stage_config.py). Pipeline-wide settings
+# (trust_remote_code, distributed_executor_backend, etc.) use DeployConfig
+# defaults unless overridden here.
+
+trust_remote_code: true
+async_chunk: false
+
+stages:
+  # Stage 0: AR Thinker (CheersForConditionalGeneration)
+  # Multimodal understanding + text generation via Qwen2-based LLM.
+  # KV cache is transferred to stage 1 after prefill.
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.95
+    enforce_eager: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 4096
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      top_k: 1
+      max_tokens: 2048
+      seed: 52
+      detokenize: true
+      repetition_penalty: 1.05
+
+  # Stage 1: Diffusion (SigLIP2 + flow-matching denoiser + VAE)
+  # Receives KV cache from AR, performs iterative denoising + VAE decode.
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.95
+    enforce_eager: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 32768
+    devices: "1"
+    input_connectors:
+      from_stage_0: shared_memory_connector
+    default_sampling_params:
+      seed: 52
+
+connectors:
+  shared_memory_connector:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536

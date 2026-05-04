@@ -101,4 +101,8 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.moss_tts_nano.pipeline",
         "MOSS_TTS_NANO_PIPELINE",
     ),
+    "umm": (
+        "vllm_omni.model_executor.models.cheers.pipeline",
+        "UMM_PIPELINE",
+    ),
 }

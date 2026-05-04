@@ -737,6 +737,10 @@ class OmniDiffusionConfig:
                     self.model_class_name = "BagelPipeline"
                     self.tf_model_config = TransformerConfig()
                     self.update_multimodal_support()
+                elif model_type == "umm" or "CheersForConditionalGeneration" in architectures:
+                    self.model_class_name = "CheersGenerationPipeline"
+                    self.tf_model_config = TransformerConfig()
+                    self.update_multimodal_support()
                 elif model_type == "nextstep":
                     if self.model_class_name is None:
                         self.model_class_name = "NextStep11Pipeline"
