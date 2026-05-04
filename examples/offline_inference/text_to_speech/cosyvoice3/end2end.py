@@ -31,13 +31,13 @@ def run_e2e():
         help="Override the deploy config path. If unset, auto-loads "
         "vllm_omni/deploy/cosyvoice3.yaml based on the HF model_type.",
     )
-    parser.add_argument("--prompt", type=str, default="Hello, this is a test of the CosyVoice system capability.")
+    parser.add_argument("--text", type=str, default="Hello, this is a test of the CosyVoice system capability.")
     parser.add_argument(
         "--prompt-text",
         type=str,
         default="You are a helpful assistant.<|endofprompt|>Testing my voices. Why should I not?",
     )
-    parser.add_argument("--audio-path", type=str, default="prompt.wav")
+    parser.add_argument("--ref-audio", type=str, default="prompt.wav")
     parser.add_argument(
         "--tokenizer",
         type=str,
@@ -64,11 +64,11 @@ def run_e2e():
     sampling_cfg = {"top_p": 0.8, "top_k": 25, "eos_token_id": 6561 + 1}
 
     print("Model initialized. Preparing inputs...")
-    if args.audio_path:
-        if not os.path.exists(args.audio_path):
-            raise FileNotFoundError(f"Audio file not found: {args.audio_path}")
+    if args.ref_audio:
+        if not os.path.exists(args.ref_audio):
+            raise FileNotFoundError(f"Audio file not found: {args.ref_audio}")
         # Load at native sample rate
-        audio_signal, sr = load_audio(args.audio_path, sr=None)
+        audio_signal, sr = load_audio(args.ref_audio, sr=None)
 
         # Validate sample rate before processing (similar to original CosyVoice)
         min_sr = 16000
@@ -84,7 +84,7 @@ def run_e2e():
         audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
 
     prompts = {
-        "prompt": args.prompt,
+        "prompt": args.text,
         "multi_modal_data": {
             "audio": audio_data,
         },
@@ -94,7 +94,7 @@ def run_e2e():
         },
     }
 
-    print(f"Generating for prompt: {args.prompt}")
+    print(f"Generating for prompt: {args.text}")
 
     config = CosyVoice3Config()
     tokenizer = get_qwen_tokenizer(
@@ -102,7 +102,7 @@ def run_e2e():
         skip_special_tokens=config.skip_special_tokens,
         version=config.version,
     )
-    _, text_token_len = extract_text_token(args.prompt, tokenizer, config.allowed_special)
+    _, text_token_len = extract_text_token(args.text, tokenizer, config.allowed_special)
     base_len = int(text_token_len)
     min_len = int(base_len * config.min_token_text_ratio)
     max_len = int(base_len * config.max_token_text_ratio)

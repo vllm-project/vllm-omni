@@ -241,7 +241,7 @@ def parse_args() -> Namespace:
         help="Text to synthesize.",
     )
     parser.add_argument(
-        "--audio-path",
+        "--ref-audio",
         type=str,
         default=None,
         help="Path to reference audio file for voice cloning.",
@@ -344,10 +344,10 @@ def main(args: Any) -> None:
     model_name = args.model
     output_dir = args.output_dir
 
-    if args.voice is None and args.audio_path is None:
-        raise ValueError("Either --voice or --audio-path must be provided.")
+    if args.voice is None and args.ref_audio is None:
+        raise ValueError("Either --voice or --ref-audio must be provided.")
 
-    audio_prompt_file = args.audio_path
+    audio_prompt_file = args.ref_audio
     text_chunk = TextChunk(text=args.text)
 
     if args.write_audio:

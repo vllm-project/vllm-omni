@@ -1240,7 +1240,7 @@ class OmniRunner:
         if isinstance(prompts, str):
             prompts = [prompts]
 
-        # Qwen-TTS: follow examples/offline_inference/qwen3_tts/end2end.py style.
+        # Qwen-TTS: follow examples/offline_inference/text_to_speech/qwen3_tts/end2end.py style.
         # Stage 0 expects token placeholders + additional_information (text/speaker/task_type/...),
         # and Talker replaces embeddings in preprocess based on additional_information only.
         is_tts_model = "Qwen3-TTS" in self.model_name or "qwen3_tts" in self.model_name.lower()

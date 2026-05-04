@@ -122,8 +122,9 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     --no-async-chunk
 ```
 
-For the TTS counterpart (synchronous codec variant), see
-[qwen3_tts README](../qwen3_tts/README.md#sync-vs-async-chunk-mode).
+For the TTS counterpart (synchronous codec variant), see the Qwen3-TTS
+section of the online TTS hub:
+[examples/online_serving/text_to_speech/README.md#qwen3-tts](../text_to_speech/README.md#qwen3-tts).
 
 Explicit CLI flags **override** the deploy YAML (which itself overrides the
 parser defaults). If you don't pass a flag, the YAML value wins.
