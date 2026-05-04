@@ -108,7 +108,8 @@ class OmniVoiceDecoder(nn.Module):
         quantized = self.quantizer.decode(codes)
 
         # Project: [B, 1024, T] → fc2 → [B, 256, T]
-        quantized = self.fc2(quantized.transpose(1, 2)).transpose(1, 2)
+        # Cast to fc2 weight dtype to handle float32 RVQ output under fp16/bf16 engine
+        quantized = self.fc2(quantized.transpose(1, 2).to(self.fc2.weight.dtype)).transpose(1, 2)
 
         # Acoustic decoder: [B, 256, T] → [B, 1, T*960]
         audio = self.acoustic_decoder(quantized)
