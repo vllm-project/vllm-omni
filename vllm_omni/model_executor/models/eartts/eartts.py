@@ -43,6 +43,7 @@ Per-step flow:
      consume as the decode input.
 """
 
+import bisect
 from collections.abc import Callable, Iterable
 from typing import Any, Optional, Union
 
@@ -54,10 +55,15 @@ from transformers.generation.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
 )
-from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.compilation.backends import set_model_tag
+from vllm.compilation.decorators import (
+    ignore_torch_compile,
+    support_torch_compile,
+)
+from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.model_executor.models.gemma3 import Gemma3Model
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -766,8 +772,13 @@ class MaskGITSampler(nn.Module):
 
 @support_torch_compile
 class EarTTSModel(nn.Module):
-    """Wrapper module that combines the embedding preparation, backbone
-    transformer and sampler. All components support torch compile.
+    """Embedding preparation + Gemma3 backbone (compiled together).
+
+    The MaskGIT sampler used to live inside this module's compiled
+    forward, but it is now hosted in :class:`EarTTSSamplerModel` so that
+    the (expensive) iterative MaskGIT sampling can be skipped on prefill
+    positions while still being CUDA-graph captured for decode-only
+    batches. See :meth:`EarTTSForCausalLM.forward` for the orchestration.
     """
 
     def __init__(
@@ -779,7 +790,6 @@ class EarTTSModel(nn.Module):
         super().__init__()
         self.total_emb = EarTTSInputEmbedding(vllm_config.model_config.hf_config)
         self.backbone = Gemma3Model(vllm_config=vllm_config, prefix=prefix)
-        self.sampler = MaskGITSampler(vllm_config.model_config.hf_config)
 
     def forward(
         self,
@@ -790,9 +800,9 @@ class EarTTSModel(nn.Module):
         text_tokens: torch.Tensor,
         text_mask: torch.Tensor,
         bos_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Forward pass through embeddings and backbone transformer.
-        Returns ``(hidden_states, codes)``.
+        Returns the backbone's ``hidden_states``.
         """
         total_emb = self.total_emb(
             acoustic_tokens=acoustic_tokens,
@@ -803,8 +813,69 @@ class EarTTSModel(nn.Module):
         hidden_states = self.backbone(
             input_ids, positions, intermediate_tensors, inputs_embeds=total_emb
         )
-        codes = self.sampler(hidden_states)
-        return hidden_states, codes
+        return hidden_states
+
+
+@support_torch_compile
+class EarTTSSamplerModel(nn.Module):
+    """MaskGIT sampler in its own compile group.
+
+    Hosting the sampler in a separate ``@support_torch_compile`` module
+    is what makes it possible for :meth:`EarTTSForCausalLM.forward` to:
+
+    * Capture and replay a CUDA-graph for decode-only batches (where
+      every position needs sampling).
+    * Skip the sampler entirely on prefill positions, where the audio
+      output isn't actually needed.
+    * Run the sampler on a sliced subset of positions in mixed
+      prefill+decode batches, with a ``BatchDescriptor`` override so the
+      sampler's CUDA-graph cache is hit at the padded decode-batch size.
+
+    The :meth:`forward` operates on a stable-address scratch buffer
+    (:attr:`_sampler_input`) so callers can pass a transient slice
+    (e.g. ``hidden_states[decode_idx]``) without breaking CUDA-graph
+    replay. The non-compiled :meth:`sample` wrapper does that copy and
+    then invokes the compiled :meth:`forward`.
+    """
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+    ):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        self.sampler = MaskGITSampler(config)
+
+        # Stable-address scratch buffer for the sampler's input. Every
+        # CUDA-graph replay must read from the same ``data_ptr()``; the
+        # caller may pass either the full backbone output or a fresh
+        # ``hidden_states[decode_idx]`` slice, so we copy into this
+        # buffer (in :meth:`sample`) before invoking :meth:`forward`.
+        max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        hidden_size = config.hidden_size
+        dtype = vllm_config.model_config.dtype
+        self._sampler_input = torch.zeros(
+            max_num_tokens, hidden_size, dtype=dtype
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Compiled — runs MaskGIT on a (stable-address) hidden buffer."""
+        return self.sampler(hidden_states)
+
+    def sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Non-compiled wrapper — copies into the stable buffer first.
+
+        Mirrors the qwen3-tts code-predictor pattern: transient inputs
+        are first written into a model-owned static-address buffer so
+        the captured CUDA-graph for the compiled :meth:`forward` always
+        reads from the recorded ``data_ptr()``.
+        """
+        seq_len = int(hidden_states.shape[0])
+        buf = self._sampler_input[:seq_len]
+        buf.copy_(hidden_states)
+        return self(buf)
 
 
 # ---------------------------------------------------------------------------
@@ -827,6 +898,8 @@ class EarTTSModel(nn.Module):
 _DUMMY_TOKEN_ID = 0
 
 
+@ignore_torch_compile
+@support_torch_compile
 class EarTTSForCausalLM(nn.Module):
     """EarTTS for vLLM-Omni.
 
@@ -846,14 +919,45 @@ class EarTTSForCausalLM(nn.Module):
     (:attr:`_acoustic_tokens`, :attr:`_text_tokens`, :attr:`_text_mask`,
     :attr:`_bos_mask`) at each request's flat-batch offset. ``forward``
     slices them up to ``num_tokens`` and runs the compiled
-    :class:`EarTTSModel` (text transformer + Gemma3 backbone + MaskGIT
-    sampler) inside a CUDA graph. The generated codes (BTx31) are
-    copied into :attr:`_out_codes` and exposed under the conventional
-    ``"audio_codes"`` multimodal key by :meth:`make_omni_output`.
-    ``postprocess`` stashes the final-frame codes under
-    ``last_acoustic_codes`` for the next decode step's
+    :class:`EarTTSModel` (text transformer + Gemma3 backbone) for
+    every position, then conditionally invokes the compiled
+    :class:`EarTTSSamplerModel` (MaskGIT) to produce codes. The sampler
+    is skipped on prefill positions — see :meth:`forward` for details.
+    The generated codes (BTx31) are written to :attr:`_out_codes` and
+    exposed under the conventional ``"audio_codes"`` multimodal key by
+    :meth:`make_omni_output`. ``postprocess`` stashes the final-frame
+    codes under ``last_acoustic_codes`` for the next decode step's
     :meth:`preprocess`.
+
+    Sampler skipping mirrors the qwen3-tts code-predictor pattern:
+
+    * **Profile / dummy run** (``attn_metadata is None``) and
+      **decode-only batches** (``max_query_len == 1``) run the sampler
+      on every token so the captured CUDA graph covers all of
+      ``cudagraph_capture_sizes``.
+    * **Mixed prefill+decode batches**: only decode-token positions go
+      through the sampler. The sampler's ``BatchDescriptor`` is
+      overridden to the padded decode-batch size so the right captured
+      graph is replayed.
+    * **Prefill-only batches**: the sampler is skipped entirely.
+    * For prefill positions, :attr:`_out_codes` is initialized from
+      :attr:`_acoustic_tokens` (i.e. the input reference audio frames),
+      so :meth:`postprocess` on a request whose last position falls in
+      prefill returns the last reference audio frame as
+      ``last_acoustic_codes`` — the natural acoustic input for the
+      first decode step that follows.
     """
+
+    # Map raw HuggingFace checkpoint names to the vLLM module layout.
+    # Only ``model.sampler.*`` needed remapping when the MaskGIT sampler
+    # was lifted out of :class:`EarTTSModel` into its own compile group
+    # (:attr:`sampler_module`). All other prefixes (``model.total_emb.``,
+    # ``model.backbone.``) match the new layout 1:1.
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.sampler.": "sampler_module.sampler.",
+        }
+    )
 
     # Omni preprocess/postprocess hooks (consumed by the gpu model runner).
     has_preprocess = True
@@ -890,10 +994,28 @@ class EarTTSForCausalLM(nn.Module):
         self.vllm_config = vllm_config
         self.model_path = vllm_config.model_config.model
 
+        # Embedding + Gemma3 backbone — runs on every position. Built
+        # under the default ``"backbone"`` model tag (vLLM's compile
+        # cache key for the main model). We don't wrap this in a
+        # ``set_model_tag`` block because :func:`set_model_tag` asserts
+        # the new tag differs from the current one and the default is
+        # already ``"backbone"``.
         self.model = EarTTSModel(
             vllm_config=vllm_config,
             prefix=prefix,
         )
+
+        # MaskGIT sampler in its own compile group, so it can be invoked
+        # conditionally (decode positions only, or skipped entirely on
+        # prefill-only batches) while still being CUDA-graph captured
+        # for decode-only batches over ``cudagraph_capture_sizes``. The
+        # ``"sampler"`` tag keys the sampler's compile cache separately
+        # from the backbone's.
+        with set_model_tag("sampler"):
+            self.sampler_module = EarTTSSamplerModel(
+                vllm_config=vllm_config,
+                prefix=prefix,
+            )
 
         # Pad ids used by buffers / preprocess. Match the conventions of
         # the original EarTTSInputEmbedding: an acoustic token id of
@@ -1304,8 +1426,65 @@ class EarTTSForCausalLM(nn.Module):
         return input_ids, inputs_embeds_out, info_update
 
     # ------------------------------------------------------------------
-    # forward — runs the compiled embedding + backbone + sampler
+    # forward — runs the compiled embedding + backbone, then the sampler
+    # only on decode positions (skipping the expensive MaskGIT loop on
+    # prefill positions).
     # ------------------------------------------------------------------
+
+    def _get_decode_idxs(self):
+        """Return ``(decode_token_indices, num_requests)`` for sampler dispatch.
+
+        Mirrors the qwen3-tts code-predictor pattern:
+
+        * ``(None, 0)`` → run sampler on every token. Used during
+          profile / dummy runs (no ``attn_metadata``) and decode-only
+          batches (``max_query_len == 1``), so the captured CUDA graph
+          covers all of ``cudagraph_capture_sizes``.
+        * ``(decode_token_indices, num_requests)`` → run sampler only on
+          the listed positions. ``decode_token_indices`` is padded up to
+          the next captured CUDA-graph size (so the sampler's graph
+          cache is hit) and ``num_requests`` is the unpadded count of
+          real decode tokens (used to scatter codes back into the right
+          rows of :attr:`_out_codes`).
+        """
+        ctx = get_forward_context()
+        attn_metadata = ctx.attn_metadata
+        if attn_metadata is None:
+            # Profile / dummy run. Apply sampler everywhere so capture
+            # covers every cudagraph_capture_sizes value.
+            return None, 0
+
+        if isinstance(attn_metadata, dict):
+            any_layer_meta = next(iter(attn_metadata.values()))
+        else:
+            any_layer_meta = attn_metadata
+
+        if any_layer_meta.max_query_len == 1:
+            # Decode-only batch: every position is a decode position,
+            # so just run the sampler over the whole flat batch.
+            return None, 0
+
+        start_loc = any_layer_meta.query_start_loc
+        tokens_per_req = start_loc[1:] - start_loc[:-1]
+        is_decode = (tokens_per_req == 1)
+        decode_token_indices = start_loc[:-1][is_decode]
+
+        num_requests = decode_token_indices.shape[0]
+        padded_num_requests = num_requests
+        if (
+            self.vllm_config.compilation_config.cudagraph_mode
+            != CUDAGraphMode.NONE
+        ):
+            sizes = self.vllm_config.compilation_config.cudagraph_capture_sizes
+            idx = bisect.bisect_left(sizes, num_requests)
+            if idx < len(sizes):
+                padded_num_requests = sizes[idx]
+        if padded_num_requests != num_requests:
+            decode_token_indices = torch.nn.functional.pad(
+                decode_token_indices,
+                (0, padded_num_requests - num_requests),
+            )
+        return decode_token_indices, num_requests
 
     def forward(
         self,
@@ -1317,16 +1496,34 @@ class EarTTSForCausalLM(nn.Module):
     ) -> torch.Tensor:
         """Forward pass.
 
-        Slices the per-token input buffers populated by
-        :meth:`preprocess` up to ``num_tokens`` and calls the compiled
-        :class:`EarTTSModel`. The resulting ``codes`` tensor is copied
-        into the stable :attr:`_out_codes` buffer so it can be consumed
-        by :meth:`make_omni_output` after the forward returns.
+        1. Slice the per-token input buffers populated by
+           :meth:`preprocess` up to ``num_tokens`` and call the compiled
+           :class:`EarTTSModel` (embedding + backbone) on every position.
+        2. Initialize :attr:`_out_codes` from :attr:`_acoustic_tokens`
+           so prefill positions carry the input reference-audio frames
+           (decode positions are overwritten in step 3 below). This way
+           :meth:`postprocess` on a request whose last position falls in
+           prefill returns the last reference audio frame as
+           ``last_acoustic_codes`` — the natural acoustic input for the
+           first decode step that follows.
+        3. Conditionally invoke the compiled :class:`EarTTSSamplerModel`:
+
+           * **No ``attn_metadata`` (dummy / profile run)** or
+             **decode-only batch**: run sampler on every position; the
+             compiled forward replays the captured CUDA graph for the
+             matching ``cudagraph_capture_sizes`` entry.
+           * **Mixed prefill+decode batch**: gather decode positions
+             into a contiguous tensor, override the sampler's
+             ``BatchDescriptor`` to the padded decode-batch size so the
+             right captured graph is replayed, and scatter the produced
+             codes back into the corresponding rows of
+             :attr:`_out_codes`.
+           * **Prefill-only batch**: skip the sampler entirely.
 
         ``inputs_embeds`` is ignored: ``preprocess`` returns zeros for
         it and the actual embedding is built inside the compiled
-        EarTTSInputEmbedding (this keeps the text transformer encoder
-        inside the CUDA graph).
+        :class:`EarTTSInputEmbedding` (this keeps the text transformer
+        encoder inside the CUDA graph).
         """
         num_tokens = int(input_ids.shape[0])
 
@@ -1335,7 +1532,8 @@ class EarTTSForCausalLM(nn.Module):
         text_mask = self._text_mask[:num_tokens]
         bos_mask = self._bos_mask[:num_tokens]
 
-        hidden_states, codes = self.model(
+        # Step 1: embedding + backbone on every position (compiled).
+        hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
             intermediate_tensors=intermediate_tensors,
@@ -1345,10 +1543,41 @@ class EarTTSForCausalLM(nn.Module):
             bos_mask=bos_mask,
         )
 
-        # Copy codes into the stable-address output buffer so
-        # make_omni_output / postprocess can read them after the
-        # compiled graph returns.
-        self._out_codes[:num_tokens].copy_(codes.to(dtype=torch.long))
+        # Step 2: prefill fallback. Initialize _out_codes from the input
+        # acoustic tokens so prefill rows always contain something
+        # sensible (the reference-audio frame at that position). Decode
+        # rows are overwritten by the sampler in step 3 below.
+        self._out_codes[:num_tokens].copy_(acoustic_tokens)
+
+        # Step 3: conditionally run the (separately compiled) sampler.
+        decode_idx, num_req = self._get_decode_idxs()
+        if decode_idx is None:
+            # Dummy / profile run, or decode-only batch: sample every
+            # position. The captured CUDA-graph for the sampler is
+            # selected by num_tokens, which is in cudagraph_capture_sizes.
+            codes = self.sampler_module.sample(hidden_states)
+            self._out_codes[:num_tokens].copy_(codes.to(dtype=torch.long))
+        elif num_req > 0:
+            # Mixed batch: gather decode positions and run sampler only
+            # on those. Override the BatchDescriptor so the sampler's
+            # CUDA-graph cache is hit at the padded decode-batch size
+            # (set by _get_decode_idxs to the next cudagraph_capture
+            # bucket above num_req).
+            ctx = get_forward_context()
+            orig_batch_descriptor = ctx.batch_descriptor
+            ctx.batch_descriptor = BatchDescriptor(
+                num_tokens=decode_idx.shape[0],
+            )
+            decode_hidden = hidden_states[decode_idx]
+            codes = self.sampler_module.sample(decode_hidden)
+            ctx.batch_descriptor = orig_batch_descriptor
+
+            valid_dec_idx = decode_idx[:num_req]
+            self._out_codes[valid_dec_idx] = codes[:num_req].to(
+                dtype=torch.long
+            )
+        # else: prefill-only batch — sampler is skipped entirely.
+
         return hidden_states
 
     # ------------------------------------------------------------------
@@ -1479,8 +1708,14 @@ class EarTTSForCausalLM(nn.Module):
                 else:
                     yield name, w
 
+        # ``hf_to_vllm_mapper`` rewrites ``model.sampler.*`` to
+        # ``sampler_module.sampler.*`` so the upstream EarTTS checkpoint
+        # (which still places the MaskGIT sampler under ``model.``) lands
+        # on the dedicated :attr:`sampler_module` compile group.
         loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
-        return loader.load_weights(_adjusted_weights())
+        return loader.load_weights(
+            _adjusted_weights(), mapper=self.hf_to_vllm_mapper
+        )
 
     # ------------------------------------------------------------------
     # Generation length estimation
