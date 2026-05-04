@@ -106,13 +106,25 @@ class OmniVoiceDecoder(nn.Module):
 
         # RVQ decode: sum codebook embeddings → [B, 1024, T]
         quantized = self.quantizer.decode(codes)
+        logger.info("[DEBUG-DEC] after RVQ: shape=%s dtype=%s std=%.4f max_abs=%.4f nan=%s",
+                    tuple(quantized.shape), quantized.dtype,
+                    quantized.std().item(), quantized.abs().max().item(),
+                    quantized.isnan().any().item())
 
         # Project: [B, 1024, T] → fc2 → [B, 256, T]
         # Cast to fc2 weight dtype to handle float32 RVQ output under fp16/bf16 engine
         quantized = self.fc2(quantized.transpose(1, 2).to(self.fc2.weight.dtype)).transpose(1, 2)
+        logger.info("[DEBUG-DEC] after fc2: shape=%s dtype=%s std=%.4f max_abs=%.4f nan=%s",
+                    tuple(quantized.shape), quantized.dtype,
+                    quantized.std().item(), quantized.abs().max().item(),
+                    quantized.isnan().any().item())
 
         # Acoustic decoder: [B, 256, T] → [B, 1, T*960]
         audio = self.acoustic_decoder(quantized)
+        logger.info("[DEBUG-DEC] after acoustic: shape=%s dtype=%s std=%s max_abs=%s nan=%s",
+                    tuple(audio.shape), audio.dtype,
+                    audio.std().item(), audio.abs().max().item(),
+                    audio.isnan().any().item())
 
         # Ensure [B, 1, samples]
         if audio.dim() == 2:
