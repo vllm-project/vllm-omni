@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-import dataclasses
+import copy
 import io
 import os
 from collections.abc import Callable, Iterable, Mapping
@@ -384,9 +384,17 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Code predictor uses an isolated vLLM config so its KV cache doesn't
         # pollute the main engine's static_forward_context (shallow-copy shares
         # the dict by reference — must assign a fresh one).
-        predictor_compilation = dataclasses.replace(vllm_config.compilation_config)
+        # Use copy.copy rather than dataclasses.replace: CompilationConfig /
+        # VllmConfig are pydantic dataclasses, so `replace` re-runs
+        # __init__→pydantic validators + __post_init__. If a backend has
+        # already rebound compilation_config.backend to a non-stock value, the
+        # piecewise-backend validator in vllm/config/compilation.py rejects it
+        # and the clone raises. copy.copy goes through __reduce_ex__, skips
+        # validation, and leaves the parent's already-initialized state intact.
+        predictor_compilation = copy.copy(vllm_config.compilation_config)
         predictor_compilation.static_forward_context = {}
-        self._code_predictor_vllm_config = dataclasses.replace(vllm_config, compilation_config=predictor_compilation)
+        self._code_predictor_vllm_config = copy.copy(vllm_config)
+        self._code_predictor_vllm_config.compilation_config = predictor_compilation
         from vllm.config.vllm import set_current_vllm_config as _set_cfg
 
         with _set_cfg(self._code_predictor_vllm_config):
