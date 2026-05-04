@@ -299,8 +299,23 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
             class_temperature=self.class_temperature,
         )
 
+        # Debug: token distribution
+        mask_ratio = (tokens == mask_id).float().mean().item()
+        unique_tokens = tokens.unique().numel()
+        logger.info(
+            "[DEBUG] tokens shape=%s  mask_ratio=%.3f  unique=%d  min=%d  max=%d",
+            tuple(tokens.shape), mask_ratio, unique_tokens,
+            tokens.min().item(), tokens.max().item(),
+        )
+
         # Decode tokens to audio
         audio = self.decoder(tokens)  # [1, 1, samples]
+
+        # Debug: audio amplitude
+        logger.info(
+            "[DEBUG] audio shape=%s  std=%.6f  max_abs=%.6f",
+            tuple(audio.shape), audio.std().item(), audio.abs().max().item(),
+        )
 
         return DiffusionOutput(output=audio)
 
