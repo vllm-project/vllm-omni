@@ -27,7 +27,7 @@ decoupled gRPC stream.
 
 ```bash
 cd examples/online_serving/qwen3_tts_nv_triton
-docker build -t qwen3tts_triton .
+docker build --network=host -t qwen3tts_triton .
 docker run --rm -it --gpus all \
     --shm-size=8g \
     --network=host \
@@ -45,7 +45,7 @@ All subsequent commands are run inside the container, from
 
 ```bash
 python3 export_codec.py \
-    --tokenizer-path /workspace/server/examples/online_serving/qwen3_tts_nv_triton/models--Qwen--Qwen3-TTS-Tokenizer-12Hz/snapshots/2069d3478828c9135fff015cd13613975dfa4ba8 \
+    --tokenizer-path Qwen/Qwen3-TTS-Tokenizer-12Hz \
     --trt-path model_repository/codec_decoder/1/model.plan \
     --trt-batch-profile 1 8 32
 ```
