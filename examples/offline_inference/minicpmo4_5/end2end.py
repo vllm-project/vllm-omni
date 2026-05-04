@@ -29,9 +29,25 @@ AUDIO_OUTPUT_SYSTEM_PROMPT = (
 )
 
 DEFAULT_PROMPTS: dict[QueryType, str] = {
-    "text": "Please read this sentence aloud: vLLM Omni is testing MiniCPM text to audio generation.",
-    "use_image": "Describe the image in one concise spoken sentence.",
-    "use_video": "Describe the video in one concise spoken sentence.",
+    "text": (
+        "Please read this single long sentence aloud exactly once without shortening it: "
+        "vLLM Omni is running a benchmark for MiniCPM speech generation, and this sentence intentionally "
+        "includes enough detail about streaming text to audio generation, multimodal reasoning, "
+        "stage connectors, careful benchmarking, and stable speech synthesis behavior to last well "
+        "over ten seconds when spoken at a natural pace."
+    ),
+    "use_image": (
+        "Describe the image in one single detailed spoken sentence of at least sixty words, "
+        "mentioning every visible shape, its color, its approximate size, its position "
+        "relative to the other shapes, the plain background, and the overall layout, and keep "
+        "the answer natural but long enough to last more than ten seconds."
+    ),
+    "use_video": (
+        "Describe the video in one single detailed spoken sentence of at least sixty words, "
+        "covering the moving objects, their colors, their approximate sizes, the direction and "
+        "pattern of their motion over time, the dark background, and the overall scene, and "
+        "keep the answer natural but long enough to last more than ten seconds."
+    ),
 }
 
 
@@ -52,6 +68,26 @@ def _parse_modalities(value: str) -> list[str]:
     if invalid:
         raise ValueError(f"Unsupported modalities: {invalid}. Valid: {sorted(valid)}")
     return modalities
+
+
+def _load_ref_audio(path: str | None) -> dict[str, Any] | None:
+    if not path:
+        return None
+
+    audio_path = Path(path).expanduser()
+    if not audio_path.is_file():
+        raise FileNotFoundError(f"Reference audio file not found: {audio_path}")
+
+    wav, sr = sf.read(audio_path, dtype="float32", always_2d=False)
+    wav_np = np.asarray(wav, dtype=np.float32)
+    if wav_np.ndim == 0 or wav_np.size == 0:
+        raise ValueError(f"Reference audio is empty: {audio_path}")
+    if wav_np.ndim > 1:
+        wav_np = wav_np.mean(axis=-1)
+    return {
+        "wav": wav_np.reshape(-1).tolist(),
+        "sr": int(sr),
+    }
 
 
 def _build_tts_prompt(model_path: str, text: str, system_prompt: str) -> dict[str, Any]:
@@ -184,6 +220,7 @@ def _build_multimodal_prompt(
     seed: int,
     num_video_frames: int,
     system_prompt: str,
+    ref_audio: dict[str, Any] | None,
 ) -> dict[str, Any]:
     prompt = _build_text_prompt(text, modalities, system_prompt)
     user_content = ""
@@ -206,16 +243,25 @@ def _build_multimodal_prompt(
     )
     if multi_modal_data:
         prompt["multi_modal_data"] = multi_modal_data
+    if ref_audio is not None:
+        prompt["additional_information"] = {"ref_audio": ref_audio}
     return prompt
 
 
 def _build_prompt(args: argparse.Namespace, modalities: list[str]) -> dict[str, Any]:
     query_type: QueryType = args.query_type
     prompt_text = args.prompt or DEFAULT_PROMPTS[query_type]
+    ref_audio = _load_ref_audio(args.ref_audio_path)
     if query_type == "text" and modalities == ["audio"]:
-        return _build_tts_prompt(args.model_path, prompt_text, args.system_prompt)
+        prompt = _build_tts_prompt(args.model_path, prompt_text, args.system_prompt)
+        if ref_audio is not None:
+            prompt["additional_information"] = {"ref_audio": ref_audio}
+        return prompt
     if query_type == "text":
-        return _build_text_prompt(prompt_text, modalities, args.system_prompt)
+        prompt = _build_text_prompt(prompt_text, modalities, args.system_prompt)
+        if ref_audio is not None:
+            prompt["additional_information"] = {"ref_audio": ref_audio}
+        return prompt
     return _build_multimodal_prompt(
         query_type,
         prompt_text,
@@ -225,6 +271,7 @@ def _build_prompt(args: argparse.Namespace, modalities: list[str]) -> dict[str, 
         seed=args.seed,
         num_video_frames=args.num_video_frames,
         system_prompt=args.system_prompt,
+        ref_audio=ref_audio,
     )
 
 
@@ -288,6 +335,7 @@ def main() -> None:
     parser.add_argument("--system-prompt", default=AUDIO_OUTPUT_SYSTEM_PROMPT)
     parser.add_argument("--image-path")
     parser.add_argument("--video-path")
+    parser.add_argument("--ref-audio-path", help="Optional reference audio for MiniCPM voice conditioning.")
     parser.add_argument("--num-video-frames", type=int, default=30)
     parser.add_argument("--modalities", default="audio", help="Comma-separated output modalities: text,audio")
     parser.add_argument("--output-wav", default="minicpmo45_output.wav")

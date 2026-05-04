@@ -129,6 +129,9 @@ def thinker2talker(
             "llm_tokens": llm_tokens,
             "tts_hidden_states": tts_hidden_states,
         }
+        ref_audio = _extract_ref_audio_from_prompt(prompt, index=len(talker_inputs))
+        if ref_audio is not None:
+            info["ref_audio"] = ref_audio
         prompt_len = MiniCPMO4_5TalkerForConditionalGeneration.estimate_prompt_len_from_additional_information(info)
 
         talker_inputs.append(

@@ -556,6 +556,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if hasattr(request, "cache_salt") and request.cache_salt is not None:
             engine_prompt["cache_salt"] = request.cache_salt
 
+        # MiniCPM-o 4.5 uses chat completions for text/image/video -> audio
+        # and carries ref_audio through additional_information to the talker.
+        additional_information = getattr(request, "additional_information", None)
+        if additional_information is None:
+            extra_body = getattr(request, "extra_body", None) or getattr(request, "model_extra", {}) or {}
+            additional_information = extra_body.get("additional_information")
+        if isinstance(additional_information, dict) and additional_information:
+            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
+                engine_prompt["additional_information"] = {}
+            engine_prompt["additional_information"].update(additional_information)
+
         speaker = getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())
         if normalized is not None:

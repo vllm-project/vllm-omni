@@ -25,13 +25,13 @@ stage_args:
     final_output: true
     final_output_type: text
     default_sampling_params:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: -1
+      temperature: 0.7
+      top_p: 0.8
+      top_k: 100
       max_tokens: 2048
       seed: 42
       detokenize: True
-      repetition_penalty: 1.1
+      repetition_penalty: 1.02
 
   - stage_id: 1
     stage_type: llm  # Use llm stage type for AR stages

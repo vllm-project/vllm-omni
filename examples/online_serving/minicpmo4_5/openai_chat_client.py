@@ -17,9 +17,25 @@ MODEL = "openbmb/MiniCPM-o-4_5"
 QueryType = Literal["text", "use_image", "use_video"]
 
 DEFAULT_PROMPTS: dict[QueryType, str] = {
-    "text": "Please read this sentence aloud: vLLM Omni is testing MiniCPM text to audio generation.",
-    "use_image": "Describe the image in one short spoken sentence.",
-    "use_video": "Describe the video in one short spoken sentence.",
+    "text": (
+        "Please read this single long sentence aloud exactly once without shortening it: "
+        "vLLM Omni is running a benchmark for MiniCPM speech generation, and this sentence intentionally "
+        "includes enough detail about streaming text to audio generation, multimodal reasoning, "
+        "stage connectors, careful benchmarking, and stable speech synthesis behavior to last well "
+        "over ten seconds when spoken at a natural pace."
+    ),
+    "use_image": (
+        "Describe the image in one single detailed spoken sentence of at least sixty words, "
+        "mentioning every visible shape, its color, its approximate size, its position "
+        "relative to the other shapes, the plain background, and the overall layout, and keep "
+        "the answer natural but long enough to last more than ten seconds."
+    ),
+    "use_video": (
+        "Describe the video in one single detailed spoken sentence of at least sixty words, "
+        "covering the moving objects, their colors, their approximate sizes, the direction and "
+        "pattern of their motion over time, the dark background, and the overall scene, and "
+        "keep the answer natural but long enough to last more than ten seconds."
+    ),
 }
 
 
@@ -100,6 +116,29 @@ def _parse_modalities(value: str) -> list[str]:
     return modalities
 
 
+def _load_ref_audio(path: str | None) -> dict[str, Any] | None:
+    if not path:
+        return None
+
+    import numpy as np
+    import soundfile as sf
+
+    audio_path = Path(path).expanduser()
+    if not audio_path.is_file():
+        raise FileNotFoundError(f"Reference audio file not found: {audio_path}")
+
+    wav, sr = sf.read(audio_path, dtype="float32", always_2d=False)
+    wav_np = np.asarray(wav, dtype=np.float32)
+    if wav_np.ndim == 0 or wav_np.size == 0:
+        raise ValueError(f"Reference audio is empty: {audio_path}")
+    if wav_np.ndim > 1:
+        wav_np = wav_np.mean(axis=-1)
+    return {
+        "wav": wav_np.reshape(-1).tolist(),
+        "sr": int(sr),
+    }
+
+
 def _output_path_for_index(path: str, index: int) -> Path:
     output = Path(path)
     if index == 0:
@@ -172,6 +211,7 @@ def main() -> None:
     parser.add_argument("--prompt")
     parser.add_argument("--image-path")
     parser.add_argument("--video-path")
+    parser.add_argument("--ref-audio-path", help="Optional reference audio for MiniCPM voice conditioning.")
     parser.add_argument("--modalities", default="audio")
     parser.add_argument("--output-wav", default="minicpmo45_online_output.wav")
     parser.add_argument("--output-text", default="minicpmo45_online_output.txt")
@@ -179,17 +219,22 @@ def main() -> None:
     args = parser.parse_args()
 
     client = OpenAI(base_url=f"{args.server.rstrip('/')}/v1", api_key="EMPTY")
+    extra_body = {
+        "chat_template_kwargs": {
+            "use_tts_template": True,
+            "enable_thinking": False,
+        }
+    }
+    ref_audio = _load_ref_audio(args.ref_audio_path)
+    if ref_audio is not None:
+        extra_body["additional_information"] = {"ref_audio": ref_audio}
+
     response = client.chat.completions.create(
         model=args.model,
         messages=[_system_message(), _user_message(args)],
         modalities=_parse_modalities(args.modalities),
         stream=args.stream,
-        extra_body={
-            "chat_template_kwargs": {
-                "use_tts_template": True,
-                "enable_thinking": False,
-            }
-        },
+        extra_body=extra_body,
     )
 
     if args.stream:

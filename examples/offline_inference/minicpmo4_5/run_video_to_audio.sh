@@ -6,9 +6,13 @@ DEPLOY_CONFIG="${DEPLOY_CONFIG:-vllm_omni/deploy/minicpmo4_5.yaml}"
 OUTPUT="${OUTPUT:-minicpmo45_video_to_audio.wav}"
 NUM_FRAMES="${NUM_FRAMES:-30}"
 VIDEO_ARGS=()
+REF_AUDIO_ARGS=()
 
 if [[ -n "${VIDEO_PATH:-}" ]]; then
   VIDEO_ARGS=(--video-path "${VIDEO_PATH}")
+fi
+if [[ -n "${REF_AUDIO_PATH:-}" ]]; then
+  REF_AUDIO_ARGS=(--ref-audio-path "${REF_AUDIO_PATH}")
 fi
 
 python examples/offline_inference/minicpmo4_5/end2end.py \
@@ -18,4 +22,5 @@ python examples/offline_inference/minicpmo4_5/end2end.py \
   --modalities audio \
   --num-video-frames "${NUM_FRAMES}" \
   --output-wav "${OUTPUT}" \
-  "${VIDEO_ARGS[@]}"
+  "${VIDEO_ARGS[@]}" \
+  "${REF_AUDIO_ARGS[@]}"

@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import random
@@ -200,21 +201,32 @@ def _normalize_token_ids(tokenized: Any) -> list[int]:
     return [int(t) for t in tokenized]
 
 
-def _build_tts_prompt(model_path: str, text: str) -> dict[str, Any]:
-    from transformers import AutoTokenizer
+def _chat_system_message() -> dict[str, Any]:
+    return {"role": "system", "content": [AUDIO_OUTPUT_SYSTEM_PROMPT]}
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    messages = [
-        {"role": "system", "content": AUDIO_OUTPUT_SYSTEM_PROMPT},
-        {"role": "user", "content": text},
-    ]
+
+def _render_chat_template(
+    tokenizer: Any,
+    messages: list[dict[str, Any]],
+    *,
+    tokenize: bool,
+) -> Any:
     tokenized = tokenizer.apply_chat_template(
         messages,
-        tokenize=True,
+        tokenize=tokenize,
         add_generation_prompt=True,
         use_tts_template=True,
         enable_thinking=False,
     )
+    return tokenized
+
+
+def _build_tts_prompt(tokenizer: Any, text: str) -> dict[str, Any]:
+    messages = [
+        {"role": "system", "content": AUDIO_OUTPUT_SYSTEM_PROMPT},
+        {"role": "user", "content": text},
+    ]
+    tokenized = _render_chat_template(tokenizer, messages, tokenize=True)
     return {
         "prompt_token_ids": _normalize_token_ids(tokenized),
         "modalities": ["audio"],
@@ -222,30 +234,30 @@ def _build_tts_prompt(model_path: str, text: str) -> dict[str, Any]:
 
 
 def _build_multimodal_audio_prompt(
+    tokenizer: Any,
     text: str,
     image: np.ndarray | None = None,
     video: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    user_content = ""
+    content_parts: list[str] = []
 
     multi_modal_data: dict[str, Any] = {}
     if image is not None:
-        user_content += "(<image>./</image>)"
+        content_parts.append("(<image>./</image>)")
         multi_modal_data["image"] = image
     if video is not None:
-        user_content += "(<video>./</video>)"
+        content_parts.append("(<video>./</video>)")
         multi_modal_data["video"] = video
 
-    user_content += text
-
-    assistant_prefix = "<|im_start|>assistant\n<think>\n\n</think>\n\n<|tts_bos|>"
+    content_parts.append(text)
+    user_content = "\n".join(content_parts)
+    messages = [
+        {"role": "system", "content": AUDIO_OUTPUT_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
 
     prompt: dict[str, Any] = {
-        "prompt": (
-            f"<|im_start|>system\n{AUDIO_OUTPUT_SYSTEM_PROMPT}<|im_end|>\n"
-            f"<|im_start|>user\n{user_content}<|im_end|>\n"
-            f"{assistant_prefix}"
-        ),
+        "prompt": _render_chat_template(tokenizer, messages, tokenize=False),
         "modalities": ["audio"],
     }
     if multi_modal_data:
@@ -253,23 +265,44 @@ def _build_multimodal_audio_prompt(
     return prompt
 
 
-def _build_prompt(
-    model_path: str,
+def _build_vllm_prompt(
+    tokenizer: Any,
     modality: Modality,
     *,
     media_seed: int,
 ) -> dict[str, Any]:
     text = MODALITY_PROMPT[modality]
     if modality == "text":
-        return _build_tts_prompt(model_path, text)
+        return _build_tts_prompt(tokenizer, text)
     elif modality == "text+image":
         image = _make_image(media_seed)
-        return _build_multimodal_audio_prompt(text, image=image)
+        return _build_multimodal_audio_prompt(tokenizer, text, image=image)
     elif modality == "text+video":
         video = _make_video(media_seed)
-        return _build_multimodal_audio_prompt(text, video=video)
+        return _build_multimodal_audio_prompt(tokenizer, text, video=video)
     else:
         raise ValueError(f"Unknown modality: {modality}")
+
+
+def _build_hf_messages(
+    modality: Modality,
+    *,
+    media_seed: int,
+) -> list[dict[str, Any]]:
+    text = MODALITY_PROMPT[modality]
+    if modality == "text":
+        user_content: list[Any] = [text]
+    elif modality == "text+image":
+        user_content = [_make_pil_image(media_seed), text]
+    elif modality == "text+video":
+        from PIL import Image
+
+        video_np = _make_video(media_seed)
+        user_content = [*[Image.fromarray(frame) for frame in video_np], text]
+    else:
+        raise ValueError(f"Unknown modality: {modality}")
+
+    return [_chat_system_message(), {"role": "user", "content": user_content}]
 
 
 # ---------------------------------------------------------------------------
@@ -666,8 +699,27 @@ def _collect_vllm_output_metadata(
 # ---------------------------------------------------------------------------
 
 
-def _iter_omni_outputs(omni: Any, prompt: dict[str, Any]) -> Any:
-    sampling_params_list = omni.resolve_sampling_params_list(omni.default_sampling_params_list)
+def _iter_omni_outputs(
+    omni: Any,
+    prompt: dict[str, Any],
+    *,
+    max_new_tokens: int,
+    temperature: float,
+) -> Any:
+    sampling_params_list = [
+        copy.copy(params) for params in omni.resolve_sampling_params_list(omni.default_sampling_params_list)
+    ]
+    thinker_params = sampling_params_list[0]
+    # Align thinker text generation with HF MiniCPM reference defaults.
+    for attr, value in {
+        "temperature": float(temperature),
+        "top_p": 0.8,
+        "top_k": 100,
+        "max_tokens": int(max_new_tokens),
+        "repetition_penalty": 1.02,
+    }.items():
+        if hasattr(thinker_params, attr):
+            setattr(thinker_params, attr, value)
     return omni._run_generation(prompt, sampling_params_list, use_tqdm=False)
 
 
@@ -679,6 +731,8 @@ def run_vllm_omni_bench(
     modalities: list[Modality],
     num_repeats: int,
     seed: int,
+    max_new_tokens: int,
+    temperature: float,
 ) -> list[RequestResult]:
     from transformers import AutoTokenizer
 
@@ -702,14 +756,19 @@ def run_vllm_omni_bench(
         for run_idx in range(num_repeats):
             for modality in modalities:
                 media_seed = media_seed_base + run_idx
-                prompt = _build_prompt(model_path, modality, media_seed=media_seed)
+                prompt = _build_vllm_prompt(tokenizer, modality, media_seed=media_seed)
 
                 t0 = time.perf_counter()
                 last_ts = t0
                 all_outputs: list[Any] = []
 
                 try:
-                    for output in _iter_omni_outputs(omni, prompt):
+                    for output in _iter_omni_outputs(
+                        omni,
+                        prompt,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                    ):
                         ts = time.perf_counter()
                         last_ts = ts
                         all_outputs.append(output)
@@ -893,36 +952,7 @@ def run_hf_bench(
                     except Exception:
                         model.init_token2wav_cache(np.zeros((16000,), dtype=np.float32))
 
-                if hasattr(model, "get_sys_prompt"):
-                    sys_msg = model.get_sys_prompt(ref_audio=None, mode="omni", language="en")
-                    content = sys_msg.get("content")
-                    if isinstance(content, list) and content and isinstance(content[-1], str):
-                        content[-1] = f"{content[-1]} {AUDIO_OUTPUT_SYSTEM_PROMPT}".strip()
-                else:
-                    sys_msg = {
-                        "role": "system",
-                        "content": [
-                            "You are MiniCPM, a helpful multimodal assistant. "
-                            "When audio output is requested, reply with speech only."
-                        ],
-                    }
-
-                text = MODALITY_PROMPT[modality]
-
-                if modality == "text":
-                    user_content = [text]
-                elif modality == "text+image":
-                    user_content = [_make_pil_image(media_seed), text]
-                elif modality == "text+video":
-                    from PIL import Image
-
-                    video_np = _make_video(media_seed)
-                    pil_frames = [Image.fromarray(frame) for frame in video_np]
-                    user_content = [*pil_frames, text]
-                else:
-                    raise ValueError(f"Unknown modality: {modality}")
-
-                user_msg = {"role": "user", "content": user_content}
+                msgs = _build_hf_messages(modality, media_seed=media_seed)
 
                 try:
                     t0 = time.perf_counter()
@@ -930,12 +960,12 @@ def run_hf_bench(
                     _call_with_supported_kwargs(
                         model.streaming_prefill,
                         session_id=session_id,
-                        msgs=[sys_msg],
+                        msgs=[msgs[0]],
                     )
                     _call_with_supported_kwargs(
                         model.streaming_prefill,
                         session_id=session_id,
-                        msgs=[user_msg],
+                        msgs=[msgs[1]],
                         is_last_chunk=True,
                     )
 
@@ -990,7 +1020,7 @@ def run_hf_bench(
                         )
                     )
                     print(
-                        f"  [hf] {modality} run={run_idx} "
+                        f"  [hf:streaming] {modality} run={run_idx} "
                         f"latency={latency * 1000:.0f}ms rtf={rtf:.2f} "
                         f"audio={audio_duration_s:.1f}s text_tokens={output_text_tokens}"
                     )
@@ -1012,7 +1042,7 @@ def run_hf_bench(
                             error_traceback=error_tb,
                         )
                     )
-                    print(f"  [hf] {modality} run={run_idx} ERROR: {error_type}: {error_repr}")
+                    print(f"  [hf:streaming] {modality} run={run_idx} ERROR: {error_type}: {error_repr}")
     finally:
         del model
 
@@ -1175,6 +1205,8 @@ def save_json_report(
     num_repeats: int,
     modalities: list[str],
     modes: list[str],
+    max_new_tokens: int,
+    temperature: float,
 ) -> None:
     report = {
         "model_path": model_path,
@@ -1183,6 +1215,14 @@ def save_json_report(
         "num_repeats": num_repeats,
         "modalities": modalities,
         "modes": modes,
+        "generation": {
+            "hf_reference_path": "streaming_prefill+streaming_generate",
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "vllm_thinker_top_p": 0.8,
+            "vllm_thinker_top_k": 100,
+            "vllm_thinker_repetition_penalty": 1.02,
+        },
         "results": [
             {
                 "mode": br.mode,
@@ -1291,13 +1331,13 @@ def main() -> None:
         "--max-new-tokens",
         type=int,
         default=2048,
-        help="Max new tokens for HF mode (default: 2048).",
+        help="Max new tokens for HF mode and vLLM thinker stage (default: 2048).",
     )
     parser.add_argument(
         "--temperature",
         type=float,
         default=0.7,
-        help="Temperature for HF mode (default: 0.7).",
+        help="Temperature for HF mode and vLLM thinker stage (default: 0.7).",
     )
     parser.add_argument(
         "--output-dir",
@@ -1368,6 +1408,8 @@ def main() -> None:
     print(f"Modalities: {modalities}")
     print(f"Repeats per combination: {args.num_repeats}")
     print(f"Seed: {args.seed}")
+    print("HF reference path: streaming_prefill+streaming_generate")
+    print(f"Generation: temperature={args.temperature} max_new_tokens={args.max_new_tokens}")
     _print_cuda_info()
     print()
 
@@ -1402,6 +1444,8 @@ def main() -> None:
                     modalities=modalities,
                     num_repeats=args.num_repeats,
                     seed=args.seed,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
                 )
             else:
                 print(f"Unknown mode: {mode}, skipping.")
@@ -1428,6 +1472,8 @@ def main() -> None:
         num_repeats=args.num_repeats,
         modalities=[str(m) for m in modalities],
         modes=modes,
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
     )
 
     # Exit with error if any benchmark failed entirely

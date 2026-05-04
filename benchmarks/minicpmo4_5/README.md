@@ -105,9 +105,12 @@ traceback when a request fails.
 ## Notes
 
 - HF timing includes streaming prefill and streaming generation.
-- The HF `chat(..., generate_audio=True)` audio path is not used here because it
-  fails in the current tested runtime; the working HF path is
-  `streaming_prefill` plus `streaming_generate`.
+- HF mode uses `streaming_prefill` plus `streaming_generate`, which is the
+  working MiniCPM-o 4.5 reference path for audio output.
+- The benchmark aligns the vLLM thinker stage sampling parameters with the HF
+  reference text-generation settings (`temperature`, `top_p=0.8`, `top_k=100`,
+  `repetition_penalty=1.02`, and `max_new_tokens`). Talker and Code2Wav keep
+  the recipe defaults.
 - The public vLLM-Omni `py_generator=True` path closes `Omni` after the first
   request, so the benchmark uses the internal generation iterator for repeated
   requests on one engine instance.
