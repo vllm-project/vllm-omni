@@ -25,7 +25,7 @@ RUN pip install --no-cache-dir \
     librosa \
     sox \
     onnx-graphsurgeon
-RUN pip intsall --no-cache-dir \
+RUN pip install --no-cache-dir \
     --force-reinstall --no-deps \
     "transformers==4.57.3" \
     "numpy==1.26.4"
