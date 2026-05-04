@@ -854,7 +854,10 @@ class TestDeployConfigLoading:
             "trust_remote_code",
         }
 
-        assert expected_fields == deploy_override_field_names()
+        actual_fields = deploy_override_field_names()
+        assert expected_fields == actual_fields, (
+            f"added={actual_fields - expected_fields}, removed={expected_fields - actual_fields}"
+        )
 
     def test_load_qwen3_omni_moe_deploy_config(self):
         from pathlib import Path

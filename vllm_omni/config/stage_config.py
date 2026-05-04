@@ -716,10 +716,7 @@ def deploy_override_field_names() -> frozenset[str]:
     return (
         frozenset(_STAGE_DEPLOY_FIELDS)
         | frozenset(_PIPELINE_WIDE_ENGINE_FIELDS)
-        | {
-            "async_chunk",
-            "devices",
-        }
+        | frozenset({"async_chunk", "devices"})
     )
 
 
@@ -895,9 +892,7 @@ class StageConfig:
 
         # CLI overrides take precedence over YAML defaults
         for key, value in self.runtime_overrides.items():
-            if value is None:
-                continue
-            if key not in ("devices", "max_batch_size"):
+            if value is not None and key not in ("devices", "max_batch_size"):
                 engine_args[key] = value
 
         # Build runtime config from YAML defaults + CLI overrides
