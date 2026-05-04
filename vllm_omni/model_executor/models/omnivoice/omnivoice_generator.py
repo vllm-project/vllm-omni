@@ -377,42 +377,81 @@ def _apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor)
 
 
 class _OmniVoiceCUDAGraphForward:
-    """Lazily captures and replays OmniVoiceGenerator's per-step forward pass.
+    """Pre-captures CUDA graphs for predefined sequence-length buckets.
 
-    On the first call for a given input shape, performs one warmup run then
-    captures a CUDA Graph. Subsequent calls with the same shape copy new
-    values into the static buffers and replay the graph, eliminating kernel
-    launch overhead across all 32 unmasking steps.
+    During warmup(), captures one graph per bucket size (B=1 with CFG → two_b=2).
+    At call time, pads input to the nearest bucket >= actual_S and replays the
+    graph, eliminating kernel-launch overhead across all 32 unmasking steps.
+
+    Falls back to lazy per-shape capture for sequences exceeding the largest
+    bucket or batch sizes other than 1.
 
     RoPE tensors are pre-cast to the model dtype before capture so no
-    dtype-conversion allocation occurs inside the graph.
+    dtype-conversion allocation occurs inside the captured region.
     """
 
-    def __init__(self, generator: "OmniVoiceGenerator") -> None:
+    def __init__(self, generator: "OmniVoiceGenerator", capture_sizes: list[int]) -> None:
         self._gen = generator
-        self._graphs: dict[tuple[int, ...], dict] = {}
+        self._capture_sizes = sorted(capture_sizes)
+        self._graphs: dict[tuple[int, int], dict] = {}
 
-    def _capture(
+    def _find_bucket(self, actual_S: int) -> int | None:
+        for bucket_S in self._capture_sizes:
+            if bucket_S >= actual_S:
+                return bucket_S
+        return None
+
+    def _pad_inputs(
         self,
         input_ids: torch.Tensor,
         audio_mask: torch.Tensor,
         attention_mask: torch.Tensor | None,
+        bucket_S: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        S = input_ids.shape[-1]
+        if S == bucket_S:
+            return input_ids, audio_mask, attention_mask
+
+        two_b = input_ids.shape[0]
+        num_cb = input_ids.shape[1]
+
+        ids_padded = torch.zeros(two_b, num_cb, bucket_S, dtype=input_ids.dtype, device=input_ids.device)
+        ids_padded[:, :, :S] = input_ids
+
+        mask_padded = torch.zeros(two_b, bucket_S, dtype=torch.bool, device=audio_mask.device)
+        mask_padded[:, :S] = audio_mask
+
+        if attention_mask is not None:
+            attn_padded = torch.zeros(
+                two_b, 1, bucket_S, bucket_S,
+                dtype=attention_mask.dtype,
+                device=attention_mask.device,
+            )
+            attn_padded[:, :, :S, :S] = attention_mask
+        else:
+            attn_padded = None
+
+        return ids_padded, mask_padded, attn_padded
+
+    def _capture_for_key(
+        self,
+        key: tuple[int, int],
+        input_ids: torch.Tensor,
+        audio_mask: torch.Tensor,
+        attention_mask: torch.Tensor | None,
     ) -> dict:
-        key = tuple(input_ids.shape)
-        seq_len = input_ids.shape[-1]
+        _, bucket_S = key
         device = input_ids.device
 
-        # Pre-cast RoPE to model dtype so no allocation occurs inside the graph
-        self._gen._ensure_rope(seq_len, device)
+        self._gen._ensure_rope(bucket_S, device)
         model_dtype = self._gen.text_embedding.weight.dtype
-        static_cos = self._gen._rope_cos[:seq_len].to(device=device, dtype=model_dtype).contiguous()
-        static_sin = self._gen._rope_sin[:seq_len].to(device=device, dtype=model_dtype).contiguous()
+        static_cos = self._gen._rope_cos[:bucket_S].to(device=device, dtype=model_dtype).contiguous()
+        static_sin = self._gen._rope_sin[:bucket_S].to(device=device, dtype=model_dtype).contiguous()
 
         static_input_ids = input_ids.clone()
         static_audio_mask = audio_mask.clone()
         static_attn_mask = attention_mask.clone() if attention_mask is not None else None
 
-        # Warmup run (outside graph capture stream)
         with torch.no_grad():
             _ = self._gen._step_forward(
                 static_input_ids, static_audio_mask, static_attn_mask,
@@ -420,7 +459,6 @@ class _OmniVoiceCUDAGraphForward:
             )
         torch.cuda.synchronize(device)
 
-        # Capture
         graph = torch.cuda.CUDAGraph()
         with torch.no_grad():
             with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
@@ -439,8 +477,27 @@ class _OmniVoiceCUDAGraphForward:
             "static_output": static_output,
         }
         self._graphs[key] = entry
-        logger.info("OmniVoice CUDA Graph captured for shape %s", key)
+        logger.info("OmniVoice CUDA Graph captured for key %s", key)
         return entry
+
+    def warmup(self, device: torch.device) -> None:
+        """Pre-capture graphs for all bucket sizes with B=1 (two_b=2 for CFG)."""
+        if not torch.cuda.is_available():
+            return
+        logger.info(
+            "OmniVoice CUDA Graph warmup: capturing %d bucket sizes %s",
+            len(self._capture_sizes),
+            self._capture_sizes,
+        )
+        two_b = 2
+        num_cb = self._gen.config.num_audio_codebook
+        for bucket_S in self._capture_sizes:
+            key = (two_b, bucket_S)
+            dummy_ids = torch.zeros(two_b, num_cb, bucket_S, dtype=torch.long, device=device)
+            dummy_mask = torch.zeros(two_b, bucket_S, dtype=torch.bool, device=device)
+            dummy_attn = torch.ones(two_b, 1, bucket_S, bucket_S, dtype=torch.bool, device=device)
+            self._capture_for_key(key, dummy_ids, dummy_mask, dummy_attn)
+        logger.info("OmniVoice CUDA Graph warmup complete (%d graphs)", len(self._graphs))
 
     def __call__(
         self,
@@ -448,7 +505,6 @@ class _OmniVoiceCUDAGraphForward:
         audio_mask: torch.Tensor,
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        # Fall back to eager when an outer CUDA graph capture is in progress
         if torch.cuda.is_current_stream_capturing():
             seq_len = input_ids.shape[-1]
             self._gen._ensure_rope(seq_len, input_ids.device)
@@ -457,16 +513,37 @@ class _OmniVoiceCUDAGraphForward:
             sin = self._gen._rope_sin[:seq_len].to(device=input_ids.device, dtype=dtype)
             return self._gen._step_forward(input_ids, audio_mask, attention_mask, cos, sin)
 
-        key = tuple(input_ids.shape)
-        entry = self._graphs.get(key) or self._capture(input_ids, audio_mask, attention_mask)
+        actual_S = input_ids.shape[-1]
+        two_b = input_ids.shape[0]
+        bucket_S = self._find_bucket(actual_S) if two_b == 2 else None
 
-        entry["static_input_ids"].copy_(input_ids)
-        entry["static_audio_mask"].copy_(audio_mask)
-        if attention_mask is not None and entry["static_attn_mask"] is not None:
-            entry["static_attn_mask"].copy_(attention_mask)
+        if bucket_S is None:
+            # Lazy capture for oversized sequences or non-unit batch
+            key = (two_b, actual_S)
+            ids_in, mask_in, attn_in = input_ids, audio_mask, attention_mask
+            entry = self._graphs.get(key) or self._capture_for_key(
+                key, ids_in, mask_in, attn_in
+            )
+        else:
+            key = (two_b, bucket_S)
+            ids_in, mask_in, attn_in = self._pad_inputs(
+                input_ids, audio_mask, attention_mask, bucket_S
+            )
+            entry = self._graphs.get(key)
+            if entry is None:
+                entry = self._capture_for_key(key, ids_in, mask_in, attn_in)
+
+        entry["static_input_ids"].copy_(ids_in)
+        entry["static_audio_mask"].copy_(mask_in)
+        if attn_in is not None and entry["static_attn_mask"] is not None:
+            entry["static_attn_mask"].copy_(attn_in)
 
         entry["graph"].replay()
-        return entry["static_output"]
+
+        output = entry["static_output"]
+        if bucket_S is not None and bucket_S != actual_S:
+            output = output[:, :, :actual_S, :]
+        return output
 
     def clear(self) -> None:
         self._graphs.clear()
@@ -528,9 +605,11 @@ class OmniVoiceGenerator(nn.Module):
         self._rope_cos = None
         self._rope_sin = None
 
-        # CUDA Graph (lazy capture on first forward call)
+        # CUDA Graph (bucket-size pre-capture; lazy fallback for oversized shapes)
         self._cuda_graph_fwd: _OmniVoiceCUDAGraphForward | None = (
-            _OmniVoiceCUDAGraphForward(self) if config.enable_cuda_graph else None
+            _OmniVoiceCUDAGraphForward(self, config.cuda_graph_capture_sizes)
+            if config.enable_cuda_graph
+            else None
         )
 
     def _ensure_rope(self, seq_len: int, device: torch.device) -> None:
@@ -857,3 +936,6 @@ class OmniVoiceGenerator(nn.Module):
             )
         else:
             logger.info("Generator: all %d weights loaded", len(loaded_keys))
+
+        if self._cuda_graph_fwd is not None:
+            self._cuda_graph_fwd.warmup(device)

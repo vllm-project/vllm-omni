@@ -84,6 +84,11 @@ class OmniVoiceConfig(PretrainedConfig):
         self.speculative_config = None
         self.enable_cuda_graph = getattr(self, "enable_cuda_graph",
             os.environ.get("OMNIVOICE_CUDA_GRAPH", "1") != "0")
+        self.cuda_graph_capture_sizes = getattr(
+            self,
+            "cuda_graph_capture_sizes",
+            [128, 192, 256, 320, 384, 448, 512, 640, 768, 1024],
+        )
 
 
 AutoConfig.register("omnivoice", OmniVoiceConfig)
