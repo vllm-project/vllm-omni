@@ -11,9 +11,9 @@ from vllm.multimodal.media.audio import load_audio
 
 from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.model_executor.models.cosyvoice3.utils import extract_text_token
+from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
 
 def run_e2e():
