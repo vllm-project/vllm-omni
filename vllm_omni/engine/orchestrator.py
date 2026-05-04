@@ -109,6 +109,9 @@ class OrchestratorRequestState:
 
     # Metrics: timestamp when request was submitted to each stage
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
+    stage_first_output_ts: dict[int, float] = field(default_factory=dict)
+    stage_finished_ts: dict[int, float] = field(default_factory=dict)
+    stage_output_counts: dict[int, int] = field(default_factory=dict)
     mm_processor_kwargs: dict | None = None
     mm_features: list | None = None
 
@@ -186,6 +189,28 @@ class Orchestrator:
         self._stages_shutdown = False
         self._fatal_error: str | None = None
         self._fatal_error_stage_id: int | None = None
+
+    @staticmethod
+    def _accumulate_pipeline_timing(req_state: OrchestratorRequestState, key: str, delta_ms: float) -> None:
+        if delta_ms <= 0:
+            return
+        req_state.pipeline_timings[key] = req_state.pipeline_timings.get(key, 0.0) + float(delta_ms)
+
+    def _record_stage_first_output(self, req_state: OrchestratorRequestState, stage_id: int) -> None:
+        now = _time.time()
+        req_state.stage_output_counts[stage_id] = req_state.stage_output_counts.get(stage_id, 0) + 1
+        req_state.pipeline_timings[f"stage_{stage_id}_output_count"] = float(req_state.stage_output_counts[stage_id])
+        if stage_id in req_state.stage_first_output_ts:
+            return
+        req_state.stage_first_output_ts[stage_id] = now
+        submit_ts = req_state.stage_submit_ts.get(stage_id)
+        if submit_ts is None:
+            return
+        self._accumulate_pipeline_timing(
+            req_state,
+            f"stage_{stage_id}_ttfo_ms",
+            (now - submit_ts) * 1000.0,
+        )
 
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
@@ -368,7 +393,9 @@ class Orchestrator:
                 await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
 
                 # 2) Process raw outputs through the output processor
+                process_outputs_start = _time.perf_counter()
                 request_outputs = await self._process_stage_outputs(stage_id, raw_outputs)
+                process_outputs_ms = (_time.perf_counter() - process_outputs_start) * 1000.0
 
                 # 3) Route each processed output
                 for output in request_outputs:
@@ -381,8 +408,16 @@ class Orchestrator:
                             list(self.request_states.keys()),
                         )
                         continue
+                    self._record_stage_first_output(req_state, stage_id)
+                    if request_outputs:
+                        self._accumulate_pipeline_timing(
+                            req_state,
+                            f"stage_{stage_id}_output_process_ms",
+                            process_outputs_ms / len(request_outputs),
+                        )
                     stage_metrics = None
                     if output.finished:
+                        req_state.stage_finished_ts[stage_id] = _time.time()
                         stage_metrics = self._build_stage_metrics(
                             stage_id,
                             output.request_id,
@@ -404,6 +439,7 @@ class Orchestrator:
         stage_metrics: Any,
     ) -> None:
         """Route a processed output: send to main thread and/or forward to next stage."""
+        route_start = _time.perf_counter()
         req_id = output.request_id
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
@@ -412,6 +448,11 @@ class Orchestrator:
         # CFG companion handling: companions don't produce user-visible output
         # and don't forward to the next stage directly.
         if finished and self._cfg_tracker.is_companion(req_id):
+            self._accumulate_pipeline_timing(
+                req_state,
+                f"stage_{stage_id}_route_ms",
+                (_time.perf_counter() - route_start) * 1000.0,
+            )
             await self._handle_cfg_companion_ready(req_id)
             self.request_states.pop(req_id, None)
             return
@@ -489,10 +530,26 @@ class Orchestrator:
                     )
 
         if finished and stage_id == req_state.final_stage_id:
+            self._accumulate_pipeline_timing(
+                req_state,
+                f"stage_{stage_id}_route_ms",
+                (_time.perf_counter() - route_start) * 1000.0,
+            )
+            if stage_metrics is not None:
+                stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
             # PD: clean up any lingering KV params for this request
             self._pd_kv_params.pop(req_id, None)
             self._cfg_tracker.cleanup_parent(req_id)
             self.request_states.pop(req_id, None)
+            return
+
+        self._accumulate_pipeline_timing(
+            req_state,
+            f"stage_{stage_id}_route_ms",
+            (_time.perf_counter() - route_start) * 1000.0,
+        )
+        if stage_metrics is not None:
+            stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
@@ -671,6 +728,9 @@ class Orchestrator:
         next-stage inputs, build lightweight requests, and submit them.
         """
         next_stage_id = stage_id + 1
+        forward_start = _time.perf_counter()
+        source_stage_finish_ts = _time.time()
+        req_state.stage_finished_ts[stage_id] = source_stage_finish_ts
         next_client = self.stage_clients[next_stage_id]
         params = req_state.sampling_params_list[next_stage_id]
         next_stage_resumable = is_streaming_session and not is_final_update
@@ -744,6 +804,16 @@ class Orchestrator:
                     kv_sender_info=kv_sender_info,
                 )
             req_state.stage_submit_ts[next_stage_id] = _time.time()
+            self._accumulate_pipeline_timing(
+                req_state,
+                f"stage_{stage_id}_forward_ms",
+                (_time.perf_counter() - forward_start) * 1000.0,
+            )
+            self._accumulate_pipeline_timing(
+                req_state,
+                f"stage_{stage_id}_to_stage_{next_stage_id}_handoff_ms",
+                (req_state.stage_submit_ts[next_stage_id] - source_stage_finish_ts) * 1000.0,
+            )
             return
 
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
@@ -790,6 +860,16 @@ class Orchestrator:
                 await next_client.add_request_async(request)
 
             req_state.stage_submit_ts[next_stage_id] = _time.time()
+            self._accumulate_pipeline_timing(
+                req_state,
+                f"stage_{stage_id}_forward_ms",
+                (_time.perf_counter() - forward_start) * 1000.0,
+            )
+            self._accumulate_pipeline_timing(
+                req_state,
+                f"stage_{stage_id}_to_stage_{next_stage_id}_handoff_ms",
+                (req_state.stage_submit_ts[next_stage_id] - source_stage_finish_ts) * 1000.0,
+            )
             return
 
         self.stage_clients[stage_id].set_engine_outputs([output])
@@ -839,6 +919,16 @@ class Orchestrator:
 
         # Record submit timestamp for the next stage
         req_state.stage_submit_ts[next_stage_id] = _time.time()
+        self._accumulate_pipeline_timing(
+            req_state,
+            f"stage_{stage_id}_forward_ms",
+            (_time.perf_counter() - forward_start) * 1000.0,
+        )
+        self._accumulate_pipeline_timing(
+            req_state,
+            f"stage_{stage_id}_to_stage_{next_stage_id}_handoff_ms",
+            (req_state.stage_submit_ts[next_stage_id] - source_stage_finish_ts) * 1000.0,
+        )
 
     async def _poll_stage_raw(self, stage_id: int) -> EngineCoreOutputs | None:
         """Pull raw EngineCoreOutputs from a stage client without processing.

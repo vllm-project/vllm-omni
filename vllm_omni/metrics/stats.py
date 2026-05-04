@@ -498,6 +498,17 @@ class OrchestratorAggregator:
                     break  # only once per request
         if preprocess_times:
             overall_summary["input_preprocess_time_ms"] = sum(preprocess_times) / len(preprocess_times)
+        pipeline_metric_values: defaultdict[str, list[float]] = defaultdict(list)
+        for req_id, evts in self.stage_events.items():
+            if not evts:
+                continue
+            pipeline_timings = evts[-1].pipeline_timings or {}
+            for key, value in pipeline_timings.items():
+                if isinstance(value, (int, float)):
+                    pipeline_metric_values[key].append(float(value))
+        for key, values in sorted(pipeline_metric_values.items()):
+            if values:
+                overall_summary[f"avg_{key}"] = sum(values) / len(values)
         # Add stage_wall_time_ms as separate fields for each stage
         for idx, wall_time in enumerate(stage_wall_time_ms):
             overall_summary[f"e2e_stage_{idx}_wall_time_ms"] = wall_time
@@ -557,6 +568,8 @@ class OrchestratorAggregator:
                 parts = [f"req={rid}"]
                 if e2e_evt:
                     parts.append(f"total={e2e_evt.e2e_total_ms / 1000.0:.2f}s")
+                if "queue_wait_ms" in pt:
+                    parts.append(f"queue={pt['queue_wait_ms']:.2f}ms")
                 if "preprocess_ms" in pt:
                     parts.append(f"preprocess={pt['preprocess_ms'] / 1000.0:.2f}s")
                 if e2e_evt:
@@ -577,6 +590,16 @@ class OrchestratorAggregator:
                     parts.append(f"transfers=[{','.join(transfer_parts)}]")
                 if "ar2diffusion_ms" in pt:
                     parts.append(f"ar2diffusion={pt['ar2diffusion_ms']:.2f}ms")
+                runtime_parts = []
+                for key in sorted(pt):
+                    if key in {"queue_wait_ms", "preprocess_ms", "ar2diffusion_ms"}:
+                        continue
+                    value = pt[key]
+                    if value in (0, 0.0):
+                        continue
+                    runtime_parts.append(f"{key}={value:.2f}")
+                if runtime_parts:
+                    parts.append(f"runtime=[{','.join(runtime_parts)}]")
                 logger.info("[OmniTiming] %s", " ".join(parts))
 
             # === Stage table (columns = stage_id) ===
