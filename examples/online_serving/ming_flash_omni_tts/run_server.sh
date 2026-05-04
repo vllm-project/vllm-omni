@@ -12,13 +12,13 @@ set -e
 MODEL="${MODEL:-Jonathan1909/Ming-flash-omni-2.0}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8091}"
-STAGE_CONFIG="${STAGE_CONFIG:-vllm_omni/model_executor/stage_configs/ming_flash_omni_tts.yaml}"
+DEPLOY_CONFIG="${DEPLOY_CONFIG:-vllm_omni/deploy/ming_flash_omni_tts.yaml}"
 
 echo "Starting Ming standalone TTS server with model: $MODEL"
-echo "Stage config: $STAGE_CONFIG"
+echo "Deploy config: $DEPLOY_CONFIG"
 
 vllm serve "$MODEL" \
-    --stage-configs-path "$STAGE_CONFIG" \
+    --deploy-config "$DEPLOY_CONFIG" \
     --host "$HOST" \
     --port "$PORT" \
     --trust-remote-code \

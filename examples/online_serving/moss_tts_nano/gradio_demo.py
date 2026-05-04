@@ -42,29 +42,8 @@ PCM_SAMPLE_RATE = 48000
 PCM_CHANNELS = 2
 DEFAULT_API_BASE = "http://localhost:8091"
 
-# Built-in voice presets (matches the MOSS-TTS-Nano GitHub repo assets/)
-VOICE_PRESETS = {
-    # Chinese
-    "Junhao (ZH)": "Junhao",
-    "Zhiming (ZH)": "Zhiming",
-    "Weiguo (ZH)": "Weiguo",
-    "Xiaoyu (ZH)": "Xiaoyu",
-    "Yuewen (ZH)": "Yuewen",
-    "Lingyu (ZH)": "Lingyu",
-    # English
-    "Ava (EN)": "Ava",
-    "Bella (EN)": "Bella",
-    "Adam (EN)": "Adam",
-    "Nathan (EN)": "Nathan",
-    # Japanese
-    "Sakura (JA)": "Sakura",
-    "Yui (JA)": "Yui",
-    "Aoi (JA)": "Aoi",
-    "Hina (JA)": "Hina",
-    "Mei (JA)": "Mei",
-}
-PRESET_LABELS = list(VOICE_PRESETS.keys())
-DEFAULT_PRESET = "Junhao (ZH)"
+# MOSS-TTS-Nano is voice-cloning-only — no built-in presets. Users must
+# upload a reference audio clip + transcript in the UI.
 
 # ── AudioWorklet processor (loaded in browser via Blob URL) ──────────
 # Downmixes stereo-interleaved int16 PCM to mono float32 for playback.
@@ -333,47 +312,41 @@ def encode_audio_to_base64(audio_data: tuple) -> str:
 
 def build_payload(
     text: str,
-    voice_preset: str,
     ref_audio: tuple | None,
     ref_text: str,
     response_format: str = "pcm",
     stream: bool = True,
 ) -> dict:
-    """Build the /v1/audio/speech request payload."""
+    """Build the /v1/audio/speech request payload.
+
+    The server uses upstream's voice_clone mode and ignores ``ref_text``,
+    so we drop it from the payload entirely. The textbox is kept in the
+    UI for users coming from voice-cloning systems that do consume a
+    transcript (e.g. Qwen3-TTS), so the same UX habits transfer.
+    """
     if not text or not text.strip():
         raise gr.Error("Please enter text to synthesize.")
+    if ref_audio is None:
+        raise gr.Error("Reference audio is required. Upload a 10-30 s clip in the Reference Audio panel.")
+    del ref_text  # accepted in the form but not forwarded
 
-    voice_name = VOICE_PRESETS.get(voice_preset, "Junhao")
-
-    payload: dict = {
+    return {
         "input": text.strip(),
-        "voice": voice_name,
+        "ref_audio": encode_audio_to_base64(ref_audio),
         "response_format": "pcm" if stream else response_format,
         "stream": stream,
     }
-
-    has_ref = ref_audio is not None
-    if has_ref:
-        payload["ref_audio"] = encode_audio_to_base64(ref_audio)
-        ref_text_stripped = ref_text.strip() if ref_text else ""
-        if ref_text_stripped:
-            payload["ref_text"] = ref_text_stripped
-        else:
-            raise gr.Error("Voice cloning requires a transcript of the reference audio.")
-
-    return payload
 
 
 def generate_speech(
     api_base: str,
     text: str,
-    voice_preset: str,
     ref_audio: tuple | None,
     ref_text: str,
     response_format: str,
 ) -> tuple:
     """Non-streaming: call /v1/audio/speech and return full audio as (sr, np_array)."""
-    payload = build_payload(text, voice_preset, ref_audio, ref_text, response_format, stream=False)
+    payload = build_payload(text, ref_audio, ref_text, response_format, stream=False)
 
     try:
         with httpx.Client(timeout=300.0) as client:
@@ -508,28 +481,23 @@ def create_app(api_base: str):
                     lines=4,
                 )
 
-                voice_preset = gr.Dropdown(
-                    choices=PRESET_LABELS,
-                    value=DEFAULT_PRESET,
-                    label="Voice Preset",
-                    info="Built-in multilingual voices. ZH = Chinese, EN = English, JA = Japanese.",
+                gr.Markdown(
+                    "Upload a 10-30 s reference audio clip. MOSS-TTS-Nano "
+                    "uses upstream's voice_clone mode, which does not "
+                    "consume a transcript — the transcript box below is "
+                    "kept for UX consistency with other TTS systems but is "
+                    "not sent to the model."
                 )
-
-                with gr.Accordion("Custom Voice Clone (optional)", open=False):
-                    gr.Markdown(
-                        "Upload a reference audio clip (10-30 s) and provide its transcript "
-                        "to clone that voice instead of using the built-in preset."
-                    )
-                    ref_audio = gr.Audio(
-                        label="Reference Audio",
-                        type="numpy",
-                        sources=["upload", "microphone"],
-                    )
-                    ref_text = gr.Textbox(
-                        label="Reference Audio Transcript (required for cloning)",
-                        placeholder="Exact transcript of the reference audio...",
-                        lines=2,
-                    )
+                ref_audio = gr.Audio(
+                    label="Reference Audio (required)",
+                    type="numpy",
+                    sources=["upload", "microphone"],
+                )
+                ref_text = gr.Textbox(
+                    label="Reference Audio Transcript (ignored by MOSS-TTS-Nano)",
+                    placeholder="Optional. The MOSS-TTS-Nano voice_clone mode does not use a transcript.",
+                    lines=2,
+                )
 
                 with gr.Row():
                     response_format = gr.Dropdown(
@@ -576,12 +544,12 @@ def create_app(api_base: str):
                 )
                 gr.Examples(
                     examples=[
-                        ["Hello, this is MOSS-TTS-Nano speaking.", "Ava (EN)"],
-                        ["The quick brown fox jumps over the lazy dog.", "Adam (EN)"],
-                        ["MOSS-TTS-Nanoは、軽量なテキスト読み上げモデルです。", "Sakura (JA)"],
+                        ["Hello, this is MOSS-TTS-Nano speaking."],
+                        ["The quick brown fox jumps over the lazy dog."],
+                        ["MOSS-TTS-Nanoは、軽量なテキスト読み上げモデルです。"],
                     ],
-                    inputs=[text_input, voice_preset],
-                    label="Examples",
+                    inputs=[text_input],
+                    label="Example Texts (upload reference audio above first)",
                 )
                 gr.HTML("""
                 <div style="text-align:center; padding:8px 0; margin-top:4px;">
@@ -629,18 +597,18 @@ def create_app(api_base: str):
             js="() => { if (window.ttsStop) window.ttsStop(); }",
         )
 
-        all_inputs = [text_input, voice_preset, ref_audio, ref_text, response_format]
+        all_inputs = [text_input, ref_audio, ref_text, response_format]
 
         def on_generate(stream_enabled, *args):
             import time as _time
 
-            text, voice, ref_a, ref_t, _fmt = args
+            text, ref_a, ref_t, _fmt = args
             if stream_enabled:
-                payload = build_payload(text, voice, ref_a, ref_t, stream=True)
+                payload = build_payload(text, ref_a, ref_t, stream=True)
                 payload["_nonce"] = int(_time.time() * 1000)
                 return json.dumps(payload), gr.update()
             else:
-                audio = generate_speech(api_base, text, voice, ref_a, ref_t, _fmt)
+                audio = generate_speech(api_base, text, ref_a, ref_t, _fmt)
                 return "", audio
 
         generate_btn.click(

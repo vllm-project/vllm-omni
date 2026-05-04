@@ -13,6 +13,7 @@ import dataclasses
 import json
 import os
 import queue
+import sys
 import threading
 import time
 import uuid
@@ -65,6 +66,7 @@ from vllm_omni.engine.stage_init_utils import (
     StartedLlmStage,
     _inject_inferred_kv_tp_topology,
     acquire_device_locks,
+    acquire_diffusion_device_locks,
     build_diffusion_config,
     build_engine_args_dict,
     build_vllm_config,
@@ -110,6 +112,13 @@ _PARENT_ARGS_KEEP: frozenset[str] = frozenset(
         "worker_extension_cls",
         "allowed_local_media_path",
         "allowed_media_domains",
+        # Legacy stage-config YAMLs may intentionally leave parallel or
+        # distributed knobs unspecified at the stage level and rely on
+        # top-level CLI values to fill them in during the per-stage merge.
+        # Keep these fields so stages that omit them can inherit CLI values,
+        # while stages with explicit YAML values still win because the legacy
+        # stage-config loader prefers stage-local engine args.
+        "tensor_parallel_size",
     }
 )
 
@@ -352,6 +361,7 @@ class AsyncOmniEngine:
             name="orchestrator",
         )
         self.orchestrator_thread.start()
+
         self._wait_for_orchestrator_init(startup_future, startup_timeout)
 
         # Stage runtime fields are assigned directly on self by the bootstrap thread.
@@ -518,7 +528,8 @@ class AsyncOmniEngine:
                 stage_id=metadata.stage_id,
             )
             logger.info("[AsyncOmniEngine] Stage %s remote engine handshake started", metadata.stage_id)
-            with launch_cm as (engine_manager, coordinator, addresses):
+            (engine_manager, coordinator, addresses, _tensor_queue) = launch_cm.__enter__()
+            try:
                 started_stage = StartedLlmStage(
                     stage_id=metadata.stage_id,
                     metadata=metadata,
@@ -528,6 +539,11 @@ class AsyncOmniEngine:
                     coordinator=coordinator,
                     addresses=addresses,
                 )
+            except BaseException:
+                if not launch_cm.__exit__(*sys.exc_info()):
+                    raise
+            else:
+                launch_cm.__exit__(None, None, None)
             logger.info("[AsyncOmniEngine] Stage %s remote engine startup completed", metadata.stage_id)
             assert started_stage is not None
             return started_stage
@@ -541,11 +557,14 @@ class AsyncOmniEngine:
         stage_cfg: Any,
         metadata: Any,
         omni_master_server: OmniMasterServer,
+        stage_init_timeout: int,
     ) -> StageDiffusionClient:
         """Launch a local diffusion stage on OmniMasterServer-allocated sockets."""
         proc = None
+        lock_fds: list[int] = []
         try:
             od_config = build_diffusion_config(self.model, stage_cfg, metadata)
+            lock_fds = acquire_diffusion_device_locks(metadata.stage_id, od_config, stage_init_timeout)
             handshake_address, request_address, response_address = register_stage_with_omni_master(
                 omni_master_address=omni_master_server.address,
                 omni_master_port=omni_master_server.port,
@@ -564,7 +583,7 @@ class AsyncOmniEngine:
                 request_address=request_address,
                 response_address=response_address,
             )
-            complete_diffusion_handshake(proc, handshake_address)
+            complete_diffusion_handshake(proc, handshake_address, stage_init_timeout)
             logger.info(
                 "[AsyncOmniEngine] Stage %s diffusion startup completed",
                 metadata.stage_id,
@@ -580,6 +599,9 @@ class AsyncOmniEngine:
             if proc is not None:
                 terminate_alive_proc(proc)
             raise
+        finally:
+            if lock_fds:
+                release_device_locks(lock_fds)
 
     def _create_remote_diffusion_stage(
         self,
@@ -785,6 +807,7 @@ class AsyncOmniEngine:
                                         stage_cfg,
                                         metadata,
                                         self._omni_master_server,
+                                        stage_init_timeout,
                                     )
                                 else:
                                     use_inline = True if self.num_stages == 1 else False
@@ -1271,9 +1294,12 @@ class AsyncOmniEngine:
             ring_degree = normalized_kwargs.get("ring_degree") or 1
             ulysses_mode = normalized_kwargs.get("ulysses_mode") or "strict"
             sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
+            pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
+            data_parallel_size = normalized_kwargs.get("data_parallel_size") or 1
             tensor_parallel_size = normalized_kwargs.get("tensor_parallel_size") or 1
             cfg_parallel_size = normalized_kwargs.get("cfg_parallel_size") or 1
             vae_patch_parallel_size = normalized_kwargs.get("vae_patch_parallel_size") or 1
+            enable_expert_parallel = normalized_kwargs.get("enable_expert_parallel") or False
             use_hsdp = normalized_kwargs.get("use_hsdp", False)
             hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
             hsdp_replicate_size = normalized_kwargs.get("hsdp_replicate_size", 1)
@@ -1281,9 +1307,10 @@ class AsyncOmniEngine:
                 sequence_parallel_size = ulysses_degree * ring_degree
 
             parallel_config = DiffusionParallelConfig(
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
+                pipeline_parallel_size=pipeline_parallel_size,
+                data_parallel_size=data_parallel_size,
                 tensor_parallel_size=tensor_parallel_size,
+                enable_expert_parallel=enable_expert_parallel,
                 sequence_parallel_size=sequence_parallel_size,
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
@@ -1310,7 +1337,7 @@ class AsyncOmniEngine:
             "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
-            "enforce_eager": kwargs.get("enforce_eager", False),
+            "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
@@ -1445,8 +1472,6 @@ class AsyncOmniEngine:
                         cfg.engine_args.enable_sleep_mode = global_sleep_mode
                 if getattr(cfg, "stage_type", None) != "diffusion":
                     continue
-                if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
-                    cfg.engine_args = OmegaConf.create({})
                 if kwargs.get("lora_path") is not None:
                     if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
                         cfg.engine_args.lora_path = kwargs["lora_path"]

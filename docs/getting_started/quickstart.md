@@ -19,10 +19,10 @@ uv venv --python 3.12 --seed
 source .venv/bin/activate
 
 # On CUDA
-uv pip install vllm==0.19.0 --torch-backend=auto
+uv pip install vllm==0.20.0 --torch-backend=auto
 
 # On ROCm
-uv pip install vllm==0.19.0+rocm700 --extra-index-url https://wheels.vllm.ai/rocm/0.19.0/rocm700
+uv pip install vllm==0.20.0+rocm721 --extra-index-url https://wheels.vllm.ai/rocm/0.20.0/rocm721
 
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
@@ -30,6 +30,12 @@ uv pip install -e .
 ```
 
 For additional installation methods — please see the [installation guide](installation/README.md).
+
+
+!!! note
+    It is important to install the same major & minor version of vLLM and vLLM Omni, otherwise things may not work as expected. If the versions are misaligned, you will see a warning when you import vLLM Omni.
+
+    If you are seeing strange behavior with the `vllm` command not handling the `--omni` flag correctly, you most likely have a version mismatch with vLLM < `0.20.0` and vLLM Omni `0.20.0`, as vLLM Omni no longer hijacks the vLLM entrypoint. Updating vLLM should resolve this issue.
 
 ## Offline Inference
 
