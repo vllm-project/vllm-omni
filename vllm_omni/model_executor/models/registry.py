@@ -174,11 +174,19 @@ _OMNI_MODELS = {
         "VoxtralTTSAudioGenerationForConditionalGeneration",
     ),
     "VoxtralTTSAudioTokenizer": ("voxtral_tts", "voxtral_tts_audio_tokenizer", "VoxtralTTSAudioTokenizer"),
+<<<<<<< HEAD
     ## MOSS-TTS-Nano
     "MossTTSNanoForCausalLM": (
         "moss_tts_nano",
         "modeling_moss_tts_nano",
         "MossTTSNanoForGeneration",
+=======
+    ## EarTTS
+    "EarTTSForCausalLM": (
+        "eartts",
+        "eartts",
+        "EarTTSForCausalLM",
+>>>>>>> 6cb8d457 (eartts: initial commit)
     ),
     "DyninOmniForConditionalGeneration": (
         "dynin_omni",
