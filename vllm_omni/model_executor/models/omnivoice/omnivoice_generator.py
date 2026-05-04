@@ -55,8 +55,8 @@ try:
 
     @triton.jit
     def _rms_norm_fwd_kernel(
-        Y_ptr, Y_stride, X_ptr, X_stride, W_ptr, n_cols, eps,
-        BLOCK_SIZE: tl.constexpr,
+        Y_ptr, Y_stride, X_ptr, X_stride, W_ptr, n_cols, eps,  # noqa: N803
+        BLOCK_SIZE: tl.constexpr,  # noqa: N803
     ):
         row = tl.program_id(0).to(tl.int64)
         cols = tl.arange(0, BLOCK_SIZE)
@@ -85,7 +85,7 @@ try:
     @triton.jit
     def _swiglu_fwd_kernel(
         gate_ptr, up_ptr, out_ptr, stride, n_cols: tl.constexpr,
-        BLOCK_SIZE: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,  # noqa: N803
     ):
         pid = tl.program_id(0).to(tl.int64)
         gate_ptr += pid * stride
@@ -116,9 +116,9 @@ try:
 
     @triton.jit
     def _fused_add_rms_norm_fwd_kernel(
-        Y_ptr, Y_stride, S_ptr, S_stride,
-        X_ptr, X_stride, R_ptr, R_stride,
-        W_ptr, n_cols, eps, BLOCK_SIZE: tl.constexpr,
+        Y_ptr, Y_stride, S_ptr, S_stride,  # noqa: N803
+        X_ptr, X_stride, R_ptr, R_stride,  # noqa: N803
+        W_ptr, n_cols, eps, BLOCK_SIZE: tl.constexpr,  # noqa: N803
     ):
         row = tl.program_id(0).to(tl.int64)
         cols = tl.arange(0, BLOCK_SIZE)
