@@ -207,6 +207,11 @@ class OmniVoiceDecoder(nn.Module):
                 param.data.copy_(state_dict[higgs_name])
                 loaded += 1
 
+        # Checkpoint weights may be fp16; force float32 so ConvTranspose1d
+        # upsampling doesn't overflow (fp16 max ~65504 is too small for
+        # intermediate activations in the DAC upsampling chain).
+        self.acoustic_decoder.float()
+
         # Apply HiggsAudioV2 output padding adjustment
         self._adjust_output_padding(self.acoustic_decoder)
 
