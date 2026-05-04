@@ -701,6 +701,7 @@ class OpenAIClientHandler:
         start_time = time.perf_counter()
         try:
             images = []
+            audios = []
             for choice in chat_completion.choices:
                 content = getattr(choice.message, "content", None)
                 if isinstance(content, list):
@@ -714,8 +715,21 @@ class OpenAIClientHandler:
                         if image_url and image_url.startswith("data:image"):
                             b64_data = image_url.split(",", 1)[1]
                             images.append(decode_b64_image(b64_data))
+
+                # OpenAI audio responses (e.g. AudioX text-to-audio) populate `message.audio`.
+                audio_obj = getattr(choice.message, "audio", None)
+                audio_b64 = getattr(audio_obj, "data", None) if audio_obj is not None else None
+                if audio_b64:
+                    audios.append(
+                        {
+                            "wav_bytes": base64.b64decode(audio_b64),
+                            "id": getattr(audio_obj, "id", None),
+                            "expires_at": getattr(audio_obj, "expires_at", None),
+                        }
+                    )
             result.e2e_latency = time.perf_counter() - start_time
             result.images = images if images else None
+            result.audios = audios if audios else None
             result.success = True
         except Exception as e:
             result.error_message = f"Diffusion response processing error: {str(e)}"
