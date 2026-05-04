@@ -356,14 +356,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     tprompt["modalities"] = ["image"]
                 if negative_prompt is not None:
                     tprompt["negative_prompt"] = negative_prompt
-                # GLM-Image's _call_hf_processor expects target_h/target_w in mm_processor_kwargs
+                # Always attach mm_processor_kwargs (possibly empty) so
+                # OmniInputPreprocessor._process_text routes through the
+                # multimodal processor path. Without it, the preprocessor
+                # falls back to plain _tokenize_prompt and AR-based image-gen
+                # models like GLM-Image never see their image-generation
+                # scaffold.
                 mm_processor_kwargs: dict[str, Any] = {}
                 if height is not None:
                     mm_processor_kwargs["target_h"] = height
                 if width is not None:
                     mm_processor_kwargs["target_w"] = width
-                if mm_processor_kwargs:
-                    tprompt["mm_processor_kwargs"] = mm_processor_kwargs
+                tprompt["mm_processor_kwargs"] = mm_processor_kwargs
                 if engine_prompt_image is not None:
                     tprompt["multi_modal_data"] = engine_prompt_image
                     # Provide multi_modal_uuids so that newer vLLM versions
