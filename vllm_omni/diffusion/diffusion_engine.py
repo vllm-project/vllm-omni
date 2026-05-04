@@ -63,6 +63,31 @@ def supports_audio_output(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_audio_output", False))
 
 
+def _move_tensors_to_cpu(data: Any) -> Any:
+    """Recursively move all tensors in a nested structure to CPU."""
+    if isinstance(data, torch.Tensor):
+        return data.cpu() if data.device.type != "cpu" else data
+    if isinstance(data, dict):
+        return {k: _move_tensors_to_cpu(v) for k, v in data.items()}
+    if isinstance(data, (list, tuple)):
+        moved = [_move_tensors_to_cpu(item) for item in data]
+        if hasattr(type(data), "_fields"):  # namedtuple
+            return type(data)(*moved)
+        return type(data)(moved)
+    return data
+
+
+def _split_batched_output(output: Any, n: int) -> list:
+    """Split a batched output into a list of per-request outputs."""
+    if isinstance(output, list):
+        return output
+    if isinstance(output, torch.Tensor) and output.ndim > 0 and output.shape[0] == n:
+        return list(output.unbind(0))
+    if isinstance(output, np.ndarray) and output.ndim > 0 and output.shape[0] == n:
+        return [output[i] for i in range(output.shape[0])]
+    return [output] if output is not None else []
+
+
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
@@ -143,12 +168,8 @@ class DiffusionEngine:
         # post-processing to avoid device OOM — model weights may still
         # reside on the device and leave no headroom for intermediates.
         output_data = output.output
-        if (
-            self.od_config.enable_cpu_offload
-            and isinstance(output_data, torch.Tensor)
-            and output_data.device.type != "cpu"
-        ):
-            output_data = output_data.cpu()
+        if self.od_config.enable_cpu_offload:
+            output_data = _move_tensors_to_cpu(output_data)
 
         postprocess_start_time = time.perf_counter()
         if self.post_process_func is not None:
@@ -186,7 +207,7 @@ class DiffusionEngine:
         # Convert to OmniRequestOutput format
         # Ensure outputs is a list
         if not isinstance(outputs, list):
-            outputs = [outputs] if outputs is not None else []
+            outputs = _split_batched_output(outputs, len(request.prompts))
 
         metrics = {
             "preprocess_time_ms": preprocess_time * 1000,
@@ -272,15 +293,15 @@ class DiffusionEngine:
                             images=[],
                             prompt=prompt,
                             metrics=metrics,
-                            latents=output.trajectory_latents,
-                            trajectory_latents=output.trajectory_latents,
-                            trajectory_timesteps=output.trajectory_timesteps,
-                            trajectory_log_probs=output.trajectory_log_probs,
-                            trajectory_decoded=output.trajectory_decoded,
+                            latents=output.trajectory_latents if i == 0 else None,
+                            trajectory_latents=output.trajectory_latents if i == 0 else None,
+                            trajectory_timesteps=output.trajectory_timesteps if i == 0 else None,
+                            trajectory_log_probs=output.trajectory_log_probs if i == 0 else None,
+                            trajectory_decoded=output.trajectory_decoded if i == 0 else None,
                             multimodal_output={"audio": request_audio_payload},
                             final_output_type="audio",
-                            stage_durations=output.stage_durations,
-                            peak_memory_mb=output.peak_memory_mb,
+                            stage_durations=output.stage_durations if i == 0 else None,
+                            peak_memory_mb=output.peak_memory_mb if i == 0 else 0.0,
                         ),
                     )
                 else:
@@ -307,15 +328,15 @@ class DiffusionEngine:
                             images=request_outputs,
                             prompt=prompt,
                             metrics=metrics,
-                            latents=output.trajectory_latents,
-                            trajectory_latents=output.trajectory_latents,
-                            trajectory_timesteps=output.trajectory_timesteps,
-                            trajectory_log_probs=output.trajectory_log_probs,
-                            trajectory_decoded=output.trajectory_decoded,
-                            custom_output=custom_output,
+                            latents=output.trajectory_latents if i == 0 else None,
+                            trajectory_latents=output.trajectory_latents if i == 0 else None,
+                            trajectory_timesteps=output.trajectory_timesteps if i == 0 else None,
+                            trajectory_log_probs=output.trajectory_log_probs if i == 0 else None,
+                            trajectory_decoded=output.trajectory_decoded if i == 0 else None,
+                            custom_output=custom_output if i == 0 else {},
                             multimodal_output=mm_output,
-                            stage_durations=output.stage_durations,
-                            peak_memory_mb=output.peak_memory_mb,
+                            stage_durations=output.stage_durations if i == 0 else None,
+                            peak_memory_mb=output.peak_memory_mb if i == 0 else 0.0,
                         ),
                     )
 
