@@ -112,8 +112,10 @@ class OmniVoiceDecoder(nn.Module):
                     quantized.isnan().any().item())
 
         # Project: [B, 1024, T] → fc2 → [B, 256, T]
-        # Cast to fc2 weight dtype to handle float32 RVQ output under fp16/bf16 engine
-        quantized = self.fc2(quantized.transpose(1, 2).to(self.fc2.weight.dtype)).transpose(1, 2)
+        # Cast to fc2 weight dtype (may be fp16 when weights stored as fp16),
+        # then upcast back to float32 — acoustic decoder uses ConvTranspose1d
+        # upsampling whose intermediate values exceed fp16 range (~65504), causing NaN.
+        quantized = self.fc2(quantized.transpose(1, 2).to(self.fc2.weight.dtype)).transpose(1, 2).float()
         logger.info("[DEBUG-DEC] after fc2: shape=%s dtype=%s std=%.4f max_abs=%.4f nan=%s",
                     tuple(quantized.shape), quantized.dtype,
                     quantized.std().item(), quantized.abs().max().item(),
