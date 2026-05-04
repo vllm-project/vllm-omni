@@ -55,13 +55,13 @@ try:
 
     @triton.jit
     def _rms_norm_fwd_kernel(
-        Y_ptr,
-        Y_stride,
-        X_ptr,
-        X_stride,
-        W_ptr,
+        Y_ptr,  # noqa: N803
+        Y_stride,  # noqa: N803
+        X_ptr,  # noqa: N803
+        X_stride,  # noqa: N803
+        W_ptr,  # noqa: N803
         n_cols,
-        eps,  # noqa: N803
+        eps,
         BLOCK_SIZE: tl.constexpr,  # noqa: N803
     ):
         row = tl.program_id(0).to(tl.int64)
@@ -138,15 +138,15 @@ try:
 
     @triton.jit
     def _fused_add_rms_norm_fwd_kernel(
-        Y_ptr,
-        Y_stride,
-        S_ptr,
+        Y_ptr,  # noqa: N803
+        Y_stride,  # noqa: N803
+        S_ptr,  # noqa: N803
         S_stride,  # noqa: N803
-        X_ptr,
-        X_stride,
-        R_ptr,
+        X_ptr,  # noqa: N803
+        X_stride,  # noqa: N803
+        R_ptr,  # noqa: N803
         R_stride,  # noqa: N803
-        W_ptr,
+        W_ptr,  # noqa: N803
         n_cols,
         eps,
         BLOCK_SIZE: tl.constexpr,  # noqa: N803
@@ -433,7 +433,7 @@ class _OmniVoiceCUDAGraphForward:
     dtype-conversion allocation occurs inside the captured region.
     """
 
-    def __init__(self, generator: "OmniVoiceGenerator", capture_sizes: list[int]) -> None:
+    def __init__(self, generator: OmniVoiceGenerator, capture_sizes: list[int]) -> None:
         self._gen = generator
         self._capture_sizes = sorted(capture_sizes)
         self._graphs: dict[tuple[int, int], dict] = {}
