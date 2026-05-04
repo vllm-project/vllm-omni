@@ -11,7 +11,7 @@
         "no-async-chunk": true,
         "tensor-parallel-size": 1,
         "cfg-parallel-size": 1,
-        "gpu-memory-utilization": 0.98,
+        "gpu-memory-utilization": 0.90,
         "max-model-len": 8192,
         "max-num-batched-tokens": 9216
       }
@@ -120,7 +120,7 @@
         "deploy-config": "vllm_omni/deploy/bagel_single_stage.yaml",
         "no-async-chunk": true,
         "tensor-parallel-size": 2,
-        "gpu-memory-utilization": 0.98,
+        "gpu-memory-utilization": 0.90,
         "max-model-len": 8192,
         "max-num-batched-tokens": 9216
       }
