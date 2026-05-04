@@ -10,7 +10,7 @@ steps:
     depends_on: upload-nightly-pipeline
     if: build.env("NIGHTLY") == "1" || build.pull_request.labels includes "nightly-test" || build.pull_request.labels includes "omni-test"
     steps:
-      - label: ":full_moon: Omni · Function Test"
+      - label: ":full_moon: Omni · Function Test with H100"
         timeout_in_minutes: 90
         commands:
           - pytest -s -v tests/e2e/ -m "full_model and H100 and omni" --run-level "full_model" --ignore=tests/e2e/accuracy
@@ -47,6 +47,25 @@ steps:
                     hostPath:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
+
+      - label: ":full_moon: Omni · Function Test with L4"
+        timeout_in_minutes: 90
+        commands:
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - pytest -s -v tests/e2e/*/test_qwen2_5_omni_expansion.py --run-level "core_model"
+        agents:
+          queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              shm-size: "8gb"
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
 
       - label: ":full_moon: Omni · Doc Test with L4"
         timeout_in_minutes: 90
@@ -205,7 +224,7 @@ steps:
         timeout_in_minutes: 90
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-          - pytest -s -v tests/e2e/ -m "full_model and L4 and omni" --run-level "full_model" --ignore=tests/e2e/accuracy
+          - pytest -s -v tests/e2e/ -m "full_model and L4 and omni" -k "not test_qwen2_5" --run-level "full_model" --ignore=tests/e2e/accuracy
         agents:
           queue: "gpu_1_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
         plugins:
@@ -278,7 +297,7 @@ steps:
       - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with H100"
         timeout_in_minutes: 120
         commands:
-          - pytest -sv tests/e2e/ -k "not test_wan and not hunyuan" -m "full_model and diffusion and H100" --run-level "full_model" --ignore=tests/e2e/accuracy
+          - pytest -sv tests/e2e/ -k "not test_wan and not test_bagel_expansion and not hunyuan" -m "full_model and diffusion and H100" --run-level "full_model" --ignore=tests/e2e/accuracy
         agents:
           queue: "mithril-h100-pool"
         plugins:
@@ -313,10 +332,48 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
+      - label: ":full_moon: Diffusion X2I(&A&T) · Bagel Function Test with H100"
+        timeout_in_minutes: 120
+        commands:
+          - pytest -sv tests/e2e/online_serving/test_bagel_expansion.py -m "full_model and diffusion and H100" --run-level "full_model"
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 3
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: hf-cache
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
+
       - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with L4"
         timeout_in_minutes: 60
         commands:
-          - pytest -sv tests/e2e/ -k "not test_wan and not hunyuan" -m "full_model and diffusion and L4" --run-level "full_model" --ignore=tests/e2e/accuracy
+          - pytest -sv tests/e2e/ -k "not test_wan and not test_bagel_expansion and not hunyuan" -m "full_model and diffusion and L4" --run-level "full_model" --ignore=tests/e2e/accuracy
         agents:
           queue: "gpu_4_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
         plugins:
@@ -633,6 +690,53 @@ steps:
                       path: /mnt/hf-cache
                       type: DirectoryOrCreate
 
+      - label: ":full_moon: Diffusion X2V · Perf Test"
+        key: nightly-diffusion-x2v-performance
+        timeout_in_minutes: 180
+        commands:
+          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_wan22_i2v_vllm_omni.json
+            EXIT1=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
+            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            exit $$EXIT1
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 2
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: hf-cache
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
+
   - label: ":bar_chart: Testcase Statistics"
     key: nightly-testcase-statistics
     timeout_in_minutes: 120
@@ -682,6 +786,7 @@ steps:
       - nightly-omni-performance
       - nightly-tts-performance
       - nightly-diffusion-x2iat-performance
+      - nightly-diffusion-x2v-performance
       - nightly-testcase-statistics
     if: build.env("NIGHTLY") == "1"
     commands:
@@ -691,6 +796,7 @@ steps:
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-tts-performance
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance
+      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2v-performance
       - buildkite-agent artifact download "tests/dfx/perf/results/*.html" . --step nightly-testcase-statistics
       - python tools/nightly/generate_nightly_perf_excel.py
       - python tools/nightly/generate_nightly_perf_html.py

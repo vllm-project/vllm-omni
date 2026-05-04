@@ -119,7 +119,7 @@ def _make_runner(req_ids=("r1", "r2"), hidden_size=4):
     runner.text_step = DummyBuffer(torch.zeros((bsz, hidden_size), dtype=torch.float32))
 
     runner.talker_mtp = DummyTalkerMTP()
-    runner.model = SimpleNamespace(talker_mtp_output_key="code_predictor_codes")
+    runner.model = SimpleNamespace(talker_mtp_output_key=("codes", "audio"))
     runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace())
 
     # Provide a minimal implementation that returns the expected 4-tuple.
@@ -188,8 +188,8 @@ def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
     # Validate per-request additional_information_cpu was updated
     info_r1 = runner.requests["r1"].additional_information_cpu
     info_r2 = runner.requests["r2"].additional_information_cpu
-    assert int(info_r1["code_predictor_codes"][0, 0]) == 0
-    assert int(info_r2["code_predictor_codes"][0, 0]) == 1
+    assert int(info_r1["codes"]["audio"][0, 0]) == 0
+    assert int(info_r2["codes"]["audio"][0, 0]) == 1
 
 
 def test_talker_mtp_forward_cpu_empty_batch_noop(monkeypatch):

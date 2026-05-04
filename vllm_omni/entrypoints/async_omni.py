@@ -31,6 +31,7 @@ from vllm_omni.entrypoints.omni_base import (
     OmniBase,
     OmniEngineDeadError,
 )
+from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
     from vllm.tokenizers import TokenizerLike
     from vllm.v1.engine import PauseMode
 
-    from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
+    from vllm_omni.inputs.data import OmniPromptType
 
 logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
@@ -278,7 +279,13 @@ class AsyncOmni(EngineClient, OmniBase):
                 and not isinstance(sampling_params_list, (str, bytes))
             ):
                 sampling_params_list = self._maybe_expand_sampling_params(list(sampling_params_list))
-            sampling_params_list = self.resolve_sampling_params_list(sampling_params_list)
+
+            # Set the output kind to delta output if sampling params were omitted,
+            # since AsyncOmni is typically used for streaming.
+            sampling_params_list = self.resolve_sampling_params_list(
+                sampling_params_list,
+                allow_delta_coercion=True,
+            )
 
             # Track per-request metrics
             wall_start_ts = time.time()
@@ -366,14 +373,14 @@ class AsyncOmni(EngineClient, OmniBase):
         # only check thinker's sampling params now
         stage0_params = sampling_params_list[0]
         self._validate_streaming_input_sampling_params(stage0_params)
-
         req_state = self.request_states[request_id]
+        has_submitted_first_chunk = False
 
+        # NOTE: InputProcessor in vLLM should generally do this too, but for
+        # now we do it defensively. TODO (Alex) ensure clones/copying are optimized
         if not stage0_params.skip_clone:
             stage0_params = stage0_params.clone()
             stage0_params.skip_clone = True
-
-        has_submitted_first_chunk = False
 
         async def handle_inputs() -> None:
             nonlocal has_submitted_first_chunk

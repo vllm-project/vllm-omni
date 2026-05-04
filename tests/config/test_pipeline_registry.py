@@ -6,11 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from vllm_omni.config.pipeline_registry import (
-    _DIFFUSION_PIPELINES,
-    _OMNI_PIPELINES,
-    _VLLM_OMNI_PIPELINES,
-)
+from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
 from vllm_omni.config.stage_config import (
     _PIPELINE_REGISTRY,
     PipelineConfig,
@@ -23,17 +19,9 @@ from vllm_omni.config.stage_config import (
 class TestCentralRegistryDeclarations:
     """Every in-tree pipeline must be declared exactly once in the central registry."""
 
-    def test_union_contains_all_omni(self):
+    def test_omni_entries_visible_in_registry(self):
         for key in _OMNI_PIPELINES:
-            assert key in _VLLM_OMNI_PIPELINES
-
-    def test_union_contains_all_diffusion(self):
-        for key in _DIFFUSION_PIPELINES:
-            assert key in _VLLM_OMNI_PIPELINES
-
-    def test_no_duplicate_model_type_between_omni_and_diffusion(self):
-        overlap = set(_OMNI_PIPELINES) & set(_DIFFUSION_PIPELINES)
-        assert not overlap, f"Duplicate model_types across omni/diffusion: {overlap}"
+            assert key in _PIPELINE_REGISTRY
 
     def test_expected_omni_pipelines_present(self):
         # Guard against accidental removal during future refactors.

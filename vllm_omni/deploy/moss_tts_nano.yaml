@@ -1,0 +1,31 @@
+# MOSS-TTS-Nano deploy: single-stage AR TTS (0.1B).
+# Verified on 1x L4 24GB (and sufficient for H20 / A100 / 3090).
+#
+# Fields omitted from a stage fall back to StageDeployConfig defaults (see
+# vllm_omni/config/stage_config.py). Notable choices:
+#   * enforce_eager=true — the model uses upstream inference_stream() with
+#     trust_remote_code; CUDA graph capture is not wired up.
+#   * gpu_memory_utilization=0.3 — the AR LM + codec fit in ~2 GiB.
+#   * max_num_seqs=4 — mirrors the legacy stage_configs contract; per-request
+#     streaming generators are stored in self._stream_gens.
+#
+# MOSS-TTS-Nano has no multimodal input preprocessing, so skip_mm_profiling
+# bypasses the dummy-MM pass at profile time.
+async_chunk: false
+trust_remote_code: true
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.3
+    enforce_eager: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    skip_mm_profiling: true
+    default_sampling_params:
+      temperature: 1.0
+      top_p: 1.0
+      top_k: 50
+      max_tokens: 4096
+      seed: 42

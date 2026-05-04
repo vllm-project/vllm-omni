@@ -35,7 +35,7 @@ def tokens2audio(
 
     # Pass audio_tokens from generator to decoder
     engine_input = OmniTokensPrompt(
-        prompt_token_ids=output.token_ids,
+        prompt_token_ids=output.cumulative_token_ids,
         additional_information=multi_modal_data,
     )
     return [engine_input]

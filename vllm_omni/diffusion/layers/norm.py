@@ -70,17 +70,33 @@ class RMSNorm(CustomOp):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    def _forward_fused(self, x: torch.Tensor) -> torch.Tensor:
+        from vllm._custom_ops import rms_norm as fused_rms_norm
+
+        orig_shape = x.shape
+        hidden_size = orig_shape[-1]
+        x_2d = x.reshape(-1, hidden_size)
+        out = torch.empty_like(x_2d)
+        fused_rms_norm(out, x_2d, self.weight.data, self.variance_epsilon)
+        return out.reshape(orig_shape)
+
     def forward_cuda(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_native(x)
+        try:
+            return self._forward_fused(x)
+        except Exception:
+            return self.forward_native(x)
 
     def forward_hip(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_native(x)
+        try:
+            return self._forward_fused(x)
+        except Exception:
+            return self.forward_native(x)
 
     def forward_npu(
         self,
@@ -108,3 +124,81 @@ class RMSNorm(CustomOp):
         out = x * torch.rsqrt(variance + self.variance_epsilon)
         out = self.weight.to(torch.float32) * out
         return out.to(input_dtype)
+
+
+class RMSNormVAE(CustomOp):
+    """Root Mean Square Layer Normalization for Channel-First or Last"""
+
+    def __init__(
+        self,
+        dim: int,
+        channel_first: bool = True,
+        images: bool = True,
+        bias: bool = False,
+        epsilon: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        broadcastable_dims = (1, 1, 1) if not images else (1, 1)
+        shape = (dim, *broadcastable_dims) if channel_first else (dim,)
+
+        self.channel_first = channel_first
+        self.scale = dim**0.5
+        self.gamma = nn.Parameter(torch.ones(shape))
+        self.bias = nn.Parameter(torch.zeros(shape)) if bias else None
+        self.epsilon = epsilon
+
+        self.gamma_rmsnorm = None
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.forward_native(x)
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.forward_native(x)
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        import torch_npu
+
+        if self.gamma_rmsnorm is None:
+            self.gamma_rmsnorm = self.gamma.reshape(-1)
+
+        if self.channel_first:
+            x = x.transpose(1, -1)
+            out = torch_npu.npu_rms_norm(x, self.gamma_rmsnorm, epsilon=self.epsilon)[0].transpose(1, -1)
+        else:
+            out = torch_npu.npu_rms_norm(x, self.gamma_rmsnorm, epsilon=self.epsilon)[0]
+
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.forward_native(x)
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        out = (
+            F.normalize(
+                x,
+                dim=(1 if self.channel_first else -1),
+                eps=self.epsilon,
+            )
+            * self.scale
+            * self.gamma
+        )
+        if self.bias is not None:
+            out = out + self.bias
+        return out

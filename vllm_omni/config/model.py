@@ -225,6 +225,12 @@ class OmniModelConfig(ModelConfig):
         new_hf_text_config = self.draw_hf_text_config()
         if new_hf_text_config is not self.hf_text_config:
             self.hf_text_config = new_hf_text_config
+            # Recalculate model_arch_config since it derives head counts,
+            # hidden size, etc. from hf_text_config.  Without this the
+            # FlashAttentionMetadataBuilder uses the wrong num_heads_q /
+            # num_heads_kv (from the thinker) for talker stages, causing
+            # FA3 scheduler_metadata shape mismatches at runtime.
+            self.model_arch_config = self.get_model_arch_config()
             # Recalculate dependent attributes
             self.attention_chunk_size = getattr(self.hf_text_config, "attention_chunk_size", None)
             # Recalculate max_model_len since it depends on hf_text_config

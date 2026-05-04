@@ -14,7 +14,7 @@ import zmq
 from omegaconf import OmegaConf
 from vllm.config import CacheConfig, VllmConfig
 from vllm.logger import init_logger
-from vllm.utils.network_utils import get_open_port, zmq_socket_ctx
+from vllm.utils.network_utils import get_open_ports_list, zmq_socket_ctx
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.utils import (
     STARTUP_POLL_PERIOD_MS,
@@ -120,9 +120,7 @@ class OmniMasterServer:
         for sid in stage_ids:
             self._stage_config_events[sid] = threading.Event()
             self._stage_coordinator_addresses[sid] = StageCoordinatorAddresses()
-            hs_port = get_open_port()
-            inp_port = get_open_port()
-            out_port = get_open_port()
+            hs_port, inp_port, out_port = get_open_ports_list(count=3)
             self._allocations[sid] = StageAllocation(
                 handshake_bind_address=f"tcp://{master_address}:{hs_port}",
                 handshake_connect_address=f"tcp://{master_address}:{hs_port}",
@@ -445,13 +443,22 @@ def _wait_for_omni_engine_startup(
             logger.debug("[omni] HELLO from engine %d", eng_index)
 
         elif status == "READY" and engine.state == CoreEngineState.CONNECTED:
-            num_gpu_blocks = (cache_config.num_gpu_blocks or 0) + msg["num_gpu_blocks"]
-            cache_config.num_gpu_blocks = num_gpu_blocks
+            # Upstream vllm >=0.19 dropped `num_gpu_blocks` from the READY
+            # handshake payload (the field is now communicated out-of-band via
+            # stats/health topics); tolerate both legacy and new message
+            # shapes so the omni handshake keeps working across rebases.
+            reported_blocks = msg.get("num_gpu_blocks")
+            if reported_blocks is not None:
+                cache_config.num_gpu_blocks = (cache_config.num_gpu_blocks or 0) + int(reported_blocks)
             if engine_addresses.frontend_stats_publish_address is None:
                 engine_addresses.frontend_stats_publish_address = msg.get("dp_stats_address")
             start_pending -= 1
             engine.state = CoreEngineState.READY
-            logger.debug("[omni] READY from engine %d (num_gpu_blocks=%d)", eng_index, msg["num_gpu_blocks"])
+            logger.debug(
+                "[omni] READY from engine %d (num_gpu_blocks=%s)",
+                eng_index,
+                "unknown" if reported_blocks is None else reported_blocks,
+            )
 
         else:
             raise RuntimeError(f"[omni] Unexpected status '{status}' from engine {eng_index} in state {engine.state}.")
@@ -462,7 +469,7 @@ def connect_remote_engine_cores(
     vllm_config: VllmConfig,
     omni_master_server: OmniMasterServer,
     stage_id: int,
-) -> Iterator[tuple[None, DPCoordinator | None, EngineZmqAddresses]]:
+) -> Iterator[tuple[None, DPCoordinator | None, EngineZmqAddresses, None]]:
     """Wait for remote engine cores to connect through the omni handshake."""
     addresses = omni_master_server.get_zmq_addresses(stage_id)
     parallel_config = vllm_config.parallel_config
@@ -491,7 +498,7 @@ def connect_remote_engine_cores(
     handshake_bind_address = omni_master_server.get_allocation(stage_id).handshake_bind_address
 
     with zmq_socket_ctx(handshake_bind_address, zmq.ROUTER, bind=True) as handshake_socket:
-        yield None, coordinator, addresses
+        yield None, coordinator, addresses, None
 
         _wait_for_omni_engine_startup(
             handshake_socket,

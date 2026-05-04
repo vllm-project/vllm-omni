@@ -264,6 +264,8 @@ tmp_test
 vllm_omni/_version.py
 # output files
 *.wav
+# Vendored test reference audio (small, intentionally checked in)
+!tests/assets/**/*.wav
 .worktrees/
 # CI overlay yamls materialized from tests/utils.py:_CI_OVERLAYS at test time
 tests/.ci_generated/

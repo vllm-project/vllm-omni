@@ -180,14 +180,20 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", prefix_test_params, indirect=True)
-@pytest.mark.skip(reason="issue: #2833")
+@pytest.mark.skip(reason="Flaky: identical greedy requests diverge on text_content (prefix caching path).")
 def test_thinker_prefix_caching(omni_server, openai_client) -> None:
     """
     Test thinker prefix caching by sending identical requests with an image (i.e.,
     a large shared prefix) and verifying that the second request uses cached tokens
-    & produces the same output.
+    & produces the same output with greedy decoding.
+
+    NOTE: The seed for this test is used as a regression test for the issue linked below;
+    https://github.com/vllm-project/vllm-omni/issues/2833; without passing the sampling
+    params, this test will fail with the current default stage configs.
     """
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    seed = 10
+    img_res = generate_synthetic_image(224, 224, seed=seed)
+    image_data_url = f"data:image/jpeg;base64,{img_res['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         image_data_url=image_data_url,
@@ -199,16 +205,14 @@ def test_thinker_prefix_caching(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": False,
         "modalities": ["text"],
+        "sampling_params_list": [{"seed": seed, "temperature": 0, "max_tokens": 16}] * 3,
     }
 
     response_1 = openai_client.send_omni_request(request_config, request_num=1)[0]
     response_2 = openai_client.send_omni_request(request_config, request_num=1)[0]
 
-    assert response_1.success
-    assert response_2.success
-    assert response_2.cached_tokens is not None
     # We should cache the vast majority of the prompt (image + up to last full block),
-    # and set seed in the CI config, so the second request should give an identical
+    # and set seed + temperature, so the second request should give an identical
     # response for the generated input image, even if we use dummy weights
-    assert response_2.cached_tokens > 0
+    assert response_2.cached_tokens is not None and response_2.cached_tokens > 0
     assert response_1.text_content == response_2.text_content

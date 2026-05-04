@@ -147,7 +147,9 @@ class OmniBenchmarkServingSubcommand(OmniBenchmarkSubcommandBase):
 
         for action in parser._actions:
             if action.dest == "dataset_name" and action.choices is not None:
-                extra = [c for c in ("daily-omni", "seed-tts") if c not in action.choices]
+                extra = [
+                    c for c in ("daily-omni", "seed-tts", "seed-tts-text", "seed-tts-design") if c not in action.choices
+                ]
                 if extra:
                     action.choices = list(action.choices) + extra
 

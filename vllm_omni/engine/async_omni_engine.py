@@ -13,6 +13,7 @@ import dataclasses
 import json
 import os
 import queue
+import sys
 import threading
 import time
 import uuid
@@ -35,6 +36,7 @@ from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config.stage_config import strip_parent_engine_args
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.diffusion_engine import supports_audio_output
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.diffusion.stage_diffusion_proc import (
     complete_diffusion_handshake,
@@ -65,6 +67,7 @@ from vllm_omni.engine.stage_init_utils import (
     StartedLlmStage,
     _inject_inferred_kv_tp_topology,
     acquire_device_locks,
+    acquire_diffusion_device_locks,
     build_diffusion_config,
     build_engine_args_dict,
     build_vllm_config,
@@ -110,6 +113,13 @@ _PARENT_ARGS_KEEP: frozenset[str] = frozenset(
         "worker_extension_cls",
         "allowed_local_media_path",
         "allowed_media_domains",
+        # Legacy stage-config YAMLs may intentionally leave parallel or
+        # distributed knobs unspecified at the stage level and rely on
+        # top-level CLI values to fill them in during the per-stage merge.
+        # Keep these fields so stages that omit them can inherit CLI values,
+        # while stages with explicit YAML values still win because the legacy
+        # stage-config loader prefers stage-local engine args.
+        "tensor_parallel_size",
     }
 )
 
@@ -279,13 +289,16 @@ class AsyncOmniEngine:
 
         logger.info(f"[AsyncOmniEngine] Initializing with model {model}")
 
-        # Merge typed engine_args fields into kwargs; explicit kwargs take priority.
+        # Merge tracked engine_args fields into kwargs; explicit kwargs take priority.
         if engine_args is not None:
-            ea_dict = {
-                f.name: getattr(engine_args, f.name)
-                for f in dataclasses.fields(engine_args)
-                if not f.name.startswith("_")
-            }
+            if not hasattr(engine_args, "_explicit_fields"):
+                raise TypeError(
+                    "engine_args=OmniEngineArgs(...) is ambiguous under "
+                    "sentinel-default precedence. Use "
+                    "OmniEngineArgs.create(**explicit) or pass explicit kwargs "
+                    "directly."
+                )
+            ea_dict = engine_args.explicit_kwargs()
             # Remove model since it is passed as a positional arg already.
             ea_dict.pop("model", None)
             kwargs = {**ea_dict, **kwargs}
@@ -349,6 +362,7 @@ class AsyncOmniEngine:
             name="orchestrator",
         )
         self.orchestrator_thread.start()
+
         self._wait_for_orchestrator_init(startup_future, startup_timeout)
 
         # Stage runtime fields are assigned directly on self by the bootstrap thread.
@@ -515,7 +529,8 @@ class AsyncOmniEngine:
                 stage_id=metadata.stage_id,
             )
             logger.info("[AsyncOmniEngine] Stage %s remote engine handshake started", metadata.stage_id)
-            with launch_cm as (engine_manager, coordinator, addresses):
+            (engine_manager, coordinator, addresses, _tensor_queue) = launch_cm.__enter__()
+            try:
                 started_stage = StartedLlmStage(
                     stage_id=metadata.stage_id,
                     metadata=metadata,
@@ -525,6 +540,11 @@ class AsyncOmniEngine:
                     coordinator=coordinator,
                     addresses=addresses,
                 )
+            except BaseException:
+                if not launch_cm.__exit__(*sys.exc_info()):
+                    raise
+            else:
+                launch_cm.__exit__(None, None, None)
             logger.info("[AsyncOmniEngine] Stage %s remote engine startup completed", metadata.stage_id)
             assert started_stage is not None
             return started_stage
@@ -538,11 +558,14 @@ class AsyncOmniEngine:
         stage_cfg: Any,
         metadata: Any,
         omni_master_server: OmniMasterServer,
+        stage_init_timeout: int,
     ) -> StageDiffusionClient:
         """Launch a local diffusion stage on OmniMasterServer-allocated sockets."""
         proc = None
+        lock_fds: list[int] = []
         try:
             od_config = build_diffusion_config(self.model, stage_cfg, metadata)
+            lock_fds = acquire_diffusion_device_locks(metadata.stage_id, od_config, stage_init_timeout)
             handshake_address, request_address, response_address = register_stage_with_omni_master(
                 omni_master_address=omni_master_server.address,
                 omni_master_port=omni_master_server.port,
@@ -561,7 +584,7 @@ class AsyncOmniEngine:
                 request_address=request_address,
                 response_address=response_address,
             )
-            complete_diffusion_handshake(proc, handshake_address)
+            complete_diffusion_handshake(proc, handshake_address, stage_init_timeout)
             logger.info(
                 "[AsyncOmniEngine] Stage %s diffusion startup completed",
                 metadata.stage_id,
@@ -577,6 +600,9 @@ class AsyncOmniEngine:
             if proc is not None:
                 terminate_alive_proc(proc)
             raise
+        finally:
+            if lock_fds:
+                release_device_locks(lock_fds)
 
     def _create_remote_diffusion_stage(
         self,
@@ -782,6 +808,7 @@ class AsyncOmniEngine:
                                         stage_cfg,
                                         metadata,
                                         self._omni_master_server,
+                                        stage_init_timeout,
                                     )
                                 else:
                                     use_inline = True if self.num_stages == 1 else False
@@ -1029,6 +1056,7 @@ class AsyncOmniEngine:
         original_prompt = prompt
 
         stage_type = self.stage_metadata[0].get("stage_type")
+        _preprocess_ms = 0.0
         if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
             # Inject global_request_id into the raw prompt.
             if isinstance(prompt, dict):
@@ -1038,6 +1066,7 @@ class AsyncOmniEngine:
                     _inject_global_id(item, request_id)
 
             # Full input processing (tokenization, multimodal, etc.)
+            _t_preprocess = time.perf_counter()
             request = self.input_processor.process_inputs(
                 request_id=request_id,
                 prompt=prompt,
@@ -1051,6 +1080,7 @@ class AsyncOmniEngine:
                 data_parallel_rank=data_parallel_rank,
                 resumable=resumable,
             )
+            _preprocess_ms = (time.perf_counter() - _t_preprocess) * 1000.0
             # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
             # additional_information field in the prompt.
             request = _upgrade_to_omni_request(request, prompt)
@@ -1087,6 +1117,8 @@ class AsyncOmniEngine:
             "original_prompt": original_prompt,
             "sampling_params_list": effective_sampling_params_list,
             "final_stage_id": final_stage_id,
+            "preprocess_ms": _preprocess_ms,
+            "enqueue_ts": time.perf_counter(),
         }
 
     def _enqueue_cfg_companions(
@@ -1238,6 +1270,8 @@ class AsyncOmniEngine:
         if not isinstance(default_sampling_params, dict):
             default_sampling_params = None
         stage_default_sampling_params = default_sampling_params.get("0", {}) if default_sampling_params else {}
+        if normalized_kwargs.get("dtype") is None:
+            normalized_kwargs["dtype"] = "auto"
 
         # TODO: hack, convert dtype to string to avoid non-premitive omegaconf create error.
         if "dtype" in normalized_kwargs and not isinstance(normalized_kwargs["dtype"], str):
@@ -1261,9 +1295,12 @@ class AsyncOmniEngine:
             ring_degree = normalized_kwargs.get("ring_degree") or 1
             ulysses_mode = normalized_kwargs.get("ulysses_mode") or "strict"
             sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
+            pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
+            data_parallel_size = normalized_kwargs.get("data_parallel_size") or 1
             tensor_parallel_size = normalized_kwargs.get("tensor_parallel_size") or 1
             cfg_parallel_size = normalized_kwargs.get("cfg_parallel_size") or 1
             vae_patch_parallel_size = normalized_kwargs.get("vae_patch_parallel_size") or 1
+            enable_expert_parallel = normalized_kwargs.get("enable_expert_parallel") or False
             use_hsdp = normalized_kwargs.get("use_hsdp", False)
             hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
             hsdp_replicate_size = normalized_kwargs.get("hsdp_replicate_size", 1)
@@ -1271,9 +1308,10 @@ class AsyncOmniEngine:
                 sequence_parallel_size = ulysses_degree * ring_degree
 
             parallel_config = DiffusionParallelConfig(
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
+                pipeline_parallel_size=pipeline_parallel_size,
+                data_parallel_size=data_parallel_size,
                 tensor_parallel_size=tensor_parallel_size,
+                enable_expert_parallel=enable_expert_parallel,
                 sequence_parallel_size=sequence_parallel_size,
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
@@ -1287,6 +1325,8 @@ class AsyncOmniEngine:
 
         num_devices = max(1, int(parallel_config.world_size))
         devices = ",".join(str(i) for i in range(num_devices))
+        model_class_name = kwargs.get("model_class_name", None)
+        final_output_type = "audio" if model_class_name and supports_audio_output(model_class_name) else "image"
 
         stage_engine_args = {
             "max_num_seqs": 1,
@@ -1300,7 +1340,7 @@ class AsyncOmniEngine:
             "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
-            "enforce_eager": kwargs.get("enforce_eager", False),
+            "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
@@ -1311,6 +1351,7 @@ class AsyncOmniEngine:
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
+            "enable_ar_profiler": kwargs.get("enable_ar_profiler", False),
             **(
                 {
                     "profiler_config": asdict(kwargs["profiler_config"])
@@ -1342,7 +1383,7 @@ class AsyncOmniEngine:
                 "engine_args": stage_engine_args,
                 "default_sampling_params": stage_default_sampling_params,
                 "final_output": True,
-                "final_output_type": "image",
+                "final_output_type": final_output_type,
             }
         ]
         default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"
@@ -1388,10 +1429,7 @@ class AsyncOmniEngine:
         stage_configs_path = kwargs.get("stage_configs_path", None)
         deploy_config_path = kwargs.pop("deploy_config", None)
         stage_overrides_json = kwargs.pop("stage_overrides", None)
-        # Set of CLI keys the user actually typed; ``None`` means we have no
-        # parser-level info (e.g. programmatic Omni() call) and the lower
-        # layers should treat all kwargs as explicit.
-        cli_explicit_keys = kwargs.pop("_cli_explicit_keys", None)
+        kwargs.pop("_cli_explicit_keys", None)
         explicit_stage_configs = kwargs.pop("stage_configs", None)
         if explicit_stage_configs is not None:
             logger.warning(
@@ -1424,7 +1462,6 @@ class AsyncOmniEngine:
             default_stage_cfg_factory=lambda: self._create_default_diffusion_stage_cfg(kwargs),
             deploy_config_path=deploy_config_path,
             stage_overrides=stage_overrides,
-            cli_explicit_keys=cli_explicit_keys,
         )
 
         # Inject diffusion LoRA-related knobs from kwargs if not present in the stage config.
@@ -1438,8 +1475,6 @@ class AsyncOmniEngine:
                         cfg.engine_args.enable_sleep_mode = global_sleep_mode
                 if getattr(cfg, "stage_type", None) != "diffusion":
                     continue
-                if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
-                    cfg.engine_args = OmegaConf.create({})
                 if kwargs.get("lora_path") is not None:
                     if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
                         cfg.engine_args.lora_path = kwargs["lora_path"]
@@ -1457,6 +1492,21 @@ class AsyncOmniEngine:
                         or cfg.engine_args.quantization_config is None
                     ):
                         cfg.engine_args.quantization_config = quantization_config
+                # Inject profiler flags for diffusion stages
+                for profiler_key in (
+                    "enable_diffusion_pipeline_profiler",
+                    "enable_ar_profiler",
+                ):
+                    val = kwargs.get(profiler_key)
+                    if val:
+                        if not hasattr(cfg.engine_args, profiler_key) or not getattr(
+                            cfg.engine_args, profiler_key, False
+                        ):
+                            setattr(cfg.engine_args, profiler_key, val)
+                quantization = kwargs.get("quantization")
+                if quantization is not None:
+                    if not hasattr(cfg.engine_args, "quantization") or cfg.engine_args.quantization is None:
+                        cfg.engine_args.quantization = quantization
             except Exception as e:
                 logger.warning("Failed to inject LoRA config for stage: %s", e)
 

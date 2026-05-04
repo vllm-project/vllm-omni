@@ -82,8 +82,8 @@ def generator2tokenizer_async_chunk(
     if length <= 0:
         if finished:
             return {
-                "code_predictor_codes": [],
-                "finished": torch.tensor(True, dtype=torch.bool),
+                "codes": {"audio": []},
+                "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
             }
         return None
 
@@ -105,6 +105,6 @@ def generator2tokenizer_async_chunk(
     code_predictor_codes = torch.tensor(window_frames).reshape(-1).tolist()
 
     return {
-        "code_predictor_codes": [int(ctx_frames)] + [int(context_length)] + code_predictor_codes,
-        "finished": torch.tensor(finished, dtype=torch.bool),
+        "codes": {"audio": [int(ctx_frames)] + [int(context_length)] + code_predictor_codes},
+        "meta": {"finished": torch.tensor(finished, dtype=torch.bool)},
     }

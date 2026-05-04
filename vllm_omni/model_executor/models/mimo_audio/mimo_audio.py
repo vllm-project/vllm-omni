@@ -799,7 +799,7 @@ class MiMoAudioForConditionalGeneration(
 
             return OmniOutput(
                 text_hidden_states=text_hidden_states.reshape(-1, text_hidden_states.shape[-1]),
-                multimodal_outputs={"code_predictor_codes": next_speech_tokens},
+                multimodal_outputs={"codes": {"audio": next_speech_tokens}},
             )
 
         if self.model_stage == "code2wav":

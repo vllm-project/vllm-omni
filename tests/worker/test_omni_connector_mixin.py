@@ -891,9 +891,8 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
     def test_rank0_only_polls_connector_for_tp_async_chunk(self):
         host = self._make_host(rank=0)
         payload = {
-            "code_predictor_codes": [10, 11],
-            "left_context_size": 0,
-            "finished": torch.tensor(False),
+            "codes": {"audio": [10, 11]},
+            "meta": {"left_context_size": 0, "finished": torch.tensor(False)},
         }
         host._omni_connector.get.return_value = (payload, 123)
         tp_group = _FakeTPGroup(world_size=2, rank_in_group=0)
@@ -1165,9 +1164,8 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
 
         host._omni_connector.get.return_value = (
             {
-                "code_predictor_codes": [20, 21, 22],
-                "left_context_size": 0,
-                "finished": torch.tensor(False),
+                "codes": {"audio": [20, 21, 22]},
+                "meta": {"left_context_size": 0, "finished": torch.tensor(False)},
             },
             1,
         )

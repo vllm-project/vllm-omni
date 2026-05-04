@@ -13,6 +13,7 @@ import multiprocessing as mp
 import os
 from collections.abc import Iterable
 from contextlib import AbstractContextManager, nullcontext
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -21,6 +22,7 @@ from vllm.config import CompilationConfig, DeviceConfig, VllmConfig, set_current
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
+from vllm.transformers_utils.config import get_config, get_hf_text_config
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import GiB_bytes
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -120,6 +122,20 @@ class DiffusionWorker:
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         vllm_config.parallel_config.enable_expert_parallel = self.od_config.parallel_config.enable_expert_parallel
         vllm_config.profiler_config = self.od_config.profiler_config
+        try:
+            hf_config = get_config(self.od_config.model, trust_remote_code=self.od_config.trust_remote_code)
+        except ValueError:
+            hf_config = None
+            logger.info("Skipping hf_config loading for diffusion model %r", self.od_config.model_class_name)
+        hf_text_config = get_hf_text_config(hf_config) if hf_config is not None else None
+        vllm_config.model_config = SimpleNamespace(
+            hf_config=hf_config,
+            hf_text_config=hf_text_config,
+            enforce_eager=self.od_config.enforce_eager,
+            dtype=self.od_config.dtype,
+            enable_return_routed_experts=False,
+        )
+        vllm_config.quant_config = self.od_config.quantization_config
         self.vllm_config = vllm_config
 
         # Initialize distributed environment

@@ -12,15 +12,15 @@ Supports multiple backends:
     - v1/videos: Use /v1/videos endpoint
 
 Usage:
-    # Video (vllm-omni backend)
+    # Video (v1/videos backend)
     t2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend vllm-omni --dataset vbench --task t2v --num-prompts 10 \
+        --backend v1/videos --dataset vbench --task t2v --num-prompts 10 \
         --height 480 --width 640 --fps 16 --num-frames 80
 
     i2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend vllm-omni --dataset vbench --task i2v --num-prompts 10
+        --backend v1/videos --dataset vbench --task i2v --num-prompts 10
 
 
     # Image (vllm-omni backend)
@@ -49,7 +49,7 @@ Usage:
         --backend openai --dataset vbench --task t2i --num-prompts 10 \
         --height 1024 --width 1024 --port 3000
 
-    # Video (v1/vedeos)
+    # Video (v1/videos)
     t2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
         --backend v1/videos --dataset random --task t2v --num-prompts 1 \

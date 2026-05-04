@@ -24,6 +24,7 @@
 import math
 import os
 from collections.abc import Iterable, Mapping, Sequence
+from functools import lru_cache
 from typing import Annotated, Literal
 
 import torch
@@ -103,6 +104,15 @@ logger = init_logger(__name__)
 # === Multimodal Processing ===
 
 
+@lru_cache(maxsize=1)
+def _load_cached_glm_image_processor(processor_path: str, trust_remote_code: bool) -> GlmImageProcessor:
+    """Cache GLM-Image processor loading to avoid repeated from_pretrained cost."""
+    return GlmImageProcessor.from_pretrained(
+        processor_path,
+        trust_remote_code=trust_remote_code,
+    )
+
+
 class GlmImagePixelInputs(TensorSchema):
     """
     Schema for GLM-Image pixel inputs.
@@ -177,11 +187,22 @@ class GlmImageProcessingInfo(BaseProcessingInfo):
             if not os.path.exists(processor_path):
                 processor_path = model_path
 
-        # Load processor directly from the correct path
-        return GlmImageProcessor.from_pretrained(
-            processor_path,
-            trust_remote_code=self.ctx.model_config.trust_remote_code,
-            **kwargs,
+        trust_remote_code = self.ctx.model_config.trust_remote_code
+
+        # Keep dynamic override behavior when kwargs are provided, but use a
+        # cached instance for the default path to reduce per-request overhead.
+        # Default path (without kwargs): high frequency, stable, safely reuse cache;
+        # with kwargs: maintain precise semantics, construct instantly per call, avoid mismatch risk.
+        if kwargs:
+            return GlmImageProcessor.from_pretrained(
+                processor_path,
+                trust_remote_code=trust_remote_code,
+                **kwargs,
+            )
+
+        return _load_cached_glm_image_processor(
+            processor_path=processor_path,
+            trust_remote_code=trust_remote_code,
         )
 
     def get_data_parser(self) -> GlmImageDataParser:
@@ -329,6 +350,13 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
     - Prompt construction with image placeholders
     - Grid dimension calculation for M-RoPE position encoding
     """
+
+    def _cached_apply_hf_processor(self, inputs, timing_ctx):
+        # i2i: prompt text must be modified based on mm data presence,
+        # and grid computation requires all images together — bypass cache.
+        if inputs.mm_data_items.get_all_counts().get("image", 0) > 0:
+            return self._apply_hf_processor(inputs, timing_ctx)
+        return super()._cached_apply_hf_processor(inputs, timing_ctx)
 
     def _call_hf_processor(
         self,
@@ -678,7 +706,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
             try:
                 mrope_grid_thw = self._build_generation_grids(hf_processor_mm_kwargs)
                 mm_processed_data["mrope_image_grid_thw"] = mrope_grid_thw
-                logger.info(
+                logger.debug(
                     "_apply_hf_processor_main t2i: mrope_image_grid_thw=%s",
                     mrope_grid_thw.tolist(),
                 )
@@ -786,7 +814,7 @@ class GlmImageMultiModalProcessor(BaseMultiModalProcessor[GlmImageProcessingInfo
         hf_config = self.info.get_hf_config()
         image_token_id = getattr(hf_config, "image_token_id", 167855)
         image_token_count = prompt_ids.count(image_token_id)
-        logger.info(
+        logger.debug(
             "_apply_hf_processor_main i2i(HF): num_images=%s, prompt_len=%s, image_token_count=%s, "
             "source_grid_shape=%s, mrope_grid_shape=%s",
             num_images,
@@ -2321,13 +2349,13 @@ class GlmImageModel(nn.Module):
                 upsampled_token_ids.append(tokens_upsampled.view(-1))
 
             prior_token_image_ids_info = {
-                "prior_token_image_ids": upsampled_token_ids,
+                "ids": {"prior_image": upsampled_token_ids},
                 "image_grid_thw": image_grid_thw.tolist(),
             }
 
             # Debug: log prior_token_image_ids_info
             shapes = [t.shape for t in upsampled_token_ids]
-            logger.info(
+            logger.debug(
                 f"[GlmImageModel.forward] Built prior_token_image_ids_info: "
                 f"num_images={len(upsampled_token_ids)}, shapes={shapes}, "
                 f"image_grid_thw={image_grid_thw.tolist()}"
@@ -2533,13 +2561,11 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         # image_grid_thw is NOT included because:
         # 1. vLLM's pooling_output expects dict[str, torch.Tensor], not mixed types
         # 2. ar2diffusion doesn't need it - the grid info is already encoded in tensor shape
-        prior_token_info = {
-            "prior_token_image_ids": upsampled_token_ids,
-        }
+        prior_token_info = {"ids": {"prior_image": upsampled_token_ids}}
 
         # Debug: log prior_token_info
         shapes = [t.shape for t in upsampled_token_ids]
-        logger.info(
+        logger.debug(
             f"[_process_image_input] Built prior_token_info: "
             f"num_images={len(upsampled_token_ids)}, shapes={shapes}, "
             f"image_grid_thw={image_grid_thw.tolist()}"
@@ -2607,8 +2633,10 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         # Cache prior_token_info for retrieval in forward()
         # This is needed because vLLM doesn't pass pixel_values to forward
         self._prior_token_cache = prior_token_info
+        prior_image_ids = prior_token_info.get("ids", {}).get("prior_image", [])
         logger.debug(
-            f"embed_multimodal: cached prior_token_info with {len(prior_token_info['prior_token_image_ids'])} images"
+            "embed_multimodal: cached prior_token_info with %s images",
+            len(prior_image_ids),
         )
 
         return tuple(image_embeddings)

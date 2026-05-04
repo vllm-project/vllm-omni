@@ -1,20 +1,93 @@
 # Adding a TTS Model
 
-This guide walks through adding a new TTS model to vLLM-Omni, using **Qwen3-TTS**
-as a reference. Qwen3-TTS demonstrates the standard two-stage TTS pipeline and the
-key optimizations all TTS models in this repo should follow.
+This guide walks through adding a new TTS model to vLLM-Omni. Two patterns are
+supported:
+
+- **Two-stage pipeline** (e.g. Qwen3-TTS, Fish Speech): an AR code-predictor stage
+  feeds an audio decoder stage via the `async_chunk` framework. This is the standard
+  pattern for maximum streaming performance.
+- **Single-stage AR model** (e.g. MOSS-TTS-Nano): the model runs entirely inside one
+  AR worker and streams audio chunks directly from its own `inference_stream()` generator.
+
+Qwen3-TTS is used as the reference for the two-stage pattern. For the single-stage
+pattern, refer to MOSS-TTS-Nano.
 
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Directory Structure](#directory-structure)
-3. [Step-by-Step Implementation](#step-by-step-implementation)
-4. [Key Components](#key-components)
-5. [Model Registration](#model-registration)
-6. [Stage Configuration](#stage-configuration)
-7. [Stage Input Processors](#stage-input-processors)
-8. [Testing](#testing)
-9. [Summary](#summary)
+2. [Cross-Cutting Invariants](#cross-cutting-invariants)
+3. [Directory Structure](#directory-structure)
+4. [Step-by-Step Implementation](#step-by-step-implementation)
+5. [Key Components](#key-components)
+6. [Model Registration](#model-registration)
+7. [Stage Configuration](#stage-configuration)
+8. [Stage Input Processors](#stage-input-processors)
+9. [Online Serving Integration](#online-serving-integration)
+10. [Single-Stage Models](#single-stage-models)
+11. [Testing](#testing)
+12. [Pre-commit and DCO](#pre-commit-and-dco)
+13. [Summary](#summary)
+
+## Cross-Cutting Invariants
+
+These rules apply to every TTS model regardless of architecture (AR vs AR+diffusion,
+single-stage vs two-stage, codec-based vs VAE-based). Each has surfaced as a silent
+bug in a shipped PR — check them at the end of every phase, not just at the start.
+
+**I1. Streaming output contract.** Pick one per-step semantics for `forward()` and
+document it in the docstring:
+
+- *Delta*: yield only new audio samples produced this step. Preferred — linear cost.
+- *Cumulative*: re-decode from step 0 every call. O(N²); only acceptable when the
+  codec exposes no streaming decode.
+
+If you choose delta, audit the full chain: `forward()` returns the new chunk →
+`_consolidate_multimodal_tensors()` in `vllm_omni/engine/output_processor.py`
+concatenates the audio key into a single tensor at finish → streaming consumers
+receive per-step chunks, offline consumers receive the concatenated tensor. A
+mismatch (consolidator skips the key with `continue`, or consumers expect a list
+but receive a tensor) is invisible in offline RTF benchmarks — users hear replays
+or truncation only under live playback.
+
+**I2. Multimodal output consumer hygiene.** `outputs[0].outputs[0].multimodal_output[key]`
+can be `Tensor`, `list[Tensor]` (pre-consolidation snapshot), `np.ndarray`, or
+scalar. In every test, example, and benchmark:
+
+- Never write `dict.get("a") or dict.get("b")` on tensor values — Python evaluates
+  the tensor's truthiness and raises `Boolean value of Tensor with more than one
+  value is ambiguous`. Use explicit `if x is None` chains.
+- Defensively handle the list form:
+  `if isinstance(x, list): x = torch.cat([t.reshape(-1) for t in x], dim=0)`.
+- Assert `shape` / `dtype` / `duration` explicitly — do not rely on truthiness for
+  presence checks.
+
+**I3. Hot-loop GPU discipline.** Inside any per-step model loop (AR decode,
+diffusion solver, CFM Euler step, per-frame vocoder):
+
+- No `tensor.item()`, `.cpu()`, or `.tolist()` — each triggers a GPU→CPU sync; a
+  10-step × 60-frame × 4-op loop creates 2400 syncs per request.
+- Prefer `dst.copy_(src)` over `dst.fill_(src.item())` for scalar-into-buffer writes.
+- Whole-model `torch.compile(Model.forward, fullgraph=False)` usually outperforms
+  per-submodule compile — fewer dispatch boundaries, larger fusion regions. Measure
+  before choosing granularity.
+- No Python control flow that depends on tensor values; use `torch.where` or masking.
+
+Profile before optimizing.
+
+**I4. Validation pyramid.** Offline RTF alone is necessary but not sufficient. A
+new TTS model must pass all three levels:
+
+| Layer | Catches | Tool |
+|-------|---------|------|
+| Offline RTF / duration | Throughput regressions, missing audio, wrong sample rate | `end2end.py`, pytest e2e |
+| Browser streaming playback | Delta-vs-cumulative bugs, chunk boundary glitches, TTFP regressions | Gradio demo over `/v1/audio/speech?stream=true` |
+| Concurrent requests | Per-request state leaks, codec window round-robin gaps | `max_num_seqs>1` smoke with 4+ parallel prompts |
+
+**I5. Per-request state belongs to the request.** If the model caches anything
+across `forward()` calls (streaming generators, codec buffers, sliding-window pads,
+CUDA graph state), key it by `info.get("_omni_req_id")` and free the entry on
+request finish. A shared buffer silently corrupts audio across concurrent requests —
+the symptom is crosstalk or truncation under load, nothing in single-request tests.
 
 ## Overview
 
@@ -556,6 +629,302 @@ Recommended test cases for a new TTS model:
 
 Reference test: `tests/model_executor/stage_input_processors/test_qwen3_tts_async_chunk.py`
 
+### E2E Online Serving Tests (`tests/e2e/online_serving/test_<your_model>.py`)
+
+The `omni_server` fixture in `tests/conftest.py` is **module-scoped**. Each distinct
+`OmniServerParams` id in the same test file forces the fixture to tear the server
+down and spawn a new one mid-module. A few rules that save real CI debugging time:
+
+- **Prefer a single `OmniServerParams` set per file.** If you need to exercise two
+  deploy variants (e.g. `model.yaml` and `model_async_chunk.yaml`), either use one
+  variant and exercise streaming via request args, or split into two test files so
+  each file does exactly one server lifecycle. Mid-module teardown/restart is the
+  fragile path and surfaces startup races first.
+- **Never depend on server-side fetching of external URLs** for reference audio or
+  other fixture data. CI runners (and China-hosted dev boxes) routinely fail on
+  SSL/DNS for public URLs. Inline the payload as a `data:audio/wav;base64,...`
+  ref_audio value — the serving layer accepts both forms.
+- **Don't roll your own readiness probe.** The harness already waits for HTTP 200
+  on `/health` before releasing the server to the test. If your model needs extra
+  warmup signals, expose them through `/health` rather than adding `time.sleep(...)`
+  inside the test. (Bare TCP `connect_ex` probes were insufficient; see
+  `tests/conftest.py` `OmniServer.wait_for_ready`.)
+- **Use `core_model` marker + H100 hardware_test** to match the `test-ready.yml`
+  pipeline so your test is picked up by the `ready` label, not only nightly.
+
+## Online Serving Integration
+
+To expose your model through the `/v1/audio/speech` OpenAI-compatible endpoint, add
+**all five** of the following integration points to
+`vllm_omni/entrypoints/openai/serving_speech.py` in a **single commit**. Adding them
+piecemeal causes partial-integration failures that are hard to debug.
+
+### 1. Stage constant
+
+Near the top of the file, alongside the other `_*_TTS_MODEL_STAGES` constants:
+
+```python
+_YOUR_MODEL_TTS_MODEL_STAGES = {"your_model_stage_key"}
+```
+
+### 2. Union into `_TTS_MODEL_STAGES`
+
+Add to the `_TTS_MODEL_STAGES` set union:
+
+```python
+_TTS_MODEL_STAGES: set[str] = (
+    ...
+    | _YOUR_MODEL_TTS_MODEL_STAGES
+)
+```
+
+### 3. Model type detection
+
+In `_detect_tts_model_type()`, add before the final `return None`:
+
+```python
+if model_stage in _YOUR_MODEL_TTS_MODEL_STAGES:
+    return "your_model"
+```
+
+### 4. Request validation dispatch
+
+In `_validate_tts_request()`, add before the fallback `return`:
+
+```python
+if self._tts_model_type == "your_model":
+    return self._validate_your_model_request(request)
+```
+
+### 5. Validation and parameter-builder methods
+
+Add two new methods:
+
+```python
+def _validate_your_model_request(
+    self, request: OpenAICreateSpeechRequest
+) -> str | None:
+    """Validate YourModel request. Returns an error string or None."""
+    if not request.input or not request.input.strip():
+        return "Input text cannot be empty"
+    return None
+
+def _build_your_model_params(
+    self, request: OpenAICreateSpeechRequest
+) -> dict[str, Any]:
+    """Build additional_information dict for YourModel."""
+    params: dict[str, Any] = {"text": [request.input]}
+    if request.voice is not None:
+        params["voice"] = [request.voice]
+    # Add any other model-specific fields here
+    return params
+```
+
+Then wire `_build_your_model_params` into the request-dispatch block in
+`_create_tts_request()` (search for the equivalent `_build_*_params` call for an
+existing model to find the right location). If the model supports voice cloning
+(`ref_audio` → `prompt_audio_path`, `ref_text` → `prompt_text`), add those mappings
+here too — follow any existing `_build_<model>_params` in `serving_speech.py` (e.g.
+`_build_moss_tts_params` for the voice-cloning variant) for the pattern.
+
+> **Two dispatch patterns coexist:** Fish Speech uses a `self._is_fish_speech` boolean
+> checked *before* `elif self._is_tts`. All newer models use the `_tts_model_type`
+> string pattern shown above. For new models, always use the string pattern — do not
+> add new `_is_*` boolean flags.
+
+> **Note on unused variables:** Only extract parameters in `_build_your_model_params`
+> that you actually pass to the model's generate / `inference_stream` call. Extracting
+> a variable without forwarding it will trigger a `ruff F841` pre-commit failure.
+
+### Merge conflicts
+
+`serving_speech.py` is modified by every new model PR and is the most common source of
+rebase conflicts. When rebasing onto `main` and a conflict appears here, the resolution
+is always to **keep both** the upstream model's additions and your own — never discard
+either side. After resolving:
+
+```bash
+git add vllm_omni/entrypoints/openai/serving_speech.py
+git rebase --continue
+```
+
+## Single-Stage Models
+
+Some TTS models (e.g. MOSS-TTS-Nano) do not use a two-stage pipeline. Instead the
+entire AR LM and audio decoder run inside a single AR worker, streaming audio chunks
+directly from the model's own generator.
+
+### Directory structure
+
+```
+vllm_omni/model_executor/models/your_model_name/
+    __init__.py
+    modeling_your_model_name.py    # unified class: load_weights + forward + streaming
+
+vllm_omni/model_executor/stage_configs/your_model_name.yaml
+```
+
+No stage input processor is needed.
+
+### Stage config
+
+Use a single stage with `worker_type: ar`. The `is_comprehension: true` field and the
+top-level `async_chunk: false` are required — omitting them causes silent
+misclassification in the serving layer. Set `max_num_seqs` to at least 4 for
+concurrent production use.
+
+```yaml
+# stage_configs/your_model_name.yaml
+async_chunk: false
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true          # required for serving_speech.py dispatch
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: your_model_stage_key
+      model_arch: YourModelForCausalLM
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      engine_output_type: audio
+      max_num_seqs: 4               # min 4 for concurrent requests; default 1 causes gaps
+    final_output: true
+    final_output_type: audio
+```
+
+### Generator-based streaming pattern
+
+This is the MOSS-TTS-Nano pattern, distinct from VoxCPM2's vLLM-native AR pattern
+(see `plan/voxcpm2_native_ar_design.md` for that variant). Load model weights in
+`load_weights()` (not `__init__`) so vLLM finishes distributed initialisation before
+any CUDA allocations. Stream via a per-request generator stored in an instance dict:
+
+```python
+class YourModelForCausalLM(nn.Module):
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        self._lm: nn.Module | None = None          # populated in load_weights()
+        self._stream_gens: dict[str, Any] = {}     # request_key → generator
+
+    def load_weights(self, weights):
+        # Load self._lm here, after vLLM distributed init
+        ...
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        runtime_additional_information: list[dict] | None = None,  # one dict per request
+        **kwargs,
+    ) -> OmniOutput:
+        infos = runtime_additional_information or [{}]
+        # Return empty output during dummy/profiling calls
+        if not runtime_additional_information or all(i.get("_is_dummy") for i in infos):
+            self._ar_emit_stop_token = True
+            return OmniOutput(...)
+
+        outputs, last_flags = [], []
+        for info in infos:
+            request_key = str(info.get("_omni_req_id", "0"))  # set by vLLM, not user code
+            if request_key not in self._stream_gens:
+                self._stream_gens[request_key] = self._create_stream_gen(info)
+            try:
+                chunk, is_last = next(self._stream_gens[request_key])
+            except StopIteration:
+                chunk, is_last = torch.zeros(0), True
+            if is_last:
+                del self._stream_gens[request_key]
+            outputs.append(chunk)
+            last_flags.append(is_last)
+
+        self._ar_emit_stop_token = all(last_flags)
+        return OmniOutput(multimodal_outputs={"model_outputs": outputs, "is_last": last_flags})
+
+    def _create_stream_gen(self, info: dict):
+        """Yield (waveform_tensor, is_last) from the model's inference_stream().
+
+        Handle both incremental ("audio" events) and batch ("result" event) models:
+        some upstream implementations emit one "result" event with the full waveform
+        instead of incremental "audio" events. Both paths must be covered.
+        """
+        for event in self._lm.inference_stream(...):
+            if event["type"] == "audio":
+                yield event["waveform"], False
+            elif event["type"] == "result":
+                # Fallback for models that don't emit incremental audio events
+                yield event.get("waveform", torch.zeros(0)), True
+                return
+        yield torch.zeros(0), True
+
+    def compute_logits(self, hidden_states, sampling_metadata):
+        # Emit EOS only when the last chunk has been yielded so the AR
+        # scheduler ends the request at the right time.
+        ...
+```
+
+For an in-tree reference, look for any single-stage AR model under
+`vllm_omni/model_executor/models/` (for example
+`moss_tts_nano/modeling_moss_tts_nano.py` once its integration has landed).
+
+## Pre-commit and DCO
+
+All contributions must pass the pre-commit checks and the Developer Certificate of
+Origin (DCO) sign-off before merging.
+
+### Running pre-commit
+
+Install the hooks once with `pre-commit install`. Then run before committing:
+
+```bash
+pre-commit run --files \
+  vllm_omni/model_executor/models/your_model_name/*.py \
+  vllm_omni/entrypoints/openai/serving_speech.py \
+  vllm_omni/model_executor/models/registry.py \
+  tests/e2e/offline_inference/test_your_model_name.py \
+  tests/e2e/online_serving/test_your_model_name.py
+```
+
+When pre-commit **modifies files**, it exits with a non-zero code but the reformatting
+is correct. Stage the modified files and commit again — do not revert the changes.
+
+Common failures and fixes:
+
+| Check | Cause | Fix |
+|-------|-------|-----|
+| `ruff F841` | Local variable assigned but never used | Remove the extraction or forward it to the model call |
+| `ruff E402` | Module-level import not at top of file | Move import to the top-level import block |
+| `ruff format` | Line length, spacing, or quote style | Accept the auto-fix, stage, and re-commit |
+
+### DCO sign-off
+
+Every commit must carry a `Signed-off-by` trailer. Use the `-s` flag when committing:
+
+```bash
+git commit -s -m "feat(your-model): add YourModel TTS support"
+```
+
+Or configure git to add it automatically:
+
+```bash
+git config format.signOff true
+```
+
+To fix a missing sign-off on the most recent commit:
+
+```bash
+git commit --amend -s --no-edit
+git push origin your-branch --force-with-lease
+```
+
+> The DCO check verifies that the commit author email matches the `Signed-off-by` email.
+> Make sure `git config user.email` is set to the address associated with your GitHub
+> account before committing.
+
 ## Adding a Model Recipe
 
 After implementing and testing your model, add a model recipe to the
@@ -567,15 +936,19 @@ for the expected format.
 
 Adding a TTS model to vLLM-Omni involves:
 
-1. **Create model directory** with AR stage, decoder stage, and unified class
+1. **Create model directory** with AR stage, decoder stage, and unified class (two-stage)
+   or a single unified class with generator-based streaming (single-stage)
 2. **AR stage** - use vLLM's native decoder layers with fused QKV; do not wrap HF directly
 3. **Decoder stage** - thin wrapper around your audio decoder; implement `chunked_decode_streaming()`
 4. **Unified class** - dispatches on `model_stage`; same structure as `Qwen3TTSModelForGeneration`
 5. **Register** all stage classes in `registry.py`
-6. **YAML configs** - provide both batch and `async_chunk` variants
-7. **Stage input processor** - buffer Stage 0 outputs and forward in chunks of 25
-8. **Tests** - cover single request, batching, and async_chunk streaming
-9. **Model recipe** - add to [vllm-project/recipes](https://github.com/vllm-project/recipes)
+6. **YAML configs** - provide both batch and `async_chunk` variants (two-stage), or a single-stage AR config
+7. **Stage input processor** - buffer Stage 0 outputs and forward in chunks of 25 (two-stage only)
+8. **Online serving** - add all 5 integration points to `serving_speech.py` in one commit
+9. **Tests** - cover single request, batching, and streaming
+10. **Pre-commit + DCO** - run `pre-commit` before pushing; sign every commit with `git commit -s`
+11. **Model recipe** - add to [vllm-project/recipes](https://github.com/vllm-project/recipes)
+12. **Invariants** - re-check I1–I5 (streaming contract, consumer hygiene, hot-loop discipline, validation pyramid, per-request state) at the end of every phase
 
 ### Qwen3-TTS Reference Files
 
