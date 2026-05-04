@@ -24,6 +24,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     RequestResponseMetadata,
 )
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
+from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector
 from vllm.utils import random_uuid
@@ -1537,10 +1538,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             self._tts_tokenizer = mistral_tokenizer.instruct
         if voice is not None:
             tokens = self._tts_tokenizer.encode_speech_request(SpeechRequest(input=text, voice=voice)).tokens
-            return {
-                "prompt_token_ids": tokens,
-                "additional_information": {"voice": [voice]},
-            }
+            prompt = tokens_input(prompt_token_ids=tokens)
+            prompt["additional_information"] = {"voice": [voice]}
+            return prompt
         else:
             tokenized = self._tts_tokenizer.encode_speech_request(SpeechRequest(input=text, ref_audio=ref_audio))
             audio = tokenized.audios[0]
@@ -1586,10 +1586,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             }
             if request.max_new_tokens is not None:
                 additional_information["max_new_tokens"] = [request.max_new_tokens]
-            return {
-                "prompt_token_ids": prompt_ids,
-                "additional_information": additional_information,
-            }
+            prompt = tokens_input(prompt_token_ids=prompt_ids)
+            prompt["additional_information"] = additional_information
+            return prompt
 
         wav_samples, sr = ref_audio_data
         normalized_text, normalized_ref_text = normalize_fish_voice_clone_texts(request.input, request.ref_text)
@@ -1612,10 +1611,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 additional_information["voice_created_at"] = self.uploaded_speakers[voice_lower].get("created_at", 0)
         if request.max_new_tokens is not None:
             additional_information["max_new_tokens"] = request.max_new_tokens
-        return {
-            "prompt_token_ids": [1] * ph_len,
-            "additional_information": additional_information,
-        }
+        prompt = tokens_input(prompt_token_ids=[1] * ph_len)
+        prompt["additional_information"] = additional_information
+        return prompt
 
     # ---- CosyVoice3 helpers ----
 
@@ -1685,10 +1683,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if has_spk_emb:
             # Passed as plain float list
             additional_information["spk_emb"] = list(request.speaker_embedding)
-        return {
-            "prompt_token_ids": [0],
-            "additional_information": additional_information,
-        }
+        prompt = tokens_input(prompt_token_ids=[0])
+        prompt["additional_information"] = additional_information
+        return prompt
 
     # ---- Common speech generation helpers ----
 
@@ -1764,7 +1761,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 tts_params = {}
             elif self._tts_model_type == "moss_tts_nano":
                 tts_params = await self._build_moss_tts_params(request)
-                prompt = {"prompt_token_ids": [1], "additional_information": tts_params}
+                prompt = tokens_input(prompt_token_ids=[1])
+                prompt["additional_information"] = tts_params
             else:
                 tts_params = self._build_tts_params(request)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
@@ -1778,7 +1776,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     tts_params["ref_audio"] = [[wav_list, sr]]
 
                 ph_len = await self._estimate_prompt_len_async(tts_params)
-                prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
+                prompt = tokens_input(prompt_token_ids=[1] * ph_len)
+                prompt["additional_information"] = tts_params
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The
