@@ -130,6 +130,7 @@ from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
+from vllm_omni.entrypoints.sleep_api import include_sleep_router_if_enabled
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 logger = init_logger(__name__)
@@ -410,6 +411,10 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         if _should_enable_profiler_endpoints(stage_configs):
             logger.warning("Profiler endpoints are enabled. This should ONLY be used for local development!")
             app.include_router(profiler_router)
+
+        # Register vLLM-compatible sleep/wake HTTP endpoints when sleep mode is
+        # enabled, without requiring VLLM_SERVER_DEV_MODE.
+        include_sleep_router_if_enabled(app, args)
 
         vllm_config = await _get_vllm_config(engine_client)
 

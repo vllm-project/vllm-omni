@@ -34,35 +34,82 @@ Omni Sleep Mode is optimized for high-performance computing backends:
 
 ---
 
-
 ## 2. Usage Examples
 
 ### Python API Example
 You can programmatically control the lifecycle of stages using the `AsyncOmni` engine.
 
 ```python
-
 import asyncio
+
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
-async def run_sleep_demo():
-    # 1. initialization
-    engine = AsyncOmni(
-        model="ByteDance-Seed/BAGEL-7B-MoT",
-        enable_sleep_mode=True
-    )
 
-    # 2. sleep mode level2
+async def run_sleep_demo():
+    engine = AsyncOmni(model="ByteDance-Seed/BAGEL-7B-MoT", enable_sleep_mode=True)
+
     acks = await engine.sleep(stage_ids=[0], level=2)
     print(f"Freed {acks[0].freed_bytes / 1024**3:.2f} GiB on Stage 0")
 
-    # 3. wake up
     await engine.wake_up(stage_ids=[0])
+
 
 if __name__ == "__main__":
     asyncio.run(run_sleep_demo())
-
 ```
+
+### vLLM-Compatible HTTP API
+
+Start the server with `--enable-sleep-mode`:
+
+```bash
+vllm serve Qwen/Qwen-Image --omni --enable-sleep-mode --port 8091
+```
+
+This registers the following whole-engine HTTP endpoints without requiring `VLLM_SERVER_DEV_MODE`:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/sleep?level=1&mode=abort` | Put the engine to sleep |
+| POST | `/wake_up` | Wake up the engine |
+| GET  | `/is_sleeping` | Query sleep status |
+
+**Sleep levels:**
+
+- **Level 0** — Pause scheduling only (no GPU memory changes)
+- **Level 1** — Offload model weights to CPU, discard KV cache (default)
+- **Level 2** — Discard all GPU memory
+
+**Pause modes** (how to handle in-flight requests, inherited from upstream vLLM):
+
+- `abort` — Abort all pending requests (default)
+- `wait` — Wait for pending requests to complete before sleeping
+- `keep` — Keep pending requests in queue; they resume on wake-up
+
+> **Note:** The Omni backend currently only fully implements `abort` mode.
+> `wait` and `keep` set the paused flag but do not yet drain or freeze
+> requests. Full support is planned.
+
+**Examples:**
+
+```bash
+# Put the whole engine to sleep (level 1, abort pending requests)
+curl -X POST "http://localhost:8091/sleep?level=1"
+
+# Check sleep status
+curl http://localhost:8091/is_sleeping
+# {"is_sleeping": true}
+
+# Wake up the whole engine
+curl -X POST http://localhost:8091/wake_up
+
+# Partial wake-up (only reload weights)
+curl -X POST "http://localhost:8091/wake_up?tags=weights"
+```
+
+### Omni ACK HTTP API
+
+The Omni ACK API supports stage-aware sleep and wake-up. It returns worker ACKs with reclaimed-memory telemetry.
 
 ### server command Example
 Start the server with sleep mode enabled:
