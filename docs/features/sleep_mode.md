@@ -66,7 +66,9 @@ Start the server with `--enable-sleep-mode`:
 vllm serve Qwen/Qwen-Image --omni --enable-sleep-mode --port 8091
 ```
 
-This registers the following whole-engine HTTP endpoints without requiring `VLLM_SERVER_DEV_MODE`:
+This registers vLLM-compatible HTTP endpoints without requiring `VLLM_SERVER_DEV_MODE`.
+Query-only requests operate on the whole engine. vLLM-Omni also accepts an optional JSON body with `stage_ids`
+and returns the ACK list produced by the Omni backend.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -96,6 +98,12 @@ This registers the following whole-engine HTTP endpoints without requiring `VLLM
 # Put the whole engine to sleep (level 1, abort pending requests)
 curl -X POST "http://localhost:8091/sleep?level=1"
 
+# Put only stages 0 and 1 to sleep and return worker ACKs
+curl -X POST http://localhost:8091/sleep \
+     -H "Content-Type: application/json" \
+     -d '{"stage_ids": [0, 1], "level": 2, "mode": "abort"}'
+# {"status":"SUCCESS","acks":[...]}
+
 # Check sleep status
 curl http://localhost:8091/is_sleeping
 # {"is_sleeping": true}
@@ -105,11 +113,19 @@ curl -X POST http://localhost:8091/wake_up
 
 # Partial wake-up (only reload weights)
 curl -X POST "http://localhost:8091/wake_up?tags=weights"
+
+# Wake only stages 0 and 1
+curl -X POST http://localhost:8091/wake_up \
+     -H "Content-Type: application/json" \
+     -d '{"stage_ids": [0, 1]}'
+# {"status":"SUCCESS","acks":[...]}
 ```
 
 ### Omni ACK HTTP API
 
-The Omni ACK API supports stage-aware sleep and wake-up. It returns worker ACKs with reclaimed-memory telemetry.
+The canonical Omni ACK API paths are `/v1/omni/sleep` and `/v1/omni/wakeup`. They support stage-aware sleep
+and wake-up and return worker ACKs with reclaimed-memory telemetry. The `/sleep` and `/wake_up` endpoints above
+remain vLLM-compatible aliases with the same optional `stage_ids` extension.
 
 ### server command Example
 Start the server with sleep mode enabled:
