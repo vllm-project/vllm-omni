@@ -615,7 +615,9 @@ class OmniResponse:
     e2e_latency: float | None = None
     success: bool = False
     error_message: str | None = None
+    prompt_tokens: int | None = None
     cached_tokens: int | None = None
+    logprobs: list | None = None
 
 
 @dataclass
@@ -679,10 +681,12 @@ class OpenAIClientHandler:
                     audio_data = choice.message.audio.data
                 if hasattr(choice.message, "content") and choice.message.content is not None:
                     text_content = choice.message.content
-            # Extract cached_tokens for prefix caching tests
+            # Extract cached & prompt token counts for prefix caching tests
             usage = getattr(chat_completion, "usage", None)
-            if usage and (details := getattr(usage, "prompt_tokens_details", None)):
-                result.cached_tokens = details.cached_tokens
+            if usage:
+                result.prompt_tokens = usage.prompt_tokens
+                if details := getattr(usage, "prompt_tokens_details", None):
+                    result.cached_tokens = details.cached_tokens
             result.e2e_latency = time.perf_counter() - start_time
             audio_content = None
             if audio_data:
@@ -690,6 +694,8 @@ class OpenAIClientHandler:
                 audio_content = convert_audio_bytes_to_text(result.audio_bytes)
             result.text_content = text_content
             result.audio_content = audio_content
+            if chat_completion.choices and chat_completion.choices[0].logprobs is not None:
+                result.logprobs = chat_completion.choices[0].logprobs.content
             result.success = True
         except Exception as e:
             result.error_message = f"Non-stream processing error: {str(e)}"
@@ -756,6 +762,10 @@ class OpenAIClientHandler:
             "stream": stream,
             "modalities": modalities,
         }
+        if "logprobs" in request_config:
+            create_kwargs["logprobs"] = request_config["logprobs"]
+        if "top_logprobs" in request_config:
+            create_kwargs["top_logprobs"] = request_config["top_logprobs"]
         if extra_body:
             create_kwargs["extra_body"] = extra_body
 
