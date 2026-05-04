@@ -401,24 +401,32 @@ class StageDeployConfig:
     the top level of ``DeployConfig`` and propagated to every stage.
     """
 
-    # Stage identity.
+    # === Omni fields ===
+    # Stage identity and Omni runtime placement.
     stage_id: int
-
-    # GPU resources and parallelism.
     devices: str | None = None
-    tensor_parallel_size: int | None = None
 
-    # Scheduler and memory-capacity knobs passed to vLLM engine args.
-    max_num_seqs: int | None = None
+    # Inter-stage connector wiring and request defaults.
+    output_connectors: dict[str, str] | None = None
+    input_connectors: dict[str, str] | None = None
+    default_sampling_params: dict[str, Any] | None = None
+    subtalker_sampling_params: dict[str, Any] | None = None
+
+    # === vLLM EngineArgs fields ===
+    # Parallelism and scheduler/memory capacity.
+    tensor_parallel_size: int | None = None
     gpu_memory_utilization: float | None = None
-    enforce_eager: bool | None = None
+    max_num_seqs: int | None = None
     max_num_batched_tokens: int | None = None
     max_model_len: int | None = None
+
+    # Execution, scheduling, and KV/cache behavior.
+    enforce_eager: bool | None = None
     async_scheduling: bool | None = None
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = None
 
-    # Profiling, tokenizer/config parsing, and model-loading behavior.
+    # Compilation, profiling, tokenizer/config parsing, and model loading.
     compilation_config: dict[str, Any] | None = None
     profiler_config: dict[str, Any] | None = None
     skip_mm_profiling: bool | None = None
@@ -427,13 +435,7 @@ class StageDeployConfig:
     load_format: str | None = None
     tokenizer_mode: str | None = None
 
-    # Inter-stage connector wiring and default request sampling behavior.
-    output_connectors: dict[str, str] | None = None
-    input_connectors: dict[str, str] | None = None
-    default_sampling_params: dict[str, Any] | None = None
-    subtalker_sampling_params: dict[str, Any] | None = None
-
-    # Pass-through engine args that are not represented by explicit fields.
+    # Pass-through vLLM EngineArgs fields that are not represented above.
     engine_extras: dict[str, Any] = field(default_factory=dict)
 
 

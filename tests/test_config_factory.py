@@ -856,37 +856,41 @@ class TestDeployConfigLoading:
 
         assert expected_fields == deploy_override_field_names()
 
-    def test_load_deploy_config(self):
+    def test_load_qwen3_omni_moe_deploy_config(self):
         from pathlib import Path
 
         from vllm_omni.config.stage_config import load_deploy_config
 
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
-        if not deploy_path.exists():
-            pytest.skip("Deploy config not found")
-
         deploy = load_deploy_config(deploy_path)
         assert len(deploy.stages) == 3
         assert deploy.async_chunk is True
         assert deploy.connectors is not None
         assert deploy.platforms is not None
 
-        voxtral_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "voxtral_tts.yaml"
-        if voxtral_path.exists():
-            voxtral_deploy = load_deploy_config(voxtral_path)
-            assert voxtral_deploy.stages[0].config_format == "mistral"
-            assert voxtral_deploy.stages[0].load_format == "mistral"
-            assert voxtral_deploy.stages[0].tokenizer_mode == "mistral"
-            assert not any(
-                name in voxtral_deploy.stages[0].engine_extras
-                for name in ("config_format", "load_format", "tokenizer_mode")
-            )
+    def test_load_voxtral_tts_deploy_config_schema_fields(self):
+        from pathlib import Path
 
-        ming_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni.yaml"
-        if ming_path.exists():
-            ming_deploy = load_deploy_config(ming_path)
-            assert ming_deploy.stages[0].compilation_config == {"pass_config": {"fuse_allreduce_rms": False}}
-            assert "compilation_config" not in ming_deploy.stages[0].engine_extras
+        from vllm_omni.config.stage_config import load_deploy_config
+
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "voxtral_tts.yaml"
+        deploy = load_deploy_config(deploy_path)
+        assert deploy.stages[0].config_format == "mistral"
+        assert deploy.stages[0].load_format == "mistral"
+        assert deploy.stages[0].tokenizer_mode == "mistral"
+        assert not any(
+            name in deploy.stages[0].engine_extras for name in ("config_format", "load_format", "tokenizer_mode")
+        )
+
+    def test_load_ming_flash_omni_deploy_config_schema_fields(self):
+        from pathlib import Path
+
+        from vllm_omni.config.stage_config import load_deploy_config
+
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni.yaml"
+        deploy = load_deploy_config(deploy_path)
+        assert deploy.stages[0].compilation_config == {"pass_config": {"fuse_allreduce_rms": False}}
+        assert "compilation_config" not in deploy.stages[0].engine_extras
 
     def test_merge_pipeline_deploy(self):
         from pathlib import Path
