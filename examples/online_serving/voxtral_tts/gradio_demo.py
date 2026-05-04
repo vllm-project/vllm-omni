@@ -216,6 +216,7 @@ def make_update_voice_dropdown(language_voices: dict[str, list[str]]):
 def run_inference(
     voice_name: str,
     text_prompt: str,
+    cfg_alpha: float,
     base_url: str,
     model: str,
 ) -> tuple[int, np.ndarray]:
@@ -233,6 +234,7 @@ def run_inference(
         "model": model,
         "response_format": "wav",
         "voice": voice_name,
+        "extra_params": {"cfg_alpha": cfg_alpha},
     }
 
     response = httpx.post(
@@ -377,6 +379,14 @@ def main(
                     placeholder="Enter the text you want to synthesize...",
                     lines=4,
                 )
+                cfg_alpha_slider = gr.Slider(
+                    minimum=1.0,
+                    maximum=2.0,
+                    step=0.1,
+                    value=1.2,
+                    label="CFG Alpha",
+                    info="Flow-matching guidance strength (default: 1.2)",
+                )
                 with gr.Row():
                     reset_btn = gr.Button("Clear")
                     submit_btn = gr.Button("Generate audio", interactive=False)
@@ -415,9 +425,9 @@ def main(
         )
 
         # --- Wiring inference + persistence to the button ---
-        def _on_submit(voice: str, text: str):
+        def _on_submit(voice: str, text: str, cfg_alpha: float):
             assert text.strip() != ""
-            sr, audio_array = run_inference(voice, text, base_url, model)
+            sr, audio_array = run_inference(voice, text, cfg_alpha, base_url, model)
             if outputs_dir is not None:
                 share_id, saved_audio_path = _save_example(
                     outputs_dir,
@@ -432,7 +442,7 @@ def main(
 
         submit_btn.click(
             fn=_on_submit,
-            inputs=[voice_name, text_prompt],
+            inputs=[voice_name, text_prompt, cfg_alpha_slider],
             outputs=[output_audio, share_link_box],
         )
 
@@ -446,6 +456,7 @@ def main(
                     language,  # language_dropdown
                     voice,  # voice_name
                     "",  # text_prompt
+                    1.2,  # cfg_alpha_slider
                     None,  # output_audio
                     gr.update(interactive=False),  # submit_btn
                     "",  # share_link_box
@@ -456,7 +467,15 @@ def main(
         reset_btn.click(
             fn=make_on_reset(languages, language_voices),
             inputs=[],
-            outputs=[language_dropdown, voice_name, text_prompt, output_audio, submit_btn, share_link_box],
+            outputs=[
+                language_dropdown,
+                voice_name,
+                text_prompt,
+                cfg_alpha_slider,
+                output_audio,
+                submit_btn,
+                share_link_box,
+            ],
         )
 
         def make_load_from_share(outputs_dir: Path | None, languages: list[str], language_voices: dict[str, list[str]]):

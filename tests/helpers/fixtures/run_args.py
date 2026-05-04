@@ -6,8 +6,8 @@ def pytest_addoption(parser):
         "--run-level",
         action="store",
         default="core_model",
-        choices=["core_model", "advanced_model"],
-        help="Test level to run: L2, L3",
+        choices=["core_model", "advanced_model", "full_model"],
+        help="Test level to run: L2, L3, L4",
     )
 
 

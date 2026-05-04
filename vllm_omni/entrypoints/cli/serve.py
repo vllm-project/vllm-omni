@@ -9,7 +9,6 @@ import argparse
 import json
 import os
 import signal
-import sys
 from types import FrameType
 from typing import Any
 
@@ -20,9 +19,9 @@ from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import omni_run_server
-from vllm_omni.entrypoints.utils import detect_explicit_cli_keys
 
 logger = init_logger(__name__)
 
@@ -94,10 +93,6 @@ class OmniServeCommand(CLISubcommand):
         # If model is specified in CLI (as positional arg), it takes precedence
         if hasattr(args, "model_tag") and args.model_tag is not None:
             args.model = args.model_tag
-
-        # Stash the set of long-option keys the user actually typed so the
-        # stage-config factory can give YAML precedence over argparse defaults.
-        args._cli_explicit_keys = detect_explicit_cli_keys(sys.argv[1:], OmniServeCommand._parser)
 
         if args.headless:
             run_headless(args)
@@ -266,6 +261,40 @@ class OmniServeCommand(CLISubcommand):
             type=str,
             default=None,
             help="Override the diffusion pipeline class name (e.g. LTX2ImageToVideoPipeline).",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-load-format",
+            dest="diffusion_load_format",
+            type=str,
+            default=None,
+            choices=["default", "custom_pipeline", "dummy", "diffusers"],
+            help=(
+                "How to load the diffusion pipeline: native/registry (default), "
+                "custom_pipeline, dummy, or diffusers for the HF diffusers adapter."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusers-load-kwargs",
+            dest="diffusers_load_kwargs",
+            type=json.loads,
+            default="{}",
+            help=(
+                "JSON object passed to DiffusionPipeline.from_pretrained()."
+                "It overrides corresponding parameters in the standard vLLM-Omni interface."
+                '(e.g. \'{"use_safetensors": true, "variant": "fp16"}\').'
+            ),
+        )
+        omni_config_group.add_argument(
+            "--diffusers-call-kwargs",
+            dest="diffusers_call_kwargs",
+            type=json.loads,
+            default="{}",
+            help=(
+                "JSON object passed to pipeline.__call__(). "
+                "Useful for model-specific sampling parameters not covered by the vLLM-Omni interface."
+                "During request time, it is overridden by corresponding parameters in the vLLM-Omni interface."
+                '(e.g. \'{"num_inference_steps": 30, "guidance_scale": 7.5}\').'
+            ),
         )
         omni_config_group.add_argument(
             "--usp",
@@ -448,9 +477,16 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable diffusion pipeline profiler to display stage durations.",
         )
+        omni_config_group.add_argument(
+            "--enable-ar-profiler",
+            action="store_true",
+            help="Enable AR stage profiler to include AR stage timing in stage_durations.",
+        )
         # Stash via type(self) so the docs hook (which execs this function in a
         # sandboxed globals dict via ``DummySelf``) doesn't fail on a NameError.
         type(self)._parser = serve_parser
+
+        nullify_stage_engine_defaults(serve_parser)
         return serve_parser
 
 
@@ -506,15 +542,11 @@ def run_headless(args: argparse.Namespace) -> None:
         raise ValueError("headless mode requires worker_backend=multi_process")
 
     args_dict = vars(args).copy()
-    # Preserve the explicit-keys set captured at parse time so per-stage yaml
-    # values (e.g. stage 1's ``gpu_memory_utilization: 0.5``) are not
-    # overwritten by argparse defaults for flags the user didn't type.
-    cli_explicit_keys = args_dict.pop("_cli_explicit_keys", None)
+    args_dict.pop("_cli_explicit_keys", None)
     config_path, stage_configs = load_and_resolve_stage_configs(
         model,
         args_dict.get("stage_configs_path"),
         args_dict,
-        cli_explicit_keys=cli_explicit_keys,
     )
 
     # Locate the stage config that matches stage_id.
@@ -686,7 +718,9 @@ def run_headless(args: argparse.Namespace) -> None:
             executor_class=executor_class,
             log_stats=log_stats,
         )
-        engine_manager.join_first()
+        # vllm>=0.19 renamed CoreEngineProcManager.join_first() to
+        # monitor_engine_liveness() (see upstream PR #35862).
+        engine_manager.monitor_engine_liveness()
     finally:
         logger.info("[Headless] Shutting down stage %d.", stage_id)
         if engine_manager is not None:

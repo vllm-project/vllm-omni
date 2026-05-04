@@ -301,7 +301,10 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         # Load transformer (DiT)
         logger.info("Loading GlmImageTransformer2DModel (DiT)...")
-        self.transformer = GlmImageTransformer2DModel(od_config=od_config)
+        self.transformer = GlmImageTransformer2DModel(
+            od_config=od_config,
+            quant_config=od_config.quantization_config,
+        )
 
         # Weight sources for DiT loading
         self.weights_sources = [

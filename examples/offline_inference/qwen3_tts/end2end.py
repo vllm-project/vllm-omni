@@ -83,11 +83,28 @@ def _estimate_prompt_len(
             if not isinstance(audio_path, str) or not audio_path.strip():
                 return None
             try:
-                from vllm.multimodal.media import MediaConnector
+                from urllib.parse import urlparse
 
-                connector = MediaConnector(allowed_local_media_path="/")
-                audio, sr = connector.fetch_audio(audio_path)
                 import numpy as np
+
+                def _is_url(path: str) -> bool:
+                    try:
+                        parsed = urlparse(path)
+                        if parsed.scheme in ("http", "https"):
+                            return bool(parsed.netloc)
+                        return parsed.scheme in ("file", "data")
+                    except Exception:
+                        return False
+
+                if _is_url(audio_path):
+                    from vllm.multimodal.media import MediaConnector
+
+                    connector = MediaConnector(allowed_local_media_path="/")
+                    audio, sr = connector.fetch_audio(audio_path)
+                else:
+                    from vllm.multimodal.media.audio import load_audio
+
+                    audio, sr = load_audio(audio_path, sr=None, mono=True)
 
                 wav_np = np.asarray(audio, dtype=np.float32)
 

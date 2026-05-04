@@ -411,6 +411,125 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "bagel": {
+        "base_config": "bagel.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 3,
+                "gpu_memory_utilization": 0.45,
+                "load_format": "dummy",
+            },
+            {
+                "stage_id": 1,
+                "max_num_seqs": 1,
+                "load_format": "dummy",
+            },
+        ],
+    },
+    "bagel_think": {
+        "base_config": "bagel_think.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 3,
+                "gpu_memory_utilization": 0.45,
+                "load_format": "dummy",
+            },
+            {
+                "stage_id": 1,
+                "max_num_seqs": 1,
+                "load_format": "dummy",
+            },
+        ],
+    },
+    "bagel_single_stage": {
+        "base_config": "bagel_single_stage.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 1,
+                "load_format": "dummy",
+            },
+        ],
+    },
+    "bagel_mooncake": {
+        "base_config": "bagel.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.45,
+                "load_format": "dummy",
+                "output_connectors": {"to_stage_1": "mooncake_connector"},
+            },
+            {
+                "stage_id": 1,
+                "max_num_seqs": 1,
+                "load_format": "dummy",
+                "input_connectors": {"from_stage_0": "mooncake_connector"},
+            },
+        ],
+        "connectors": {
+            "mooncake_connector": {
+                "name": "MooncakeConnector",
+                "extra": {
+                    "host": "${MOONCAKE_HOST}",
+                    "metadata_server": "http://${MOONCAKE_HOST}:${MOONCAKE_HTTP_PORT}/metadata",
+                    "master": "${MOONCAKE_HOST}:${MOONCAKE_RPC_PORT}",
+                    "segment": 64000000,
+                    "localbuf": 64000000,
+                    "proto": "tcp",
+                },
+            },
+        },
+    },
+    "ming_flash_omni": {
+        "base_config": "ming_flash_omni.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.74,
+                "max_model_len": 16384,
+                "max_num_batched_tokens": 16384,
+                "mm_processor_cache_gb": 0,
+                "skip_mm_profiling": True,
+                "enable_flashinfer_autotune": False,
+                "load_format": "dummy",
+                "default_sampling_params": {
+                    "temperature": 0.0,
+                    "max_tokens": 100,
+                },
+            },
+            {
+                "stage_id": 1,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.18,
+                "load_format": "dummy",
+            },
+        ],
+    },
+    "ming_flash_omni_thinker_only": {
+        "base_config": "ming_flash_omni_thinker_only.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.9,
+                "max_model_len": 16384,
+                "max_num_batched_tokens": 16384,
+                "mm_processor_cache_gb": 0,
+                "skip_mm_profiling": True,
+                "enable_flashinfer_autotune": False,
+                "load_format": "dummy",
+                "default_sampling_params": {
+                    "temperature": 0.4,
+                    "max_tokens": 100,
+                },
+            },
+        ],
+    },
     # Single-stage thinker-only topology for the abort test.
     "qwen2_5_omni_thinker_only": {
         "async_chunk": False,

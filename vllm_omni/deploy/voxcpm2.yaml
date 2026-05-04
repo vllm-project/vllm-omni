@@ -1,0 +1,29 @@
+# VoxCPM2 deploy: single-stage AR pipeline with per-request state batching.
+# Verified on 1x H20 141GB.
+#
+# Fields omitted from a stage fall back to StageDeployConfig defaults (see
+# vllm_omni/config/stage_config.py). Notable choices:
+#   * enforce_eager=true because the talker's KV-cache save/restore loop is
+#     not cudagraph-compatible (captured separately via voxcpm2_talker's own
+#     _CapturedGraph path).
+#   * max_num_seqs=4 matches the legacy max_batch_size=4 contract: concurrent
+#     requests are supported via per-request StaticKVCache save/restore.
+async_chunk: false
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.0

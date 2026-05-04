@@ -122,6 +122,9 @@ class CodePredictorAttention(nn.Module):
         super().__init__()
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
+        assert self.num_heads % self.num_kv_heads == 0
+        self.is_gqa = self.num_kv_heads != self.num_heads
+        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.head_dim = getattr(
             config,
             "head_dim",
@@ -129,7 +132,7 @@ class CodePredictorAttention(nn.Module):
         )
         self.hidden_size = config.hidden_size
         self.scaling = self.head_dim**-0.5
-        self._use_gqa = self.num_kv_heads != self.num_heads
+        self.max_seq = int(config.num_code_groups) + 1
 
         # Separate q/k/v projections matching HF (no fused packing)
         bias = getattr(config, "attention_bias", False)
@@ -139,6 +142,73 @@ class CodePredictorAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self.q_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = _RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        if current_omni_platform.is_npu():
+            if self.max_seq > 2048:
+                raise ValueError(
+                    "Qwen3-TTS code predictor NPU fusion attention uses a fixed 2048x2048 "
+                    f"causal mask, but max_seq={self.max_seq} exceeds the mask size."
+                )
+            # Ascend SDPA is_causal migration example uses a fixed 2048x2048
+            # compressed causal mask with sparse_mode=2.
+            fusion_mask = torch.triu(
+                torch.ones(2048, 2048, dtype=torch.bool),
+                diagonal=1,
+            )
+            self.register_buffer("_fusion_causal_mask", fusion_mask, persistent=False)
+
+    def _forward_npu_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        bsz: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        import torch_npu
+
+        q_f, k_f, v_f = q, k, v
+        if self.is_gqa:
+            k_f = (
+                k[:, :, None, :, :]
+                .expand(bsz, self.num_kv_heads, self.num_queries_per_kv, seq_len, self.head_dim)
+                .reshape(bsz, self.num_heads, seq_len, self.head_dim)
+            )
+            v_f = (
+                v[:, :, None, :, :]
+                .expand(bsz, self.num_kv_heads, self.num_queries_per_kv, seq_len, self.head_dim)
+                .reshape(bsz, self.num_heads, seq_len, self.head_dim)
+            )
+
+        mask = self._fusion_causal_mask
+        mask = mask.contiguous()
+        q_f = q_f.contiguous()
+        k_f = k_f.contiguous()
+        v_f = v_f.contiguous()
+        return torch_npu.npu_fusion_attention(
+            q_f,
+            k_f,
+            v_f,
+            self.num_heads,
+            "BNSD",
+            pse=None,
+            padding_mask=None,
+            atten_mask=mask,
+            scale=float(self.scaling),
+            keep_prob=1.0,
+            # Keep torch_npu's API spelling.
+            pre_tockens=2147483647,
+            next_tockens=2147483647,
+            inner_precise=0,
+            prefix=None,
+            actual_seq_qlen=None,
+            actual_seq_kvlen=None,
+            # Ascend SDPA is_causal migration example uses sparse_mode=2.
+            sparse_mode=2,
+            gen_mask_parallel=True,
+            # Keep sync=True for the NPU fused attention path.
+            sync=True,
+        )[0]
 
     def forward(
         self,
@@ -160,14 +230,17 @@ class CodePredictorAttention(nn.Module):
         q = (q * cos) + (_rotate_half(q) * sin)
         k = (k * cos) + (_rotate_half(k) * sin)
 
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            scale=self.scaling,
-            is_causal=True,
-            enable_gqa=self._use_gqa,
-        )
+        if not current_omni_platform.is_npu():
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                scale=self.scaling,
+                is_causal=True,
+                enable_gqa=self.is_gqa,
+            )
+        else:
+            attn_out = self._forward_npu_attention(q, k, v, bsz, seq_len)
 
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         return self.o_proj(attn_out)
@@ -272,12 +345,23 @@ class CodePredictorBaseModel(nn.Module):
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
+        # Run the transformer body in float32 when the model is in fp16.
+        # fp16 lacks the dynamic range for stable attention scores and
+        # SiLU-gated MLP intermediates, producing NaN on GPUs without
+        # native bf16 support (Turing, Volta).  The RMSNorm and RoPE
+        # layers already upcast internally; this extends the same
+        # treatment to attention and MLP.
+        input_dtype = inputs_embeds.dtype
+        use_fp32 = input_dtype == torch.float16
+        if use_fp32:
+            inputs_embeds = inputs_embeds.float()
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, position_embeddings)
-        hidden_states = self.norm(hidden_states)
-        return hidden_states
+        with torch.amp.autocast(inputs_embeds.device.type, enabled=use_fp32, dtype=torch.float32):
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+            for layer in self.layers:
+                hidden_states = layer(hidden_states, position_embeddings)
+            hidden_states = self.norm(hidden_states)
+        return hidden_states.to(input_dtype)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters(remove_duplicate=False))
@@ -384,7 +468,7 @@ class CodePredictorWrapper(nn.Module):
         self._bucket_pos_ids: dict[int, torch.Tensor] = {}
         self._lm_heads_list: list[nn.Module] | None = None
         self._codec_embeds_list: list[nn.Module] | None = None
-        self._cuda_graphs: dict[int, tuple[torch.cuda.CUDAGraph, torch.Tensor]] = {}
+        self._device_graphs: dict[int, tuple] = {}  # (graph, static_output) per bucket
 
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
@@ -412,7 +496,7 @@ class CodePredictorWrapper(nn.Module):
         self._proj_buf = torch.zeros(bsz, max_seq, self._cp_hidden, dtype=dtype, device=device)
 
     def _setup_compile(self) -> None:
-        """Lazily set up torch.compile with optional CUDA graph capture."""
+        """Lazily set up torch.compile with optional device graph capture."""
         if self._compiled_model_fwd is not None:
             return
 
@@ -424,8 +508,16 @@ class CodePredictorWrapper(nn.Module):
         self._codec_embeds_list = list(self.model.codec_embedding)
 
         if not current_omni_platform.supports_torch_inductor():
-            logger.warning_once("code_predictor: torch.compile disabled")
+            # NPU or other platforms without Inductor support
             self._compiled_model_fwd = self.model.forward
+
+            if current_omni_platform.is_npu() and self._wrapper_config.use_cuda_graphs:
+                # For NPU, use eager + NPU graphs (no torch.compile)
+                self._warmup_buckets()
+                self._capture_npu_graphs()
+                logger.info("code_predictor: eager mode + NPU graphs")
+            else:
+                logger.warning_once("code_predictor: torch.compile disabled")
             return
 
         # torch.compile fuses RMSNorm/RoPE in ways that lose float32
@@ -491,9 +583,27 @@ class CodePredictorWrapper(nn.Module):
             with torch.cuda.graph(g, pool=pool):
                 static_output = self._compiled_model_fwd(static_input, pos_ids)
 
-            self._cuda_graphs[bsz] = (g, static_output)
+            self._device_graphs[bsz] = (g, static_output)
 
         logger.info("code_predictor: captured CUDA graphs for buckets %s", self._bucket_sizes)
+
+    def _capture_npu_graphs(self) -> None:
+        """Capture an NPU graph per bucket using torch_npu's NPUGraph."""
+        max_seq = self._num_groups + 1
+        proj_buf = self._proj_buf
+        pool = torch.npu.graph_pool_handle()
+
+        for bsz in self._bucket_sizes:
+            static_input = proj_buf[:bsz, :max_seq, :]
+            pos_ids = self._bucket_pos_ids[bsz]
+
+            g = torch.npu.NPUGraph()
+            with torch.npu.graph(g, pool=pool):
+                static_output = self._compiled_model_fwd(static_input, pos_ids)
+
+            self._device_graphs[bsz] = (g, static_output)
+
+        logger.info("code_predictor: captured NPU graphs for buckets %s", self._bucket_sizes)
 
     # ------------------------------------------------------------------
     #  Forward -- re-prefill + inline sampling
@@ -544,8 +654,8 @@ class CodePredictorWrapper(nn.Module):
                 torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(padded_bsz, -1).contiguous()
             )
 
-        # Use captured CUDA graph if available, otherwise call compiled fn.
-        cuda_graph_entry = self._cuda_graphs.get(padded_bsz)
+        # Use captured device graph if available, otherwise call compiled fn.
+        device_graph_entry = self._device_graphs.get(padded_bsz)
 
         # Prepare sampling parameters
         stored_mode = self._wrapper_config.sampling_mode == "stored"
@@ -570,10 +680,10 @@ class CodePredictorWrapper(nn.Module):
 
         # Autoregressive loop: predict layers 1..G-1
         for step in range(1, num_groups):
-            # Run transformer (CUDA graph replay or compiled forward)
-            if cuda_graph_entry is not None:
-                cuda_graph_entry[0].replay()
-                hidden_out = cuda_graph_entry[1]
+            # Run transformer (device graph replay or compiled forward)
+            if device_graph_entry is not None:
+                device_graph_entry[0].replay()
+                hidden_out = device_graph_entry[1]
             else:
                 hidden_out = model_fwd(proj_buf[:padded_bsz, :max_seq, :], full_pos_ids)
 
@@ -587,12 +697,12 @@ class CodePredictorWrapper(nn.Module):
                     logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
                 if s_top_p < 1.0:
                     sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
-                    sorted_probs = F.softmax(sorted_logits, dim=-1)
+                    sorted_probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
                     cumulative_probs = sorted_probs.cumsum(dim=-1)
                     remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
                     sorted_logits[remove_mask] = float("-inf")
                     logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
-                probs = F.softmax(logits, dim=-1)
+                probs = F.softmax(logits, dim=-1, dtype=torch.float32)
                 code = torch.multinomial(probs, num_samples=1)
             else:
                 # "per_call" mode: temperature-scaled + top-k
@@ -601,7 +711,7 @@ class CodePredictorWrapper(nn.Module):
                     if top_k > 0:
                         topk_vals, _ = scaled.topk(top_k, dim=-1)
                         scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                    probs = F.softmax(scaled, dim=-1)
+                    probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
                     code = torch.multinomial(probs, num_samples=1)
                 else:
                     code = logits.argmax(dim=-1, keepdim=True)

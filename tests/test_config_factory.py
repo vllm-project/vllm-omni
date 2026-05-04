@@ -4,6 +4,7 @@
 Unit tests for StageConfigFactory and related classes.
 """
 
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -375,6 +376,31 @@ class TestStageResolutionHelpers:
         }
         assert overridden == ["tensor_parallel_size"]
 
+    def test_strip_parent_engine_args_keeps_allowed_media_access_controls(self):
+        from dataclasses import fields as dc_fields
+
+        from vllm.engine.arg_utils import EngineArgs
+
+        parent_fields = {f.name: f for f in dc_fields(EngineArgs)}
+        filtered, overridden = strip_parent_engine_args(
+            {
+                "model": "some/model",
+                "stage_configs_path": "/tmp/stages.yaml",
+                "allowed_local_media_path": "/data/qwentts",
+                "allowed_media_domains": ["example.com"],
+            },
+            parent_fields=parent_fields,
+            keep_keys={"allowed_local_media_path", "allowed_media_domains"},
+            strip_keys={"stage_configs_path"},
+            no_warn_keys={"model"},
+        )
+
+        assert filtered == {
+            "allowed_local_media_path": "/data/qwentts",
+            "allowed_media_domains": ["example.com"],
+        }
+        assert overridden == []
+
 
 class TestPipelineYamlParsing:
     """Tests for pipeline YAML file parsing (@ZJY0516)."""
@@ -675,7 +701,7 @@ stages:
 
 
 class TestPipelineDiscovery:
-    """Tests for the central pipeline registry (``pipeline_registry._VLLM_OMNI_PIPELINES``)."""
+    """Tests for the central pipeline registry (``pipeline_registry._OMNI_PIPELINES``)."""
 
     def test_registry_has_known_models(self):
         """Built-in pipelines are lazy-loaded from the central declaration
@@ -940,6 +966,192 @@ class TestQwen3TTSPipeline:
         # Stage 1 uses its per-stage override
         assert stages[1].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
 
+    def test_subtalker_sampling_params_deep_merge_preserves_base_keys(self):
+        """Verify subtalker sampling params participate in stage deep-merge."""
+        from vllm_omni.config.stage_config import _deep_merge_stage
+
+        base = {
+            "stage_id": 0,
+            "subtalker_sampling_params": {
+                "do_sample": True,
+                "temperature": 0.9,
+                "top_k": 50,
+                "top_p": 1.0,
+            },
+        }
+        overlay = {
+            "stage_id": 0,
+            "subtalker_sampling_params": {
+                "temperature": 0.7,
+                "top_k": 32,
+            },
+        }
+
+        merged = _deep_merge_stage(base, overlay)
+
+        assert merged["subtalker_sampling_params"] == {
+            "do_sample": True,
+            "temperature": 0.7,
+            "top_k": 32,
+            "top_p": 1.0,
+        }
+
+
+class TestMingFlashOmniPipeline:
+    def test_registered(self):
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+
+        p = _PIPELINE_REGISTRY.get("ming_flash_omni")
+        assert p is not None
+        assert p.model_arch == "MingFlashOmniForConditionalGeneration"
+        assert len(p.stages) == 2
+        assert p.validate() == []
+
+    def test_thinker_stage(self):
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+
+        s = _PIPELINE_REGISTRY["ming_flash_omni"].get_stage(0)
+        assert s.model_stage == "thinker"
+        assert s.execution_type == StageExecutionType.LLM_AR
+        assert s.owns_tokenizer is True
+        assert s.requires_multimodal_data is True
+        assert s.engine_output_type == "text"
+        assert s.hf_config_name == "llm_config"
+        assert s.sampling_constraints["detokenize"] is True
+
+    def test_talker_stage(self):
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+
+        s = _PIPELINE_REGISTRY["ming_flash_omni"].get_stage(1)
+        assert s.model_stage == "ming_tts"
+        assert s.execution_type == StageExecutionType.LLM_GENERATION
+        assert s.input_sources == (0,)
+        assert s.final_output_type == "audio"
+        assert s.engine_output_type == "audio"
+        assert s.hf_config_name == "talker_config"
+        # Per-stage model_arch override (Ming talker has its own self-contained LLM)
+        assert s.model_arch == "MingFlashOmniTalkerForConditionalGeneration"
+        assert s.tokenizer_subdir == "talker/llm"
+        assert s.custom_process_input_func is not None
+
+    def test_talker_stage_processor_wiring_resolves(self):
+        """The custom_process_input_func string must point to a real callable.
+
+        Lazy string references only fail at first inference otherwise — this
+        catches typos in the pipeline declaration at import / registration time.
+        """
+        import importlib
+
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+
+        s = _PIPELINE_REGISTRY["ming_flash_omni"].get_stage(1)
+        module_path, _, attr = s.custom_process_input_func.rpartition(".")
+        module = importlib.import_module(module_path)
+        assert callable(getattr(module, attr))
+
+    def test_tts_pipeline_registered(self):
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+
+        p = _PIPELINE_REGISTRY.get("ming_flash_omni_tts")
+        assert p is not None
+        assert p.model_arch == "MingFlashOmniTalkerForConditionalGeneration"
+        assert len(p.stages) == 1
+        assert p.validate() == []
+
+    def test_tts_stage(self):
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+
+        s = _PIPELINE_REGISTRY["ming_flash_omni_tts"].get_stage(0)
+        assert s.model_stage == "ming_tts"
+        assert s.execution_type == StageExecutionType.LLM_GENERATION
+        assert s.input_sources == ()
+        assert s.owns_tokenizer is True
+        assert s.final_output_type == "audio"
+        assert s.engine_output_type == "audio"
+        assert s.hf_config_name == "talker_config"
+        assert s.tokenizer_subdir == "talker/llm"
+
+    def test_full_yaml_loads_and_merges(self):
+        """deploy/ming_flash_omni.yaml parses and merges with the registered pipeline."""
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni.yaml"
+        if not deploy_path.exists():
+            pytest.skip("ming_flash_omni deploy yaml not found")
+
+        deploy = load_deploy_config(deploy_path)
+        assert len(deploy.stages) == 2
+        assert deploy.async_chunk is False
+        assert deploy.pipeline == "ming_flash_omni"
+        # We won't test stage 0/1 colocation contract here,
+        # as there could exist more variant of custom device setup
+
+        pipeline = _PIPELINE_REGISTRY["ming_flash_omni"]
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        assert len(stages) == 2
+        assert stages[0].yaml_engine_args["model_arch"] == "MingFlashOmniForConditionalGeneration"
+        assert stages[1].yaml_engine_args["model_arch"] == "MingFlashOmniTalkerForConditionalGeneration"
+
+    def test_tts_yaml_loads_and_merges(self):
+        """deploy/ming_flash_omni_tts.yaml parses and routes to the TTS-only pipeline."""
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni_tts.yaml"
+        if not deploy_path.exists():
+            pytest.skip("ming_flash_omni_tts deploy yaml not found")
+
+        deploy = load_deploy_config(deploy_path)
+        assert len(deploy.stages) == 1
+        assert deploy.pipeline == "ming_flash_omni_tts"
+
+        pipeline = _PIPELINE_REGISTRY["ming_flash_omni_tts"]
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        assert len(stages) == 1
+        assert stages[0].yaml_engine_args["model_arch"] == "MingFlashOmniTalkerForConditionalGeneration"
+
+    def test_thinker_only_pipeline_registered(self):
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+
+        p = _PIPELINE_REGISTRY.get("ming_flash_omni_thinker_only")
+        assert p is not None
+        assert p.model_arch == "MingFlashOmniForConditionalGeneration"
+        assert len(p.stages) == 1
+        assert p.validate() == []
+
+    def test_thinker_only_stage(self):
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+
+        s = _PIPELINE_REGISTRY["ming_flash_omni_thinker_only"].get_stage(0)
+        assert s.model_stage == "thinker"
+        assert s.execution_type == StageExecutionType.LLM_AR
+        assert s.input_sources == ()
+        assert s.owns_tokenizer is True
+        assert s.requires_multimodal_data is True
+        assert s.final_output_type == "text"
+        assert s.engine_output_type == "text"
+        assert s.hf_config_name == "llm_config"
+        assert s.sampling_constraints["detokenize"] is True
+
+    def test_thinker_only_yaml_loads_and_merges(self):
+        """deploy/ming_flash_omni_thinker_only.yaml parses and routes to the thinker-only pipeline."""
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni_thinker_only.yaml"
+        if not deploy_path.exists():
+            pytest.skip("ming_flash_omni_thinker_only deploy yaml not found")
+
+        deploy = load_deploy_config(deploy_path)
+        assert len(deploy.stages) == 1
+        assert deploy.pipeline == "ming_flash_omni_thinker_only"
+
+        pipeline = _PIPELINE_REGISTRY["ming_flash_omni_thinker_only"]
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        assert len(stages) == 1
+        assert stages[0].yaml_engine_args["model_arch"] == "MingFlashOmniForConditionalGeneration"
+
 
 class TestBaseConfigInheritance:
     """Test deploy YAML base_config inheritance."""
@@ -1141,98 +1353,88 @@ class TestCLIOverrideFlow:
             assert s.runtime_overrides["enforce_eager"] is True
 
 
-class TestCLIExplicitPrecedence:
-    """Verify YAML > argparse defaults; explicit CLI args > YAML."""
+class TestSentinelDefaultPrecedence:
+    """Caller-typed (non-None) values win over YAML; None values fall through
+    to YAML / dataclass defaults (#3035)."""
 
-    def _stages(self, cli_overrides, cli_explicit_keys):
+    def _stages(self, cli_overrides):
         import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
 
         return StageConfigFactory._create_from_registry(
             "qwen3_omni_moe",
             cli_overrides=cli_overrides,
-            cli_explicit_keys=cli_explicit_keys,
         )
 
-    def test_explicit_cli_overrides_yaml(self):
-        """User-typed --max-num-seqs wins over the deploy YAML value."""
-        stages = self._stages(
-            cli_overrides={"max_num_seqs": 999},
-            cli_explicit_keys={"max_num_seqs"},
-        )
-        # Stage 2 yaml has max_num_seqs=1; explicit CLI must beat it.
+    def test_typed_kwarg_overrides_yaml(self):
+        stages = self._stages({"max_num_seqs": 999})
         assert stages[2].runtime_overrides.get("max_num_seqs") == 999
 
-    def test_default_cli_does_not_override_yaml(self):
-        """Argparse defaults must NOT clobber values that are present in YAML."""
-        stages = self._stages(
-            cli_overrides={"max_num_seqs": 256},
-            cli_explicit_keys=set(),  # user typed nothing
-        )
-        # Stage 2's YAML value (1) should win because the user didn't type --max-num-seqs.
-        assert stages[2].runtime_overrides.get("max_num_seqs") != 256
+    def test_none_value_skipped_yaml_wins(self):
+        stages = self._stages({"max_num_seqs": None})
+        assert stages[2].runtime_overrides.get("max_num_seqs") is None
+        assert stages[2].yaml_engine_args.get("max_num_seqs") == 1
 
-    def test_default_cli_fills_missing_yaml_field(self):
-        """Argparse defaults still fill fields the YAML doesn't set."""
-        stages = self._stages(
-            cli_overrides={"some_unrelated_knob": "fallback"},
-            cli_explicit_keys=set(),
-        )
-        # Field absent from YAML → CLI default flows through as a fallback.
-        assert stages[0].runtime_overrides.get("some_unrelated_knob") == "fallback"
+    def test_empty_kwargs_yaml_only(self):
+        stages = self._stages({})
+        for stage in stages:
+            assert stage.runtime_overrides == {}
 
-    def test_per_stage_overrides_always_explicit(self):
-        """``stage_<id>_*`` keys are always treated as explicit."""
-        stages = self._stages(
-            cli_overrides={"stage_0_gpu_memory_utilization": 0.42},
-            cli_explicit_keys=set(),  # not in the explicit set, but per-stage
-        )
+    def test_typed_kwarg_equal_to_dataclass_default_still_overrides(self):
+        # Caller intent honored regardless of value coincidence (no heuristic).
+        stages = self._stages({"gpu_memory_utilization": 0.9})
+        assert stages[2].runtime_overrides.get("gpu_memory_utilization") == 0.9
+
+    def test_per_stage_kwarg_routed_to_correct_stage(self):
+        stages = self._stages({"stage_0_gpu_memory_utilization": 0.42})
         assert stages[0].runtime_overrides.get("gpu_memory_utilization") == 0.42
+        assert stages[2].runtime_overrides.get("gpu_memory_utilization") is None
 
-    def test_none_explicit_set_treats_all_as_explicit(self):
-        """Programmatic Omni() callers (cli_explicit_keys=None) keep current behavior."""
-        stages = self._stages(
-            cli_overrides={"max_num_seqs": 999},
-            cli_explicit_keys=None,
-        )
-        assert stages[2].runtime_overrides.get("max_num_seqs") == 999
-
-    def test_explicit_async_chunk_false_overrides_yaml(self):
-        """``--no-async-chunk`` flips the deploy-level async_chunk to False even
-        when the YAML sets it to True. Verifies that the per-stage
-        ``async_chunk: True`` injection in ``merge_pipeline_deploy`` is skipped
-        and that ``async_chunk`` does not leak through ``_merge_cli_overrides``.
-        """
-        stages = self._stages(
-            cli_overrides={"async_chunk": False},
-            cli_explicit_keys={"async_chunk"},
-        )
-        # qwen3_omni_moe.yaml has `async_chunk: true`, so by default every
-        # stage's engine_args would carry it. With the explicit override, it
-        # must NOT show up.
+    def test_async_chunk_false_overrides_yaml_true(self):
+        stages = self._stages({"async_chunk": False})
         for stage in stages:
             assert stage.yaml_engine_args.get("async_chunk") is not True
-            assert stage.runtime_overrides.get("async_chunk") is None
 
-    def test_default_async_chunk_leaves_yaml_alone(self):
-        """An unset ``--async-chunk`` (default None) must leave the YAML's True
-        in force on every stage."""
-        stages = self._stages(
-            cli_overrides={"async_chunk": None},
-            cli_explicit_keys=set(),
-        )
-        # qwen3_omni_moe.yaml: `async_chunk: true` → injected on every stage.
+    def test_async_chunk_none_keeps_yaml_true(self):
+        stages = self._stages({"async_chunk": None})
         for stage in stages:
             assert stage.yaml_engine_args.get("async_chunk") is True
 
-    def test_explicit_enable_prefix_caching_overrides_yaml(self):
-        """``--enable-prefix-caching`` (global) flips every stage's
-        ``enable_prefix_caching`` to True regardless of the YAML default."""
-        stages = self._stages(
-            cli_overrides={"enable_prefix_caching": True},
-            cli_explicit_keys={"enable_prefix_caching"},
-        )
+    def test_enable_prefix_caching_typed_overrides_yaml(self):
+        stages = self._stages({"enable_prefix_caching": True})
         for stage in stages:
             assert stage.runtime_overrides.get("enable_prefix_caching") is True
+
+    def test_omni_with_vars_args_anti_pattern_is_safe(self):
+        # Omni(**vars(args)) with mostly-None namespace must not clobber YAML.
+        simulated_vars_args = {
+            "gpu_memory_utilization": None,
+            "max_num_seqs": None,
+            "async_chunk": None,
+            "enable_prefix_caching": None,
+            "dtype": None,
+        }
+        stages = self._stages(simulated_vars_args)
+        for stage in stages:
+            assert stage.runtime_overrides == {}
+
+    def test_create_from_registry_no_cli_explicit_keys_param(self):
+        import inspect
+
+        sig = inspect.signature(StageConfigFactory._create_from_registry)
+        named = [p for p in sig.parameters.values() if p.kind != p.VAR_KEYWORD]
+        assert "cli_explicit_keys" not in {p.name for p in named}
+
+    def test_cli_explicit_keys_kwarg_emits_deprecation(self):
+        import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            StageConfigFactory._create_from_registry(
+                "qwen3_omni_moe",
+                cli_overrides={},
+                cli_explicit_keys={"max_num_seqs"},
+            )
+            assert any(issubclass(x.category, DeprecationWarning) for x in w)
 
     def test_async_chunk_dispatches_processors(self):
         """A single ``qwen3_tts`` pipeline picks per-chunk vs end-to-end

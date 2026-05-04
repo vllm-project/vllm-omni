@@ -7,7 +7,6 @@ from __future__ import annotations
 import pytest
 
 torch = pytest.importorskip("torch")
-pytest.importorskip("librosa")
 
 from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (  # noqa: E402
     VoxCPM2TalkerForConditionalGeneration,

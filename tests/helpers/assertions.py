@@ -11,7 +11,9 @@ import numpy as np
 import soundfile as sf
 from PIL import Image
 
-from tests.helpers.media import cosine_similarity_text
+from tests.helpers.media import (
+    cosine_similarity_text,
+)
 
 _GENDER_PIPELINE = None
 _GENDER_PIPELINE_LOCK = threading.Lock()
@@ -56,7 +58,7 @@ def assert_image_diffusion_response(
             f"Expected {num_outputs_per_prompt} images, got {len(response.images)}"
         )
 
-    if run_level == "advanced_model":
+    if run_level in {"advanced_model", "full_model"}:
         width = extra_body.get("width")
         height = extra_body.get("height")
 
@@ -316,7 +318,7 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         top = outputs[0]
         label = str(top.get("label", "")).lower()
         conf = float(top.get("score", 0.0))
-        if conf < 0.5:
+        if conf < 0.6:
             gender = "unknown"
         elif ("female" in label) or ("жен" in label):
             gender = "female"
@@ -378,14 +380,23 @@ def _compute_pcm_hnr_db(pcm_samples: np.ndarray, sr: int = _PCM_SPEECH_SAMPLE_RA
     return float(np.mean(hnr_values)) if hnr_values else 0.0
 
 
-def _assert_pcm_int16_speech_hnr(audio_bytes: bytes) -> None:
+def _assert_pcm_int16_speech_hnr(audio_bytes: bytes, min_hnr_db: float = _MIN_PCM_SPEECH_HNR_DB) -> None:
+    """Validate harmonic-to-noise ratio on raw int16 PCM from /v1/audio/speech.
+
+    min_hnr_db defaults to the global _MIN_PCM_SPEECH_HNR_DB (1.0 dB),
+    which matches the cleaner TTS models the helper was originally calibrated
+    for. Quieter codecs (e.g. MOSS-TTS-Nano, whose voice_clone output is
+    intrinsically around -2 dB) can pass a lower per-test threshold via
+    request_config["min_hnr_db"] to keep the catastrophic-failure check
+    while not gating CI on a model-intrinsic property.
+    """
     assert audio_bytes is not None and len(audio_bytes) >= 2, "missing PCM bytes"
     assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
     pcm_samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
     hnr = _compute_pcm_hnr_db(pcm_samples)
-    print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {_MIN_PCM_SPEECH_HNR_DB} dB)")
-    assert hnr >= _MIN_PCM_SPEECH_HNR_DB, (
-        f"Audio distortion detected: HNR={hnr:.2f} dB < {_MIN_PCM_SPEECH_HNR_DB} dB. "
+    print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {min_hnr_db} dB)")
+    assert hnr >= min_hnr_db, (
+        f"Audio distortion detected: HNR={hnr:.2f} dB < {min_hnr_db} dB. "
         "Voice clone decoder may be losing ref_code speaker context on later chunks."
     )
 
@@ -407,7 +418,8 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
 
     modalities = request_config.get("modalities", ["text", "audio"])
 
-    if run_level == "advanced_model":
+    if run_level in {"advanced_model", "full_model"}:
+        # Verify output success
         if "audio" in modalities:
             assert response.audio_content is not None, "No audio output is generated"
             print(f"audio content is: {response.audio_content}")
@@ -417,12 +429,11 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                     response.audio_bytes,
                     speaker,
                 )
-
         if "text" in modalities:
             assert response.text_content is not None, "No text output is generated"
             print(f"text content is: {response.text_content}")
 
-        # Verify image description
+        # Verify keywords in output
         word_types = ["text", "image", "audio", "video"]
         keywords_dict = request_config.get("key_words", {})
         for word_type in word_types:
@@ -441,11 +452,25 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                     )
 
         # Verify similarity (Whisper transcript vs streamed/detokenized text)
-        if "text" in modalities and "audio" in modalities:
-            assert response.similarity is not None and response.similarity > 0.9, (
-                "The audio content is not same as the text"
-            )
-            print(f"similarity is: {response.similarity}")
+        if "audio" in modalities:
+            audio_ref_text = request_config.get("audio_ref_text")
+            if "text" in modalities:
+                transcript = (response.audio_content or "").strip()
+                text_output = (response.text_content or "").strip()
+                similarity = cosine_similarity_text(
+                    transcript.lower(),
+                    text_output.lower(),
+                )
+                assert similarity > 0.9, "The audio content is not same as the text"
+                print(f"similarity is: {similarity}")
+            if audio_ref_text:
+                audio_similarity = cosine_similarity_text(
+                    response.audio_content.lower(),
+                    str(audio_ref_text).lower(),
+                )
+                assert audio_similarity > 0.9, (
+                    f"The audio content does not match reference text: similarity={audio_similarity:.3f}"
+                )
 
 
 def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str) -> None:
@@ -456,7 +481,8 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
 
     req_fmt = request_config.get("response_format")
     if req_fmt == "pcm" and response.audio_bytes:
-        _assert_pcm_int16_speech_hnr(response.audio_bytes)
+        min_hnr_db = float(request_config.get("min_hnr_db", _MIN_PCM_SPEECH_HNR_DB))
+        _assert_pcm_int16_speech_hnr(response.audio_bytes, min_hnr_db=min_hnr_db)
         if response.audio_format:
             assert "pcm" in response.audio_format.lower(), (
                 f"Expected audio/pcm content-type, got {response.audio_format!r}"
@@ -464,7 +490,7 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
     elif req_fmt == "wav" and response.audio_format:
         assert req_fmt in response.audio_format
 
-    if run_level == "advanced_model" and req_fmt != "pcm":
+    if run_level in {"advanced_model", "full_model"} and req_fmt != "pcm":
         expected_text = request_config.get("input")
         if expected_text:
             transcript = (response.audio_content or "").strip()

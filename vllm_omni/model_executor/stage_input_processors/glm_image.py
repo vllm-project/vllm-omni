@@ -240,7 +240,7 @@ def ar2diffusion(
     for i, ar_output in enumerate(ar_outputs):
         _t_req = time.perf_counter()
         output = ar_output.outputs[0]
-        generated_token_ids = output.token_ids
+        generated_token_ids = output.cumulative_token_ids
 
         # Get original prompt info
         original_prompt = prompt[i] if i < len(prompt) else {}
@@ -290,9 +290,8 @@ def ar2diffusion(
 
         if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
             mm_output = ar_output.multimodal_output
-            if isinstance(mm_output, dict):
-                if mm_output.get("prior_token_image_ids") is not None:
-                    is_i2i = True
+            if isinstance(mm_output, dict) and mm_output.get("ids", {}).get("prior_image") is not None:
+                is_i2i = True
         _dt_mode = (time.perf_counter() - _t_mode) * 1000
 
         # Parse and upsample prior tokens
@@ -329,7 +328,7 @@ def ar2diffusion(
         if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
             mm_output = ar_output.multimodal_output
             if isinstance(mm_output, dict):
-                raw_prior_image_ids = mm_output.get("prior_token_image_ids")
+                raw_prior_image_ids = mm_output.get("ids", {}).get("prior_image")
                 if raw_prior_image_ids is not None:
                     # Handle different formats:
                     # 1. Single tensor -> wrap in list
@@ -355,7 +354,7 @@ def ar2diffusion(
                 mm_output = output.multimodal_output
                 logger.debug(f"[ar2diffusion] Request {i}: found multimodal_output on CompletionOutput (fallback)")
                 if isinstance(mm_output, dict):
-                    raw_prior_image_ids = mm_output.get("prior_token_image_ids")
+                    raw_prior_image_ids = mm_output.get("ids", {}).get("prior_image")
                     if raw_prior_image_ids is not None:
                         if isinstance(raw_prior_image_ids, torch.Tensor):
                             prior_token_image_ids = [raw_prior_image_ids]

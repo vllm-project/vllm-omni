@@ -8,6 +8,8 @@ from typing import Any
 import torch
 from vllm.v1.request import Request, RequestStatus
 
+from vllm_omni.data_entry_keys import unflatten_payload
+
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec
 from ..utils.logging import get_connector_logger
@@ -150,30 +152,38 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Update connector state
             self.get_req_chunk[req_id] += 1
 
+            meta = payload_data.get("meta", {})
             if self.model_mode == "ar":
-                self._update_request_payload(external_req_id, payload_data)
-                request.additional_information = payload_data
-                if payload_data.get("finished"):
+                merged_payload = self._update_request_payload(external_req_id, payload_data)
+                request.additional_information = merged_payload
+                if meta.get("finished"):
                     self.finished_requests.add(req_id)
             else:
-                if payload_data.get("finished"):
+                if meta.get("finished"):
                     self.finished_requests.add(req_id)
 
-                new_ids = payload_data.get("code_predictor_codes", [])
+                new_ids = payload_data.get("codes", {}).get("audio", [])
                 request.prompt_token_ids = new_ids
-                # Preserve previously attached request metadata (e.g. prompt
-                # conditioning tensors) and update only per-chunk fields.
                 prev_info = getattr(request, "additional_information", None)
                 info = dict(prev_info) if isinstance(prev_info, dict) else {}
                 for key, value in payload_data.items():
-                    if key in {"code_predictor_codes", "finished"}:
+                    if key == "codes":
+                        continue
+                    if isinstance(value, dict):
+                        existing_sub = info.get(key)
+                        merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
+                        for sk, sv in value.items():
+                            if key == "meta" and sk == "finished":
+                                continue
+                            merged_sub[sk] = sv
+                        info[key] = merged_sub
                         continue
                     info[key] = value
                 request.additional_information = info
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.
-                if not new_ids and not payload_data.get("finished"):
+                if not new_ids and not meta.get("finished"):
                     return True
 
             # Mark as finished for consumption
@@ -184,33 +194,36 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return False
 
     def _update_request_payload(self, req_id: str, payload_data: dict[str, Any]) -> dict[str, Any]:
-        """Update the payload data for a request in the connector.
-
-        Args:
-            connector: OmniConnectorBase instance
-            req_id: Request ID to update
-            payload_data: New payload data to store
-        """
+        """Update the stored payload for *req_id* with the latest chunk."""
         if req_id not in self.request_payload:
             self.request_payload[req_id] = payload_data
             return payload_data
-        origin_payload = self.request_payload[req_id]
-        override_keys = payload_data.pop("override_keys", [])
-        for key, value in payload_data.items():
-            if key == "finished":
+        origin = self.request_payload[req_id]
+        raw_ok = payload_data.get("meta", {}).pop("override_keys", [])
+        override_keys = {tuple(k) if isinstance(k, list) else k for k in raw_ok}
+
+        for type_key, new_val in payload_data.items():
+            if not isinstance(new_val, dict):
                 continue
-            elif key in override_keys:
-                payload_data[key] = value
-            elif isinstance(value, torch.Tensor) and key in origin_payload:
-                payload_data[key] = torch.cat([origin_payload[key], value], dim=0)
-            elif isinstance(value, list) and key in origin_payload:
-                payload_data[key] = origin_payload[key] + value
+            origin_sub = origin.get(type_key)
+            if not isinstance(origin_sub, dict):
+                continue
+            for qual, value in new_val.items():
+                if type_key == "meta" and qual == "finished":
+                    continue
+                if (type_key, qual) in override_keys:
+                    continue
+                if isinstance(value, torch.Tensor) and qual in origin_sub:
+                    new_val[qual] = torch.cat([origin_sub[qual], value], dim=0)
+                elif isinstance(value, list) and qual in origin_sub:
+                    new_val[qual] = origin_sub[qual] + value
 
         self.request_payload[req_id] = payload_data
         return payload_data
 
     def _send_single_request(self, task: dict):
-        pooling_output = task["pooling_output"]
+        raw_po = task["pooling_output"]
+        pooling_output = unflatten_payload(raw_po) if isinstance(raw_po, dict) else raw_po
         request = task["request"]
         is_finished = task["is_finished"]
         stage_id = self.connector.stage_id
@@ -245,7 +258,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if success:
             self.put_req_chunk[external_req_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
-            finished_flag = payload_data.get("finished")
+            finished_flag = payload_data.get("meta", {}).get("finished", payload_data.get("finished"))
             is_payload_finished = False
             if isinstance(finished_flag, torch.Tensor):
                 is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())

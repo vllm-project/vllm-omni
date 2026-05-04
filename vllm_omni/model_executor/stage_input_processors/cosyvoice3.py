@@ -79,10 +79,10 @@ def text2flow(
         if multi_modal_data is None:
             raise RuntimeError(f"Missing multimodal_output for request {source_output.request_id}")
 
-        output_ids = _ensure_list(output.token_ids)
+        output_ids = _ensure_list(output.cumulative_token_ids)
         prefix_ids = _ensure_list(source_output.prompt_token_ids)
         additional_info = dict(multi_modal_data)
-        additional_info["prefix_ids"] = prefix_ids
+        additional_info.setdefault("ids", {})["prompt"] = prefix_ids
         engine_inputs.append(OmniTokensPrompt(prompt_token_ids=output_ids, additional_information=additional_info))
     return engine_inputs
 
@@ -181,8 +181,8 @@ def talker2code2wav_async_chunk(
             if not finished:
                 return None
             payload: dict[str, Any] = {
-                "code_predictor_codes": [],
-                "finished": torch.tensor(True, dtype=torch.bool),
+                "codes": {"audio": []},
+                "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
             }
             if not state.get("sent_prompt", False):
                 payload.update(state.get("prompt_payload", {}))
@@ -193,8 +193,8 @@ def talker2code2wav_async_chunk(
         emitted_token_len = int(state.get("emitted_token_len", 0))
         if finished and length <= emitted_token_len:
             payload = {
-                "code_predictor_codes": [],
-                "finished": torch.tensor(True, dtype=torch.bool),
+                "codes": {"audio": []},
+                "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
             }
             if not state.get("sent_prompt", False):
                 payload.update(state.get("prompt_payload", {}))
@@ -225,12 +225,12 @@ def talker2code2wav_async_chunk(
             code_predictor_codes = [int(frame[0]) for frame in token_frames[:prefix_len]]
 
         payload = {
-            "code_predictor_codes": code_predictor_codes,
+            "codes": {"audio": code_predictor_codes},
+            "meta": {"finished": torch.tensor(finished, dtype=torch.bool)},
             "token_offset": token_offset,
             "left_context_size": token_offset,
             "req_id": [request_id],
             "stream_finished": torch.tensor(finished, dtype=torch.bool),
-            "finished": torch.tensor(finished, dtype=torch.bool),
         }
         if not state.get("sent_prompt", False):
             payload.update(state.get("prompt_payload", {}))

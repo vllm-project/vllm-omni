@@ -55,6 +55,44 @@ def test_default_stage_devices_from_sequence_parallel():
     assert stage_cfg["runtime"]["devices"] == "0,1,2,3"
 
 
+def test_default_stage_config_uses_parallel_size_kwargs():
+    """Ensure default diffusion parallel_config uses CLI/API parallel sizes."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "pipeline_parallel_size": 2,
+            "data_parallel_size": 3,
+            "tensor_parallel_size": 4,
+            "enable_expert_parallel": True,
+        }
+    )[0]
+
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config.pipeline_parallel_size == 2
+    assert parallel_config.data_parallel_size == 3
+    assert parallel_config.tensor_parallel_size == 4
+    assert parallel_config.enable_expert_parallel is True
+
+
+def test_default_stage_config_defaults_nullified_parallel_size_kwargs():
+    """Ensure nullified diffusion parallel-size kwargs fall back to defaults."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "pipeline_parallel_size": None,
+            "data_parallel_size": None,
+            "tensor_parallel_size": None,
+            "enable_expert_parallel": None,
+            "enforce_eager": None,
+        }
+    )[0]
+
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config.pipeline_parallel_size == 1
+    assert parallel_config.data_parallel_size == 1
+    assert parallel_config.tensor_parallel_size == 1
+    assert parallel_config.enable_expert_parallel is False
+    assert stage_cfg["engine_args"]["enforce_eager"] is False
+
+
 def test_default_stage_config_propagates_ulysses_mode():
     """Ensure UAA mode survives default diffusion-stage creation."""
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(

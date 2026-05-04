@@ -24,6 +24,7 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
@@ -192,9 +193,6 @@ def get_wan22_pre_process_func(
 ):
     """Pre-process function for Wan2.2: optionally load and resize input image for I2V mode."""
     import numpy as np
-    from diffusers.video_processor import VideoProcessor
-
-    video_processor = VideoProcessor(vae_scale_factor=8)
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         for i, prompt in enumerate(request.prompts):
@@ -238,10 +236,6 @@ def get_wan22_pre_process_func(
             )
             prompt["multi_modal_data"]["image"] = image  # type: ignore # key existence already checked above
 
-            # Preprocess for VAE
-            prompt["additional_information"]["preprocessed_image"] = video_processor.preprocess(
-                image, height=request.sampling_params.height, width=request.sampling_params.width
-            )
             request.prompts[i] = prompt
         return request
 
@@ -326,6 +320,13 @@ class Wan22Pipeline(
                     fall_back_to_pt=True,
                 )
             )
+
+        # See ``hub_prefetch.py`` for the transformers v5 subfolder race.
+        prefetch_subfolders(
+            model,
+            ["tokenizer", "text_encoder", "vae"],
+            local_files_only=local_files_only,
+        )
 
         self.tokenizer = AutoTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
         self.text_encoder = UMT5EncoderModel.from_pretrained(

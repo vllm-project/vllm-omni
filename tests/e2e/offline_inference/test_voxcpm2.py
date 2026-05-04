@@ -7,25 +7,17 @@ import torch
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path
 
 VOXCPM2_MODEL = "openbmb/VoxCPM2"
-STAGE_CONFIG = os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "..",
-    "..",
-    "vllm_omni",
-    "model_executor",
-    "stage_configs",
-    "voxcpm2.yaml",
-)
+DEPLOY_CONFIG = get_deploy_config_path("voxcpm2.yaml")
 SAMPLE_RATE = 48000
 
 
 @pytest.fixture(scope="module")
 def voxcpm2_engine():
     """Create VoxCPM2 engine for testing."""
-    with OmniRunner(VOXCPM2_MODEL, stage_configs_path=STAGE_CONFIG) as runner:
+    with OmniRunner(VOXCPM2_MODEL, stage_configs_path=DEPLOY_CONFIG) as runner:
         yield runner.omni
 
 

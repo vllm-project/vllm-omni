@@ -54,9 +54,9 @@ class DistributedVaeExecutor:
         self.parallel_size = parallel_size
 
     def gather_tensors(self, tensor: torch.Tensor):
-        gather_list = [torch.empty_like(tensor) for _ in range(self.world_size)] if self.rank == 0 else None
-        dist.gather(tensor, gather_list=gather_list, dst=0, group=self.group)
-        return gather_list
+        gather_list = [torch.empty_like(tensor) for _ in range(self.world_size)]
+        dist.all_gather(gather_list, tensor, group=self.group)
+        return gather_list if self.rank == 0 else None
 
     def broadcast_tensor(self, tensor: torch.Tensor):
         dist.broadcast(tensor, src=0, group=self.group)

@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from pytest_mock import MockerFixture
 from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
 
+from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import (
@@ -852,18 +853,53 @@ class TestTTSMethods:
         result = speech_server._validate_tts_request(req)
         assert "non-empty" in result
 
-    def test_speaker_embedding_wrong_dims_accepted(self, speech_server):
-        """Non-standard dimensions pass validation (warning only, not an error)."""
-        emb = [0.1] * 512  # not 1024 or 2048
+    def test_speaker_embedding_wrong_dims_rejected(self, speech_server):
+        """speaker_embedding dimensions must match the loaded Qwen3-TTS model."""
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(hidden_size=2048),
+            )
+        )
+
+        emb = [0.1] * 1024
         req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=emb, x_vector_only_mode=True)
         result = speech_server._validate_tts_request(req)
-        assert result is None
+        assert "speaker_embedding has 1024 dimensions" in result
+        assert "expected 2048" in result
 
     def test_speaker_embedding_2048_dims_accepted(self, speech_server):
         """2048-dim embedding (1.7B model) is accepted without warning."""
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(hidden_size=2048),
+            )
+        )
+
         emb = [0.1] * 2048
         req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=emb, x_vector_only_mode=True)
         assert speech_server._validate_tts_request(req) is None
+
+    def test_upload_voice_embedding_wrong_dims_rejected(self, speech_server):
+        """Embedding uploads must match the loaded Qwen3-TTS model before being stored."""
+        import json
+
+        speech_server._tts_model_type = "qwen3_tts"
+        speech_server.engine_client.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(hidden_size=2048),
+            )
+        )
+
+        with pytest.raises(ValueError, match="expected 2048"):
+            asyncio.run(
+                speech_server.upload_voice_embedding(
+                    embedding_json=json.dumps([0.0] * 1024),
+                    consent="consent",
+                    name="bad_emb_voice",
+                )
+            )
 
     def test_base_task_requires_ref_audio_or_speaker_embedding(self, speech_server):
         """Base task without ref_audio or speaker_embedding is rejected."""
@@ -1705,6 +1741,77 @@ def test_api_server_create_speech_wraps_error_response_status(mocker: MockerFixt
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 400
+
+
+def test_api_server_create_speech_engine_error_response_includes_request_and_stage_id(mocker: MockerFixture):
+    handler = mocker.MagicMock()
+    handler.create_speech = mocker.AsyncMock(
+        side_effect=OmniEngineDeadError(
+            "engine dead",
+            error_stage_id=1,
+        )
+    )
+
+    terminate_mock = mocker.patch.object(api_server_module, "terminate_if_errored")
+
+    app = FastAPI()
+    app.state.args = SimpleNamespace(log_error_stack=False)
+    app.state.openai_serving_speech = handler
+    app.state.engine_client = SimpleNamespace(
+        engine=SimpleNamespace(is_alive=lambda: False),
+        errored=True,
+    )
+    app.state.server = SimpleNamespace()
+    scope = {
+        "type": "http",
+        "app": app,
+        "method": "POST",
+        "path": "/v1/audio/speech",
+        "headers": [],
+        "query_string": b"",
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "scheme": "http",
+    }
+    raw_request = Request(scope)
+    raw_request.state.request_metadata = SimpleNamespace(request_id="speech-req-1")
+    request = OpenAICreateSpeechRequest(input="Hello")
+
+    response = asyncio.run(api_server_module.create_speech(request, raw_request))
+
+    assert isinstance(response, JSONResponse)
+    assert response.status_code == 500
+    assert response.body.decode("utf-8") == (
+        '{"error":{"message":"engine dead","type":"InternalServerError","param":null,'
+        '"code":500,"request_id":"speech-req-1","error_stage_id":1}}'
+    )
+    terminate_mock.assert_called_once()
+
+
+def test_omni_engine_error_handler_includes_request_and_stage_id(mocker: MockerFixture):
+    app = FastAPI()
+    app.state.args = SimpleNamespace(log_error_stack=False)
+    app.state.engine_client = SimpleNamespace(
+        engine=SimpleNamespace(is_alive=lambda: False),
+        errored=True,
+    )
+    app.state.server = SimpleNamespace()
+
+    terminate_mock = mocker.patch.object(api_server_module, "terminate_if_errored")
+    api_server_module._register_omni_exception_handlers(app)
+
+    @app.get("/boom")
+    async def boom(request: Request):
+        request.state.request_metadata = SimpleNamespace(request_id="speech-req-1")
+        exc = OmniEngineDeadError("engine dead", error_stage_id=1)
+        raise exc
+
+    response = TestClient(app).get("/boom")
+
+    assert response.status_code == 500
+    assert response.json()["error"]["request_id"] == "speech-req-1"
+    assert response.json()["error"]["error_stage_id"] == 1
+    terminate_mock.assert_called_once()
 
 
 class TestWAVHeaderGeneration:

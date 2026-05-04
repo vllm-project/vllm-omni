@@ -2,6 +2,7 @@
 
 import base64
 import concurrent.futures
+import errno
 import io
 import json
 import os
@@ -9,7 +10,9 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from collections.abc import Generator
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -35,7 +38,6 @@ from tests.helpers.env import run_forced_gpu_cleanup_round
 from tests.helpers.media import (
     _merge_base64_audio_to_segment,
     convert_audio_bytes_to_text,
-    cosine_similarity_text,
     decode_b64_image,
 )
 from vllm_omni.config.stage_config import resolve_deploy_yaml
@@ -55,10 +57,37 @@ except Exception:  # pragma: no cover
         return None
 
 
-def get_open_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
+    """Return a local TCP port that is suitable for binding a new listener.
+
+    A single ``bind(host, 0)`` / close cycle leaves a race where another process can
+    take the same port number before PyTorch/vLLM bind it, yielding
+    ``EADDRINUSE`` / ``DistNetworkError``. We therefore:
+
+    #. Allocate an ephemeral port on *host*.
+    #. Immediately attempt ``bind(host, port)`` again. If that fails with
+       ``errno.EADDRINUSE``, retry from step 1.
+
+    Raises ``RuntimeError`` if no free port is found after *max_attempts* (e.g. port
+    exhaustion under heavy parallel tests).
+    """
+    last_exc: OSError | None = None
+    for _ in range(max_attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, 0))
+            port = int(s.getsockname()[1])
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind((host, port))
+        except OSError as exc:
+            last_exc = exc
+            if exc.errno == errno.EADDRINUSE:
+                continue
+            raise
+        return port
+    raise RuntimeError(
+        f"Could not obtain a free TCP port on {host!r} after {max_attempts} attempts (last error: {last_exc!r})"
+    ) from last_exc
 
 
 def dummy_messages_from_mix_data(
@@ -119,6 +148,89 @@ class OmniServerParams(NamedTuple):
     use_stage_cli: bool = False
     init_timeout: int | None = None
     stage_init_timeout: int | None = None  # None: fixture supplies default (600 s)
+
+
+def run_omni_server(
+    request: Any,
+    run_level: str,
+    model_prefix: str,
+    omni_fixture_lock: threading.Lock,
+) -> Generator["OmniServer", Any, None]:
+    from tests.helpers.stage_config import modify_stage_config
+
+    with omni_fixture_lock:
+        params: OmniServerParams = request.param
+        model = model_prefix + params.model
+        port = params.port
+        stage_config_path = params.stage_config_path
+        if run_level in {"advanced_model", "full_model"} and stage_config_path is not None:
+            with open(stage_config_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            # Strip ``load_format: dummy`` (CI overlay default) so advanced_model
+            # tests use real weights. New schema (``stages:``) writes the field
+            # flat at stage level; legacy schema (``stage_args:``) nests it as
+            # ``engine_args.load_format``. Handle both.
+            new_schema_stages = cfg.get("stages")
+            stage_key = "stages" if new_schema_stages is not None else "stage_args"
+            delete_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
+            stage_entries = cfg.get(stage_key, [])
+            stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
+            stage_config_path = modify_stage_config(
+                stage_config_path,
+                deletes={stage_key: {stage_id: [delete_path] for stage_id in stage_ids}},
+            )
+
+        server_args = params.server_args or []
+        if params.use_omni and params.stage_init_timeout is not None:
+            server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
+        else:
+            server_args = [*server_args, "--stage-init-timeout", "600"]
+        if params.init_timeout is not None:
+            server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
+        else:
+            server_args = [*server_args, "--init-timeout", "900"]
+        if params.use_stage_cli:
+            if not params.use_omni:
+                raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
+            if stage_config_path is None:
+                raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
+            server_args += ["--stage-configs-path", stage_config_path]
+
+            with OmniServerStageCli(
+                model,
+                stage_config_path,
+                server_args,
+                port=port,
+                env_dict=params.env_dict,
+            ) as server:
+                print("OmniServer started successfully")
+                yield server
+                print("OmniServer stopping...")
+        else:
+            if stage_config_path is not None:
+                server_args += ["--stage-configs-path", stage_config_path]
+
+            with (
+                OmniServer(
+                    model,
+                    server_args,
+                    port=port,
+                    env_dict=params.env_dict,
+                    use_omni=params.use_omni,
+                )
+                if port
+                else OmniServer(
+                    model,
+                    server_args,
+                    env_dict=params.env_dict,
+                    use_omni=params.use_omni,
+                )
+            ) as server:
+                print("OmniServer started successfully")
+                yield server
+                print("OmniServer stopping...")
+
+        print("OmniServer stopped")
 
 
 class OmniServer:
@@ -500,7 +612,6 @@ class OmniResponse:
     audio_content: str | None = None
     audio_format: str | None = None
     audio_bytes: bytes | None = None
-    similarity: float | None = None
     e2e_latency: float | None = None
     success: bool = False
     error_message: str | None = None
@@ -542,19 +653,15 @@ class OpenAIClientHandler:
                         text_content += content
             result.e2e_latency = time.perf_counter() - start_time
             audio_content = None
-            similarity = None
             if audio_data:
                 merged_seg = _merge_base64_audio_to_segment(audio_data)
                 wav_buf = BytesIO()
                 merged_seg.export(wav_buf, format="wav")
                 result.audio_bytes = wav_buf.getvalue()
                 audio_content = convert_audio_bytes_to_text(result.audio_bytes)
-            if audio_content and text_content:
-                similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
             result.text_content = text_content
             result.audio_data = audio_data
             result.audio_content = audio_content
-            result.similarity = similarity
             result.success = True
         except Exception as e:
             result.error_message = f"Stream processing error: {str(e)}"
@@ -578,15 +685,11 @@ class OpenAIClientHandler:
                 result.cached_tokens = details.cached_tokens
             result.e2e_latency = time.perf_counter() - start_time
             audio_content = None
-            similarity = None
             if audio_data:
                 result.audio_bytes = base64.b64decode(audio_data)
                 audio_content = convert_audio_bytes_to_text(result.audio_bytes)
-            if audio_content and text_content:
-                similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
             result.text_content = text_content
             result.audio_content = audio_content
-            result.similarity = similarity
             result.success = True
         except Exception as e:
             result.error_message = f"Non-stream processing error: {str(e)}"
@@ -630,6 +733,9 @@ class OpenAIClientHandler:
             mm = dict(extra_body.get("mm_processor_kwargs") or {})
             mm["use_audio_in_video"] = True
             extra_body["mm_processor_kwargs"] = mm
+        if "sampling_params_list" in request_config:
+            extra_body["sampling_params_list"] = request_config["sampling_params_list"]
+
         create_kwargs: dict[str, Any] = {
             "model": request_config.get("model"),
             "messages": request_config.get("messages"),
@@ -1006,7 +1112,14 @@ class OmniRunner:
         seed: int = 42,
         stage_init_timeout: int = 600,
         batch_timeout: int = 10,
-        init_timeout: int = 900,
+        # Bumped from 900s -> 1800s to give CI cold-cache loads of large
+        # diffusion models enough headroom (Buildkite #8418 hit a 6-second
+        # overrun loading Tongyi-MAI/Z-Image-Turbo: weights alone took 690s,
+        # the full stage was ready at ~896s, but the orchestrator wrapper
+        # finished at ~906s, just past the previous 900s ceiling). Engine
+        # production default in AsyncOmniEngine remains 600s; this only
+        # affects the test runner wrapper.
+        init_timeout: int = 1800,
         shm_threshold_bytes: int = 65536,
         log_stats: bool = False,
         stage_configs_path: str | None = None,

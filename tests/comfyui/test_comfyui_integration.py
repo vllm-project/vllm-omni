@@ -523,7 +523,6 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
             "Qwen/Qwen-Image-Edit",
             True,
             id="image-to-image-dalle-endpoint",
-            marks=pytest.mark.skip(reason="Temporarily disabled due to failure."),
         ),
         pytest.param(
             ServerCase(

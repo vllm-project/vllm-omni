@@ -20,7 +20,7 @@ MASTER_ADDRESS="${MASTER_ADDRESS:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-8092}"
 STAGE="all"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-STAGE_CONFIGS_PATH="${STAGE_CONFIGS_PATH:-$SCRIPT_DIR/../../../vllm_omni/model_executor/stage_configs/bagel.yaml}"
+DEPLOY_CONFIG="${DEPLOY_CONFIG:-$SCRIPT_DIR/../../../vllm_omni/deploy/bagel.yaml}"
 EXTRA_ARGS=()
 
 usage() {
@@ -33,7 +33,7 @@ Options:
   --port PORT                API port for stage 0 (default: $PORT)
   --master-address ADDRESS   Master/orchestrator address (default: $MASTER_ADDRESS)
   --master-port PORT         Master/orchestrator port (default: $MASTER_PORT)
-  --stage-configs-path PATH  Stage config YAML path (default: $STAGE_CONFIGS_PATH)
+  --deploy-config PATH       Deploy config YAML path (default: $DEPLOY_CONFIG)
   --help                     Show this help message
 
 Examples:
@@ -71,8 +71,8 @@ while [[ $# -gt 0 ]]; do
             MASTER_PORT="$2"
             shift 2
             ;;
-        --stage-configs-path)
-            STAGE_CONFIGS_PATH="$2"
+        --deploy-config)
+            DEPLOY_CONFIG="$2"
             shift 2
             ;;
         --help|-h)
@@ -103,7 +103,7 @@ print_config() {
     echo "API Port: $PORT"
     echo "Master Address: $MASTER_ADDRESS"
     echo "Master Port: $MASTER_PORT"
-    echo "Stage Configs: $STAGE_CONFIGS_PATH"
+    echo "Deploy Config: $DEPLOY_CONFIG"
     echo "Selected Stage: $STAGE"
     if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
         echo "Extra Args: ${EXTRA_ARGS[*]}"
@@ -114,21 +114,21 @@ run_stage_0() {
     echo "Starting Stage 0 (Thinker) as master..."
     vllm serve "$MODEL" --omni \
         --port "$PORT" \
-        --stage-configs-path "$STAGE_CONFIGS_PATH" \
+        --deploy-config "$DEPLOY_CONFIG" \
         --stage-id 0 \
-        -oma "$MASTER_ADDRESS" \
-        -omp "$MASTER_PORT" \
+        --omni-master-address "$MASTER_ADDRESS" \
+        --omni-master-port "$MASTER_PORT" \
         "${EXTRA_ARGS[@]}"
 }
 
 run_stage_1() {
     echo "Starting Stage 1 (DiT) in headless mode..."
     vllm serve "$MODEL" --omni \
-        --stage-configs-path "$STAGE_CONFIGS_PATH" \
+        --deploy-config "$DEPLOY_CONFIG" \
         --stage-id 1 \
         --headless \
-        -oma "$MASTER_ADDRESS" \
-        -omp "$MASTER_PORT" \
+        --omni-master-address "$MASTER_ADDRESS" \
+        --omni-master-port "$MASTER_PORT" \
         "${EXTRA_ARGS[@]}"
 }
 

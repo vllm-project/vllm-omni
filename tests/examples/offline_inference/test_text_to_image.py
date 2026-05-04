@@ -11,7 +11,7 @@ from tests.examples.helpers import EXAMPLES, ExampleRunner, ReadmeSnippet
 from tests.helpers.assertions import assert_image_valid
 from tests.helpers.mark import hardware_marks
 
-pytestmark = [pytest.mark.advanced_model, pytest.mark.example, *hardware_marks(res={"cuda": "H100"})]
+pytestmark = [pytest.mark.full_model, pytest.mark.example, *hardware_marks(res={"cuda": "H100"})]
 
 T2I_SCRIPT = EXAMPLES / "offline_inference" / "text_to_image" / "text_to_image.py"
 README_PATH = T2I_SCRIPT.with_name("README.md")

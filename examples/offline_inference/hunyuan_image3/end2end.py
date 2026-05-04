@@ -135,6 +135,9 @@ def parse_args():
     parser.add_argument("--init-timeout", type=int, default=300, help="Initialization timeout in seconds.")
     parser.add_argument("--enforce-eager", action="store_true", help="Disable torch.compile.")
 
+    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

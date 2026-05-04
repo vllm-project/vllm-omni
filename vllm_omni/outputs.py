@@ -104,6 +104,27 @@ class OmniRequestOutput:
     error: str | None = None
 
     @classmethod
+    def from_error(
+        cls,
+        request_id: str,
+        error_message: str,
+    ) -> "OmniRequestOutput":
+        """Create a terminal error output.
+
+        Args:
+            request_id: Request identifier
+            error_message: Human-readable error description
+
+        Returns:
+            OmniRequestOutput with ``finished=True`` and the ``error`` field set.
+        """
+        return cls(
+            request_id=request_id,
+            finished=True,
+            error=error_message,
+        )
+
+    @classmethod
     def from_pipeline(
         cls,
         stage_id: int,

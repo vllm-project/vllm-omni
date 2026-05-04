@@ -3,7 +3,6 @@
 
 import inspect
 import logging
-import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -75,6 +74,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe import HunyuanFusedMoE
+from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -1484,7 +1484,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.gate",
         )
         if config.use_mixed_mlp_moe > 0:
@@ -1658,8 +1658,10 @@ class HunYuanAttention(nn.Module):
         custom_pos_emb: tuple[torch.FloatTensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        bsz, q_len, _ = hidden_states.size()
+        bsz, q_len, hidden_size = hidden_states.size()
+        hidden_states = hidden_states.reshape(-1, hidden_size)
         qkv, _ = self.qkv_proj(hidden_states)
+        qkv = qkv.reshape(bsz, q_len, -1)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         past_key_value: Cache | None = kwargs.get("past_key_value", None)
@@ -1723,7 +1725,7 @@ class HunyuanImage3DecoderLayer(nn.Module):
                 rope_theta=rope_theta,
                 rope_scaling=rope_scaling,
                 max_position_embeddings=max_position_embeddings,
-                quant_config=None,
+                quant_config=quant_config,
                 bias=attention_bias,
                 cache_config=None,
                 prefix=f"{prefix}.self_attn",
@@ -1933,7 +1935,7 @@ class HunyuanImage3Model(nn.Module):
                 layer_idx=int(prefix.split(".")[-1]),
                 prefix=prefix,
             ),
-            prefix=f"{prefix}.layers",
+            prefix=f"{prefix}.layers" if prefix else "layers",
         )
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1948,7 +1950,7 @@ class HunyuanImage3Model(nn.Module):
         num_attention_heads = self.config.num_attention_heads
         num_kv_heads = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
         num_key_value_groups = num_attention_heads // num_kv_heads
-        hidden_size = self.config.hidden_size
+        hidden_size = qkv.shape[1]
 
         if hasattr(self.config, "head_dim"):
             attention_head_dim = self.config.head_dim
@@ -2001,8 +2003,15 @@ class HunyuanImage3Model(nn.Module):
         split_params_mapping = [
             (".gate_up_proj", ".gate_and_up_proj", 2, [(1, 1), (0, 1)], None),
             (
-                ".qkv_proj",
-                ".qkv_proj",
+                ".qkv_proj.weight",
+                ".qkv_proj.weight",
+                num_attention_heads + num_kv_heads * 2,
+                [("q", num_attention_heads), ("k", num_kv_heads), ("v", num_kv_heads)],
+                self._split_qkv_weight,
+            ),
+            (
+                ".qkv_proj.weight_scale",
+                ".qkv_proj.weight_scale",
                 num_attention_heads + num_kv_heads * 2,
                 [("q", num_attention_heads), ("k", num_kv_heads), ("v", num_kv_heads)],
                 self._split_qkv_weight,
@@ -2100,6 +2109,8 @@ class HunyuanImage3Model(nn.Module):
                 if weight_name not in name:
                     continue
                 if "mlp.experts" in name:
+                    continue
+                if ".qkv_proj" in name and not name.endswith(weight_name):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
@@ -2865,31 +2876,6 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             return (image,)
 
         return HunyuanImage3Text2ImagePipelineOutput(samples=image)
-
-
-def timestep_embedding(t, dim, max_period=10000):
-    """
-    Create sinusoidal timestep embeddings.
-
-    Args:
-        t (torch.Tensor): a 1-D Tensor of N indices, one per batch element. These may be fractional.
-        dim (int): the dimension of the output.
-        max_period (int): controls the minimum frequency of the embeddings.
-
-    Returns:
-        embedding (torch.Tensor): An (N, D) Tensor of positional embeddings.
-
-    .. ref_link: https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-    """
-    half = dim // 2
-    freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
-        device=t.device
-    )
-    args = t[:, None].float() * freqs[None]
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    if dim % 2:
-        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-    return embedding
 
 
 class TimestepEmbedder(nn.Module):

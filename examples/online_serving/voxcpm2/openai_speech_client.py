@@ -13,10 +13,7 @@ Examples:
         --ref-audio "https://example.com/reference.wav"
 
 Server setup:
-    python -m vllm_omni.entrypoints.openai.api_server \
-        --model openbmb/VoxCPM2 \
-        --stage-configs-path vllm_omni/model_executor/stage_configs/voxcpm2.yaml \
-        --host 0.0.0.0 --port 8000
+    vllm serve openbmb/VoxCPM2 --omni --host 0.0.0.0 --port 8000
 """
 
 from __future__ import annotations

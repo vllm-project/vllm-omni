@@ -474,10 +474,13 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
             table = self.profiler.key_averages().table(sort_by=sort_key)
 
             if not _is_uri_path(profiler_dir):
-                table_file = os.path.join(profiler_dir, f"profiler_out_{rank}.txt")
+                table_file = os.path.join(
+                    self._ensure_session_dir(),
+                    f"profiler_out_{rank}.txt",
+                )
                 with open(table_file, "w") as f:
                     print(table, file=f)
-                self._table_path = table_file
+                self._artifact_paths["profiler_out"] = table_file
 
             if rank == 0:
                 print(table)

@@ -24,7 +24,13 @@ def run_e2e():
         required=True,
         help="Path to CosyVoice3 model directory (e.g., pretrained_models/Fun-CosyVoice3-0.5B/).",
     )
-    parser.add_argument("--stage-config", type=str, default="vllm_omni/model_executor/stage_configs/cosyvoice3.yaml")
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help="Override the deploy config path. If unset, auto-loads "
+        "vllm_omni/deploy/cosyvoice3.yaml based on the HF model_type.",
+    )
     parser.add_argument("--prompt", type=str, default="Hello, this is a test of the CosyVoice system capability.")
     parser.add_argument(
         "--prompt-text",
@@ -43,19 +49,14 @@ def run_e2e():
     if not os.path.exists(args.tokenizer):
         raise FileNotFoundError(f"{args.tokenizer} does not exist!")
 
-    # Ensure stage config exists
-    if not os.path.exists(args.stage_config):
-        raise FileNotFoundError(f"{args.stage_config} does not exist!")
+    if args.deploy_config is not None and not os.path.exists(args.deploy_config):
+        raise FileNotFoundError(f"{args.deploy_config} does not exist!")
 
     print(f"Initializing cosyvoice E2E with model={args.model}")
 
-    # Initialize Omni
-    # This spins up the engine(s) based on the stage config
-    # We pass trust_remote_code=True same as Qwen examples
     omni = Omni(
         model=args.model,
-        stage_configs_path=args.stage_config,
-        trust_remote_code=True,
+        deploy_config=args.deploy_config,
         tokenizer=args.tokenizer,
         log_stats=True,
     )

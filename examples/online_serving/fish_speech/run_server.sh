@@ -13,11 +13,7 @@ PORT="${PORT:-8091}"
 echo "Starting Fish Speech S2 Pro server with model: $MODEL"
 
 FLASHINFER_DISABLE_VERSION_CHECK=1 \
-vllm-omni serve "$MODEL" \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/fish_speech_s2_pro.yaml \
+vllm serve "$MODEL" \
+    --omni \
     --host 0.0.0.0 \
-    --port "$PORT" \
-    --gpu-memory-utilization 0.9 \
-    --trust-remote-code \
-    --enforce-eager \
-    --omni
+    --port "$PORT"

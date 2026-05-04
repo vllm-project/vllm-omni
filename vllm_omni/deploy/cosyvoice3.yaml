@@ -1,0 +1,58 @@
+# CosyVoice3 deploy: 2-stage talker → flow-matching code2wav.
+#
+# Default mode is async-chunk streaming through SharedMemoryConnector. Pass
+# ``--no-async-chunk`` to the serve CLI for the legacy sync path (stage 1
+# builds flow input from the full speech-token sequence via ``text2flow``).
+# The shared-memory connector definition and input/output_connectors
+# references stay in the yaml unconditionally; the runtime only activates
+# them when ``async_chunk: true``.
+#
+# enforce_eager=true everywhere:
+#   * Stage 0 (talker) — cudagraph not verified on this checkpoint.
+#   * Stage 1 (code2wav) — CUDA graphs don't work with dynamic conv shapes.
+async_chunk: true
+dtype: float32
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+      codec_vocab_size: 6561
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.4
+    enforce_eager: true
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      max_tokens: 2048
+      top_k: 25
+      top_p: 0.8
+      # near-identity repetition penalty forces vLLM to track
+      # output_token_ids for RAS (stop-token logit logsumexp).
+      repetition_penalty: 1.0001
+    disable_hybrid_kv_cache_manager: true
+    mm_processor_cache_gb: 0
+    skip_mm_profiling: true
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.2
+    enforce_eager: true
+    max_model_len: 32768
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      max_tokens: 2048
+    disable_hybrid_kv_cache_manager: true
+    skip_mm_profiling: true

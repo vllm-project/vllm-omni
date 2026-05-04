@@ -5,6 +5,7 @@ This example shows how to use vLLM-Omni for running offline inference
 with the correct prompt format on Qwen2.5-Omni
 """
 
+import json
 import os
 import time
 from typing import NamedTuple
@@ -289,7 +290,10 @@ query_map = {
 
 
 def main(args):
-    model_name = "Qwen/Qwen2.5-Omni-7B"
+    model_name = args.model
+    quantization_config = None
+    if args.quantization_config is not None:
+        quantization_config = json.loads(args.quantization_config)
 
     # Get paths from args
     video_path = getattr(args, "video_path", None)
@@ -320,6 +324,7 @@ def main(args):
         query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
     else:
         query_result = query_func()
+    args.quantization_config = quantization_config
     omni = Omni.from_cli_args(args, model=model_name)
     thinker_sampling_params = SamplingParams(
         temperature=0.0,  # Deterministic - no randomness
@@ -424,6 +429,18 @@ def main(args):
 
 def parse_args():
     parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="Qwen/Qwen2.5-Omni-7B",
+        help="Model name or local path.",
+    )
+    parser.add_argument(
+        "--quantization-config",
+        type=str,
+        default=None,
+        help="Optional JSON string forwarded to Omni(quantization_config=...).",
+    )
     parser.add_argument(
         "--query-type",
         "-q",
