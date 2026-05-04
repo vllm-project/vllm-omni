@@ -80,6 +80,7 @@ class OmniVoiceConfig(PretrainedConfig):
 
         # Serving
         self.speculative_config = None
+        self.enable_cuda_graph = getattr(self, "enable_cuda_graph", True)
 
 
 AutoConfig.register("omnivoice", OmniVoiceConfig)
