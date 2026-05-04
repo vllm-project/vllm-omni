@@ -190,10 +190,14 @@ class OmniServeCommand(CLISubcommand):
                 "all-eager",
                 "comprehension-eager",
                 "shared-device-eager",
+                "balanced-eager",
                 "critical-path-eager",
             ],
             help="Apply a stage-aware cold-start policy. This rewrites selected "
-            "stages to `enforce_eager=true` without editing the deploy YAML.",
+            "stages to `enforce_eager=true` without editing the deploy YAML. "
+            "`balanced-eager` only rewrites upstream shared-device stages, which "
+            "helps cold start while avoiding unnecessary runtime regressions on "
+            "text-only stage-0 workloads.",
         )
         omni_config_group.add_argument(
             "--stage-id",

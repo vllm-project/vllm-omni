@@ -361,3 +361,21 @@ def test_apply_stage_startup_policy_shared_device_eager():
     assert not hasattr(stage_configs[0].engine_args, "enforce_eager")
     assert stage_configs[1].engine_args.enforce_eager is True
     assert stage_configs[2].engine_args.enforce_eager is True
+
+
+def test_apply_stage_startup_policy_balanced_eager():
+    stage_configs = [
+        _stage_cfg(0, devices=["cuda:0"], is_comprehension=True),
+        _stage_cfg(1, devices=["cuda:1"]),
+        _stage_cfg(2, devices=["cuda:1"]),
+    ]
+
+    policy, plan = AsyncOmniEngine._apply_stage_startup_policy(stage_configs, "balanced-eager")
+
+    assert policy == "balanced-eager"
+    assert plan == {
+        1: "shared-device-upstream:cuda:1",
+    }
+    assert not hasattr(stage_configs[0].engine_args, "enforce_eager")
+    assert stage_configs[1].engine_args.enforce_eager is True
+    assert not hasattr(stage_configs[2].engine_args, "enforce_eager")

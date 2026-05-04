@@ -102,6 +102,7 @@ _SUPPORTED_STARTUP_POLICIES: frozenset[str] = frozenset(
         "all-eager",
         "comprehension-eager",
         "shared-device-eager",
+        "balanced-eager",
         "critical-path-eager",
     }
 )
@@ -442,14 +443,35 @@ class AsyncOmniEngine:
             for device in cls._stage_runtime_devices(stage_cfg):
                 device_refcounts[device] = device_refcounts.get(device, 0) + 1
 
+        shared_devices_by_stage: dict[int, tuple[str, ...]] = {}
+        for stage_cfg in stage_configs:
+            metadata = extract_stage_metadata(stage_cfg)
+            shared_devices_by_stage[metadata.stage_id] = tuple(
+                device for device in cls._stage_runtime_devices(stage_cfg) if device_refcounts.get(device, 0) > 1
+            )
+
+        upstream_shared_devices_by_stage: dict[int, tuple[str, ...]] = {}
+        for idx, stage_cfg in enumerate(stage_configs):
+            metadata = extract_stage_metadata(stage_cfg)
+            stage_id = metadata.stage_id
+            shared_devices = shared_devices_by_stage[stage_id]
+            upstream_shared_devices = tuple(
+                device
+                for device in shared_devices
+                if any(
+                    device in shared_devices_by_stage.get(extract_stage_metadata(later_stage_cfg).stage_id, ())
+                    for later_stage_cfg in stage_configs[idx + 1 :]
+                )
+            )
+            upstream_shared_devices_by_stage[stage_id] = upstream_shared_devices
+
         applied_stage_plan: dict[int, str] = {}
         for stage_cfg in stage_configs:
             metadata = extract_stage_metadata(stage_cfg)
             stage_id = metadata.stage_id
             is_comprehension = bool(metadata.is_comprehension or stage_id == 0)
-            shared_devices = tuple(
-                device for device in cls._stage_runtime_devices(stage_cfg) if device_refcounts.get(device, 0) > 1
-            )
+            shared_devices = shared_devices_by_stage[stage_id]
+            upstream_shared_devices = upstream_shared_devices_by_stage[stage_id]
 
             reason: str | None = None
             if normalized_policy == "all-eager":
@@ -458,6 +480,8 @@ class AsyncOmniEngine:
                 reason = "comprehension-stage"
             elif normalized_policy == "shared-device-eager" and shared_devices:
                 reason = f"shared-device:{','.join(shared_devices)}"
+            elif normalized_policy == "balanced-eager" and upstream_shared_devices:
+                reason = f"shared-device-upstream:{','.join(upstream_shared_devices)}"
             elif normalized_policy == "critical-path-eager":
                 if is_comprehension:
                     reason = "comprehension-stage"
