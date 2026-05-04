@@ -18,17 +18,6 @@ if [[ ! "$QUERY_TYPE" =~ ^(text|use_audio|use_image|use_video|use_mixed_modaliti
     exit 1
 fi
 
-thinker_sampling_params='{
-  "temperature": 0.4,
-  "top_p": 0.9,
-  "top_k": -1,
-  "max_tokens": 16384,
-  "seed": 42,
-  "detokenize": true,
-  "repetition_penalty": 1.05
-}'
-# Above is optional, it has a default setting in stage_configs of the corresponding model.
-
 # Define URLs for assets
 MARY_HAD_LAMB_AUDIO_URL="https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/mary_had_lamb.ogg"
 CHERRY_BLOSSOM_IMAGE_URL="https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/cherry_blossom.jpg"
@@ -114,9 +103,6 @@ echo ""
 request_body=$(cat <<EOF
 {
   "model": "Jonathan1909/Ming-flash-omni-2.0",
-  "sampling_params_list": [
-    $thinker_sampling_params
-  ],
   "modalities": ["text"],
   "messages": [
     {
