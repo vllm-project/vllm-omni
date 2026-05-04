@@ -10,6 +10,14 @@ build:
   jobs:
     post_checkout:
       - git fetch --unshallow || true
+    build:
+      html:
+        - |
+          if [ "$READTHEDOCS_VERSION_TYPE" = "external" ]; then
+            python -m mkdocs build --clean --site-dir $READTHEDOCS_OUTPUT/html --config-file mkdocs.readthedocs.yml --strict
+          else
+            python -m mkdocs build --clean --site-dir $READTHEDOCS_OUTPUT/html --config-file mkdocs.yml --strict
+          fi
 
 mkdocs:
   configuration: mkdocs.yml

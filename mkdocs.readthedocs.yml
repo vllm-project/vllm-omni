@@ -1,0 +1,55 @@
+INHERIT: mkdocs.yml
+
+# Pull request previews on Read the Docs have a 15-minute total build limit.
+# Keep the full API reference for regular version builds, but skip api-autonav
+# for external PR builds so docs changes can be validated within the limit.
+hooks:
+  - docs/mkdocs/hooks/url_schemes.py
+  - docs/mkdocs/hooks/generate_examples.py
+  - docs/mkdocs/hooks/generate_argparse.py
+
+exclude_docs: |
+  **/*.inc.md
+  api/**
+
+plugins:
+  - meta
+  - search
+  - autorefs
+  - glightbox
+  - git-revision-date-localized:
+      exclude:
+        - api/*
+        - generated/**
+        - user_guide/examples/**
+        - contributing/design_documents/api_design_template.md
+        - DOCS_GUIDE.md
+  - minify:
+      minify_html: true
+      minify_js: true
+      minify_css: true
+      cache_safe: true
+      js_files: [docs/mkdocs/javascript/*.js]
+      css_files: [docs/mkdocs/stylesheets/*.css]
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            filters:
+              - "!^_"
+            summary:
+              modules: true
+            show_if_no_docstring: true
+            show_signature_annotations: true
+            separate_signature: true
+            show_overloads: true
+            signature_crossrefs: true
+          inventories:
+            - https://docs.python.org/3/objects.inv
+            - https://typing-extensions.readthedocs.io/en/latest/objects.inv
+            - https://docs.aiohttp.org/en/stable/objects.inv
+            - https://pillow.readthedocs.io/en/stable/objects.inv
+            - https://numpy.org/doc/stable/objects.inv
+            - https://psutil.readthedocs.io/stable/objects.inv
