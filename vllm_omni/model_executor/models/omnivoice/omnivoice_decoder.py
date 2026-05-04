@@ -106,27 +106,15 @@ class OmniVoiceDecoder(nn.Module):
 
         # RVQ decode: sum codebook embeddings → [B, 1024, T]
         quantized = self.quantizer.decode(codes)
-        logger.info("[DEBUG-DEC] after RVQ: shape=%s dtype=%s std=%.4f max_abs=%.4f nan=%s",
-                    tuple(quantized.shape), quantized.dtype,
-                    quantized.std().item(), quantized.abs().max().item(),
-                    quantized.isnan().any().item())
 
         # Project: [B, 1024, T] → fc2 → [B, 256, T]
-        # Cast to fc2 weight dtype (may be fp16 when weights stored as fp16),
-        # then upcast back to float32 — acoustic decoder uses ConvTranspose1d
-        # upsampling whose intermediate values exceed fp16 range (~65504), causing NaN.
+        # Cast to fc2 weight dtype (may be fp16 when checkpoint stores weights as fp16),
+        # then upcast back to float32 — acoustic decoder ConvTranspose1d upsampling
+        # produces intermediate values that exceed the fp16 range (~65504), causing NaN.
         quantized = self.fc2(quantized.transpose(1, 2).to(self.fc2.weight.dtype)).transpose(1, 2).float()
-        logger.info("[DEBUG-DEC] after fc2: shape=%s dtype=%s std=%.4f max_abs=%.4f nan=%s",
-                    tuple(quantized.shape), quantized.dtype,
-                    quantized.std().item(), quantized.abs().max().item(),
-                    quantized.isnan().any().item())
 
         # Acoustic decoder: [B, 256, T] → [B, 1, T*960]
         audio = self.acoustic_decoder(quantized)
-        logger.info("[DEBUG-DEC] after acoustic: shape=%s dtype=%s std=%s max_abs=%s nan=%s",
-                    tuple(audio.shape), audio.dtype,
-                    audio.std().item(), audio.abs().max().item(),
-                    audio.isnan().any().item())
 
         # Ensure [B, 1, samples]
         if audio.dim() == 2:
