@@ -395,10 +395,10 @@ class _OmniVoiceCUDAGraphForward:
         self._capture_sizes = sorted(capture_sizes)
         self._graphs: dict[tuple[int, int], dict] = {}
 
-    def _find_bucket(self, actual_S: int) -> int | None:
-        for bucket_S in self._capture_sizes:
-            if bucket_S >= actual_S:
-                return bucket_S
+    def _find_bucket(self, seq_len: int) -> int | None:
+        for bucket in self._capture_sizes:
+            if bucket >= seq_len:
+                return bucket
         return None
 
     def _pad_inputs(
@@ -406,24 +406,24 @@ class _OmniVoiceCUDAGraphForward:
         input_ids: torch.Tensor,
         audio_mask: torch.Tensor,
         attention_mask: torch.Tensor | None,
-        bucket_S: int,
+        bucket: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         S = input_ids.shape[-1]
-        if S == bucket_S:
+        if S == bucket:
             return input_ids, audio_mask, attention_mask
 
         two_b = input_ids.shape[0]
         num_cb = input_ids.shape[1]
 
-        ids_padded = torch.zeros(two_b, num_cb, bucket_S, dtype=input_ids.dtype, device=input_ids.device)
+        ids_padded = torch.zeros(two_b, num_cb, bucket, dtype=input_ids.dtype, device=input_ids.device)
         ids_padded[:, :, :S] = input_ids
 
-        mask_padded = torch.zeros(two_b, bucket_S, dtype=torch.bool, device=audio_mask.device)
+        mask_padded = torch.zeros(two_b, bucket, dtype=torch.bool, device=audio_mask.device)
         mask_padded[:, :S] = audio_mask
 
         if attention_mask is not None:
             attn_padded = torch.zeros(
-                two_b, 1, bucket_S, bucket_S,
+                two_b, 1, bucket, bucket,
                 dtype=attention_mask.dtype,
                 device=attention_mask.device,
             )
@@ -440,13 +440,13 @@ class _OmniVoiceCUDAGraphForward:
         audio_mask: torch.Tensor,
         attention_mask: torch.Tensor | None,
     ) -> dict:
-        _, bucket_S = key
+        _, bucket = key
         device = input_ids.device
 
-        self._gen._ensure_rope(bucket_S, device)
+        self._gen._ensure_rope(bucket, device)
         model_dtype = self._gen.text_embedding.weight.dtype
-        static_cos = self._gen._rope_cos[:bucket_S].to(device=device, dtype=model_dtype).contiguous()
-        static_sin = self._gen._rope_sin[:bucket_S].to(device=device, dtype=model_dtype).contiguous()
+        static_cos = self._gen._rope_cos[:bucket].to(device=device, dtype=model_dtype).contiguous()
+        static_sin = self._gen._rope_sin[:bucket].to(device=device, dtype=model_dtype).contiguous()
 
         static_input_ids = input_ids.clone()
         static_audio_mask = audio_mask.clone()
@@ -491,11 +491,11 @@ class _OmniVoiceCUDAGraphForward:
         )
         two_b = 2
         num_cb = self._gen.config.num_audio_codebook
-        for bucket_S in self._capture_sizes:
-            key = (two_b, bucket_S)
-            dummy_ids = torch.zeros(two_b, num_cb, bucket_S, dtype=torch.long, device=device)
-            dummy_mask = torch.zeros(two_b, bucket_S, dtype=torch.bool, device=device)
-            dummy_attn = torch.ones(two_b, 1, bucket_S, bucket_S, dtype=torch.bool, device=device)
+        for bucket in self._capture_sizes:
+            key = (two_b, bucket)
+            dummy_ids = torch.zeros(two_b, num_cb, bucket, dtype=torch.long, device=device)
+            dummy_mask = torch.zeros(two_b, bucket, dtype=torch.bool, device=device)
+            dummy_attn = torch.ones(two_b, 1, bucket, bucket, dtype=torch.bool, device=device)
             self._capture_for_key(key, dummy_ids, dummy_mask, dummy_attn)
         logger.info("OmniVoice CUDA Graph warmup complete (%d graphs)", len(self._graphs))
 
@@ -513,21 +513,21 @@ class _OmniVoiceCUDAGraphForward:
             sin = self._gen._rope_sin[:seq_len].to(device=input_ids.device, dtype=dtype)
             return self._gen._step_forward(input_ids, audio_mask, attention_mask, cos, sin)
 
-        actual_S = input_ids.shape[-1]
+        seq_len = input_ids.shape[-1]
         two_b = input_ids.shape[0]
-        bucket_S = self._find_bucket(actual_S) if two_b == 2 else None
+        bucket = self._find_bucket(seq_len) if two_b == 2 else None
 
-        if bucket_S is None:
+        if bucket is None:
             # Lazy capture for oversized sequences or non-unit batch
-            key = (two_b, actual_S)
+            key = (two_b, seq_len)
             ids_in, mask_in, attn_in = input_ids, audio_mask, attention_mask
             entry = self._graphs.get(key) or self._capture_for_key(
                 key, ids_in, mask_in, attn_in
             )
         else:
-            key = (two_b, bucket_S)
+            key = (two_b, bucket)
             ids_in, mask_in, attn_in = self._pad_inputs(
-                input_ids, audio_mask, attention_mask, bucket_S
+                input_ids, audio_mask, attention_mask, bucket
             )
             entry = self._graphs.get(key)
             if entry is None:
@@ -541,8 +541,8 @@ class _OmniVoiceCUDAGraphForward:
         entry["graph"].replay()
 
         output = entry["static_output"]
-        if bucket_S is not None and bucket_S != actual_S:
-            output = output[:, :, :actual_S, :]
+        if bucket is not None and bucket != seq_len:
+            output = output[:, :, :seq_len, :]
         return output
 
     def clear(self) -> None:
