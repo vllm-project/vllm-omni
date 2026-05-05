@@ -139,6 +139,28 @@ def test_default_stage_config_engine_args():
     assert engine_args["trust_remote_code"] is True
 
 
+def test_default_stage_config_whitelist_none_fallback():
+    """DeployConfig / StageDeployConfig whitelist fields with value None
+    fall back to OmniDiffusionConfig dataclass defaults."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            # DeployConfig pipeline-wide
+            "trust_remote_code": None,
+            "distributed_executor_backend": None,
+            "dtype": None,
+            # StageDeployConfig
+            "enforce_eager": None,
+        }
+    )[0]
+
+    engine_args = stage_cfg["engine_args"]
+
+    assert engine_args["trust_remote_code"] is False
+    assert engine_args["distributed_executor_backend"] == "mp"
+    assert engine_args["dtype"] == "auto"
+    assert engine_args["enforce_eager"] is False
+
+
 def test_serve_cli_accepts_ulysses_mode():
     """Ensure diffusion serve CLI exposes ulysses_mode and wires it to parallel_config."""
     parser = FlexibleArgumentParser()
