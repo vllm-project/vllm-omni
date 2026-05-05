@@ -191,7 +191,7 @@ def _unload(omni):
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
 
 # ---------------------------------------------------------------------------

@@ -119,7 +119,7 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
     @classmethod
     def synchronize(cls) -> None:
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
     @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:

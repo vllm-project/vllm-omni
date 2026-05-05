@@ -229,7 +229,7 @@ class _PerfTimer:
     def _resolve(self) -> None:
         if not self._pairs:
             return
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         for name, s, e in self._pairs:
             self._timers[name] = self._timers.get(name, 0.0) + s.elapsed_time(e)
             self._counts[name] = self._counts.get(name, 0) + 1

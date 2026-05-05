@@ -35,14 +35,14 @@ def get_vram_info(device_id: int) -> dict:
         if current_omni_platform.is_rocm():
             num_gpus = torch.cuda.device_count()
             safe_id = device_id if device_id < num_gpus else 0
-            torch.cuda.synchronize(safe_id)
+            torch.accelerator.synchronize(safe_id)
             return {
                 "reserved": torch.cuda.memory_reserved(safe_id) / 1024**3,
                 "allocated": torch.cuda.memory_allocated(safe_id) / 1024**3,
             }
         else:
             with torch.cuda.device(device_id):
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 return {
                     "reserved": torch.cuda.memory_reserved() / 1024**3,
                     "allocated": torch.cuda.memory_allocated() / 1024**3,
