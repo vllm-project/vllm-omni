@@ -414,7 +414,7 @@ class TestDiffusionEngine:
 
     def test_dummy_run_raises_on_output_error(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
-        engine.od_config = SimpleNamespace(model_class_name="mock_model")
+        engine.od_config = SimpleNamespace(model_class_name="mock_model", diffusion_load_format="default")
         engine.pre_process_func = None
         engine.add_req_and_wait_for_response = mocker.Mock(return_value=DiffusionOutput(error="boom"))
 

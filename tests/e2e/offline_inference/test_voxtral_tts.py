@@ -7,7 +7,7 @@ End-to-end offline inference tests for Voxtral TTS model.
 Tests both synchronous (Omni) and async streaming (AsyncOmni) paths.
 
 Equivalent to running:
-    python3 examples/offline_inference/voxtral_tts/end2end.py \
+    python3 examples/offline_inference/text_to_speech/voxtral_tts/end2end.py \
         --model mistralai/Voxtral-4B-TTS-2603 \
         --voice casual_female \
         --text "Hello, how are you?" \

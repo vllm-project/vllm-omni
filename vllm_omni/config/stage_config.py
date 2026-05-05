@@ -13,9 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from vllm.logger import init_logger
+from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
-from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 
 _MODELS_DIR = Path(__file__).resolve().parent.parent / "model_executor" / "models"
@@ -136,18 +137,27 @@ class StageExecutionType(str, Enum):
     DIFFUSION = "diffusion"
 
 
-# Mapping class refs (not dotted-path strings) so module/class renames fail
-# at import time instead of lazily at scheduler resolution. YAML overrides
-# and downstream serialization still use the dotted-path string form; the
-# conversion happens at the map lookup site via _scheduler_path().
-_EXECUTION_TYPE_TO_SCHEDULER: dict[StageExecutionType, type | None] = {
-    StageExecutionType.LLM_AR: OmniARScheduler,
-    StageExecutionType.LLM_GENERATION: OmniGenerationScheduler,
-    StageExecutionType.DIFFUSION: None,
-}
+def _resolve_scheduler(
+    execution_type: StageExecutionType,
+    async_scheduling: bool = True,
+) -> type[VLLMScheduler] | None:
+    """Return the scheduler class for the given execution_type.
+
+    NOTE: For AutoRegressive stages, we have two schedulers for sync / async
+    respectively, and decide which to used based on the value of async_scheduling.
+    For other execution types, async_scheduling is not used.
+    """
+    if execution_type == StageExecutionType.LLM_AR:
+        if not async_scheduling:
+            return OmniARScheduler
+        return OmniARAsyncScheduler
+    if execution_type == StageExecutionType.LLM_GENERATION:
+        return OmniGenerationScheduler
+    # Diffusion currently returns None here.
+    return None
 
 
-def _scheduler_path(cls: type | None) -> str | None:
+def _scheduler_path(cls: type[VLLMScheduler] | None) -> str | None:
     """Return the dotted import path for a scheduler class (``None`` passes through)."""
     if cls is None:
         return None
@@ -212,18 +222,6 @@ class PipelineConfig:
             if stage.stage_id == stage_id:
                 return stage
         return None
-
-    def get_scheduler_cls(self, stage_id: int) -> str | None:
-        """Return the inferred scheduler class path for a stage.
-
-        Returns ``None`` for DIFFUSION stages (no vLLM scheduler). Raises
-        ``ValueError`` if ``stage_id`` doesn't exist in this pipeline, and
-        ``KeyError`` if ``execution_type`` isn't in the scheduler map.
-        """
-        stage = self.get_stage(stage_id)
-        if stage is None:
-            raise ValueError(f"Pipeline {self.model_type!r} has no stage with id {stage_id}")
-        return _scheduler_path(_EXECUTION_TYPE_TO_SCHEDULER[stage.execution_type])
 
     def validate(self) -> list[str]:
         """Return list of topology errors (empty if valid)."""
@@ -796,6 +794,12 @@ def merge_pipeline_deploy(
         stage_type, worker_type = _resolve_execution_mode(ps.execution_type)
         input_proc, next_stage_proc = _select_processor_funcs(ps, deploy.async_chunk)
         engine_args = _build_engine_args(ps, ds, pipeline, deploy, next_stage_proc)
+        sched_cls = _resolve_scheduler(
+            ps.execution_type,
+            engine_args.get("async_scheduling", True),
+        )
+        if ps.execution_type == StageExecutionType.LLM_AR:
+            engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
         extras = _build_extras(ps, ds)
         runtime: dict[str, Any] = {"process": True}
         if ds is not None:
@@ -811,7 +815,7 @@ def merge_pipeline_deploy(
                 final_output=ps.final_output,
                 final_output_type=ps.final_output_type,
                 worker_type=worker_type,
-                scheduler_cls=_scheduler_path(_EXECUTION_TYPE_TO_SCHEDULER.get(ps.execution_type)),
+                scheduler_cls=_scheduler_path(sched_cls),
                 hf_config_name=ps.hf_config_name,
                 is_comprehension=ps.owns_tokenizer,
                 yaml_engine_args=engine_args,
@@ -1280,6 +1284,23 @@ class StageConfigFactory:
             # YAMLs (worker_type, scheduler_cls, etc.) — read from both places.
             worker_type = stage_data.get("worker_type", None) or yaml_engine_args.pop("worker_type", None)
             scheduler_cls = stage_data.get("scheduler_cls", None) or yaml_engine_args.pop("scheduler_cls", None)
+            if scheduler_cls:
+                async_sched = yaml_engine_args.get("async_scheduling")
+                if async_sched is not None:
+                    logger.warning(
+                        "Stage %s: async_scheduling=%r and scheduler_cls=%r "
+                        "should not be set together. scheduler_cls will take "
+                        "precedence for which scheduler is used.",
+                        stage_data.stage_id,
+                        async_sched,
+                        scheduler_cls,
+                    )
+                else:
+                    logger.warning(
+                        "Stage %s: scheduler_cls=%r is deprecated. Use async_scheduling instead.",
+                        stage_data.stage_id,
+                        scheduler_cls,
+                    )
             hf_config_name = stage_data.get("hf_config_name", None) or yaml_engine_args.pop("hf_config_name", None)
             model_stage = getattr(stage_data, "model_stage", None) or yaml_engine_args.pop("model_stage", None)
 
