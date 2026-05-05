@@ -34,7 +34,7 @@ nav:
     - Online Serving:
       - BAGEL-7B-MoT: user_guide/examples/online_serving/bagel.md
       - vLLM-Omni Helm Chart: user_guide/examples/online_serving/chart-helm.md
-      - Diffusers Backend Adapter Example: user_guide/examples/online_serving/diffusers_pipeline_adapter.md
+      - Diffusers Backend Adapter: user_guide/examples/online_serving/diffusers_pipeline_adapter.md
       - GLM-Image Online Serving: user_guide/examples/online_serving/glm_image.md
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
       - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
