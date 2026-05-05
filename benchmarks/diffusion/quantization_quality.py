@@ -163,7 +163,7 @@ def _generate_image(omni, args, prompt, seed):
         ),
     )
     elapsed = time.perf_counter() - start
-    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+    peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
     first = outputs[0]
     req_out = first.request_output[0] if hasattr(first, "request_output") else first
@@ -192,7 +192,7 @@ def _generate_video(omni, args, prompt, seed):
         ),
     )
     elapsed = time.perf_counter() - start
-    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+    peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
     first = outputs[0]
     if hasattr(first, "request_output") and isinstance(first.request_output, list):

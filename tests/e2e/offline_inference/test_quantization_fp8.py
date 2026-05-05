@@ -81,7 +81,7 @@ def _generate_single_stage_image(
             ),
         )
 
-        peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+        peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
         first_output = outputs[0]
         assert first_output.final_output_type == "image"
@@ -134,7 +134,7 @@ def _generate_bagel_image(
             )
         )
 
-        peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+        peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
         # Extract image
         generated_image = None

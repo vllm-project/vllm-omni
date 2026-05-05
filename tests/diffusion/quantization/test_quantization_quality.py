@@ -116,7 +116,7 @@ def _generate_image(omni, config: QualityTestConfig):
         ),
     )
 
-    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+    peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
     first = outputs[0]
     if hasattr(first, "images") and first.images:
         return first.images[0], peak_mem
@@ -148,7 +148,7 @@ def _generate_video(omni, config: QualityTestConfig):
         ),
     )
 
-    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+    peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
     first = outputs[0]
     if hasattr(first, "request_output") and isinstance(first.request_output, list):
         inner = first.request_output[0]
