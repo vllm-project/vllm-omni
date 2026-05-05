@@ -313,10 +313,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if finished_reqs and hasattr(self.model, "get_kv_transfer_metadata"):
             for req_id, data in finished_reqs.items():
                 try:
-                    req_idx = self.input_batch.req_id_to_index.get(req_id)
-                    num_computed = (
-                        int(self.input_batch.num_computed_tokens_cpu[req_idx]) if req_idx is not None else None
-                    )
+                    # NOTE: seq_len is the same as num_computed_tokens_cpu in current
+                    # async scheduling, since both exclude async placeholders. We use
+                    # seq_len since we control it, just in case upstream async scheduler
+                    # semantics change in the future.
+                    num_computed = data.get("seq_len")
+
                     model_meta = self.model.get_kv_transfer_metadata(
                         req_id,
                         num_computed_tokens=num_computed,
