@@ -186,6 +186,17 @@ vllm_omni/model_executor/stage_configs/
   your_model_name_async_chunk.yaml   # Streaming mode config
 ```
 
+### Example placement
+
+TTS examples live in the consolidated text-to-speech hub, **not** in their
+own top-level directory. Place per-model scripts under
+`examples/offline_inference/text_to_speech/<your_model>/` and
+`examples/online_serving/text_to_speech/<your_model>/`, and add a section
+to the hub `README.md` files (table row + per-model section) instead of a
+new per-model `README.md`. The mkdocs `generate_examples` hook treats the
+`text_to_speech/` parent as a single example, so per-model READMEs inside
+it would not be picked up — the hub README is the documented surface.
+
 **Qwen3-TTS reference files:**
 
 | File | Purpose |
