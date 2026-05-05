@@ -10,12 +10,12 @@ from pathlib import Path
 
 import pytest
 
+from tests.helpers.mark import hardware_test
 from tests.helpers.media import (
     generate_synthetic_image,
     generate_synthetic_video,
 )
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
-from tests.utils import hardware_test
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
@@ -24,6 +24,28 @@ MODEL = "openbmb/MiniCPM-o-4_5"
 IMAGE_KEY = ["square", "quadrate", "rectangle"]
 VIDEO_KEY = ["sphere", "globe", "circle", "round", "ball"]
 ARTIFACT_DIR_ENV = "MINICPMO45_E2E_OUTPUT_DIR"
+AUDIO_OUTPUT_SYSTEM_PROMPT = (
+    "When audio output is requested, reply with speech only and follow any requested length constraints."
+)
+TEXT_TO_AUDIO_PROMPT = (
+    "Please read this single long sentence aloud exactly once without shortening it: "
+    "vLLM Omni is running a benchmark for MiniCPM speech generation, and this sentence intentionally "
+    "includes enough detail about streaming text to audio generation, multimodal reasoning, "
+    "stage connectors, careful benchmarking, and stable speech synthesis behavior to last well "
+    "over ten seconds when spoken at a natural pace."
+)
+IMAGE_TO_AUDIO_PROMPT = (
+    "Describe the image in one single detailed spoken sentence of at least sixty words, "
+    "mentioning every visible shape, its color, its approximate size, its position "
+    "relative to the other shapes, the plain background, and the overall layout, and keep "
+    "the answer natural but long enough to last more than ten seconds."
+)
+VIDEO_TO_AUDIO_PROMPT = (
+    "Describe the video in one single detailed spoken sentence of at least sixty words, "
+    "covering the moving objects, their colors, their approximate sizes, the direction and "
+    "pattern of their motion over time, the dark background, and the overall scene, and "
+    "keep the answer natural but long enough to last more than ten seconds."
+)
 CHAT_TEMPLATE_PATH = str(
     Path(__file__).parent.parent.parent.parent
     / "vllm_omni"
@@ -56,10 +78,7 @@ def get_system_prompt() -> dict:
         "content": [
             {
                 "type": "text",
-                "text": (
-                    "You are MiniCPM, a helpful multimodal assistant. "
-                    "When audio output is requested, reply with speech only."
-                ),
+                "text": AUDIO_OUTPUT_SYSTEM_PROMPT,
             }
         ],
     }
@@ -149,24 +168,25 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
     """
     Input Modal: text
     Output Modal: audio
-    Input Setting: stream=True
+    Input Setting: stream=False
     Datasets: single request
     """
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
-        content_text=get_prompt("text"),
+        content_text=TEXT_TO_AUDIO_PROMPT,
     )
 
     request_config = {
         "model": omni_server.model,
         "messages": messages,
-        "modalities": ["audio"],
-        "stream": True,
+        "modalities": ["text", "audio"],
+        "stream": False,
         "extra_body": get_audio_extra_body(),
-        "key_words": {"text": ["beijing"]},
+        "key_words": {"text": ["benchmark", "generation"]},
     }
 
-    openai_client.send_omni_request(request_config)
+    responses = openai_client.send_omni_request(request_config)
+    save_audio_artifacts("text_to_audio_001", responses)
 
 
 @pytest.mark.advanced_model
@@ -213,7 +233,7 @@ def test_image_to_audio_001(omni_server, openai_client) -> None:
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         image_data_url=image_data_url,
-        content_text=get_prompt("image"),
+        content_text=IMAGE_TO_AUDIO_PROMPT,
     )
 
     request_config = {
@@ -272,7 +292,7 @@ def test_video_to_audio_001(omni_server, openai_client) -> None:
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         video_data_url=video_data_url,
-        content_text=get_prompt("video"),
+        content_text=VIDEO_TO_AUDIO_PROMPT,
     )
 
     request_config = {

@@ -452,6 +452,9 @@ class MiniCPMO4_5Code2Wav(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None) -> None:
         return None
 
+    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, bool]]:
+        return [{"_is_dummy": True} for _ in range(num_reqs)]
+
     def _split_request_ids(
         self,
         ids: torch.Tensor,
@@ -583,6 +586,15 @@ class MiniCPMO4_5Code2Wav(nn.Module):
         sr_tensor = torch.tensor(self._output_sample_rate, dtype=torch.int32)
         if runtime_additional_information is None:
             runtime_additional_information = kwargs.get("runtime_additional_information")
+
+        if runtime_additional_information and all(info.get("_is_dummy") for info in runtime_additional_information):
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={
+                    "model_outputs": [empty] * len(runtime_additional_information),
+                    "sr": [sr_tensor] * len(runtime_additional_information),
+                },
+            )
 
         if input_ids is None or input_ids.numel() == 0:
             return OmniOutput(

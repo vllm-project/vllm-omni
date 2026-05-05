@@ -726,7 +726,7 @@ class OpenAIClientHandler:
         responses: list[OmniResponse] = []
         stream = request_config.get("stream", False)
         modalities = request_config.get("modalities", ["text", "audio"])
-        extra_body: dict[str, Any] = {}
+        extra_body: dict[str, Any] = dict(request_config.get("extra_body") or {})
         if "speaker" in request_config:
             extra_body["speaker"] = request_config["speaker"]
         if request_config.get("use_audio_in_video"):

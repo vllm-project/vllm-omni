@@ -24,12 +24,12 @@ import numpy as np
 import pytest
 import soundfile as sf
 
+from tests.helpers.mark import hardware_test
 from tests.helpers.media import (
     generate_synthetic_audio,
     generate_synthetic_image,
     generate_synthetic_video,
 )
-from tests.utils import hardware_test
 
 MODEL = "openbmb/MiniCPM-o-4_5"
 ARTIFACT_DIR_ENV = "MINICPMO45_E2E_OUTPUT_DIR"
@@ -37,6 +37,25 @@ REF_AUDIO_PATH_ENV = "MINICPMO45_REF_AUDIO_PATH"
 SYNTHETIC_MEDIA_SEED_ENV = "MINICPMO45_SYNTHETIC_MEDIA_SEED"
 AUDIO_OUTPUT_SYSTEM_PROMPT = (
     "When audio output is requested, reply with speech only and follow any requested length constraints."
+)
+TEXT_TO_AUDIO_PROMPT = (
+    "Please read this single long sentence aloud exactly once without shortening it: "
+    "vLLM Omni is running a benchmark for MiniCPM speech generation, and this sentence intentionally "
+    "includes enough detail about streaming text to audio generation, multimodal reasoning, "
+    "stage connectors, careful benchmarking, and stable speech synthesis behavior to last well "
+    "over ten seconds when spoken at a natural pace."
+)
+IMAGE_TO_AUDIO_PROMPT = (
+    "Describe the image in one single detailed spoken sentence of at least sixty words, "
+    "mentioning every visible shape, its color, its approximate size, its position "
+    "relative to the other shapes, the plain background, and the overall layout, and keep "
+    "the answer natural but long enough to last more than ten seconds."
+)
+VIDEO_TO_AUDIO_PROMPT = (
+    "Describe the video in one single detailed spoken sentence of at least sixty words, "
+    "covering the moving objects, their colors, their approximate sizes, the direction and "
+    "pattern of their motion over time, the dark background, and the overall scene, and "
+    "keep the answer natural but long enough to last more than ten seconds."
 )
 
 
@@ -57,6 +76,8 @@ def _resolve_model_path() -> str:
 
 
 def _normalize_token_ids(tokenized: Any) -> list[int]:
+    if hasattr(tokenized, "__contains__") and "input_ids" in tokenized:
+        tokenized = tokenized["input_ids"]
     if hasattr(tokenized, "tolist"):
         tokenized = tokenized.tolist()
     if isinstance(tokenized, list) and tokenized and isinstance(tokenized[0], list):
@@ -420,7 +441,7 @@ def test_minicpmo45_text_to_audio_with_and_without_ref() -> None:
     )
 
     try:
-        tts_text = "Please read this sentence aloud: vLLM Omni is testing MiniCPM text to audio generation."
+        tts_text = TEXT_TO_AUDIO_PROMPT
         prompt_no_ref = _build_tts_prompt(
             model_path,
             tts_text,
@@ -635,10 +656,8 @@ def test_minicpmo45_text_image_to_audio() -> None:
 
     try:
         image = generate_synthetic_image(224, 224)["np_array"]
-        prompt_text = "Describe the image briefly in one short spoken sentence."
-        system_prompt = (
-            "You are MiniCPM, a helpful multimodal assistant. When audio output is requested, reply with speech only."
-        )
+        prompt_text = IMAGE_TO_AUDIO_PROMPT
+        system_prompt = AUDIO_OUTPUT_SYSTEM_PROMPT
         prompt = _build_multimodal_text_prompt(
             prompt_text,
             image=image,
@@ -740,10 +759,8 @@ def test_minicpmo45_text_video_to_audio() -> None:
 
     try:
         video = generate_synthetic_video(64, 64, 30)["np_array"]
-        prompt_text = "Describe the video briefly in one short spoken sentence."
-        system_prompt = (
-            "You are MiniCPM, a helpful multimodal assistant. When audio output is requested, reply with speech only."
-        )
+        prompt_text = VIDEO_TO_AUDIO_PROMPT
+        system_prompt = AUDIO_OUTPUT_SYSTEM_PROMPT
         prompt = _build_multimodal_text_prompt(
             prompt_text,
             video=video,

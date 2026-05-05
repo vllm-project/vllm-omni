@@ -113,6 +113,11 @@ class MiniCPMO4_5ForConditionalGeneration(
         )
         return loaded_weights
 
+    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, Any]]:
+        if hasattr(self.model, "get_dummy_runtime_additional_information"):
+            return self.model.get_dummy_runtime_additional_information(num_reqs)
+        return [{} for _ in range(num_reqs)]
+
     def embed_input_ids(
         self,
         input_ids: torch.Tensor,
