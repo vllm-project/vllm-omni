@@ -249,4 +249,3 @@ vllm_omni/_version.py
 *.wav
 *.mp4
 *.png
-

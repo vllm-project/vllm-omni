@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 import random
 import sys
 from pathlib import Path
@@ -39,8 +38,7 @@ if MOONVALLEY_DIR not in sys.path:
 
 DEFAULT_CONFIG = "/app/wlam/models/checkpoints/marey/distilled-0001/config.yaml"
 DEFAULT_TRANSFORMER_WEIGHTS = (
-    "/app/wlam/models/checkpoints/marey/distilled-0001/"
-    "epoch0-global_step5000_distilled/ema_inference_ckpt.safetensors"
+    "/app/wlam/models/checkpoints/marey/distilled-0001/epoch0-global_step5000_distilled/ema_inference_ckpt.safetensors"
 )
 
 DEFAULT_PROMPT = (
@@ -93,13 +91,16 @@ def parse_args():
     p.add_argument("--guidance-every-n-steps", type=int, default=2)
     p.add_argument("--flow-shift", type=float, default=3.0)
     p.add_argument("--clip-value", type=float, default=10.0)
-    p.add_argument("--force-same-timesteps", action="store_true",
-                   help="Force both paths to use the same (ref) timesteps to isolate timestep drift.")
+    p.add_argument(
+        "--force-same-timesteps",
+        action="store_true",
+        help="Force both paths to use the same (ref) timesteps to isolate timestep drift.",
+    )
     return p.parse_args()
 
 
 def _banner(title):
-    print(f"\n{'='*70}\n  {title}\n{'='*70}")
+    print(f"\n{'=' * 70}\n  {title}\n{'=' * 70}")
 
 
 def _compare(name, a, b, rtol=1e-3, atol=1e-4, verbose=True):
@@ -107,20 +108,21 @@ def _compare(name, a, b, rtol=1e-3, atol=1e-4, verbose=True):
     diff = (af - bf).abs()
     max_d = diff.max().item()
     mean_d = diff.mean().item()
-    cos = torch.nn.functional.cosine_similarity(
-        af.flatten().unsqueeze(0), bf.flatten().unsqueeze(0)
-    ).item()
+    cos = torch.nn.functional.cosine_similarity(af.flatten().unsqueeze(0), bf.flatten().unsqueeze(0)).item()
     match = torch.allclose(af, bf, rtol=rtol, atol=atol)
     tag = "MATCH" if match else "MISMATCH"
     if verbose or not match:
-        print(f"  [{tag}] {name}: max_diff={max_d:.8f} mean_diff={mean_d:.8f} "
-              f"cos={cos:.8f} a_std={af.std().item():.6f} b_std={bf.std().item():.6f}")
+        print(
+            f"  [{tag}] {name}: max_diff={max_d:.8f} mean_diff={mean_d:.8f} "
+            f"cos={cos:.8f} a_std={af.std().item():.6f} b_std={bf.std().item():.6f}"
+        )
     return match
 
 
 # ============================================================================
 # Reference-style functions (matching opensora RFLOW exactly)
 # ============================================================================
+
 
 def ref_guidance_schedule(gs, n, warmup, cooldown, every_n):
     sched = np.ones(n)
@@ -130,7 +132,7 @@ def ref_guidance_schedule(gs, n, warmup, cooldown, every_n):
     if main > 0:
         osc = np.ones(main)
         osc[1::every_n] = gs
-        sched[warmup:warmup + main] = osc
+        sched[warmup : warmup + main] = osc
     return sched.tolist()
 
 
@@ -150,20 +152,23 @@ def ref_timesteps(num_steps, shift, tmin=0.001, tmax=1.0, teacher=100, nt=1000, 
 # vllm-omni-style functions (from text_to_video.py)
 # ============================================================================
 
+
 def vllm_guidance_schedule(n, gs, warmup, cooldown, every_n):
     from text_to_video import build_guidance_schedule
+
     return build_guidance_schedule(n, gs, warmup, cooldown, every_n)
 
 
 def vllm_timesteps(num_steps, shift, tmin=0.001, tmax=1.0, teacher=100, nt=1000, device=None):
     from text_to_video import create_flow_timesteps
-    return create_flow_timesteps(num_steps, shift=shift, tmin=tmin, tmax=tmax,
-                                  teacher_steps=teacher, device=device)
+
+    return create_flow_timesteps(num_steps, shift=shift, tmin=tmin, tmax=tmax, teacher_steps=teacher, device=device)
 
 
 # ============================================================================
 # Main comparison
 # ============================================================================
+
 
 def main():
     args = parse_args()
@@ -179,11 +184,11 @@ def main():
     _banner("Phase 0: Schedule comparison")
 
     ref_sched = ref_guidance_schedule(
-        args.guidance_scale, args.steps, args.warmup_steps,
-        args.cooldown_steps, args.guidance_every_n_steps)
+        args.guidance_scale, args.steps, args.warmup_steps, args.cooldown_steps, args.guidance_every_n_steps
+    )
     vllm_sched = vllm_guidance_schedule(
-        args.steps, args.guidance_scale, args.warmup_steps,
-        args.cooldown_steps, args.guidance_every_n_steps)
+        args.steps, args.guidance_scale, args.warmup_steps, args.cooldown_steps, args.guidance_every_n_steps
+    )
 
     sched_diffs = [(i, r, v) for i, (r, v) in enumerate(zip(ref_sched, vllm_sched)) if abs(r - v) > 1e-6]
     if sched_diffs:
@@ -191,7 +196,7 @@ def main():
         for i, r, v in sched_diffs[:10]:
             print(f"    step {i}: ref={r:.1f} vllm={v:.1f}")
     else:
-        print(f"  [MATCH] Guidance schedules identical ({sum(1 for g in ref_sched if g>1)} active)")
+        print(f"  [MATCH] Guidance schedules identical ({sum(1 for g in ref_sched if g > 1)} active)")
 
     ref_ts = ref_timesteps(args.steps, args.flow_shift, device=device)
     vllm_ts = vllm_timesteps(args.steps, args.flow_shift, device=device)
@@ -210,7 +215,7 @@ def main():
     # Phase 1: Text encoding
     # ---------------------------------------------------------------
     _banner("Phase 1: Text encoding")
-    from text_to_video import load_text_encoders, encode_text, _extract_quotes
+    from text_to_video import _extract_quotes, encode_text, load_text_encoders
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -220,7 +225,8 @@ def main():
     pos_seq, pos_masks, pos_vec = encode_text(args.prompt, encoders, device, dtype)
     pos_quote = _extract_quotes(args.prompt)
     neg_seq, neg_masks, neg_vec = encode_text(
-        DEFAULT_NEGATIVE_PROMPT, encoders, device, dtype, quote_override=pos_quote)
+        DEFAULT_NEGATIVE_PROMPT, encoders, device, dtype, quote_override=pos_quote
+    )
     del encoders
     torch.cuda.empty_cache()
 
@@ -235,9 +241,13 @@ def main():
     _banner("Phase 2: Build model")
 
     from text_to_video import (
-        init_distributed, cleanup_distributed,
-        build_transformer, load_transformer_weights, build_extra_features,
+        build_extra_features,
+        build_transformer,
+        cleanup_distributed,
+        init_distributed,
+        load_transformer_weights,
     )
+
     init_distributed(tp_size=1)
 
     vae_cfg = config.get("vae", {})
@@ -282,10 +292,16 @@ def main():
 
     def fwd(z_in, t_in, seq, vec, mask, ef):
         raw = model(
-            hidden_states=z_in.to(dtype), timestep=t_in,
-            encoder_hidden_states=seq, encoder_hidden_states_mask=mask,
-            vector_cond=vec, height=height_t, width=width_t, fps=fps_t,
-            extra_features=ef, return_dict=False,
+            hidden_states=z_in.to(dtype),
+            timestep=t_in,
+            encoder_hidden_states=seq,
+            encoder_hidden_states_mask=mask,
+            vector_cond=vec,
+            height=height_t,
+            width=width_t,
+            fps=fps_t,
+            extra_features=ef,
+            return_dict=False,
         )[0]
         return raw[:, :in_channels] if raw.shape[1] != in_channels else raw
 
@@ -317,10 +333,6 @@ def main():
             gs_ref = ref_sched[i]
             gs_vllm = vllm_sched[i]
 
-            # Check if timesteps and guidance differ
-            t_diff = abs(t_ref.item() - t_vllm.item())
-            gs_diff = abs(gs_ref - gs_vllm)
-
             # Reference logic
             use_uncond_ref = gs_ref > 1.0
             pred_cond_ref = fwd(z_ref, t_ref.expand(1), pos_seq, pos_vec, pos_masks, extra_features)
@@ -351,18 +363,18 @@ def main():
 
             # DDPM step
             if i < args.steps - 1:
-                sigma_s_ref = (ref_ts[i+1].to(device) / nt).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-                sigma_s_vllm = (vllm_ts[i+1].to(device) / nt).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+                sigma_s_ref = (ref_ts[i + 1].to(device) / nt).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+                sigma_s_vllm = (vllm_ts[i + 1].to(device) / nt).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
 
                 def ddpm_step(z, x0, sigma_t, sigma_s, seed_offset):
                     a_t = 1.0 - sigma_t
                     a_s = 1.0 - sigma_s
                     a_ts = a_t / a_s
-                    a_ts2 = a_ts ** 2
+                    a_ts2 = a_ts**2
                     ss_div_t2 = (sigma_s / sigma_t) ** 2
                     sts_div_t2 = 1.0 - a_ts2 * ss_div_t2
                     mean = a_ts * ss_div_t2 * z + a_s * sts_div_t2 * x0
-                    var = sts_div_t2 * sigma_s ** 2
+                    var = sts_div_t2 * sigma_s**2
                     torch.manual_seed(args.seed + i + 1000)
                     noise = torch.randn_like(z)
                     return mean + torch.sqrt(var) * noise
@@ -375,7 +387,10 @@ def main():
 
             step_match = _compare(
                 f"step {i:2d} z (t={t_ref.item():.1f}, gs_ref={gs_ref:.1f} gs_vllm={gs_vllm:.1f})",
-                z_ref, z_vllm, rtol=1e-5, atol=1e-6,
+                z_ref,
+                z_vllm,
+                rtol=1e-5,
+                atol=1e-6,
                 verbose=True,
             )
             if not step_match and first_mismatch_step is None:

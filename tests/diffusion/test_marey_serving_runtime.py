@@ -17,10 +17,13 @@ def test_allow_raw_latent_output_respects_default_output_type(monkeypatch) -> No
 
 def test_allow_raw_latent_output_model_config_overrides_env(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_OMNI_ALLOW_MAREY_RAW_LATENTS", "0")
-    assert allow_raw_latent_output(
-        default_output_type="np",
-        model_config={"allow_raw_latent_output": True},
-    ) is True
+    assert (
+        allow_raw_latent_output(
+            default_output_type="np",
+            model_config={"allow_raw_latent_output": True},
+        )
+        is True
+    )
 
 
 def test_startup_missing_vae_error_mentions_contract() -> None:

@@ -63,7 +63,21 @@ async def decode_image_url(image_url: str) -> Image.Image:
                 ) from exc
         return _decode_image_bytes(response.content, source="image_reference.image_url")
 
-    raise InvalidInputReferenceError("Invalid image_reference.image_url: must be an http(s) URL or data URL.")
+    if image_url.startswith("file://"):
+        # Standard file URI: file:///abs/path. Use urlparse so we handle
+        # percent-encoded paths and ignore any spurious authority component.
+        from urllib.parse import unquote, urlparse
+
+        parsed = urlparse(image_url)
+        path = unquote(parsed.path)
+        if not path or not os.path.isfile(path):
+            raise InvalidInputReferenceError(f"Invalid image_reference.image_url: file:// path not found: {path}.")
+        with open(path, "rb") as f:
+            return _decode_image_bytes(f.read(), source="image_reference.image_url")
+
+    raise InvalidInputReferenceError(
+        "Invalid image_reference.image_url: must be an http(s) URL, data URL, or file:// URI."
+    )
 
 
 async def decode_input_reference(
@@ -84,6 +98,84 @@ async def decode_input_reference(
         raise InvalidInputReferenceError("Invalid image_reference: file_id is not supported yet.")
 
     return None
+
+
+async def decode_frame_conditions(
+    frame_conditions_json: str,
+) -> tuple[list[Image.Image], list[int]]:
+    """Parse a ``frame_conditions`` JSON dict and load each entry's image.
+
+    Schema mirrors the OpenAI chat-completions image_url input — each frame
+    index maps to an object with a nested ``image_url`` carrying a ``url``
+    field. Accepted URL schemes: ``data:image/...;base64,...``, ``http(s)://``,
+    and ``file:///abs/path`` (server-side filesystem read; useful for local
+    testing).
+
+        {
+          "<frame_idx>": {
+            "image_url": {
+              "url":    "https://... | data:image/...;base64,... | file:///abs/path",
+              "detail": "auto"   // optional, accepted and ignored
+            }
+          },
+          ...
+        }
+
+    Returns ``(images, indices)`` sorted by frame index ascending. Used for
+    multi-keyframe I2V (Marey 30B, etc.).
+
+    Raises ``InvalidInputReferenceError`` for malformed JSON, non-int keys,
+    negative/duplicate indices, missing/empty ``image_url.url``, or unreachable URLs.
+    """
+    import json
+
+    try:
+        parsed = json.loads(frame_conditions_json)
+    except json.JSONDecodeError as exc:
+        raise InvalidInputReferenceError(f"Invalid frame_conditions: not valid JSON ({exc}).") from exc
+    if not isinstance(parsed, dict):
+        raise InvalidInputReferenceError("Invalid frame_conditions: must be a JSON object.")
+    if not parsed:
+        raise InvalidInputReferenceError("Invalid frame_conditions: must contain at least one entry.")
+
+    entries: list[tuple[int, dict]] = []
+    for k, v in parsed.items():
+        try:
+            idx = int(k)
+        except (TypeError, ValueError) as exc:
+            raise InvalidInputReferenceError(
+                f"Invalid frame_conditions: key {k!r} is not a non-negative integer."
+            ) from exc
+        if idx < 0:
+            raise InvalidInputReferenceError(f"Invalid frame_conditions: key {idx} must be non-negative.")
+        if not isinstance(v, dict):
+            raise InvalidInputReferenceError(f"Invalid frame_conditions[{k}]: expected JSON object.")
+        entries.append((idx, v))
+
+    if len({idx for idx, _ in entries}) != len(entries):
+        raise InvalidInputReferenceError("Invalid frame_conditions: duplicate frame indices.")
+
+    # Sort by frame index ascending so downstream code (VAE encode, idx2offset)
+    # gets a deterministic order matching mv's _frame_conditions implementation.
+    entries.sort(key=lambda e: e[0])
+
+    images: list[Image.Image] = []
+    indices: list[int] = []
+    for idx, entry in entries:
+        url_field = entry.get("image_url")
+        if not isinstance(url_field, dict):
+            raise InvalidInputReferenceError(
+                f"Invalid frame_conditions[{idx}].image_url: must be an object with a 'url' field."
+            )
+        url = url_field.get("url")
+        if not isinstance(url, str) or not url:
+            raise InvalidInputReferenceError(
+                f"Invalid frame_conditions[{idx}].image_url.url: must be a non-empty string."
+            )
+        images.append(await decode_image_url(url))
+        indices.append(idx)
+
+    return images, indices
 
 
 def _normalize_video_tensor(video_tensor: torch.Tensor) -> np.ndarray:

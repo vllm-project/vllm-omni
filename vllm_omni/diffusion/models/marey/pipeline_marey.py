@@ -27,7 +27,6 @@ import yaml
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPTextModel, CLIPTokenizer, T5EncoderModel
-from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -308,13 +307,12 @@ def _resolve_moonvalley_dir() -> str:
         candidate = Path(env_root).resolve()
         if _is_valid(candidate):
             return str(candidate)
-        raise RuntimeError(
-            f"MOONVALLEY_AI_PATH={env_root} does not contain open_sora/opensora/models/vae"
-        )
+        raise RuntimeError(f"MOONVALLEY_AI_PATH={env_root} does not contain open_sora/opensora/models/vae")
 
     candidates: list[Path] = []
     try:
         import opensora as _os_pkg  # noqa: F401 (import for path discovery)
+
         candidates.append(Path(_os_pkg.__file__).resolve().parents[2])
     except ImportError as e:
         # opensora is not pip-installable in our deployment; _setup_opensora_imports
@@ -326,19 +324,20 @@ def _resolve_moonvalley_dir() -> str:
         # ImportError (e.g. a broken transitive dep). Surface it so the
         # failure is debuggable, then continue with the path-based fallback.
         logger.warning(
-            "opensora is importable but raised during import; "
-            "falling back to path-based lookup",
+            "opensora is importable but raised during import; falling back to path-based lookup",
             exc_info=True,
         )
 
     # pipeline_marey.py lives at <repo>/vllm_omni/diffusion/models/marey/,
     # so parents[4] is the repo root and parents[5] is the parent of the repo.
     repo_root = Path(__file__).resolve().parents[4]
-    candidates.extend([
-        Path("/workspace/moonvalley_ai"),
-        repo_root.parent / "moonvalley_ai",
-        repo_root / "moonvalley_ai",
-    ])
+    candidates.extend(
+        [
+            Path("/workspace/moonvalley_ai"),
+            repo_root.parent / "moonvalley_ai",
+            repo_root / "moonvalley_ai",
+        ]
+    )
 
     for candidate in candidates:
         if _is_valid(candidate):
@@ -375,7 +374,6 @@ def _setup_opensora_imports():
 
     opensora_models_path = str(Path(opensora_pkg_root) / "opensora" / "models")
     sys.modules["opensora.models"].__path__ = [opensora_models_path]
-
 
 
 def _load_vae(
@@ -434,42 +432,99 @@ def get_marey_post_process_func(od_config: OmniDiffusionConfig):
 
 
 def get_marey_pre_process_func(od_config: OmniDiffusionConfig):
-    """Optional pre-process for I2V: load and resize input image."""
+    """Pre-process conditioning images for Marey I2V.
+
+    Mirrors mv `marey_inference.py:_frame_conditions` (lines 230-297): for each
+    conditioning image, letterbox-resize via ``ImageOps.fit`` to the target
+    resolution, ``to_tensor``, then ``Normalize(mean=[0.5], std=[0.5])`` to land
+    in ``[-1, 1]``. Stack into ``(1, C, T_keyframes, H, W)``. Store along with
+    the parallel list of frame indices in ``additional_information`` for the
+    pipeline's forward to pick up.
+    """
     import numpy as np
     import PIL.Image
-    from diffusers.video_processor import VideoProcessor
+    from PIL import ImageOps
+    from torchvision import transforms
 
-    video_processor = VideoProcessor(vae_scale_factor=8)
+    def _infer_target_size(image: PIL.Image.Image) -> tuple[int, int]:
+        max_area = 720 * 1280
+        aspect_ratio = image.height / image.width
+        mod_value = 16
+        height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+        width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+        return int(width), int(height)
 
     def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
             if isinstance(prompt, str):
                 from vllm_omni.inputs.data import OmniTextPrompt
+
                 prompt = OmniTextPrompt(prompt=prompt)
             if "additional_information" not in prompt:
                 prompt["additional_information"] = {}
-            if raw_image is None:
-                continue
-            image = PIL.Image.open(raw_image).convert("RGB") if isinstance(raw_image, str) else raw_image
+
+            multi_modal_data = prompt.get("multi_modal_data", {})
+            raw_images = multi_modal_data.get("images")
+            raw_frame_indices = multi_modal_data.get("frame_indices")
+
+            # Back-compat: fall back to a single-image request via ``image`` key.
+            if not raw_images:
+                raw_image = multi_modal_data.get("image")
+                if raw_image is None:
+                    request.prompts[i] = prompt
+                    continue
+                raw_images = [raw_image]
+                if raw_frame_indices is None:
+                    raw_frame_indices = [0]
+
+            if raw_frame_indices is None or len(raw_frame_indices) != len(raw_images):
+                raise ValueError(
+                    f"Marey I2V preprocessing: expected frame_indices with the same length as images "
+                    f"(got {len(raw_frame_indices) if raw_frame_indices is not None else 'None'} indices "
+                    f"for {len(raw_images)} images)."
+                )
+
+            # Load and pick a target (W, H) from the first image if not provided.
+            pil_images = [
+                PIL.Image.open(img).convert("RGB") if isinstance(img, str) else img.convert("RGB") for img in raw_images
+            ]
             if request.sampling_params.height is None or request.sampling_params.width is None:
-                max_area = 720 * 1280
-                aspect_ratio = image.height / image.width
-                mod_value = 16
-                height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-                width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+                w, h = _infer_target_size(pil_images[0])
                 if request.sampling_params.height is None:
-                    request.sampling_params.height = height
+                    request.sampling_params.height = h
                 if request.sampling_params.width is None:
-                    request.sampling_params.width = width
-            image = image.resize(
-                (request.sampling_params.width, request.sampling_params.height),
-                PIL.Image.Resampling.LANCZOS,
-            )
-            prompt["multi_modal_data"]["image"] = image
-            prompt["additional_information"]["preprocessed_image"] = video_processor.preprocess(
-                image, height=request.sampling_params.height, width=request.sampling_params.width
+                    request.sampling_params.width = w
+            target_w = int(request.sampling_params.width)
+            target_h = int(request.sampling_params.height)
+
+            # Letterbox-fit to match mv (marey_inference.py:284-286).
+            fitted = [ImageOps.fit(img, size=(target_w, target_h)) for img in pil_images]
+            tensors = [transforms.functional.to_tensor(img) for img in fitted]
+            normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            tensors = [normalize(t) for t in tensors]
+            cond_images = torch.stack(tensors, dim=1).unsqueeze(0)  # (1, C, T_keyframes, H, W) in [-1, 1]
+
+            # Reject dense keyframe groups (consecutive runs of 4 starting at idx%4==0)
+            # which would need the deferred split_vae_blocks_and_frames VAE-block path
+            # (mv marey_inference.py:63-95). Phase 2 only implements the individual-frame path.
+            sorted_idx = sorted(int(x) for x in raw_frame_indices)
+            for k in range(len(sorted_idx) - 3):
+                run = sorted_idx[k : k + 4]
+                if run[0] % 4 == 0 and run == list(range(run[0], run[0] + 4)):
+                    raise NotImplementedError(
+                        f"Dense keyframe group {run} requires the VAE-block encoding path, "
+                        f"which is not implemented yet. Use sparse keyframes (e.g. every 4+ frames)."
+                    )
+
+            prompt["multi_modal_data"]["images"] = fitted
+            prompt["multi_modal_data"]["image"] = fitted[0]  # back-compat alias
+            prompt["multi_modal_data"]["frame_indices"] = [int(x) for x in raw_frame_indices]
+            prompt["additional_information"]["cond_images"] = cond_images
+            prompt["additional_information"]["cond_frame_indices"] = [int(x) for x in raw_frame_indices]
+            logger.info(
+                "Marey I2V preprocess: cond_images.shape=%s cond_frame_indices=%s",
+                tuple(cond_images.shape),
+                prompt["additional_information"]["cond_frame_indices"],
             )
             request.prompts[i] = prompt
         return request
@@ -545,13 +600,11 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
             self.clip_max_length = te_cfg.get("metaclip_max_length", 77)
             self.byt5_max_length = te_cfg.get("byt5_max_length", self.clip_max_length)
             self.clip_tokenizer = CLIPTokenizer.from_pretrained(metaclip_name)
-            self.clip_model = CLIPTextModel.from_pretrained(
-                metaclip_name, torch_dtype=dtype, device_map="cpu").eval()
+            self.clip_model = CLIPTextModel.from_pretrained(metaclip_name, torch_dtype=dtype, device_map="cpu").eval()
             # Alias MetaCLIP into the byt5 slot for reuse in encode_prompt
             self.byt5_tokenizer = self.clip_tokenizer
             self.byt5_model = self.clip_model
-            caption_channels = [self.ul2_model.config.d_model,
-                                self.clip_model.config.hidden_size]
+            caption_channels = [self.ul2_model.config.d_model, self.clip_model.config.hidden_size]
             vector_cond_channels = None
         else:
             # ul2-clip-quote (30B): CLIP pooled vector + ByT5 sequence
@@ -561,13 +614,10 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
             self.clip_max_length = te_cfg.get("clip_max_length", 77)
             self.byt5_max_length = te_cfg.get("byt5_max_length", 70)
             self.clip_tokenizer = CLIPTokenizer.from_pretrained(clip_name)
-            self.clip_model = CLIPTextModel.from_pretrained(
-                clip_name, torch_dtype=dtype, device_map="cpu").eval()
+            self.clip_model = CLIPTextModel.from_pretrained(clip_name, torch_dtype=dtype, device_map="cpu").eval()
             self.byt5_tokenizer = AutoTokenizer.from_pretrained(byt5_name)
-            self.byt5_model = T5EncoderModel.from_pretrained(
-                byt5_name, torch_dtype=dtype, device_map="cpu").eval()
-            caption_channels = [self.ul2_model.config.d_model,
-                                self.byt5_model.config.d_model]
+            self.byt5_model = T5EncoderModel.from_pretrained(byt5_name, torch_dtype=dtype, device_map="cpu").eval()
+            caption_channels = [self.ul2_model.config.d_model, self.byt5_model.config.d_model]
             vector_cond_channels = self.clip_model.config.hidden_size
 
         # -- VAE --------------------------------------------------------------
@@ -593,7 +643,11 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         # -- Transformer ------------------------------------------------------
         in_channels = len(vae_cfg.get("scaling_factor", [0] * 16))
         self.transformer = _create_transformer_from_config(
-            model_cfg, te_cfg, in_channels, caption_channels, vector_cond_channels,
+            model_cfg,
+            te_cfg,
+            in_channels,
+            caption_channels,
+            vector_cond_channels,
         )
 
         # -- Scheduler config -------------------------------------------------
@@ -719,14 +773,71 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         if latents is not None:
             return latents.to(device=device, dtype=dtype)
 
-        time_pad = 0 if (num_frames % self.vae_scale_factor_temporal == 0) else (
-            self.vae_scale_factor_temporal - num_frames % self.vae_scale_factor_temporal
+        time_pad = (
+            0
+            if (num_frames % self.vae_scale_factor_temporal == 0)
+            else (self.vae_scale_factor_temporal - num_frames % self.vae_scale_factor_temporal)
         )
         num_latent_frames = (num_frames + time_pad) // self.vae_scale_factor_temporal
         latent_h = math.ceil(height / self.vae_scale_factor_spatial)
         latent_w = math.ceil(width / self.vae_scale_factor_spatial)
         shape = (batch_size, num_channels_latents, num_latent_frames, latent_h, latent_w)
         return randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+
+    # -- Conditioning-frame encoding (I2V) -----------------------------------
+
+    def _encode_cond_frames(
+        self,
+        cond_images: torch.Tensor,
+        cond_frame_indices: list[int],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode I2V conditioning images → ``cond_frames`` latent + ``cond_offsets``.
+
+        Mirrors mv ``marey_inference.py:_encode_images`` (lines 617-639) with
+        ``encode_as_images=True, clip_as_keyframes=True`` and the per-keyframe
+        offset loop at lines 330-341. Only the individual-frame path; dense
+        VAE-block keyframe groups are rejected earlier in the preprocess hook.
+
+        Args:
+            cond_images: ``(1, C=3, T_keyframes, H, W)`` in ``[-1, 1]``.
+            cond_frame_indices: List of target frame indices in the output video.
+
+        Returns:
+            ``(cond_frames, cond_offsets)`` — ``cond_frames`` shaped
+            ``(1, C_vae, T_keyframes, H_lat, W_lat)`` in transformer ``dtype``;
+            ``cond_offsets`` a 1-D int64 tensor of length ``T_keyframes``.
+        """
+        from einops import rearrange
+
+        if self.vae is None:
+            raise MareyVAEInitializationError(
+                build_request_missing_vae_error(self.vae_init_error, "cond_frames (I2V requires VAE)")
+            )
+
+        model_cfg = self.config.get("model", {})
+        latent_time_offset = model_cfg.get("latent_time_offset", -0.75)
+
+        # (1, C, T_kf, H, W) → (T_kf, C, 1, H, W): VAE treats each keyframe independently.
+        x = cond_images.to(device=device, dtype=dtype)
+        T_kf = x.shape[2]
+        x = rearrange(x, "B C (Tl L) H W -> (B Tl) C L H W", L=1)
+
+        with torch.no_grad():
+            enc = self.vae.encode_images(x)  # (T_kf, C_vae, 1, H_lat, W_lat)
+        enc = enc.squeeze(2)
+        cond_frames = rearrange(enc, "(B T) C H W -> B C T H W", T=T_kf).contiguous().to(dtype=dtype)
+
+        indices_tensor = torch.tensor(cond_frame_indices, device=device, dtype=torch.int64)
+        cond_offsets = self.vae.idx2offset(
+            indices_tensor,
+            latent_time_offset,
+            encode_as_images=True,
+            clip_as_keyframes=True,
+        )
+        return cond_frames, cond_offsets
 
     # -- Forward (DDPM flow-matching loop) -----------------------------------
 
@@ -756,7 +867,7 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         if generator is None and sp.seed is not None:
             generator = torch.Generator(device=device).manual_seed(sp.seed)
         elif generator is None:
-            generator = torch.Generator(device=device).manual_seed(0) # default seed
+            generator = torch.Generator(device=device).manual_seed(0)  # default seed
 
         # -- Text encoding (offload transformer, load encoders) ---------------
         self.transformer.to("cpu")
@@ -767,7 +878,10 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
 
         # Reference passes quote_override="" (ByT5 encodes empty string)
         prompt_embeds, prompt_masks, vector_cond = self.encode_prompt(
-            prompt, device, dtype, quote_override="",
+            prompt,
+            device,
+            dtype,
+            quote_override="",
         )
 
         use_cfg = guidance_scale > 1.0
@@ -777,7 +891,10 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         if use_cfg:
             neg_text = negative_prompt if negative_prompt is not None else DEFAULT_NEGATIVE_PROMPT
             negative_prompt_embeds, negative_prompt_masks, negative_vector_cond = self.encode_prompt(
-                neg_text, device, dtype, quote_override="",
+                neg_text,
+                device,
+                dtype,
+                quote_override="",
             )
 
         # Offload encoders, reload transformer
@@ -785,6 +902,29 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         self.clip_model.to("cpu")
         self.byt5_model.to("cpu")
         torch.cuda.empty_cache()
+
+        # -- I2V: encode conditioning frames (VAE only, transformer still offloaded) --
+        cond_frames: torch.Tensor | None = None
+        cond_offsets: torch.Tensor | None = None
+        additional_information = raw_prompt.get("additional_information", {}) if not isinstance(raw_prompt, str) else {}
+        cond_images = additional_information.get("cond_images")
+        cond_frame_indices = additional_information.get("cond_frame_indices")
+        if cond_images is not None and cond_frame_indices:
+            self.vae.to(device)
+            cond_frames, cond_offsets = self._encode_cond_frames(
+                cond_images,
+                cond_frame_indices,
+                device=device,
+                dtype=dtype,
+            )
+            self.vae.to("cpu")
+            torch.cuda.empty_cache()
+            logger.info(
+                "Marey I2V forward: cond_frames.shape=%s cond_offsets=%s",
+                tuple(cond_frames.shape),
+                cond_offsets.tolist(),
+            )
+
         self.transformer.to(device)
 
         # -- Timesteps --------------------------------------------------------
@@ -864,6 +1004,8 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                 width=width_t,
                 fps=fps_t,
                 extra_features=ef if ef is not None else extra_features,
+                cond_frames=cond_frames,
+                cond_offsets=cond_offsets,
                 return_dict=False,
             )[0]
             if raw.shape[1] != in_channels:
@@ -882,13 +1024,20 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                 use_uncond = has_neg and ((not self.skip_uncond) or (gs_i > 1.0))
 
                 pred_cond = _model_forward(
-                    z, t_input, prompt_embeds, vector_cond, prompt_masks,
+                    z,
+                    t_input,
+                    prompt_embeds,
+                    vector_cond,
+                    prompt_masks,
                     ef=extra_features,
                 )
 
                 if use_uncond:
                     pred_uncond = _model_forward(
-                        z, t_input, negative_prompt_embeds, negative_vector_cond,
+                        z,
+                        t_input,
+                        negative_prompt_embeds,
+                        negative_vector_cond,
                         negative_prompt_masks,
                         ef=_uncond_ef,
                     )
@@ -903,16 +1052,22 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                     x0 = torch.clamp(x0, -clip_value, clip_value)
 
                 if i < len(timesteps) - 1:
-                    sigma_s = (timesteps[i + 1] / self.num_train_timesteps).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+                    sigma_s = (
+                        (timesteps[i + 1] / self.num_train_timesteps)
+                        .unsqueeze(-1)
+                        .unsqueeze(-1)
+                        .unsqueeze(-1)
+                        .unsqueeze(-1)
+                    )
                     alpha_t = 1.0 - sigma_t
                     alpha_s = 1.0 - sigma_s
                     alpha_ts = alpha_t / alpha_s
-                    alpha_ts_sq = alpha_ts ** 2
+                    alpha_ts_sq = alpha_ts**2
                     sigma_s_div_t_sq = (sigma_s / sigma_t) ** 2
                     sigma_ts_div_t_sq = 1.0 - alpha_ts_sq * sigma_s_div_t_sq
 
                     mean = alpha_ts * sigma_s_div_t_sq * z + alpha_s * sigma_ts_div_t_sq * x0
-                    variance = sigma_ts_div_t_sq * sigma_s ** 2
+                    variance = sigma_ts_div_t_sq * sigma_s**2
 
                     noise = torch.randn_like(z, generator=generator)
                     z = mean + torch.sqrt(variance) * noise
@@ -981,15 +1136,13 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                 ckpt_path = matches[0]
                 break
         if ckpt_path is None:
-            raise FileNotFoundError(
-                f"Cannot find ema_inference_ckpt.safetensors under {model_dir}"
-            )
+            raise FileNotFoundError(f"Cannot find ema_inference_ckpt.safetensors under {model_dir}")
 
         logger.info("Loading transformer weights from %s", ckpt_path)
         state_dict = safetensors.torch.load_file(ckpt_path)
 
-        def _remap_items():
-            for name, tensor in state_dict.items():
+        def _remap_items(sd: dict[str, torch.Tensor]):
+            for name, tensor in sd.items():
                 r = name
                 for old, new in _CHECKPOINT_KEY_REMAP:
                     if old in r:
@@ -997,7 +1150,7 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                         break
                 yield r, tensor
 
-        self.transformer.load_weights(_remap_items())
+        self.transformer.load_weights(_remap_items(state_dict))
 
         del state_dict
         torch.cuda.empty_cache()

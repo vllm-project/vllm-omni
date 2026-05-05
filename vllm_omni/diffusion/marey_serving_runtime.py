@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 
-
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 
 

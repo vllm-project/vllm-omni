@@ -42,8 +42,7 @@ import yaml
 # ---------------------------------------------------------------------------
 DEFAULT_CONFIG = "/app/wlam/models/checkpoints/marey/distilled-0001/config.yaml"
 DEFAULT_TRANSFORMER_WEIGHTS = (
-    "/app/wlam/models/checkpoints/marey/distilled-0001/"
-    "epoch0-global_step5000_distilled/ema_inference_ckpt.safetensors"
+    "/app/wlam/models/checkpoints/marey/distilled-0001/epoch0-global_step5000_distilled/ema_inference_ckpt.safetensors"
 )
 DEFAULT_VAE_WEIGHTS = "/app/wlam/models/checkpoints/marey/vae/epoch_4_step2819000.ckpt"
 
@@ -74,26 +73,52 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=720, help="Video height.")
     parser.add_argument("--width", type=int, default=1280, help="Video width.")
     parser.add_argument("--num-frames", type=int, default=33, help="Number of output frames.")
-    parser.add_argument("--steps", type=int, default=100, help="Number of denoising steps (reference uses 100 for distilled).")
+    parser.add_argument(
+        "--steps", type=int, default=100, help="Number of denoising steps (reference uses 100 for distilled)."
+    )
     parser.add_argument("--guidance-scale", type=float, default=7.5, help="CFG guidance scale.")
-    parser.add_argument("--use-guidance-schedule", action=argparse.BooleanOptionalAction, default=True,
-                        help="Use warmup/cooldown guidance schedule (matching reference RFLOW scheduler).")
-    parser.add_argument("--skip-uncond", action=argparse.BooleanOptionalAction, default=None,
-                        help="Skip unconditional prediction when guidance scale is 1.0. "
-                             "Default: auto-detect from checkpoint path (True for distilled models).")
+    parser.add_argument(
+        "--use-guidance-schedule",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use warmup/cooldown guidance schedule (matching reference RFLOW scheduler).",
+    )
+    parser.add_argument(
+        "--skip-uncond",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Skip unconditional prediction when guidance scale is 1.0. "
+        "Default: auto-detect from checkpoint path (True for distilled models).",
+    )
     parser.add_argument("--warmup-steps", type=int, default=4, help="Number of guidance warmup steps.")
     parser.add_argument("--cooldown-steps", type=int, default=18, help="Number of guidance cooldown steps.")
-    parser.add_argument("--guidance-every-n-steps", type=int, default=2,
-                        help="Apply guidance every N steps during the middle phase.")
-    parser.add_argument("--clip-value", type=float, default=10.0, help="Clamp predicted x0 to [-clip, clip]. 0 to disable.")
-    parser.add_argument("--quality-guidance", action=argparse.BooleanOptionalAction, default=True,
-                        help="Enable quality guidance (cond=0, uncond=9 for dover/aesthetics scores). Matches reference.")
-    parser.add_argument("--flow-shift", type=float, default=3.0, help="Rectified flow shift (default 3.0 matches reference inference CLI).")
+    parser.add_argument(
+        "--guidance-every-n-steps", type=int, default=2, help="Apply guidance every N steps during the middle phase."
+    )
+    parser.add_argument(
+        "--clip-value", type=float, default=10.0, help="Clamp predicted x0 to [-clip, clip]. 0 to disable."
+    )
+    parser.add_argument(
+        "--quality-guidance",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable quality guidance (cond=0, uncond=9 for dover/aesthetics scores). Matches reference.",
+    )
+    parser.add_argument(
+        "--flow-shift",
+        type=float,
+        default=3.0,
+        help="Rectified flow shift (default 3.0 matches reference inference CLI).",
+    )
     parser.add_argument("--fps", type=int, default=24, help="Output video FPS.")
     parser.add_argument("--output", type=str, default="marey_output.mp4", help="Output video path.")
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"], help="Compute dtype.")
-    parser.add_argument("--tp", type=int, default=1, help="Tensor parallel size. Use torchrun --nproc_per_node=N for tp > 1.")
-    parser.add_argument("--diag", action="store_true", help="Enable DIAG / BLOCK_DIAG diagnostic output from the transformer.")
+    parser.add_argument(
+        "--tp", type=int, default=1, help="Tensor parallel size. Use torchrun --nproc_per_node=N for tp > 1."
+    )
+    parser.add_argument(
+        "--diag", action="store_true", help="Enable DIAG / BLOCK_DIAG diagnostic output from the transformer."
+    )
     return parser.parse_args()
 
 
@@ -137,8 +162,7 @@ def init_distributed(tp_size: int) -> tuple[int, int]:
 
     if world_size != tp_size:
         raise RuntimeError(
-            f"World size ({world_size}) must equal --tp ({tp_size}). "
-            f"Use: torchrun --nproc_per_node={tp_size} ..."
+            f"World size ({world_size}) must equal --tp ({tp_size}). Use: torchrun --nproc_per_node={tp_size} ..."
         )
 
     dist_state.init_distributed_environment(
@@ -186,7 +210,7 @@ def load_text_encoders(config: dict, device: torch.device, dtype: torch.dtype):
     clip_max_len = te_cfg.get("clip_max_length", 77)
     byt5_max_len = te_cfg.get("byt5_max_length", 70)
 
-    from transformers import AutoModel, AutoTokenizer, CLIPTextModel, CLIPTokenizer, T5EncoderModel
+    from transformers import AutoTokenizer, CLIPTextModel, CLIPTokenizer, T5EncoderModel
 
     print(f"Loading UL2 text encoder: {ul2_name}")
     ul2_tokenizer = AutoTokenizer.from_pretrained(ul2_name)
@@ -218,6 +242,7 @@ def _extract_quotes(text: str) -> str:
     """Extract text between quotes for ByT5 encoding. Returns the full
     prompt if no quotes are found."""
     import re
+
     matches = re.findall(r'["\u201c\u201d](.*?)["\u201c\u201d]', text)
     return " ".join(matches) if matches else text
 
@@ -374,15 +399,11 @@ def load_vae(
             frame_chunk_len=vae_config.get("frame_chunk_len"),
             max_batch_size=vae_config.get("max_batch_size"),
             reuse_as_spatial_vae=vae_config.get("reuse_as_spatial_vae", False),
-            extra_context_and_drop_strategy=vae_config.get(
-                "extra_context_and_drop_strategy", False
-            ),
+            extra_context_and_drop_strategy=vae_config.get("extra_context_and_drop_strategy", False),
         )
         vae = vae.to(device, dtype).eval()
         print(
-            f"Loaded opensora VAE successfully  "
-            f"(out_channels={vae.out_channels}, "
-            f"downsample={vae.downsample_factors})"
+            f"Loaded opensora VAE successfully  (out_channels={vae.out_channels}, downsample={vae.downsample_factors})"
         )
         return vae
     except Exception as e:
@@ -429,7 +450,9 @@ def build_extra_features(
     return features
 
 
-def build_transformer(config: dict, in_channels: int, caption_channels: int | list[int], vector_cond_channels: int | None):
+def build_transformer(
+    config: dict, in_channels: int, caption_channels: int | list[int], vector_cond_channels: int | None
+):
     """Build MareyTransformer from config.yaml model section."""
     from vllm_omni.diffusion.models.marey.marey_transformer import MareyTransformer
 
@@ -639,7 +662,11 @@ def generate(
     vae_scale_factor_spatial = vae_downsample_factors[1]
     num_train_timesteps = 1000
 
-    time_pad = 0 if (num_frames % vae_scale_factor_temporal == 0) else (vae_scale_factor_temporal - num_frames % vae_scale_factor_temporal)
+    time_pad = (
+        0
+        if (num_frames % vae_scale_factor_temporal == 0)
+        else (vae_scale_factor_temporal - num_frames % vae_scale_factor_temporal)
+    )
     num_latent_frames = (num_frames + time_pad) // vae_scale_factor_temporal
 
     latent_h = math.ceil(height / vae_scale_factor_spatial)
@@ -699,7 +726,9 @@ def generate(
         pred_cond = _model_forward(z, t_input, prompt_embeds, vector_cond, prompt_embeds_mask, ef=extra_features)
 
         if use_uncond:
-            pred_uncond = _model_forward(z, t_input, negative_prompt_embeds, negative_vector_cond, negative_prompt_embeds_mask, ef=_uncond_ef)
+            pred_uncond = _model_forward(
+                z, t_input, negative_prompt_embeds, negative_vector_cond, negative_prompt_embeds_mask, ef=_uncond_ef
+            )
             v_pred = pred_uncond + gs_i * (pred_cond - pred_uncond)
         else:
             v_pred = pred_cond
@@ -716,12 +745,12 @@ def generate(
             alpha_t = 1.0 - sigma_t
             alpha_s = 1.0 - sigma_s
             alpha_ts = alpha_t / alpha_s
-            alpha_ts_sq = alpha_ts ** 2
+            alpha_ts_sq = alpha_ts**2
             sigma_s_div_t_sq = (sigma_s / sigma_t) ** 2
             sigma_ts_div_t_sq = 1.0 - alpha_ts_sq * sigma_s_div_t_sq
 
             mean = alpha_ts * sigma_s_div_t_sq * z + alpha_s * sigma_ts_div_t_sq * x0
-            variance = sigma_ts_div_t_sq * sigma_s ** 2
+            variance = sigma_ts_div_t_sq * sigma_s**2
 
             noise = torch.randn_like(z)
             z = mean + torch.sqrt(variance) * noise
@@ -730,10 +759,12 @@ def generate(
 
         if is_main and ((i + 1) % 5 == 0 or i == 0 or i == len(timesteps) - 1):
             zf = z.float()
-            print(f"  Step {i + 1}/{len(timesteps)}: sigma={sigma_t.item():.4f} "
-                  f"v_pred std={v_pred.float().std().item():.4f} "
-                  f"x0 std={x0.float().std().item():.4f} "
-                  f"z std={zf.std().item():.4f}")
+            print(
+                f"  Step {i + 1}/{len(timesteps)}: sigma={sigma_t.item():.4f} "
+                f"v_pred std={v_pred.float().std().item():.4f} "
+                f"x0 std={x0.float().std().item():.4f} "
+                f"z std={zf.std().item():.4f}"
+            )
 
     return z
 
@@ -767,7 +798,6 @@ def save_video(frames: np.ndarray, output_path: str, fps: int = 24) -> None:
 # ---------------------------------------------------------------------------
 
 
-
 def main():
     args = parse_args()
 
@@ -775,6 +805,7 @@ def main():
     rank, world_size = init_distributed(args.tp)
 
     import random as _random
+
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     dtype = dtype_map[args.dtype]
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -789,7 +820,6 @@ def main():
     if skip_uncond is None:
         skip_uncond = "distilled" in args.transformer_weights.lower()
 
-
     if rank == 0:
         print(f"\n{'=' * 60}")
         print("Marey MMDiT Video Generation")
@@ -799,8 +829,10 @@ def main():
         print(f"  Prompt:     {args.prompt}")
         print(f"  Resolution: {args.width}x{args.height}, {args.num_frames} frames")
         print(f"  Steps:      {args.steps}, CFG: {args.guidance_scale}")
-        print(f"  Schedule:   use_guidance_schedule={args.use_guidance_schedule}, "
-              f"skip_uncond={skip_uncond}, clip_value={args.clip_value}")
+        print(
+            f"  Schedule:   use_guidance_schedule={args.use_guidance_schedule}, "
+            f"skip_uncond={skip_uncond}, clip_value={args.clip_value}"
+        )
         print(f"  Flow shift: {args.flow_shift}")
         print(f"  Dtype:      {args.dtype}")
         print(f"  TP:         {args.tp}")
@@ -818,7 +850,7 @@ def main():
     t_encode = 0.0
 
     if rank == 0:
-        print(f'Pre-loading VAE')
+        print("Pre-loading VAE")
         vae_cfg = config.get("vae", {})
         vae = load_vae(vae_cfg, device, dtype)
     if rank == 0:
@@ -831,7 +863,11 @@ def main():
         # Reference passes quote_prompts="" to the scheduler (the line is commented
         # out in marey_inference.py), so ByT5 encodes an empty string.
         prompt_embeds, prompt_masks, vector_cond = encode_text(
-            args.prompt, encoders, device, dtype, quote_override="",
+            args.prompt,
+            encoders,
+            device,
+            dtype,
+            quote_override="",
         )
         t_encode = time.perf_counter() - t0
         seq_shapes = [s.shape for s in prompt_embeds] if isinstance(prompt_embeds, list) else prompt_embeds.shape
@@ -842,7 +878,11 @@ def main():
         negative_vector_cond = None
         if use_cfg:
             negative_prompt_embeds, negative_prompt_masks, negative_vector_cond = encode_text(
-                negative_prompt_text, encoders, device, dtype, quote_override="",
+                negative_prompt_text,
+                encoders,
+                device,
+                dtype,
+                quote_override="",
             )
             print(f"Negative prompt encoded  (CFG scale={args.guidance_scale})")
 
@@ -857,9 +897,23 @@ def main():
         negative_vector_cond = None
 
     if world_size > 1:
-        obj_list = [prompt_embeds, prompt_masks, vector_cond, negative_prompt_embeds, negative_prompt_masks, negative_vector_cond]
+        obj_list = [
+            prompt_embeds,
+            prompt_masks,
+            vector_cond,
+            negative_prompt_embeds,
+            negative_prompt_masks,
+            negative_vector_cond,
+        ]
         torch.distributed.broadcast_object_list(obj_list, src=0)
-        prompt_embeds, prompt_masks, vector_cond, negative_prompt_embeds, negative_prompt_masks, negative_vector_cond = obj_list
+        (
+            prompt_embeds,
+            prompt_masks,
+            vector_cond,
+            negative_prompt_embeds,
+            negative_prompt_masks,
+            negative_vector_cond,
+        ) = obj_list
         if isinstance(prompt_embeds, list):
             prompt_embeds = [p.to(device) for p in prompt_embeds]
         else:
@@ -910,7 +964,7 @@ def main():
                 uncond_extra_features[qkey] = torch.tensor([9], device=device, dtype=torch.long)
                 extra_features[qkey] = torch.tensor([0], device=device, dtype=torch.long)
         if rank == 0:
-            print(f"Quality guidance enabled: cond quality=0, uncond quality=9")
+            print("Quality guidance enabled: cond quality=0, uncond quality=9")
 
     if rank == 0 and args.diag:
         transformer._diag = True
@@ -932,8 +986,10 @@ def main():
     tmax = sched_cfg.get("tmax", 1.0)
     teacher_steps = sched_cfg.get("num_sampling_steps", 100)
     if rank == 0:
-        print(f"Timestep schedule: use_transform={use_ts_transform}, shift={shift_value}, "
-              f"tmin={tmin}, tmax={tmax}, teacher_steps={teacher_steps}")
+        print(
+            f"Timestep schedule: use_transform={use_ts_transform}, shift={shift_value}, "
+            f"tmin={tmin}, tmax={tmax}, teacher_steps={teacher_steps}"
+        )
     timesteps = create_flow_timesteps(
         num_steps=args.steps,
         shift=shift_value,
@@ -960,9 +1016,11 @@ def main():
         )
         if rank == 0:
             active = sum(1 for g in guidance_sched if g > 1.0)
-            print(f"Guidance schedule: {active}/{len(guidance_sched)} steps active "
-                  f"(warmup_steps={args.warmup_steps}, cooldown_steps={args.cooldown_steps}, "
-                  f"every_n={args.guidance_every_n_steps})")
+            print(
+                f"Guidance schedule: {active}/{len(guidance_sched)} steps active "
+                f"(warmup_steps={args.warmup_steps}, cooldown_steps={args.cooldown_steps}, "
+                f"every_n={args.guidance_every_n_steps})"
+            )
 
     clip_val = args.clip_value if args.clip_value > 0 else None
 
@@ -1010,11 +1068,13 @@ def main():
 
     if rank == 0:
         lf = latents.float()
-        print(f"Final latents: shape={list(latents.shape)} "
-              f"mean={lf.mean().item():.4f} std={lf.std().item():.4f} "
-              f"min={lf.min().item():.4f} max={lf.max().item():.4f}")
+        print(
+            f"Final latents: shape={list(latents.shape)} "
+            f"mean={lf.mean().item():.4f} std={lf.std().item():.4f} "
+            f"min={lf.min().item():.4f} max={lf.max().item():.4f}"
+        )
         for ch in range(min(latents.shape[1], 4)):
-            print(f"  ch{ch}: mean={lf[0,ch].mean().item():.4f} std={lf[0,ch].std().item():.4f}")
+            print(f"  ch{ch}: mean={lf[0, ch].mean().item():.4f} std={lf[0, ch].std().item():.4f}")
 
         latent_path = str(Path(args.output).with_suffix(".latents.pt"))
         torch.save(latents.float().cpu(), latent_path)
@@ -1036,10 +1096,7 @@ def main():
                 print("Single latent frame detected, using single-frame decode")
             elif chunk is not None and num_pixel_frames % chunk != 0:
                 num_pixel_frames = (num_pixel_frames // chunk) * chunk
-                print(
-                    f"Aligned pixel frames to {num_pixel_frames} "
-                    f"(frame_chunk_len={chunk})"
-                )
+                print(f"Aligned pixel frames to {num_pixel_frames} (frame_chunk_len={chunk})")
 
             with torch.no_grad():
                 video = vae.decode(
@@ -1055,15 +1112,16 @@ def main():
 
             if isinstance(video, torch.Tensor):
                 vf = video.float()
-                print(f"VAE raw output: shape={list(vf.shape)} "
-                      f"mean={vf.mean().item():.4f} std={vf.std().item():.4f} "
-                      f"min={vf.min().item():.4f} max={vf.max().item():.4f}")
+                print(
+                    f"VAE raw output: shape={list(vf.shape)} "
+                    f"mean={vf.mean().item():.4f} std={vf.std().item():.4f} "
+                    f"min={vf.min().item():.4f} max={vf.max().item():.4f}"
+                )
                 video = vf.cpu()
                 if video.dim() == 5 and video.shape[1] in (3, 4):
                     video = video[0].permute(1, 2, 3, 0)  # [T, H, W, C]
                 video = video.clamp(-1, 1) * 0.5 + 0.5
-                print(f"After clamp+rescale: mean={video.mean().item():.4f} "
-                      f"std={video.std().item():.4f}")
+                print(f"After clamp+rescale: mean={video.mean().item():.4f} std={video.std().item():.4f}")
                 video = video.numpy()
         else:
             print("No VAE available. Saving latent visualization.")

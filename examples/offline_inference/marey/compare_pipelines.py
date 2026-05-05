@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 import sys
 import traceback
 from pathlib import Path
@@ -37,8 +36,7 @@ import torch
 
 DEFAULT_CONFIG = "/app/wlam/models/checkpoints/marey/distilled-0001/config.yaml"
 DEFAULT_TRANSFORMER_WEIGHTS = (
-    "/app/wlam/models/checkpoints/marey/distilled-0001/"
-    "epoch0-global_step5000_distilled/ema_inference_ckpt.safetensors"
+    "/app/wlam/models/checkpoints/marey/distilled-0001/epoch0-global_step5000_distilled/ema_inference_ckpt.safetensors"
 )
 DEFAULT_VAE_WEIGHTS = "/app/wlam/models/checkpoints/marey/vae/epoch_4_step2819000.ckpt"
 
@@ -74,10 +72,10 @@ def parse_args():
     p.add_argument("--cooldown-steps", type=int, default=18)
     p.add_argument("--guidance-every-n-steps", type=int, default=2)
     p.add_argument("--flow-shift", type=float, default=3.0)
-    p.add_argument("--skip", nargs="*", default=[],
-                   help="Tests to skip: guidance timesteps encoding forward denoise vae")
-    p.add_argument("--only", nargs="*", default=[],
-                   help="Run only these tests (same names as --skip)")
+    p.add_argument(
+        "--skip", nargs="*", default=[], help="Tests to skip: guidance timesteps encoding forward denoise vae"
+    )
+    p.add_argument("--only", nargs="*", default=[], help="Run only these tests (same names as --skip)")
     return p.parse_args()
 
 
@@ -85,10 +83,11 @@ def parse_args():
 # Utilities
 # ============================================================================
 
+
 def _banner(title: str):
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"  {title}")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
 
 
 def _compare_tensors(name: str, a: torch.Tensor, b: torch.Tensor, rtol=1e-3, atol=1e-4):
@@ -100,9 +99,7 @@ def _compare_tensors(name: str, a: torch.Tensor, b: torch.Tensor, rtol=1e-3, ato
     mean_diff = diff.mean().item()
     a_std = a_f.std().item()
     b_std = b_f.std().item()
-    cos_sim = torch.nn.functional.cosine_similarity(
-        a_f.flatten().unsqueeze(0), b_f.flatten().unsqueeze(0)
-    ).item()
+    cos_sim = torch.nn.functional.cosine_similarity(a_f.flatten().unsqueeze(0), b_f.flatten().unsqueeze(0)).item()
 
     match = torch.allclose(a_f, b_f, rtol=rtol, atol=atol)
     status = "MATCH" if match else "MISMATCH"
@@ -133,6 +130,7 @@ def _should_run(test_name: str, args) -> bool:
 # Test 1: Guidance Schedule
 # ============================================================================
 
+
 def reference_guidance_schedule(
     guidance_scale: float,
     num_steps: int,
@@ -153,7 +151,7 @@ def reference_guidance_schedule(
         oscillation = np.ones(main_phase_steps)
         start_idx = 1 if guidance_during_warmup else 0
         oscillation[start_idx::guidance_every_n_steps] = guidance_scale
-        guidance_schedule[warmup_steps:warmup_steps + main_phase_steps] = oscillation
+        guidance_schedule[warmup_steps : warmup_steps + main_phase_steps] = oscillation
     return guidance_schedule.tolist()
 
 
@@ -185,12 +183,18 @@ def test_guidance_schedule(args):
     _banner("Test 1: Guidance Schedule Comparison")
 
     ref = reference_guidance_schedule(
-        args.guidance_scale, args.steps, args.warmup_steps,
-        args.cooldown_steps, args.guidance_every_n_steps,
+        args.guidance_scale,
+        args.steps,
+        args.warmup_steps,
+        args.cooldown_steps,
+        args.guidance_every_n_steps,
     )
     vllm = vllm_guidance_schedule(
-        args.steps, args.guidance_scale, args.warmup_steps,
-        args.cooldown_steps, args.guidance_every_n_steps,
+        args.steps,
+        args.guidance_scale,
+        args.warmup_steps,
+        args.cooldown_steps,
+        args.guidance_every_n_steps,
     )
 
     ref_active = sum(1 for g in ref if g > 1.0)
@@ -208,18 +212,19 @@ def test_guidance_schedule(args):
     else:
         print(f"  [MISMATCH] {len(mismatches)} steps differ:")
         for i, r, v in mismatches[:20]:
-            phase = "warmup" if i < args.warmup_steps else (
-                "cooldown" if i >= args.steps - args.cooldown_steps else "main"
+            phase = (
+                "warmup" if i < args.warmup_steps else ("cooldown" if i >= args.steps - args.cooldown_steps else "main")
             )
             mid = i - args.warmup_steps if phase == "main" else None
             print(f"    step {i:3d} ({phase}, mid_idx={mid}): ref={r:.1f}  vllm={v:.1f}")
         if len(mismatches) > 20:
-            print(f"    ... and {len(mismatches)-20} more")
+            print(f"    ... and {len(mismatches) - 20} more")
 
-        print("\n  ROOT CAUSE: Reference oscillation uses numpy slicing "
-              "`oscillation[1::n] = gs` (1-indexed from main start),")
-        print("  while vllm-omni uses `middle_idx > 0 and middle_idx % n == 0` "
-              "(2-indexed from main start).")
+        print(
+            "\n  ROOT CAUSE: Reference oscillation uses numpy slicing "
+            "`oscillation[1::n] = gs` (1-indexed from main start),"
+        )
+        print("  while vllm-omni uses `middle_idx > 0 and middle_idx % n == 0` (2-indexed from main start).")
         print("  The first active guidance step in the main phase is off by 1.")
 
     return len(mismatches) == 0
@@ -229,8 +234,8 @@ def test_guidance_schedule(args):
 # Test 2: Timestep Schedule
 # ============================================================================
 
-def reference_timesteps(num_steps, shift, tmin=0.001, tmax=1.0,
-                        teacher_steps=100, num_timesteps=1000):
+
+def reference_timesteps(num_steps, shift, tmin=0.001, tmax=1.0, teacher_steps=100, num_timesteps=1000):
     """Reference RFLOW draw_time + distilled subsampling."""
     timesteps_sigma = torch.linspace(tmax, tmin, teacher_steps)
     timesteps_raw = timesteps_sigma * num_timesteps  # shape [teacher_steps]
@@ -242,8 +247,7 @@ def reference_timesteps(num_steps, shift, tmin=0.001, tmax=1.0,
     return [timesteps_raw[i * num_distilled_steps].unsqueeze(0) for i in range(num_steps)]
 
 
-def vllm_timesteps(num_steps, shift, tmin=0.001, tmax=1.0,
-                    teacher_steps=100, num_timesteps=1000):
+def vllm_timesteps(num_steps, shift, tmin=0.001, tmax=1.0, teacher_steps=100, num_timesteps=1000):
     """vllm-omni create_flow_timesteps."""
     sigmas = torch.linspace(tmax, tmin, teacher_steps)
     if shift is not None and shift > 0:
@@ -259,10 +263,8 @@ def test_timestep_schedule(args):
     ref = reference_timesteps(args.steps, args.flow_shift)
     vllm = vllm_timesteps(args.steps, args.flow_shift)
 
-    print(f"  Reference: {len(ref)} timesteps, "
-          f"first={ref[0].item():.4f}, last={ref[-1].item():.4f}")
-    print(f"  vllm-omni: {len(vllm)} timesteps, "
-          f"first={vllm[0].item():.4f}, last={vllm[-1].item():.4f}")
+    print(f"  Reference: {len(ref)} timesteps, first={ref[0].item():.4f}, last={ref[-1].item():.4f}")
+    print(f"  vllm-omni: {len(vllm)} timesteps, first={vllm[0].item():.4f}, last={vllm[-1].item():.4f}")
 
     max_diff = 0.0
     for i, (r, v) in enumerate(zip(ref, vllm)):
@@ -283,6 +285,7 @@ def test_timestep_schedule(args):
 # ============================================================================
 # Test 3: Text Encoding
 # ============================================================================
+
 
 def _load_reference_text_encoder(config, device, dtype):
     """Load the reference MQTextEncoder by directly calling the factory.
@@ -329,6 +332,7 @@ def _load_reference_text_encoder(config, device, dtype):
 def _extract_quotes_reference(prompt: str) -> str:
     """Reference spaCy-based quote extraction."""
     import spacy
+
     nlp = spacy.load("en_core_web_sm")
     tokens = nlp(prompt)
     text_quotes = ""
@@ -343,6 +347,7 @@ def _extract_quotes_reference(prompt: str) -> str:
 def _extract_quotes_vllm(text: str) -> str:
     """vllm-omni regex-based quote extraction."""
     import re
+
     matches = re.findall(r'["\u201c\u201d](.*?)["\u201c\u201d]', text)
     return " ".join(matches) if matches else text
 
@@ -358,7 +363,7 @@ def test_text_encoding(args, config, device, dtype):
     if ref_quote == vllm_quote:
         print("  [MATCH] Quote extraction results are identical")
     else:
-        print(f"  [MISMATCH] Quote extraction differs!")
+        print("  [MISMATCH] Quote extraction differs!")
         print(f"    ref len={len(ref_quote)}, vllm len={len(vllm_quote)}")
 
     # --- Load reference encoder ---
@@ -367,13 +372,14 @@ def test_text_encoding(args, config, device, dtype):
 
     # --- Load vllm-omni encoder ---
     print("  Loading vllm-omni text encoders...")
-    from text_to_video import load_text_encoders, encode_text, _extract_quotes
+    from text_to_video import encode_text, load_text_encoders
+
     vllm_encoders = load_text_encoders(config, device, dtype)
 
     # --- Encode with reference ---
     print("  Encoding prompt with reference...")
     ref_cond = ref_encoder.encode([args.prompt], [ref_quote])
-    ref_seq = ref_cond.seq_cond     # list of tensors
+    ref_seq = ref_cond.seq_cond  # list of tensors
     ref_mask = ref_cond.seq_cond_mask  # [B, total_len]
     ref_vec = ref_cond.vector_cond  # list of tensors or None
 
@@ -390,7 +396,9 @@ def test_text_encoding(args, config, device, dtype):
             m = _compare_tensors(f"seq_cond[{i}] ({name})", rs, vs)
             all_match = all_match and m
     else:
-        m = _compare_tensors("seq_cond", ref_seq, torch.cat(vllm_seq, dim=1) if isinstance(vllm_seq, list) else vllm_seq)
+        m = _compare_tensors(
+            "seq_cond", ref_seq, torch.cat(vllm_seq, dim=1) if isinstance(vllm_seq, list) else vllm_seq
+        )
         all_match = all_match and m
 
     # --- Compare masks ---
@@ -418,7 +426,10 @@ def test_text_encoding(args, config, device, dtype):
     print("\n  Negative prompt encoding:")
     ref_null = ref_encoder.encode([DEFAULT_NEGATIVE_PROMPT], [ref_quote])
     vllm_neg_seq, vllm_neg_masks, vllm_neg_vec = encode_text(
-        DEFAULT_NEGATIVE_PROMPT, vllm_encoders, device, dtype,
+        DEFAULT_NEGATIVE_PROMPT,
+        vllm_encoders,
+        device,
+        dtype,
         quote_override=vllm_quote,
     )
 
@@ -442,6 +453,7 @@ def test_text_encoding(args, config, device, dtype):
 # Runs one forward pass, saves the output to CPU, frees GPU, loads the next.
 # ============================================================================
 
+
 def _build_reference_model_args(config, args, device, dtype):
     """Build model_args dict matching reference prepare_multi_resolution_info + extra features."""
     model_args = dict(
@@ -454,7 +466,10 @@ def _build_reference_model_args(config, args, device, dtype):
 
     model_cfg = config.get("model", {})
     extra_cfg = model_cfg.get("extra_features_embedders", {})
-    _to_batched_tensor = lambda x: torch.tensor([x], dtype=torch.int32, device=device)
+
+    def _to_batched_tensor(x):
+        return torch.tensor([x], dtype=torch.int32, device=device)
+
     for feat, feat_cfg in extra_cfg.items():
         if "eval_value" in feat_cfg:
             eval_value = feat_cfg["eval_value"]
@@ -485,8 +500,7 @@ def test_transformer_forward(args, config, device, dtype):
 
     # Deterministic input
     torch.manual_seed(args.seed)
-    z = torch.randn(1, in_channels, num_latent_frames, latent_h, latent_w,
-                     device=device, dtype=dtype)
+    z = torch.randn(1, in_channels, num_latent_frames, latent_h, latent_w, device=device, dtype=dtype)
     t = torch.tensor([750.0], device=device, dtype=dtype)
 
     # ---- Phase 1: reference model ----
@@ -504,11 +518,11 @@ def test_transformer_forward(args, config, device, dtype):
     torch.cuda.empty_cache()
 
     print("  Loading reference model...")
+    import safetensors.torch
     from omegaconf import OmegaConf
     from opensora.model_utils import build_model_from_config
     from opensora.utils.ckpt_utils import maybe_update_model_cfg
     from opensora.utils.config_utils import to_container
-    import safetensors.torch
 
     model_cfg_om = OmegaConf.create(config.get("model", {}))
     updated_model_cfg = maybe_update_model_cfg(model_cfg_om)
@@ -540,9 +554,13 @@ def test_transformer_forward(args, config, device, dtype):
     # ---- Phase 2: vllm-omni model ----
     print("  Loading vllm-omni text encoders...")
     from text_to_video import (
-        build_transformer, load_transformer_weights, build_extra_features,
-        load_text_encoders, encode_text,
+        build_extra_features,
+        build_transformer,
+        encode_text,
+        load_text_encoders,
+        load_transformer_weights,
     )
+
     vllm_encoders = load_text_encoders(config, device, dtype)
     vllm_seq, vllm_masks, vllm_vec = encode_text(args.prompt, vllm_encoders, device, dtype)
     del vllm_encoders
@@ -598,6 +616,7 @@ def test_transformer_forward(args, config, device, dtype):
 # identical results when given the same model. Uses a single model instance.
 # ============================================================================
 
+
 def test_denoising_loop(args, config, device, dtype):
     _banner("Test 5: Multi-step Denoising Loop (3 steps, single model)")
 
@@ -606,14 +625,21 @@ def test_denoising_loop(args, config, device, dtype):
     vae_ds = tuple(vae_cfg.get("downsample_factors", (4, 16, 16)))
 
     from text_to_video import (
-        build_transformer, load_transformer_weights, build_extra_features,
-        load_text_encoders, encode_text, _extract_quotes,
+        _extract_quotes,
+        build_extra_features,
+        build_transformer,
+        encode_text,
+        load_text_encoders,
+        load_transformer_weights,
     )
 
     vllm_encoders = load_text_encoders(config, device, dtype)
     vllm_seq, vllm_masks, vllm_vec = encode_text(args.prompt, vllm_encoders, device, dtype)
     vllm_neg_seq, vllm_neg_masks, vllm_neg_vec = encode_text(
-        DEFAULT_NEGATIVE_PROMPT, vllm_encoders, device, dtype,
+        DEFAULT_NEGATIVE_PROMPT,
+        vllm_encoders,
+        device,
+        dtype,
         quote_override=_extract_quotes(args.prompt),
     )
     del vllm_encoders
@@ -643,12 +669,18 @@ def test_denoising_loop(args, config, device, dtype):
     vllm_ts = vllm_timesteps(args.steps, args.flow_shift)[:num_test_steps]
 
     ref_sched = reference_guidance_schedule(
-        args.guidance_scale, args.steps, args.warmup_steps,
-        args.cooldown_steps, args.guidance_every_n_steps,
+        args.guidance_scale,
+        args.steps,
+        args.warmup_steps,
+        args.cooldown_steps,
+        args.guidance_every_n_steps,
     )
     vllm_sched = vllm_guidance_schedule(
-        args.steps, args.guidance_scale, args.warmup_steps,
-        args.cooldown_steps, args.guidance_every_n_steps,
+        args.steps,
+        args.guidance_scale,
+        args.warmup_steps,
+        args.cooldown_steps,
+        args.guidance_every_n_steps,
     )
 
     height_t = torch.tensor([args.height], device=device, dtype=dtype)
@@ -656,8 +688,8 @@ def test_denoising_loop(args, config, device, dtype):
     fps_t = torch.tensor([24.0], device=device, dtype=dtype)
     num_train_timesteps = 1000
 
-    def _forward(z_in, t_in, text_emb, vec, text_mask, ef):
-        raw = model(
+    def _forward(z_in, t_in, text_emb, vec, text_mask, ef, mdl):
+        raw = mdl(
             hidden_states=z_in.to(dtype),
             timestep=t_in,
             encoder_hidden_states=text_emb,
@@ -685,14 +717,24 @@ def test_denoising_loop(args, config, device, dtype):
             gs_ref = ref_sched[i]
             gs_vllm = vllm_sched[i]
 
-            print(f"\n  Step {i}: t_ref={t_ref.item():.2f} t_vllm={t_vllm.item():.2f} "
-                  f"gs_ref={gs_ref:.1f} gs_vllm={gs_vllm:.1f}")
+            print(
+                f"\n  Step {i}: t_ref={t_ref.item():.2f} t_vllm={t_vllm.item():.2f} "
+                f"gs_ref={gs_ref:.1f} gs_vllm={gs_vllm:.1f}"
+            )
 
-            pred_cond = _forward(z_ref, t_ref.expand(1), vllm_seq, vllm_vec, vllm_masks, extra_features)
+            pred_cond = _forward(z_ref, t_ref.expand(1), vllm_seq, vllm_vec, vllm_masks, extra_features, model)
 
             use_uncond = gs_ref > 1.0
             if use_uncond:
-                pred_uncond = _forward(z_ref, t_ref.expand(1), vllm_neg_seq, vllm_neg_vec, vllm_neg_masks, uncond_extra_features)
+                pred_uncond = _forward(
+                    z_ref,
+                    t_ref.expand(1),
+                    vllm_neg_seq,
+                    vllm_neg_vec,
+                    vllm_neg_masks,
+                    uncond_extra_features,
+                    model,
+                )
                 v_pred = pred_uncond + gs_ref * (pred_cond - pred_uncond)
             else:
                 v_pred = pred_cond
@@ -704,15 +746,21 @@ def test_denoising_loop(args, config, device, dtype):
             v_pred = (z_ref - x0) / sigma_t
 
             if i < num_test_steps - 1:
-                sigma_s = (ref_ts[i + 1].to(device) / num_train_timesteps).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+                sigma_s = (
+                    (ref_ts[i + 1].to(device) / num_train_timesteps)
+                    .unsqueeze(-1)
+                    .unsqueeze(-1)
+                    .unsqueeze(-1)
+                    .unsqueeze(-1)
+                )
                 alpha_t = 1.0 - sigma_t
                 alpha_s = 1.0 - sigma_s
                 alpha_ts = alpha_t / alpha_s
-                alpha_ts_sq = alpha_ts ** 2
+                alpha_ts_sq = alpha_ts**2
                 sigma_s_div_t_sq = (sigma_s / sigma_t) ** 2
                 sigma_ts_div_t_sq = 1.0 - alpha_ts_sq * sigma_s_div_t_sq
                 mean = alpha_ts * sigma_s_div_t_sq * z_ref + alpha_s * sigma_ts_div_t_sq * x0
-                variance = sigma_ts_div_t_sq * sigma_s ** 2
+                variance = sigma_ts_div_t_sq * sigma_s**2
                 torch.manual_seed(args.seed + i + 1000)
                 noise = torch.randn_like(z_ref)
                 z_ref = mean + torch.sqrt(variance) * noise
@@ -720,10 +768,18 @@ def test_denoising_loop(args, config, device, dtype):
                 z_ref = x0
 
             # Same thing with vllm schedule (should be identical now)
-            pred_cond2 = _forward(z_vllm, t_vllm.expand(1), vllm_seq, vllm_vec, vllm_masks, extra_features)
+            pred_cond2 = _forward(z_vllm, t_vllm.expand(1), vllm_seq, vllm_vec, vllm_masks, extra_features, model)
             use_uncond2 = gs_vllm > 1.0
             if use_uncond2:
-                pred_uncond2 = _forward(z_vllm, t_vllm.expand(1), vllm_neg_seq, vllm_neg_vec, vllm_neg_masks, uncond_extra_features)
+                pred_uncond2 = _forward(
+                    z_vllm,
+                    t_vllm.expand(1),
+                    vllm_neg_seq,
+                    vllm_neg_vec,
+                    vllm_neg_masks,
+                    uncond_extra_features,
+                    model,
+                )
                 v_pred2 = pred_uncond2 + gs_vllm * (pred_cond2 - pred_uncond2)
             else:
                 v_pred2 = pred_cond2
@@ -734,15 +790,21 @@ def test_denoising_loop(args, config, device, dtype):
             v_pred2 = (z_vllm - x02) / sigma_t2
 
             if i < num_test_steps - 1:
-                sigma_s2 = (vllm_ts[i + 1].to(device) / num_train_timesteps).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+                sigma_s2 = (
+                    (vllm_ts[i + 1].to(device) / num_train_timesteps)
+                    .unsqueeze(-1)
+                    .unsqueeze(-1)
+                    .unsqueeze(-1)
+                    .unsqueeze(-1)
+                )
                 alpha_t2 = 1.0 - sigma_t2
                 alpha_s2 = 1.0 - sigma_s2
                 alpha_ts2 = alpha_t2 / alpha_s2
-                alpha_ts_sq2 = alpha_ts2 ** 2
+                alpha_ts_sq2 = alpha_ts2**2
                 sigma_s_div_t_sq2 = (sigma_s2 / sigma_t2) ** 2
                 sigma_ts_div_t_sq2 = 1.0 - alpha_ts_sq2 * sigma_s_div_t_sq2
                 mean2 = alpha_ts2 * sigma_s_div_t_sq2 * z_vllm + alpha_s2 * sigma_ts_div_t_sq2 * x02
-                variance2 = sigma_ts_div_t_sq2 * sigma_s2 ** 2
+                variance2 = sigma_ts_div_t_sq2 * sigma_s2**2
                 torch.manual_seed(args.seed + i + 1000)
                 noise2 = torch.randn_like(z_vllm)
                 z_vllm = mean2 + torch.sqrt(variance2) * noise2
@@ -761,6 +823,7 @@ def test_denoising_loop(args, config, device, dtype):
 # Test 6: VAE Decode
 # ============================================================================
 
+
 def test_vae_decode(args, config, device, dtype):
     _banner("Test 6: VAE Decode Comparison")
 
@@ -776,12 +839,12 @@ def test_vae_decode(args, config, device, dtype):
     latent_w = math.ceil(args.width / vae_s)
 
     torch.manual_seed(args.seed)
-    latents = torch.randn(1, in_channels, num_latent_frames, latent_h, latent_w,
-                           device=device, dtype=dtype)
+    latents = torch.randn(1, in_channels, num_latent_frames, latent_h, latent_w, device=device, dtype=dtype)
 
     # Load VAE (both use the same opensora VAE)
     print("  Loading VAE...")
     from text_to_video import load_vae
+
     vae = load_vae(vae_cfg, device, dtype)
     if vae is None:
         print("  [SKIP] VAE not available")
@@ -799,15 +862,13 @@ def test_vae_decode(args, config, device, dtype):
     # Decode twice with same input to verify determinism
     print("  Running VAE decode (pass 1)...")
     with torch.no_grad():
-        out1 = vae.decode(latents.to(dtype), num_frames=num_pixel_frames,
-                          spatial_size=(args.height, args.width))
+        out1 = vae.decode(latents.to(dtype), num_frames=num_pixel_frames, spatial_size=(args.height, args.width))
     if isinstance(out1, tuple):
         out1 = out1[0]
 
     print("  Running VAE decode (pass 2)...")
     with torch.no_grad():
-        out2 = vae.decode(latents.to(dtype), num_frames=num_pixel_frames,
-                          spatial_size=(args.height, args.width))
+        out2 = vae.decode(latents.to(dtype), num_frames=num_pixel_frames, spatial_size=(args.height, args.width))
     if isinstance(out2, tuple):
         out2 = out2[0]
 
@@ -822,10 +883,12 @@ def test_vae_decode(args, config, device, dtype):
 # Main
 # ============================================================================
 
+
 def main():
     args = parse_args()
 
     import yaml
+
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
@@ -845,7 +908,8 @@ def main():
     # Initialize vllm distributed state (needed for MareyTransformer's parallel layers)
     needs_vllm = any(_should_run(t, args) for t in ("forward", "denoise"))
     if needs_vllm:
-        from text_to_video import init_distributed, cleanup_distributed
+        from text_to_video import cleanup_distributed, init_distributed
+
         init_distributed(tp_size=1)
 
     results = {}

@@ -242,8 +242,8 @@ def _apply_build_metadata_to_latest_only(
 
 def _sort_records_for_summary(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Sort so that same model_id is grouped, newest date first within each group."""
-    by_date_desc = sorted(records, key=lambda r: (r.get("date") or ""), reverse=True)
-    return sorted(by_date_desc, key=lambda r: (r.get("model_id") or ""))
+    by_date_desc = sorted(records, key=lambda r: r.get("date") or "", reverse=True)
+    return sorted(by_date_desc, key=lambda r: r.get("model_id") or "")
 
 
 def _values_differ(a: Any, b: Any) -> bool:

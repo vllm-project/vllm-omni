@@ -111,7 +111,7 @@ from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpee
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
-from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
+from vllm_omni.entrypoints.openai.video_api_utils import decode_frame_conditions, decode_input_reference
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams, OmniTextPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
@@ -1821,6 +1821,7 @@ async def create_video(
     prompt: str = Form(...),
     input_reference: UploadFile | None = File(default=None),
     image_reference: str | None = Form(default=None),
+    frame_conditions: str | None = Form(default=None),
     model: str | None = Form(default=None),
     seconds: SecondStr | None = Form(default=None),
     size: SizeStr | None = Form(default=None),
@@ -1878,12 +1879,25 @@ async def create_video(
         unavailable, or job initialization fails.
     """
     input_reference_bytes = await input_reference.read() if input_reference is not None else None
+
     parsed_image_reference = _parse_form_json(image_reference)
     if parsed_image_reference is not None and input_reference_bytes is not None:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail="Provide either input_reference or image_reference, not both.",
         )
+
+    # frame_conditions JSON dict mirrors openai's chat API schema:
+    # '{"<frame_idx>": {"image_url": {"url": "https://... | data:image/...;base64,... | file:///abs/path"}}, ...}'.
+    # When set, it
+    # supersedes input_reference / image_reference for I2V multi-keyframe
+    # conditioning. Image paths are read from the server's filesystem.
+    if frame_conditions is not None and frame_conditions.strip() != "":
+        if input_reference_bytes is not None or parsed_image_reference is not None:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=("Provide either frame_conditions or input_reference/image_reference, not both."),
+            )
 
     request_data: dict[str, Any] = {
         "prompt": prompt,
@@ -1937,12 +1951,36 @@ async def create_video(
         )
     ref = video_response_from_request(effective_model_name, request)
 
-    try:
-        image_data = await decode_input_reference(request.image_reference, input_reference_bytes)
-    except InvalidInputReferenceError as exc:
-        raise HTTPException(400, detail=str(exc) or "Invalid input reference.") from exc
+    image_data_list: list[Image.Image] = []
+    parsed_frame_indices: list[int] = []
 
-    reference_image = ReferenceImage(data=image_data) if image_data is not None else image_data
+    if frame_conditions is not None and frame_conditions.strip() != "":
+        # mv-style multi-keyframe path. Each entry may carry image_url (HTTP /
+        # data URL, preferred) or image_path (local filesystem fallback).
+        try:
+            image_data_list, parsed_frame_indices = await decode_frame_conditions(frame_conditions)
+        except InvalidInputReferenceError as exc:
+            raise HTTPException(400, detail=str(exc) or "Invalid frame_conditions.") from exc
+    else:
+        # Single-image path (Wan2.2/LTX2 multipart upload, or image_reference JSON URL).
+        try:
+            single_image = await decode_input_reference(request.image_reference, input_reference_bytes)
+        except InvalidInputReferenceError as exc:
+            raise HTTPException(400, detail=str(exc) or "Invalid input reference.") from exc
+        if single_image is not None:
+            image_data_list = [single_image]
+            parsed_frame_indices = [0]
+
+    reference_image: ReferenceImage | None
+    if image_data_list:
+        reference_image = ReferenceImage(
+            data=image_data_list[0],
+            images=image_data_list,
+            frame_indices=parsed_frame_indices,
+        )
+    else:
+        reference_image = None
+
     await VIDEO_STORE.upsert(ref.id, ref)
     task = asyncio.create_task(_run_video_generation_job(handler, request, ref.id, reference_image))
     await VIDEO_TASKS.upsert(ref.id, task)

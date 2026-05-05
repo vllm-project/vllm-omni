@@ -29,9 +29,23 @@ logger = init_logger(__name__)
 
 @dataclass
 class ReferenceImage:
-    """Reference class for tracking additional metadata if needed"""
+    """Reference class for tracking one or more conditioning images.
+
+    ``data`` is the first image (back-compat alias used by single-image I2V callers).
+    ``images`` carries all uploaded images in order; ``frame_indices`` carries the
+    corresponding target frame index for each image (used by Marey multi-keyframe I2V).
+    For single-image callers, ``images=[data]`` and ``frame_indices=[0]``.
+    """
 
     data: Image.Image
+    images: list[Image.Image] | None = None
+    frame_indices: list[int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.images is None:
+            self.images = [self.data]
+        if self.frame_indices is None:
+            self.frame_indices = [0] * len(self.images)
 
 
 class OmniOpenAIServingVideo:
@@ -86,13 +100,28 @@ class OmniOpenAIServingVideo:
         gen_params = OmniDiffusionSamplingParams()
 
         input_image = None if reference_image is None else reference_image.data
+        input_images: list[Image.Image] | None = None if reference_image is None else reference_image.images
+        frame_indices: list[int] | None = None if reference_image is None else reference_image.frame_indices
         vp = request.resolve_video_params()
         if input_image is not None and vp.width is not None and vp.height is not None:
             target_size = (vp.width, vp.height)
+            # NOTE: per-pipeline pre-process hooks (e.g. Marey's get_marey_pre_process_func)
+            # are responsible for aspect-ratio-correct resizing (ImageOps.fit). This resize
+            # is a back-compat fast-path for pipelines that don't install a pre-process hook.
             if input_image.size != target_size:
                 input_image = input_image.resize(target_size, Image.Resampling.LANCZOS)
+            if input_images is not None:
+                input_images = [
+                    img if img.size == target_size else img.resize(target_size, Image.Resampling.LANCZOS)
+                    for img in input_images
+                ]
         if input_image is not None:
-            prompt["multi_modal_data"] = {"image": input_image}
+            mm: dict[str, Any] = {"image": input_image}
+            if input_images is not None and len(input_images) > 0:
+                mm["images"] = input_images
+            if frame_indices is not None:
+                mm["frame_indices"] = frame_indices
+            prompt["multi_modal_data"] = mm
         if vp.width is not None and vp.height is not None:
             gen_params.width = vp.width
             gen_params.height = vp.height

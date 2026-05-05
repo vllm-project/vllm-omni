@@ -25,7 +25,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from vllm.distributed import (
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -57,23 +56,59 @@ def t2i_modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> t
     return x * (1 + scale) + shift
 
 
+def t2i_modulate_masked(
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    shift_t0: torch.Tensor | None = None,
+    scale_t0: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Mask-aware ``t2i_modulate`` for I2V.
+
+    Positions where ``mask`` is True (noise frames) use ``(shift, scale)`` from
+    ``t_emb``; positions where ``mask`` is False (conditioning frames) use the
+    ``t0`` variant so conditioning tokens are modulated as if ``timestep=0``.
+    Mirrors mv ``open_sora/opensora/models/stdit/dit3d.py:1165-1170``.
+    """
+    out = t2i_modulate(x, shift, scale)
+    if mask is not None and shift_t0 is not None and scale_t0 is not None:
+        out_t0 = t2i_modulate(x, shift_t0, scale_t0)
+        out = torch.where(mask, out, out_t0)
+    return out
+
+
+def gate_masked(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    gate_t0: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Mask-aware gate for I2V. Mirrors mv ``dit3d.py:1173-1177``."""
+    out = x * gate
+    if mask is not None and gate_t0 is not None:
+        out_t0 = x * gate_t0
+        out = torch.where(mask, out, out_t0)
+    return out
+
+
 def get_temporal_pos(
     x: torch.Tensor,
-    T: int,
-    S: int,
+    num_t: int,
+    num_s: int,
     cond_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Temporal positional indices for latent patches [B, T*S]."""
     if cond_offsets is not None:
-        Tf = cond_offsets.shape[0]
-        index_tensor = torch.arange(T - Tf, device=x.device, dtype=x.dtype)
+        tf = cond_offsets.shape[0]
+        index_tensor = torch.arange(num_t - tf, device=x.device, dtype=x.dtype)
         index_tensor = torch.cat([index_tensor, cond_offsets], dim=0)
     else:
-        index_tensor = torch.arange(T, device=x.device, dtype=x.dtype)
+        index_tensor = torch.arange(num_t, device=x.device, dtype=x.dtype)
     B = x.shape[0]
     index_tensor = index_tensor.unsqueeze(0).unsqueeze(-1)
-    index_tensor = index_tensor.expand(B, T, S)
-    return index_tensor.reshape(B, T * S)
+    index_tensor = index_tensor.expand(B, num_t, num_s)
+    return index_tensor.reshape(B, num_t * num_s)
 
 
 def apply_rope(
@@ -391,13 +426,15 @@ class SeqProjector(nn.Module):
         super().__init__()
         if isinstance(input_size, int):
             input_size = [input_size]
-        self.projections = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(sz, projection_dim),
-                nn.LayerNorm(projection_dim),
-            )
-            for sz in input_size
-        ])
+        self.projections = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(sz, projection_dim),
+                    nn.LayerNorm(projection_dim),
+                )
+                for sz in input_size
+            ]
+        )
 
     def forward(self, x: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
         if isinstance(x, list):
@@ -587,9 +624,7 @@ class MareyFluxAttention(nn.Module):
         q = q.unflatten(-1, (self.tp_num_heads, self.head_dim))
         return norm(q)
 
-    def _project_kv(
-        self, x: torch.Tensor, linear: nn.Module, norm: nn.Module
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _project_kv(self, x: torch.Tensor, linear: nn.Module, norm: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
         kv = linear(x)
         kv = kv.unflatten(-1, (2, self.tp_num_kv_heads, self.head_dim))
         k, v = kv.unbind(dim=-3)
@@ -723,6 +758,8 @@ class MareyFluxBlock(nn.Module):
         temporal_pos: torch.Tensor | None = None,
         y_temporal_pos: torch.Tensor | None = None,
         spatial_pos_emb: torch.Tensor | None = None,
+        x_t_mask: torch.Tensor | None = None,
+        t0_x: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.share_weights:
             norm1_y, norm2_y = self.norm1_x, self.norm2_x
@@ -745,7 +782,21 @@ class MareyFluxBlock(nn.Module):
             modulation_y(t_y).unsqueeze(1).chunk(6, dim=-1)
         )
 
-        _bd = getattr(self, '_block_diag', False)
+        # I2V: compute t0-modulation params for the x-branch (y-branch unused).
+        # Reuses the same ``self.modulation_x`` Linear — no extra weights.
+        shift_msa_t0_x = scale_msa_t0_x = gate_msa_t0_x = None
+        shift_mlp_t0_x = scale_mlp_t0_x = gate_mlp_t0_x = None
+        if t0_x is not None:
+            (
+                shift_msa_t0_x,
+                scale_msa_t0_x,
+                gate_msa_t0_x,
+                shift_mlp_t0_x,
+                scale_mlp_t0_x,
+                gate_mlp_t0_x,
+            ) = self.modulation_x(t0_x).unsqueeze(1).chunk(6, dim=-1)
+
+        _bd = getattr(self, "_block_diag", False)
         if _bd:
             logger.info(
                 f"  BLOCK_DIAG modulation_x: "
@@ -757,8 +808,15 @@ class MareyFluxBlock(nn.Module):
                 f"gate_mlp={gate_mlp_x.float().mean():.4f}/{gate_mlp_x.float().std():.4f}"
             )
 
-        # Pre-attention: norm + modulate
-        x_m = t2i_modulate(self.norm1_x(x), shift_msa_x, scale_msa_x)
+        # Pre-attention: norm + modulate (x-branch is mask-aware in I2V)
+        x_m = t2i_modulate_masked(
+            self.norm1_x(x),
+            shift_msa_x,
+            scale_msa_x,
+            mask=x_t_mask,
+            shift_t0=shift_msa_t0_x,
+            scale_t0=scale_msa_t0_x,
+        )
         y_m = t2i_modulate(norm1_y(y), shift_msa_y, scale_msa_y)
 
         if _bd:
@@ -772,12 +830,11 @@ class MareyFluxBlock(nn.Module):
 
         if _bd:
             logger.info(
-                f"  BLOCK_DIAG attn: x_attn std={x_attn.float().std():.4f} "
-                f"y_attn std={y_attn.float().std():.4f}"
+                f"  BLOCK_DIAG attn: x_attn std={x_attn.float().std():.4f} y_attn std={y_attn.float().std():.4f}"
             )
 
-        # Gate + residual (attention)
-        x = x + x_attn * gate_msa_x
+        # Gate + residual (attention). x-branch: mask-aware gate.
+        x = x + gate_masked(x_attn, gate_msa_x, mask=x_t_mask, gate_t0=gate_msa_t0_x)
         y = y + y_attn * gate_msa_y
 
         if _bd:
@@ -787,7 +844,14 @@ class MareyFluxBlock(nn.Module):
             )
 
         # MLP: norm + modulate + MLP + gate + residual
-        x_m = t2i_modulate(self.norm2_x(x), shift_mlp_x, scale_mlp_x)
+        x_m = t2i_modulate_masked(
+            self.norm2_x(x),
+            shift_mlp_x,
+            scale_mlp_x,
+            mask=x_t_mask,
+            shift_t0=shift_mlp_t0_x,
+            scale_t0=scale_mlp_t0_x,
+        )
         y_m = t2i_modulate(norm2_y(y), shift_mlp_y, scale_mlp_y)
         mlp_out_x = self.mlp_x(x_m)
         mlp_out_y = mlp_y(y_m)
@@ -798,7 +862,7 @@ class MareyFluxBlock(nn.Module):
                 f"gated_mlp std={(mlp_out_x * gate_mlp_x).float().std():.4f}"
             )
 
-        x = x + mlp_out_x * gate_mlp_x
+        x = x + gate_masked(mlp_out_x, gate_mlp_x, mask=x_t_mask, gate_t0=gate_mlp_t0_x)
         y = y + mlp_out_y * gate_mlp_y
 
         return x, y
@@ -826,7 +890,7 @@ class MareyFinalLayer(nn.Module):
         x = t2i_modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         # Reshape to separate T,S
-        x = x.reshape(x.shape[0], x.shape[1], -1) # [B, T, S, C]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # [B, T, S, C]
         return x
 
 
@@ -834,8 +898,7 @@ class MareyFinalLayer(nn.Module):
 # Main Transformer
 # ---------------------------------------------------------------------------
 class SPInputsWrap(nn.Module):
-    """Prepares inputs to be sharded by _sp_plan
-    """
+    """Prepares inputs to be sharded by _sp_plan"""
 
     def __init__(self):
         super().__init__()
@@ -854,14 +917,16 @@ class SPInputsWrap(nn.Module):
             spatial_pos_emb: Spatial position embeddings
         """
         return x_hidden_states, temporal_pos, spatial_pos_emb
+
+
 class SPOutputWrap(nn.Module):
-    """Wraps output to be gathered by _sp_plan
-    """
+    """Wraps output to be gathered by _sp_plan"""
+
     def __init__(self):
         super().__init__()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Gather output from SP.
-        """
+        """Gather output from SP."""
         return x
 
 
@@ -1011,25 +1076,27 @@ class MareyTransformer(nn.Module):
         def _share_weights(i: int) -> bool:
             return i >= depth - depth_single_blocks
 
-        self.blocks = nn.ModuleList([
-            MareyFluxBlock(
-                hidden_size=hidden_size,
-                num_heads=num_heads,
-                mlp_ratio=mlp_ratio,
-                share_weights=_share_weights(i),
-                rope_channels_ratio=rope_channels_ratio,
-                rope_dim=rope_dim,
-                qk_norm=qk_norm,
-                num_kv_heads=num_kv_heads,
-                add_spatial_pos_emb=add_pos_embed_at_every_block,
-            )
-            for i in range(depth)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                MareyFluxBlock(
+                    hidden_size=hidden_size,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    share_weights=_share_weights(i),
+                    rope_channels_ratio=rope_channels_ratio,
+                    rope_dim=rope_dim,
+                    qk_norm=qk_norm,
+                    num_kv_heads=num_kv_heads,
+                    add_spatial_pos_emb=add_pos_embed_at_every_block,
+                )
+                for i in range(depth)
+            ]
+        )
 
         # Final layer
         self.final_layer = MareyFinalLayer(hidden_size, int(np.prod(patch_size)), out_channels)
 
-        #Wrapper for SP
+        # Wrapper for SP
         self.sp_inputs_wrap = SPInputsWrap()
         self.sp_output_wrap = SPOutputWrap()
 
@@ -1055,6 +1122,8 @@ class MareyTransformer(nn.Module):
         width: torch.Tensor | None = None,
         fps: torch.Tensor | None = None,
         extra_features: dict[str, torch.Tensor] | None = None,
+        cond_frames: torch.Tensor | None = None,
+        cond_offsets: torch.Tensor | None = None,
         return_dict: bool = True,
     ) -> torch.Tensor | Transformer2DModelOutput:
         """
@@ -1067,6 +1136,13 @@ class MareyTransformer(nn.Module):
             height: Video height [B] (for position embedding scaling).
             width: Video width [B].
             fps: Frames per second [B] (for FPS conditioning).
+            cond_frames: (I2V) Conditioning latents [B, C, Tf, H, W]. When provided,
+                these are patch-embedded and concatenated onto ``hidden_states``
+                along the temporal axis; the appended positions are modulated as
+                ``timestep=0`` via ``t0_emb`` and have their RoPE temporal positions
+                set by ``cond_offsets`` so the model sees them at their true target
+                frame locations. Mirrors mv ``dit3d.py:1020-1043``.
+            cond_offsets: (I2V) Per-keyframe latent-time offsets of shape [Tf].
         """
         dtype = self.x_embedder.proj.weight.dtype
         B = hidden_states.size(0)
@@ -1092,7 +1168,7 @@ class MareyTransformer(nn.Module):
             encoder_hidden_states, encoder_hidden_states_mask, vector_cond, train=self.training
         )
 
-        _diag = getattr(self, '_diag', False)
+        _diag = getattr(self, "_diag", False)
         if _diag:
             _sf = seq_cond.float()
             logger.info(
@@ -1106,7 +1182,11 @@ class MareyTransformer(nn.Module):
         if fps is not None:
             if T == 1:
                 fps = 120.0 * torch.ones_like(fps)
-            fps_mod = self.extra_features_embedders["fps"] if "fps" in self.extra_features_embedders else getattr(self, "fps_embedder", None)
+            fps_mod = (
+                self.extra_features_embedders["fps"]
+                if "fps" in self.extra_features_embedders
+                else getattr(self, "fps_embedder", None)
+            )
             if fps_mod is not None:
                 vec_cond = vec_cond + fps_mod(fps)
 
@@ -1117,7 +1197,7 @@ class MareyTransformer(nn.Module):
                     continue
                 if feat in self.extra_features_embedders:
                     vec_cond = vec_cond + self.extra_features_embedders[feat](val)
-        elif hasattr(self, '_extra_vec_cond') and self._extra_vec_cond is not None:
+        elif hasattr(self, "_extra_vec_cond") and self._extra_vec_cond is not None:
             vec_cond = vec_cond + self._extra_vec_cond
 
         # Timestep embedding
@@ -1125,6 +1205,14 @@ class MareyTransformer(nn.Module):
         t_emb = t_emb + vec_cond
         t_mlp = self.t_block(t_emb)  # [B, hidden_size]
         t_emb_final = t_emb
+
+        # I2V: precompute the ``timestep=0`` path so cond-frame tokens can be
+        # modulated with t0 inside the blocks. Same ``t_embedder`` / ``t_block``
+        # weights (zero new params). Mirrors mv ``dit3d.py:1008``.
+        t0_mlp: torch.Tensor | None = None
+        if cond_frames is not None:
+            t0_emb = self.t_embedder(torch.zeros_like(timestep), dtype=dtype) + vec_cond
+            t0_mlp = self.t_block(t0_emb)
 
         if _diag:
             logger.info(
@@ -1137,34 +1225,66 @@ class MareyTransformer(nn.Module):
         x = x.reshape(B, T, S, -1)
         if not self.add_pos_embed_at_every_block:
             x = x + spatial_pos_emb
+
+        # I2V: embed conditioning frames the same way and concat along T.
+        # Mirrors mv ``dit3d.py:1018-1043`` (cond_frames_concat_to_stack path).
+        Tf = 0
+        x_t_mask: torch.Tensor | None = None
+        if cond_frames is not None:
+            Tf_local, Hf, Wf = self.get_dynamic_size(cond_frames)
+            assert Hf == H and Wf == W, f"cond_frames spatial dims ({Hf}x{Wf}) must match hidden_states ({H}x{W})"
+            Tf = Tf_local
+            cond_frames_emb = self.x_embedder(cond_frames.to(dtype))  # [B, Tf*S, C]
+            cond_frames_emb = cond_frames_emb.reshape(B, Tf, S, -1)
+            # Unlike ``x`` above, cond frames ALWAYS receive the initial
+            # spatial_pos_emb, even when ``add_pos_embed_at_every_block=True``.
+            # Mirrors mv ``dit3d.py:1033`` — the per-block pos_emb is then
+            # added on top for both noise and cond tokens during the block
+            # loop, giving cond tokens a double-strength positional signal
+            # that the checkpoint was trained with.
+            cond_frames_emb = cond_frames_emb + spatial_pos_emb
+            x = torch.cat([x, cond_frames_emb], dim=1)  # [B, T+Tf, S, C]
+            # Mask: True for noise frames (first T), False for cond frames (last Tf).
+            mask_1d = torch.arange(T + Tf, device=x.device) < T
+            x_t_mask = mask_1d.view(1, T + Tf, 1, 1).expand(B, T + Tf, S, 1).contiguous()
+            T = T + Tf
+
         x = x.reshape(B, T * S, -1)
 
         if _diag:
             _xf = x.float()
             logger.info(
-                f"DIAG after x_embed: mean={_xf.mean():.4f} std={_xf.std():.4f} "
-                f"spatial_var={_xf.var(dim=1).mean():.6f}"
+                f"DIAG after x_embed: mean={_xf.mean():.4f} std={_xf.std():.4f} spatial_var={_xf.var(dim=1).mean():.6f}"
             )
 
         # Prepare spatial_pos_emb for per-block use
-        # Always create it because sp inputs needs to split it, then if self.add_pos_embed_at_every_block: false set it to None
+        # Always create it because sp inputs needs to split it; if add_pos_embed_at_every_block is false,
+        # it is set to None below.
         spatial_pos_emb_blocks = spatial_pos_emb.expand(-1, T, -1, -1).reshape(1, T * S, -1)
 
-        # Temporal positions for RoPE
-        temporal_pos = get_temporal_pos(x, T, S)
+        # Temporal positions for RoPE (I2V: append cond_offsets for the appended cond frames).
+        temporal_pos = get_temporal_pos(x, T, S, cond_offsets)
 
-        #Pass through SP wrapper for _sp_plan to auto shard them
-        temporal_pos = temporal_pos.reshape(temporal_pos.shape[0], T, S) # [B, T, S]
-        spatial_pos_emb_blocks = spatial_pos_emb_blocks.reshape(spatial_pos_emb.shape[0], T, S, -1) # [1, T, S, C]
+        # Pass through SP wrapper for _sp_plan to auto shard them
+        temporal_pos = temporal_pos.reshape(temporal_pos.shape[0], T, S)  # [B, T, S]
+        spatial_pos_emb_blocks = spatial_pos_emb_blocks.reshape(spatial_pos_emb.shape[0], T, S, -1)  # [1, T, S, C]
 
-        x = x.reshape(B, T, S, -1) # [B, T, S, C]
+        x = x.reshape(B, T, S, -1)  # [B, T, S, C]
         x, temporal_pos, spatial_pos_emb_blocks = self.sp_inputs_wrap(x, temporal_pos, spatial_pos_emb_blocks)
         S_new = x.shape[2]
         S_full = S
         S = S_new
         x = x.reshape(B, T * S, -1)
-        temporal_pos = temporal_pos.reshape(temporal_pos.shape[0], T*S)
-        spatial_pos_emb_blocks = spatial_pos_emb_blocks.reshape(1, T*S, -1)
+        temporal_pos = temporal_pos.reshape(temporal_pos.shape[0], T * S)
+        spatial_pos_emb_blocks = spatial_pos_emb_blocks.reshape(1, T * S, -1)
+
+        # I2V: shard x_t_mask along the same S dim as x, bypassing the _sp_plan
+        # framework (which would require x_t_mask to be non-None even for T2V).
+        if x_t_mask is not None:
+            from vllm_omni.diffusion.distributed.sp_sharding import sp_shard
+
+            x_t_mask = sp_shard(x_t_mask, dim=2, validate=False)  # [1, T, S_local, 1]
+            x_t_mask = x_t_mask.reshape(B, T * S, 1)
 
         if not self.add_pos_embed_at_every_block:
             spatial_pos_emb_blocks = None
@@ -1188,6 +1308,8 @@ class MareyTransformer(nn.Module):
                 t_y=y_t_emb,
                 temporal_pos=temporal_pos,
                 spatial_pos_emb=spatial_pos_emb_blocks,
+                x_t_mask=x_t_mask,
+                t0_x=t0_mlp,
             )
             if _diag and bi in (0, 20, len(self.blocks) - 1):
                 _xf = x.float()
@@ -1204,6 +1326,14 @@ class MareyTransformer(nn.Module):
         x = self.final_layer(x, t_emb_final)
         x = x.reshape(x.shape[0], T, S, -1)
         x = self.sp_output_wrap(x)
+
+        # I2V: drop the appended cond-frame positions before unpatchify so the
+        # returned tensor matches the input noise-latent shape. Mirrors mv
+        # ``dit3d.py:1128-1132``.
+        if Tf > 0:
+            T = T - Tf
+            x = x[:, :T]
+
         x = x.reshape(x.shape[0], T * S_full, -1)
         # Unpatchify
         x = self._unpatchify(x, T, H, W, hidden_states)
@@ -1217,30 +1347,34 @@ class MareyTransformer(nn.Module):
     def _unpatchify(
         self,
         x: torch.Tensor,
-        N_t: int,
-        N_h: int,
-        N_w: int,
+        n_t: int,
+        n_h: int,
+        n_w: int,
         original_input: torch.Tensor,
     ) -> torch.Tensor:
         """Convert patch sequence back to [B, C, T, H, W]."""
-        T_p, H_p, W_p = self.patch_size
-        _, _, R_t, R_h, R_w = original_input.shape
+        t_p, h_p, w_p = self.patch_size
+        _, _, r_t, r_h, r_w = original_input.shape
         x = x.reshape(
             x.shape[0],
-            N_t, N_h, N_w,
-            T_p, H_p, W_p,
+            n_t,
+            n_h,
+            n_w,
+            t_p,
+            h_p,
+            w_p,
             self.out_channels,
         )
-        x = x.permute(0, 7, 1, 4, 2, 5, 3, 6)  # [B, C, N_t, T_p, N_h, H_p, N_w, W_p]
+        x = x.permute(0, 7, 1, 4, 2, 5, 3, 6)  # [B, C, n_t, t_p, n_h, h_p, n_w, w_p]
         x = x.reshape(
             x.shape[0],
             self.out_channels,
-            N_t * T_p,
-            N_h * H_p,
-            N_w * W_p,
+            n_t * t_p,
+            n_h * h_p,
+            n_w * w_p,
         )
         # Crop to original size (remove padding)
-        x = x[:, :, :R_t, :R_h, :R_w]
+        x = x[:, :, :r_t, :r_h, :r_w]
         return x
 
     _MLP_WEIGHT_MAP = {

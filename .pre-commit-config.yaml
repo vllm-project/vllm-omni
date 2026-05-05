@@ -23,12 +23,6 @@ repos:
       args: [--output-format, github, --fix]
     - id: ruff-format
 
-  - repo: https://github.com/crate-ci/typos
-    rev: typos-dict-v0.13.13
-    hooks:
-      - id: typos
-        # only for staged files
-
   - repo: https://github.com/rhysd/actionlint
     # v1.7.8+ sets `go 1.24.0` in go.mod, which older Go toolchains (and most
     # current CI images) cannot parse. Pin to v1.7.7 until actionlint fixes the
