@@ -240,7 +240,7 @@ class TestOmniSleepMode:
             await diffusion_engine.wake_up(stage_ids=[0])
 
             get_vram_info(device_id)
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             await asyncio.sleep(2)
 
             initial_vram = get_vram_info(device_id)["reserved"]
@@ -253,7 +253,7 @@ class TestOmniSleepMode:
             await diffusion_engine.sleep(stage_ids=[0], level=2)
 
             await asyncio.sleep(3.0)
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
 
             final_vram = get_vram_info(device_id)["reserved"]
             logger.info(f"GPU {device_id} Final VRAM after coordinated sleep: {final_vram:.2f} GiB")
@@ -276,7 +276,7 @@ class TestOmniSleepMode:
         device_id = 1
         try:
             get_vram_info(device_id)
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             vram_initial = get_vram_info(device_id)["reserved"]
             logger.info(f"Diffusion Initial VRAM: {vram_initial:.2f} GiB")
 
@@ -290,7 +290,7 @@ class TestOmniSleepMode:
 
             await asyncio.sleep(2)
             get_vram_info(device_id)
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
 
             vram_sleeping = get_vram_info(device_id)["reserved"]
             logger.info(f"External VRAM measurement during Sleep: {vram_sleeping:.2f} GiB")
@@ -305,7 +305,7 @@ class TestOmniSleepMode:
 
             await asyncio.sleep(2)
             get_vram_info(device_id)
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             vram_restored = get_vram_info(device_id)["reserved"]
             logger.info(f"VRAM after Wake-up: {vram_restored:.2f} GiB")
 

@@ -109,7 +109,7 @@ def _run_diffusers_image_edit(
         del pipe
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
         run_post_test_cleanup(enable_force=True)
 
 

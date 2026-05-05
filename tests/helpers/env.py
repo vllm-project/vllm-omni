@@ -130,7 +130,7 @@ def wait_for_gpu_memory_to_clear(
                 )
 
             gc.collect()
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             time.sleep(5)
 
 
@@ -262,7 +262,7 @@ def run_post_test_cleanup(enable_force: bool = False) -> None:
 
     if torch.cuda.is_available():
         gc.collect()
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
 
         print("Post-test GPU status:")
         _print_gpu_processes()

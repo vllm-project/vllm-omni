@@ -228,7 +228,7 @@ def _unload_omni(omni):
     del omni
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
         torch.accelerator.synchronize()
 
 

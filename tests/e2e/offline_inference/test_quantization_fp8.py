@@ -190,7 +190,7 @@ def test_single_stage_zimage_fp8_uses_less_memory():
         model="Tongyi-MAI/Z-Image-Turbo",
         quantization=None,
     )
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
 
     _, mem_fp8 = _generate_single_stage_image(
         model="Tongyi-MAI/Z-Image-Turbo",
@@ -241,7 +241,7 @@ def test_single_stage_flux_fp8_uses_less_memory():
         width=512,
         num_inference_steps=4,
     )
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
 
     _, mem_fp8 = _generate_single_stage_image(
         model="black-forest-labs/FLUX.1-dev",

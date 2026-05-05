@@ -160,7 +160,7 @@ def _run_diffusers_wan22_i2v(*, model: str, output_path: Path, conditioning_imag
         del pipe
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
         run_post_test_cleanup(enable_force=True)
 
 
@@ -240,7 +240,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
         del pipe
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
         run_post_test_cleanup(enable_force=True)
 
 

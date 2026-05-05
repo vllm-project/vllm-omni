@@ -433,7 +433,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._tts.base_lm = None
         del self._tts.residual_lm
         self._tts.residual_lm = None
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
 
         self._inference_timesteps = 10
         self._cfg_value = 2.0
