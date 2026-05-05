@@ -34,6 +34,7 @@ from vllm.multimodal.audio import AudioResampler
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 from .minicpm4_paged import MiniCPM4PagedForVoxCPM2, MiniCPM4PagedResidualLM
 from .voxcpm2_import_utils import import_voxcpm2_core
@@ -445,6 +446,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._compile_vae = True
         self._max_decode_steps = 2000
         self._max_batch_size = getattr(vllm_config.scheduler_config, "max_num_seqs", 4)
+
+        # Speaker cache for ref_audio_feat across requests
+        self._speaker_cache = get_speaker_cache()
 
         self._perf = _PerfTimer(enabled=_ENABLE_PROFILING)
         self._cfm_buffers: _CFMBufferManager | None = None
@@ -1165,15 +1169,48 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 prompt_text = prompt_text[0] if prompt_text else None
 
             state.prompt_cache = None
+            voice_name = info_dict.get("voice_name")
+            if isinstance(voice_name, list):
+                voice_name = voice_name[0] if voice_name else None
+            _created_at = int(info_dict.get("voice_created_at") or 0)
+
             if ref_audio or (prompt_audio and prompt_text):
-                try:
-                    state.prompt_cache = self._build_prompt_cache(
-                        ref_audio=ref_audio,
-                        prompt_audio=prompt_audio,
-                        prompt_text=prompt_text,
+                # Check speaker cache for reference-only mode
+                if voice_name and ref_audio and not prompt_audio:
+                    _cache_key = self._speaker_cache.make_cache_key(
+                        voice_name, model_type="voxcpm2", created_at=_created_at
                     )
-                except Exception as e:
-                    logger.warning("build_prompt_cache failed: %s", e)
+                    cached = self._speaker_cache.get(_cache_key)
+                    if cached is not None:
+                        state.prompt_cache = {
+                            "mode": "reference",
+                            "ref_audio_feat": cached["ref_audio_feat"].clone(),
+                        }
+                        logger.debug("Speaker cache HIT for VoxCPM2 speaker '%s'", voice_name)
+
+                if state.prompt_cache is None:
+                    try:
+                        state.prompt_cache = self._build_prompt_cache(
+                            ref_audio=ref_audio,
+                            prompt_audio=prompt_audio,
+                            prompt_text=prompt_text,
+                        )
+                        if (
+                            voice_name
+                            and state.prompt_cache is not None
+                            and state.prompt_cache.get("mode") == "reference"
+                            and "ref_audio_feat" in state.prompt_cache
+                        ):
+                            _key = self._speaker_cache.make_cache_key(
+                                voice_name, model_type="voxcpm2", created_at=_created_at
+                            )
+                            self._speaker_cache.put(
+                                _key, {"ref_audio_feat": state.prompt_cache["ref_audio_feat"].cpu()}
+                            )
+                            logger.debug("Speaker cache STORE for VoxCPM2 speaker '%s'", voice_name)
+                    except Exception as e:
+                        logger.warning("build_prompt_cache failed: %s; falling back to zero-shot", e)
+                        state.prompt_cache = None
 
             inputs = self._build_prefill_inputs(token_ids, dev, req_id)
             tts = self.tts
