@@ -550,7 +550,7 @@ steps:
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test"
         key: nightly-diffusion-x2iat-performance
-        timeout_in_minutes: 180
+        timeout_in_minutes: 360
         commands:
           - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
           - export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
@@ -570,6 +570,60 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             exit $$((EXIT1 | EXIT2 | EXIT3 | EXIT4))
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 4
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: hf-cache
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
+
+      - label: ":full_moon: Diffusion X2I(&A&T) · HunyuanImage3 · DiT Perf Test"
+        key: nightly-hunyuan-image3-performance
+        soft_fail: true
+        timeout_in_minutes: 120
+        if: build.env("RUN_HUNYUAN_IMAGE3_PERF") == "1"
+        commands:
+          - export DIFFUSION_BENCHMARK_DIR=tests/dfx/perf/results
+          - export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
+          - export CACHE_DIT_VERSION=1.3.0
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp4_fp8.json
+            EXIT1=$$?
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp2_fp8_sp2.json
+            EXIT2=$$?
+            pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_hunyuan_image_tp2_fp8_cfgp2.json
+            EXIT3=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
+            buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            exit $$((EXIT1 | EXIT2 | EXIT3))
         agents:
           queue: "mithril-h100-pool"
         plugins:

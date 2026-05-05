@@ -80,6 +80,8 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
         "model.layers[0].mlp.forward",
         "vae.encode",
         "vae.decode",
+        "patch_embed.forward",
+        "final_layer.forward",
     ]
 
     def __init__(self, od_config: OmniDiffusionConfig) -> None:

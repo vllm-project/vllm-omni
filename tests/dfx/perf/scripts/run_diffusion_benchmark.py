@@ -507,7 +507,7 @@ def run_benchmark(
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", prefix="diffusion_bench_tmp_", delete=False) as tmp:
         tmp_result_file = Path(tmp.name)
 
-    exclude_keys = {"baseline", "dataset", "task", "name"}
+    exclude_keys = {"baseline", "dataset", "task", "name", "skip-performance-assertion"}
 
     cmd = [
         sys.executable,
@@ -656,6 +656,10 @@ def assert_result(result: dict[str, Any], params: dict[str, Any]) -> None:
     num_prompts = params.get("num-prompts", 10)
     completed = result.get("completed_requests", result.get("completed", 0))
     assert completed == num_prompts, f"Expected {num_prompts} completed requests, got {completed}"
+
+    if params.get("skip-performance-assertion", False):
+        print("Skipping performance assertions.")
+        return
 
     for metric, threshold in params.get("baseline", {}).items():
         current = result.get(metric)
