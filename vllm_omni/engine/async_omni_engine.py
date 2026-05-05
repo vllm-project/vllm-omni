@@ -1348,8 +1348,6 @@ class AsyncOmniEngine:
             "worker_extension_cls": kwargs.get("worker_extension_cls", None),
             "trust_remote_code": kwargs.get("trust_remote_code", False),
             "distributed_executor_backend": kwargs.get("distributed_executor_backend", "mp"),
-            "boundary_ratio": kwargs.get("boundary_ratio", None),
-            "flow_shift": kwargs.get("flow_shift", None),
             "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
