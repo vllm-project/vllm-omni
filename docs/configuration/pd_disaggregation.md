@@ -113,6 +113,15 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
   --enable-pd-disaggregation
 ```
 
+`--enable-pd-disaggregation` overrides the deploy YAML's
+`pd_disaggregation.enabled` value for that launch only. Because the CLI flag is
+declared with `argparse.BooleanOptionalAction`, both forms are supported:
+
+- `--enable-pd-disaggregation`: force PD on for this run
+- `--no-enable-pd-disaggregation`: force PD off for this run
+
+When the flag is omitted, the YAML value stays in effect.
+
 To tune the generated prefill/decode runtime stages from CLI, reuse
 `--stage-overrides` after PD is enabled. In the resolved 4-stage runtime config,
 stage `0` is prefill and stage `1` is decode:
@@ -178,6 +187,16 @@ config artifact.
 
 ```bash
 pytest tests/entrypoints/test_pd_disaggregation.py -q
+```
+
+### 3. DFX perf benchmark
+
+To run the Qwen3-Omni PD performance benchmark config added under
+`tests/dfx/perf/tests/`, use:
+
+```bash
+pytest tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_qwen_omni_pd.json -s
 ```
 
 ## Operational Notes
