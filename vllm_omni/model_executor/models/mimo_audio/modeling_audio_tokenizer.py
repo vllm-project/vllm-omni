@@ -293,16 +293,55 @@ class ISTFTHead(nn.Module):
 
 
 class RotaryEmbedding(nn.Module):
+    inv_freq: torch.Tensor
+
     def __init__(self, base, dim, max_seq_len, rope_type="default", device=None):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.rope_type = rope_type
+        # Cache base/dim so we can reconstruct `inv_freq` from scratch during transformers >=5.x's
+        # `PreTrainedModel._init_weights` reinit path (which calls
+        # `module.compute_default_rope_parameters(module.config)` and then `init.copy_` the result
+        # into `inv_freq` / `original_inv_freq`). Our class does not carry an HF config, so we
+        # ignore it and rely on these cached values.
+        self._rope_base = base
+        self._rope_dim = dim
+        # transformers 5.x `_init_weights` reads `module.config` for modules whose class name
+        # contains "RotaryEmbedding" (see `PreTrainedModel._init_weights`). Provide a placeholder
+        # so that attribute access works; the value is unused by our
+        # `compute_default_rope_parameters` below.
+        self.config = None
 
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(device=device, base=base, dim=dim)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
+        # Register `original_inv_freq` as a proper buffer (rather than a plain attribute alias of
+        # `self.inv_freq`). In transformers >=5.x `from_pretrained` builds the model on a meta
+        # device, then `_move_missing_keys_from_meta_to_device` iterates `named_buffers()` and
+        # replaces each non-persistent buffer with an `empty_like` on the real device. A plain
+        # attribute alias is invisible to `named_buffers()`, so it would be left pointing at the
+        # stale meta tensor and `init.copy_(module.original_inv_freq, ...)` inside `_init_weights`
+        # would then fail / operate on a wrong-device tensor.
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+
+    def compute_default_rope_parameters(
+        self,
+        config=None,
+        device: "torch.device | None" = None,
+        seq_len: int | None = None,
+    ) -> tuple[torch.Tensor, float]:
+        """Recompute `inv_freq` for transformers >=5.x's `_init_weights` reinit path.
+
+        transformers calls this as `module.compute_default_rope_parameters(module.config)` and then
+        `init.copy_` the returned tensor into `inv_freq` / `original_inv_freq`. Our RotaryEmbedding
+        does not carry an HF config, so we ignore the `config` arg and reuse the `base`/`dim`
+        captured at construction time. This is critical: with `transformers>=5.x`, models are
+        built on meta device and the non-persistent `inv_freq` buffer is replaced by uninitialized
+        memory during `_move_missing_keys_from_meta_to_device`, so we MUST let `_init_weights`
+        refill it (hence why we do not set `_is_hf_initialized = True` here).
+        """
+        return self.rope_init_fn(device=device, base=self._rope_base, dim=self._rope_dim)
 
     @torch.no_grad()
     @dynamic_rope_update
@@ -820,8 +859,22 @@ class AudioDecoder(nn.Module):
 class MiMoAudioTokenizer(PreTrainedModel):
     config_class = MiMoAudioTokenizerConfig
 
+    @property
+    def all_tied_weights_keys(self) -> dict[str, list[str]]:
+        # Transformers `from_pretrained` -> `caching_allocator_warmup` -> `get_total_byte_count`
+        # accesses this on the root module; some PreTrainedModel versions omit the property for
+        # custom subclasses. MiMo-Audio tokenizer has no weight tying at the root.
+        return {}
+
     def __init__(self, config: MiMoAudioTokenizerConfig):
         super().__init__(config)
+        # Transformers `caching_allocator_warmup` / `get_total_byte_count` calls `len(model._tp_plan)`
+        # on the root module. The base `PreTrainedModel` class default is `None`, and this subclass
+        # does not invoke `self.post_init()` where `_tp_plan` would otherwise be initialized to `{}`.
+        # Set it explicitly to avoid `TypeError: object of type 'NoneType' has no len()`.
+        self._tp_plan = {}
+        self._pp_plan = {}
+        self._ep_plan = {}
         self.config = config
         self.sampling_rate = config.sampling_rate
         self.encoder = AudioEncoder(config=config)

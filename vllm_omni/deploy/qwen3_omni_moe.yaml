@@ -76,11 +76,6 @@ platforms:
         gpu_memory_utilization: 0.3
         devices: "2"
 
-  rocm:
-    stages:
-      - stage_id: 0
-        enforce_eager: true
-
   xpu:
     stages:
       - stage_id: 0

@@ -8,27 +8,29 @@ Please refer to [README.md](../../../README.md)
 
 | Mode | Launch command | Output |
 |------|---------------|--------|
-| Thinker only (multimodal understanding) | `vllm serve ... --omni` | Text |
-| Thinker + Talker (omni-speech) | `vllm serve ... --omni --stage-configs-path ming_flash_omni.yaml` | Text + Audio |
+| Thinker + Talker (omni-speech, default) | `vllm serve ... --omni` | Text + Audio |
+| Thinker only (multimodal understanding) | `vllm serve ... --omni --deploy-config vllm_omni/deploy/ming_flash_omni_thinker_only.yaml` | Text |
 
-For standalone TTS (talker only), see [`examples/online_serving/ming_flash_omni_tts/`](../ming_flash_omni_tts/).
+For standalone TTS (talker only), see the [Ming-flash-omni-TTS section in the Text-To-Speech hub](../text_to_speech/README.md#ming-flash-omni-tts).
 
 ## Run examples (Ming-flash-omni 2.0)
 
 ### Launch the Server
 
-**Thinker only (text output):**
+**Thinker + Talker (omni-speech, text + audio output):**
 ```bash
 vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni --port 8091
 ```
 
-**Thinker + Talker (omni-speech, text + audio output):**
+The model registry auto-loads corresponding deploy yaml.
+
+**Thinker-only (text output):**
 ```bash
 vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni --port 8091 \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/ming_flash_omni.yaml
+    --deploy-config vllm_omni/deploy/ming_flash_omni_thinker_only.yaml
 ```
 
-Pass `--stage-configs-path /path/to/your_config.yaml` to use a custom stage
+Pass `--deploy-config /path/to/your_deploy.yaml` to use a custom deploy
 config.
 
 ### Send Multi-modal Request

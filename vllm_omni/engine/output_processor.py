@@ -128,9 +128,12 @@ class OmniRequestState(RequestState):
                 if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
                     try:
                         if k == "audio":
-                            # Audio chunks are usually 2D (i.e., 1, N); concatenate
-                            # on the last axis to preserve the channel dimension.
-                            self.mm_accumulated[k] = torch.cat(v, dim=-1)
+                            # Preserve channel dimension when chunks are compatible;
+                            # fall back to 1-D waveform concatenation for uneven chunks.
+                            try:
+                                self.mm_accumulated[k] = torch.cat(v, dim=-1)
+                            except RuntimeError:
+                                self.mm_accumulated[k] = torch.cat([t.reshape(-1) for t in v], dim=0)
                         elif k == "sr":
                             # Sample rate is a constant scalar, keep last value.
                             self.mm_accumulated[k] = v[-1]

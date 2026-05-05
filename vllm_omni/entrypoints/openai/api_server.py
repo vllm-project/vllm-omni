@@ -65,8 +65,8 @@ from vllm.entrypoints.openai.speech_to_text.serving import (
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.pooling.classify.serving import ServingClassification
 from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
-from vllm.entrypoints.pooling.pooling.serving import OpenAIServingPooling
-from vllm.entrypoints.pooling.score.serving import ServingScores
+from vllm.entrypoints.pooling.pooling.serving import ServingPooling
+from vllm.entrypoints.pooling.scoring.serving import ServingScores
 from vllm.entrypoints.serve.disagg.serving import ServingTokens
 
 # vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
@@ -95,7 +95,11 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     parse_size,
     validate_layered_layers,
 )
-from vllm_omni.entrypoints.openai.protocol.audio import BatchSpeechRequest, OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.protocol.audio import (
+    BatchSpeechRequest,
+    OpenAICreateAudioGenerateRequest,
+    OpenAICreateSpeechRequest,
+)
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
@@ -112,6 +116,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
+from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
@@ -312,6 +317,9 @@ class _DiffusionServingModels:
     @property
     def base_model_paths(self) -> list[BaseModelPath]:
         return self._base_model_paths
+
+    def is_base_model(self, model_name: str) -> bool:
+        return any(p.name == model_name for p in self._base_model_paths)
 
     def __getattr__(self, name):
         return self._Unsupported(name)
@@ -581,10 +589,10 @@ async def omni_init_app_state(
 
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
+    model_name = served_model_names[0] if served_model_names else args.model
 
     # Pure Diffusion mode: use simplified initialization logic
     if is_pure_diffusion:
-        model_name = served_model_names[0] if served_model_names else args.model
         state.vllm_config = None
         state.diffusion_engine = engine_client
         state.openai_serving_models = _DiffusionServingModels(base_model_paths)
@@ -597,6 +605,16 @@ async def omni_init_app_state(
             model_name=model_name,
         )
 
+        # audio related
+        state.openai_serving_speech = None
+        state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate.for_diffusion(
+            engine_client,
+            state.openai_serving_models,
+            request_logger=request_logger,
+            model_name=model_name,
+        )
+
+        # video related
         diffusion_stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
         state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
@@ -652,51 +670,35 @@ async def omni_init_app_state(
     )
     lora_modules = process_lora_modules(args.lora_modules, default_mm_loras)
 
-    # Ensure input_processor, io_processor, and model_config exist for OpenAIServingModels compatibility
+    # Ensure `input_processor` and `model_config` exist on the engine client
+    # for OpenAIServingModels compatibility.
+    #
+    # vLLM 0.20 dropped the `io_processor` kwarg from OpenAIServingRender and
+    # neither `vllm.entrypoints.openai.*` nor `vllm.entrypoints.serve.*` reads
+    # `engine_client.io_processor` anymore, so we no longer need to back-fill
+    # it here. AsyncOmni still sets `self.io_processor` in its own __init__
+    # for any vllm-omni internal callers that rely on it.
     if (
         not hasattr(engine_client, "input_processor")
         or engine_client.input_processor is None
-        or not hasattr(engine_client, "io_processor")
-        or engine_client.io_processor is None
         or not hasattr(engine_client, "model_config")
         or engine_client.model_config is None
     ):
         if vllm_config is not None:
-            # Try to initialize processors if vllm_config is available
             try:
-                from vllm.plugins.io_processors import get_io_processor
                 from vllm.v1.engine.input_processor import InputProcessor
 
                 tokenizer = await engine_client.get_tokenizer()
                 if tokenizer is not None:
-                    # Initialize input_processor
                     if not hasattr(engine_client, "input_processor") or engine_client.input_processor is None:
                         engine_client.input_processor = InputProcessor(
                             vllm_config=vllm_config,
                         )
                         logger.info("Initialized input_processor for AsyncOmni")
 
-                    # Initialize model_config
                     if not hasattr(engine_client, "model_config") or engine_client.model_config is None:
                         engine_client.model_config = vllm_config.model_config
                         logger.info("Initialized model_config for AsyncOmni")
-
-                    # Initialize io_processor
-                    if not hasattr(engine_client, "io_processor") or engine_client.io_processor is None:
-                        model_config = (
-                            engine_client.model_config
-                            if hasattr(engine_client, "model_config")
-                            else vllm_config.model_config
-                        )
-                        io_processor_plugin = model_config.io_processor_plugin
-                        renderer = getattr(engine_client, "renderer", None)
-                        if renderer is None:
-                            from vllm.renderers import renderer_from_config
-
-                            renderer = renderer_from_config(vllm_config)
-                            engine_client.renderer = renderer
-                        engine_client.io_processor = get_io_processor(vllm_config, renderer, io_processor_plugin)
-                        logger.info("Initialized io_processor for AsyncOmni")
                 else:
                     logger.warning("Cannot initialize processors: tokenizer is None. OpenAIServingModels may fail.")
             except Exception as e:
@@ -714,10 +716,15 @@ async def omni_init_app_state(
     )
     await state.openai_serving_models.init_static_loras()
 
+    # NOTE: kept aligned with vllm 0.20 `init_app_state`:
+    # - dropped the `io_processor` kwarg (no longer accepted by 0.20);
+    #   io_processor stays on `engine_client` and downstream serving classes
+    #   read it from there.
+    # - pass `reasoning_parser` so render-time `adjust_request` runs for
+    #   reasoning models (matches `vllm.entrypoints.openai.api_server`).
     state.openai_serving_render = OpenAIServingRender(
         model_config=engine_client.model_config,
         renderer=engine_client.renderer,
-        io_processor=engine_client.io_processor,
         model_registry=state.openai_serving_models.registry,
         request_logger=request_logger,
         chat_template=resolved_chat_template,
@@ -726,6 +733,7 @@ async def omni_init_app_state(
         enable_auto_tools=args.enable_auto_tool_choice,
         exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
         tool_parser=args.tool_call_parser,
+        reasoning_parser=args.structured_outputs_config.reasoning_parser,
         default_chat_template_kwargs=args.default_chat_template_kwargs,
         log_error_stack=args.log_error_stack,
     )
@@ -792,10 +800,9 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_pooling = (
-        OpenAIServingPooling(
+        ServingPooling(
             engine_client,
             state.openai_serving_models,
-            state.openai_serving_render,
             supported_tasks=tuple(supported_tasks),
             request_logger=request_logger,
             chat_template=resolved_chat_template,
@@ -906,7 +913,11 @@ async def omni_init_app_state(
     )
 
     state.openai_serving_speech = OmniOpenAIServingSpeech(
-        engine_client, state.openai_serving_models, request_logger=request_logger
+        engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
+    )
+
+    state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate(
+        engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
     )
 
     state.openai_streaming_speech = OmniStreamingSpeechHandler(
@@ -947,6 +958,10 @@ def Omnichat(request: Request) -> OmniOpenAIServingChat | None:
 
 def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
     return request.app.state.openai_serving_speech
+
+
+def OmniAudioGenerate(request: Request) -> OmniOpenAIServingAudioGenerate | None:
+    return getattr(request.app.state, "openai_serving_audio_generate", None)
 
 
 @router.post(
@@ -1111,6 +1126,40 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
         return _create_engine_error_json_response(raw_request, exc)
     except ValueError as e:
         raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
+
+
+@router.post(
+    "/v1/audio/generate",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"content": {"audio/*": {}}},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+@load_aware_call
+async def create_audio_generate(request: OpenAICreateAudioGenerateRequest, raw_request: Request):
+    handler = OmniAudioGenerate(raw_request)
+    if handler is None:
+        base_server = getattr(raw_request.app.state, "openai_serving_tokenization", None)
+        if base_server is None:
+            raise HTTPException(
+                status_code=HTTPStatus.NOT_FOUND.value,
+                detail="The model does not support Audio Generate API",
+            )
+        return base_server.create_error_response(message="The model does not support Audio Generate API")
+    try:
+        result = await handler.create_audio_generate(request, raw_request)
+        if isinstance(result, ErrorResponse):
+            return JSONResponse(
+                content=result.model_dump(),
+                status_code=result.error.code if result.error else 400,
+            )
+        return result
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
 

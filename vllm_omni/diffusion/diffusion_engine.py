@@ -37,18 +37,23 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
-def supports_image_input(model_class_name: str) -> bool:
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
-        return False
-    return bool(getattr(model_cls, "support_image_input", False))
+def supports_multimodal_input(od_config: OmniDiffusionConfig) -> tuple[bool, bool]:
+    if od_config.diffusion_load_format == "diffusers" and (pipe_cls := od_config.diffusers_pipeline_cls) is not None:
+        signature = inspect.signature(pipe_cls.__call__)
+        support_image_input = "image" in signature.parameters
+        support_audio_input = (
+            "audio" in signature.parameters or "audio_latents" in signature.parameters
+        )  # ref. LTX-2 format
+        return support_image_input, support_audio_input
 
+    supports_image_input = False
+    supports_audio_input = False
 
-def supports_audio_input(model_class_name: str) -> bool:
-    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-    if model_cls is None:
-        return False
-    return bool(getattr(model_cls, "support_audio_input", False))
+    model_cls = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
+    if model_cls is not None:
+        supports_image_input = bool(getattr(model_cls, "support_image_input", False))
+        supports_audio_input = bool(getattr(model_cls, "support_audio_input", False))
+    return supports_image_input, supports_audio_input
 
 
 def image_color_format(model_class_name: str) -> str:
@@ -199,6 +204,16 @@ class DiffusionEngine:
 
         # Handle single request or multiple requests
         is_audio_output = supports_audio_output(self.od_config.model_class_name)
+        if is_audio_output and model_audio_sample_rate is None:
+            model_cls = DiffusionModelRegistry._try_load_model_cls(self.od_config.model_class_name)
+            model_audio_sample_rate = getattr(model_cls, "audio_sample_rate", None)
+
+        def _audio_mm(payload: Any) -> dict[str, Any]:
+            mm: dict[str, Any] = {"audio": payload}
+            if model_audio_sample_rate is not None:
+                mm["audio_sample_rate"] = model_audio_sample_rate
+            return mm
+
         if len(request.prompts) == 1:
             # Single request: return single OmniRequestOutput
             prompt = request.prompts[0]
@@ -217,7 +232,7 @@ class DiffusionEngine:
                         trajectory_timesteps=output.trajectory_timesteps,
                         trajectory_log_probs=output.trajectory_log_probs,
                         trajectory_decoded=output.trajectory_decoded,
-                        multimodal_output={"audio": request_audio_payload},
+                        multimodal_output=_audio_mm(request_audio_payload),
                         final_output_type="audio",
                         stage_durations=output.stage_durations,
                         peak_memory_mb=output.peak_memory_mb,
@@ -277,7 +292,7 @@ class DiffusionEngine:
                             trajectory_timesteps=output.trajectory_timesteps,
                             trajectory_log_probs=output.trajectory_log_probs,
                             trajectory_decoded=output.trajectory_decoded,
-                            multimodal_output={"audio": request_audio_payload},
+                            multimodal_output=_audio_mm(request_audio_payload),
                             final_output_type="audio",
                             stage_durations=output.stage_durations,
                             peak_memory_mb=output.peak_memory_mb,
@@ -406,23 +421,20 @@ class DiffusionEngine:
         num_inference_steps = 1
         height = 512
         width = 512
-        if supports_image_input(self.od_config.model_class_name):
+        prompt: OmniTextPrompt = {"prompt": "dummy run"}
+
+        supports_image_input, supports_audio_input = supports_multimodal_input(self.od_config)
+        if supports_image_input:
             # Provide a dummy image input if the model supports it
             color_format = image_color_format(self.od_config.model_class_name)
             dummy_image = PIL.Image.new(color_format, (width, height))
-        else:
-            dummy_image = None
+            prompt.setdefault("multi_modal_data", {})["image"] = dummy_image
 
-        if supports_audio_input(self.od_config.model_class_name):
+        if supports_audio_input:
             audio_sr = 16000
             dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
-        else:
-            dummy_audio = None
+            prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
 
-        prompt: OmniTextPrompt = {
-            "prompt": "dummy run",
-            "multi_modal_data": {"image": dummy_image, "audio": dummy_audio},
-        }
         req = OmniDiffusionRequest(
             prompts=[prompt],
             request_ids=["dummy_req_id"],

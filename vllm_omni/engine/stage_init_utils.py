@@ -397,6 +397,13 @@ def build_engine_args_dict(
 ) -> dict[str, Any]:
     """Build the normalized engine args dict for one stage."""
     engine_args = stage_config.engine_args
+    # HACK (Alex) Tensor parallel size should not be passed as None;
+    # remove it if this is the case so that we fall back to default
+    # creation from vLLM's engine args.
+    # NOTE: This will be fixed more generically in ongoing work for engine arg filtering.
+    if "tensor_parallel_size" in engine_args and engine_args["tensor_parallel_size"] is None:
+        del engine_args["tensor_parallel_size"]
+
     stage_type = getattr(stage_config, "stage_type", "llm")
     stage_id = stage_config.stage_id
 
@@ -598,6 +605,32 @@ def release_device_locks(lock_fds: list[int]) -> None:
             logger.debug("Released initialization lock (fd=%s)", lock_fd)
         except (OSError, ValueError):
             pass
+
+
+def acquire_diffusion_device_locks(
+    stage_id: int,
+    od_config: Any,
+    stage_init_timeout: int,
+) -> list[int]:
+    """Acquire init locks for the GPU set used by a diffusion stage.
+
+    Diffusion stages express their device count via ``OmniDiffusionConfig``'s
+    ``parallel_config.world_size`` rather than the LLM-style
+    ``tensor_parallel_size`` knob, so adapt to the shape that
+    ``acquire_device_locks`` understands.
+    """
+    parallel_config = getattr(od_config, "parallel_config", None)
+    world_size = getattr(parallel_config, "world_size", 1)
+    try:
+        world_size = max(1, int(world_size))
+    except (TypeError, ValueError):
+        world_size = 1
+
+    return acquire_device_locks(
+        stage_id,
+        {"tensor_parallel_size": world_size},
+        stage_init_timeout,
+    )
 
 
 def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> Any:

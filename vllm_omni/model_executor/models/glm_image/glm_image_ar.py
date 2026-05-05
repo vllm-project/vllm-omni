@@ -24,6 +24,7 @@
 import math
 import os
 from collections.abc import Iterable, Mapping, Sequence
+from functools import lru_cache
 from typing import Annotated, Literal
 
 import torch
@@ -103,6 +104,15 @@ logger = init_logger(__name__)
 # === Multimodal Processing ===
 
 
+@lru_cache(maxsize=1)
+def _load_cached_glm_image_processor(processor_path: str, trust_remote_code: bool) -> GlmImageProcessor:
+    """Cache GLM-Image processor loading to avoid repeated from_pretrained cost."""
+    return GlmImageProcessor.from_pretrained(
+        processor_path,
+        trust_remote_code=trust_remote_code,
+    )
+
+
 class GlmImagePixelInputs(TensorSchema):
     """
     Schema for GLM-Image pixel inputs.
@@ -177,11 +187,22 @@ class GlmImageProcessingInfo(BaseProcessingInfo):
             if not os.path.exists(processor_path):
                 processor_path = model_path
 
-        # Load processor directly from the correct path
-        return GlmImageProcessor.from_pretrained(
-            processor_path,
-            trust_remote_code=self.ctx.model_config.trust_remote_code,
-            **kwargs,
+        trust_remote_code = self.ctx.model_config.trust_remote_code
+
+        # Keep dynamic override behavior when kwargs are provided, but use a
+        # cached instance for the default path to reduce per-request overhead.
+        # Default path (without kwargs): high frequency, stable, safely reuse cache;
+        # with kwargs: maintain precise semantics, construct instantly per call, avoid mismatch risk.
+        if kwargs:
+            return GlmImageProcessor.from_pretrained(
+                processor_path,
+                trust_remote_code=trust_remote_code,
+                **kwargs,
+            )
+
+        return _load_cached_glm_image_processor(
+            processor_path=processor_path,
+            trust_remote_code=trust_remote_code,
         )
 
     def get_data_parser(self) -> GlmImageDataParser:
@@ -2612,8 +2633,10 @@ class GlmImageForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP
         # Cache prior_token_info for retrieval in forward()
         # This is needed because vLLM doesn't pass pixel_values to forward
         self._prior_token_cache = prior_token_info
+        prior_image_ids = prior_token_info.get("ids", {}).get("prior_image", [])
         logger.debug(
-            f"embed_multimodal: cached prior_token_info with {len(prior_token_info['prior_token_image_ids'])} images"
+            "embed_multimodal: cached prior_token_info with %s images",
+            len(prior_image_ids),
         )
 
         return tuple(image_embeddings)

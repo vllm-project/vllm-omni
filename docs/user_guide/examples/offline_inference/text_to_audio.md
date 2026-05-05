@@ -57,6 +57,8 @@ Key arguments:
 - `--hsdp-shard-size`: number of GPUs used for HSDP sharding.
 - `--hsdp-replicate-size`: number of HSDP replica groups.
 - `--output`: path to save the generated WAV file.
+- `--enable-cpu-offload`: enabling model-wise offloading to save gpu memory
+- `--enable-layerwise-offload`: enabling layerwise offloading to save gpu memory
 
 ## Example materials
 
