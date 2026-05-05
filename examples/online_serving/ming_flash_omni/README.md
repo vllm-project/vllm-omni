@@ -11,7 +11,7 @@ Please refer to [README.md](../../../README.md)
 | Thinker + Talker (omni-speech, default) | `vllm serve ... --omni` | Text + Audio |
 | Thinker only (multimodal understanding) | `vllm serve ... --omni --deploy-config vllm_omni/deploy/ming_flash_omni_thinker_only.yaml` | Text |
 
-For standalone TTS (talker only), see [`examples/online_serving/ming_flash_omni_tts/`](../ming_flash_omni_tts/).
+For standalone TTS (talker only), see the [Ming-flash-omni-TTS section in the Text-To-Speech hub](../text_to_speech/README.md#ming-flash-omni-tts).
 
 ## Run examples (Ming-flash-omni 2.0)
 
