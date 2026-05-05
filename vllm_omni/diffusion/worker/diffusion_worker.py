@@ -18,7 +18,8 @@ from typing import Any
 
 import torch
 import zmq
-from vllm.config import CompilationConfig, DeviceConfig, VllmConfig, set_current_vllm_config
+from vllm.config import CompilationConfig, DeviceConfig, KernelConfig, VllmConfig, set_current_vllm_config
+from vllm.config.kernel import IrOpPriorityConfig
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
@@ -117,6 +118,9 @@ class DiffusionWorker:
         vllm_config = VllmConfig(
             compilation_config=CompilationConfig(),
             device_config=DeviceConfig(device=self.device),
+            kernel_config=KernelConfig(
+                ir_op_priority=IrOpPriorityConfig(rms_norm=["vllm_c", "native"]),
+            ),
         )
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
