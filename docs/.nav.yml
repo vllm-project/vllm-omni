@@ -16,8 +16,6 @@ nav:
     - examples/README.md
     - Offline Inference:
       - BAGEL-7B-MoT: user_guide/examples/offline_inference/bagel.md
-      - CosyVoice3: user_guide/examples/offline_inference/cosyvoice3.md
-      - Fish Speech S2 Pro: user_guide/examples/offline_inference/fish_speech.md
       - GLM-Image Multistage End-to-End Inference: user_guide/examples/offline_inference/glm_image.md
       - Helios Video Generation: user_guide/examples/offline_inference/helios.md
       - HunyuanImage-3.0 Image-to-Text Inference: user_guide/examples/offline_inference/hunyuan_image3.md
@@ -28,24 +26,22 @@ nav:
       - MiMo-Audio Offline Inference: user_guide/examples/offline_inference/mimo_audio.md
       - Qwen2.5-Omni: user_guide/examples/offline_inference/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/offline_inference/qwen3_omni.md
-      - Qwen3-TTS: user_guide/examples/offline_inference/qwen3_tts.md
       - Text-To-Audio: user_guide/examples/offline_inference/text_to_audio.md
       - Text-To-Image: user_guide/examples/offline_inference/text_to_image.md
+      - Text-To-Speech: user_guide/examples/offline_inference/text_to_speech.md
       - Text-To-Video: user_guide/examples/offline_inference/text_to_video.md
-      - Voxtral TTS Offline Inference: user_guide/examples/offline_inference/voxtral_tts.md
       - X-To-Video-Audio: user_guide/examples/offline_inference/x_to_video_audio.md
     - Online Serving:
       - BAGEL-7B-MoT: user_guide/examples/online_serving/bagel.md
       - vLLM-Omni Helm Chart: user_guide/examples/online_serving/chart-helm.md
       - Diffusers Backend Adapter Example: user_guide/examples/online_serving/diffusers_pipeline_adapter.md
-      - Fish Speech S2 Pro: user_guide/examples/online_serving/fish_speech.md
       - GLM-Image Online Serving: user_guide/examples/online_serving/glm_image.md
       - Image-To-Image: user_guide/examples/online_serving/image_to_image.md
       - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
       - Online serving Example of vLLM-Omni for MiMo-Audio: user_guide/examples/online_serving/mimo_audio.md
       - Qwen2.5-Omni: user_guide/examples/online_serving/qwen2_5_omni.md
       - Qwen3-Omni: user_guide/examples/online_serving/qwen3_omni.md
-      - Qwen3-TTS: user_guide/examples/online_serving/qwen3_tts.md
+      - Text-To-Speech: user_guide/examples/online_serving/text_to_speech.md
       - Text-To-Image: user_guide/examples/online_serving/text_to_image.md
       - Text-To-Video: user_guide/examples/online_serving/text_to_video.md
   - General:

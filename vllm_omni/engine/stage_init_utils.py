@@ -397,6 +397,13 @@ def build_engine_args_dict(
 ) -> dict[str, Any]:
     """Build the normalized engine args dict for one stage."""
     engine_args = stage_config.engine_args
+    # HACK (Alex) Tensor parallel size should not be passed as None;
+    # remove it if this is the case so that we fall back to default
+    # creation from vLLM's engine args.
+    # NOTE: This will be fixed more generically in ongoing work for engine arg filtering.
+    if "tensor_parallel_size" in engine_args and engine_args["tensor_parallel_size"] is None:
+        del engine_args["tensor_parallel_size"]
+
     stage_type = getattr(stage_config, "stage_type", "llm")
     stage_id = stage_config.stage_id
 
