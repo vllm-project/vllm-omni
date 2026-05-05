@@ -11,15 +11,33 @@ free guidance code paths removed (vLLM-Omni does not support CFG).
 
 The outer :class:`EarTTSForCausalLM` exposes the minimal vLLM-Omni
 preprocess/postprocess hooks. Per-request inputs are passed via
-``additional_information``:
+``additional_information``.
 
-  * ``reference_audio_tokens`` — Tensor of shape ``(Tref, 31)`` with the
-    reference speaker's acoustic tokens. ``Tref`` is also the prefill
-    placeholder length (the user passes ``prompt_token_ids = [0] * Tref``).
-  * ``text`` — string to synthesize. The model tokenizes it once during
-    the first prefill chunk and pads the result to ``round(4.0 * N)``
-    text tokens (where ``N = len(tokenize(text))``) — one padded token
-    is consumed per decode step.
+Two input modes are supported:
+
+1. **Cached-text mode** (default): the full synthesis text is provided
+   up front via ``text`` and tokenized + padded once during the first
+   prefill chunk. The padded text tokens are then consumed one per
+   decode step from a GPU-resident cache.
+
+   * ``reference_audio_tokens`` — Tensor of shape ``(Tref, 31)`` with the
+     reference speaker's acoustic tokens. ``Tref`` is also the prefill
+     placeholder length (the user passes ``prompt_token_ids = [0] * Tref``).
+   * ``text`` — string to synthesize. The model tokenizes it once during
+     the first prefill chunk and pads the result to ``round(4.0 * N)``
+     text tokens (where ``N = len(tokenize(text))``) — one padded token
+     is consumed per decode step.
+
+2. **Streaming-text mode**: the user injects each text token externally,
+   one per decode step, via ``StreamingInput`` (``prompt_token_ids =
+   [next_text_token_id]``). No precomputed text cache is built; the
+   text token consumed at each decode step is read directly out of the
+   per-step ``input_ids``.
+
+   * ``reference_audio_tokens`` — same as above (passed in the first
+     prefill chunk's ``additional_information``).
+   * Simply omit ``text`` from the first prefill chunk's
+     ``additional_information`` to select this mode.
 
 Per-step flow:
   1. ``preprocess`` builds (or reads from cached buffers) the per-token
@@ -1133,12 +1151,18 @@ class EarTTSForCausalLM(nn.Module):
 
     def _build_prefill_tensors(
         self,
-        text: str,
+        text: Optional[str],
         ref_audio_tokens: torch.Tensor,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Construct the full prefill per-token tensors and the cached
-        padded text tokens for decode.
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+    ]:
+        """Construct the full prefill per-token tensors and (optionally)
+        the cached padded text tokens for decode.
 
         Layout (length ``num = ref_audio_tokens.shape[0]``):
 
@@ -1159,6 +1183,11 @@ class EarTTSForCausalLM(nn.Module):
             with total length ``round(EARTTS_FRAMES_PER_TEXT_TOKEN * N)``
             where ``N = len(tokenize(text))``. One entry is consumed per
             decode step.
+
+        When ``text`` is ``None`` (streaming-text mode), the decode-side
+        cache is not built and ``None`` is returned in its place — the
+        per-step text token will be supplied externally via the
+        per-chunk ``input_ids``.
         """
         num = int(ref_audio_tokens.shape[0])
         if num <= 0:
@@ -1207,21 +1236,27 @@ class EarTTSForCausalLM(nn.Module):
             )
 
         # Cached padded text tokens consumed one-per-step in decode.
-        text_ids = list(
-            self.tokenizer.encode(text, add_special_tokens=True)
-        )
-        n = len(text_ids)
-        if n <= 0:
-            raise ValueError("text tokenized to an empty sequence.")
-        total_frames = max(
-            n, int(round(n * EARTTS_FRAMES_PER_TEXT_TOKEN))
-        )
-        pad_n = max(0, total_frames - n)
-        decode_text_tokens = torch.tensor(
-            text_ids + [self._text_pad_id] * pad_n,
-            dtype=torch.long,
-            device=device,
-        )
+        # Skipped in streaming-text mode (text is None) — the per-step
+        # text token is supplied externally via input_ids.
+        decode_text_tokens: Optional[torch.Tensor]
+        if text is None:
+            decode_text_tokens = None
+        else:
+            text_ids = list(
+                self.tokenizer.encode(text, add_special_tokens=True)
+            )
+            n = len(text_ids)
+            if n <= 0:
+                raise ValueError("text tokenized to an empty sequence.")
+            total_frames = max(
+                n, int(round(n * EARTTS_FRAMES_PER_TEXT_TOKEN))
+            )
+            pad_n = max(0, total_frames - n)
+            decode_text_tokens = torch.tensor(
+                text_ids + [self._text_pad_id] * pad_n,
+                dtype=torch.long,
+                device=device,
+            )
 
         return (
             full_text_tokens,
@@ -1247,9 +1282,9 @@ class EarTTSForCausalLM(nn.Module):
         """Build per-request ``(input_ids, inputs_embeds)`` for this step.
 
         Prefill (``span_len > 1``):
-            On the first prefill chunk, tokenizes the synthesis text
-            (cached for decode) and constructs the per-position prefill
-            tensors of length ``num = reference_audio_tokens.shape[0]``:
+            On the first prefill chunk, constructs the per-position
+            prefill tensors of length ``num =
+            reference_audio_tokens.shape[0]``:
 
             * ``acoustic_tokens`` = ``reference_audio_tokens`` (copy)
             * ``text_tokens``     = ``tokenize(PREFILL_PREFIX_TEXT) +
@@ -1257,22 +1292,33 @@ class EarTTSForCausalLM(nn.Module):
             * ``text_mask``       = ``[0] * num``; ``mask[-2:] = 1``
             * ``bos_mask``        = ``[0] * num``; ``mask[-1] = 1``
 
-            The full per-position tensors are cached on GPU under
-            ``ear_prefill_*`` keys (kept device-resident via
+            When ``additional_information['text']`` is provided
+            (cached-text mode), the synthesis text is also tokenized
+            and padded once and cached under ``ear_decode_text_tokens``
+            for the decode phase. When it's omitted (streaming-text
+            mode), no decode-text cache is built — each decode step's
+            text token is taken directly from the externally-provided
+            per-chunk ``input_ids``.
+
+            The full prefill per-position tensors are cached on GPU
+            under ``ear_prefill_*`` keys (kept device-resident via
             :attr:`gpu_resident_buffer_keys`) and a running
             ``ear_prefill_offset`` tracks how much of the prefill has
             already been copied into the static-address buffers across
-            multi-chunk prefill. The tokenized + padded synthesis text
-            is cached under ``ear_decode_text_tokens`` for the decode
-            phase.
+            multi-chunk prefill.
 
         Decode (``span_len == 1``):
             Reads ``last_acoustic_codes`` (stashed by
             :meth:`postprocess` after the previous step) into
             :attr:`_acoustic_tokens` at the request's offset, picks the
-            next padded text token from ``ear_decode_text_tokens`` at
-            ``ear_decode_offset``, and sets ``text_mask = 1`` /
+            next text token, and sets ``text_mask = 1`` /
             ``bos_mask = 0``.
+
+            * If the cached ``ear_decode_text_tokens`` is present, the
+              next text token is read from it at ``ear_decode_offset``.
+            * Otherwise (streaming-text mode), the next text token is
+              ``input_ids[0]`` — the user injects it externally via
+              ``StreamingInput`` at every decode step.
         """
         # Normalize: some runner paths still pass per-request state
         # nested under ``additional_information`` instead of flattened.
@@ -1302,27 +1348,30 @@ class EarTTSForCausalLM(nn.Module):
             cached_acoustic = info_dict.get("ear_prefill_acoustic_tokens")
             cached_bos_mask = info_dict.get("ear_prefill_bos_mask")
             cached_decode_text = info_dict.get("ear_decode_text_tokens")
+            # The decode-text cache is intentionally absent in
+            # streaming-text mode — only the four prefill caches are
+            # needed to recognise a follow-up multi-chunk prefill step.
             is_first = not (
                 isinstance(cached_text_tokens, torch.Tensor)
                 and isinstance(cached_text_mask, torch.Tensor)
                 and isinstance(cached_acoustic, torch.Tensor)
                 and isinstance(cached_bos_mask, torch.Tensor)
-                and isinstance(cached_decode_text, torch.Tensor)
             )
 
             info_update: dict[str, Any] = {}
             if is_first:
                 # First prefill chunk: build the full per-position
-                # tensors + decode text cache once. Allocate them on
-                # GPU so the runner's ``model_intermediate_buffer``
-                # keeps them device-resident across multi-chunk prefill
-                # and decode (avoids per-chunk / per-step H2D uploads).
-                text = self._first_str(info_dict.get("text"))
-                if not text:
-                    raise ValueError(
-                        "EarTTS preprocess requires non-empty "
-                        "additional_information['text'] for prefill."
-                    )
+                # tensors + (optionally) decode text cache once.
+                # Allocate them on GPU so the runner's
+                # ``model_intermediate_buffer`` keeps them
+                # device-resident across multi-chunk prefill and decode
+                # (avoids per-chunk / per-step H2D uploads).
+                #
+                # If ``text`` is omitted, the model runs in
+                # streaming-text mode: each decode step's text token is
+                # injected externally via the per-chunk ``input_ids``,
+                # and no decode-text cache is built here.
+                text = self._first_str(info_dict.get("text")) or None
                 ref_audio_tokens = self._coerce_ref_audio_tokens(
                     info_dict.get("reference_audio_tokens")
                 )
@@ -1349,7 +1398,8 @@ class EarTTSForCausalLM(nn.Module):
                 info_update["ear_prefill_text_mask"] = cached_text_mask
                 info_update["ear_prefill_acoustic_tokens"] = cached_acoustic
                 info_update["ear_prefill_bos_mask"] = cached_bos_mask
-                info_update["ear_decode_text_tokens"] = cached_decode_text
+                if cached_decode_text is not None:
+                    info_update["ear_decode_text_tokens"] = cached_decode_text
                 info_update["ear_prefill_offset"] = 0
                 info_update["ear_decode_offset"] = 0
 
@@ -1392,7 +1442,11 @@ class EarTTSForCausalLM(nn.Module):
 
         # ----- Decode (span_len == 1) -------------------------------
         # Acoustic input = previous-step codes (stashed by postprocess).
-        # Text input = next padded text token from the decode cache.
+        # Text input = either the next padded text token from the
+        # cached-text decode cache (when the user provided ``text`` up
+        # front), or — in streaming-text mode — the token id passed in
+        # via ``input_ids[0]`` (one text token per ``StreamingInput``
+        # chunk yielded by the client).
         # ``text_mask = 1`` and ``bos_mask = 0`` for every decode step.
         last_codes = info_dict.get("last_acoustic_codes")
         cached_decode_text = info_dict.get("ear_decode_text_tokens")
@@ -1408,15 +1462,27 @@ class EarTTSForCausalLM(nn.Module):
             )
             self._acoustic_tokens[buf_s, : ac.shape[0]].copy_(ac)
 
-        info_update = {}
-        if isinstance(cached_decode_text, torch.Tensor) and cached_decode_text.numel() > 0:
+        if (
+            isinstance(cached_decode_text, torch.Tensor)
+            and cached_decode_text.numel() > 0
+        ):
             total = int(cached_decode_text.shape[0])
             idx = decode_offset if decode_offset < total else total - 1
-            self._text_tokens[buf_s].copy_(
-                cached_decode_text[idx].to(device=device, dtype=torch.long)
+            text_tok = cached_decode_text[idx].to(
+                device=device, dtype=torch.long
             )
-            self._text_mask[buf_s] = 1
-            info_update["ear_decode_offset"] = decode_offset + 1
+        else:
+            # Streaming-text mode: take the text token id directly out
+            # of the per-chunk input_ids. Each StreamingInput chunk
+            # carries exactly one text token (``prompt_token_ids =
+            # [next_text_token_id]``).
+            text_tok = input_ids.reshape(-1)[0].to(
+                device=device, dtype=torch.long
+            )
+        self._text_tokens[buf_s].copy_(text_tok)
+        self._text_mask[buf_s] = 1
+
+        info_update: dict[str, Any] = {"ear_decode_offset": decode_offset + 1}
 
         inputs_embeds_out = torch.zeros(
             (1, self.config.hidden_size),
