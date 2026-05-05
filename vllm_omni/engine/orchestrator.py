@@ -450,9 +450,9 @@ class Orchestrator:
                     list(self._pd_kv_params[req_id].keys()),
                 )
             else:
-                logger.warning(
+                logger.debug(
                     "[Orchestrator][PD] prefill stage output for req=%s has no kv_transfer_params; "
-                    "KV transfer may fail. Ensure apply_mooncake_connector_patch() was called.",
+                    "continuing with transfer_id/bootstrap-based Mooncake routing.",
                     req_id,
                 )
 
@@ -548,14 +548,15 @@ class Orchestrator:
         if sp.extra_args is None:
             sp.extra_args = {}
 
-        # Get KV params captured from the prefill output (must include remote_request_id).
-        kv_prefill_params = self._pd_kv_params.pop(req_id, None)
-        if not kv_prefill_params or "remote_request_id" not in kv_prefill_params:
-            raise RuntimeError(
-                f"[Orchestrator][PD] Missing prefill kv_transfer_params.remote_request_id for req={req_id}"
-            )
+        # Newer Mooncake routing keys requests by transfer_id and uses
+        # remote_engine_id + remote_bootstrap_addr to discover the producer.
+        # Prefill-side kv_transfer_params are therefore optional; when present
+        # we only treat them as an overlay/fallback.
+        kv_prefill_params = self._pd_kv_params.pop(req_id, None) or {}
 
         decode_kv_params: dict[str, Any] = {
+            "do_remote_prefill": True,
+            "do_remote_decode": False,
             "transfer_id": f"xfer-{req_id}",
         }
 
@@ -565,8 +566,20 @@ class Orchestrator:
         if self._pd_prefill_engine_id:
             decode_kv_params["remote_engine_id"] = self._pd_prefill_engine_id
 
-        # Overlay params from prefill side (includes remote_request_id set by monkey patch).
+        # Overlay any prefill-side params (legacy patches may still thread
+        # remote_request_id or other connector-specific fields through outputs).
         decode_kv_params.update(kv_prefill_params)
+
+        missing = [
+            key
+            for key in ("transfer_id", "remote_bootstrap_addr", "remote_engine_id")
+            if not decode_kv_params.get(key)
+        ]
+        if missing:
+            raise RuntimeError(
+                "[Orchestrator][PD] Missing decode kv_transfer_params fields for "
+                f"req={req_id}: {', '.join(missing)}"
+            )
 
         # Ensure these flags are set correctly after any overlay.
         decode_kv_params["do_remote_prefill"] = True

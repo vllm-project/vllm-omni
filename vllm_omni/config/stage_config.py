@@ -842,6 +842,7 @@ def _apply_pd_disaggregation(
         target_stage,
         final_output=False,
         final_output_type=None,
+        owns_tokenizer=False,
         custom_process_input_func=None,
         custom_process_next_stage_input_func=None,
         async_chunk_process_next_stage_input_func=None,

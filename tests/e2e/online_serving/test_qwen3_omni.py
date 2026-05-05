@@ -7,7 +7,6 @@ import os
 import pytest
 
 from tests.helpers.mark import hardware_marks, hardware_test
-from tests.helpers.mark import hardware_marks, hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
@@ -37,14 +36,11 @@ def get_chunk_config(config_path: str | None = None):
 
 def get_pd_config(config_path: str | None = None):
     """Load the qwen3_omni CI deploy yaml with PD disaggregation enabled."""
-    """Load the qwen3_omni CI deploy yaml with PD disaggregation enabled."""
     if config_path is None:
         config_path = _CI_DEPLOY
     return modify_stage_config(
         config_path,
         updates={
-            "pd_disaggregation.enabled": True,
-            "pd_disaggregation.async_chunk": False,
             "pd_disaggregation.enabled": True,
             "pd_disaggregation.async_chunk": False,
             "stages": {
@@ -69,28 +65,32 @@ def get_prefix_caching_config(config_path: str):
 
 
 # Cover sync, async-chunk, and PD launch paths by default.
-test_params = [
-    pytest.param(
-        OmniServerParams(model=model, stage_config_path=_CI_DEPLOY),
-        id="default",
-        marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2),
-    )
-    for model in models
-] + [
-    pytest.param(
-        OmniServerParams(model=model, stage_config_path=get_chunk_config()),
-        id="async_chunk",
-        marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2),
-    )
-    for model in models
-] + [
-    pytest.param(
-        OmniServerParams(model=model, stage_config_path=get_pd_config()),
-        id="pd_default",
-        marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3),
-    )
-    for model in models
-]
+test_params = (
+    [
+        pytest.param(
+            OmniServerParams(model=model, stage_config_path=_CI_DEPLOY),
+            id="default",
+            marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2),
+        )
+        for model in models
+    ]
+    + [
+        pytest.param(
+            OmniServerParams(model=model, stage_config_path=get_chunk_config()),
+            id="async_chunk",
+            marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2),
+        )
+        for model in models
+    ]
+    + [
+        pytest.param(
+            OmniServerParams(model=model, stage_config_path=get_pd_config()),
+            id="pd_default",
+            marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3),
+        )
+        for model in models
+    ]
+)
 prefix_caching_stage_configs = [get_prefix_caching_config(_CI_DEPLOY)]
 
 # For prefix caching, we need to enable prompt token details so that we

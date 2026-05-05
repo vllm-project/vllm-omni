@@ -121,6 +121,8 @@ class StageEngineCoreClientBase:
             self.default_sampling_params = metadata.default_sampling_params
             self.custom_process_input_func = metadata.custom_process_input_func
             self.model_stage = metadata.model_stage
+            self.is_prefill_only = metadata.is_prefill_only
+            self.is_decode_only = metadata.is_decode_only
 
         self.engine_outputs: Any = None
         self._proc = proc

@@ -1110,7 +1110,7 @@ class TestPDYAMLConfig:
         # Prefill stage
         assert stages[0].yaml_extras["is_prefill_only"] is True
         assert stages[0].final_output is False
-        assert stages[0].is_comprehension is True
+        assert stages[0].is_comprehension is False
 
         # Decode stage
         assert stages[1].yaml_extras["is_decode_only"] is True

@@ -41,6 +41,7 @@ from tests.helpers.media import (
     decode_b64_image,
 )
 from vllm_omni.config.stage_config import resolve_deploy_yaml
+from vllm_omni.entrypoints.utils import detect_explicit_cli_keys, load_and_resolve_stage_configs
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -381,8 +382,21 @@ class OmniServerStageCli(OmniServer):
             f"{yaml.safe_dump(resolved_cfg, sort_keys=False, default_flow_style=False)}",
             flush=True,
         )
-        self.stage_runtime_devices = self._load_stage_runtime_devices(resolved_cfg)
-        self.stage_ids = stage_ids or self._load_stage_ids(resolved_cfg)
+        runtime_stage_configs = self._load_runtime_stage_configs(model, stage_config_path, self.serve_args)
+        runtime_layout = [
+            {
+                "stage_id": self._stage_id(stage_cfg),
+                "devices": self._runtime_devices(stage_cfg),
+            }
+            for stage_cfg in runtime_stage_configs
+        ]
+        print(
+            f"[OmniServerStageCli] Runtime stage layout from {stage_config_path}:\n"
+            f"{yaml.safe_dump(runtime_layout, sort_keys=False, default_flow_style=False)}",
+            flush=True,
+        )
+        self.stage_runtime_devices = self._load_stage_runtime_devices(runtime_stage_configs)
+        self.stage_ids = stage_ids or self._load_stage_ids(runtime_stage_configs)
         if 0 not in self.stage_ids:
             raise ValueError(f"Stage CLI test requires stage_id=0 in config: {stage_config_path}")
         self.stage_procs: dict[int, subprocess.Popen] = {}
@@ -395,24 +409,82 @@ class OmniServerStageCli(OmniServer):
         return cfg.get("stage_args") or cfg.get("stages") or []
 
     @staticmethod
-    def _load_stage_ids(resolved_config: dict) -> list[int]:
-        stage_ids = [
-            stage["stage_id"] for stage in OmniServerStageCli._stage_entries(resolved_config) if "stage_id" in stage
-        ]
+    def _stage_id(stage: Any) -> int | None:
+        if isinstance(stage, dict):
+            stage_id = stage.get("stage_id")
+        else:
+            stage_id = getattr(stage, "stage_id", None)
+        return int(stage_id) if stage_id is not None else None
+
+    @staticmethod
+    def _runtime_devices(stage: Any) -> str | None:
+        if isinstance(stage, dict):
+            devices = stage.get("devices") or stage.get("runtime", {}).get("devices")
+            return str(devices) if devices else None
+
+        runtime = getattr(stage, "runtime", None)
+        if runtime is not None:
+            if hasattr(runtime, "get"):
+                devices = runtime.get("devices")
+            else:
+                devices = getattr(runtime, "devices", None)
+            if devices:
+                return str(devices)
+
+        runtime_overrides = getattr(stage, "runtime_overrides", None) or {}
+        yaml_runtime = getattr(stage, "yaml_runtime", None) or {}
+        devices = runtime_overrides.get("devices") or yaml_runtime.get("devices")
+        return str(devices) if devices else None
+
+    @classmethod
+    def _load_runtime_stage_configs(cls, model: str, stage_config_path: str, serve_args: list[str]) -> list[Any]:
+        cli_argv = ["serve", model, "--omni", *serve_args]
+        cli_kwargs: dict[str, Any] = {"_cli_explicit_keys": detect_explicit_cli_keys(cli_argv)}
+        try:
+            from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+            from vllm_omni.entrypoints.cli.serve import OmniServeCommand
+
+            root = FlexibleArgumentParser(add_help=False)
+            subparsers = root.add_subparsers(dest="subcommand")
+            cmd = OmniServeCommand()
+            serve_parser = cmd.subparser_init(subparsers)
+            args, _ = root.parse_known_args(cli_argv)
+            cli_kwargs = vars(args).copy()
+            cli_kwargs.pop("subcommand", None)
+            cli_kwargs["_cli_explicit_keys"] = detect_explicit_cli_keys(cli_argv, serve_parser)
+        except Exception:
+            # Parser construction is best-effort in tests; the heuristic
+            # explicit-key path still lets deploy YAMLs drive runtime layout.
+            pass
+
+        _, stage_configs = load_and_resolve_stage_configs(
+            model=model,
+            stage_configs_path=stage_config_path,
+            kwargs=cli_kwargs,
+        )
+        return stage_configs
+
+    @classmethod
+    def _load_stage_ids(cls, stage_source: dict | list[Any]) -> list[int]:
+        if isinstance(stage_source, dict):
+            stage_ids = [cls._stage_id(stage) for stage in cls._stage_entries(stage_source)]
+        else:
+            stage_ids = [cls._stage_id(stage) for stage in stage_source]
+        stage_ids = [stage_id for stage_id in stage_ids if stage_id is not None]
         if not stage_ids:
             raise ValueError("No stage IDs found in resolved config")
         return stage_ids
 
-    @staticmethod
-    def _load_stage_runtime_devices(resolved_config: dict) -> dict[int, str]:
+    @classmethod
+    def _load_stage_runtime_devices(cls, stage_source: dict | list[Any]) -> dict[int, str]:
         runtime_devices: dict[int, str] = {}
-        for stage in OmniServerStageCli._stage_entries(resolved_config):
-            stage_id = stage.get("stage_id")
-            # New schema: stage.devices is flat at stage level.
-            # Legacy schema: stage.runtime.devices is nested.
-            devices = stage.get("devices") or stage.get("runtime", {}).get("devices")
+        stage_entries = cls._stage_entries(stage_source) if isinstance(stage_source, dict) else stage_source
+        for stage in stage_entries:
+            stage_id = cls._stage_id(stage)
+            devices = cls._runtime_devices(stage)
             if stage_id is not None and devices:
-                runtime_devices[int(stage_id)] = str(devices)
+                runtime_devices[stage_id] = devices
         return runtime_devices
 
     @classmethod

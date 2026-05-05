@@ -6,6 +6,7 @@ import types
 import pytest
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.engine.stage_init_utils import extract_stage_metadata
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -19,6 +20,30 @@ def test_stage_engine_core_client_module_reload_keeps_forward_refs_deferred():
     assert client_mod.StageEngineCoreClientBase.make_async_mp_client.__annotations__["return"] == (
         "StageEngineCoreClient | DPLBStageEngineCoreClient"
     )
+
+
+def test_extract_stage_metadata_preserves_pd_role_flags():
+    stage_cfg = types.SimpleNamespace(
+        stage_id=1,
+        stage_type="llm",
+        engine_args=types.SimpleNamespace(model_stage="thinker", engine_output_type="latent"),
+        runtime={},
+        engine_input_source=[0],
+        final_output=True,
+        final_output_type="text",
+        default_sampling_params={},
+        custom_process_input_func=None,
+        prompt_expand_func=None,
+        cfg_kv_collect_func=None,
+        is_comprehension=True,
+        is_prefill_only=True,
+        is_decode_only=False,
+    )
+
+    metadata = extract_stage_metadata(stage_cfg)
+
+    assert metadata.is_prefill_only is True
+    assert metadata.is_decode_only is False
 
 
 def test_initialize_stages_restores_device_visibility_after_diffusion_init(monkeypatch):

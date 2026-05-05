@@ -888,6 +888,8 @@ class TestDeployConfigLoading:
         assert len(stages) == 4
         assert stages[0].yaml_extras["is_prefill_only"] is True
         assert stages[1].yaml_extras["is_decode_only"] is True
+        assert stages[0].is_comprehension is False
+        assert stages[1].is_comprehension is True
         assert stages[1].input_sources == [0]
         assert stages[2].input_sources == [1]
         assert stages[3].input_sources == [2]
