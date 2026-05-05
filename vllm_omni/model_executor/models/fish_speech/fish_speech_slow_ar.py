@@ -12,7 +12,7 @@ Analogous to ``Qwen3TTSTalkerForConditionalGeneration`` in qwen3_tts.
 
 from __future__ import annotations
 
-import dataclasses
+import copy
 import math
 from collections.abc import Iterable
 from typing import Any
@@ -224,10 +224,18 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
             self.text_config.hidden_size,
         )
 
-        # Fast AR (residual codebook predictor).
-        predictor_compilation = dataclasses.replace(vllm_config.compilation_config)
+        # Fast AR (residual codebook predictor). Use copy.copy rather than
+        # dataclasses.replace: CompilationConfig / VllmConfig are pydantic
+        # dataclasses, so `replace` re-runs __init__→pydantic validators +
+        # __post_init__. If a backend has already rebound
+        # compilation_config.backend to a non-stock value, the piecewise-backend
+        # validator in vllm/config/compilation.py rejects it and the clone
+        # raises. copy.copy goes through __reduce_ex__, skips validation, and
+        # leaves the parent's already-initialized state intact.
+        predictor_compilation = copy.copy(vllm_config.compilation_config)
         predictor_compilation.static_forward_context = {}
-        self._fast_ar_vllm_config = dataclasses.replace(vllm_config, compilation_config=predictor_compilation)
+        self._fast_ar_vllm_config = copy.copy(vllm_config)
+        self._fast_ar_vllm_config.compilation_config = predictor_compilation
         from vllm.config.vllm import set_current_vllm_config as _set_cfg
 
         with _set_cfg(self._fast_ar_vllm_config):

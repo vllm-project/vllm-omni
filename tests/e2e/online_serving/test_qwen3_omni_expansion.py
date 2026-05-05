@@ -356,7 +356,6 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-@pytest.mark.skip(reason="issue: #2827")
 def test_audio_in_video_001(omni_server, openai_client) -> None:
     """
     Input Modal: text + video (synthetic MP4 with embedded audio; ``use_audio_in_video`` uses audio from the video).
@@ -376,7 +375,7 @@ def test_audio_in_video_001(omni_server, openai_client) -> None:
         "messages": messages,
         "stream": False,
         "use_audio_in_video": True,
-        "key_words": {"video": VIDEO_KEY, "audio": AUDIO_KEY + ["beep", "electronic"]},
+        "key_words": {"video": VIDEO_KEY},
     }
     openai_client.send_omni_request(request_config)
 

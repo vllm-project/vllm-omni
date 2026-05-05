@@ -5,7 +5,7 @@ This directory contains online e2e examples for **Ming-flash-omni-2.0 standalone
 Server uses:
 
 - `model`: `Jonathan1909/Ming-flash-omni-2.0`
-- `stage config`: `vllm_omni/model_executor/stage_configs/ming_flash_omni_tts.yaml`
+- `deploy config`: `vllm_omni/deploy/ming_flash_omni_tts.yaml`
 
 ## Launch the Server
 
@@ -18,7 +18,7 @@ Equivalent manual command:
 
 ```bash
 vllm serve Jonathan1909/Ming-flash-omni-2.0 \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/ming_flash_omni_tts.yaml \
+    --deploy-config vllm_omni/deploy/ming_flash_omni_tts.yaml \
     --host 0.0.0.0 \
     --port 8091 \
     --trust-remote-code \

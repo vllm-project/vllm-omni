@@ -6,8 +6,6 @@ import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
-from pathlib import Path
-
 import pytest
 
 from tests.helpers.mark import hardware_test
@@ -16,7 +14,7 @@ from tests.helpers.media import (
     generate_synthetic_image,
     generate_synthetic_video,
 )
-from tests.helpers.stage_config import modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 models = ["Jonathan1909/Ming-flash-omni-2.0"]
 
@@ -35,48 +33,27 @@ def build_prompt(user_text: str) -> str:
     )
 
 
+_CI_DEPLOY_THINKER_ONLY = get_deploy_config_path("ci/ming_flash_omni_thinker_only.yaml")
+_CI_DEPLOY = get_deploy_config_path("ci/ming_flash_omni.yaml")
+
+
+def get_eager_config_thinker():
+    return modify_stage_config(_CI_DEPLOY_THINKER_ONLY, updates={"stages": {0: {"enforce_eager": True}}})
+
+
 def get_eager_config():
-    path = modify_stage_config(
-        str(Path(__file__).parent.parent / "stage_configs" / "bailingmm_moe_v2_lite_thinker_only_ci.yaml"),
-        updates={
-            "stage_args": {
-                0: {
-                    "engine_args.enforce_eager": "true",
-                },
-            },
-        },
-    )
-    return path
-
-
-def get_eager_tts_config():
     """Thinker+talker CI config with enforce_eager on the thinker stage."""
-    path = modify_stage_config(
-        str(Path(__file__).parent.parent / "stage_configs" / "bailingmm_moe_v2_lite_ci.yaml"),
-        updates={
-            "stage_args": {
-                0: {
-                    "engine_args.enforce_eager": "true",
-                },
-            },
-        },
-    )
-    return path
+    return modify_stage_config(_CI_DEPLOY, updates={"stages": {0: {"enforce_eager": True}}})
 
 
-# Thinker-only config — used by text-output tests.
-stage_configs = [get_eager_config()]
-test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
-
-# Thinker+talker config — used by audio-output tests.
-stage_configs_tts = [get_eager_tts_config()]
-test_params_tts = [(model, stage_config) for model in models for stage_config in stage_configs_tts]
+test_params_thinker = [(m, c) for m in models for c in [get_eager_config_thinker()]]
+test_params = [(m, c) for m in models for c in [get_eager_config()]]
 
 
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
-@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+@pytest.mark.parametrize("omni_runner", test_params_thinker, indirect=True)
 def test_text_to_text(omni_runner, omni_runner_handler) -> None:
     """
     Test text-only input processing and text output generation.
@@ -92,7 +69,7 @@ def test_text_to_text(omni_runner, omni_runner_handler) -> None:
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
-@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+@pytest.mark.parametrize("omni_runner", test_params_thinker, indirect=True)
 def test_image_to_text(omni_runner, omni_runner_handler) -> None:
     """
     Test image understanding with text output.
@@ -109,7 +86,7 @@ def test_image_to_text(omni_runner, omni_runner_handler) -> None:
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
-@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+@pytest.mark.parametrize("omni_runner", test_params_thinker, indirect=True)
 def test_audio_to_text(omni_runner, omni_runner_handler) -> None:
     """
     Test audio understanding with text output.
@@ -128,7 +105,7 @@ def test_audio_to_text(omni_runner, omni_runner_handler) -> None:
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
-@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+@pytest.mark.parametrize("omni_runner", test_params_thinker, indirect=True)
 def test_video_to_text(omni_runner, omni_runner_handler) -> None:
     """
     Test video understanding with text output.
@@ -145,7 +122,7 @@ def test_video_to_text(omni_runner, omni_runner_handler) -> None:
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
-@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+@pytest.mark.parametrize("omni_runner", test_params_thinker, indirect=True)
 def test_mixed_to_text(omni_runner, omni_runner_handler) -> None:
     """
     Test mixed modality input (image + audio) with text output.
@@ -165,7 +142,7 @@ def test_mixed_to_text(omni_runner, omni_runner_handler) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
-@pytest.mark.parametrize("omni_runner", test_params_tts, indirect=True)
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_text_to_audio(omni_runner, omni_runner_handler) -> None:
     """
     Test text input with audio output via the thinker+talker pipeline.
@@ -181,7 +158,7 @@ def test_text_to_audio(omni_runner, omni_runner_handler) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
-@pytest.mark.parametrize("omni_runner", test_params_tts, indirect=True)
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_image_to_audio(omni_runner, omni_runner_handler) -> None:
     """
     Test image + text input with audio output via the thinker+talker pipeline.

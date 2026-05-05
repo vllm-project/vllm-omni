@@ -3,7 +3,6 @@
 
 import inspect
 import logging
-import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -75,6 +74,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe import HunyuanFusedMoE
+from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -2876,31 +2876,6 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             return (image,)
 
         return HunyuanImage3Text2ImagePipelineOutput(samples=image)
-
-
-def timestep_embedding(t, dim, max_period=10000):
-    """
-    Create sinusoidal timestep embeddings.
-
-    Args:
-        t (torch.Tensor): a 1-D Tensor of N indices, one per batch element. These may be fractional.
-        dim (int): the dimension of the output.
-        max_period (int): controls the minimum frequency of the embeddings.
-
-    Returns:
-        embedding (torch.Tensor): An (N, D) Tensor of positional embeddings.
-
-    .. ref_link: https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-    """
-    half = dim // 2
-    freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
-        device=t.device
-    )
-    args = t[:, None].float() * freqs[None]
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    if dim % 2:
-        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-    return embedding
 
 
 class TimestepEmbedder(nn.Module):

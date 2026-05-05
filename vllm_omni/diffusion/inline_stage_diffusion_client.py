@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from PIL import Image
 from vllm.logger import init_logger
+from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
@@ -328,6 +329,12 @@ class InlineStageDiffusionClient:
             kwargs,
             None,
         )
+
+    def check_health(self) -> None:
+        """Check if the inline diffusion engine and its workers are healthy."""
+        if self._shutting_down:
+            raise EngineDeadError("InlineStageDiffusionClient is shutting down")
+        self._engine.executor.check_health()
 
     def shutdown(self) -> None:
         self._shutting_down = True

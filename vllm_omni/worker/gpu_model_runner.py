@@ -268,6 +268,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.requests.pop(req_id, None)
             self.model_intermediate_buffer.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            if hasattr(self, "_downstream_payload_cache"):
+                self._downstream_payload_cache.pop(req_id, None)
+
         if hasattr(self, "late_interaction_runner"):
             self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
         # Remove the finished requests from the persistent batch.
@@ -1060,6 +1063,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         combined_hidden_states: dict[str, torch.Tensor] | None = None,
         combined_multimodal_outputs: dict[str, object] | None = None,
+        req_ids_filter: set[str] | None = None,
     ) -> None:
         """Process model-provided per-request updates and merge into model_intermediate_buffer."""
         try:
@@ -1067,6 +1071,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             # TODO(Peiqi): do we have a more elegant way to do this?
             if hasattr(self.model, "has_postprocess") and self.model.has_postprocess:
                 for req_index, req_id in enumerate(self.input_batch.req_ids):
+                    if req_ids_filter is not None and req_id not in req_ids_filter:
+                        continue
                     req_infos = self.model_intermediate_buffer.get(req_id, {})
                     if combined_hidden_states:
                         # Combined hidden states contains all hidden states for every request

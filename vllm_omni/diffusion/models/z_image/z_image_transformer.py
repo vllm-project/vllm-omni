@@ -25,7 +25,6 @@ import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -33,6 +32,8 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from vllm_omni.diffusion.layers.norm import RMSNorm
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -50,6 +51,7 @@ from vllm_omni.diffusion.forward_context import (
     is_forward_context_available,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
+from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -236,20 +238,8 @@ class TimestepEmbedder(nn.Module):
 
         self.frequency_embedding_size = frequency_embedding_size
 
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
-        )
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
     def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = timestep_embedding(t, self.frequency_embedding_size)
         weight_dtype = self.mlp[0].bias.dtype
         if weight_dtype.is_floating_point:
             t_freq = t_freq.to(weight_dtype)
