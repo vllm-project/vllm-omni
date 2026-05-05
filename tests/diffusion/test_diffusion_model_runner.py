@@ -245,7 +245,7 @@ def test_vllm_set_forward_context_implementation(monkeypatch):
         "If this test fails, it likely means that vLLM's set_forward_context (vllm/forward_context.py) implementation has changed. "
         "In this case, we should update our forward_context (vllm_omni/diffusion/forward_context.py) as well. "
         "We should at least confirm that the `try: with (<what's inside?>): yield` part does not miss any information "
-        "(typically by calling the same or similar stuff as vLLM)."
+        "(typically by calling the same or similar stuff as vLLM). See #3352 for an example. "
         "Then, update this test to reflect the new implementation, and also update test_set_forward_context_enters_vllm_config_contexts."
     )
 
