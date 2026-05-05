@@ -35,7 +35,7 @@ stage_args:
       top_p: 0.95
       top_k: 1024
       max_tokens: 2048
-      stop_token_ids: [127957, 128026]  # <|endoftext|>, </answer>
+      stop_token_ids: [127957, 128024, 128026]  # <|endoftext|>, </think>, </answer>
       detokenize: True
 
 runtime:
