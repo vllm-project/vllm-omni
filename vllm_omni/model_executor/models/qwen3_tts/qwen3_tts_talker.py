@@ -29,7 +29,7 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.audio import mel_filter_bank
-from vllm_omni.utils.voice_cache import VoiceEmbeddingCache
+from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
@@ -428,8 +428,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._tokenizer = None
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
 
-        # In-memory LRU cache for voice extraction artifacts (Base voice clone).
-        self._voice_cache = VoiceEmbeddingCache()
+        self._speaker_cache = get_speaker_cache()
         raw_subtalker_sampling = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
         self._subtalker_sampling_params: dict[str, Any] = (
             dict(raw_subtalker_sampling) if isinstance(raw_subtalker_sampling, Mapping) else {}
@@ -1364,23 +1363,36 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             in_context_mode = not xvec_only
             voice_clone_prompt = _normalize_voice_clone_prompt(info_dict.get("voice_clone_prompt"))
 
-            # Voice cache: only for uploaded voices (created_at > 0)
-            _voice_cache_key = None
+            # Speaker cache: only for uploaded (named) speakers
+            _speaker_cache_key = None
             if voice_clone_prompt is None:
                 _speaker_list = info_dict.get("speaker")
                 if isinstance(_speaker_list, list) and _speaker_list:
                     _voice_name = str(_speaker_list[0]).lower()
-                    _voice_created_at = float((info_dict.get("voice_created_at") or [0])[0])
-                    if _voice_created_at > 0:
-                        _voice_cache_key = self._voice_cache.make_cache_key(_voice_name, xvec_only, _voice_created_at)
-                    _cached = self._voice_cache.get(_voice_cache_key) if _voice_cache_key is not None else None
+                    # Per-mode namespace — xvec and icl produce different artifacts
+                    # for the same voice, so they must not share a cache slot.
+                    _mode = "xvec" if xvec_only else "icl"
+                    _voice_created_at = int((info_dict.get("voice_created_at") or [0])[0])
+                    _speaker_cache_key = self._speaker_cache.make_cache_key(
+                        _voice_name,
+                        model_type=f"qwen3_tts_{_mode}",
+                        created_at=_voice_created_at,
+                    )
+                    _cached = self._speaker_cache.get(_speaker_cache_key)
                     if _cached is not None:
+                        # Transfer cached tensors to current device
+                        ref_code_cached = _cached.get("ref_code")
+                        ref_spk_embed_cached = _cached.get("ref_spk_embedding")
+                        if isinstance(ref_code_cached, torch.Tensor):
+                            ref_code_cached = ref_code_cached.to(device=input_ids.device)
+                        if isinstance(ref_spk_embed_cached, torch.Tensor):
+                            ref_spk_embed_cached = ref_spk_embed_cached.to(device=input_ids.device)
                         voice_clone_prompt = {
-                            "ref_code": _cached.get("ref_code"),
-                            "ref_spk_embedding": _cached.get("ref_spk_embedding"),
+                            "ref_code": ref_code_cached,
+                            "ref_spk_embedding": ref_spk_embed_cached,
                             "icl_mode": _cached.get("icl_mode"),
                         }
-                        _voice_cache_key = None  # hit -> don't store again
+                        _speaker_cache_key = None  # hit → don't store again
 
             # Official implementation may pass `voice_clone_prompt.icl_mode`.
             if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt:
@@ -1432,9 +1444,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
 
             # Cache miss: store extraction result
-            if _voice_cache_key is not None and speaker_embed is not None:
-                self._voice_cache.put(
-                    _voice_cache_key,
+            if _speaker_cache_key is not None and speaker_embed is not None:
+                self._speaker_cache.put(
+                    _speaker_cache_key,
                     {
                         "ref_code": ref_code_prompt.detach().cpu()
                         if isinstance(ref_code_prompt, torch.Tensor)

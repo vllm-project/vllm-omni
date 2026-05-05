@@ -41,6 +41,7 @@ from vllm_omni.model_executor.models.cosyvoice3.utils import (
     extract_text_token,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
 
@@ -104,6 +105,7 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
             providers=["CPUExecutionProvider"],
         )
         self._cached_model_dir = model_dir
+        self._speaker_cache = get_speaker_cache()
 
     def _call_hf_processor(
         self,
@@ -161,6 +163,28 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
         )
         device = "cpu"
 
+        # Speaker cache: skip 3 ONNX sessions on cache hit
+        voice_name = mm_kwargs.get("voice_name")
+        cache_key = None
+        if voice_name and isinstance(voice_name, str):
+            cache_key = self._speaker_cache.make_cache_key(
+                voice_name,
+                model_type="cosyvoice3",
+                created_at=int(mm_kwargs.get("voice_created_at") or 0),
+            )
+            cached = self._speaker_cache.get(cache_key)
+            if cached is not None:
+                ft = BatchFeature(
+                    {
+                        "input_ids": input_ids,
+                        "speech_feat": cached["speech_feat"].clone(),
+                        "speech_token": cached["speech_token"].clone(),
+                        "speech_token_len": [cached["speech_token_len"].clone()],
+                        "embedding": cached["embedding"].clone(),
+                    }
+                )
+                return ft
+
         speech_token, speech_token_len = extract_speech_token(audio, self.speech_tokenizer, device)
         speech_feat, speech_feat_len = extract_speech_feat(audio, self.feat_extractor, device)
 
@@ -170,6 +194,18 @@ class CosyVoice3MultiModalProcessor(BaseMultiModalProcessor[CosyVoice3MultiModal
             speech_token, speech_token_len[:] = speech_token[:, :token_len], token_len
 
         embedding = extract_spk_embedding(audio, self.campplus_session, device)
+
+        # Cache the extracted artifacts for named speakers
+        if cache_key is not None:
+            self._speaker_cache.put(
+                cache_key,
+                {
+                    "speech_feat": speech_feat.detach().cpu(),
+                    "speech_token": speech_token.detach().cpu(),
+                    "speech_token_len": speech_token_len.detach().cpu(),
+                    "embedding": embedding.detach().cpu(),
+                },
+            )
 
         ft = BatchFeature(
             {
