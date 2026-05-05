@@ -244,7 +244,7 @@ def run_pre_test_cleanup(enable_force: bool = False) -> None:
 
     print("Pre-test GPU status:")
 
-    num_gpus = torch.cuda.device_count()
+    num_gpus = torch.accelerator.device_count()
     if num_gpus > 0:
         try:
             wait_for_gpu_memory_to_clear(

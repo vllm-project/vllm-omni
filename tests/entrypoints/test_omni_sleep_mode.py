@@ -33,7 +33,7 @@ def get_vram_info(device_id: int) -> dict:
     """Obtain a snapshot of the specified GPU's memory (GiB)."""
     try:
         if current_omni_platform.is_rocm():
-            num_gpus = torch.cuda.device_count()
+            num_gpus = torch.accelerator.device_count()
             safe_id = device_id if device_id < num_gpus else 0
             torch.accelerator.synchronize(safe_id)
             return {

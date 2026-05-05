@@ -116,7 +116,7 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
     @classmethod
     def get_device_count(cls) -> int:
-        return torch.cuda.device_count()
+        return torch.accelerator.device_count()
 
     @classmethod
     def get_device_version(cls) -> str | None:

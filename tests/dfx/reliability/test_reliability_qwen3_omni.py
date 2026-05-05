@@ -57,7 +57,7 @@ DEPLOY_CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "vll
 
 def _default_oom_device_spec() -> str:
     """Use currently visible CUDA ordinals to avoid invalid device index in sidecar."""
-    count = torch.cuda.device_count()
+    count = torch.accelerator.device_count()
     if count <= 0:
         return "0"
     return ",".join(str(i) for i in range(count))
