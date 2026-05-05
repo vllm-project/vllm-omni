@@ -44,6 +44,7 @@ def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | 
     system_token_id = 8948
     user_token_id = 872
     assistant_token_id = 77091
+    audio_token_id = 151675
 
     ids = info.get("ids", {})
     thinker_sequences = torch.tensor(ids["all"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
@@ -67,11 +68,15 @@ def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | 
         if role == system_token_id:
             continue
         elif role == user_token_id:
+            # Skip text-only user sections (e.g. tool responses) — they have
+            # no audio tokens and would route entirely through text_projection
+            # in the talker, producing garbled speech.
+            section_ids = input_ids[0, s:e]
+            if not (section_ids == audio_token_id).any().item():
+                continue
             sum_user_len += e - s
         elif role == assistant_token_id and i == len(im_start_indexes) - 2:
             assistant_len += 9  # 3 + 4 + 1 + 1
-        else:
-            pass
 
     return sum_user_len + assistant_len
 
@@ -633,6 +638,13 @@ def talker2code2wav(
     Returns:
         List of OmniTokensPrompt for code2wav stage
     """
+    # Max codec tokens code2wav can process in a single step. This is set by
+    # max_num_batched_tokens in the code2wav stage config. Responses that
+    # produce codec_codes_len > this limit will be silently truncated by
+    # vLLM, causing garbled or cut-off audio. Raise the limit in the YAML
+    # if you hit the warning below.
+    _CODE2WAV_MAX_BATCHED_TOKENS = 65536  # matches stage 2 max_num_batched_tokens
+
     talker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
     code2wav_inputs: list[OmniTokensPrompt] = []
     # Process each talker output
@@ -652,11 +664,19 @@ def talker2code2wav(
         if "codes" not in mm or not isinstance(mm.get("codes"), dict) or "audio" not in mm["codes"]:
             logger.debug("talker2code2wav: skip req=%s due to missing codes.audio", req_id)
             continue
-        # Extract codec codes from talker output
-        # Expected shape: [8, seq_len] (8-layer RVQ codes)
+        # Extract codec codes from talker output: [8, seq_len] RVQ codes → flat list
         codec_codes = (
             mm["codes"]["audio"][-seq_len:].to(torch.long).transpose(0, 1).cpu().to(torch.long).reshape(-1).tolist()
-        )  # 16, seq_len
+        )
+        if len(codec_codes) > _CODE2WAV_MAX_BATCHED_TOKENS * 0.8:
+            logger.warning(
+                "talker2code2wav: codec_codes_len=%d is >80%% of max_num_batched_tokens=%d "
+                "(%.1fs audio). Responses approaching or exceeding the limit will be "
+                "silently truncated, producing garbled or cut-off audio. "
+                "Raise max_num_batched_tokens and max_model_len for the code2wav stage "
+                "in the YAML config if this happens.",
+                len(codec_codes), _CODE2WAV_MAX_BATCHED_TOKENS, seq_len / 75.0,
+            )
         code2wav_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=codec_codes,

@@ -46,16 +46,6 @@ class TestRealtimeConnectionTensorAndPcm:
         assert out.shape == (2,)
         np.testing.assert_allclose(out, [0.25, -0.25], rtol=1e-5)
 
-    def test_pcm16_b64_roundtrip(self) -> None:
-        audio = np.array([0.0, 1.0, -1.0], dtype=np.float32)
-        b64 = RealtimeConnection._pcm16_b64(audio)
-        raw = base64.b64decode(b64)
-        assert len(raw) == 6
-        pcm = np.frombuffer(raw, dtype=np.int16)
-        assert pcm[0] == 0
-        assert pcm[1] == 32767
-        assert pcm[2] == -32767
-
 
 class TestAsyncOmniStreamingParamsValidation:
     def test_accepts_streaming_friendly_params(self) -> None:

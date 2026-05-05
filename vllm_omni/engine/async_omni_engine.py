@@ -965,7 +965,8 @@ class AsyncOmniEngine:
         try:
             loop.run_until_complete(_run_orchestrator())
         except Exception as e:
-            if not startup_future.done():
+            post_startup_crash = startup_future.done()
+            if not post_startup_crash:
                 wrapped = RuntimeError(f"Orchestrator initialization failed: {e}")
                 wrapped.__cause__ = e
                 startup_future.set_exception(wrapped)
@@ -979,6 +980,14 @@ class AsyncOmniEngine:
                     self.rpc_output_queue.sync_q.put_nowait(error_msg)
             except Exception:
                 pass
+            if post_startup_crash:
+                # The orchestrator crashed after a successful startup.  Since
+                # this thread is a daemon, the main process would otherwise
+                # keep running in a silently broken state.  Force a hard exit
+                # with code 1 so the deployment can detect the failure and
+                # restart.
+                logger.error("[AsyncOmniEngine] Orchestrator crashed post-startup; forcing process exit (code 1)")
+                os._exit(1)
             raise
         finally:
             try:

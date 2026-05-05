@@ -4,6 +4,8 @@
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
 import asyncio
+import json
+import re
 from collections.abc import AsyncGenerator, Iterable
 from functools import cached_property
 from typing import Any
@@ -218,6 +220,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         audio_stream: AsyncGenerator[np.ndarray, None],
         input_stream: asyncio.Queue[list[int]],
         model_config: ModelConfig,
+        conversation_context: str | None = None,
+        prior_blocks: str | None = None,
     ) -> AsyncGenerator[PromptType, None]:
         processor = cached_processor_from_config(model_config)
         feature_extractor = processor.feature_extractor
@@ -232,25 +236,163 @@ class Qwen3OmniMoeForConditionalGeneration(
         )
 
         audio_placeholder = Qwen3OmniMoeThinkerForConditionalGeneration.get_placeholder_str("audio", 0)
-        prompt_template = f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n<|im_start|>assistant\n"
 
-        prompt_token_ids = tokenizer.encode(prompt_template)
+        # System + prior history yielded once as a prefix; each audio segment
+        # then yields a self-contained <|im_start|>user\n<audio><|im_end|>
+        # block (so the thinker's MRope position computation sees one audio
+        # segment per user turn); a final <|im_start|>assistant\n chunk opens
+        # the assistant turn exactly once.
+        prefix_parts: list[str] = []
+        if conversation_context:
+            prefix_parts.append(f"<|im_start|>system\n{conversation_context}<|im_end|>\n")
+        if prior_blocks:
+            prefix_parts.append(prior_blocks if prior_blocks.endswith("\n") else prior_blocks + "\n")
+        if prefix_parts:
+            yield TokensPrompt(prompt_token_ids=tokenizer.encode("".join(prefix_parts)))
+
+        per_segment_text = f"<|im_start|>user\n{audio_placeholder}<|im_end|>\n"
+        per_segment_token_ids = tokenizer.encode(per_segment_text)
 
         async for audio_chunk in audio_stream:
             buffer.write_audio(audio_chunk)
-
             while (segment := buffer.read_audio()) is not None:
                 yield TokensPrompt(
-                    prompt_token_ids=prompt_token_ids,
+                    prompt_token_ids=per_segment_token_ids,
                     multi_modal_data={"audio": segment},
                 )
 
         remaining = buffer.flush()
         if remaining is not None and len(remaining) > 0:
             yield TokensPrompt(
-                prompt_token_ids=prompt_token_ids,
+                prompt_token_ids=per_segment_token_ids,
                 multi_modal_data={"audio": remaining},
             )
+
+        yield TokensPrompt(prompt_token_ids=tokenizer.encode("<|im_start|>assistant\n"))
+
+    # ==================== Realtime chat formatting ====================
+    #
+    # Helpers used by RealtimeConnection to keep the generic connection logic
+    # decoupled from Qwen3-Omni's chat-template / special-token surface. All
+    # methods are stateless — pass them via ``self.serving.model_cls``.
+
+    AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
+    TOOL_CALL_OPEN = "<tool_call>"
+    TOOL_CALL_CLOSE = "</tool_call>"
+    # Marker that closes a generated assistant turn — used by the connection
+    # to early-abort transcription once a full turn has been produced.
+    ASSISTANT_TURN_END = "<|im_end|>"
+
+    # Strips any Qwen special token (<|im_start|>, <|audio_*|>, etc.) from
+    # generated text before it's stored in conversation history.
+    _SPECIAL_TOKEN_RE: re.Pattern = re.compile(r"<\|[^|]*\|>")
+
+    @classmethod
+    def strip_special_tokens(cls, text: str) -> str:
+        return cls._SPECIAL_TOKEN_RE.sub("", text).strip()
+
+    @classmethod
+    def format_tools_schema(cls, tools: list[dict]) -> str:
+        """Render the ``# Tools`` block of a Qwen3 chat-template system message."""
+        if not tools:
+            return ""
+        tool_lines = "\n".join(json.dumps(t) for t in tools)
+        return (
+            "# Tools\n\n"
+            "You may call one or more functions to assist with the user query.\n\n"
+            "You are provided with function signatures within <tools></tools> XML tags:\n"
+            f"<tools>\n{tool_lines}\n</tools>\n\n"
+            "For each function call, return a json object with function name and arguments "
+            "within <tool_call></tool_call> XML tags:\n"
+            f"{cls.TOOL_CALL_OPEN}\n"
+            '{\"name\": <function-name>, \"arguments\": <args-json-object>}\n'
+            f"{cls.TOOL_CALL_CLOSE}"
+        )
+
+    @classmethod
+    def parse_tool_call(cls, tool_call_block: str) -> dict | None:
+        """Parse a complete <tool_call>...</tool_call> block to {name, arguments}."""
+        try:
+            inner = tool_call_block.split(cls.TOOL_CALL_OPEN, 1)[1]
+            inner = inner.split(cls.TOOL_CALL_CLOSE)[0].strip()
+            parsed = json.loads(inner)
+            name = parsed.get("name")
+            if not name:
+                return None
+            return {"name": name, "arguments": parsed.get("arguments", {})}
+        except Exception as exc:
+            logger.warning("Failed to parse tool call block: %s", exc)
+            return None
+
+    @classmethod
+    def render_history(cls, items: list[dict]) -> str:
+        """Render conversation items as concatenated <|im_start|>...<|im_end|> blocks.
+
+        Tool messages are rendered as user-role blocks wrapped in
+        <tool_response>...</tool_response>, matching Qwen3's chat template.
+        """
+        blocks: list[str] = []
+        for item in items:
+            role = item.get("role", "")
+            if role == "user":
+                content = item.get("content", "")
+                if content:
+                    blocks.append(f"<|im_start|>user\n{content}<|im_end|>")
+            elif role == "assistant":
+                content = item.get("content", "") or ""
+                tool_calls = item.get("tool_calls") or []
+                clean = cls.strip_special_tokens(content)
+                segments: list[str] = []
+                if clean:
+                    segments.append(clean)
+                for call in tool_calls:
+                    args_obj = call.get("arguments", {})
+                    args_str = (
+                        args_obj if isinstance(args_obj, str) else json.dumps(args_obj)
+                    )
+                    segments.append(
+                        f"{cls.TOOL_CALL_OPEN}\n"
+                        f'{{"name": "{call.get("name")}", "arguments": {args_str}}}\n'
+                        f"{cls.TOOL_CALL_CLOSE}"
+                    )
+                if segments:
+                    body = "\n".join(segments)
+                    blocks.append(f"<|im_start|>assistant\n{body}<|im_end|>")
+            elif role == "tool":
+                content = item.get("content", "") or ""
+                blocks.append(
+                    f"<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>"
+                )
+        return "\n".join(blocks)
+
+    @classmethod
+    def build_audio_pass_prompt(cls, system_body: str | None, history: str) -> str:
+        """Assemble the audio-pass prompt.
+
+        Audio user block is FIRST so the talker's hidden_projection sees
+        purely acoustic states for bootstrap; system/history blocks come
+        after — causal attention shields the audio tokens from them.
+        """
+        parts: list[str] = [f"<|im_start|>user\n{cls.AUDIO_PLACEHOLDER}<|im_end|>"]
+        if system_body:
+            parts.append(f"<|im_start|>system\n{system_body}<|im_end|>")
+        if history:
+            parts.append(history)
+        parts.append("<|im_start|>assistant")
+        return "\n".join(parts) + "\n"
+
+    @classmethod
+    def build_transcription_prompt(cls) -> str:
+        """ASR-mode prompt used by the side-channel STT pass."""
+        return (
+            "<|im_start|>system\n"
+            "You are a transcription assistant. Output ONLY the verbatim text "
+            "of what the user said, with no commentary, no quotes, no labels."
+            "<|im_end|>\n"
+            f"<|im_start|>user\n{cls.AUDIO_PLACEHOLDER}"
+            "Transcribe the audio.<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
 
     # ==================== Device utilities ====================
 
@@ -932,6 +1074,12 @@ class Qwen3OmniMoeForConditionalGeneration(
                 continue
             # Talker takes word embeddings for tokens and hidden state from `accept_hidden_layer` for multimodal inputs
             elif (role_token == self.config.user_token_id).item():
+                # Skip text-only user sections (e.g. tool responses) — they
+                # have no audio tokens, so all positions would route through
+                # text_projection and produce garbled speech.
+                user_mm_mask = multimodal_mask[im_start_index:segment_end_index]
+                if not user_mm_mask.any():
+                    continue
                 talker_user_part = self._get_talker_user_parts(
                     im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed
                 )
