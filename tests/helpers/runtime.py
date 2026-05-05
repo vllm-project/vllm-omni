@@ -235,7 +235,6 @@ class OmniServer:
 
         cmd = [
             sys.executable,
-            "-u",  # unbuffered output so CI outputs real-time log even if startup times out
             "-m",
             "vllm_omni.entrypoints.cli.main",
             "serve",
@@ -254,27 +253,7 @@ class OmniServer:
             cmd,
             env=env,
             cwd=_omni_subprocess_cwd(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
         )
-
-        self.server_log_file_path = "server_startup.log"
-        self.server_log_file_handle = open(self.server_log_file_path, "w", encoding="utf-8")
-
-        def tee_output():
-            try:
-                for line in iter(self.proc.stdout.readline, ""):  # pyright: ignore[reportOptionalMemberAccess]
-                    if line:
-                        print(f"[Server]: {line}", end="", flush=True)
-                        self.server_log_file_handle.write(line)
-                        self.server_log_file_handle.flush()
-            finally:
-                self.server_log_file_handle.close()
-
-        self.output_thread = threading.Thread(target=tee_output, daemon=True)
-        self.output_thread.start()
 
         max_wait = 1200
         start_time = time.time()
@@ -288,9 +267,6 @@ class OmniServer:
                     print(f"Server ready on {self.host}:{self.port}")
                     return
             time.sleep(2)
-        print("Server output")
-        with open("server_startup.log") as reader:
-            print(reader.read())
         raise RuntimeError(f"Server failed to start within {max_wait} seconds")
 
     def _kill_process_tree(self, pid):
