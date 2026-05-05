@@ -53,13 +53,13 @@ stages:
       repetition_penalty: 1.05
 
   - stage_id: 2
+    max_num_batched_tokens: 51200
     max_num_seqs: 64
     gpu_memory_utilization: 0.1
     enforce_eager: true
     trust_remote_code: true
     enable_prefix_caching: false
     async_scheduling: false
-    max_num_batched_tokens: 51200
     devices: "1"
     input_connectors:
       from_stage_1: connector_of_shared_memory
