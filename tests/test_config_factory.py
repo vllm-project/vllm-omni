@@ -842,6 +842,62 @@ class TestDeployConfigLoading:
         assert s0.yaml_engine_args["engine_output_type"] == "latent"
         assert s0.yaml_extras["default_sampling_params"]["detokenize"] is True
 
+    def test_merge_pipeline_deploy_with_pd_separation(self, tmp_path):
+        from pathlib import Path
+
+        import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
+        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+
+        pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe"]
+        base = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
+        if not base.exists():
+            pytest.skip("Deploy config not found")
+
+        overlay = tmp_path / "qwen3_omni_pd.yaml"
+        overlay.write_text(
+            f"base_config: {base}\n"
+            "pd_separation:\n"
+            "  enabled: true\n"
+            "  target_stage_id: 0\n"
+            "  async_chunk: false\n"
+            "  stages:\n"
+            "    - role: prefill\n"
+            "      max_num_seqs: 16\n"
+            "      devices: \"0\"\n"
+            "      engine_extras:\n"
+            "        kv_transfer_config:\n"
+            "          kv_connector: MooncakeConnector\n"
+            "          kv_role: kv_producer\n"
+            "          kv_rank: 0\n"
+            "          kv_parallel_size: 2\n"
+            "    - role: decode\n"
+            "      max_num_seqs: 64\n"
+            "      devices: \"1\"\n"
+            "      engine_extras:\n"
+            "        kv_transfer_config:\n"
+            "          kv_connector: MooncakeConnector\n"
+            "          kv_role: kv_consumer\n"
+            "          kv_rank: 1\n"
+            "          kv_parallel_size: 2\n",
+            encoding="utf-8",
+        )
+
+        deploy = load_deploy_config(overlay)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert len(stages) == 4
+        assert stages[0].yaml_extras["is_prefill_only"] is True
+        assert stages[1].yaml_extras["is_decode_only"] is True
+        assert stages[1].input_sources == [0]
+        assert stages[2].input_sources == [1]
+        assert stages[3].input_sources == [2]
+        assert stages[0].yaml_engine_args.get("async_chunk") is not True
+        assert stages[1].yaml_engine_args.get("custom_process_next_stage_input_func") is None
+        assert stages[0].yaml_engine_args["kv_transfer_config"]["kv_role"] == "kv_producer"
+        assert stages[1].yaml_engine_args["kv_transfer_config"]["kv_role"] == "kv_consumer"
+        assert stages[2].yaml_extras["input_connectors"] == {"from_stage_1": "connector_of_shared_memory"}
+        assert stages[3].yaml_extras["input_connectors"] == {"from_stage_2": "connector_of_shared_memory"}
+
 
 class TestQwen3OmniPipeline:
     def test_registered(self):

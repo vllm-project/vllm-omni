@@ -60,6 +60,36 @@ stages:
       seed: 42
       repetition_penalty: 1.1
 
+pd_separation:
+  enabled: false
+  target_stage_id: 0
+  async_chunk: false
+  stages:
+    - role: prefill
+      max_num_seqs: 16
+      devices: "0"
+      tensor_parallel_size: 1
+      engine_extras:
+        kv_transfer_config:
+          kv_connector: "MooncakeConnector"
+          kv_role: "kv_producer"
+          kv_rank: 0
+          kv_parallel_size: 2
+          kv_connector_extra_config:
+            mooncake_bootstrap_port: 25201
+    - role: decode
+      max_num_seqs: 64
+      devices: "1"
+      tensor_parallel_size: 1
+      engine_extras:
+        kv_transfer_config:
+          kv_connector: "MooncakeConnector"
+          kv_role: "kv_consumer"
+          kv_rank: 1
+          kv_parallel_size: 2
+          kv_connector_extra_config:
+            mooncake_bootstrap_port: 25202
+
 platforms:
   npu:
     stages:

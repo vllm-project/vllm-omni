@@ -6,11 +6,10 @@ import os
 
 import pytest
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks, hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
-from vllm_omni.platforms import current_omni_platform
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
@@ -18,8 +17,6 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
-# Set VLLM_TEST_PD_MODE=1 to test PD disaggregation (follow-up — deploy overlay not yet migrated).
-_USE_PD = os.environ.get("VLLM_TEST_PD_MODE", "0") == "1"
 
 _CI_DEPLOY = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 
@@ -37,36 +34,75 @@ def get_chunk_config(config_path: str | None = None):
     return modify_stage_config(config_path, updates={"async_chunk": True})
 
 
-# Platform-specific overrides live inside the new deploy yaml's ``platforms:``
-# section, so a single ``_CI_DEPLOY`` path serves CUDA, ROCm, and XPU.
-# TODO: re-add VLLM_TEST_PD_MODE branch once the PD-disaggregation deploy
-# overlay has been migrated to the new schema (previously used the deleted
-# ``qwen3_omni_moe_pd_ci.yaml`` stage-configs file).
-if current_omni_platform.is_xpu():
-    stage_configs = [_CI_DEPLOY]
-else:  # CUDA + ROCm MI325 share the same deploy config
-    stage_configs = [get_chunk_config()]
+def get_pd_config(config_path: str | None = None):
+    """Load the qwen3_omni CI deploy yaml with PD disaggregation enabled."""
+    if config_path is None:
+        config_path = _CI_DEPLOY
+    return modify_stage_config(
+        config_path,
+        updates={
+            "pd_disaggregation.enabled": True,
+            "pd_disaggregation.async_chunk": False,
+            "stages": {
+                1: {"devices": "2"},
+                2: {"devices": "2"},
+            },
+        },
+    )
 
-# Create parameter combinations for model and stage config
-test_params = [
-    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
-]
-# For prefix caching, we enable it on the thinker (stage 0) via CLI override
-# and enable prompt token details so that we can determine if any tokens were cached.
-BLOCK_SIZE = 16
+
+def get_prefix_caching_config(config_path: str):
+    """Create a stage config with prefix caching enabled on the thinker (stage 0)."""
+    path = modify_stage_config(
+        config_path,
+        updates={
+            "stage_args": {
+                0: {"engine_args.enable_prefix_caching": True},
+            },
+        },
+    )
+    return path
+
+
+# Cover sync, async-chunk, and PD launch paths by default.
+test_params = (
+    [
+        pytest.param(
+            OmniServerParams(model=model, stage_config_path=_CI_DEPLOY),
+            id="default",
+            marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2),
+        )
+        for model in models
+    ]
+    + [
+        pytest.param(
+            OmniServerParams(model=model, stage_config_path=get_chunk_config()),
+            id="async_chunk",
+            marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2),
+        )
+        for model in models
+    ]
+    + [
+        pytest.param(
+            OmniServerParams(model=model, stage_config_path=get_pd_config()),
+            id="pd_default",
+            marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3),
+        )
+        for model in models
+    ]
+)
+prefix_caching_stage_configs = [get_prefix_caching_config(_CI_DEPLOY)]
+
+# For prefix caching, we need to enable prompt token details so that we
+# can determine if any tokens were cached.
 prefix_test_params = [
     OmniServerParams(
         model=model,
-        stage_config_path=_CI_DEPLOY,
-        server_args=[
-            "--block-size",
-            str(BLOCK_SIZE),
-            "--stage-overrides",
-            '{"0": {"enable_prefix_caching": true}}',
-            "--enable-prompt-tokens-details",
-        ],
+        stage_config_path=stage_config,
+        server_args=["--enable-prompt-tokens-details"],  # Enable prompt tokens details to get cached_tokens
     )
     for model in models
+    for stage_config in prefix_caching_stage_configs
 ]
 
 
@@ -103,8 +139,7 @@ def get_max_batch_size(size_type="few"):
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
-@pytest.mark.skipif(_USE_PD, reason="Temporarily skip PD mode in this test module.")
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3 if _USE_PD else 2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     """
@@ -143,8 +178,7 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
-@pytest.mark.skipif(_USE_PD, reason="Temporarily skip PD mode in this test module.")
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3 if _USE_PD else 2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, openai_client) -> None:
     """
@@ -172,17 +206,15 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", prefix_test_params, indirect=True)
-def test_thinker_prefix_caching(omni_server, openai_client, run_level) -> None:
+def test_thinker_prefix_caching(omni_server, openai_client) -> None:
     """
     Test thinker prefix caching by sending identical requests with an image (i.e.,
     a large shared prefix) and verifying that the second request uses cached tokens
     & produces the same output with greedy decoding.
 
-    NOTE: The reason that we check against logprobs instead of direct text here is that
-    the outputs may still diverge a bit even though we set the seed and temperature.
-    This is mostly because the GEMM algorithm may vary based on the input tensors dims.
-    Because of this, we don't check the logprobs if it's a dummy load, since in that case
-    the top logprobs will all be very close.
+    NOTE: The seed for this test is used as a regression test for the issue linked below;
+    https://github.com/vllm-project/vllm-omni/issues/2833; without passing the sampling
+    params, this test will fail with the current default stage configs.
     """
     seed = 10
     img_res = generate_synthetic_image(224, 224, seed=seed)
@@ -193,41 +225,19 @@ def test_thinker_prefix_caching(omni_server, openai_client, run_level) -> None:
         content_text=get_prompt("text_image"),
     )
 
-    top_k = 10
-    sampling_params = {"seed": seed, "temperature": 0, "max_tokens": 8, "logprobs": top_k}
     request_config = {
         "model": omni_server.model,
         "messages": messages,
         "stream": False,
         "modalities": ["text"],
-        "logprobs": True,
-        "top_logprobs": top_k,
-        "sampling_params_list": [sampling_params] * 3,
+        "sampling_params_list": [{"seed": seed, "temperature": 0, "max_tokens": 16}] * 3,
     }
 
-    uncached_response = openai_client.send_omni_request(request_config, request_num=1)[0]
-    cached_response = openai_client.send_omni_request(request_config, request_num=1)[0]
+    response_1 = openai_client.send_omni_request(request_config, request_num=1)[0]
+    response_2 = openai_client.send_omni_request(request_config, request_num=1)[0]
 
-    # Ensure that we have a prefix cache hit on the second request and that only the last
-    # partial block is uncached (since currently we don't cache partial blocks).
-    num_cached_tokens = cached_response.cached_tokens
-    num_prompt_tokens = cached_response.prompt_tokens
-    assert num_cached_tokens is not None and num_prompt_tokens is not None
-    num_uncached_tokens = num_prompt_tokens % BLOCK_SIZE
-    assert num_cached_tokens > 0
-    assert num_cached_tokens % BLOCK_SIZE == 0
-    assert (num_cached_tokens + num_uncached_tokens) == num_prompt_tokens
-
-    # Ensure that we have logprobs and tokens were generated for both requests
-    assert uncached_response.logprobs is not None
-    assert cached_response.logprobs is not None
-    n_tokens = min(len(uncached_response.logprobs), len(cached_response.logprobs))
-    assert n_tokens > 0
-
-    if run_level == "advanced_model":
-        # For each token index where both responses have an output, ensure that the greedy token
-        # predicted in the uncached case is in the top k logprobs for the cached case
-        for idx in range(n_tokens):
-            greedy_token = uncached_response.logprobs[idx].token
-            cached_top_k = {lp.token for lp in cached_response.logprobs[idx].top_logprobs}
-            assert greedy_token in cached_top_k
+    # We should cache the vast majority of the prompt (image + up to last full block),
+    # and set seed + temperature, so the second request should give an identical
+    # response for the generated input image, even if we use dummy weights
+    assert response_2.cached_tokens is not None and response_2.cached_tokens > 0
+    assert response_1.text_content == response_2.text_content
