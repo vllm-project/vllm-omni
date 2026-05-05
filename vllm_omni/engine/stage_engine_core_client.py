@@ -125,6 +125,7 @@ class StageEngineCoreClientBase:
             self.is_decode_only = metadata.is_decode_only
 
         self.engine_outputs: Any = None
+        self.pd_prefill_multimodal_by_req: dict[str, dict[str, Any]] = {}
         self._proc = proc
         self.client_addresses = dict(client_addresses or {})
         self._omni_kv_config = getattr(getattr(vllm_config, "model_config", None), "omni_kv_config", None)
@@ -357,6 +358,18 @@ class StageEngineCoreClientBase:
     def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None:
         """Set engine outputs (called by orchestrator)."""
         self.engine_outputs = engine_outputs
+
+    def set_pd_prefill_multimodal_output(self, req_id: str, multimodal_output: dict[str, Any] | None) -> None:
+        if multimodal_output is None:
+            self.pd_prefill_multimodal_by_req.pop(req_id, None)
+        else:
+            self.pd_prefill_multimodal_by_req[req_id] = multimodal_output
+
+    def get_pd_prefill_multimodal_output(self, req_id: str) -> dict[str, Any] | None:
+        return self.pd_prefill_multimodal_by_req.get(req_id)
+
+    def clear_pd_prefill_multimodal_output(self, req_id: str) -> None:
+        self.pd_prefill_multimodal_by_req.pop(req_id, None)
 
     def process_engine_inputs(
         self,

@@ -491,6 +491,7 @@ class Orchestrator:
         if finished and stage_id == req_state.final_stage_id:
             # PD: clean up any lingering KV params for this request
             self._pd_kv_params.pop(req_id, None)
+            self._clear_pd_prefill_multimodal_output(req_id)
             self._cfg_tracker.cleanup_parent(req_id)
             self.request_states.pop(req_id, None)
 
@@ -585,13 +586,14 @@ class Orchestrator:
             decode_kv_params["transfer_id"] = f"xfer-{req_id}"
 
         sp.extra_args["kv_transfer_params"] = decode_kv_params
-
-        logger.debug(
-            "[Orchestrator][PD] decode kv_transfer_params for req=%s: %s",
-            req_id,
-            decode_kv_params,
-        )
         return sp
+
+    def _clear_pd_prefill_multimodal_output(self, req_id: str) -> None:
+        if self._pd_pair is None:
+            return
+        clear_fn = getattr(self.stage_clients[self._pd_pair[0]], "clear_pd_prefill_multimodal_output", None)
+        if callable(clear_fn):
+            clear_fn(req_id)
 
     def _build_stage_metrics(
         self,
@@ -728,6 +730,7 @@ class Orchestrator:
                             }
                         )
                         self._pd_kv_params.pop(req_id, None)
+                        self._clear_pd_prefill_multimodal_output(req_id)
                         self._cfg_tracker.cleanup_parent(req_id)
                         self.request_states.pop(req_id, None)
                         return
@@ -758,8 +761,12 @@ class Orchestrator:
 
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
         if self._pd_pair is not None and (stage_id, next_stage_id) == self._pd_pair:
-            # Save prefill stage outputs so thinker2talker can merge embeddings later
-            self.stage_clients[stage_id].set_engine_outputs([output])
+            prefill_mm = None
+            try:
+                prefill_mm = output.outputs[0].multimodal_output
+            except Exception:
+                prefill_mm = None
+            self.stage_clients[stage_id].set_pd_prefill_multimodal_output(req_id, prefill_mm)
 
             params = self._build_pd_decode_params(req_id, params)
 
@@ -1105,6 +1112,7 @@ class Orchestrator:
             # EngineCoreOutput, so we must purge them explicitly.
             self.output_processors[stage_id].abort_requests(all_ids_to_abort, internal=True)
         for req_id in all_ids_to_abort:
+            self._clear_pd_prefill_multimodal_output(req_id)
             self.request_states.pop(req_id, None)
         logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
 
@@ -1220,6 +1228,7 @@ class Orchestrator:
                         "stage_id": self._fatal_error_stage_id,
                     }
                 )
+            self._clear_pd_prefill_multimodal_output(req_id)
             self.request_states.pop(req_id, None)
 
     def _shutdown_stages(self) -> None:
