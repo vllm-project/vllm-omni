@@ -256,7 +256,8 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
     )
     vllm_latency = vllm_latency * 1000
     diffusers_latency = diffusers_latency * 1000
-    latency_threshold = diffusers_latency * 1.2
+    latency_threshold_factor = 0.2
+    latency_threshold = diffusers_latency * (1 + latency_threshold_factor)
     print(f"{model_id} latency metrics:")
     print(
         f"  Latency={vllm_latency:.2f}ms, threshold<={latency_threshold:.2f}ms, diffusers latency={diffusers_latency:.2f}ms, lower is better"
@@ -272,7 +273,7 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
         psnr_threshold=PSNR_THRESHOLD,
     )
     assert vllm_latency <= latency_threshold, (
-        f"VLLM latency ({vllm_latency:.2f}ms) is greater than 20% more than Diffusers latency ({diffusers_latency:.2f}ms)."
+        f"VLLM latency ({vllm_latency:.2f}ms) is greater than {latency_threshold_factor * 100}% more than Diffusers latency ({diffusers_latency:.2f}ms)."
     )
 
 
@@ -297,7 +298,8 @@ def test_diffusers_backend_i2v_matches_diffusers(
         model=model_id, output_path=diffusers_path, conditioning_image=resized_image
     )
     diffusers_latency = diffusers_latency * 1000
-    latency_threshold = diffusers_latency * 1.2
+    latency_threshold_factor = 0.3
+    latency_threshold = diffusers_latency * (1 + latency_threshold_factor)
 
     ssim_output = _run_ffmpeg_similarity("ssim", vllm_path, diffusers_path)
     psnr_output = _run_ffmpeg_similarity("psnr", vllm_path, diffusers_path)
@@ -320,7 +322,7 @@ def test_diffusers_backend_i2v_matches_diffusers(
         f"PSNR below threshold for {model_id}: got {psnr_score:.6f}, expected >= {VIDEO_PSNR_THRESHOLD:.6f}."
     )
     assert vllm_latency <= latency_threshold, (
-        f"VLLM latency ({vllm_latency:.2f}ms) is greater than 20% more than Diffusers latency ({diffusers_latency:.2f}ms)."
+        f"VLLM latency ({vllm_latency:.2f}ms) is greater than {latency_threshold_factor * 100}% more than Diffusers latency ({diffusers_latency:.2f}ms)."
     )
 
 
