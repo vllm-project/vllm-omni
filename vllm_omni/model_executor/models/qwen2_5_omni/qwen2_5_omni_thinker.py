@@ -272,8 +272,6 @@ class Qwen2_5OmniConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMixi
     def _process_video_input(
         self,
         video_input: Qwen2_5_VLVideoInputs,
-        video_hashes: list[str] = None,
-        cached_video_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         if video_input["type"] == "video_embeds":
             return video_input["video_embeds"].type(self.visual.dtype)
@@ -621,11 +619,14 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         # Check for audio-in-video: interleaved video and audio tokens
         # in the multimodal region. Only use the interleaved path when
         # needed; otherwise fall back to the default parent implementation.
+        # vLLM's _gather_mm_embeddings builds is_multimodal on CPU for merge
+        # indexing; bitwise ops with input_ids require the same device.
+        is_mm_device = is_multimodal.to(device=input_ids.device, non_blocking=True)
         video_token_id = self.config.video_token_index
         audio_token_id = self.config.audio_token_index
 
-        is_video = is_multimodal & (input_ids == video_token_id)
-        is_audio = is_multimodal & (input_ids == audio_token_id)
+        is_video = is_mm_device & (input_ids == video_token_id)
+        is_audio = is_mm_device & (input_ids == audio_token_id)
 
         num_video = is_video.sum().item()
         num_audio = is_audio.sum().item()
@@ -641,7 +642,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 multimodal_embeddings,
                 is_video,
                 is_audio,
-                is_multimodal,
+                is_mm_device,
                 num_video,
                 num_audio,
             )

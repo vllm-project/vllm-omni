@@ -204,6 +204,16 @@ class DiffusionEngine:
 
         # Handle single request or multiple requests
         is_audio_output = supports_audio_output(self.od_config.model_class_name)
+        if is_audio_output and model_audio_sample_rate is None:
+            model_cls = DiffusionModelRegistry._try_load_model_cls(self.od_config.model_class_name)
+            model_audio_sample_rate = getattr(model_cls, "audio_sample_rate", None)
+
+        def _audio_mm(payload: Any) -> dict[str, Any]:
+            mm: dict[str, Any] = {"audio": payload}
+            if model_audio_sample_rate is not None:
+                mm["audio_sample_rate"] = model_audio_sample_rate
+            return mm
+
         if len(request.prompts) == 1:
             # Single request: return single OmniRequestOutput
             prompt = request.prompts[0]
@@ -222,7 +232,7 @@ class DiffusionEngine:
                         trajectory_timesteps=output.trajectory_timesteps,
                         trajectory_log_probs=output.trajectory_log_probs,
                         trajectory_decoded=output.trajectory_decoded,
-                        multimodal_output={"audio": request_audio_payload},
+                        multimodal_output=_audio_mm(request_audio_payload),
                         final_output_type="audio",
                         stage_durations=output.stage_durations,
                         peak_memory_mb=output.peak_memory_mb,
@@ -282,7 +292,7 @@ class DiffusionEngine:
                             trajectory_timesteps=output.trajectory_timesteps,
                             trajectory_log_probs=output.trajectory_log_probs,
                             trajectory_decoded=output.trajectory_decoded,
-                            multimodal_output={"audio": request_audio_payload},
+                            multimodal_output=_audio_mm(request_audio_payload),
                             final_output_type="audio",
                             stage_durations=output.stage_durations,
                             peak_memory_mb=output.peak_memory_mb,

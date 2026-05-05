@@ -9,6 +9,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
@@ -17,7 +18,6 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
 )
 
 MODEL_NAME = "Jonathan1909/Ming-flash-omni-2.0"
-DEFAULT_STAGE_CONFIG = "vllm_omni/model_executor/stage_configs/ming_flash_omni_tts.yaml"
 
 
 def get_messages(case: str, text_override: str | None) -> dict[str, Any]:
@@ -71,10 +71,10 @@ def parse_args():
     parser = FlexibleArgumentParser(description="Ming-flash-omni standalone talker offline e2e example")
     parser.add_argument("--model", type=str, default=MODEL_NAME, help="Model name or local path.")
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         type=str,
-        default=DEFAULT_STAGE_CONFIG,
-        help="Path to stage configs yaml for standalone talker deployment.",
+        default="vllm_omni/deploy/ming_flash_omni_tts.yaml",
+        help="Path to a custom deploy YAML for the TTS deployment. ",
     )
     parser.add_argument(
         "--case",
@@ -88,19 +88,15 @@ def parse_args():
     parser.add_argument("--log-stats", action="store_true", default=False, help="Enable stats logging.")
     parser.add_argument("--init-timeout", type=int, default=600, help="Engine init timeout in seconds.")
     parser.add_argument("--stage-init-timeout", type=int, default=300, help="Single stage init timeout in seconds.")
+
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    omni = Omni(
-        model=args.model,
-        stage_configs_path=args.stage_configs_path,
-        log_stats=args.log_stats,
-        init_timeout=args.init_timeout,
-        stage_init_timeout=args.stage_init_timeout,
-    )
+    omni = Omni.from_cli_args(args, model=args.model)
 
     messages = get_messages(args.case, args.text)
     decode_args = {

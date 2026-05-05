@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from omegaconf import OmegaConf
 from pydantic import ValidationError
 from transformers import PretrainedConfig
 from vllm.engine.arg_utils import EngineArgs
@@ -17,6 +18,7 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -251,7 +253,7 @@ def test_voxcpm_model_arch_injects_model_type_override(mocker):
 def test_strip_single_engine_args():
     """_strip_single_engine_args should remove EngineArgs fields but keep omni fields."""
     kwargs = {
-        # Parent EngineArgs fields — should be stripped
+        # Parent EngineArgs fields — stripped unless explicitly allowlisted
         "compilation_config": '{"cudagraph_mode": "FULL_AND_PIECEWISE"}',
         "tensor_parallel_size": 4,
         "gpu_memory_utilization": 0.9,
@@ -269,7 +271,7 @@ def test_strip_single_engine_args():
 
     # Stripped — parent EngineArgs fields
     assert "compilation_config" not in filtered
-    assert "tensor_parallel_size" not in filtered
+    assert filtered["tensor_parallel_size"] == 4
     assert "gpu_memory_utilization" not in filtered
     assert "model" not in filtered
 
@@ -299,15 +301,30 @@ def test_strip_single_engine_args_model_does_not_trigger_warning(mocker):
     mock_warn.assert_not_called()
 
     # When there *are* genuinely surprising overrides alongside model,
-    # the warning should mention them but not model.
+    # the warning should mention them but not model. Keep-listed fields such as
+    # tensor_parallel_size are intentionally passed through and should not warn.
     AsyncOmniEngine._strip_single_engine_args(
         {
             "model": "some/model",
+            "compilation_config": '{"cudagraph_mode": "FULL_AND_PIECEWISE"}',
             "tensor_parallel_size": 4,
             "custom_pipeline_args": {"pipeline_class": "my.Pipeline"},
         }
     )
     mock_warn.assert_called_once()
     warned_args = mock_warn.call_args[0][-1]  # the formatted arg list
-    assert "tensor_parallel_size" in warned_args
+    assert "compilation_config" in warned_args
+    assert "tensor_parallel_size" not in warned_args
     assert "model" not in warned_args
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/3293
+def test_tensor_parallel_size_none_is_handled():
+    """Ensure the tensor parallel size of None isn't forwarded."""
+    engine_args = OmegaConf.create({"stage_id": 0, "engine_args": {"tensor_parallel_size": None}})
+    args = build_engine_args_dict(
+        engine_args,
+        model="snu-aidas/Dynin-Omni",
+    )
+    assert isinstance(args, dict)
+    assert "tensor_parallel_size" not in args
