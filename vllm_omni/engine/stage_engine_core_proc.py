@@ -67,6 +67,11 @@ class StageEngineCoreProc(EngineCoreProc):
             set_process_title(f"StageEngineCoreProc_DP{dp_rank}")
             decorate_logs()
 
+            model_config = vllm_config.model_config
+            from vllm_omni.logger import set_stage_context
+
+            set_stage_context(model_config.stage_id, model_config.model_stage)
+
             # the current vllm-omni does not support data parallelism,
             # so we set the data parallel size to 1.
             # [TODO] support data parallelism in the future.

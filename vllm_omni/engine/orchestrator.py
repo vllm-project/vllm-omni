@@ -675,6 +675,17 @@ class Orchestrator:
         params = req_state.sampling_params_list[next_stage_id]
         next_stage_resumable = is_streaming_session and not is_final_update
 
+        src_stage = getattr(self.stage_clients[stage_id], "model_stage", str(stage_id))
+        dst_stage = getattr(next_client, "model_stage", str(next_stage_id))
+        logger.info(
+            "[Orchestrator] Stage transition: stage %d (%s) -> stage %d (%s) for req=%s",
+            stage_id,
+            src_stage,
+            next_stage_id,
+            dst_stage,
+            req_id,
+        )
+
         if next_client.stage_type == "diffusion":
             self.stage_clients[stage_id].set_engine_outputs([output])
             if next_client.custom_process_input_func is not None:
