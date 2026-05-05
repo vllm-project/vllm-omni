@@ -2914,6 +2914,35 @@ async def omni_wakeup(request: OmniWakeupRequest, raw_request: Request):
     return {"status": "SUCCESS", "acks": [dataclasses.asdict(a) if dataclasses.is_dataclass(a) else a for a in acks]}
 
 
+@router.post("/v1/omni/rpc_lock_stats")
+async def omni_get_rpc_lock_stats(raw_request: Request, request: ProfileRequest | None = None):
+    """Return diffusion RPC lock contention stats for the selected stages.
+
+    Args:
+        request: Optional request body with stages to inspect.
+            - stages: List of diffusion stage IDs to query. If None, queries all
+              stages.
+
+    Example:
+        POST /v1/omni/rpc_lock_stats
+        {"stages": [0]}  # Inspect only stage 0
+    """
+    engine_client = raw_request.app.state.engine_client
+    if not hasattr(engine_client, "get_rpc_lock_stats"):
+        raise HTTPException(status_code=404, detail="rpc_lock_stats is not supported by this engine")
+    try:
+        stages = request.stages if request else None
+        logger.info("Fetching rpc lock stats for stages: %s", stages if stages else "all")
+        result = await engine_client.get_rpc_lock_stats(stages=stages)
+        return JSONResponse(content=result)
+    except Exception as e:
+        logger.exception("Failed to fetch rpc lock stats: %s", e)
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            detail=f"Failed to fetch rpc lock stats: {str(e)}",
+        )
+
+
 if __name__ == "__main__":
     import argparse
     import asyncio

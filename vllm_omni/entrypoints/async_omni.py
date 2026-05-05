@@ -744,6 +744,15 @@ class AsyncOmni(EngineClient, OmniBase):
         """
         return await self.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
 
+    async def get_rpc_lock_stats(self, stages: list[int] | None = None) -> list[Any]:
+        """Return diffusion RPC lock contention stats for selected stages.
+
+        Args:
+            stages: List of diffusion stage IDs to query. If None, queries all
+                stages and returns one snapshot per stage.
+        """
+        return await self.collective_rpc(method="get_rpc_lock_stats", stage_ids=stages)
+
     async def reset_mm_cache(self) -> None:
         """Reset the multi-modal cache for all stages.
 

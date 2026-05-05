@@ -1,5 +1,7 @@
 """Unit tests for OmniBase and AsyncOmni profiler methods."""
 
+from unittest.mock import AsyncMock
+
 import pytest
 from pytest_mock import MockerFixture
 
@@ -7,7 +9,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class TestOmniBaseProfiler:
-    """Test suite for OmniBase profiler methods (start_profile, stop_profile)."""
+    """Test suite for OmniBase profiler methods."""
 
     @pytest.fixture
     def mock_engine(self, mocker: MockerFixture):
@@ -157,6 +159,33 @@ class TestOmniBaseProfiler:
             stage_ids=[],
         )
 
+    def test_get_rpc_lock_stats_calls_collective_rpc(self, omni_base_instance, mock_engine):
+        """Test that get_rpc_lock_stats uses the dedicated control RPC."""
+        omni_base_instance.get_rpc_lock_stats()
+
+        mock_engine.collective_rpc.assert_called_once_with(
+            method="get_rpc_lock_stats",
+            stage_ids=None,
+        )
+
+    def test_get_rpc_lock_stats_with_stages(self, omni_base_instance, mock_engine):
+        """Test that get_rpc_lock_stats passes stages through unchanged."""
+        omni_base_instance.get_rpc_lock_stats(stages=[1])
+
+        mock_engine.collective_rpc.assert_called_once_with(
+            method="get_rpc_lock_stats",
+            stage_ids=[1],
+        )
+
+    def test_get_rpc_lock_stats_returns_rpc_result(self, omni_base_instance, mock_engine):
+        """Test that get_rpc_lock_stats returns the result from collective_rpc."""
+        expected_result = [{"count": 3, "total_wait_ms": 1.5, "mean_wait_ms": 0.5, "max_wait_ms": 1.0}]
+        mock_engine.collective_rpc.return_value = expected_result
+
+        result = omni_base_instance.get_rpc_lock_stats()
+
+        assert result == expected_result
+
 
 class TestOmniBaseProfilerSignatureConsistency:
     """Test that profiler methods have consistent signatures with vLLM."""
@@ -188,6 +217,18 @@ class TestOmniBaseProfilerSignatureConsistency:
         assert "self" in params
         assert "stages" in params
 
+    def test_get_rpc_lock_stats_signature(self):
+        """Verify get_rpc_lock_stats has the expected signature parameters."""
+        import inspect
+
+        from vllm_omni.entrypoints.omni_base import OmniBase
+
+        sig = inspect.signature(OmniBase.get_rpc_lock_stats)
+        params = list(sig.parameters.keys())
+
+        assert "self" in params
+        assert "stages" in params
+
     def test_start_profile_default_values(self):
         """Verify start_profile has correct default parameter values."""
         import inspect
@@ -210,6 +251,16 @@ class TestOmniBaseProfilerSignatureConsistency:
         sig = inspect.signature(OmniBase.stop_profile)
 
         # stages should default to None
+        assert sig.parameters["stages"].default is None
+
+    def test_get_rpc_lock_stats_default_values(self):
+        """Verify get_rpc_lock_stats has correct default parameter values."""
+        import inspect
+
+        from vllm_omni.entrypoints.omni_base import OmniBase
+
+        sig = inspect.signature(OmniBase.get_rpc_lock_stats)
+
         assert sig.parameters["stages"].default is None
 
 
@@ -243,6 +294,18 @@ class TestAsyncOmniProfilerSignatureConsistency:
         assert "self" in params
         assert "stages" in params
 
+    def test_async_get_rpc_lock_stats_signature(self):
+        """Verify AsyncOmni.get_rpc_lock_stats has the expected signature parameters."""
+        import inspect
+
+        from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+        sig = inspect.signature(AsyncOmni.get_rpc_lock_stats)
+        params = list(sig.parameters.keys())
+
+        assert "self" in params
+        assert "stages" in params
+
     def test_async_start_profile_is_coroutine(self):
         """Verify AsyncOmni.start_profile is an async method."""
         import inspect
@@ -258,3 +321,25 @@ class TestAsyncOmniProfilerSignatureConsistency:
         from vllm_omni.entrypoints.async_omni import AsyncOmni
 
         assert inspect.iscoroutinefunction(AsyncOmni.stop_profile)
+
+    def test_async_get_rpc_lock_stats_is_coroutine(self):
+        """Verify AsyncOmni.get_rpc_lock_stats is an async method."""
+        import inspect
+
+        from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+        assert inspect.iscoroutinefunction(AsyncOmni.get_rpc_lock_stats)
+
+
+class TestAsyncOmniRpcLockStats:
+    @pytest.mark.asyncio
+    async def test_get_rpc_lock_stats_calls_collective_rpc(self):
+        from vllm_omni.entrypoints.async_omni import AsyncOmni
+
+        app = object.__new__(AsyncOmni)
+        app.collective_rpc = AsyncMock(return_value=[{"count": 1}])
+
+        result = await app.get_rpc_lock_stats(stages=[0])
+
+        app.collective_rpc.assert_awaited_once_with(method="get_rpc_lock_stats", stage_ids=[0])
+        assert result == [{"count": 1}]

@@ -504,6 +504,20 @@ class OmniBase(PDDisaggregationMixin):
         """
         return self.engine.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
 
+    def get_rpc_lock_stats(self, stages: list[int] | None = None) -> list[Any]:
+        """Return diffusion RPC lock contention stats for selected stages.
+
+        Args:
+            stages: List of diffusion stage IDs to query. If None, queries all
+                stages and returns one snapshot per stage.
+
+        Returns:
+            List of per-stage stats dicts from ``DiffusionEngine.get_rpc_lock_stats()``.
+            Non-diffusion stages may return TODO-style placeholders until they
+            implement this control RPC.
+        """
+        return self.engine.collective_rpc(method="get_rpc_lock_stats", stage_ids=stages)
+
     def _shutdown_base(self) -> None:
         if getattr(self, "_shutdown_called", False):
             return

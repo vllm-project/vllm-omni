@@ -16,7 +16,11 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 def _make_engine() -> DiffusionEngine:
