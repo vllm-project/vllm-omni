@@ -40,10 +40,12 @@ KV_RANK_PORT_STRIDE = 16
 # The orchestrator-level path (``create_connectors_from_config`` below)
 # has its own Mooncake-specific port adjustment for PD disaggregation
 # and is intentionally independent of this set.
-_ROLE_BOUND_ZMQ_CONNECTORS = frozenset({
-    "MoriTransferEngineConnector",
-    "MooncakeTransferEngineConnector",
-})
+_ROLE_BOUND_ZMQ_CONNECTORS = frozenset(
+    {
+        "MoriTransferEngineConnector",
+        "MooncakeTransferEngineConnector",
+    }
+)
 
 
 def _detect_local_ip() -> str:
@@ -292,14 +294,10 @@ def get_connectors_config_for_stage(transfer_config: OmniTransferConfig | None, 
     target_stage = str(stage_id)
 
     incoming_edges: list[tuple[str, ConnectorSpec]] = [
-        (from_s, spec)
-        for (from_s, to_s), spec in transfer_config.connectors.items()
-        if to_s == target_stage
+        (from_s, spec) for (from_s, to_s), spec in transfer_config.connectors.items() if to_s == target_stage
     ]
     outgoing_edges: list[tuple[str, ConnectorSpec]] = [
-        (to_s, spec)
-        for (from_s, to_s), spec in transfer_config.connectors.items()
-        if from_s == target_stage
+        (to_s, spec) for (from_s, to_s), spec in transfer_config.connectors.items() if from_s == target_stage
     ]
 
     if not incoming_edges and not outgoing_edges:

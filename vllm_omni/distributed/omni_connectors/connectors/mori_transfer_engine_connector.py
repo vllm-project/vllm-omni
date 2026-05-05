@@ -336,8 +336,7 @@ class MoriTransferEngineConnector(OmniConnectorBase):
         role = str(config.get("role", "sender")).lower()
         if role not in {"sender", "receiver", "dual"}:
             raise ValueError(
-                f"Invalid role={role!r} for MoriTransferEngineConnector. "
-                "Expected 'sender', 'receiver', or 'dual'."
+                f"Invalid role={role!r} for MoriTransferEngineConnector. Expected 'sender', 'receiver', or 'dual'."
             )
         self.role = role
         self.can_put = role in ("sender", "dual")
