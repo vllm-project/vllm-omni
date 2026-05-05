@@ -630,6 +630,24 @@ async def omni_init_app_state(
         state.openai_streaming_speech = None
         state.openai_streaming_video = None
 
+        # Register realtime video handler only if the model supports it
+        try:
+            is_supported = await engine_client.collective_rpc(method="realtime_is_supported")
+            # Unwrap nested list layers from collective_rpc
+            while isinstance(is_supported, list) and len(is_supported) == 1:
+                is_supported = is_supported[0]
+        except Exception:
+            is_supported = False
+
+        if is_supported:
+            from vllm_omni.entrypoints.openai.serving_realtime_video import (
+                RealtimeVideoHandler,
+            )
+
+            state.realtime_video_handler = RealtimeVideoHandler(engine_client)
+        else:
+            state.realtime_video_handler = None
+
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
         logger.info("Pure diffusion API server initialized for model: %s", model_name)
@@ -1398,6 +1416,30 @@ async def realtime_websocket(websocket: WebSocket):
         return
     connection = RealtimeConnection(websocket, serving)
     await connection.handle_connection()
+
+
+@router.websocket("/v1/realtime_video/generate")
+async def realtime_video_generate(websocket: WebSocket):
+    """WebSocket endpoint for realtime video streaming (T2V + V2V).
+
+    Uses MessagePack protocol. See serving_realtime_video.py for details.
+    """
+    handler = getattr(websocket.app.state, "realtime_video_handler", None)
+    if handler is None:
+        await websocket.accept()
+        try:
+            from msgpack import packb as _packb
+
+            await websocket.send_bytes(
+                _packb({"type": "error", "content": "Realtime video is not available"}, use_bin_type=True)
+            )
+        except ImportError:
+            import json
+
+            await websocket.send_text(json.dumps({"type": "error", "content": "Realtime video is not available"}))
+        await websocket.close()
+        return
+    await handler.handle_session(websocket)
 
 
 # Health and Model endpoints for diffusion mode

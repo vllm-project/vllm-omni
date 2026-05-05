@@ -117,40 +117,53 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     return {}
 
 
-def create_transformer_from_config(config: dict) -> WanTransformer3DModel:
-    """Create WanTransformer3DModel from config dict."""
-    kwargs = {}
+def _is_causal_config(config: dict) -> bool:
+    """Detect if config describes a causal WanVideo model."""
+    cls_name = config.get("_class_name", "")
+    if "Causal" in cls_name or "causal" in cls_name.lower():
+        return True
+    return config.get("causal", False) or "local_attn_size" in config or "num_frame_per_block" in config
 
+
+def _extract_common_kwargs(config: dict) -> dict:
+    """Extract kwargs shared by both standard and causal transformers."""
+    kwargs = {}
+    _COMMON_KEYS = [
+        "num_attention_heads",
+        "attention_head_dim",
+        "in_channels",
+        "out_channels",
+        "text_dim",
+        "freq_dim",
+        "ffn_dim",
+        "num_layers",
+        "cross_attn_norm",
+        "eps",
+        "image_dim",
+        "added_kv_proj_dim",
+        "rope_max_seq_len",
+        "pos_embed_seq_len",
+    ]
+    for key in _COMMON_KEYS:
+        if key in config:
+            kwargs[key] = config[key]
     if "patch_size" in config:
         kwargs["patch_size"] = tuple(config["patch_size"])
-    if "num_attention_heads" in config:
-        kwargs["num_attention_heads"] = config["num_attention_heads"]
-    if "attention_head_dim" in config:
-        kwargs["attention_head_dim"] = config["attention_head_dim"]
-    if "in_channels" in config:
-        kwargs["in_channels"] = config["in_channels"]
-    if "out_channels" in config:
-        kwargs["out_channels"] = config["out_channels"]
-    if "text_dim" in config:
-        kwargs["text_dim"] = config["text_dim"]
-    if "freq_dim" in config:
-        kwargs["freq_dim"] = config["freq_dim"]
-    if "ffn_dim" in config:
-        kwargs["ffn_dim"] = config["ffn_dim"]
-    if "num_layers" in config:
-        kwargs["num_layers"] = config["num_layers"]
-    if "cross_attn_norm" in config:
-        kwargs["cross_attn_norm"] = config["cross_attn_norm"]
-    if "eps" in config:
-        kwargs["eps"] = config["eps"]
-    if "image_dim" in config:
-        kwargs["image_dim"] = config["image_dim"]
-    if "added_kv_proj_dim" in config:
-        kwargs["added_kv_proj_dim"] = config["added_kv_proj_dim"]
-    if "rope_max_seq_len" in config:
-        kwargs["rope_max_seq_len"] = config["rope_max_seq_len"]
-    if "pos_embed_seq_len" in config:
-        kwargs["pos_embed_seq_len"] = config["pos_embed_seq_len"]
+    return kwargs
+
+
+def create_transformer_from_config(config: dict) -> WanTransformer3DModel:
+    """Create WanTransformer3DModel (or CausalWanTransformer3DModel) from config dict."""
+    kwargs = _extract_common_kwargs(config)
+
+    if _is_causal_config(config):
+        from vllm_omni.diffusion.models.wan2_2.causal_wan2_2_transformer import CausalWanTransformer3DModel
+
+        _CAUSAL_KEYS = ["local_attn_size", "sink_size", "num_frame_per_block"]
+        for key in _CAUSAL_KEYS:
+            if key in config:
+                kwargs[key] = config[key]
+        return CausalWanTransformer3DModel(**kwargs)
 
     return WanTransformer3DModel(**kwargs)
 

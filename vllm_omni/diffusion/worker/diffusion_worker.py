@@ -299,6 +299,310 @@ class DiffusionWorker:
     def pin_lora(self, adapter_id: int) -> bool:
         return self.lora_manager.pin_adapter(adapter_id)
 
+    # ==================== Realtime Video ====================
+
+    def realtime_is_supported(self) -> bool:
+        """Check if the loaded pipeline supports realtime video generation."""
+        pipeline = self.model_runner.pipeline
+        if pipeline is None or not hasattr(pipeline, "transformer"):
+            return False
+        from vllm_omni.diffusion.models.wan2_2.causal_wan2_2_transformer import (
+            CausalWanTransformer3DModel,
+        )
+
+        return isinstance(pipeline.transformer, CausalWanTransformer3DModel)
+
+    def realtime_create_session(self, session_id: str, config: dict) -> bool:
+        """Create a realtime video pipeline + session on this worker."""
+        if not hasattr(self, "_realtime_sessions"):
+            self._realtime_sessions: dict[str, tuple] = {}
+
+        if session_id in self._realtime_sessions:
+            return True
+
+        pipeline = self.model_runner.pipeline
+        if pipeline is None:
+            raise RuntimeError("No pipeline loaded on worker")
+
+        from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_realtime import (
+            RealtimeSession,
+            Wan22RealtimePipeline,
+        )
+
+        rt_pipeline = Wan22RealtimePipeline(
+            transformer=pipeline.transformer,
+            vae=pipeline.vae,
+            tokenizer=pipeline.tokenizer,
+            text_encoder=pipeline.text_encoder,
+            num_frames_per_block=config.get("num_frames_per_block", 3),
+            kv_cache_num_frames=config.get("kv_cache_num_frames", 3),
+            vae_dtype=torch.float32,
+            transformer_dtype=next(pipeline.transformer.parameters()).dtype,
+        )
+        session = RealtimeSession(
+            v2v_strength=config.get("v2v_strength"),
+        )
+        seed = config.get("seed", 42)
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        self._realtime_sessions[session_id] = (rt_pipeline, session, generator)
+        if not hasattr(self, "_realtime_session_config"):
+            self._realtime_session_config: dict[str, dict] = {}
+        self._realtime_session_config[session_id] = {
+            "frame_format": config.get("frame_format", "jpeg"),
+            "frame_quality": config.get("frame_quality", 95),
+        }
+        logger.info("Worker %d: Created realtime session %s", self.rank, session_id)
+        return True
+
+    @torch.no_grad()
+    def realtime_generate_block(
+        self,
+        session_id: str,
+        prompt: str,
+        height: int = 480,
+        width: int = 832,
+        num_inference_steps: int | None = None,
+        video_frames_bytes: list[bytes] | None = None,
+    ) -> list[bytes]:
+        """Generate one video block with VAE-denoise overlap.
+
+        Block 0 runs synchronously for fast initial output.
+        Block 1 seeds the pipeline (denoise + async VAE, returns []).
+        Block 2+ pipelines: collect VAE(N-1) while denoise(N) runs.
+        """
+        if not hasattr(self, "_realtime_sessions"):
+            raise RuntimeError(f"No realtime sessions; session {session_id} not found")
+        if session_id not in self._realtime_sessions:
+            raise RuntimeError(f"Realtime session {session_id} not found")
+
+        rt_pipeline, session, generator = self._realtime_sessions[session_id]
+
+        input_frames = None
+        if video_frames_bytes:
+            import io as _io
+
+            from PIL import Image
+
+            input_frames = [Image.open(_io.BytesIO(b)).convert("RGB") for b in video_frames_bytes]
+
+        block_idx = session.block_idx
+        is_first_block = block_idx == 0
+
+        profiler = self._get_profiler()
+
+        with (
+            set_forward_context(
+                vllm_config=self.vllm_config,
+                omni_diffusion_config=self.od_config,
+            ),
+            set_current_vllm_config(self.vllm_config),
+        ):
+            if is_first_block:
+                ctx = profiler.annotate_context_manager("rt_generate_block") if profiler else nullcontext()
+                with ctx:
+                    video_np = rt_pipeline.generate_block(
+                        session=session,
+                        prompt=prompt,
+                        height=height,
+                        width=width,
+                        num_inference_steps=num_inference_steps,
+                        input_video_frames=input_frames,
+                        generator=generator,
+                    )
+                if profiler:
+                    profiler.step()
+                if self.rank == 0:
+                    cfg = self._get_session_encode_config(session_id)
+                    return self._encode_all_frames(video_np, **cfg)
+                return []
+
+            self._sync_and_start_encode(session_id, rt_pipeline)
+
+            ctx = profiler.annotate_context_manager("rt_denoise_block") if profiler else nullcontext()
+            with ctx:
+                latents = rt_pipeline.denoise_block(
+                    session=session,
+                    prompt=prompt,
+                    height=height,
+                    width=width,
+                    num_inference_steps=num_inference_steps,
+                    input_video_frames=input_frames,
+                    generator=generator,
+                )
+            if profiler:
+                profiler.step()
+
+            self._launch_async_vae(session_id, rt_pipeline, session, block_idx, latents)
+
+            return self._collect_encoded_frames(session_id)
+
+    def _get_session_encode_config(self, session_id: str) -> dict:
+        if hasattr(self, "_realtime_session_config"):
+            cfg = self._realtime_session_config.get(session_id, {})
+            return {
+                "fmt": cfg.get("frame_format", "jpeg"),
+                "quality": cfg.get("frame_quality", 95),
+            }
+        return {}
+
+    def _sync_and_start_encode(self, session_id: str, rt_pipeline) -> None:
+        """Sync VAE stream and submit CPU encode work to a background thread.
+
+        Must be called before denoise_block so that session state written
+        by decode_block on the VAE stream is visible. The heavy CPU work
+        (postprocess + image encode) runs in a thread that overlaps with
+        the subsequent GPU denoise.
+        """
+        if not hasattr(self, "_pending_vae_decode"):
+            return
+        pending = self._pending_vae_decode.pop(session_id, None)
+        if pending is None:
+            return
+
+        pending["stream"].synchronize()
+
+        if self.rank == 0:
+            video_tensor_cpu = pending["video_tensor"].cpu()
+
+            if not hasattr(self, "_encode_executor"):
+                from concurrent.futures import ThreadPoolExecutor
+
+                self._encode_executor = ThreadPoolExecutor(max_workers=1)
+            if not hasattr(self, "_pending_png_future"):
+                self._pending_png_future: dict = {}
+
+            self._pending_png_future[session_id] = self._encode_executor.submit(
+                self._postprocess_and_encode,
+                rt_pipeline,
+                video_tensor_cpu,
+                self._get_session_encode_config(session_id),
+            )
+
+    def _collect_encoded_frames(self, session_id: str) -> list[bytes]:
+        """Collect encoded bytes from the background encode thread."""
+        if not hasattr(self, "_pending_png_future"):
+            return []
+        future = self._pending_png_future.pop(session_id, None)
+        if future is None:
+            return []
+        return future.result()
+
+    @staticmethod
+    def _postprocess_and_encode(rt_pipeline, video_tensor_cpu, encode_cfg: dict | None = None) -> list[bytes]:
+        video_np = rt_pipeline.postprocess_decoded(video_tensor_cpu)
+        return DiffusionWorker._encode_all_frames(video_np, **(encode_cfg or {}))
+
+    def _launch_async_vae(
+        self,
+        session_id: str,
+        rt_pipeline,
+        session,
+        block_idx: int,
+        latents: torch.Tensor,
+    ) -> None:
+        """Launch VAE decode on a separate CUDA stream (non-blocking)."""
+        if not hasattr(self, "_pending_vae_decode"):
+            self._pending_vae_decode: dict[str, dict] = {}
+        if not hasattr(self, "_vae_streams"):
+            self._vae_streams: dict[str, torch.cuda.Stream] = {}
+
+        vae_stream = self._vae_streams.get(session_id)
+        if vae_stream is None:
+            vae_stream = torch.cuda.Stream()
+            self._vae_streams[session_id] = vae_stream
+
+        # Ensure denoise results on default stream are visible to vae_stream
+        vae_stream.wait_stream(torch.cuda.current_stream())
+
+        profiler = self._get_profiler()
+        with torch.cuda.stream(vae_stream):
+            ctx = profiler.annotate_context_manager("rt_vae_decode") if profiler else nullcontext()
+            with ctx:
+                video_tensor = rt_pipeline.decode_block(session, block_idx, latents)
+
+        self._pending_vae_decode[session_id] = {
+            "stream": vae_stream,
+            "video_tensor": video_tensor,
+        }
+
+    def realtime_flush_decode(self, session_id: str) -> list[bytes]:
+        """Flush pending VAE decode and return last block's frames."""
+        frames = self._collect_encoded_frames(session_id)
+        if not hasattr(self, "_realtime_sessions"):
+            return frames
+        entry = self._realtime_sessions.get(session_id)
+        if entry is None:
+            return frames
+        if not hasattr(self, "_pending_vae_decode"):
+            return frames
+        pending = self._pending_vae_decode.pop(session_id, None)
+        if pending is None:
+            return frames
+
+        profiler = self._get_profiler()
+        ctx = profiler.annotate_context_manager("rt_vae_decode") if profiler else nullcontext()
+        with ctx:
+            pending["stream"].synchronize()
+            if self.rank == 0:
+                rt_pipeline = entry[0]
+                video_np = rt_pipeline.postprocess_decoded(pending["video_tensor"])
+                cfg = self._get_session_encode_config(session_id)
+                frames.extend(self._encode_all_frames(video_np, **cfg))
+        if profiler:
+            profiler.step()
+        return frames
+
+    def realtime_dispose_session(self, session_id: str) -> bool:
+        """Dispose a realtime session and free GPU resources."""
+        if not hasattr(self, "_realtime_sessions"):
+            return True
+        # Flush any pending async VAE decode
+        self.realtime_flush_decode(session_id)
+        if hasattr(self, "_vae_streams"):
+            self._vae_streams.pop(session_id, None)
+        if hasattr(self, "_realtime_session_config"):
+            self._realtime_session_config.pop(session_id, None)
+        entry = self._realtime_sessions.pop(session_id, None)
+        if entry is not None:
+            _, session, _ = entry
+            session.dispose()
+            logger.info(
+                "Worker %d: Disposed realtime session %s",
+                self.rank,
+                session_id,
+            )
+        return True
+
+    @staticmethod
+    def _encode_all_frames(video_np, fmt: str = "jpeg", quality: int = 95) -> list[bytes]:
+        """Encode all video frames to a list of image bytes."""
+        import io as _io
+
+        import numpy as np
+        from PIL import Image
+
+        if video_np.ndim == 5:
+            video_np = video_np[0]
+        if video_np.ndim == 3:
+            video_np = video_np[np.newaxis]
+
+        fmt_upper = fmt.upper()
+        if fmt_upper == "JPG":
+            fmt_upper = "JPEG"
+        save_kwargs: dict = {"format": fmt_upper}
+        if fmt_upper == "JPEG":
+            save_kwargs["quality"] = quality
+
+        result = []
+        for frame in video_np:
+            if frame.dtype in (np.float32, np.float64):
+                frame = (frame * 255).clip(0, 255).astype(np.uint8)
+            img = Image.fromarray(frame)
+            buf = _io.BytesIO()
+            img.save(buf, **save_kwargs)
+            result.append(buf.getvalue())
+        return result
+
     def sleep(self, level: int = 1) -> bool:
         """
         Put the worker to sleep, offloading model weights.
@@ -518,7 +822,7 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         gpu_id: int,
         broadcast_handle,
-        wake_event: mp.Event,
+        wake_event: mp.Event = None,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
     ):
@@ -684,7 +988,7 @@ class WorkerProc:
         od_config: OmniDiffusionConfig,
         pipe_writer: mp.connection.Connection,
         broadcast_handle,
-        wake_event: mp.Event,
+        wake_event: mp.Event = None,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
     ) -> None:

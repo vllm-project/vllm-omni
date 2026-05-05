@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from .causal_wan2_2_transformer import CausalWanTransformer3DModel
+from .kv_cache import CrossAttentionKVCache, KVCacheManager, SelfAttentionKVCache
 from .patch_diffusers import patch_wan_rms_norm
 from .pipeline_wan2_2 import (
     Wan22Pipeline,
@@ -16,6 +18,11 @@ from .pipeline_wan2_2_i2v import (
     WanI2VDMD2Pipeline,
     get_wan22_i2v_post_process_func,
     get_wan22_i2v_pre_process_func,
+)
+from .pipeline_wan2_2_realtime import (
+    RealtimeSession,
+    RealtimeVideoMode,
+    Wan22RealtimePipeline,
 )
 from .pipeline_wan2_2_ti2v import (
     Wan22TI2VPipeline,
@@ -48,9 +55,16 @@ __all__ = [
     "Wan22VACEPipeline",
     "get_wan22_vace_post_process_func",
     "get_wan22_vace_pre_process_func",
+    "CausalWanTransformer3DModel",
     "WanTransformer3DModel",
     "VaceWanTransformerBlock",
     "WanVACETransformer3DModel",
+    "KVCacheManager",
+    "SelfAttentionKVCache",
+    "CrossAttentionKVCache",
+    "RealtimeSession",
+    "RealtimeVideoMode",
+    "Wan22RealtimePipeline",
 ]
 
 patch_wan_rms_norm()
