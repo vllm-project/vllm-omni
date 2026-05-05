@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from vllm_omni.config.stage_config import (
-    _EXECUTION_TYPE_TO_SCHEDULER,
     _PIPELINE_REGISTRY,
     ModelPipeline,
     PipelineConfig,
@@ -20,6 +19,7 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
     StageType,
+    _resolve_scheduler,
     build_stage_runtime_overrides,
     register_pipeline,
     strip_parent_engine_args,
@@ -768,25 +768,29 @@ class TestPipelineConfigNew:
         p = PipelineConfig(model_type="t", model_arch="A")
         assert any("no stages" in e.lower() for e in p.validate())
 
-    def test_get_scheduler_cls(self):
-        p = PipelineConfig(
-            model_type="t",
-            model_arch="A",
-            stages=(
-                StagePipelineConfig(stage_id=0, model_stage="a", execution_type=StageExecutionType.LLM_AR),
-                StagePipelineConfig(
-                    stage_id=1, model_stage="b", execution_type=StageExecutionType.LLM_GENERATION, input_sources=(0,)
-                ),
-            ),
-        )
-        assert "OmniARScheduler" in p.get_scheduler_cls(0)
-        assert "OmniGenerationScheduler" in p.get_scheduler_cls(1)
 
-
-class TestExecutionTypeToScheduler:
-    def test_all_types_mapped(self):
+class TestResolveScheduler:
+    def test_all_execution_types_handled(self):
         for et in StageExecutionType:
-            assert et in _EXECUTION_TYPE_TO_SCHEDULER
+            _resolve_scheduler(et)
+
+    def test_ar_sync_when_false(self):
+        cls = _resolve_scheduler(StageExecutionType.LLM_AR, async_scheduling=False)
+        assert cls is not None
+        assert "Async" not in cls.__name__
+
+    def test_ar_async_when_true(self):
+        cls = _resolve_scheduler(StageExecutionType.LLM_AR, async_scheduling=True)
+        assert cls is not None
+        assert "Async" in cls.__name__
+
+    def test_generation(self):
+        cls = _resolve_scheduler(StageExecutionType.LLM_GENERATION)
+        assert cls is not None
+        assert "Generation" in cls.__name__
+
+    def test_diffusion_returns_none(self):
+        assert _resolve_scheduler(StageExecutionType.DIFFUSION) is None
 
 
 class TestPipelineRegistry:

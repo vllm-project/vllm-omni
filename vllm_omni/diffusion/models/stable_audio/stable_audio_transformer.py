@@ -5,7 +5,6 @@
 Stable Audio DiT Model for vLLM-Omni.
 """
 
-import math
 from collections.abc import Iterable
 
 import torch
@@ -18,6 +17,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
+from vllm_omni.diffusion.layers.fourier import GaussianFourierProjection
 
 logger = init_logger(__name__)
 
@@ -56,7 +56,7 @@ def apply_rotary_emb_stable_audio(
     return torch.cat([x_rot, x_pass], dim=-1)
 
 
-class StableAudioGaussianFourierProjection(nn.Module):
+class StableAudioGaussianFourierProjection(GaussianFourierProjection):
     """Gaussian Fourier embeddings for noise levels.
 
     Matches diffusers StableAudioGaussianFourierProjection with:
@@ -65,15 +65,12 @@ class StableAudioGaussianFourierProjection(nn.Module):
     """
 
     def __init__(self, embedding_size: int = 256, scale: float = 1.0):
-        super().__init__()
-        self.weight = nn.Parameter(torch.randn(embedding_size) * scale, requires_grad=False)
+        super().__init__(in_features=1, embedding_size=embedding_size, scale=scale, trainable=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: [batch] or [batch, 1]
-        # Output: [batch, embedding_size * 2]
-        x_proj = 2 * math.pi * x[:, None] @ self.weight[None, :]
-        # flip_sin_to_cos=True means cos comes first
-        return torch.cat([torch.cos(x_proj), torch.sin(x_proj)], dim=-1)
+        # Output: [batch, embedding_size * 2], with cos first.
+        return super().forward(x)
 
 
 class StableAudioSelfAttention(nn.Module):

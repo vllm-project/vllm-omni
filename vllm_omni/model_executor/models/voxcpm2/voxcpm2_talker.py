@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, override_forward_context
+from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -121,7 +122,9 @@ def build_voxcpm2_prompt(
         else:
             additional["reference_audio"] = [[ref_audio, ref_sr]]
             prefill_len += ref_len + 2  # ref_start / ref_end
-    return {"prompt_token_ids": [1] * prefill_len, "additional_information": additional}
+    prompt = tokens_input(prompt_token_ids=[1] * prefill_len)
+    prompt["additional_information"] = additional
+    return prompt
 
 
 def _encode_raw_audio(

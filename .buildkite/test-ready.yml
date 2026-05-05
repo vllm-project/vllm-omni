@@ -120,6 +120,23 @@ steps:
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
 
+  - label: "AudioX Online Test"
+    depends_on: upload-ready-pipeline
+    commands:
+      - timeout 20m pytest -s -v tests/e2e/online_serving/test_audiox_online.py -m "core_model and diffusion" --run-level core_model
+    agents:
+      queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+    plugins:
+      - docker#v5.2.0:
+          image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+          always-pull: true
+          propagate-environment: true
+          environment:
+            - "HF_HOME=/fsx/hf_cache"
+            - "HF_TOKEN"
+          volumes:
+            - "/fsx/hf_cache:/fsx/hf_cache"
+
   - label: "Diffusion Cache Backend Test"
     depends_on: upload-ready-pipeline
     commands:

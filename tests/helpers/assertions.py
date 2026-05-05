@@ -3,6 +3,7 @@
 import io
 import tempfile
 import threading
+import wave
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -115,8 +116,17 @@ def assert_audio_diffusion_response(
 ) -> None:
     """
     Validate audio diffusion response.
+
+    `response.audios` carries one entry per choice, each a `dict` with raw WAV
+    bytes (`wav_bytes`) and the OpenAI audio metadata (`id`, `expires_at`).
     """
-    raise NotImplementedError("Audio validation is not implemented yet")
+    assert response.audios, "Audio response is empty"
+    for audio in response.audios:
+        wav_bytes = audio.get("wav_bytes")
+        assert wav_bytes, "Audio entry missing decoded WAV bytes"
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+            assert wav_file.getnframes() > 0, "Decoded WAV has zero frames"
+            assert wav_file.getframerate() > 0, "Decoded WAV has invalid sample rate"
 
 
 def _maybe_int(value: Any) -> int | None:
