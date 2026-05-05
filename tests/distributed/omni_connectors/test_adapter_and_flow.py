@@ -4,7 +4,11 @@
 import pytest
 from pytest_mock import MockerFixture
 
-from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector, try_send_via_connector
+from vllm_omni.distributed.omni_connectors.adapter import (
+    compute_talker_prompt_ids_length,
+    try_recv_via_connector,
+    try_send_via_connector,
+)
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec, OmniTransferConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import get_connectors_config_for_stage
@@ -235,3 +239,81 @@ def test_recv_with_missing_metadata(mocker: MockerFixture):
 
     inputs, _ = try_recv_via_connector(task, connectors, stage_id=1)
     assert inputs is None
+
+
+# Qwen3-Omni chat-template token IDs used by compute_talker_prompt_ids_length.
+_IM_START = 151644
+_SYSTEM = 8948
+_USER = 872
+_ASSISTANT = 77091
+_AUDIO_PAD = 151675
+_IMAGE_PAD = 151655
+_VIDEO_PAD = 151656
+_FILLER = 1  # any non-special id
+
+
+def _block(role: int, *body: int) -> list[int]:
+    """Build a Qwen3 turn block: <|im_start|> <role> <body...>."""
+    return [_IM_START, role, *body]
+
+
+class TestComputeTalkerPromptIdsLength:
+    """``compute_talker_prompt_ids_length`` must mirror the segments that
+    ``_thinker_to_talker_prefill`` actually appends to the talker input."""
+
+    def test_empty(self) -> None:
+        assert compute_talker_prompt_ids_length([]) == 0
+
+    def test_system_block_skipped(self) -> None:
+        # System-only — system blocks are skipped by the talker prefill.
+        prompt = _block(_SYSTEM, _FILLER, _FILLER)
+        assert compute_talker_prompt_ids_length(prompt) == 0
+
+    def test_audio_user_block_counted(self) -> None:
+        # User block containing an audio token contributes its full length.
+        prompt = _block(_USER, _AUDIO_PAD, _FILLER, _FILLER)
+        assert compute_talker_prompt_ids_length(prompt) == len(prompt)
+
+    def test_image_user_block_counted(self) -> None:
+        prompt = _block(_USER, _IMAGE_PAD, _FILLER)
+        assert compute_talker_prompt_ids_length(prompt) == len(prompt)
+
+    def test_video_user_block_counted(self) -> None:
+        prompt = _block(_USER, _VIDEO_PAD, _FILLER)
+        assert compute_talker_prompt_ids_length(prompt) == len(prompt)
+
+    def test_text_only_user_block_skipped(self) -> None:
+        # Text-only user blocks (e.g. STT transcripts, tool responses) are
+        # skipped by the prefill — counting them oversizes the talker input
+        # and hangs stage-1 waiting for tokens that never arrive.
+        prompt = _block(_USER, _FILLER, _FILLER, _FILLER)
+        assert compute_talker_prompt_ids_length(prompt) == 0
+
+    def test_last_assistant_block_adds_nine(self) -> None:
+        # The last assistant block contributes a fixed 9-token codec preamble.
+        prompt = _block(_ASSISTANT, _FILLER, _FILLER)
+        assert compute_talker_prompt_ids_length(prompt) == 9
+
+    def test_non_last_assistant_block_skipped(self) -> None:
+        # Only the LAST assistant block contributes 9 — earlier ones are skipped.
+        audio_user = _block(_USER, _AUDIO_PAD, _FILLER)
+        prompt = (
+            _block(_ASSISTANT, _FILLER, _FILLER)
+            + audio_user
+            + _block(_ASSISTANT, _FILLER)
+        )
+        # Non-last assistant: 0; audio user: full length; last assistant: 9.
+        assert compute_talker_prompt_ids_length(prompt) == len(audio_user) + 9
+
+    def test_full_conversation(self) -> None:
+        # System + audio user + tool-response (text-only user) + last assistant.
+        audio_user = _block(_USER, _AUDIO_PAD, _FILLER, _FILLER)
+        tool_response_user = _block(_USER, _FILLER, _FILLER, _FILLER, _FILLER)
+        prompt = (
+            _block(_SYSTEM, _FILLER)
+            + audio_user
+            + tool_response_user
+            + _block(_ASSISTANT, _FILLER)
+        )
+        # Only the audio user (full length) + last assistant (+9) count.
+        assert compute_talker_prompt_ids_length(prompt) == len(audio_user) + 9
