@@ -104,7 +104,7 @@ def _generate_image(omni, config: QualityTestConfig):
     generator = torch.Generator(
         device=current_omni_platform.device_type,
     ).manual_seed(config.seed)
-    torch.cuda.reset_peak_memory_stats()
+    torch.accelerator.reset_peak_memory_stats()
 
     outputs = omni.generate(
         {"prompt": config.prompt},
@@ -135,7 +135,7 @@ def _generate_video(omni, config: QualityTestConfig):
     generator = torch.Generator(
         device=current_omni_platform.device_type,
     ).manual_seed(config.seed)
-    torch.cuda.reset_peak_memory_stats()
+    torch.accelerator.reset_peak_memory_stats()
 
     outputs = omni.generate(
         {"prompt": config.prompt, "negative_prompt": ""},

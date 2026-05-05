@@ -67,7 +67,7 @@ def _generate_single_stage_image(
         omni_kwargs["quantization"] = quantization
 
     with OmniRunner(model, **omni_kwargs) as runner:
-        torch.cuda.reset_peak_memory_stats()
+        torch.accelerator.reset_peak_memory_stats()
 
         generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
         outputs = runner.omni.generate(
@@ -116,7 +116,7 @@ def _generate_bagel_image(
     model_name = omni_kwargs.pop("model")
     with OmniRunner(model_name, **omni_kwargs) as runner:
         omni = runner.omni
-        torch.cuda.reset_peak_memory_stats()
+        torch.accelerator.reset_peak_memory_stats()
 
         params_list = omni.default_sampling_params_list
         if len(params_list) > 1:

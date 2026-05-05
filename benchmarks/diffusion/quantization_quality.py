@@ -151,7 +151,7 @@ def _generate_image(omni, args, prompt, seed):
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
-    torch.cuda.reset_peak_memory_stats()
+    torch.accelerator.reset_peak_memory_stats()
     start = time.perf_counter()
     outputs = omni.generate(
         {"prompt": prompt},
@@ -178,7 +178,7 @@ def _generate_video(omni, args, prompt, seed):
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
-    torch.cuda.reset_peak_memory_stats()
+    torch.accelerator.reset_peak_memory_stats()
     start = time.perf_counter()
     outputs = omni.generate(
         {"prompt": prompt, "negative_prompt": ""},
