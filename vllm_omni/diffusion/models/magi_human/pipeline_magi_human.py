@@ -1684,7 +1684,7 @@ class MagiHumanPipeline(nn.Module, ProgressBarMixin, DiffusionPipelineProfilerMi
         super().__init__()
         model_path = od_config.model
         local_files_only = os.path.exists(model_path)
-        device = f"cuda:{torch.cuda.current_device()}"
+        device = f"cuda:{torch.accelerator.current_device_index()}"
         self.device_str = device
         self.dtype = od_config.dtype or torch.bfloat16
 
