@@ -171,3 +171,63 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     assert runner.cache_backend is None
     assert runner.od_config.cache_backend is None
     assert dummy_cache_backend.enabled is False
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_set_forward_context_enters_vllm_config_contexts(monkeypatch):
+    """Ensure `with set_forward_context(...):` enters vllm's context managers internally and calls desired vllm functions."""
+    import vllm.config.vllm as vllm_config_module
+    import vllm.ir
+    from vllm.config import CompilationConfig, DeviceConfig, VllmConfig
+
+    from vllm_omni.diffusion.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+        set_forward_context,
+    )
+
+    vllm_config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        compilation_config=CompilationConfig(),
+    )
+    calls = []
+
+    @contextmanager
+    def _set_current_vllm_config(cfg):
+        calls.append(("set_current_vllm_config", cfg))
+        yield
+        calls.append(("set_current_vllm_config_exit", cfg))
+
+    @contextmanager
+    def _set_priority(*args, **kwargs):
+        del args, kwargs
+        calls.append(("ir_op_priority", None))
+        yield
+        calls.append(("ir_op_priority_exit", None))
+
+    @contextmanager
+    def _enable_torch_wrap(flag):
+        calls.append(("enable_torch_wrap", flag))
+        yield
+        calls.append(("enable_torch_wrap_exit", flag))
+
+    monkeypatch.setattr(vllm_config_module, "set_current_vllm_config", _set_current_vllm_config)
+    monkeypatch.setattr(vllm_config.kernel_config.ir_op_priority, "set_priority", _set_priority)
+    monkeypatch.setattr(vllm.ir, "enable_torch_wrap", _enable_torch_wrap)
+
+    assert not is_forward_context_available()
+
+    with set_forward_context(vllm_config=vllm_config):
+        assert is_forward_context_available()
+        assert get_forward_context().vllm_config is vllm_config
+
+    assert not is_forward_context_available()
+    assert calls == [
+        ("set_current_vllm_config", vllm_config),
+        ("ir_op_priority", None),
+        ("enable_torch_wrap", vllm_config.compilation_config.ir_enable_torch_wrap),
+        ("enable_torch_wrap_exit", vllm_config.compilation_config.ir_enable_torch_wrap),
+        ("ir_op_priority_exit", None),
+        ("set_current_vllm_config_exit", vllm_config),
+    ]
