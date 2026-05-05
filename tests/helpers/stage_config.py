@@ -552,12 +552,7 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                     "devices": "1",
                     "tensor_parallel_size": 1,
                     "default_sampling_params": {
-                        "temperature": 0.4,
-                        "top_p": 0.9,
-                        "top_k": 1,
-                        "max_tokens": 2048,
-                        "seed": 42,
-                        "repetition_penalty": 1.05,
+                        "max_tokens": 150,
                         "ignore_eos": False,
                         "stop_token_ids": [151645],
                     },
