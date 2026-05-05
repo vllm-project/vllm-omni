@@ -841,6 +841,16 @@ class MoriTransferEngineConnector(OmniConnectorBase):
 
     # ============================================================== LISTENER
     def _cleanup_stale_buffers(self) -> None:
+        """Reclaim buffers older than ``_BUFFER_TTL_SECONDS``.
+
+        Prevents permanent memory leaks when a receiver crashes or times out
+        without ever pulling the data.
+
+        TODO(zejwang): In extreme rare case, long transfer time, there might
+        exist TTL cleanup vs in-flight RDMA transfer conflict, which will be
+        handled in a follow-up PR. Same race is acknowledged in
+        ``MooncakeTransferEngineConnector._cleanup_stale_buffers``.
+        """
         now = _time_mod.monotonic()
         with self._local_buffers_lock:
             stale = [k for k, v in self._local_buffers.items() if now - v[5] > _BUFFER_TTL_SECONDS]
@@ -853,42 +863,19 @@ class MoriTransferEngineConnector(OmniConnectorBase):
 
     def _zmq_listener_loop(self) -> None:
         sock = self.zmq_ctx.socket(zmq.ROUTER)
-        bound = False
 
-        # Try the configured port first
         try:
             sock.bind(f"tcp://{self.host}:{self.zmq_port}")
-            bound = True
         except zmq.ZMQError as exc:
-            if exc.errno in (zmq.EADDRINUSE, 98):
-                logger.warning(f"ZMQ port {self.zmq_port} already in use, falling back to OS-assigned port")
-            else:
-                logger.error(f"ZMQ bind failed on {self.host}:{self.zmq_port}: {exc}")
-                self.can_put = False
-                self._bind_error = exc
-                self._listener_ready.set()
-                return
-
-        # Fallback: let the OS pick a free port
-        if not bound:
-            try:
-                sock.bind(f"tcp://{self.host}:*")
-                bound = True
-            except zmq.ZMQError as exc:
-                logger.error(f"ZMQ bind failed on {self.host}:*: {exc}")
-                self.can_put = False
-                self._bind_error = exc
-                self._listener_ready.set()
-                return
-
-        # Read back the actual port (works for both configured and
-        # OS-assigned ports) and update self.zmq_port so that put()
-        # metadata and get_connection_info() return the correct value.
-        endpoint = sock.getsockopt(zmq.LAST_ENDPOINT).decode()
-        actual_port = int(endpoint.rsplit(":", 1)[1])
-        if actual_port != self.zmq_port:
-            logger.info(f"ZMQ listener bound on {self.host}:{actual_port} (configured: {self.zmq_port})")
-        self.zmq_port = actual_port
+            # Any bind failure (EADDRINUSE, EADDRNOTAVAIL, EACCES, etc.) is
+            # fatal for a sender — fail fast so __init__ propagates the error.
+            # There is no silent receiver fallback; roles are explicitly
+            # assigned (matches MooncakeTransferEngineConnector).
+            logger.error(f"ZMQ bind failed on {self.host}:{self.zmq_port}: {exc} (errno={exc.errno})")
+            self.can_put = False
+            self._bind_error = exc
+            self._listener_ready.set()
+            return
 
         self._listener_ready.set()
 
@@ -976,20 +963,38 @@ class MoriTransferEngineConnector(OmniConnectorBase):
 
             src_offset, src_size, _, _, _, _ = item
 
+            # Validate against sender's own src_size before RDMA write:
+            # length < src_size silently truncates the payload; length >
+            # src_size reads past this allocation into adjacent in-flight
+            # buffers because pool_mem_desc covers the whole pool, not just
+            # this slot, so Mori does not bound-check. Refuse on mismatch
+            # rather than corrupt or leak data silently.
+            if pull.length != src_size:
+                logger.error(
+                    "Length mismatch for %s: sender src_size=%d != receiver length=%d; refusing transfer",
+                    pull.request_id,
+                    src_size,
+                    pull.length,
+                )
+                response_queue.put((identity, TRANS_ERROR))
+                self._notify_listener(notify_addr)
+                return
+
             # Register the receiver's IOEngine (idempotent)
             self._ensure_remote_registered(pull.engine_desc_packed)
 
             # Reconstruct the receiver's pool MemoryDesc
             remote_mem = MemoryDesc.unpack(pull.mem_desc_packed)
 
-            # RDMA write from local pool → remote pool
+            # RDMA write from local pool → remote pool. Use src_size (sender's
+            # own record); it has just been validated to equal pull.length.
             transfer_uid = self.engine.allocate_transfer_uid()
             statuses = self.engine.batch_write(
                 [self.pool_mem_desc],
                 [[src_offset]],
                 [remote_mem],
                 [[pull.dst_offset]],
-                [[pull.length]],
+                [[src_size]],
                 [transfer_uid],
             )
 
