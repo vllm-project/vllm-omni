@@ -142,6 +142,12 @@ ignore = [
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"
+"torch.cuda.max_memory_allocated".msg = "Use torch.accelerator.max_memory_allocated"
+"torch.cuda.reset_peak_memory_stats".msg = "Use torch.accelerator.reset_peak_memory_stats"
+"torch.cuda.device_count".msg = "Use torch.accelerator.device_count"
+"torch.cuda.current_device".msg = "Use torch.accelerator.current_device_index"
+"torch.cuda.empty_cache".msg  = "Use torch.accelerator.empty_cache"
+"torch.cuda.synchronize".msg = "Use torch.accelerator.synchronize"
 
 [tool.mypy]
 python_version = "3.12, 3.13"
