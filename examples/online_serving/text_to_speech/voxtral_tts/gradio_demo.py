@@ -5,7 +5,7 @@
 
 Example use case:
 
-python examples/online_serving/voxtral_tts/gradio_demo.py --host slurm-199-077 --port 8000
+python examples/online_serving/text_to_speech/voxtral_tts/gradio_demo.py --host slurm-199-077 --port 8000
 
 """
 

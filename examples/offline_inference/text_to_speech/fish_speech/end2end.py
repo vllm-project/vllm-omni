@@ -44,6 +44,7 @@ DEFAULT_STAGE_CONFIG = os.path.join(
     "..",
     "..",
     "..",
+    "..",
     "vllm_omni",
     "model_executor",
     "stage_configs",
