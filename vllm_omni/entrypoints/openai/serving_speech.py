@@ -2120,21 +2120,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     request.max_new_tokens,
                 )
 
-        # Propagate per-request seed to sampling params so both Slow AR
-        # and Fast AR produce deterministic output for the same seed.
         if request.seed is not None and sampling_params_list:
-            if not self._is_fish_speech:
-                logger.warning(
-                    "seed=%d requested but deterministic Fast AR seeding is "
-                    "only implemented for Fish Speech; other TTS models will "
-                    "use the seed for the main AR sampler only.",
-                    request.seed,
-                )
             if sampling_params_list is self.engine_client.default_sampling_params_list:
                 import copy
 
                 sampling_params_list = copy.deepcopy(sampling_params_list)
             sampling_params_list[0].seed = request.seed
+            if self._tts_model_type == "qwen3_tts":
+                if sampling_params_list[0].extra_args is None:
+                    sampling_params_list[0].extra_args = {}
+                sampling_params_list[0].extra_args["qwen3_tts_request_seed"] = request.seed
 
         generator = self.engine_client.generate(
             prompt=prompt,
