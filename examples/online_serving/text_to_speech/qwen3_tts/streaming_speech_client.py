@@ -7,6 +7,11 @@ Usage:
     # Send full text at once
     python streaming_speech_client.py --text "Hello world. How are you? I am fine."
 
+    # TTS with certain speaker
+    python streaming_speech_client_ori.py --text "Hello world. How are you? I am fine." \
+        --speaker "Serena" \
+        --language "Chinese"
+
     # Simulate STT: send text word-by-word with delay
     python streaming_speech_client.py \
         --text "Hello world. How are you? I am fine." \
@@ -215,7 +220,7 @@ def main():
     config = {}
     for key in [
         "model",
-        "speaker",
+        # "speaker",
         "task_type",
         "language",
         "instructions",
@@ -228,6 +233,9 @@ def main():
         val = getattr(args, key.replace("-", "_"), None)
         if val is not None:
             config[key] = val
+    # Server receive voice instead of speaker to control
+    if args.speaker:
+        config["voice"] = args.speaker.lower().strip()
     if args.stream_audio:
         config["stream_audio"] = True
     if args.x_vector_only_mode:
