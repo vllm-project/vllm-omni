@@ -547,7 +547,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 pp_group = get_pp_group()
                 pp_rank = pp_group.rank_in_group
                 tasks = assignment[pp_rank]
-                prev_tasks = assignment[pp_group.prev_rank]
+                prev_task = assignment[pp_group.prev_rank] if pp_group.world_size > 1 else None
 
                 if is_new_request:
                     pp_group.reset_buffer()
@@ -612,7 +612,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     primary.extra_task_outputs = task_outputs[1:]
                 if t_start_ns is not None:
                     primary.micro_step_wall_ns = time.perf_counter_ns() - t_start_ns
-                    
+
                 return primary
 
     def _rank0_decode_due_chunks(self, state: DiffusionRequestState) -> RunnerOutput | None:
