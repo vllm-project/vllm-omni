@@ -19,7 +19,6 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from vllm import _oink_ops, envs  # For vllm 0.19 RMSNorm below
 from vllm._aiter_ops import rocm_aiter_ops  # For vllm 0.19 RMSNorm below
 from vllm.logger import init_logger
-from vllm.model_executor.custom_op import CustomOp  # For vllm 0.19 RMSNorm below
 from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant  # For vllm 0.19 RMSNorm below
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -48,6 +47,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
+from vllm_omni.diffusion.layers.custom_op import CustomOp
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
