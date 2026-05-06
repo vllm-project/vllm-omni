@@ -30,6 +30,7 @@ from vllm_omni.model_executor.models.omnivoice.config import OmniVoiceConfig
 from vllm_omni.model_executor.models.omnivoice.duration import RuleDurationEstimator
 from vllm_omni.model_executor.models.omnivoice.omnivoice_decoder import OmniVoiceDecoder
 from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import OmniVoiceGenerator
+from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 try:
     from transformers import HiggsAudioV2TokenizerModel
@@ -101,6 +102,9 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         # Duration estimator
         self.duration_estimator = RuleDurationEstimator()
 
+        # Speaker cache for ref_audio_tokens
+        self._speaker_cache = get_speaker_cache()
+
         # Generation parameters
         self.num_step = self.config.num_step
         self.guidance_scale = self.config.guidance_scale
@@ -144,10 +148,12 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         lang = "None"
         instruct = "None"
 
+        voice_name = None
         if isinstance(prompt, dict):
             text = prompt.get("input", prompt.get("text", str(prompt)))
             ref_audio = prompt.get("ref_audio")
             ref_text = prompt.get("ref_text")
+            voice_name = prompt.get("voice_name")
             lang = prompt.get("lang") or "None"
             instruct = prompt.get("instruct") or "None"
         else:
@@ -175,17 +181,37 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
         text_tokens = torch.tensor(encoding.ids, dtype=torch.long, device=device)
         text_len = text_tokens.shape[0]
 
-        # Encode reference audio tokens if provided
+        # Encode reference audio tokens if provided (with voice caching)
         ref_audio_tokens = None
         if ref_audio is not None:
             if self.audio_tokenizer is None:
                 raise RuntimeError(
                     "Voice cloning requires transformers>=5.3.0. Try: uv pip install 'transformers>=5.3.0'"
                 )
-            audio_signal, sr = ref_audio
-            if isinstance(audio_signal, np.ndarray):
-                audio_signal = torch.from_numpy(audio_signal).float()
-            ref_audio_tokens = self._encode_ref_audio(audio_signal, int(sr)).to(device)
+            # Check speaker cache first
+            _cache_key = None
+            if voice_name:
+                _cache_key = self._speaker_cache.make_cache_key(
+                    voice_name,
+                    model_type="omnivoice",
+                    created_at=int(prompt.get("voice_created_at") or 0),
+                )
+                cached = self._speaker_cache.get(_cache_key)
+                if cached is not None:
+                    ref_audio_tokens = cached["ref_audio_tokens"].to(device)
+                    _cache_key = None  # hit → don't store again
+                    logger.debug("Speaker cache HIT for OmniVoice speaker '%s'", voice_name)
+
+            if ref_audio_tokens is None:
+                audio_signal, sr = ref_audio
+                if isinstance(audio_signal, np.ndarray):
+                    audio_signal = torch.from_numpy(audio_signal).float()
+                ref_audio_tokens = self._encode_ref_audio(audio_signal, int(sr)).to(device)
+
+                # Store in cache for next request
+                if _cache_key is not None:
+                    self._speaker_cache.put(_cache_key, {"ref_audio_tokens": ref_audio_tokens.cpu()})
+                    logger.debug("Speaker cache STORE for OmniVoice speaker '%s'", voice_name)
 
         # Build conditional + unconditional batches [2, 8, max_len]
         text_ids = text_tokens.unsqueeze(0).repeat(num_cb, 1)

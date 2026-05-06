@@ -93,6 +93,7 @@ class FakeStageClient:
 class FakeOutputProcessor:
     def __init__(self, *, request_outputs: list[object] | None = None) -> None:
         self.request_outputs = list(request_outputs or [])
+        self.abort_calls: list[list[str]] = []
 
     def add_request(self, *_args, **_kwargs) -> None:
         return None
@@ -102,6 +103,10 @@ class FakeOutputProcessor:
             request_outputs=list(self.request_outputs),
             reqs_to_abort=[],
         )
+
+    def abort_requests(self, request_ids, internal: bool = False):
+        self.abort_calls.append(request_ids)
+        return request_ids
 
     def update_scheduler_stats(self, _scheduler_stats) -> None:
         return None
@@ -599,6 +604,8 @@ async def test_run_abort(orchestrator_factory) -> None:
 
         for stage in stages:
             assert stage.abort_calls == [["req-abort"]]
+        for proc in processors:
+            assert proc.abort_calls == [["req-abort"]]
         assert "req-abort" not in orchestrator_fixture.orchestrator.request_states
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)

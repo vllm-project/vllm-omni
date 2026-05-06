@@ -32,7 +32,6 @@ classifiers = [
 # Dependencies are now managed dynamically via setup.py based on detected hardware platform.
 # This allows automatic installation of the correct platform-specific dependencies (CUDA/ROCm/CPU/XPU/NPU)
 # without requiring extras like [cuda]. See requirements/ directory for platform-specific dependencies.
-# Note: vllm is intentionally excluded due to entrypoints overwrite issue.
 
 [project.optional-dependencies]
 
@@ -90,7 +89,6 @@ Documentation = "https://vllm-omni.readthedocs.io"
 "Bug Tracker" = "https://github.com/vllm-project/vllm-omni/issues"
 
 [project.scripts]
-vllm = "vllm_omni.entrypoints.cli.main:main"
 vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 
 
@@ -230,6 +228,10 @@ extend-ignore-identifiers-re = [
     ".*nin.*",
     ".*[Oo]no_[Aa]nna.*",
     ".*cann.*",
+    ".*[Nn][Dd]3.*",
+]
+extend-ignore-re = [
+    "\\.\\.\\.n,d->\\.\\.\\.nd",
 ]
 [tool.typos.default.extend-words]
 ue = "ue"

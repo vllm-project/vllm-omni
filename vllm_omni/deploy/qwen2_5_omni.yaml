@@ -71,12 +71,6 @@ platforms:
         # 3-NPU layout: stage 2 lives on its own card.
         devices: "2"
 
-  rocm:
-    stages:
-      - stage_id: 2
-        # 3-GPU MI325 layout: stage 2 on a separate card.
-        devices: "2"
-
   xpu:
     stages:
       # Verified on 2x Intel Arc Pro B60. Both AR stages use cudagraphs.

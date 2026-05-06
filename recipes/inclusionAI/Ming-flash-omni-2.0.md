@@ -22,9 +22,12 @@ Use this recipe when you want a known-good starting point for serving
 
 - Upstream model:
   [`inclusionAI/Ming`](https://github.com/inclusionAI/Ming)
-- For offline inference and additional client variants, see
-  `examples/offline_inference/ming_flash_omni{,_tts}/` and
-  `examples/online_serving/ming_flash_omni{,_tts}/`.
+- For offline inference and additional client variants, see the
+  multimodal example dirs `examples/offline_inference/ming_flash_omni/` and
+  `examples/online_serving/ming_flash_omni/`. The standalone TTS variant
+  lives under the consolidated text-to-speech hub at
+  `examples/offline_inference/text_to_speech/ming_flash_omni_tts/` and
+  `examples/online_serving/text_to_speech/ming_flash_omni_tts/`.
 
 
 ## Hardware Support
@@ -46,7 +49,7 @@ Adjust `devices` in the YAML to match your hardware.
 - OS: Linux
 - Python: 3.10+
 - CUDA Driver Version: 590.48.01
-- CUDA 12.5
+- CUDA 13.0
 - vLLM version: 0.19.0
 - vLLM-Omni version or commit: 0.19.0rc1
 
@@ -64,7 +67,6 @@ Thinker + talker (text and/or audio output):
 vllm serve Jonathan1909/Ming-flash-omni-2.0 \
     --omni \
     --port 8091 \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/ming_flash_omni.yaml \
     --log-stats
 ```
 
@@ -162,7 +164,7 @@ The bundled `ming_flash_omni_tts.yaml` runs the talker on a single GPU and expos
 - OS: Linux
 - Python: 3.10+
 - CUDA Driver Version: 590.48.01
-- CUDA 12.5
+- CUDA 13.0
 - vLLM version: 0.19.0
 - vLLM-Omni version or commit: 0.19.0rc1
 
@@ -171,7 +173,7 @@ The bundled `ming_flash_omni_tts.yaml` runs the talker on a single GPU and expos
 ```bash
 vllm serve Jonathan1909/Ming-flash-omni-2.0 \
     --omni \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/ming_flash_omni_tts.yaml \
+    --deploy-config vllm_omni/deploy/ming_flash_omni_tts.yaml \
     --port 8091 \
     --log-stats
 ```
