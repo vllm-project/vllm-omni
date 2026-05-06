@@ -1,6 +1,6 @@
+import numpy as np
 import pytest
 import torch
-from tests.e2e.offline_inference.test_diffusion_cpu_offload import check_audio_determinism
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
 from tests.helpers.env import DeviceMemoryMonitor
@@ -28,6 +28,21 @@ IMAGE_VIDEO_MODELS_PARAMS = {
     "runner_params": {"boundary_ratio": 0.875, "flow_shift": 5.0},
     "sampler_params": {"height": 480, "width": 640, "num_frames": 5},
 }
+
+
+def check_audio_determinism(audio1, audio2, atol=1e-2):
+    device = current_omni_platform.device_type
+    if isinstance(audio1, np.ndarray):
+        audio1 = torch.from_numpy(audio1).to(device)
+    if isinstance(audio2, np.ndarray):
+        audio2 = torch.from_numpy(audio2).to(device)
+
+    if not torch.allclose(audio1, audio2, atol=atol):
+        diff = torch.abs(audio1 - audio2)
+        print(f"Max difference: {diff.max().item()}")
+        print(f"Mean difference: {diff.mean().item()}")
+        raise AssertionError(f"Audio outputs differ beyond tolerance atol={atol}")
+    return True
 
 
 def run_inference(

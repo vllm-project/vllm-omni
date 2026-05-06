@@ -106,15 +106,15 @@ def _build_request(
 
 def _collect_audio(omni: Omni, request: dict) -> tuple[torch.Tensor, int]:
     """Run a single request and return (waveform, sample_rate)."""
-    for stage_outputs in omni.generate(request, DEFAULT_SAMPLING):
-        for req_output in stage_outputs.request_output:
-            mm = req_output.outputs[0].multimodal_output
-            assert mm is not None, "Expected multimodal_output to be non-None"
-            audio = mm.get("audio")
-            sr = mm.get("sr")
-            assert audio is not None, "Expected 'audio' key in multimodal_output"
-            assert isinstance(audio, torch.Tensor), f"audio should be Tensor, got {type(audio)}"
-            return audio.cpu(), int(sr.item()) if sr is not None else SAMPLE_RATE
+    # Omni.generate returns list[OmniRequestOutput] by default (py_generator=False).
+    for omni_out in omni.generate(request, DEFAULT_SAMPLING):
+        mm = omni_out.multimodal_output
+        assert mm is not None, "Expected multimodal_output to be non-None"
+        audio = mm.get("audio")
+        sr = mm.get("sr")
+        assert audio is not None, "Expected 'audio' key in multimodal_output"
+        assert isinstance(audio, torch.Tensor), f"audio should be Tensor, got {type(audio)}"
+        return audio.cpu(), int(sr.item()) if sr is not None else SAMPLE_RATE
     raise AssertionError("No stage outputs received")
 
 
@@ -159,11 +159,11 @@ def test_moss_tts_nano_batch(omni_runner: OmniRunner, ref_audio_path) -> None:
         _build_request("Second request.", ref_audio_path),
     ]
     results = []
-    for stage_outputs in omni_runner.omni.generate(requests, [DEFAULT_SAMPLING] * 2):
-        for req_output in stage_outputs.request_output:
-            mm = req_output.outputs[0].multimodal_output
-            assert mm is not None
-            results.append(mm["audio"].cpu())
+    # Single-stage pipeline: one SamplingParams object is broadcast to all prompts.
+    for omni_out in omni_runner.omni.generate(requests, DEFAULT_SAMPLING):
+        mm = omni_out.multimodal_output
+        assert mm is not None
+        results.append(mm["audio"].cpu())
 
     assert len(results) == 2, f"Expected 2 outputs, got {len(results)}"
     for i, audio in enumerate(results):
