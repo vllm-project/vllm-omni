@@ -104,6 +104,7 @@ exclude = [
     "build",
     "dist",
     "vllm_omni.egg-info",
+    "vllm_omni/diffusion/models/marey/vae",
 ]
 
 [tool.ruff.lint]
