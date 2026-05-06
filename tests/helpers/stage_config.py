@@ -516,6 +516,7 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "max_num_seqs": 1,
                 "gpu_memory_utilization": 0.9,
                 "enforce_eager": True,
+                "enable_prefix_caching": False,
                 "max_num_batched_tokens": 16384,
                 "max_model_len": 16384,
                 "skip_mm_profiling": True,
