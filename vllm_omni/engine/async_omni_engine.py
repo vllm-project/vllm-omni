@@ -1455,6 +1455,10 @@ class AsyncOmniEngine:
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
             "custom_pipeline_args": kwargs.get("custom_pipeline_args", None),
             "worker_extension_cls": kwargs.get("worker_extension_cls", None),
+            "trust_remote_code": (False if kwargs.get("trust_remote_code") is None else kwargs["trust_remote_code"]),
+            "distributed_executor_backend": (
+                "mp" if kwargs.get("distributed_executor_backend") is None else kwargs["distributed_executor_backend"]
+            ),
             "enable_sleep_mode": kwargs.get("enable_sleep_mode", False),
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),

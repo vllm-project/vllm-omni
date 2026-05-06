@@ -10,6 +10,8 @@ The ar2diffusion function bridges these two stages, following the same
 signature pattern as glm_image.ar2diffusion.
 """
 
+from __future__ import annotations
+
 from typing import Any
 
 import torch
@@ -61,6 +63,7 @@ def ar2diffusion(
         height = original_prompt.get("height", 1024)
         width = original_prompt.get("width", 1024)
         text_prompt = original_prompt.get("prompt", "")
+        use_system_prompt = original_prompt.get("use_system_prompt")
 
         logger.info(
             "[ar2diffusion] Request %d: AR generated %d tokens, text length=%d, target size=%dx%d",
@@ -83,16 +86,20 @@ def ar2diffusion(
             },
         }
 
-        # Forward multimodal data (original image for IT2I conditioning)
+        # Forward use_system_prompt so the DiT can build the same system prefix
+        if use_system_prompt is not None:
+            diffusion_input["use_system_prompt"] = use_system_prompt
+
+        # Forward multimodal data (original image for IT2I conditioning).
+        # The diffusion pre_process_func reads multi_modal_data["image"], which
+        # matches vLLM's standard prompt schema, so we only need to pass it once.
         mm_data = original_prompt.get("multi_modal_data")
         if mm_data:
-            pil_image = mm_data.get("image")
-            if pil_image is None:
-                images = mm_data.get("images")
-                if images:
-                    pil_image = images[0] if isinstance(images, list) else images
-            if pil_image is not None:
-                diffusion_input["pil_image"] = pil_image
+            prompt_images = mm_data.get("image")
+            if prompt_images is None:
+                prompt_images = mm_data.get("images")
+            if prompt_images is not None:
+                diffusion_input["multi_modal_data"] = {"image": prompt_images}
 
         # Forward multimodal output from AR (if any)
         if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:
