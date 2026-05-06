@@ -23,6 +23,7 @@ import asyncio
 import queue
 import threading
 import time
+from dataclasses import fields as _dc_fields
 from types import SimpleNamespace
 from typing import Any
 
@@ -31,7 +32,12 @@ import pytest
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, _RpcTask
 from vllm_omni.diffusion.sched import RequestScheduler
+from vllm_omni.diffusion.sched.interface import SamplingParamsKey
 from vllm_omni.diffusion.worker.utils import RunnerOutput
+
+# Default values for every batch-key field, so SimpleNamespace-based
+# sampling_params satisfy ``get_sampling_params_key``'s attribute lookups.
+_SAMPLING_KEY_DEFAULTS = {f.name: f.default for f in _dc_fields(SamplingParamsKey)}
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -116,7 +122,7 @@ def _make_request(tag: str):
     return SimpleNamespace(
         request_ids=[tag],
         prompts=[f"prompt_{tag}"],
-        sampling_params=SimpleNamespace(num_inference_steps=1),
+        sampling_params=SimpleNamespace(num_inference_steps=1, **_SAMPLING_KEY_DEFAULTS),
     )
 
 
@@ -156,6 +162,18 @@ def _stop_engine(engine: DiffusionEngine) -> None:
     with engine._cv:
         engine.stop_event.set()
         engine._cv.notify_all()
+    # Race-proof shutdown for the test: drain any RPCs still queued and
+    # fail them with the documented shutdown error before the busy loop
+    # has a chance to pick them up after its current in-flight call
+    # returns. The engine's own ``_fail_pending_rpcs`` then has nothing
+    # left to do.
+    while True:
+        try:
+            task = engine._rpc_queue.get_nowait()
+        except queue.Empty:
+            break
+        if not task.future.done():
+            task.future.set_exception(RuntimeError("DiffusionEngine is shutting down."))
     engine.worker_thread.join(timeout=5)
     assert not engine.worker_thread.is_alive(), "Busy loop thread did not stop"
 
