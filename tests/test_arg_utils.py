@@ -369,8 +369,8 @@ def _build_full_serve_parser():
 def test_nullify_stage_engine_defaults_resets_inherited_defaults():
     import argparse
 
+    from vllm_omni.config.stage_config import deploy_override_field_names
     from vllm_omni.engine.arg_utils import (
-        deploy_override_field_names,
         nullify_stage_engine_defaults,
     )
 

@@ -9,9 +9,9 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
-from vllm.v1.core.sched.async_scheduler import AsyncScheduler as VLLMScheduler
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.scheduler import Scheduler as SyncScheduler
+from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.metrics.perf import PerfStats
@@ -41,12 +41,9 @@ class KVCacheTransferData:
 
 
 class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
-    """
-    OmniARScheduler: Scheduler for vLLM-Omni multimodal processing.
-
-    This scheduler extends vLLM's scheduler to support multimodal and
-    non-autoregressive processing with additional fields and methods
-    specific to vLLM-Omni.
+    """Synchronous AutoRegressive scheduler for vLLM-Omni. This class is also
+    used as a base class for the OmniARAsyncScheduler and holds most of the
+    core scheduling logic.
     """
 
     def __init__(self, *args, **kwargs):
@@ -83,28 +80,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
+        # Output placeholders are zero when async scheduling isn't used
         return request.num_computed_tokens - request.num_output_placeholders
-
-    def _update_request_with_output(self, request: Request, new_token_ids: list[int]) -> tuple[list[int], bool]:
-        """Append output tokens, then cache blocks up to the confirmed count
-        so KV transfer never sees blocks whose data has not been computed yet.
-        """
-        if request.discard_latest_async_tokens:
-            request.discard_latest_async_tokens = False
-            return [], False
-
-        status_before_update = request.status
-
-        new_token_ids, stopped = SyncScheduler._update_request_with_output(self, request, new_token_ids)
-
-        request.num_output_placeholders -= len(new_token_ids)
-        assert request.num_output_placeholders >= 0
-
-        if status_before_update == RequestStatus.RUNNING:
-            confirmed = self._get_confirmed_num_computed_tokens(request)
-            self.kv_cache_manager.cache_blocks(request, confirmed)
-
-        return new_token_ids, stopped
 
     def _get_kv_transfer_criteria(self) -> dict | None:
         # Note: vllm_config is available in Scheduler after super().__init__
@@ -786,3 +763,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         self.requests_needing_kv_transfer.clear()
         return requests
+
+
+class OmniARAsyncScheduler(OmniARScheduler, AsyncVLLMScheduler):
+    """Asynchronous AutoRegressive scheduler."""

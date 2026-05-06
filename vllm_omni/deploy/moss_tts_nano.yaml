@@ -19,6 +19,7 @@ stages:
     max_num_seqs: 4
     gpu_memory_utilization: 0.3
     enforce_eager: true
+    enable_prefix_caching: false
     max_num_batched_tokens: 4096
     max_model_len: 4096
     devices: "0"

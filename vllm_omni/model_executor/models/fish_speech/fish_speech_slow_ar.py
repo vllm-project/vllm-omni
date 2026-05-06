@@ -32,7 +32,7 @@ from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.utils.voice_cache import VoiceEmbeddingCache
+from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 from .configuration_fish_speech import FishSpeechConfig, FishSpeechFastARConfig, FishSpeechSlowARConfig
 from .dac_encoder import _load_dac_codec, encode_reference_audio_codes
@@ -262,7 +262,7 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         self.register_buffer("_semantic_allowed_mask", semantic_mask, persistent=False)
 
         # In-memory LRU cache for DAC-encoded reference audio codes.
-        self._voice_cache = VoiceEmbeddingCache()
+        self._speaker_cache = get_speaker_cache()
 
         # Tokeniser (lazy).
         self._tokenizer = None
@@ -539,37 +539,27 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         if not isinstance(ref_text, str) or not isinstance(text, str):
             raise ValueError("Fish Speech structured voice clone requires string text and ref_text")
 
-        # --- Voice cache: reuse DAC codes for uploaded (named) voices ---
-        _voice_cache_key: str | None = None
+        _speaker_cache_key: tuple[str, str, int] | None = None
         voice_name = info_dict.get("voice_name")
-        voice_created_at = info_dict.get("voice_created_at")
         if isinstance(voice_name, str) and voice_name:
-            _created_at = float(voice_created_at) if voice_created_at is not None else 0.0
-            if _created_at <= 0:
-                logger.warning(
-                    "Voice '%s' has no created_at timestamp; DAC code caching disabled for this request",
-                    voice_name,
+            _speaker_cache_key = self._speaker_cache.make_cache_key(
+                voice_name,
+                model_type="fish_speech",
+                created_at=int(info_dict.get("voice_created_at") or 0),
+            )
+            _cached = self._speaker_cache.get(_speaker_cache_key)
+            if _cached is not None:
+                ref_codes_fq = _cached["ref_codes_fq"].to(
+                    device=self.codebook_embeddings.weight.device,
+                    dtype=torch.long,
                 )
-            else:
-                _voice_cache_key = self._voice_cache.make_cache_key(
-                    voice_name,
-                    xvec_only=False,
-                    created_at=_created_at,
+                logger.debug("Speaker cache HIT for Fish Speech speaker '%s'", voice_name)
+                return self._apply_codebook_embeddings(
+                    tokenizer,
+                    text,
+                    ref_text,
+                    ref_codes_fq,
                 )
-                _cached = self._voice_cache.get(_voice_cache_key)
-                if _cached is not None:
-                    ref_codes_fq = _cached["ref_codes_fq"].to(
-                        device=self.codebook_embeddings.weight.device,
-                        dtype=torch.long,
-                    )
-                    _voice_cache_key = None  # hit → don't store again
-                    logger.debug("Voice cache HIT for Fish Speech voice '%s'", voice_name)
-                    return self._apply_codebook_embeddings(
-                        tokenizer,
-                        text,
-                        ref_text,
-                        ref_codes_fq,
-                    )
 
         if not isinstance(ref_audio_sr, int):
             raise ValueError("Fish Speech structured voice clone requires integer ref_audio_sr")
@@ -590,12 +580,12 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         )
 
         # Cache miss: store DAC codes for future reuse.
-        if _voice_cache_key is not None:
-            self._voice_cache.put(
-                _voice_cache_key,
+        if _speaker_cache_key is not None:
+            self._speaker_cache.put(
+                _speaker_cache_key,
                 {"ref_codes_fq": ref_codes_fq.detach().cpu()},
             )
-            logger.debug("Voice cache STORE for Fish Speech voice '%s'", voice_name)
+            logger.debug("Speaker cache STORE for Fish Speech speaker '%s'", voice_name)
 
         return self._apply_codebook_embeddings(tokenizer, text, ref_text, ref_codes_fq)
 
