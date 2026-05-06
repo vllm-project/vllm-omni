@@ -38,11 +38,16 @@ class TestPlatformDiffusionHooks:
         result = OmniPlatform.get_diffusion_model_runner_cls()
         assert result == "vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner"
 
-    def test_is_neuron(self):
-        """Test is_neuron() returns True for NEURON platform."""
+    def test_oot_enum_exists(self):
+        """Test OOT is a valid platform enum value."""
+        assert OmniPlatformEnum.OOT.value == "oot"
+
+    def test_is_out_of_tree(self):
+        """Test is_out_of_tree() returns True for OOT platform."""
         platform = OmniPlatform.__new__(OmniPlatform)
-        platform._omni_enum = OmniPlatformEnum.NEURON
-        assert platform.is_neuron() is True
+        platform._omni_enum = OmniPlatformEnum.OOT
+        assert platform.is_out_of_tree() is True
+        assert platform.is_cuda() is False
 
 
 class TestRegisterDiffusionModel:
