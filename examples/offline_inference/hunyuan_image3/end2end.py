@@ -17,6 +17,7 @@ import argparse
 import os
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+    _TASK_PRESETS,
     build_prompt_tokens,
 )
 from vllm_omni.entrypoints.omni import Omni
@@ -73,6 +74,11 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--height", type=int, default=1024, help="Output image height.")
     parser.add_argument("--width", type=int, default=1024, help="Output image width.")
+    parser.add_argument(
+        "--vae-use-tiling",
+        action="store_true",
+        help="Enable VAE tiling for memory optimization.",
+    )
 
     # Prompt configuration
     parser.add_argument(
@@ -113,6 +119,7 @@ def main():
     # Build Omni
     omni_kwargs = {
         "model": args.model,
+        "vae_use_tiling": args.vae_use_tiling,
         "stage_configs_path": stage_configs_path,
         "log_stats": args.log_stats,
         "init_timeout": args.init_timeout,
@@ -148,8 +155,18 @@ def main():
     formatted_prompts: list[OmniPromptType] = []
     for p in prompts:
         token_ids = build_prompt_tokens(p, tokenizer, task=task, sys_type=args.sys_type)
+        preset_sys_type, _, _ = _TASK_PRESETS[task]
+        effective_sys_type = args.sys_type or preset_sys_type
 
-        prompt_dict: dict = {"prompt_token_ids": token_ids, "prompt": p}
+        # `prompt_token_ids` drives the AR stage (matches HF byte-for-byte).
+        # `prompt` and `use_system_prompt` are forwarded by ar2diffusion to
+        # the DiT stage so the diffusion pipeline can rebuild the same
+        # system prefix when constructing its model inputs.
+        prompt_dict: dict = {
+            "prompt_token_ids": token_ids,
+            "prompt": p,
+            "use_system_prompt": effective_sys_type,
+        }
 
         if args.modality == "text2img":
             prompt_dict["modalities"] = ["image"]

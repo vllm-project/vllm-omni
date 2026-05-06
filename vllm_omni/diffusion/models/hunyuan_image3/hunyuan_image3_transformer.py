@@ -746,6 +746,9 @@ class LightProjector(nn.Module):
 
         self.layers = modules
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
+
 
 class HunYuanRotary2DEmbedder:
     r"""
@@ -1508,6 +1511,11 @@ class HunYuanSparseMoeBlock(nn.Module):
         else:
             self.shared_mlp = None
 
+        # Since vLLM 0.20, FusedMoE merges `shared_experts` output and runs
+        # the TP all-reduce internally on its forward; do NOT pass
+        # `reduce_results=False` here, and do NOT do the merge or all-reduce
+        # again in our forward below — double-reducing would introduce a
+        # subtle accuracy gap vs the HF reference.
         self.experts = HunyuanFusedMoE(
             shared_experts=self.shared_mlp,
             num_experts=self.n_routed_experts,
@@ -1530,7 +1538,9 @@ class HunYuanSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        # FusedMoE does shared_experts merge + TP all-reduce internally.
         final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+
 
         return final_hidden_states.view(orig_shape)
 
