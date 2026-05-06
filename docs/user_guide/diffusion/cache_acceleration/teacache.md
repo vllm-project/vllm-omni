@@ -103,10 +103,10 @@ See the [text_to_image.py](https://github.com/vllm-project/vllm-omni/blob/main/e
 
 ```bash
 # Default configuration
-vllm serve Qwen/Qwen-Image --omni --port 8091 --cache-backend tea_cache
+vllm serve Qwen/Qwen-Image --omni --port 8000 --cache-backend tea_cache
 
 # Custom configuration
-vllm serve Qwen/Qwen-Image --omni --port 8091 \
+vllm serve Qwen/Qwen-Image --omni --port 8000 \
   --cache-backend tea_cache \
   --cache-config '{"rel_l1_thresh": 0.2}'
 ```

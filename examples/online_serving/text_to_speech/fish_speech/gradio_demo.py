@@ -7,7 +7,7 @@ Supports:
 
 Usage:
     # Start the server first (see run_server.sh), then:
-    python gradio_demo.py --api-base http://localhost:8091
+    python gradio_demo.py --api-base http://localhost:8000
 
     # Or use run_gradio_demo.sh to start both server and demo together.
 """
@@ -25,7 +25,7 @@ import numpy as np
 import soundfile as sf
 
 PCM_SAMPLE_RATE = 44100
-DEFAULT_API_BASE = "http://localhost:8091"
+DEFAULT_API_BASE = "http://localhost:8000"
 
 
 def encode_audio_to_base64(audio_data: tuple) -> str:

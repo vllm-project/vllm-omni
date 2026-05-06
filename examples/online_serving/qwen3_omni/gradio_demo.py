@@ -73,7 +73,7 @@ def parse_args():
     )
     parser.add_argument(
         "--api-base",
-        default="http://localhost:8091/v1",
+        default="http://localhost:8000/v1",
         help="Base URL for the vLLM API server.",
     )
     parser.add_argument(

@@ -7,7 +7,7 @@ This example demonstrates how to deploy Qwen-Image model for online image genera
 ### Basic Start
 
 ```bash
-vllm serve Qwen/Qwen-Image --omni --port 8091
+vllm serve Qwen/Qwen-Image --omni --port 8000
 ```
 !!! note
     If you encounter Out-of-Memory (OOM) issues or have limited GPU memory, you can enable VAE slicing and tiling to reduce memory usage, --vae-use-slicing --vae-use-tiling
@@ -26,19 +26,19 @@ Enable Tensor Parallelism and VAE Patch Parallelism for faster inference:
 
 ```bash
 # With Tensor Parallelism (requires >= 2 GPUs)
-vllm serve Qwen/Qwen-Image --omni --port 8091 --tensor-parallel-size 2
+vllm serve Qwen/Qwen-Image --omni --port 8000 --tensor-parallel-size 2
 
 # With Tensor Parallelism and VAE Patch Parallelism (requires >= 2 GPUs)
-vllm serve Qwen/Qwen-Image --omni --port 8091 --tensor-parallel-size 2 --vae-patch-parallel-size 2 --vae-use-tiling
+vllm serve Qwen/Qwen-Image --omni --port 8000 --tensor-parallel-size 2 --vae-patch-parallel-size 2 --vae-use-tiling
 
 # With Sequence Parallelism (Ulysses-SP, requires >= 2 GPUs)
-vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2
+vllm serve Qwen/Qwen-Image --omni --port 8000 --usp 2
 
 # With Ring-Attention (requires >= 2 GPUs)
-vllm serve Qwen/Qwen-Image --omni --port 8091 --ring 2
+vllm serve Qwen/Qwen-Image --omni --port 8000 --ring 2
 
 # Combined: Ulysses + Ring (requires >= 4 GPUs)
-vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --ring 2
+vllm serve Qwen/Qwen-Image --omni --port 8000 --usp 2 --ring 2
 ```
 
 For more details on parallelism acceleration, see the [Parallelism Acceleration Guide](../../diffusion/parallelism_acceleration.md).
@@ -52,7 +52,7 @@ For more details on parallelism acceleration, see the [Parallelism Acceleration 
 bash run_curl_text_to_image.sh
 
 # Or execute directly
-curl -s http://localhost:8091/v1/chat/completions \
+curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [
@@ -74,7 +74,7 @@ curl -s http://localhost:8091/v1/chat/completions \
 from openai import OpenAI
 import base64
 
-client = OpenAI(base_url="http://localhost:8091/v1", api_key="none")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
 
 response = client.chat.completions.create(
     model="Qwen/Qwen-Image",
@@ -133,7 +133,7 @@ python openai_chat_client.py \
 The `/v1/images/generations` endpoint supports a `lora` field in the request body:
 
 ```bash
-curl -X POST http://localhost:8091/v1/images/generations \
+curl -X POST http://localhost:8000/v1/images/generations \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "A piece of cheesecake",

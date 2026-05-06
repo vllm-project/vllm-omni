@@ -27,7 +27,7 @@ Run from repository root:
 ```bash
 vllm-omni serve snu-aidas/Dynin-Omni \
   --omni \
-  --port 8091 \
+  --port 8000 \
   --stage-configs-path "$(pwd)/vllm_omni/model_executor/stage_configs/dynin_omni.yaml"
 ```
 
@@ -36,7 +36,7 @@ If `vllm-omni` is not in PATH, run:
 ```bash
 PYTHONPATH="$(pwd)" python -m vllm_omni.entrypoints.cli.main serve snu-aidas/Dynin-Omni \
   --omni \
-  --port 8091 \
+  --port 8000 \
   --stage-configs-path "$(pwd)/vllm_omni/model_executor/stage_configs/dynin_omni.yaml"
 ```
 

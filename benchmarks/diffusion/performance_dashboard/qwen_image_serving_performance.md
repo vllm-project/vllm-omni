@@ -30,7 +30,7 @@ This document covers:
 
 ```bash
 vllm serve Qwen/Qwen-Image --omni \
-    --port 8091
+    --port 8000
 ```
 
 To replay step-wise continuous batching, compare

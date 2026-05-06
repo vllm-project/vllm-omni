@@ -8,7 +8,7 @@
 set -e
 
 MODEL="${MODEL:-fishaudio/s2-pro}"
-PORT="${PORT:-8091}"
+PORT="${PORT:-8000}"
 
 echo "Starting Fish Speech S2 Pro server with model: $MODEL"
 

@@ -16,7 +16,7 @@ Generate audio from text prompts using Stable Audio models via an OpenAI-compati
 ```bash
 vllm-omni serve stabilityai/stable-audio-open-1.0 \
     --host 0.0.0.0 \
-    --port 8091 \
+    --port 8000 \
     --gpu-memory-utilization 0.9 \
     --trust-remote-code \
     --enforce-eager \
@@ -28,7 +28,7 @@ vllm-omni serve stabilityai/stable-audio-open-1.0 \
 #### Using curl
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "The sound of a cat purring",
@@ -96,7 +96,7 @@ Returns audio data in the requested format (default: WAV).
 ### Basic Generation
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "The sound of ocean waves"
@@ -106,7 +106,7 @@ curl -X POST http://localhost:8091/v1/audio/generate \
 ### Custom Duration
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "A dog barking",
@@ -117,7 +117,7 @@ curl -X POST http://localhost:8091/v1/audio/generate \
 ### High Quality with Negative Prompt
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "A piano playing a gentle melody",
@@ -131,7 +131,7 @@ curl -X POST http://localhost:8091/v1/audio/generate \
 ### Reproducible Generation
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Thunder and rain sounds",
@@ -145,7 +145,7 @@ curl -X POST http://localhost:8091/v1/audio/generate \
 For faster generation with slightly lower quality:
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Birds chirping in a forest",
@@ -210,7 +210,7 @@ python stable_audio_client.py \
 ## Troubleshooting
 
 ### Server not responding
-- Check if server is running: `curl http://localhost:8091/health`
+- Check if server is running: `curl http://localhost:8000/health`
 - Check server logs for errors
 
 ### Audio quality issues

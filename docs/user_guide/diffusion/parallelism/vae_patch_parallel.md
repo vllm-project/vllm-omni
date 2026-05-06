@@ -98,7 +98,7 @@ You can enable VAE patch parallelism in online serving via `--vae-patch-parallel
 
 ```bash
 # Text-to-Image with Z-Image, TP=2 + VAE patch parallel=2
-vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091 \
+vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8000 \
     --tensor-parallel-size 2 \
     --vae-patch-parallel-size 2 \
     --vae-use-tiling

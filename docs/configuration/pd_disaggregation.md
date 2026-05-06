@@ -157,7 +157,7 @@ runtime:
 ## 4. Launch with your custom config
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
     --stage-configs-path /path/to/qwen3_omni_pd.yaml
 ```
 

@@ -60,7 +60,7 @@ Adjust `devices` in the YAML to match your hardware.
 Thinker only (text output):
 
 ```bash
-vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni --port 8091
+vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni --port 8000
 ```
 
 Thinker + talker (text and/or audio output):
@@ -68,7 +68,7 @@ Thinker + talker (text and/or audio output):
 ```bash
 vllm serve Jonathan1909/Ming-flash-omni-2.0 \
     --omni \
-    --port 8091 \
+    --port 8000 \
     --log-stats
 ```
 
@@ -79,7 +79,7 @@ vllm serve Jonathan1909/Ming-flash-omni-2.0 \
 Text output from a multimodal (image) input:
 
 ```bash
-curl http://localhost:8091/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
       "model": "Jonathan1909/Ming-flash-omni-2.0",
@@ -97,7 +97,7 @@ curl http://localhost:8091/v1/chat/completions \
 Spoken response from a text query (save the WAV bytes):
 
 ```bash
-curl http://localhost:8091/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
       "model": "Jonathan1909/Ming-flash-omni-2.0",
@@ -113,7 +113,7 @@ Text + audio output from an audio input (swap `audio_url` for `video_url`
 or `image_url` to exercise the other multimodal input paths):
 
 ```bash
-curl http://localhost:8091/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
       "model": "Jonathan1909/Ming-flash-omni-2.0",
@@ -131,7 +131,7 @@ curl http://localhost:8091/v1/chat/completions \
 Streaming text output via SSE (set `"stream": true`):
 
 ```bash
-curl -N http://localhost:8091/v1/chat/completions \
+curl -N http://localhost:8000/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
       "model": "Jonathan1909/Ming-flash-omni-2.0",
@@ -176,7 +176,7 @@ The bundled `ming_flash_omni_tts.yaml` runs the talker on a single GPU and expos
 vllm serve Jonathan1909/Ming-flash-omni-2.0 \
     --omni \
     --deploy-config vllm_omni/deploy/ming_flash_omni_tts.yaml \
-    --port 8091 \
+    --port 8000 \
     --log-stats
 ```
 
@@ -187,7 +187,7 @@ vllm serve Jonathan1909/Ming-flash-omni-2.0 \
 Basic curl:
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
       "model": "Jonathan1909/Ming-flash-omni-2.0",
@@ -199,7 +199,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 Speaker selection (e.g. `lingguang`):
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
       "model": "Jonathan1909/Ming-flash-omni-2.0",

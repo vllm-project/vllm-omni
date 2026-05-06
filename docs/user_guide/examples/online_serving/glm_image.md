@@ -8,7 +8,7 @@ memory, sampling params) live in `vllm_omni/deploy/glm_image.yaml`.
 ## Start Server
 
 ```bash
-vllm serve zai-org/GLM-Image --omni --port 8091
+vllm serve zai-org/GLM-Image --omni --port 8000
 ```
 
 The config system auto-detects the pipeline from the model's `model_index.json` — no
@@ -18,7 +18,7 @@ By default, stage 0 (AR) runs on GPU 0 and stage 1 (Diffusion) on GPU 1. To colo
 both stages on a single GPU, override per stage:
 
 ```bash
-vllm serve zai-org/GLM-Image --omni --port 8091 \
+vllm serve zai-org/GLM-Image --omni --port 8000 \
     --stage-0-devices 0 --stage-1-devices 0
 ```
 
@@ -27,7 +27,7 @@ vllm serve zai-org/GLM-Image --omni --port 8091 \
 ### Text-to-Image
 
 ```bash
-curl -s http://localhost:8091/v1/chat/completions \
+curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [
@@ -46,7 +46,7 @@ curl -s http://localhost:8091/v1/chat/completions \
 ### Image-to-Image (Image Editing)
 
 ```bash
-curl -s http://localhost:8091/v1/chat/completions \
+curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [
@@ -73,7 +73,7 @@ curl -s http://localhost:8091/v1/chat/completions \
 from openai import OpenAI
 import base64
 
-client = OpenAI(base_url="http://localhost:8091/v1", api_key="none")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
 
 response = client.chat.completions.create(
     model="zai-org/GLM-Image",

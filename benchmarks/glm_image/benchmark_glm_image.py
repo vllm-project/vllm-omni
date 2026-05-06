@@ -452,7 +452,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--model", type=str, default="default")
     parser.add_argument("--host", type=str, default="localhost")
-    parser.add_argument("--port", type=int, default=8091)
+    parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--output-file", type=str, default=None)
     parser.add_argument("--disable-tqdm", action="store_true")
     parser.add_argument("--num-input-images", type=int, default=1, help="For random I2I dataset.")

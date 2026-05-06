@@ -33,13 +33,13 @@ For offline inference of any of these models, see the [offline TTS hub](https://
 Launch the server (defaults shown — adjust `--port`, `--gpu-memory-utilization`, etc. as needed):
 
 ```bash
-vllm serve <hf-repo-or-local-path> --omni --port 8091
+vllm serve <hf-repo-or-local-path> --omni --port 8000
 ```
 
 Send a TTS request via curl:
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, how are you?",
@@ -54,7 +54,7 @@ Or via Python httpx:
 import httpx
 
 response = httpx.post(
-    "http://localhost:8091/v1/audio/speech",
+    "http://localhost:8000/v1/audio/speech",
     json={
         "input": "Hello, how are you?",
         "voice": "default",
@@ -70,7 +70,7 @@ Or via the OpenAI SDK:
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8091/v1", api_key="none")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
 response = client.audio.speech.create(
     model="<hf-repo>",
     voice="default",
@@ -82,7 +82,7 @@ response.stream_to_file("output.wav")
 Streaming PCM output (where supported) — set `stream=true` with `response_format="pcm"`:
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, how are you?",
@@ -111,7 +111,7 @@ If your downloaded checkpoint lacks `config.json`, add one with `{"model_type": 
 
 ### Launch
 ```bash
-vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remote-code
+vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8000 --trust-remote-code
 # or:
 ./cosyvoice3/run_server.sh
 ```
@@ -157,7 +157,7 @@ pip install fish-speech
 
 ### Launch
 ```bash
-vllm serve fishaudio/s2-pro --omni --port 8091
+vllm serve fishaudio/s2-pro --omni --port 8000
 # or:
 ./fish_speech/run_server.sh
 ```
@@ -165,7 +165,7 @@ The deploy config auto-loads from `vllm_omni/deploy/fish_qwen3_omni.yaml` (the H
 
 ### Voice cloning
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, this is a cloned voice.",
@@ -185,7 +185,7 @@ python speech_client.py --text "Hello world" --stream --output output.pcm
 ### Gradio demo
 ```bash
 ./fish_speech/run_gradio_demo.sh             # launches server + Gradio
-python fish_speech/gradio_demo.py --api-base http://localhost:8091  # if server already running
+python fish_speech/gradio_demo.py --api-base http://localhost:8000  # if server already running
 ```
 
 ### Notes
@@ -239,7 +239,7 @@ python higgs_audio_v2/batch_speech_client.py \
 
 ### Launch
 ```bash
-vllm serve zai-org/GLM-TTS --omni --trust-remote-code --port 8091
+vllm serve zai-org/GLM-TTS --omni --trust-remote-code --port 8000
 # or:
 bash examples/online_serving/text_to_speech/glm_tts/run_server.sh /path/to/GLM-TTS
 ```
@@ -284,7 +284,7 @@ Voice cloning (offline) needs `transformers>=5.3.0`; auto voice works with `tran
 
 ### Launch
 ```bash
-vllm serve k2-fsa/OmniVoice --omni --port 8091 --trust-remote-code
+vllm serve k2-fsa/OmniVoice --omni --port 8000 --trust-remote-code
 # or:
 ./omnivoice/run_server.sh
 ```
@@ -317,7 +317,7 @@ Each variant ships smaller `0.6B` companions where available.
 
 ### Launch
 ```bash
-vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8091
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8000
 # or:
 ./qwen3_tts/run_server.sh                # default: CustomVoice
 ./qwen3_tts/run_server.sh VoiceDesign
@@ -368,10 +368,10 @@ python qwen3_tts/openai_speech_client.py \
 List available voices, or upload a custom one for Base cloning:
 ```bash
 # List
-curl http://localhost:8091/v1/audio/voices
+curl http://localhost:8000/v1/audio/voices
 
 # Upload
-curl -X POST http://localhost:8091/v1/audio/voices \
+curl -X POST http://localhost:8000/v1/audio/voices \
     -F "audio_sample=@/path/to/voice_sample.wav" \
     -F "consent=user_consent_id" \
     -F "name=custom_voice_1" \
@@ -399,7 +399,32 @@ Then start the server with that config and call the Speech API with only the voi
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni --deploy-config /path/to/qwen3_tts_custom_voice.yaml
 
-curl -X POST http://localhost:8091/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"input":"Hello from a precomputed voice.","voice":"alice","task_type":"Base"}' \
+    --output alice.wav
+```
+
+### Precomputed custom voices
+For reused Base voice-cloning speakers, precompute the reference artifacts once and load them at server startup:
+```bash
+python qwen3_tts/precompute_custom_voice.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --voice-name alice \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "Original transcript of the reference audio" \
+    --mode icl \
+    --output-dir /path/to/custom_voices
+```
+`--mode icl` stores both `speaker_embedding` and `ref_code`; `--mode xvec` stores only the speaker embedding. Add the output directory to a deploy config:
+```yaml
+custom_voice_dir: /path/to/custom_voices
+```
+Then start the server with that config and call the Speech API with only the voice name:
+```bash
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni --deploy-config /path/to/qwen3_tts_custom_voice.yaml
+
+curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{"input":"Hello from a precomputed voice.","voice":"alice","task_type":"Base"}' \
     --output alice.wav
@@ -407,7 +432,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 
 ### Streaming PCM
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, how are you?",
@@ -449,6 +474,66 @@ python qwen3_tts/gradio_fastrtc_demo.py --api-base http://localhost:8000
 - `vllm_omni/deploy/qwen3_tts.yaml` is the default deploy config (loaded by HF `model_type`); per-stage runtime overrides are available via `--stage-N-<field> <value>`.
 
 ---
+
+## VoxCPM
+
+Split-stage TTS at 24 kHz.
+
+### Prerequisites
+```bash
+pip install voxcpm
+# or use a local source tree:
+export VLLM_OMNI_VOXCPM_CODE_PATH=/path/to/VoxCPM/src
+```
+
+If the native VoxCPM `config.json` lacks HF `model_type`, set up an HF-compatible config dir:
+```bash
+export VOXCPM_MODEL=/path/to/voxcpm-model
+export VLLM_OMNI_VOXCPM_HF_CONFIG_PATH=/tmp/voxcpm_hf_config
+mkdir -p "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH"
+cp "$VOXCPM_MODEL/config.json" "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH/config.json"
+cp "$VOXCPM_MODEL/generation_config.json" "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH/generation_config.json" 2>/dev/null || true
+python3 -c 'import json, os; p=os.path.join(os.environ["VLLM_OMNI_VOXCPM_HF_CONFIG_PATH"], "config.json"); cfg=json.load(open(p, "r", encoding="utf-8")); cfg["model_type"]="voxcpm"; cfg.setdefault("architectures", ["VoxCPMForConditionalGeneration"]); json.dump(cfg, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)'
+```
+
+### Launch
+```bash
+export VOXCPM_MODEL=/path/to/voxcpm-model
+./voxcpm/run_server.sh                # async-chunk streaming (default)
+./voxcpm/run_server.sh sync           # non-streaming
+```
+Or directly:
+```bash
+vllm serve "$VOXCPM_MODEL" \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/voxcpm_async_chunk.yaml \
+    --trust-remote-code --enforce-eager --omni --port 8000
+```
+
+### Sending requests
+```bash
+# Basic TTS
+python voxcpm/openai_speech_client.py \
+    --model "$VOXCPM_MODEL" \
+    --text "This is a VoxCPM online text-to-speech example."
+
+# Voice cloning
+python voxcpm/openai_speech_client.py \
+    --model "$VOXCPM_MODEL" \
+    --text "This sentence is synthesized with a cloned voice." \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "The exact transcript spoken in reference.wav."
+
+# Streaming PCM
+python voxcpm/openai_speech_client.py \
+    --model "$VOXCPM_MODEL" \
+    --text "This is a streaming VoxCPM request." \
+    --stream --output voxcpm_stream.pcm
+```
+
+### Notes
+- `voxcpm.yaml` for one-shot decode; `voxcpm_async_chunk.yaml` for single-request streaming. Do not use the async-chunk config for concurrent requests or `/v1/audio/speech/batch`.
+- Generic TTS fields not supported by VoxCPM: `voice`, `instructions`, `language`, `speaker_embedding`, `x_vector_only_mode`.
+- For benchmark measurement, see [`benchmarks/voxcpm`](https://github.com/vllm-project/vllm-omni/tree/main/benchmarks/voxcpm/README.md).
 
 ---
 
@@ -511,7 +596,7 @@ pip install -e /path/to/mistral-common  # or upgrade from PyPI when available
 
 ### Launch
 ```bash
-vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8091
+vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8000
 ```
 Deploy config auto-loads from `vllm_omni/deploy/voxtral_tts.yaml`.
 

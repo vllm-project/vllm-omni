@@ -30,7 +30,7 @@ This document covers:
 
 ```bash
 vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni \
-    --port 8091
+    --port 8000
 ```
 
 ## 3.2 Key Parameters

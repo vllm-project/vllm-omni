@@ -2,7 +2,7 @@
 # Qwen-Image online serving startup script
 
 MODEL="${MODEL:-Qwen/Qwen-Image}"
-PORT="${PORT:-8091}"
+PORT="${PORT:-8000}"
 
 echo "Starting Qwen-Image server..."
 echo "Model: $MODEL"

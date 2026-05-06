@@ -130,7 +130,7 @@ def wait_for_server(base_url: str, timeout: float = _SERVER_CHECK_TIMEOUT) -> bo
     """Block until the server is available or timeout is reached.
 
     Args:
-        base_url: Base URL of the server (e.g., "http://localhost:8091/v1")
+        base_url: Base URL of the server (e.g., "http://localhost:8000/v1")
         timeout: Maximum time to wait in seconds
 
     Returns:
@@ -166,7 +166,7 @@ def fetch_voices_and_languages(base_url: str, model: str) -> tuple[list[str], di
     of available voices from the /v1/audio/voices endpoint and organizes them.
 
     Args:
-        base_url: Base URL of the server API (e.g., "http://localhost:8091/v1")
+        base_url: Base URL of the server API (e.g., "http://localhost:8000/v1")
         model: Model name (used for logging)
 
     Returns:
@@ -503,7 +503,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Voxtral TTS Gradio Demo")
     parser.add_argument("--model", type=str, default="mistralai/Voxtral-4B-TTS-2603", help="Name of model repo on HF")
     parser.add_argument("--host", type=str, default="localhost", help="Name of host")
-    parser.add_argument("--port", type=str, default="8091", help="port number")
+    parser.add_argument("--port", type=str, default="8000", help="port number")
     parser.add_argument(
         "--output-dir",
         type=str,

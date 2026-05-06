@@ -76,7 +76,7 @@ In offline mode all requests are submitted simultaneously and processed with con
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 vllm serve /path/to/GLM-Image \
-    --omni --port 8091 --host 0.0.0.0 \
+    --omni --port 8000 --host 0.0.0.0 \
     --served-model-name glm-image
 ```
 
@@ -113,7 +113,7 @@ python benchmarks/glm_image/benchmark_glm_image.py \
 | `--seed` | - | Random seed |
 | `--model` | `default` | Model name (must match `--served-model-name`) |
 | `--host` | `localhost` | Server host |
-| `--port` | `8091` | Server port |
+| `--port` | `8000` | Server port |
 | `--output-file` | - | JSON output file for metrics |
 | `--num-input-images` | `1` | Number of input images for random I2I |
 

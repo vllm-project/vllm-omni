@@ -299,7 +299,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--port",
         type=int,
-        default=8091,
+        default=8000,
         help="Port of the vLLM Omni API server",
     )
     parser.add_argument(

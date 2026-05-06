@@ -3,7 +3,7 @@
 
 # Example 1: Simple request with default parameters
 echo "Example 1: Simple request with default parameters"
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "The sound audience clapping and cheering in a stadium"
@@ -11,7 +11,7 @@ curl -X POST http://localhost:8091/v1/audio/generate \
 
 # Example 2: Request with custom audio_length
 echo "Example 2: Custom audio length (5 seconds)"
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "The sound of a dog barking",
@@ -20,7 +20,7 @@ curl -X POST http://localhost:8091/v1/audio/generate \
 
 # Example 3: Request with negative prompt for quality control
 echo "Example 3: With negative prompt"
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "A piano playing a gentle melody",
@@ -30,7 +30,7 @@ curl -X POST http://localhost:8091/v1/audio/generate \
 
 # Example 4: Full control with all parameters
 echo "Example 4: Full control (custom length, guidance, steps, seed)"
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Thunder and rain sounds",
@@ -43,7 +43,7 @@ curl -X POST http://localhost:8091/v1/audio/generate \
 
 # Example 5: Quick generation with fewer steps (faster but lower quality)
 echo "Example 5: Quick generation (fewer steps)"
-curl -X POST http://localhost:8091/v1/audio/generate \
+curl -X POST http://localhost:8000/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Ocean waves crashing on a beach",

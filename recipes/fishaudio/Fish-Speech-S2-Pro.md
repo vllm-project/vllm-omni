@@ -73,7 +73,7 @@ export VLLM_OMNI_FISH_KVCACHE_ATTN=0
 #### Command
 
 ```bash
-vllm serve fishaudio/s2-pro --omni --port 8091
+vllm serve fishaudio/s2-pro --omni --port 8000
 ```
 
 Notes:
@@ -88,7 +88,7 @@ Notes:
 Basic TTS:
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, how are you?",
@@ -101,7 +101,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 Voice cloning:
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, this is a cloned voice.",

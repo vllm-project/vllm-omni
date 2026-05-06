@@ -75,7 +75,7 @@ These commands use explicit CLI flags for all parallelism and runtime settings.
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
   --omni \
-  --port 8091 \
+  --port 8000 \
   --tensor-parallel-size 4 \
   --quantization fp8 \
   --distributed-executor-backend mp \
@@ -88,7 +88,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
   --omni \
-  --port 8091 \
+  --port 8000 \
   --tensor-parallel-size 2 \
   --usp 2 \
   --quantization fp8 \
@@ -102,7 +102,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
 ```bash
 vllm serve tencent/HunyuanImage-3.0-Instruct \
   --omni \
-  --port 8091 \
+  --port 8000 \
   --tensor-parallel-size 2 \
   --cfg-parallel-size 2 \
   --quantization fp8 \
@@ -114,7 +114,7 @@ vllm serve tencent/HunyuanImage-3.0-Instruct \
 Generate one 1024x1024 image:
 
 ```bash
-curl -s http://localhost:8091/v1/chat/completions \
+curl -s http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [
@@ -149,7 +149,7 @@ generate 1024x1024 images with 50 denoising steps.
 
 Check that:
 
-- The server responds on `http://localhost:8091/health`.
+- The server responds on `http://localhost:8000/health`.
 - The generation request writes a valid PNG file.
 - Logs include `Selected CutlassFP8ScaledMMLinearKernel` for dense FP8
   linear layers and `Using TRITON Fp8 MoE` for MoE layers.

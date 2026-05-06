@@ -31,7 +31,7 @@ outputs = omni.generate(
 
 ```bash
 vllm serve Qwen/Qwen-Image --omni \
-  --port 8091 \
+  --port 8000 \
   --step-execution \
   --max-num-seqs 8
 ```

@@ -30,13 +30,13 @@ CosyVoice3 is intentionally absent: no online example exists for it yet. See its
 Launch the server (defaults shown — adjust `--port`, `--gpu-memory-utilization`, etc. as needed):
 
 ```bash
-vllm serve <hf-repo-or-local-path> --omni --port 8091
+vllm serve <hf-repo-or-local-path> --omni --port 8000
 ```
 
 Send a TTS request via curl:
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, how are you?",
@@ -51,7 +51,7 @@ Or via Python httpx:
 import httpx
 
 response = httpx.post(
-    "http://localhost:8091/v1/audio/speech",
+    "http://localhost:8000/v1/audio/speech",
     json={
         "input": "Hello, how are you?",
         "voice": "default",
@@ -67,7 +67,7 @@ Or via the OpenAI SDK:
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8091/v1", api_key="none")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="none")
 response = client.audio.speech.create(
     model="<hf-repo>",
     voice="default",
@@ -79,7 +79,7 @@ response.stream_to_file("output.wav")
 Streaming PCM output (where supported) — set `stream=true` with `response_format="pcm"`:
 
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, how are you?",
@@ -101,7 +101,7 @@ For full request-shape documentation (all parameters, response formats, error co
 
 ### Launch
 ```bash
-vllm serve zai-org/GLM-TTS --omni --trust-remote-code --port 8091
+vllm serve zai-org/GLM-TTS --omni --trust-remote-code --port 8000
 # or:
 bash examples/online_serving/text_to_speech/glm_tts/run_server.sh /path/to/GLM-TTS
 ```
@@ -165,7 +165,7 @@ export VLLM_OMNI_FISH_KVCACHE_ATTN=0
 
 ### Launch
 ```bash
-vllm serve fishaudio/s2-pro --omni --port 8091
+vllm serve fishaudio/s2-pro --omni --port 8000
 # or:
 ./fish_speech/run_server.sh
 ```
@@ -173,7 +173,7 @@ The deploy config auto-loads from `vllm_omni/deploy/fish_qwen3_omni.yaml` (the H
 
 ### Voice cloning
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, this is a cloned voice.",
@@ -193,7 +193,7 @@ python speech_client.py --text "Hello world" --stream --output output.pcm
 ### Gradio demo
 ```bash
 ./fish_speech/run_gradio_demo.sh             # launches server + Gradio
-python fish_speech/gradio_demo.py --api-base http://localhost:8091  # if server already running
+python fish_speech/gradio_demo.py --api-base http://localhost:8000  # if server already running
 ```
 
 ### Notes
@@ -215,7 +215,7 @@ Equivalent manual command:
 ```bash
 vllm serve Jonathan1909/Ming-flash-omni-2.0 \
     --deploy-config vllm_omni/deploy/ming_flash_omni_tts.yaml \
-    --host 0.0.0.0 --port 8091 \
+    --host 0.0.0.0 --port 8000 \
     --trust-remote-code --omni
 ```
 
@@ -249,7 +249,7 @@ Single-stage 0.1B AR LM + MOSS-Audio-Tokenizer-Nano codec at 48 kHz mono. Every 
 
 ### Launch
 ```bash
-vllm serve OpenMOSS-Team/MOSS-TTS-Nano --omni --port 8091
+vllm serve OpenMOSS-Team/MOSS-TTS-Nano --omni --port 8000
 # or:
 ./moss_tts_nano/run_server.sh
 ```
@@ -264,7 +264,7 @@ REF_WAV="$REF_DIR/zh_1.wav"
 [ -s "$REF_WAV" ] || curl -L -o "$REF_WAV" https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS-Nano/main/assets/audio/zh_1.wav
 REF_AUDIO=$(base64 -w 0 "$REF_WAV")
 
-curl -X POST http://localhost:8091/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d "{
         \"input\": \"你好，这是语音合成测试。\",
@@ -275,7 +275,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 
 ### Streaming PCM
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d "{
         \"input\": \"Hello, streaming output from MOSS-TTS-Nano.\",
@@ -291,7 +291,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 ./moss_tts_nano/run_gradio_demo.sh
 
 # Option 2: server already running
-python moss_tts_nano/gradio_demo.py --api-base http://localhost:8091
+python moss_tts_nano/gradio_demo.py --api-base http://localhost:8000
 ```
 Then open http://localhost:7860 in your browser.
 
@@ -313,7 +313,7 @@ Voice cloning (offline) needs `transformers>=5.3.0`; auto voice works with `tran
 
 ### Launch
 ```bash
-vllm serve k2-fsa/OmniVoice --omni --port 8091 --trust-remote-code
+vllm serve k2-fsa/OmniVoice --omni --port 8000 --trust-remote-code
 # or:
 ./omnivoice/run_server.sh
 ```
@@ -359,7 +359,7 @@ Each variant ships smaller `0.6B` companions where available.
 
 ### Launch
 ```bash
-vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8091
+vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --omni --port 8000
 # or:
 ./qwen3_tts/run_server.sh                # default: CustomVoice
 ./qwen3_tts/run_server.sh VoiceDesign
@@ -400,10 +400,10 @@ python qwen3_tts/openai_speech_client.py \
 List available voices, or upload a custom one for Base cloning:
 ```bash
 # List
-curl http://localhost:8091/v1/audio/voices
+curl http://localhost:8000/v1/audio/voices
 
 # Upload
-curl -X POST http://localhost:8091/v1/audio/voices \
+curl -X POST http://localhost:8000/v1/audio/voices \
     -F "audio_sample=@/path/to/voice_sample.wav" \
     -F "consent=user_consent_id" \
     -F "name=custom_voice_1" \
@@ -431,15 +431,30 @@ Then start the server with that config and call the Speech API with only the voi
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base --omni --deploy-config /path/to/qwen3_tts_custom_voice.yaml
 
-curl -X POST http://localhost:8091/v1/audio/speech \
+curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{"input":"Hello from a precomputed voice.","voice":"alice","task_type":"Base"}' \
     --output alice.wav
 ```
 
-### Streaming PCM
+### Precomputed custom voices
+For reused Base voice-cloning speakers, precompute the reference artifacts once and load them at server startup:
 ```bash
-curl -X POST http://localhost:8091/v1/audio/speech \
+python qwen3_tts/precompute_custom_voice.py \
+    --model Qwen/Qwen3-TTS-12Hz-1.7B-Base \
+    --voice-name alice \
+    --ref-audio /path/to/reference.wav \
+    --ref-text "Original transcript of the reference audio" \
+    --mode icl \
+    --output-dir /path/to/custom_voices
+```
+`--mode icl` stores both `speaker_embedding` and `ref_code`; `--mode xvec` stores only the speaker embedding. Add the output directory to a deploy config:
+```yaml
+custom_voice_dir: /path/to/custom_voices
+```
+Then start the server with that config and call the Speech API with only the voice name:
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech \
     -H "Content-Type: application/json" \
     -d '{
         "input": "Hello, how are you?",
@@ -537,7 +552,7 @@ pip install -e /path/to/mistral-common  # or upgrade from PyPI when available
 
 ### Launch
 ```bash
-vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8091
+vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8000
 ```
 Deploy config auto-loads from `vllm_omni/deploy/voxtral_tts.yaml`.
 

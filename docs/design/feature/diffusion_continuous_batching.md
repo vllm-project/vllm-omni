@@ -48,7 +48,7 @@ above `1` if you want batching:
 
 ```bash
 vllm serve Qwen/Qwen-Image --omni \
-  --port 8091 \
+  --port 8000 \
   --step-execution \
   --max-num-seqs 8
 ```

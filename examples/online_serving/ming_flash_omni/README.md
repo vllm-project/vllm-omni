@@ -20,14 +20,14 @@ For standalone TTS (talker only), see the [Ming-flash-omni-TTS section in the Te
 
 **Thinker + Talker (omni-speech, text + audio output):**
 ```bash
-vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni --port 8091
+vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni --port 8000
 ```
 
 The model registry auto-loads corresponding deploy yaml.
 
 **Thinker-only (text output):**
 ```bash
-vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni --port 8091 \
+vllm serve Jonathan1909/Ming-flash-omni-2.0 --omni --port 8000 \
     --deploy-config vllm_omni/deploy/ming_flash_omni_thinker_only.yaml
 ```
 
@@ -45,7 +45,7 @@ full flag list):
 python examples/online_serving/openai_chat_completion_client_for_multimodal_generation.py \
     --model Jonathan1909/Ming-flash-omni-2.0 \
     --query-type use_mixed_modalities \
-    --port 8091 --host localhost \
+    --port 8000 --host localhost \
     --modalities text
 ```
 
@@ -160,7 +160,7 @@ streaming, reasoning mode), see the recipe at
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
 
 response = client.chat.completions.create(
     model="Jonathan1909/Ming-flash-omni-2.0",

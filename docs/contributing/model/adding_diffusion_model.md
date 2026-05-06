@@ -866,7 +866,7 @@ This tool automatically measures the execution time of selected pipeline modules
 
 Enable timing by setting:
 ```
-vllm serve Qwen/Qwen-Image --omni --port 8091 --enable-diffusion-pipeline-profiler
+vllm serve Qwen/Qwen-Image --omni --port 8000 --enable-diffusion-pipeline-profiler
 ```
 You can optionally specify which modules to profile:
 ```

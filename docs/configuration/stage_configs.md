@@ -107,7 +107,7 @@ the example below uses `CUDA_VISIBLE_DEVICES=0` for Stage 0 and
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
-    --port 8091 \
+    --port 8000 \
     --stage-id 0 \
     --omni-master-address 127.0.0.1 \
     --omni-master-port 26000
@@ -126,7 +126,7 @@ In the context of standard initialization architectures, utilizing the `--stage-
 for delineating stage-specific tuning from the CLI interface:
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
     --stage-overrides '{"1": {"gpu_memory_utilization": 0.5}}'
 ```
 
@@ -181,7 +181,7 @@ stages:
 Launched with both an explicit global flag and a per-stage override:
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
     --deploy-config my_overrides.yaml \
     --max-model-len 16384 \
     --stage-overrides '{"0": {"max_num_seqs": 8}}'
@@ -233,13 +233,13 @@ omni = Omni(model=model_name, stage_configs_path="/path/to/custom_stage_configs.
 
 For online serving:
 ```bash
-vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/deploy_config.yaml
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8000 --deploy-config /path/to/deploy_config.yaml
 ```
 
 Legacy online serving:
 
 ```bash
-vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8000 --stage-configs-path /path/to/stage_configs_file
 ```
 !!! important
     We are actively iterating on the definition of stage configs, and we welcome all feedbacks from both community users and developers to help us shape the development!

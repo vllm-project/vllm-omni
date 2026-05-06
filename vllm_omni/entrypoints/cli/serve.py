@@ -36,10 +36,10 @@ The server automatically detects the model type:
 
 Examples:
   # Start an Omni LLM server
-  vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
+  vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8000
 
   # Start a diffusion model server
-  vllm serve Qwen/Qwen-Image --omni --port 8091
+  vllm serve Qwen/Qwen-Image --omni --port 8000
 
 Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
 --help=OmniConfig)

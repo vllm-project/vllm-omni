@@ -14,7 +14,7 @@ Optional debugging: pass ``--delta-dump-dir DIR`` to write every
 
 Usage:
   python openai_realtime_client.py \
-      --url ws://localhost:8091/v1/realtime \
+      --url ws://localhost:8000/v1/realtime \
       --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
       --input-wav input_16k_mono.wav \
       --output-wav realtime_output.wav \
@@ -256,7 +256,7 @@ async def run_clients_concurrent(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Realtime audio/text client for vLLM-Omni")
-    parser.add_argument("--url", default="ws://localhost:8091/v1/realtime", help="WebSocket URL")
+    parser.add_argument("--url", default="ws://localhost:8000/v1/realtime", help="WebSocket URL")
     parser.add_argument(
         "--model",
         default="Qwen/Qwen3-Omni-30B-A3B-Instruct",

@@ -12,12 +12,12 @@ Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/
 ### Launch the Server
 
 ```bash
-vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8000
 ```
 
 If you have custom stage configs file, launch the server with command below
 ```bash
-vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8000 --stage-configs-path /path/to/stage_configs_file
 ```
 
 ### Send Multi-modal Request
@@ -30,7 +30,7 @@ cd examples/online_serving/qwen2_5_omni
 #### Send request via python
 
 ```bash
-python openai_chat_completion_client_for_multimodal_generation.py --query-type mixed_modalities --port 8091 --host "localhost"
+python openai_chat_completion_client_for_multimodal_generation.py --query-type mixed_modalities --port 8000 --host "localhost"
 ```
 
 The Python client supports the following command-line arguments:
@@ -76,7 +76,7 @@ You can control output modalities to specify which types of output the model sho
 #### Text only
 
 ```bash
-curl http://localhost:8091/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen2.5-Omni-7B",
@@ -88,7 +88,7 @@ curl http://localhost:8091/v1/chat/completions \
 #### Text + Audio
 
 ```bash
-curl http://localhost:8091/v1/chat/completions \
+curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "Qwen/Qwen2.5-Omni-7B",
@@ -112,7 +112,7 @@ python openai_chat_completion_client_for_multimodal_generation.py \
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
 
 response = client.chat.completions.create(
     model="Qwen/Qwen2.5-Omni-7B",
@@ -127,7 +127,7 @@ print(response.choices[0].message.content)
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
 
 response = client.chat.completions.create(
     model="Qwen/Qwen2.5-Omni-7B",
@@ -169,7 +169,7 @@ The Gradio demo connects to a vLLM API server. You have two options:
 The convenience script launches both the vLLM server and Gradio demo together:
 
 ```bash
-./run_gradio_demo.sh --model Qwen/Qwen2.5-Omni-7B --server-port 8091 --gradio-port 7861
+./run_gradio_demo.sh --model Qwen/Qwen2.5-Omni-7B --server-port 8000 --gradio-port 7861
 ```
 
 This script will:
@@ -180,7 +180,7 @@ This script will:
 
 The script supports the following arguments:
 - `--model`: Model name/path (default: Qwen/Qwen2.5-Omni-7B)
-- `--server-port`: Port for vLLM server (default: 8091)
+- `--server-port`: Port for vLLM server (default: 8000)
 - `--gradio-port`: Port for Gradio demo (default: 7861)
 - `--stage-configs-path`: Path to custom stage configs YAML file (optional)
 - `--server-host`: Host for vLLM server (default: 0.0.0.0)
@@ -192,12 +192,12 @@ The script supports the following arguments:
 **Step 1: Launch the vLLM API server**
 
 ```bash
-vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8000
 ```
 
 If you have custom stage configs file:
 ```bash
-vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
+vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8000 --stage-configs-path /path/to/stage_configs_file
 ```
 
 **Step 2: Run the Gradio demo**
@@ -205,7 +205,7 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --stage-configs-path /path/to
 In a separate terminal:
 
 ```bash
-python gradio_demo.py --model Qwen/Qwen2.5-Omni-7B --api-base http://localhost:8091/v1 --port 7861
+python gradio_demo.py --model Qwen/Qwen2.5-Omni-7B --api-base http://localhost:8000/v1 --port 7861
 ```
 
 Then open `http://localhost:7861/` on your local browser to interact with the web UI.
@@ -213,7 +213,7 @@ Then open `http://localhost:7861/` on your local browser to interact with the we
 The gradio script supports the following arguments:
 
 - `--model`: Model name/path (should match the server model)
-- `--api-base`: Base URL for the vLLM API server (default: http://localhost:8091/v1)
+- `--api-base`: Base URL for the vLLM API server (default: http://localhost:8000/v1)
 - `--ip`: Host/IP for Gradio server (default: 127.0.0.1)
 - `--port`: Port for Gradio server (default: 7861)
 - `--share`: Share the Gradio demo publicly (creates a public link)

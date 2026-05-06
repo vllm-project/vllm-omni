@@ -16,7 +16,7 @@ import requests
 
 def generate_image(
     prompt: str,
-    server_url: str = "http://localhost:8091",
+    server_url: str = "http://localhost:8000",
     height: int | None = None,
     width: int | None = None,
     steps: int | None = None,
@@ -118,7 +118,7 @@ def main():
     parser = argparse.ArgumentParser(description="Qwen-Image chat client")
     parser.add_argument("--prompt", "-p", default="a cup of coffee on the table", help="Text prompt")
     parser.add_argument("--output", "-o", default="qwen_image_output.png", help="Output file")
-    parser.add_argument("--server", "-s", default="http://localhost:8091", help="Server URL")
+    parser.add_argument("--server", "-s", default="http://localhost:8000", help="Server URL")
     parser.add_argument("--height", type=int, default=1024, help="Image height")
     parser.add_argument("--width", type=int, default=1024, help="Image width")
     parser.add_argument("--steps", type=int, default=50, help="Inference steps")

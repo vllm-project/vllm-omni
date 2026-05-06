@@ -91,14 +91,14 @@ python examples/offline_inference/image_to_video/image_to_video.py \
 **Standalone HSDP** (shard model across 4 GPUs):
 
 ```bash
-vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --port 8091 \
+vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --port 8000 \
     --use-hsdp --hsdp-shard-size 4
 ```
 
 **Combined with Sequence Parallel**:
 
 ```bash
-vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --port 8091 \
+vllm serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --omni --port 8000 \
     --use-hsdp --usp 4
 ```
 
