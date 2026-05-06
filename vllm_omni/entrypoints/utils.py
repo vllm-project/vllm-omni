@@ -340,6 +340,7 @@ def resolve_model_config_path(model: str) -> str:
         normalized_model_type = _DIFFUSERS_CLASS_TO_CONFIG[model_type]
     else:
         normalized_model_type = model_type.replace("-", "_")
+
     model_type_str = f"{normalized_model_type}.yaml"
     complete_config_path = PROJECT_ROOT / default_config_path / model_type_str
     if os.path.exists(complete_config_path):

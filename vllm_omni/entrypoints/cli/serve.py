@@ -593,6 +593,7 @@ def run_headless(args: argparse.Namespace) -> None:
         model,
         args_dict.get("stage_configs_path"),
         args_dict,
+        deploy_config_path=args_dict.get("deploy_config"),
     )
 
     # Locate the stage config that matches stage_id.

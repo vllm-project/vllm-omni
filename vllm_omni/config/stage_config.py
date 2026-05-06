@@ -863,6 +863,7 @@ def merge_pipeline_deploy(
             if ds.devices is not None:
                 runtime["devices"] = ds.devices
             runtime["num_replicas"] = ds.num_replicas
+        runtime["requires_multimodal_data"] = ps.requires_multimodal_data
 
         result.append(
             StageConfig(
@@ -1077,6 +1078,15 @@ class StageConfigFactory:
         model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
         if model_type and model_type in _PIPELINE_REGISTRY:
             return cls._create_from_registry(model_type, cli_overrides, deploy_config_path)
+
+        if deploy_config_path is not None:
+            deploy_cfg = load_deploy_config(deploy_config_path)
+            if deploy_cfg.pipeline and deploy_cfg.pipeline in _PIPELINE_REGISTRY:
+                return cls._create_from_registry(
+                    deploy_cfg.pipeline,
+                    cli_overrides,
+                    deploy_config_path,
+                )
 
         # --- HF architecture fallback: some models report a generic
         # model_type that collides with another model. Match by the

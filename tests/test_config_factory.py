@@ -941,6 +941,34 @@ class TestDeployConfigLoading:
         assert stages[1].yaml_runtime["devices"] == "1,2"
         assert stages[1].yaml_runtime["num_replicas"] == 2
 
+    def test_merge_pipeline_deploy_preserves_requires_multimodal_data(self):
+        from vllm_omni.config.stage_config import (
+            DeployConfig,
+            PipelineConfig,
+            StageDeployConfig,
+            StageExecutionType,
+            StagePipelineConfig,
+            merge_pipeline_deploy,
+        )
+
+        pipeline = PipelineConfig(
+            model_type="test_mm",
+            model_arch="TestModel",
+            stages=(
+                StagePipelineConfig(
+                    stage_id=0,
+                    model_stage="ar",
+                    execution_type=StageExecutionType.LLM_AR,
+                    requires_multimodal_data=True,
+                ),
+            ),
+        )
+        deploy = DeployConfig(async_chunk=False, stages=[StageDeployConfig(stage_id=0)])
+
+        stages = merge_pipeline_deploy(pipeline, deploy)
+
+        assert stages[0].yaml_runtime["requires_multimodal_data"] is True
+
 
 class TestQwen3OmniPipeline:
     def test_registered(self):

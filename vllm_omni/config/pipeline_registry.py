@@ -65,6 +65,18 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.glm_image.pipeline",
         "GLM_IMAGE_PIPELINE",
     ),
+    "hunyuan_image3": (
+        "vllm_omni.model_executor.models.hunyuan_image3.pipeline",
+        "HUNYUAN_IMAGE3_PIPELINE",
+    ),
+    "hunyuan_image3_ar": (
+        "vllm_omni.model_executor.models.hunyuan_image3.pipeline",
+        "HUNYUAN_IMAGE3_AR_PIPELINE",
+    ),
+    "hunyuan_image3_dit": (
+        "vllm_omni.model_executor.models.hunyuan_image3.pipeline",
+        "HUNYUAN_IMAGE3_DIT_PIPELINE",
+    ),
     "voxcpm2": (
         "vllm_omni.model_executor.models.voxcpm2.pipeline",
         "VOXCPM2_PIPELINE",

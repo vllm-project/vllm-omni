@@ -17,7 +17,7 @@ PROMPT = "A brown and white dog is running on the grass"
 MODEL_NAME = "tencent/HunyuanImage-3.0"
 LOCAL_CLIP_PATH = "openai/clip-vit-base-patch32"
 REPO_ROOT = Path(__file__).resolve().parents[3]
-STAGE_CONFIG_PATH = REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "hunyuan_image3_t2i.yaml"
+DEPLOY_CONFIG_PATH = REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3.yaml"
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
 
@@ -274,7 +274,8 @@ def clip_bundle() -> tuple[CLIPModel, CLIPProcessor]:
 def omni() -> Generator[Omni, None, None]:
     with OmniRunner(
         MODEL_NAME,
-        stage_configs_path=str(STAGE_CONFIG_PATH),
+        deploy_config=str(DEPLOY_CONFIG_PATH),
+        mode="text-to-image",
     ) as runner:
         yield runner.omni
 
