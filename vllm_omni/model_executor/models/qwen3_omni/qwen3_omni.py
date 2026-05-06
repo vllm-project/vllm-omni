@@ -305,7 +305,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             "For each function call, return a json object with function name and arguments "
             "within <tool_call></tool_call> XML tags:\n"
             f"{cls.TOOL_CALL_OPEN}\n"
-            '{\"name\": <function-name>, \"arguments\": <args-json-object>}\n'
+            '{"name": <function-name>, "arguments": <args-json-object>}\n'
             f"{cls.TOOL_CALL_CLOSE}"
         )
 
@@ -347,9 +347,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     segments.append(clean)
                 for call in tool_calls:
                     args_obj = call.get("arguments", {})
-                    args_str = (
-                        args_obj if isinstance(args_obj, str) else json.dumps(args_obj)
-                    )
+                    args_str = args_obj if isinstance(args_obj, str) else json.dumps(args_obj)
                     segments.append(
                         f"{cls.TOOL_CALL_OPEN}\n"
                         f'{{"name": "{call.get("name")}", "arguments": {args_str}}}\n'
@@ -360,9 +358,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     blocks.append(f"<|im_start|>assistant\n{body}<|im_end|>")
             elif role == "tool":
                 content = item.get("content", "") or ""
-                blocks.append(
-                    f"<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>"
-                )
+                blocks.append(f"<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>")
         return "\n".join(blocks)
 
     @classmethod

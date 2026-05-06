@@ -297,11 +297,7 @@ class TestComputeTalkerPromptIdsLength:
     def test_non_last_assistant_block_skipped(self) -> None:
         # Only the LAST assistant block contributes 9 — earlier ones are skipped.
         audio_user = _block(_USER, _AUDIO_PAD, _FILLER)
-        prompt = (
-            _block(_ASSISTANT, _FILLER, _FILLER)
-            + audio_user
-            + _block(_ASSISTANT, _FILLER)
-        )
+        prompt = _block(_ASSISTANT, _FILLER, _FILLER) + audio_user + _block(_ASSISTANT, _FILLER)
         # Non-last assistant: 0; audio user: full length; last assistant: 9.
         assert compute_talker_prompt_ids_length(prompt) == len(audio_user) + 9
 
@@ -309,11 +305,6 @@ class TestComputeTalkerPromptIdsLength:
         # System + audio user + tool-response (text-only user) + last assistant.
         audio_user = _block(_USER, _AUDIO_PAD, _FILLER, _FILLER)
         tool_response_user = _block(_USER, _FILLER, _FILLER, _FILLER, _FILLER)
-        prompt = (
-            _block(_SYSTEM, _FILLER)
-            + audio_user
-            + tool_response_user
-            + _block(_ASSISTANT, _FILLER)
-        )
+        prompt = _block(_SYSTEM, _FILLER) + audio_user + tool_response_user + _block(_ASSISTANT, _FILLER)
         # Only the audio user (full length) + last assistant (+9) count.
         assert compute_talker_prompt_ids_length(prompt) == len(audio_user) + 9

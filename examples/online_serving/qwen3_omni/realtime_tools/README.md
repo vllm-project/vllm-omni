@@ -55,15 +55,14 @@ tools = [
     {
         "type": "function",
         "function": {
-            "name": "get_weather",
-            "description": "Get the current weather for a specified city",
+            "name": "get_current_weather",
+            "description": "Get the current weather for a given location.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "city": {"type": "string", "description": "The city name"},
-                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                    "location": {"type": "string", "description": "City name, e.g. Paris"},
                 },
-                "required": ["city"],
+                "required": ["location"],
             },
         },
     },
@@ -79,7 +78,7 @@ the underlying model output looks like:
 
 ```
 <tool_call>
-{"name": "get_weather", "arguments": {"city": "Paris", "unit": "celsius"}}
+{"name": "get_current_weather", "arguments": {"location": "Paris"}}
 </tool_call>
 ```
 
@@ -147,24 +146,27 @@ user line instead of a placeholder.
 
 ## Running the example
 
-`/v1/realtime` requires a deployment config with `async_chunk: false`. The
-default Qwen3-Omni config (`vllm_omni/deploy/qwen3_omni_moe.yaml`) has
-`async_chunk: true` and is therefore not usable here. A ready-to-use config
-tuned for 2× A100 80 GB is bundled alongside this README at
-`qwen3_omni_moe_realtime.yaml` — see the header of that file for the GPU
-memory math if you need to retune for different hardware.
-
-Start the server:
+`/v1/realtime` requires `async_chunk: false`. The bundled Qwen3-Omni deploy
+config ships with `async_chunk: true`, so use the small overlay yaml in this
+directory which inherits from the production config and flips that flag plus
+retunes memory for 80 GB A100s — see the file header for the GPU memory math
+if you need to retune for different hardware:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
-    --deploy-config examples/online_serving/qwen3_omni/qwen3_omni_moe_realtime.yaml
+    --deploy-config examples/online_serving/qwen3_omni/realtime_tools/qwen3_omni_moe_realtime.yaml
 ```
 
-Run the example client (mock weather + calculator tools):
+For a quick smoke test on H100 (or any GPU where the bundled memory ratios
+work) you can skip the overlay and just pass `--no-async-chunk`.
+
+Run the example client (registers a real ``get_current_weather`` tool plus a
+similarly-named ``get_city_timezone`` *trap* tool — useful for verifying the
+model picks the right tool for a weather question rather than the
+plausible-but-wrong one):
 
 ```bash
-python examples/online_serving/qwen3_omni/realtime_tools_client.py \
+python examples/online_serving/qwen3_omni/realtime_tools/realtime_tools_client.py \
     --url ws://localhost:8091/v1/realtime \
     --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
     --input-wav ask_weather.wav \
@@ -176,7 +178,7 @@ WebSocket session, demonstrating that conversation context is retained
 across turns:
 
 ```bash
-python examples/online_serving/qwen3_omni/realtime_tools_client.py \
+python examples/online_serving/qwen3_omni/realtime_tools/realtime_tools_client.py \
     --input-wav greeting.wav weather_paris.wav weather_london.wav \
     --output-wav response.wav   # writes response_turn1.wav, _turn2.wav, _turn3.wav
 ```

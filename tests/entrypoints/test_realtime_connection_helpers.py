@@ -121,11 +121,7 @@ class TestQwen3OmniRealtimeChatFormatting:
         assert '"name": "ping"' in schema
 
     def test_parse_tool_call_valid(self) -> None:
-        block = (
-            "<tool_call>\n"
-            '{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
-            "</tool_call>"
-        )
+        block = '<tool_call>\n{"name": "get_weather", "arguments": {"city": "Paris"}}\n</tool_call>'
         parsed = Qwen3OmniModel.parse_tool_call(block)
         assert parsed == {"name": "get_weather", "arguments": {"city": "Paris"}}
 
@@ -155,27 +151,25 @@ class TestQwen3OmniRealtimeChatFormatting:
         assert Qwen3OmniModel.render_history(items) == ""
 
     def test_render_history_user_block(self) -> None:
-        rendered = Qwen3OmniModel.render_history(
-            [{"role": "user", "content": "hello"}]
-        )
+        rendered = Qwen3OmniModel.render_history([{"role": "user", "content": "hello"}])
         assert rendered == "<|im_start|>user\nhello<|im_end|>"
 
     def test_render_history_tool_response_uses_user_role_wrapper(self) -> None:
         # Qwen3's chat template renders tool results as user-role blocks
         # wrapped in <tool_response>...</tool_response>.
-        rendered = Qwen3OmniModel.render_history(
-            [{"role": "tool", "call_id": "c1", "content": '{"temp": 18}'}]
-        )
+        rendered = Qwen3OmniModel.render_history([{"role": "tool", "call_id": "c1", "content": '{"temp": 18}'}])
         assert rendered.startswith("<|im_start|>user\n<tool_response>\n")
         assert '{"temp": 18}' in rendered
         assert rendered.endswith("</tool_response><|im_end|>")
 
     def test_render_history_assistant_with_tool_call(self) -> None:
-        items = [{
-            "role": "assistant",
-            "content": "Looking that up",
-            "tool_calls": [{"name": "get_weather", "arguments": {"city": "Paris"}}],
-        }]
+        items = [
+            {
+                "role": "assistant",
+                "content": "Looking that up",
+                "tool_calls": [{"name": "get_weather", "arguments": {"city": "Paris"}}],
+            }
+        ]
         rendered = Qwen3OmniModel.render_history(items)
         assert rendered.startswith("<|im_start|>assistant\n")
         assert "Looking that up" in rendered
@@ -200,11 +194,13 @@ class TestQwen3OmniRealtimeChatFormatting:
     def test_render_history_assistant_tool_call_args_already_stringified(self) -> None:
         # Some clients pass arguments as a pre-serialized JSON string;
         # render_history should not double-encode them.
-        items = [{
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"name": "f", "arguments": '{"x": 1}'}],
-        }]
+        items = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"name": "f", "arguments": '{"x": 1}'}],
+            }
+        ]
         rendered = Qwen3OmniModel.render_history(items)
         # No double-quoting / nested string of the JSON.
         assert '"arguments": {"x": 1}' in rendered
@@ -243,9 +239,7 @@ class TestQwen3OmniRealtimeChatFormatting:
         # divergence between the writer (render_history) and the reader
         # (parse_tool_call) — they share the wire format.
         original = {"name": "search", "arguments": {"q": "vllm omni", "k": 3}}
-        rendered = Qwen3OmniModel.render_history(
-            [{"role": "assistant", "content": "", "tool_calls": [original]}]
-        )
+        rendered = Qwen3OmniModel.render_history([{"role": "assistant", "content": "", "tool_calls": [original]}])
         # Extract just the <tool_call>...</tool_call> block.
         start = rendered.index(Qwen3OmniModel.TOOL_CALL_OPEN)
         end = rendered.index(Qwen3OmniModel.TOOL_CALL_CLOSE) + len(Qwen3OmniModel.TOOL_CALL_CLOSE)

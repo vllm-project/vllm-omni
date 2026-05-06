@@ -638,14 +638,18 @@ def talker2code2wav(
     Returns:
         List of OmniTokensPrompt for code2wav stage
     """
-    # Max codec tokens code2wav can process in a single step. This is set by
-    # max_num_batched_tokens in the code2wav stage config. Responses that
-    # produce codec_codes_len > this limit will be silently truncated by
-    # vLLM, causing garbled or cut-off audio. Raise the limit in the YAML
-    # if you hit the warning below.
-    _CODE2WAV_MAX_BATCHED_TOKENS = 65536  # matches stage 2 max_num_batched_tokens
-
     talker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    # Max codec tokens code2wav can process per step — read live from the
+    # code2wav stage's scheduler config so the warning threshold tracks the
+    # actual YAML value instead of a stale hardcoded number. Stage layout
+    # for Qwen3-Omni: stage 2 is code2wav.
+    code2wav_max_batched_tokens: int | None = None
+    if len(stage_list) > 2:
+        code2wav_max_batched_tokens = getattr(
+            getattr(getattr(stage_list[2], "vllm_config", None), "scheduler_config", None),
+            "max_num_batched_tokens",
+            None,
+        )
     code2wav_inputs: list[OmniTokensPrompt] = []
     # Process each talker output
     for i, talker_output in enumerate(talker_outputs):
@@ -668,14 +672,16 @@ def talker2code2wav(
         codec_codes = (
             mm["codes"]["audio"][-seq_len:].to(torch.long).transpose(0, 1).cpu().to(torch.long).reshape(-1).tolist()
         )
-        if len(codec_codes) > _CODE2WAV_MAX_BATCHED_TOKENS * 0.8:
+        if code2wav_max_batched_tokens is not None and len(codec_codes) > code2wav_max_batched_tokens * 0.8:
             logger.warning(
                 "talker2code2wav: codec_codes_len=%d is >80%% of max_num_batched_tokens=%d "
                 "(%.1fs audio). Responses approaching or exceeding the limit will be "
                 "silently truncated, producing garbled or cut-off audio. "
                 "Raise max_num_batched_tokens and max_model_len for the code2wav stage "
                 "in the YAML config if this happens.",
-                len(codec_codes), _CODE2WAV_MAX_BATCHED_TOKENS, seq_len / 75.0,
+                len(codec_codes),
+                code2wav_max_batched_tokens,
+                seq_len / 75.0,
             )
         code2wav_inputs.append(
             OmniTokensPrompt(

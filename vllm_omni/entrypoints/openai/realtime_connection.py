@@ -177,10 +177,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                 # Plain/instructions modes don't run the tool-call detection
                 # path, so a function_call_output here is from a misbehaving
                 # client — ignore rather than dispatching the audio-pass.
-                logger.warning(
-                    "Received function_call_output but no tools are configured; "
-                    "ignoring."
-                )
+                logger.warning("Received function_call_output but no tools are configured; ignoring.")
                 return
             tool_result = {
                 "role": "tool",
@@ -201,9 +198,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             return
 
         logger.info("Generating audio response with tool context")
-        self.generation_task = asyncio.create_task(
-            self._run_audio_from_tool_context(append_response=True)
-        )
+        self.generation_task = asyncio.create_task(self._run_audio_from_tool_context(append_response=True))
 
     # -------------------------------------------------------------------------
     # Generation entry point
@@ -217,18 +212,12 @@ class RealtimeConnection(VllmRealtimeConnection):
 
         # Wait briefly for the prior turn's STT so this turn's history has a
         # real transcript instead of a placeholder.
-        if (
-            self._pending_transcript_task is not None
-            and not self._pending_transcript_task.done()
-        ):
+        if self._pending_transcript_task is not None and not self._pending_transcript_task.done():
             try:
-                await asyncio.wait_for(
-                    asyncio.shield(self._pending_transcript_task), timeout=3.0
-                )
+                await asyncio.wait_for(asyncio.shield(self._pending_transcript_task), timeout=3.0)
             except asyncio.TimeoutError:
                 logger.warning(
-                    "Prior-turn transcript still pending after 3s — "
-                    "history will use placeholder for that turn"
+                    "Prior-turn transcript still pending after 3s — history will use placeholder for that turn"
                 )
         self._pending_transcript_task = None
 
@@ -251,10 +240,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         if conversation_context is None and not self.tools:
             conversation_context = self._build_system_context()
 
-        prior_blocks = (
-            self.model_cls.render_history(self.conversation_items)
-            if self.conversation_items else None
-        )
+        prior_blocks = self.model_cls.render_history(self.conversation_items) if self.conversation_items else None
 
         # Reserve a user slot whose content will be filled by the side-channel
         # STT. _build_conversation_context skips None-content items, so the slot is invisible
@@ -262,18 +248,14 @@ class RealtimeConnection(VllmRealtimeConnection):
         self._current_user_item = {"role": "user", "content": None}
         self.conversation_items.append(self._current_user_item)
 
-        self._pending_transcript_task = asyncio.create_task(
-            self._transcribe_user_audio(self._current_user_item)
-        )
+        self._pending_transcript_task = asyncio.create_task(self._transcribe_user_audio(self._current_user_item))
 
         streaming_input_gen = self.serving.transcribe_realtime(
             audio_stream, input_stream, conversation_context, prior_blocks
         )
         self.conversation_context = None
 
-        self.generation_task = asyncio.create_task(
-            self._run_generation(streaming_input_gen, input_stream)
-        )
+        self.generation_task = asyncio.create_task(self._run_generation(streaming_input_gen, input_stream))
 
     # -------------------------------------------------------------------------
     # Audio utilities (from main — delta deduplication + format conversion)
@@ -318,7 +300,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             self._realtime_audio_ref = arr.copy()
             return [arr]
         if self._numpy_audio_prefix_match(ref, arr):
-            delta = arr[ref.shape[0]:]
+            delta = arr[ref.shape[0] :]
             self._realtime_audio_ref = arr.copy()
             return [delta] if delta.size > 0 else []
         self._realtime_audio_ref = np.concatenate([ref, arr])
@@ -347,7 +329,6 @@ class RealtimeConnection(VllmRealtimeConnection):
                 chunks.extend(self._raw_waveform_to_deltas(arr))
         return chunks, int(sr)
 
-
     # Maximum raw PCM bytes per WebSocket message for response.audio.delta.
     # Base64 encoding inflates by ~4/3, so 200 KB raw → ~267 KB on the wire.
     _AUDIO_DELTA_CHUNK_BYTES: int = 200 * 1024
@@ -361,13 +342,15 @@ class RealtimeConnection(VllmRealtimeConnection):
         raw = (np.clip(chunk_f32, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
         size = self._AUDIO_DELTA_CHUNK_BYTES
         for i in range(0, max(len(raw), 1), size):
-            piece = raw[i:i + size]
+            piece = raw[i : i + size]
             if not piece:
                 break
-            await self.send(ResponseAudioDelta(
-                audio=base64.b64encode(piece).decode("utf-8"),
-                sample_rate_hz=sample_rate,
-            ))
+            await self.send(
+                ResponseAudioDelta(
+                    audio=base64.b64encode(piece).decode("utf-8"),
+                    sample_rate_hz=sample_rate,
+                )
+            )
 
     # -------------------------------------------------------------------------
     # Generation loops
@@ -407,9 +390,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                     "Audio queue drained (%d chunks) — dispatching audio pass",
                     len(self._cached_user_audio),
                 )
-                self.generation_task = asyncio.create_task(
-                    self._run_audio_from_tool_context(append_response=True)
-                )
+                self.generation_task = asyncio.create_task(self._run_audio_from_tool_context(append_response=True))
                 return
 
             else:
@@ -492,14 +473,9 @@ class RealtimeConnection(VllmRealtimeConnection):
             # transcript before we render history. Without it, render_history
             # skips the None-content user item and leaves an
             # assistant->assistant adjacency that breaks alternation.
-            if (
-                self._pending_transcript_task is not None
-                and not self._pending_transcript_task.done()
-            ):
+            if self._pending_transcript_task is not None and not self._pending_transcript_task.done():
                 try:
-                    await asyncio.wait_for(
-                        asyncio.shield(self._pending_transcript_task), timeout=2.0
-                    )
+                    await asyncio.wait_for(asyncio.shield(self._pending_transcript_task), timeout=2.0)
                 except asyncio.TimeoutError:
                     logger.warning(
                         "Side-channel transcript not done before audio pass — "
@@ -516,10 +492,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             try:
                 await asyncio.wait_for(self._audio_cached_event.wait(), timeout=5.0)
             except asyncio.TimeoutError:
-                logger.warning(
-                    "audio-pass timed out waiting for audio cache — "
-                    "proceeding with whatever is buffered"
-                )
+                logger.warning("audio-pass timed out waiting for audio cache — proceeding with whatever is buffered")
 
             # Prefer current-turn audio for acoustic conditioning; fall back
             # to the first-turn cache if the buffer is empty.
@@ -539,9 +512,7 @@ class RealtimeConnection(VllmRealtimeConnection):
 
             stage_limits: list[tuple[int, int]] = []
             try:
-                for idx, vllm_cfg in enumerate(
-                    getattr(self.engine, "stage_vllm_configs", []) or []
-                ):
+                for idx, vllm_cfg in enumerate(getattr(self.engine, "stage_vllm_configs", []) or []):
                     if vllm_cfg is None:
                         continue
                     model_config = getattr(vllm_cfg, "model_config", None)
@@ -583,8 +554,8 @@ class RealtimeConnection(VllmRealtimeConnection):
                 request_id=request_id,
                 output_modalities=["audio"],
                 sampling_params_list=coerce_param_message_types(
-                        list(self.engine.default_sampling_params_list), is_streaming=True
-                    )
+                    list(self.engine.default_sampling_params_list), is_streaming=True
+                ),
             )
 
             spoken_text = ""
@@ -604,22 +575,20 @@ class RealtimeConnection(VllmRealtimeConnection):
                     # audio pass once the function_call_output arrives.
                     tc_open = self.model_cls.TOOL_CALL_OPEN
                     tc_close = self.model_cls.TOOL_CALL_CLOSE
-                    if (
-                        not audio_pass_tool_call_detected
-                        and tc_open in spoken_text
-                        and tc_close in spoken_text
-                    ):
+                    if not audio_pass_tool_call_detected and tc_open in spoken_text and tc_close in spoken_text:
                         tc_start = spoken_text.find(tc_open)
                         tc_end = spoken_text.find(tc_close) + len(tc_close)
                         tool_call_block = spoken_text[tc_start:tc_end]
                         parsed = self.model_cls.parse_tool_call(tool_call_block)
                         if parsed:
                             tool_call_id = f"call_{uuid4().hex[:24]}"
-                            self.current_tool_calls.append({
-                                "id": tool_call_id,
-                                "name": parsed["name"],
-                                "arguments": parsed["arguments"],
-                            })
+                            self.current_tool_calls.append(
+                                {
+                                    "id": tool_call_id,
+                                    "name": parsed["name"],
+                                    "arguments": parsed["arguments"],
+                                }
+                            )
                             visible = spoken_text[:tc_start]
                             visible_clean = self.model_cls.strip_special_tokens(visible) or None
                             self.conversation_items.append(
@@ -630,19 +599,22 @@ class RealtimeConnection(VllmRealtimeConnection):
                                 }
                             )
                             args_json = json.dumps(parsed["arguments"])
-                            await self.send(ResponseFunctionCallArgumentsDelta(
-                                call_id=tool_call_id,
-                                name=parsed["name"],
-                                delta=args_json,
-                            ))
-                            await self.send(ResponseFunctionCallArgumentsDone(
-                                call_id=tool_call_id,
-                                name=parsed["name"],
-                                arguments=args_json,
-                            ))
+                            await self.send(
+                                ResponseFunctionCallArgumentsDelta(
+                                    call_id=tool_call_id,
+                                    name=parsed["name"],
+                                    delta=args_json,
+                                )
+                            )
+                            await self.send(
+                                ResponseFunctionCallArgumentsDone(
+                                    call_id=tool_call_id,
+                                    name=parsed["name"],
+                                    arguments=args_json,
+                                )
+                            )
                             logger.info(
-                                "audio-pass tool call detected at %.2fs — "
-                                "aborting; emitted %d tool call(s)",
+                                "audio-pass tool call detected at %.2fs — aborting; emitted %d tool call(s)",
                                 time.monotonic() - t_audio_start,
                                 len(self.current_tool_calls),
                             )
@@ -659,10 +631,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                     # Periodic progress: text accumulating without audio
                     # chunks ⇒ stage-1 hang; neither ticking ⇒ stage-0 hang.
                     now = time.monotonic()
-                    if (
-                        len(spoken_text) - last_progress_len > 100
-                        or now - last_progress_time > 5.0
-                    ):
+                    if len(spoken_text) - last_progress_len > 100 or now - last_progress_time > 5.0:
                         logger.info(
                             "audio-pass progress %.2fs | spoken_len=%d | audio_chunks=%d",
                             now - t_audio_start,
@@ -727,9 +696,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             if self._pending_tool_context:
                 self._pending_tool_context = False
                 logger.info("Tool result pending — dispatching follow-up audio pass")
-                self.generation_task = asyncio.create_task(
-                    self._run_audio_from_tool_context(append_response=True)
-                )
+                self.generation_task = asyncio.create_task(self._run_audio_from_tool_context(append_response=True))
 
     # -------------------------------------------------------------------------
     # Conversation helpers
@@ -813,6 +780,7 @@ class RealtimeConnection(VllmRealtimeConnection):
 
     def audio_stream_generator(self):
         """Override to cache audio chunks for replay in tool-context audio pass."""
+
         async def _gen():
             self._cached_user_audio = []
             self._audio_cached_event.clear()
@@ -840,6 +808,7 @@ class RealtimeConnection(VllmRealtimeConnection):
                     self._turn_audio_cache = list(self._cached_user_audio)
                 # Always signal — STT must not hang on early abort.
                 self._audio_cached_event.set()
+
         return _gen()
 
     # -------------------------------------------------------------------------

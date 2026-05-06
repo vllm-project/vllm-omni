@@ -1,0 +1,36 @@
+# Realtime (/v1/realtime) overlay for Qwen3-Omni-MoE on 2× A100 80 GB.
+#
+# Inherits from the production deploy at vllm_omni/deploy/qwen3_omni_moe.yaml
+# (verified for H100) and:
+#   1. Disables async_chunk — required by /v1/realtime.
+#   2. Retunes gpu_memory_utilization for 80 GB A100s. The bundled values
+#      are tuned for 80 GB H100s with different KV math; on A100 80 GB the
+#      thinker (Qwen3-30B-A3B bf16 ≈ 61 GiB) needs util < 0.23 because
+#      vLLM v1 does NOT subtract weights from the util multiplier
+#      (effective KV = util * total, stacked on top of loaded weights).
+#   3. Bumps stage-2 max_num_batched_tokens so long codec outputs from
+#      multi-turn conversations or large tool responses don't get
+#      silently truncated. talker_max_frames * 8 = ~63 K codec codes.
+#
+# Use:
+#   vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+#       --deploy-config examples/online_serving/qwen3_omni/realtime_tools/qwen3_omni_moe_realtime.yaml
+base_config: vllm_omni/deploy/qwen3_omni_moe.yaml
+
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    gpu_memory_utilization: 0.15
+    max_num_batched_tokens: 16384
+    max_model_len: 32768
+
+  - stage_id: 1
+    gpu_memory_utilization: 0.35
+    max_num_batched_tokens: 8192
+    max_model_len: 8192
+
+  - stage_id: 2
+    gpu_memory_utilization: 0.20
+    max_num_batched_tokens: 65536
+    max_model_len: 65536

@@ -13,6 +13,7 @@ import dataclasses
 import json
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -981,13 +982,17 @@ class AsyncOmniEngine:
             except Exception:
                 pass
             if post_startup_crash:
-                # The orchestrator crashed after a successful startup.  Since
-                # this thread is a daemon, the main process would otherwise
-                # keep running in a silently broken state.  Force a hard exit
-                # with code 1 so the deployment can detect the failure and
-                # restart.
-                logger.error("[AsyncOmniEngine] Orchestrator crashed post-startup; forcing process exit (code 1)")
-                os._exit(1)
+                # The orchestrator thread is a daemon; if it crashes after
+                # startup, the main process keeps running in a silently
+                # broken state. Send SIGTERM to ourselves so uvicorn /
+                # asyncio shutdown handlers run (GPU cleanup, log flush,
+                # in-flight request drains) instead of os._exit() bypassing
+                # them. The orchestrator process exits non-zero, which is
+                # the signal the deployment watches for.
+                logger.error(
+                    "[AsyncOmniEngine] Orchestrator crashed post-startup; raising SIGTERM for graceful shutdown"
+                )
+                os.kill(os.getpid(), signal.SIGTERM)
             raise
         finally:
             try:
