@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
@@ -54,6 +56,35 @@ class TestLazyLoading:
         keys = set(_PIPELINE_REGISTRY)
         assert "qwen2_5_omni" in keys
         assert "qwen3_omni_moe" in keys
+
+    def test_iteration_resilience(self, monkeypatch, caplog):
+        # Synthetic failure to verify iteration robustness against load errors.
+        target_logger = logging.getLogger("vllm_omni.config.stage_config")
+        target_logger.addHandler(caplog.handler)
+        prev_level = target_logger.level
+        target_logger.setLevel(logging.ERROR)
+        try:
+            monkeypatch.setattr(
+                _PIPELINE_REGISTRY,
+                "_lazy_map",
+                {
+                    "healthy": ("vllm_omni.model_executor.models.qwen2_5_omni.pipeline", "QWEN2_5_OMNI_PIPELINE"),
+                    "broken": ("vllm_omni.non_existent_module", "SomeConfig"),
+                    "attr_fail": ("vllm_omni.config.stage_config", "NON_EXISTENT_VAR"),
+                },
+            )
+
+            # Assert that list(_PIPELINE_REGISTRY.values()) and dict(_PIPELINE_REGISTRY.items())
+            # both yield only healthy entries.
+            healthy_instance = _PIPELINE_REGISTRY["healthy"]
+            assert list(_PIPELINE_REGISTRY.values()) == [healthy_instance]
+            assert dict(_PIPELINE_REGISTRY.items()) == {"healthy": healthy_instance}
+            assert "Failed to import pipeline module" in caplog.text
+            assert "Pipeline variable 'NON_EXISTENT_VAR' not found" in caplog.text
+
+        finally:
+            target_logger.removeHandler(caplog.handler)
+            target_logger.setLevel(prev_level)
 
 
 class TestDynamicRegistration:
