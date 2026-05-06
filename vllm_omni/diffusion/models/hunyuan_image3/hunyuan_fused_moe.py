@@ -29,21 +29,6 @@ class HunyuanFusedMoEDefault(FusedMoE):
     def __init__(self, *, prefix: str = "", **kwargs: Any) -> None:
         super().__init__(prefix=prefix, **kwargs)
         self._prefix = prefix
-        # NOTE: prior to vLLM 0.20, this class registered a forward pre-hook
-        # that called ``self.quant_method.process_weights_after_loading(self)``
-        # on first forward to compensate for the standard model loader not
-        # invoking it on FusedMoE layers. Since vLLM 0.20, the standard loader
-        # invokes ``process_weights_after_loading`` model-wide
-        # (``model_executor/model_loader/base_loader.py``), so re-running it
-        # from a forward hook double-applies non-idempotent in-place
-        # transforms (``_maybe_pad_weight`` re-pads, ``_setup_kernel``
-        # re-configures the moe_kernel oracle on already-padded weights),
-        # corrupting w13/w2 layout and producing a layer-wise expert-dispatch
-        # bias that surfaces as a "painterly" style drift on DiT image output.
-        # The unquantized FusedMoE method has no
-        # ``_already_called_process_weights_after_loading`` guard (only the
-        # FP8 quant method does), so non-quantized HunyuanImage3 reliably
-        # trips this. Hook deliberately not registered.
 
     def forward(self, hidden_states: Any, router_logits: Any) -> Any:
         _set_forward_context_num_tokens(hidden_states.shape[0])
