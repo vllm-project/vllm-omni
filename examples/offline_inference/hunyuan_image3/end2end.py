@@ -149,7 +149,7 @@ def main():
     for p in prompts:
         token_ids = build_prompt_tokens(p, tokenizer, task=task, sys_type=args.sys_type)
 
-        prompt_dict: dict = {"prompt_token_ids": token_ids}
+        prompt_dict: dict = {"prompt_token_ids": token_ids, "prompt": p}
 
         if args.modality == "text2img":
             prompt_dict["modalities"] = ["image"]

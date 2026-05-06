@@ -286,28 +286,23 @@ class _LazyPipelineRegistry:
 
         try:
             module = importlib.import_module(module_path)
-        except ImportError as exc:
-            logger.error(
-                "Failed to import pipeline module %r for %r: %s",
-                module_path,
-                model_type,
-                exc,
-            )
+            pipeline = getattr(module, var_name, None)
+            if pipeline is None:
+                logger.error(
+                    "Pipeline variable %r not found in module %r (registered for %r)",
+                    var_name,
+                    module_path,
+                    model_type,
+                )
+                return None
+            errors = pipeline.validate()
+            if errors:
+                logger.warning("Pipeline %s has issues: %s", pipeline.model_type, errors)
+            self._loaded[model_type] = pipeline
+            return pipeline
+        except Exception:
+            logger.exception("Failed to import pipeline module %r for %r", module_path, model_type)
             return None
-        pipeline = getattr(module, var_name, None)
-        if pipeline is None:
-            logger.error(
-                "Pipeline variable %r not found in module %r (registered for %r)",
-                var_name,
-                module_path,
-                model_type,
-            )
-            return None
-        errors = pipeline.validate()
-        if errors:
-            logger.warning("Pipeline %s has issues: %s", pipeline.model_type, errors)
-        self._loaded[model_type] = pipeline
-        return pipeline
 
     def __contains__(self, model_type: str) -> bool:
         if model_type in self._loaded:
@@ -353,14 +348,23 @@ class _LazyPipelineRegistry:
     def keys(self) -> set[str]:
         return set(self._get_lazy_map().keys()) | set(self._loaded.keys())
 
+    def _safe_get(self, key: str) -> PipelineConfig | None:
+        try:
+            return self[key]
+        except Exception:
+            logger.warning("Skipping pipeline %r because it failed to load.", key)
+        return None
+
     def values(self):
-        # Iterating values forces load of every lazy pipeline.
+        # Iterating forces a lazy import for each pipeline; failures are logged and skipped.
         for key in self.keys():
-            yield self[key]
+            if (p := self._safe_get(key)) is not None:
+                yield p
 
     def items(self):
         for key in self.keys():
-            yield key, self[key]
+            if (p := self._safe_get(key)) is not None:
+                yield key, p
 
     def __iter__(self):
         return iter(self.keys())
