@@ -10,22 +10,15 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 
 
 def tokens2audio(
-    stage_list: list[Any],
-    engine_input_source: list[int],
-    prompt: OmniTokensPrompt | TextPrompt = None,
-    requires_multimodal_data: bool = True,
+    source_outputs: list[Any],
+    _prompt: OmniTokensPrompt | TextPrompt = None,
+    _requires_multimodal_data: bool = True,
 ):
     """Build stage-1 (decoder) inputs from stage-0 (generator) outputs.
 
     Takes the 8-codebook audio tokens from the generator and packages
     them for the HiggsAudioV2 decoder.
     """
-    source_stage_id = engine_input_source[0]
-    source_outputs = stage_list[source_stage_id].engine_outputs
-
-    if not isinstance(prompt, list):
-        prompt = [prompt]
-
     source_output = source_outputs[0]
     output = source_output.outputs[0]
 
