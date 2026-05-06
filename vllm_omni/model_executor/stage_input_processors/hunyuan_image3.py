@@ -75,7 +75,7 @@ def ar2diffusion(
 
         height = original_prompt.get("height", 1024)
         width = original_prompt.get("width", 1024)
-        text_prompt = original_prompt.get("user_prompt") or original_prompt.get("prompt", "")
+        text_prompt = original_prompt.get("prompt", "")
         use_system_prompt = original_prompt.get("use_system_prompt")
 
         logger.info(
