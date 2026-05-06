@@ -106,9 +106,7 @@ class OmniBase(PDDisaggregationMixin):
         kwargs: dict[str, Any] = {k: v for k, v in vars(args).items() if not k.startswith("_")}
 
         if parser is not None and not getattr(parser, "_omni_nullified", False):
-            from vllm_omni.engine.arg_utils import (
-                deploy_override_field_names,
-            )
+            from vllm_omni.config.stage_config import deploy_override_field_names
             from vllm_omni.entrypoints.utils import detect_explicit_cli_keys
 
             explicit = detect_explicit_cli_keys(sys.argv[1:], parser) or set()
