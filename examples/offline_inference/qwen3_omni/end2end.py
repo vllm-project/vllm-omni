@@ -389,6 +389,13 @@ def main(args):
             output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
 
             # Convert to numpy array and ensure correct format
+            # In async_chunk mode, audio may arrive as a list of chunks
+            if isinstance(audio_tensor, list):
+                import torch
+
+                audio_tensor = torch.cat(
+                    [(t if isinstance(t, torch.Tensor) else torch.tensor(t)).flatten() for t in audio_tensor]
+                )
             audio_numpy = audio_tensor.float().detach().cpu().numpy()
 
             # Ensure audio is 1D (flatten if needed)

@@ -19,7 +19,6 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeCode2WavDecoderBlock,
     Qwen3OmniMoeCode2WavTransformerModel,
     Qwen3OmniMoeConvNeXtBlock,
-    SnakeBeta,
 )
 from vllm.config import VllmConfig  # type: ignore
 from vllm.logger import init_logger  # type: ignore
@@ -27,6 +26,8 @@ from vllm.model_executor.models.utils import (  # type: ignore
     AutoWeightsLoader,
     WeightsMapper,
 )
+
+from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 
 logger = init_logger(__name__)
 
@@ -119,6 +120,61 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         ]
         self.decoder = nn.ModuleList(decoder)
 
+        # CUDA Graph support — reuses CUDAGraphDecoderWrapper from Qwen3-TTS
+        self._cudagraph_enabled = False
+        self._cudagraph_wrapper = None
+
+    def precompute_snake_caches(self):
+        """Precompute exp(alpha) and 1/(exp(beta)+eps) for all SnakeBeta modules."""
+        count = 0
+        for module in self.modules():
+            if isinstance(module, SnakeBeta):
+                module.precompute_exp_cache()
+                count += 1
+        if count > 0:
+            logger.info("Precomputed exp caches for %d SnakeBeta activations", count)
+
+    def enable_cudagraph(
+        self,
+        device: torch.device | None = None,
+        codec_chunk_frames: int = 0,
+        codec_left_context_frames: int = 0,
+    ):
+        """Enable CUDA graph acceleration (same pattern as Qwen3-TTS Code2Wav)."""
+        from vllm_omni.model_executor.models.qwen3_tts.cuda_graph_decoder_wrapper import (
+            CUDAGraphDecoderWrapper,
+        )
+
+        if device is None:
+            device = next(self.parameters()).device
+        if device.type != "cuda":
+            logger.warning("Cannot enable CUDA Graph: not on CUDA device (got %s)", device)
+            return
+
+        wrapper = CUDAGraphDecoderWrapper(
+            decoder=self,
+            num_quantizers=self.config.num_quantizers,
+            enabled=True,
+        )
+        try:
+            wrapper.warmup(
+                device,
+                dtype=torch.long,
+                codec_chunk_frames=codec_chunk_frames,
+                codec_left_context_frames=codec_left_context_frames,
+            )
+        except Exception:
+            self._cudagraph_wrapper = None
+            self._cudagraph_enabled = False
+            raise
+        self._cudagraph_wrapper = wrapper
+        self._cudagraph_enabled = True
+        logger.info(
+            "CUDA Graph enabled for Code2Wav: num_quantizers=%d, sizes=%s",
+            self.config.num_quantizers,
+            self._cudagraph_wrapper.capture_sizes,
+        )
+
     def forward(self, codes: torch.Tensor) -> torch.Tensor:
         """
         Convert num_quantizers-layer RVQ codes to audio waveform.
@@ -168,6 +224,8 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
         Decode long sequences in chunks to avoid OOM.
 
         Uses overlapping chunks with left context to avoid boundary artifacts.
+        When CUDA graphs are enabled, delegates chunk-level decoding to the
+        CUDAGraphDecoderWrapper for reduced kernel launch overhead.
 
         Args:
             codes: [batch, num_quantizers, seq_len] - num_quantizers-layer RVQ codes
@@ -180,35 +238,40 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
                 codes. For ``batch_size == 1``, this is a list containing a
                 single tensor with shape ``[1, waveform_len]``.
         """
-        wavs = []
-        start_index = 0
+        # Use CUDA graph wrapper for chunk-level decode when available
+        if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
+            batch_wav = self._cudagraph_wrapper.chunked_decode_with_cudagraph(codes, chunk_size, left_context_size)
+        else:
+            wavs = []
+            start_index = 0
 
-        while start_index < codes.shape[-1]:
-            end_index = min(start_index + chunk_size, codes.shape[-1])
-            context_size = left_context_size if start_index >= left_context_size else start_index
+            while start_index < codes.shape[-1]:
+                end_index = min(start_index + chunk_size, codes.shape[-1])
+                context_size = left_context_size if start_index >= left_context_size else start_index
 
-            # Extract chunk with left context
-            codes_chunk = codes[..., start_index - context_size : end_index]
+                # Extract chunk with left context
+                codes_chunk = codes[..., start_index - context_size : end_index]
 
-            # Decode chunk
-            wav_chunk = self(codes_chunk)
+                # Decode chunk
+                wav_chunk = self(codes_chunk)
 
-            # Remove context from output (context_size * total_upsample samples)
-            wavs.append(wav_chunk[..., context_size * self.total_upsample :])
+                # Remove context from output (context_size * total_upsample samples)
+                wavs.append(wav_chunk[..., context_size * self.total_upsample :])
 
-            start_index = end_index
+                start_index = end_index
+
+            batch_wav = torch.cat(wavs, dim=-1)
 
         if seq_token_counts is not None:
             code_seq_lens = [seq_len // self.config.num_quantizers for seq_len in seq_token_counts]
         else:
             # Fallback: assume all batch elements share the same sequence length.
             code_seq_lens = [codes.shape[-1]] * codes.shape[0]
-        batch_wav = torch.cat(wavs, dim=-1)
-        wavs = []
+        result = []
         for idx, code_seq_len in enumerate(code_seq_lens):
             wav_chunk = batch_wav[idx, :, : code_seq_len * self.total_upsample]
-            wavs.append(wav_chunk)
-        return wavs
+            result.append(wav_chunk)
+        return result
 
     def chunked_decode_streaming(
         self,
@@ -241,7 +304,10 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
             left_context_size = [0] * codes.shape[0]
         # Decode chunk
         wavs = []
-        batch_wav = self(codes)
+        if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
+            batch_wav = self._cudagraph_wrapper.decode(codes)
+        else:
+            batch_wav = self(codes)
         if seq_token_counts is not None:
             code_seq_lens = [n // self.config.num_quantizers for n in seq_token_counts]
         else:
