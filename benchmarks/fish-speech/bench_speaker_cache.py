@@ -3,11 +3,11 @@
 Measures TTFP improvement from DAC-code caching when using uploaded voices.
 
 Setup:
-  1. Start vllm-omni with Fish Speech S2 Pro (use our feat branch)
+  1. Start vllm-omni with Fish Speech S2 Pro
   2. Provide a reference audio file for voice cloning
 
 Usage:
-    python bench_voice_cache.py \
+    python bench_speaker_cache.py \
         --ref-audio /path/to/reference.wav \
         --ref-text "Transcript of the reference audio." \
         --num-prompts 20 \

@@ -90,36 +90,23 @@ def _ensure_list(x):
     return list(x)
 
 
-def _validate_stage_inputs(stage_list, engine_input_source):
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-
-    stage_id = engine_input_source[0]
-    if stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {stage_id}")
-
-    stage = stage_list[stage_id]
-    if stage.engine_outputs is None:
-        raise RuntimeError(f"Stage {stage_id} has no outputs yet")
-
-    return stage.engine_outputs
-
-
 # =========================
 # PD disaggregation helpers
 # =========================
 
 
-def _get_prefill_stage(stage_list: list[Any], source_stage_id: int) -> Any | None:
-    if source_stage_id <= 0:
+def _get_prefill_multimodal_output(
+    request_id: str,
+    streaming_context: Any | None,
+) -> dict[str, Any] | None:
+    bridge_states = getattr(streaming_context, "bridge_states", None)
+    if not isinstance(bridge_states, dict):
         return None
-    source_stage = stage_list[source_stage_id]
-    if not getattr(source_stage, "is_decode_only", False):
+    by_req = bridge_states.get("pd_prefill_multimodal_output_by_req")
+    if not isinstance(by_req, dict):
         return None
-    prev_stage = stage_list[source_stage_id - 1]
-    if getattr(prev_stage, "is_prefill_only", False) and prev_stage.engine_outputs is not None:
-        return prev_stage
-    return None
+    prefill_mm = by_req.get(request_id)
+    return prefill_mm if isinstance(prefill_mm, dict) else None
 
 
 def _merge_pd_embeddings(
@@ -165,16 +152,6 @@ def _merge_pd_embeddings(
     merged_emb = torch.cat([p_emb, decode_emb[overlap:]], dim=0)
     merged_hid = torch.cat([p_hid, decode_hid[overlap:]], dim=0)
     return merged_emb, merged_hid
-
-
-def _get_prefill_multimodal_output(prefill_stage: Any, output_index: int) -> dict[str, Any] | None:
-    """Return multimodal_output dict from the PD prefill stage for a given batch index."""
-    try:
-        prefill_eos = prefill_stage.engine_outputs
-        prefill_eo = prefill_eos[min(output_index, len(prefill_eos) - 1)]
-        return prefill_eo.outputs[0].multimodal_output
-    except Exception:
-        return None
 
 
 def _resolve_tts_token_embedding(
@@ -407,8 +384,7 @@ def thinker2talker_async_chunk(
 
 
 def thinker2talker(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+    source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | None = None,
     requires_multimodal_data: bool = False,
     streaming_context: Any | None = None,
@@ -425,22 +401,16 @@ def thinker2talker(
     decode-stage generated embeddings before handing off to the talker.
 
     Args:
-        stage_list: List of stage objects
-        engine_input_source: Source stage IDs (typically [0] for thinker)
         prompt: Original prompt data
         requires_multimodal_data: Whether multimodal data is required
 
     Returns:
         List of OmniTokensPrompt for talker stage
     """
-    thinker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    thinker_outputs = source_outputs
     talker_inputs: list[OmniTokensPrompt] = []
 
     device = torch.device(current_platform.device_type)
-
-    # PD disaggregation: look up the preceding prefill stage (if any)
-    source_stage_id = engine_input_source[0]
-    prefill_stage = _get_prefill_stage(stage_list, source_stage_id)
 
     # Process each thinker output
     for i, thinker_output in enumerate(thinker_outputs):
@@ -478,8 +448,7 @@ def thinker2talker(
         thinker_hid = hid_layer.detach().to(device=device, dtype=torch.float)[-new_seq_length:]
 
         prefill_mm: dict[str, Any] | None = None
-        if prefill_stage is not None:
-            prefill_mm = _get_prefill_multimodal_output(prefill_stage, i)
+        prefill_mm = _get_prefill_multimodal_output(req_id, streaming_context)
 
         if prefill_mm is not None:
             expected_total = len(prompt_token_ids) + len(output_ids)
@@ -610,10 +579,9 @@ def talker2code2wav_async_chunk(
 
 
 def talker2code2wav(
-    stage_list: list[Any],
-    engine_input_source: list[int],
-    prompt: OmniTokensPrompt | TextPrompt | None = None,
-    requires_multimodal_data: bool = False,
+    source_outputs: list[Any],
+    _prompt: OmniTokensPrompt | TextPrompt | None = None,
+    _requires_multimodal_data: bool = False,
     streaming_context: Any | None = None,
 ) -> list[OmniTokensPrompt]:
     """
@@ -625,15 +593,10 @@ def talker2code2wav(
     3. Package for code2wav stage
 
     Args:
-        stage_list: List of stage objects
-        engine_input_source: Source stage IDs (typically [1] for talker)
-        prompt: Original prompt data
-        requires_multimodal_data: Whether multimodal data is required
-
     Returns:
         List of OmniTokensPrompt for code2wav stage
     """
-    talker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    talker_outputs = source_outputs
     code2wav_inputs: list[OmniTokensPrompt] = []
     # Process each talker output
     for i, talker_output in enumerate(talker_outputs):

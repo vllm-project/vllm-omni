@@ -19,6 +19,7 @@ from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 from vllm_omni.diffusion.sched import RequestScheduler
 from vllm_omni.diffusion.stage_diffusion_proc import StageDiffusionProc
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
@@ -34,7 +35,11 @@ def _tagged_output(tag: str) -> DiffusionOutput:
 
 def _mock_request(tag: str):
     """Return a lightweight request object identifiable by *tag*."""
-    return SimpleNamespace(request_ids=[tag])
+    return SimpleNamespace(
+        request_ids=[tag],
+        prompts=[f"prompt_{tag}"],
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+    )
 
 
 def _make_executor(num_gpus: int = 1):
@@ -406,7 +411,7 @@ class TestCollectiveRpcTimeoutWhileLockHeld:
         t.start()
 
         # Wait until request execution is truly inside the lock and blocking.
-        add_req_blocked.wait(5)
+        assert add_req_blocked.wait(5)
 
         # collective_rpc should time out at lock acquisition, not hang.
         with pytest.raises(TimeoutError):
@@ -615,6 +620,29 @@ class TestStageDiffusionClientErrorPropagation:
         assert result is None
         assert client._shutting_down is True
         assert client._engine_dead is True
+
+    def test_initialize_client_requires_replica_id(self):
+        from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+
+        client = object.__new__(StageDiffusionClient)
+        metadata = SimpleNamespace(
+            stage_id=0,
+            final_output=True,
+            final_output_type="image",
+            default_sampling_params=None,
+            requires_multimodal_data=False,
+            custom_process_input_func=None,
+            engine_input_source=[],
+        )
+
+        with pytest.raises(AttributeError, match="replica_id"):
+            client._initialize_client(
+                metadata,
+                "tcp://req",
+                "tcp://resp",
+                proc=None,
+                batch_size=1,
+            )
 
 
 # ───────── monitor thread & death sentinel integration tests ─────────

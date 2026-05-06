@@ -70,8 +70,14 @@ def omni_snapshot_download(model_id: str) -> str:
             allow_patterns=["*"],
             require_all=True,
         )
+    except huggingface_hub.errors.GatedRepoError:
+        raise ValueError(
+            f"Access to model '{model_id}' is restricted. "
+            f"Visit https://huggingface.co/{model_id} to accept "
+            f"the license and request access."
+        )
     except huggingface_hub.errors.RepositoryNotFoundError:
-        logger.warning("Repository not found for '%s'.", model_id)
+        raise ValueError(f"Repository not found for '{model_id}'. Please check the model name or path.")
     except PermissionError:
         logger.warning(
             "Permission denied when downloading '%s'. Assuming the model is already cached locally.",
@@ -100,9 +106,7 @@ class OmniBase(PDDisaggregationMixin):
         kwargs: dict[str, Any] = {k: v for k, v in vars(args).items() if not k.startswith("_")}
 
         if parser is not None and not getattr(parser, "_omni_nullified", False):
-            from vllm_omni.engine.arg_utils import (
-                deploy_override_field_names,
-            )
+            from vllm_omni.config.stage_config import deploy_override_field_names
             from vllm_omni.entrypoints.utils import detect_explicit_cli_keys
 
             explicit = detect_explicit_cli_keys(sys.argv[1:], parser) or set()

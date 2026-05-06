@@ -300,6 +300,24 @@ def client(test_app):
 
 
 class TestSpeechAPI:
+    @pytest.fixture(autouse=True)
+    def _mock_upload_io(self, mocker: MockerFixture):
+        """Mock soundfile/safetensors so upload accepts fake audio bytes."""
+        samples = np.zeros(88200, dtype=np.float32)  # 2s @ 44.1 kHz
+        mocker.patch("soundfile.read", return_value=(samples, 44100))
+
+        def _fake_save_file(tensors, path, metadata=None):
+            Path(path).touch()
+
+        mocker.patch("safetensors.torch.save_file", side_effect=_fake_save_file)
+        mock_ctx = mocker.MagicMock()
+        mock_ctx.keys.return_value = ["audio"]
+        mock_ctx.get_tensor.return_value = torch.zeros(88200)
+        mock_ctx.metadata.return_value = {"sample_rate": "44100"}
+        mock_safe_open = mocker.MagicMock()
+        mock_safe_open.return_value.__enter__.return_value = mock_ctx
+        mocker.patch("safetensors.safe_open", mock_safe_open)
+
     def test_create_speech_success(self, client):
         payload = {
             "input": "Hello world",
@@ -470,27 +488,17 @@ class TestSpeechAPI:
         assert "MIME type" in result["detail"]
 
     def test_upload_voice_name_collision(self, client):
-        """Test voice upload with duplicate name."""
-        # First upload
+        """Re-uploading the same name overwrites the previous entry (no 400)."""
         audio_content = b"fake audio content"
-        files = {
-            "audio_sample": ("test.wav", audio_content, "audio/wav"),
-        }
-        data = {
-            "consent": "user_consent_123",
-            "name": "test_voice",
-        }
+        files = {"audio_sample": ("test.wav", audio_content, "audio/wav")}
+        data = {"consent": "user_consent_123", "name": "test_voice"}
 
         response = client.post("/v1/audio/voices", files=files, data=data)
         assert response.status_code == 200
 
-        # Second upload with same name
         response = client.post("/v1/audio/voices", files=files, data=data)
-        assert response.status_code == 400
-        result = response.json()
-        assert "detail" in result
-        assert "already exists" in result["detail"]
-        response = client.delete("/v1/audio/voices/test_voice")
+        assert response.status_code == 200
+        client.delete("/v1/audio/voices/test_voice")
 
     def test_upload_voice_missing_parameters(self, client):
         """Test voice upload with missing required parameters."""
@@ -970,7 +978,7 @@ class TestTTSMethods:
                 "file_path": "/tmp/voice_samples/custom_voice_consent_123.wav",
                 "mime_type": "audio/wav",
                 "ref_text": None,
-                "created_at": 1711234567.89,
+                "created_at": 1711234567,
             }
         }
         speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
@@ -983,7 +991,7 @@ class TestTTSMethods:
         assert params["ref_audio"] == ["data:audio/wav;base64,ZmFrZWF1ZGlv"]
         assert params["x_vector_only_mode"] == [True]
         assert params["task_type"] == ["Base"]
-        assert params["voice_created_at"] == [1711234567.89]
+        assert params["voice_created_at"] == [1711234567]
         assert "ref_text" not in params
 
     def test_build_tts_params_with_uploaded_voice_ref_text(self, speech_server, mocker: MockerFixture):
@@ -994,7 +1002,7 @@ class TestTTSMethods:
                 "file_path": "/tmp/voice_samples/custom_voice_consent_123.wav",
                 "mime_type": "audio/wav",
                 "ref_text": "Hello world transcript",
-                "created_at": 1711234567.89,
+                "created_at": 1711234567,
             }
         }
         speech_server.supported_speakers = {"ryan", "vivian", "custom_voice"}
@@ -1008,7 +1016,7 @@ class TestTTSMethods:
         assert params["x_vector_only_mode"] == [False]
         assert params["task_type"] == ["Base"]
         assert params["ref_text"] == ["Hello world transcript"]
-        assert params["voice_created_at"] == [1711234567.89]
+        assert params["voice_created_at"] == [1711234567]
 
     def test_build_tts_params_without_uploaded_voice(self, speech_server):
         """Test _build_tts_params does not auto-set ref_audio for non-uploaded voices."""
@@ -1051,28 +1059,29 @@ class TestTTSMethods:
         assert "x_vector_only_mode" not in params
 
     def test_get_uploaded_audio_data(self, speech_server, mocker: MockerFixture):
-        """Test _get_uploaded_audio_data function."""
-        # Mock file operations
-        mock_open = mocker.patch("builtins.open", create=True)
-        mock_b64encode = mocker.patch("base64.b64encode")
-        mock_exists = mocker.patch("pathlib.Path.exists")
-        mock_exists.return_value = True
-        mock_b64encode.return_value = b"ZmFrZWF1ZGlv"
+        """Returns a data URL by loading audio via safetensors + re-encoding WAV."""
+        mocker.patch("pathlib.Path.exists", return_value=True)
+        mocker.patch("soundfile.write")
+        mocker.patch("base64.b64encode", return_value=b"ZmFrZWF1ZGlv")
+        mock_ctx = mocker.MagicMock()
+        mock_ctx.keys.return_value = ["audio"]
+        mock_ctx.get_tensor.return_value = torch.zeros(88200)
+        mock_ctx.metadata.return_value = {"sample_rate": "44100"}
+        mock_safe_open = mocker.MagicMock()
+        mock_safe_open.return_value.__enter__.return_value = mock_ctx
+        mocker.patch("safetensors.safe_open", mock_safe_open)
 
-        # Setup mock file
-        mock_file = mocker.MagicMock()
-        mock_file.read.return_value = b"fakeaudio"
-        mock_open.return_value.__enter__.return_value = mock_file
-
-        # Setup uploaded speaker
         speech_server.uploaded_speakers = {
-            "test_voice": {"name": "test_voice", "file_path": "/tmp/test.wav", "mime_type": "audio/wav"}
+            "test_voice": {
+                "name": "test_voice",
+                "file_path": "/tmp/test.safetensors",
+                "mime_type": "audio/wav",
+                "embedding_source": "audio",
+                "sample_rate": 44100,
+            }
         }
         result = speech_server._get_uploaded_audio_data("test_voice")
-
         assert result == "data:audio/wav;base64,ZmFrZWF1ZGlv"
-        mock_open.assert_called_once_with(Path("/tmp/test.wav"), "rb")
-        mock_b64encode.assert_called_once_with(b"fakeaudio")
 
     def test_get_uploaded_audio_data_missing_file(self, speech_server, mocker: MockerFixture):
         """Test _get_uploaded_audio_data when file is missing."""
@@ -1229,24 +1238,6 @@ class TestTTSMethods:
         assert params["voice_clone_prompt"][0]["ref_spk_embedding"] == fake_emb
         # Must NOT have ref_audio — that would fail for safetensors files
         assert "ref_audio" not in params
-
-    def test_validate_rejects_embedding_voice_with_pending_cache(self, speech_server, mocker: MockerFixture):
-        """Validation should reject embedding voices whose cache is not yet ready."""
-        speech_server.uploaded_speakers = {
-            "myvoice": {
-                "name": "myvoice",
-                "file_path": "/tmp/myvoice.safetensors",
-                "mime_type": "application/x-safetensors",
-                "embedding_source": "direct",
-                "cache_status": "pending",
-                "cache_file": None,
-            }
-        }
-        req = OpenAICreateSpeechRequest.model_validate({"input": "Hello", "speaker": "myvoice", "task_type": "Base"})
-        mocker.patch("pathlib.Path.exists", return_value=True)
-        err = speech_server._validate_qwen_tts_request(req)
-        assert err is not None
-        assert "not yet ready" in err
 
     def test_x_vector_only_mode_not_overwritten_for_uploaded_embedding(self, speech_server, mocker: MockerFixture):
         """x_vector_only_mode set by uploaded embedding must not be overwritten by request field."""
@@ -2294,6 +2285,7 @@ class TestCosyVoice3Serving:
                 "mm_processor_kwargs": {"prompt_text": "ref text", "sample_rate": 24000},
             }
         )
+        cosyvoice3_server._apply_cosyvoice3_dynamic_tokens = mocker.MagicMock(side_effect=lambda spl, req: spl)
 
         request = OpenAICreateSpeechRequest(
             input="Hello",

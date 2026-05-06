@@ -342,7 +342,7 @@ def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
         engine_outputs=[SimpleNamespace(outputs=[output], finished=True)],
     )
 
-    prompts = talker2code2wav(stage_list=[stage], engine_input_source=[0])
+    prompts = talker2code2wav(stage.engine_outputs)
 
     assert len(prompts) == 1
     prompt = prompts[0]
@@ -388,7 +388,7 @@ def test_non_async_processor_filters_out_of_range_codec_values():
         engine_outputs=[SimpleNamespace(outputs=[output], finished=True)],
     )
 
-    prompts = talker2code2wav(stage_list=[stage], engine_input_source=[0])
+    prompts = talker2code2wav(stage.engine_outputs)
 
     assert len(prompts) == 1
     prompt = prompts[0]
