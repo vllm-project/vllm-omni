@@ -2,7 +2,7 @@
 Offline inference regression tests: Qwen3-TTS _estimate_prompt_len.
 
 Covers the four ref_audio input forms handled by the estimator in
-examples/offline_inference/qwen3_tts/end2end.py:
+examples/offline_inference/text_to_speech/qwen3_tts/end2end.py:
   - bare local path
   - file:// URI
   - http:// URL
@@ -20,7 +20,9 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-_examples_dir = str(Path(__file__).parent.parent.parent.parent / "examples" / "offline_inference" / "qwen3_tts")
+_examples_dir = str(
+    Path(__file__).parent.parent.parent.parent / "examples" / "offline_inference" / "text_to_speech" / "qwen3_tts"
+)
 sys.path.insert(0, _examples_dir)
 from end2end import _estimate_prompt_len  # noqa: E402
 

@@ -211,8 +211,8 @@ See `plan/voxcpm2_native_ar_design.md`.
 
 - Model files in `vllm_omni/model_executor/models/<model_name>/`
 - Stage config YAML
-- Working `end2end.py` with correct audio output
-- README.md in the example directory
+- Working `end2end.py` at `examples/offline_inference/text_to_speech/<model>/end2end.py`
+- New section in `examples/offline_inference/text_to_speech/README.md` (table row + per-model section). Do **not** create a top-level `examples/offline_inference/<model>/` dir or a per-model `README.md` inside `text_to_speech/<model>/` — the hub README is the documented surface and the mkdocs `generate_examples` hook only descends one level into `examples/<category>/`.
 
 ## Phase 3: Online Serving
 
@@ -308,11 +308,11 @@ def build_voice_clone_prompt(ref_audio_path: str, text: str, codec) -> list:
 ### Deliverables
 
 - Updated `serving_speech.py` with all 5 integration points (single commit)
-- Client scripts and server launcher
-- Gradio demo with streaming and voice cloning UI
+- Client scripts and server launcher under `examples/online_serving/text_to_speech/<model>/`
+- Gradio demo with streaming and voice cloning UI in the same dir
 - E2E online serving test (`tests/e2e/online_serving/test_<model>.py`)
 - Buildkite CI entry in `.buildkite/test-merge.yml`
-- Documentation (offline + online serving docs)
+- New section in `examples/online_serving/text_to_speech/README.md` (table row + per-model section). Do **not** create a top-level `examples/online_serving/<model>/` dir or a per-model `README.md` inside `text_to_speech/<model>/`.
 
 ### E2E test pitfalls to avoid
 

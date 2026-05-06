@@ -141,11 +141,12 @@ def apply_sequential_offload(
         ... )
         >>> # Modules of pipeline now automatically swap between CPU and GPU
     """
-    # Register hooks on DiT modules (offload encoders when DiT runs)
-    for dit_mod in dit_modules:
+    # Register hooks on DiT modules (offload encoders AND other DiTs when a DiT runs)
+    for i, dit_mod in enumerate(dit_modules):
+        other_dits = [d for j, d in enumerate(dit_modules) if j != i]
         registry = HookRegistry.get_or_create(dit_mod)
         hook = SequentialOffloadHook(
-            offload_targets=encoder_modules,
+            offload_targets=encoder_modules + other_dits,
             device=device,
             pin_memory=pin_memory,
             use_hsdp=use_hsdp,

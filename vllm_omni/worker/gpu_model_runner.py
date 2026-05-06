@@ -270,6 +270,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.num_prompt_logprobs.pop(req_id, None)
             if hasattr(self, "_downstream_payload_cache"):
                 self._downstream_payload_cache.pop(req_id, None)
+            if hasattr(self, "_talker_mtp_generators"):
+                self._talker_mtp_generators.pop(req_id, None)
 
         if hasattr(self, "late_interaction_runner"):
             self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
@@ -1384,35 +1386,41 @@ class OmniGPUModelRunner(GPUModelRunner):
         subtalker_params = getattr(self.vllm_config.model_config, "subtalker_sampling_params", None)
         if not isinstance(subtalker_params, dict):
             subtalker_params = {}
-        # Extract seed from the first request's sampling params for Fast AR
-        # determinism. NOTE: when batch_size > 1, all requests share the first
-        # request's seed. Per-request Fast AR seeding requires row-by-row
-        # torch.multinomial calls and is left as a follow-up optimisation.
-        _seed = None
+        generator = None
         if decode_req_ids:
-            _first_sp = getattr(self.requests[decode_req_ids[0]], "sampling_params", None)
-            if _first_sp is not None and getattr(_first_sp, "seed", None) is not None:
-                _seed = _first_sp.seed
-            # Warn when batched requests have different seeds.
-            if len(decode_req_ids) > 1 and _seed is not None:
-                _other_seeds = {
+            first_req_id = decode_req_ids[0]
+            first_sp = getattr(self.requests[first_req_id], "sampling_params", None)
+            extra_args = getattr(first_sp, "extra_args", None) if first_sp is not None else None
+            seed = extra_args.get("qwen3_tts_request_seed") if isinstance(extra_args, dict) else None
+            if len(decode_req_ids) > 1 and seed is not None:
+                other_seeds = {
                     getattr(getattr(self.requests[rid], "sampling_params", None), "seed", None)
                     for rid in decode_req_ids[1:]
                 }
-                if _other_seeds != {_seed}:
+                if other_seeds != {seed}:
                     logger.warning(
                         "Fast AR seed: batch has mixed seeds; using first request's seed=%d for all %d requests.",
-                        _seed,
+                        seed,
                         len(decode_req_ids),
                     )
+            if seed is not None:
+                generators = getattr(self, "_talker_mtp_generators", None)
+                if generators is None:
+                    generators = {}
+                    self._talker_mtp_generators = generators
+                generator = generators.get(first_req_id)
+                if generator is None or generator.device != req_input_ids.device:
+                    generator = torch.Generator(device=req_input_ids.device)
+                    generator.manual_seed(int(seed))
+                    generators[first_req_id] = generator
         talker_kwargs = {
             "do_sample": subtalker_params.get("do_sample"),
             "temperature": subtalker_params.get("temperature"),
             "top_k": subtalker_params.get("top_k"),
             "top_p": subtalker_params.get("top_p"),
         }
-        if _seed is not None:
-            talker_kwargs["seed"] = _seed
+        if generator is not None:
+            talker_kwargs["generator"] = generator
         with set_forward_context(
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):

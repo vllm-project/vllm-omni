@@ -1329,7 +1329,7 @@ class AsyncOmniEngine:
         final_output_type = "audio" if model_class_name and supports_audio_output(model_class_name) else "image"
 
         stage_engine_args = {
-            "max_num_seqs": 1,
+            "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
             "model_class_name": kwargs.get("model_class_name", None),
             "step_execution": kwargs.get("step_execution", False),

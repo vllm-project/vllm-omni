@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from vllm_omni.config.stage_config import (
-    _EXECUTION_TYPE_TO_SCHEDULER,
     _PIPELINE_REGISTRY,
     ModelPipeline,
     PipelineConfig,
@@ -20,6 +19,7 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
     StageType,
+    _resolve_scheduler,
     build_stage_runtime_overrides,
     register_pipeline,
     strip_parent_engine_args,
@@ -93,6 +93,7 @@ class TestStageConfig:
         assert omega_config.engine_args.worker_type == "ar"
         assert omega_config.final_output is True
         assert omega_config.final_output_type == "text"
+        assert "max_num_seqs" not in omega_config.engine_args
         # Legacy field name for backward compatibility
         assert omega_config.engine_input_source == []
 
@@ -145,6 +146,24 @@ class TestStageConfig:
         )
         omega_config = config.to_omegaconf()
         assert omega_config.engine_args.max_num_seqs == 32
+
+    def test_to_omegaconf_omits_none_deploy_overrides_for_engine_args(self):
+        """None deploy overrides must fall through to EngineArgs defaults."""
+        from vllm_omni.config.stage_config import deploy_override_field_names
+
+        config = StageConfig(
+            stage_id=0,
+            model_stage="thinker",
+            runtime_overrides={name: None for name in deploy_override_field_names()},
+        )
+
+        omega_config = config.to_omegaconf()
+        engine_args = dict(omega_config.engine_args)
+
+        assert "devices" not in engine_args
+        assert "max_batch_size" not in engine_args
+        for name in deploy_override_field_names() - {"devices"}:
+            assert name not in engine_args
 
 
 class TestModelPipeline:
@@ -768,25 +787,29 @@ class TestPipelineConfigNew:
         p = PipelineConfig(model_type="t", model_arch="A")
         assert any("no stages" in e.lower() for e in p.validate())
 
-    def test_get_scheduler_cls(self):
-        p = PipelineConfig(
-            model_type="t",
-            model_arch="A",
-            stages=(
-                StagePipelineConfig(stage_id=0, model_stage="a", execution_type=StageExecutionType.LLM_AR),
-                StagePipelineConfig(
-                    stage_id=1, model_stage="b", execution_type=StageExecutionType.LLM_GENERATION, input_sources=(0,)
-                ),
-            ),
-        )
-        assert "OmniARScheduler" in p.get_scheduler_cls(0)
-        assert "OmniGenerationScheduler" in p.get_scheduler_cls(1)
 
-
-class TestExecutionTypeToScheduler:
-    def test_all_types_mapped(self):
+class TestResolveScheduler:
+    def test_all_execution_types_handled(self):
         for et in StageExecutionType:
-            assert et in _EXECUTION_TYPE_TO_SCHEDULER
+            _resolve_scheduler(et)
+
+    def test_ar_sync_when_false(self):
+        cls = _resolve_scheduler(StageExecutionType.LLM_AR, async_scheduling=False)
+        assert cls is not None
+        assert "Async" not in cls.__name__
+
+    def test_ar_async_when_true(self):
+        cls = _resolve_scheduler(StageExecutionType.LLM_AR, async_scheduling=True)
+        assert cls is not None
+        assert "Async" in cls.__name__
+
+    def test_generation(self):
+        cls = _resolve_scheduler(StageExecutionType.LLM_GENERATION)
+        assert cls is not None
+        assert "Generation" in cls.__name__
+
+    def test_diffusion_returns_none(self):
+        assert _resolve_scheduler(StageExecutionType.DIFFUSION) is None
 
 
 class TestPipelineRegistry:
@@ -802,20 +825,79 @@ class TestPipelineRegistry:
 
 
 class TestDeployConfigLoading:
-    def test_load_deploy_config(self):
+    def test_deploy_override_fields_include_deploy_schema_fields(self):
+        from vllm_omni.config.stage_config import deploy_override_field_names
+
+        expected_fields = {
+            "async_chunk",
+            "async_scheduling",
+            "compilation_config",
+            "config_format",
+            "data_parallel_size",
+            "devices",
+            "disable_hybrid_kv_cache_manager",
+            "distributed_executor_backend",
+            "dtype",
+            "enable_chunked_prefill",
+            "enable_flashinfer_autotune",
+            "enable_prefix_caching",
+            "enforce_eager",
+            "gpu_memory_utilization",
+            "load_format",
+            "max_model_len",
+            "max_num_batched_tokens",
+            "max_num_seqs",
+            "mm_processor_cache_gb",
+            "pipeline_parallel_size",
+            "profiler_config",
+            "quantization",
+            "skip_mm_profiling",
+            "subtalker_sampling_params",
+            "tensor_parallel_size",
+            "tokenizer_mode",
+            "trust_remote_code",
+        }
+
+        actual_fields = deploy_override_field_names()
+        assert expected_fields == actual_fields, (
+            f"added={actual_fields - expected_fields}, removed={expected_fields - actual_fields}"
+        )
+
+    def test_load_qwen3_omni_moe_deploy_config(self):
         from pathlib import Path
 
         from vllm_omni.config.stage_config import load_deploy_config
 
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
-        if not deploy_path.exists():
-            pytest.skip("Deploy config not found")
-
         deploy = load_deploy_config(deploy_path)
         assert len(deploy.stages) == 3
         assert deploy.async_chunk is True
         assert deploy.connectors is not None
         assert deploy.platforms is not None
+
+    def test_load_voxtral_tts_deploy_config_schema_fields(self):
+        from pathlib import Path
+
+        from vllm_omni.config.stage_config import load_deploy_config
+
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "voxtral_tts.yaml"
+        deploy = load_deploy_config(deploy_path)
+        assert deploy.stages[0].config_format == "mistral"
+        assert deploy.stages[0].load_format == "mistral"
+        assert deploy.stages[0].tokenizer_mode == "mistral"
+        assert not any(
+            name in deploy.stages[0].engine_extras for name in ("config_format", "load_format", "tokenizer_mode")
+        )
+
+    def test_load_ming_flash_omni_deploy_config_schema_fields(self):
+        from pathlib import Path
+
+        from vllm_omni.config.stage_config import load_deploy_config
+
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni.yaml"
+        deploy = load_deploy_config(deploy_path)
+        assert deploy.stages[0].compilation_config == {"pass_config": {"fuse_allreduce_rms": False}}
+        assert "compilation_config" not in deploy.stages[0].engine_extras
 
     def test_merge_pipeline_deploy(self):
         from pathlib import Path
@@ -1167,7 +1249,8 @@ class TestBaseConfigInheritance:
         deploy = load_deploy_config(ci_path)
         assert len(deploy.stages) == 3
         # CI overrides
-        assert deploy.stages[0].engine_extras.get("load_format") == "dummy"
+        assert deploy.stages[0].load_format == "dummy"
+        assert "load_format" not in deploy.stages[0].engine_extras
         assert deploy.stages[0].max_num_seqs == 5
         # Inherited from base
         assert deploy.stages[0].gpu_memory_utilization == 0.9
@@ -1372,7 +1455,7 @@ class TestSentinelDefaultPrecedence:
     def test_none_value_skipped_yaml_wins(self):
         stages = self._stages({"max_num_seqs": None})
         assert stages[2].runtime_overrides.get("max_num_seqs") is None
-        assert stages[2].yaml_engine_args.get("max_num_seqs") == 1
+        assert "max_num_seqs" not in stages[2].yaml_engine_args
 
     def test_empty_kwargs_yaml_only(self):
         stages = self._stages({})
