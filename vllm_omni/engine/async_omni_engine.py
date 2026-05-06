@@ -36,6 +36,7 @@ from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config.stage_config import strip_parent_engine_args
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.diffusion_engine import supports_audio_output
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.diffusion.stage_diffusion_proc import (
     complete_diffusion_handshake,
@@ -1294,9 +1295,12 @@ class AsyncOmniEngine:
             ring_degree = normalized_kwargs.get("ring_degree") or 1
             ulysses_mode = normalized_kwargs.get("ulysses_mode") or "strict"
             sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
+            pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
+            data_parallel_size = normalized_kwargs.get("data_parallel_size") or 1
             tensor_parallel_size = normalized_kwargs.get("tensor_parallel_size") or 1
             cfg_parallel_size = normalized_kwargs.get("cfg_parallel_size") or 1
             vae_patch_parallel_size = normalized_kwargs.get("vae_patch_parallel_size") or 1
+            enable_expert_parallel = normalized_kwargs.get("enable_expert_parallel") or False
             use_hsdp = normalized_kwargs.get("use_hsdp", False)
             hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
             hsdp_replicate_size = normalized_kwargs.get("hsdp_replicate_size", 1)
@@ -1304,9 +1308,10 @@ class AsyncOmniEngine:
                 sequence_parallel_size = ulysses_degree * ring_degree
 
             parallel_config = DiffusionParallelConfig(
-                pipeline_parallel_size=1,
-                data_parallel_size=1,
+                pipeline_parallel_size=pipeline_parallel_size,
+                data_parallel_size=data_parallel_size,
                 tensor_parallel_size=tensor_parallel_size,
+                enable_expert_parallel=enable_expert_parallel,
                 sequence_parallel_size=sequence_parallel_size,
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
@@ -1320,9 +1325,11 @@ class AsyncOmniEngine:
 
         num_devices = max(1, int(parallel_config.world_size))
         devices = ",".join(str(i) for i in range(num_devices))
+        model_class_name = kwargs.get("model_class_name", None)
+        final_output_type = "audio" if model_class_name and supports_audio_output(model_class_name) else "image"
 
         stage_engine_args = {
-            "max_num_seqs": 1,
+            "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
             "model_class_name": kwargs.get("model_class_name", None),
             "step_execution": kwargs.get("step_execution", False),
@@ -1333,7 +1340,7 @@ class AsyncOmniEngine:
             "enable_cache_dit_summary": kwargs.get("enable_cache_dit_summary", False),
             "enable_cpu_offload": kwargs.get("enable_cpu_offload", False),
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
-            "enforce_eager": kwargs.get("enforce_eager", False),
+            "enforce_eager": False if kwargs.get("enforce_eager") is None else kwargs.get("enforce_eager"),
             "boundary_ratio": kwargs.get("boundary_ratio", None),
             "flow_shift": kwargs.get("flow_shift", None),
             "diffusion_load_format": kwargs.get("diffusion_load_format", "default"),
@@ -1376,7 +1383,7 @@ class AsyncOmniEngine:
                 "engine_args": stage_engine_args,
                 "default_sampling_params": stage_default_sampling_params,
                 "final_output": True,
-                "final_output_type": "image",
+                "final_output_type": final_output_type,
             }
         ]
         default_stage_cfg[0]["engine_args"]["model_stage"] = "diffusion"

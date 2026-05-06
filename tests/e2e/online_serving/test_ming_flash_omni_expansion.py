@@ -16,7 +16,7 @@ from tests.helpers.media import (
     generate_synthetic_video,
 )
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
@@ -29,22 +29,10 @@ _SKIP_NEED_4_H100_NOT_CI = pytest.mark.skip(
 
 models = ["Jonathan1909/Ming-flash-omni-2.0"]
 
+# Use thinker-only topology to test text outputs
+_CI_DEPLOY = get_deploy_config_path("ci/ming_flash_omni_thinker_only.yaml")
 
-def get_eager_config():
-    path = modify_stage_config(
-        get_deploy_config_path("bailingmm_moe_v2_lite_ci.yaml"),
-        updates={
-            "stage_args": {
-                0: {
-                    "engine_args.enforce_eager": "true",
-                },
-            },
-        },
-    )
-    return path
-
-
-stage_configs = [get_eager_config()]
+stage_configs = [_CI_DEPLOY]
 
 # Create parameter combinations for model and stage config
 test_params = [

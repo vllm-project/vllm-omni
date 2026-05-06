@@ -12,7 +12,7 @@ from vllm.distributed.parallel_state import (
     init_model_parallel_group as vllm_init_model_parallel_group,
 )
 from vllm_ascend.ascend_forward_context import MoECommType
-from vllm_ascend.ops.fused_moe.fused_moe import AscendSharedFusedMoE
+from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE
 from vllm_ascend.ops.fused_moe.moe_comm_method import _MoECommMethods
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
@@ -103,7 +103,11 @@ def prepare_hunyuan_fused_moe_runtime() -> None:
     _ensure_forward_context_attr("flash_comm_v1_enabled", bool, False)
 
 
-class AscendHunyuanFusedMoE(AscendSharedFusedMoE):
+# NOTE: vLLM v0.20.0 folded SharedFusedMoE into FusedMoE, and vllm-ascend in turn
+# removed AscendSharedFusedMoE — the shared-experts / gate / multistream-overlap
+# paths now live directly on AscendFusedMoE and are activated by passing
+# shared_experts= as a kwarg.
+class AscendHunyuanFusedMoE(AscendFusedMoE):
     def __init__(self, *, prefix: str = "", **kwargs: Any) -> None:
         super().__init__(prefix=prefix, **kwargs)
         self._prefix = prefix

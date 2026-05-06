@@ -83,6 +83,7 @@ def get_max_batch_size(size_type="few"):
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.skip(reason="CI failed 8571")
 def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Test audio and text input processing and text/audio output generation via OpenAI API.

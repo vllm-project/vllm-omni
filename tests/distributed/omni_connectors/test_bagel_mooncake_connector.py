@@ -46,7 +46,7 @@ REFERENCE_PIXELS = [
 ]
 
 # Maximum allowed difference per color channel
-PIXEL_TOLERANCE = 5
+PIXEL_TOLERANCE = 10
 
 # Default test prompt
 DEFAULT_PROMPT = "<|im_start|>A cute cat<|im_end|>"

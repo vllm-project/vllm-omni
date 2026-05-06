@@ -221,8 +221,8 @@ class TestSpeakerEmbedding1_7B:
     @pytest.mark.advanced_model
     @pytest.mark.tts
     @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_1024_dim_on_1_7b_model_rejected_or_errors(self, omni_server) -> None:
-        """1024-dim embedding on a 1.7B model (expects 2048) should fail gracefully."""
+    def test_1024_dim_on_1_7b_model_rejected(self, omni_server) -> None:
+        """1024-dim speaker_embedding on a 1.7B model (expects 2048) should fail gracefully."""
         url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech"
         payload = {
             "model": omni_server.model,
@@ -237,6 +237,6 @@ class TestSpeakerEmbedding1_7B:
             response = client.post(url, json=payload)
 
         # Wrong dimensions should produce an error, not silent garbage.
-        assert response.status_code != 200 or len(response.content) < MIN_AUDIO_BYTES, (
-            "Expected failure or degenerate output with wrong embedding dimensions"
-        )
+        assert response.status_code == 400, f"Expected 400, got {response.status_code}: {response.text}"
+        assert "speaker_embedding has 1024 dimensions" in response.text
+        assert "expected 2048" in response.text

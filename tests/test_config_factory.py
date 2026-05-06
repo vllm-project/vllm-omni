@@ -11,7 +11,6 @@ from pathlib import Path
 import pytest
 
 from vllm_omni.config.stage_config import (
-    _EXECUTION_TYPE_TO_SCHEDULER,
     _PIPELINE_REGISTRY,
     ModelPipeline,
     PipelineConfig,
@@ -20,6 +19,7 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
     StageType,
+    _resolve_scheduler,
     build_stage_runtime_overrides,
     register_pipeline,
     strip_parent_engine_args,
@@ -768,25 +768,29 @@ class TestPipelineConfigNew:
         p = PipelineConfig(model_type="t", model_arch="A")
         assert any("no stages" in e.lower() for e in p.validate())
 
-    def test_get_scheduler_cls(self):
-        p = PipelineConfig(
-            model_type="t",
-            model_arch="A",
-            stages=(
-                StagePipelineConfig(stage_id=0, model_stage="a", execution_type=StageExecutionType.LLM_AR),
-                StagePipelineConfig(
-                    stage_id=1, model_stage="b", execution_type=StageExecutionType.LLM_GENERATION, input_sources=(0,)
-                ),
-            ),
-        )
-        assert "OmniARScheduler" in p.get_scheduler_cls(0)
-        assert "OmniGenerationScheduler" in p.get_scheduler_cls(1)
 
-
-class TestExecutionTypeToScheduler:
-    def test_all_types_mapped(self):
+class TestResolveScheduler:
+    def test_all_execution_types_handled(self):
         for et in StageExecutionType:
-            assert et in _EXECUTION_TYPE_TO_SCHEDULER
+            _resolve_scheduler(et)
+
+    def test_ar_sync_when_false(self):
+        cls = _resolve_scheduler(StageExecutionType.LLM_AR, async_scheduling=False)
+        assert cls is not None
+        assert "Async" not in cls.__name__
+
+    def test_ar_async_when_true(self):
+        cls = _resolve_scheduler(StageExecutionType.LLM_AR, async_scheduling=True)
+        assert cls is not None
+        assert "Async" in cls.__name__
+
+    def test_generation(self):
+        cls = _resolve_scheduler(StageExecutionType.LLM_GENERATION)
+        assert cls is not None
+        assert "Generation" in cls.__name__
+
+    def test_diffusion_returns_none(self):
+        assert _resolve_scheduler(StageExecutionType.DIFFUSION) is None
 
 
 class TestPipelineRegistry:
@@ -995,6 +999,162 @@ class TestQwen3TTSPipeline:
             "top_k": 32,
             "top_p": 1.0,
         }
+
+
+class TestMingFlashOmniPipeline:
+    def test_registered(self):
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+
+        p = _PIPELINE_REGISTRY.get("ming_flash_omni")
+        assert p is not None
+        assert p.model_arch == "MingFlashOmniForConditionalGeneration"
+        assert len(p.stages) == 2
+        assert p.validate() == []
+
+    def test_thinker_stage(self):
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+
+        s = _PIPELINE_REGISTRY["ming_flash_omni"].get_stage(0)
+        assert s.model_stage == "thinker"
+        assert s.execution_type == StageExecutionType.LLM_AR
+        assert s.owns_tokenizer is True
+        assert s.requires_multimodal_data is True
+        assert s.engine_output_type == "text"
+        assert s.hf_config_name == "llm_config"
+        assert s.sampling_constraints["detokenize"] is True
+
+    def test_talker_stage(self):
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+
+        s = _PIPELINE_REGISTRY["ming_flash_omni"].get_stage(1)
+        assert s.model_stage == "ming_tts"
+        assert s.execution_type == StageExecutionType.LLM_GENERATION
+        assert s.input_sources == (0,)
+        assert s.final_output_type == "audio"
+        assert s.engine_output_type == "audio"
+        assert s.hf_config_name == "talker_config"
+        # Per-stage model_arch override (Ming talker has its own self-contained LLM)
+        assert s.model_arch == "MingFlashOmniTalkerForConditionalGeneration"
+        assert s.tokenizer_subdir == "talker/llm"
+        assert s.custom_process_input_func is not None
+
+    def test_talker_stage_processor_wiring_resolves(self):
+        """The custom_process_input_func string must point to a real callable.
+
+        Lazy string references only fail at first inference otherwise — this
+        catches typos in the pipeline declaration at import / registration time.
+        """
+        import importlib
+
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+
+        s = _PIPELINE_REGISTRY["ming_flash_omni"].get_stage(1)
+        module_path, _, attr = s.custom_process_input_func.rpartition(".")
+        module = importlib.import_module(module_path)
+        assert callable(getattr(module, attr))
+
+    def test_tts_pipeline_registered(self):
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+
+        p = _PIPELINE_REGISTRY.get("ming_flash_omni_tts")
+        assert p is not None
+        assert p.model_arch == "MingFlashOmniTalkerForConditionalGeneration"
+        assert len(p.stages) == 1
+        assert p.validate() == []
+
+    def test_tts_stage(self):
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+
+        s = _PIPELINE_REGISTRY["ming_flash_omni_tts"].get_stage(0)
+        assert s.model_stage == "ming_tts"
+        assert s.execution_type == StageExecutionType.LLM_GENERATION
+        assert s.input_sources == ()
+        assert s.owns_tokenizer is True
+        assert s.final_output_type == "audio"
+        assert s.engine_output_type == "audio"
+        assert s.hf_config_name == "talker_config"
+        assert s.tokenizer_subdir == "talker/llm"
+
+    def test_full_yaml_loads_and_merges(self):
+        """deploy/ming_flash_omni.yaml parses and merges with the registered pipeline."""
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni.yaml"
+        if not deploy_path.exists():
+            pytest.skip("ming_flash_omni deploy yaml not found")
+
+        deploy = load_deploy_config(deploy_path)
+        assert len(deploy.stages) == 2
+        assert deploy.async_chunk is False
+        assert deploy.pipeline == "ming_flash_omni"
+        # We won't test stage 0/1 colocation contract here,
+        # as there could exist more variant of custom device setup
+
+        pipeline = _PIPELINE_REGISTRY["ming_flash_omni"]
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        assert len(stages) == 2
+        assert stages[0].yaml_engine_args["model_arch"] == "MingFlashOmniForConditionalGeneration"
+        assert stages[1].yaml_engine_args["model_arch"] == "MingFlashOmniTalkerForConditionalGeneration"
+
+    def test_tts_yaml_loads_and_merges(self):
+        """deploy/ming_flash_omni_tts.yaml parses and routes to the TTS-only pipeline."""
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni_tts.yaml"
+        if not deploy_path.exists():
+            pytest.skip("ming_flash_omni_tts deploy yaml not found")
+
+        deploy = load_deploy_config(deploy_path)
+        assert len(deploy.stages) == 1
+        assert deploy.pipeline == "ming_flash_omni_tts"
+
+        pipeline = _PIPELINE_REGISTRY["ming_flash_omni_tts"]
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        assert len(stages) == 1
+        assert stages[0].yaml_engine_args["model_arch"] == "MingFlashOmniTalkerForConditionalGeneration"
+
+    def test_thinker_only_pipeline_registered(self):
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+
+        p = _PIPELINE_REGISTRY.get("ming_flash_omni_thinker_only")
+        assert p is not None
+        assert p.model_arch == "MingFlashOmniForConditionalGeneration"
+        assert len(p.stages) == 1
+        assert p.validate() == []
+
+    def test_thinker_only_stage(self):
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+
+        s = _PIPELINE_REGISTRY["ming_flash_omni_thinker_only"].get_stage(0)
+        assert s.model_stage == "thinker"
+        assert s.execution_type == StageExecutionType.LLM_AR
+        assert s.input_sources == ()
+        assert s.owns_tokenizer is True
+        assert s.requires_multimodal_data is True
+        assert s.final_output_type == "text"
+        assert s.engine_output_type == "text"
+        assert s.hf_config_name == "llm_config"
+        assert s.sampling_constraints["detokenize"] is True
+
+    def test_thinker_only_yaml_loads_and_merges(self):
+        """deploy/ming_flash_omni_thinker_only.yaml parses and routes to the thinker-only pipeline."""
+        import vllm_omni.model_executor.models.ming_flash_omni.pipeline  # noqa: F401
+        from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+
+        deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "ming_flash_omni_thinker_only.yaml"
+        if not deploy_path.exists():
+            pytest.skip("ming_flash_omni_thinker_only deploy yaml not found")
+
+        deploy = load_deploy_config(deploy_path)
+        assert len(deploy.stages) == 1
+        assert deploy.pipeline == "ming_flash_omni_thinker_only"
+
+        pipeline = _PIPELINE_REGISTRY["ming_flash_omni_thinker_only"]
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        assert len(stages) == 1
+        assert stages[0].yaml_engine_args["model_arch"] == "MingFlashOmniForConditionalGeneration"
 
 
 class TestBaseConfigInheritance:
