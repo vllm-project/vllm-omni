@@ -261,6 +261,8 @@ class AsyncOmniEngine:
             ea_dict.pop("model", None)
             kwargs = {**ea_dict, **kwargs}
 
+        self.tokenizer: str | None = kwargs.get("tokenizer")
+
         # ------------------------------------------------------------------ #
         # Single-stage mode detection                                        #
         # ------------------------------------------------------------------ #
@@ -485,6 +487,7 @@ class AsyncOmniEngine:
                     stage_cfg,
                     self.model,
                     stage_connector_spec=stage_connector_spec,
+                    cli_tokenizer=getattr(self, "tokenizer", None),
                 )
                 omni_conn_cfg, omni_from, omni_to = omni_kv_connector
                 if omni_conn_cfg:
@@ -654,6 +657,7 @@ class AsyncOmniEngine:
                                 stage_cfg,
                                 self.model,
                                 stage_connector_spec=plan.stage_connector_spec,
+                                cli_tokenizer=getattr(self, "tokenizer", None),
                             )
                             lock_fds = acquire_device_locks(
                                 plan.metadata.stage_id,

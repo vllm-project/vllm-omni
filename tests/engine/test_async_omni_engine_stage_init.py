@@ -563,6 +563,78 @@ def test_initialize_llm_replica_passes_stage_init_timeout_to_complete_stage_hand
     assert captured_timeout == 302
 
 
+def test_async_omni_engine_reads_tokenizer_from_engine_args(monkeypatch):
+    import vllm_omni.engine.async_omni_engine as engine_mod
+
+    class DummyThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return False
+
+    fake_engine_args = types.SimpleNamespace(
+        _explicit_fields=frozenset({"tokenizer"}),
+        explicit_kwargs=lambda: {"tokenizer": "/tokenizer/from-engine-args"},
+    )
+
+    monkeypatch.setattr(engine_mod.threading, "Thread", DummyThread)
+    monkeypatch.setattr(
+        AsyncOmniEngine,
+        "_resolve_stage_configs",
+        lambda self, model, kwargs: ("dummy-config", [types.SimpleNamespace(engine_args={})]),
+    )
+    monkeypatch.setattr(AsyncOmniEngine, "_wait_for_orchestrator_init", lambda *_, **__: None)
+
+    engine = AsyncOmniEngine("dummy-model", engine_args=fake_engine_args)
+
+    assert engine.tokenizer == "/tokenizer/from-engine-args"
+    engine.shutdown()
+
+
+def test_build_engine_args_cli_tokenizer_overrides_inferred_base_tokenizer(tmp_path):
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "llm"},
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(
+        stage_cfg,
+        str(tmp_path),
+        cli_tokenizer="/external/tokenizer",
+    )
+
+    assert engine_args["model"] == os.path.join(str(tmp_path), "llm")
+    assert engine_args["tokenizer"] == "/external/tokenizer"
+
+
+def test_build_engine_args_keeps_stage_owned_tokenizer_subdir(tmp_path):
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict
+
+    stage_cfg = types.SimpleNamespace(
+        stage_id=0,
+        stage_type="llm",
+        engine_args={"model_subdir": "llm", "tokenizer_subdir": "tokenizer"},
+        default_sampling_params={},
+    )
+
+    engine_args = build_engine_args_dict(
+        stage_cfg,
+        str(tmp_path),
+        cli_tokenizer="/external/tokenizer",
+    )
+
+    assert engine_args["model"] == os.path.join(str(tmp_path), "llm")
+    assert engine_args["tokenizer"] == os.path.join(str(tmp_path), "tokenizer")
+
+
 def test_build_stage0_input_processor_uses_omni_input_preprocessor(monkeypatch):
     import vllm_omni.engine.stage_init_utils as init_mod
 

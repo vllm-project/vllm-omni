@@ -438,10 +438,9 @@ class OrchestratorArgs:
     parallel_config: Any = None
 
     # === Multi-stage guards ===
-    # --tokenizer is captured here so it does not propagate to every stage
-    # uniformly (different stages often need different tokenizers, e.g.
-    # qwen3_omni thinker vs talker). Users wanting a per-stage tokenizer
-    # should set it in the deploy YAML.
+    # --tokenizer is captured by the orchestrator and forwarded to stages
+    # only when the stage does not define tokenizer/tokenizer_subdir itself.
+    # Users wanting a per-stage tokenizer should set it in the deploy YAML.
     tokenizer: str | None = None
 
 
