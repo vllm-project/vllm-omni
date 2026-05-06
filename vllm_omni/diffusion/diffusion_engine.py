@@ -71,6 +71,13 @@ def supports_multimodal_input(od_config: OmniDiffusionConfig) -> tuple[bool, boo
     return supports_image_input, supports_audio_input
 
 
+def supports_camera_pos_input(model_class_name: str) -> bool:
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return False
+    return bool(getattr(model_cls, "support_camera_pos_input", False))
+
+
 def image_color_format(model_class_name: str) -> str:
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
     return getattr(model_cls, "color_format", "RGB")
@@ -691,6 +698,27 @@ class DiffusionEngine:
             dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
             prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
 
+            audio_duration_sec = 4
+            audio_array = np.random.randn(audio_sr * audio_duration_sec).astype(np.float32)
+            dummy_audio = audio_array[audio_sr * 1 : audio_sr * 3]
+        else:
+            dummy_audio = None
+
+        if supports_camera_pos_input(self.od_config.model_class_name):
+            camera_pos_len = 64
+            # Shape [N x 4]
+            intrinsics = np.random.rand(camera_pos_len, 4)
+            # Shape [N x 4 x 4]
+            poses = np.array([np.identity(4) for _ in range(camera_pos_len)])
+
+            dummy_camera_pos = {"intrinsics": intrinsics, "poses": poses}
+        else:
+            dummy_camera_pos = None
+
+        prompt: OmniTextPrompt = {
+            "prompt": "dummy run",
+            "multi_modal_data": {"image": dummy_image, "audio": dummy_audio, "camera": dummy_camera_pos},
+        }
         req = OmniDiffusionRequest(
             prompts=[prompt],
             request_ids=["dummy_req_id"],

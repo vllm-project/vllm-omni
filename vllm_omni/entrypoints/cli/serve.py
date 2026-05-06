@@ -544,6 +544,19 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable AR stage profiler to include AR stage timing in stage_durations.",
         )
+
+        omni_config_group.add_argument(
+            "--ws-max-size",
+            type=int,
+            default=1_048_576, # 1MB
+            help="Change max size of a websocket payload that is accepted by the server",
+        )
+        omni_config_group.add_argument(
+            "ws",
+            default="auto",
+            help="Set the websocket Protocol type",
+        )
+
         # Stash via type(self) so the docs hook (which execs this function in a
         # sandboxed globals dict via ``DummySelf``) doesn't fail on a NameError.
         type(self)._parser = serve_parser
