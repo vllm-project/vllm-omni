@@ -188,6 +188,13 @@ _OMNI_MODELS = {
         "EarTTSForCausalLM",
 >>>>>>> 6cb8d457 (eartts: initial commit)
     ),
+    ## NemotronDuplexH (NemotronH + ASR head, used as the LLM stage in the
+    ## FastConformer + Nemotron + EarTTS S2S pipeline).
+    "NemotronDuplexHForCausalLM": (
+        "nemotron_duplex_h",
+        "nemotron_duplex_h",
+        "NemotronDuplexHForCausalLM",
+    ),
     "DyninOmniForConditionalGeneration": (
         "dynin_omni",
         "dynin_omni",
