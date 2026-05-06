@@ -57,6 +57,13 @@ def _get_ref_audio_b64() -> str:
     return f"data:audio/wav;base64,{audio_data['base64']}"
 
 
+def get_prompt(prompt_type="text"):
+    prompts = {
+        "text": "The weather is nice today, perfect for a walk in the park.",
+    }
+    return prompts.get(prompt_type, prompts["text"])
+
+
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
 class TestOmniVoiceTTS:
     """E2E tests for OmniVoice TTS model."""
@@ -66,7 +73,7 @@ class TestOmniVoiceTTS:
         """Test auto voice TTS generation (text only, no reference audio)."""
         request_config = {
             "model": omni_server.model,
-            "input": "Hello, this is a test of the OmniVoice text to speech system.",
+            "input": get_prompt("text"),
             "response_format": "wav",
             "timeout": 180.0,
             "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
@@ -84,7 +91,7 @@ class TestOmniVoiceVoiceCloning:
         """Test voice cloning with ref_audio only (x_vector mode)."""
         request_config = {
             "model": omni_server.model,
-            "input": "Hello, this is a voice cloning test.",
+            "input": get_prompt("text"),
             "ref_audio": _get_ref_audio_b64(),
             "response_format": "wav",
             "timeout": 180.0,
@@ -97,7 +104,7 @@ class TestOmniVoiceVoiceCloning:
         """Test voice cloning with ref_audio and ref_text (in-context mode)."""
         request_config = {
             "model": omni_server.model,
-            "input": "Hello, this is a voice cloning test with in-context learning.",
+            "input": get_prompt("text"),
             "ref_audio": _get_ref_audio_b64(),
             "ref_text": "This is the reference transcript.",
             "response_format": "wav",
@@ -111,7 +118,7 @@ class TestOmniVoiceVoiceCloning:
         """Test that invalid ref_audio format returns a clear error."""
         request_config = {
             "model": omni_server.model,
-            "input": "This should fail with invalid ref_audio.",
+            "input": get_prompt("text"),
             "ref_audio": "not_a_valid_uri",
             "response_format": "wav",
             "timeout": 180.0,
