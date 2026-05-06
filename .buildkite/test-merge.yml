@@ -156,7 +156,7 @@ steps:
     commands:
       - |
         timeout 15m bash -c '
-                pytest -s -v tests/engine/test_async_omni_engine_abort.py
+                pytest -s -v tests/engine/test_async_omni_engine_abort.py tests/diffusion/test_diffusion_engine_rpc_routing.py
         '
     agents:
       queue: "gpu_1_queue" # g6.12xlarge instance on AWS, has 4 L4 GPU
