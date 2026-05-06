@@ -22,8 +22,6 @@ from vllm import SamplingParams
 
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 
-pytestmark = pytest.mark.skip(reason="Temporarily skip PD entrypoint tests while PD config is being removed.")
-
 # Suppress noisy DeprecationWarnings from optional Swig bindings imported by vLLM dependencies.
 warnings.filterwarnings(
     "ignore",
@@ -1081,41 +1079,52 @@ class TestKVParamsCleanup:
 
 
 class TestPDYAMLConfig:
-    def test_pd_yaml_loads(self):
-        """The PD separation YAML config should load without errors."""
+    def test_pd_yaml_loads(self, tmp_path):
+        """PD deploy config should merge into a 4-stage runtime config."""
         import os
 
-        yaml_path = os.path.join(
-            os.path.dirname(__file__),
-            "../../vllm_omni/model_executor/stage_configs/qwen3_omni_moe_pd_separation.yaml",
+        import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
+        from vllm_omni.config.stage_config import _PIPELINE_REGISTRY, load_deploy_config, merge_pipeline_deploy
+
+        base_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../../vllm_omni/deploy/qwen3_omni_moe.yaml")
         )
-        yaml_path = os.path.abspath(yaml_path)
-        if not os.path.exists(yaml_path):
-            pytest.skip("PD separation YAML not found")
+        if not os.path.exists(base_path):
+            pytest.skip("Qwen3-Omni deploy config not found")
 
-        from omegaconf import OmegaConf
+        overlay = tmp_path / "qwen3_omni_pd_overlay.yaml"
+        overlay.write_text(
+            f"base_config: {base_path}\npd_disaggregation:\n  enabled: true\n  async_chunk: false\n",
+            encoding="utf-8",
+        )
 
-        cfg = OmegaConf.load(yaml_path)
-        stages = cfg.stage_args
+        deploy = load_deploy_config(overlay)
+        stages = merge_pipeline_deploy(_PIPELINE_REGISTRY["qwen3_omni_moe"], deploy)
         assert len(stages) == 4
 
         # Prefill stage
-        assert stages[0].is_prefill_only is True
+        assert stages[0].yaml_extras["is_prefill_only"] is True
         assert stages[0].final_output is False
-        assert stages[0].is_comprehension is True
+        assert stages[0].is_comprehension is False
 
         # Decode stage
-        assert stages[1].is_decode_only is True
+        assert stages[1].yaml_extras["is_decode_only"] is True
         assert stages[1].final_output is True
         assert stages[1].final_output_type == "text"
         assert stages[1].is_comprehension is True
-        assert 0 in stages[1].engine_input_source
+        assert 0 in stages[1].input_sources
+
+        # Common 3-GPU PD layout
+        assert stages[0].yaml_runtime["devices"] == "0"
+        assert stages[1].yaml_runtime["devices"] == "1"
+        assert stages[2].yaml_runtime["devices"] == "2"
+        assert stages[3].yaml_runtime["devices"] == "2"
 
         # KV transfer configs
-        assert stages[0].engine_args.kv_transfer_config.kv_role == "kv_producer"
-        assert stages[1].engine_args.kv_transfer_config.kv_role == "kv_consumer"
-        assert stages[0].engine_args.kv_transfer_config.kv_connector == "MooncakeConnector"
-        assert stages[1].engine_args.kv_transfer_config.kv_connector == "MooncakeConnector"
+        assert stages[0].yaml_engine_args["kv_transfer_config"]["kv_role"] == "kv_producer"
+        assert stages[1].yaml_engine_args["kv_transfer_config"]["kv_role"] == "kv_consumer"
+        assert stages[0].yaml_engine_args["kv_transfer_config"]["kv_connector"] == "MooncakeConnector"
+        assert stages[1].yaml_engine_args["kv_transfer_config"]["kv_connector"] == "MooncakeConnector"
 
 
 class TestPrefillStopNeutralization:

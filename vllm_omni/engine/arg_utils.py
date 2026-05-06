@@ -427,6 +427,7 @@ class OrchestratorArgs:
 
     # === Mode Switches (orchestrator reads, DeployConfig redistributes) ===
     async_chunk: bool | None = None
+    enable_pd_disaggregation: bool | None = None
 
     # === Observability ===
     log_stats: bool = False

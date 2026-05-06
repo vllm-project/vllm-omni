@@ -11,7 +11,7 @@ import pytest
 
 from tests.dfx.reliability.helpers import list_remote_process_pids_by_pattern, post_chat_completions_raw
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -87,7 +87,16 @@ def create_unique_server_params(
         model = server_params["model"]
         stage_config_name = server_params.get("stage_config_name")
         if stage_config_name:
-            stage_config_path = str(stage_configs_dir / stage_config_name)
+            stage_config_path = None
+            raw_stage_config = Path(stage_config_name)
+            if raw_stage_config.is_absolute():
+                stage_config_path = str(raw_stage_config)
+            else:
+                local_stage_config = stage_configs_dir / stage_config_name
+                if local_stage_config.exists():
+                    stage_config_path = str(local_stage_config)
+                else:
+                    stage_config_path = get_deploy_config_path(stage_config_name)
             delete = server_params.get("delete", None)
             update = server_params.get("update", None)
             stage_config_path = modify_stage(stage_config_path, update, delete)

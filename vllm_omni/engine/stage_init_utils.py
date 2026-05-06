@@ -257,6 +257,8 @@ class StageMetadata:
     custom_process_input_func: Callable | None
     model_stage: str | None
     runtime_cfg: Any
+    is_prefill_only: bool = False
+    is_decode_only: bool = False
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
 
@@ -335,6 +337,8 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             custom_process_input_func=custom_process_input_func,
             model_stage=None,
             runtime_cfg=runtime_cfg,
+            is_prefill_only=bool(getattr(stage_config, "is_prefill_only", False)),
+            is_decode_only=bool(getattr(stage_config, "is_decode_only", False)),
             cfg_kv_collect_func=cfg_kv_collect_func,
         )
 
@@ -356,6 +360,8 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         custom_process_input_func=custom_process_input_func,
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
+        is_prefill_only=bool(getattr(stage_config, "is_prefill_only", False)),
+        is_decode_only=bool(getattr(stage_config, "is_decode_only", False)),
         prompt_expand_func=prompt_expand_func,
     )
 

@@ -434,6 +434,9 @@ class DeployConfig:
     platforms: dict[str, Any] | None = None
     # Overrides the auto-detected pipeline registry key for structural variants.
     pipeline: str | None = None
+    # PD (Prefill-Decode) disaggregation configuration.
+    # When enabled, dynamically splits the target stage into prefill and decode stages.
+    pd_disaggregation: dict[str, Any] | None = None
 
     # === Pipeline-wide engine settings (applied uniformly to every stage) ===
     trust_remote_code: bool = True
@@ -542,6 +545,39 @@ def _merge_platforms(
     return merged
 
 
+def _merge_pd_stage_role_lists(
+    base_stages: list[dict[str, Any]] | None,
+    overlay_stages: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Merge PD ``stages:`` by ``role`` (prefill/decode)."""
+    by_role: dict[str, dict[str, Any]] = {s["role"]: s for s in (base_stages or []) if "role" in s}
+    passthrough: list[dict[str, Any]] = [s for s in (base_stages or []) if "role" not in s]
+    for overlay_stage in overlay_stages or []:
+        role = overlay_stage.get("role")
+        if role is not None and role in by_role:
+            by_role[role] = _deep_merge_stage(by_role[role], overlay_stage)
+        elif role is not None:
+            by_role[role] = overlay_stage
+        else:
+            passthrough.append(overlay_stage)
+    return [*by_role.values(), *passthrough]
+
+
+def _merge_pd_disaggregation(
+    base: dict[str, Any] | None,
+    overlay: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Deep-merge two ``pd_disaggregation:`` blocks."""
+    if not base and not overlay:
+        return None
+    base = base or {}
+    overlay = overlay or {}
+    merged = {**base, **{k: v for k, v in overlay.items() if k not in ("stages", "stage_overrides")}}
+    merged["stages"] = _merge_pd_stage_role_lists(base.get("stages"), overlay.get("stages"))
+    merged["stage_overrides"] = _merge_stage_lists(base.get("stage_overrides"), overlay.get("stage_overrides"))
+    return merged
+
+
 def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     """Load a deploy YAML with optional ``base_config`` inheritance."""
     raw_dict = to_dict(load_yaml_config(path))
@@ -554,16 +590,23 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     base_path = Path(path).parent / base_path
     base_dict = resolve_deploy_yaml(base_path)
 
-    # Merge top-level scalars: overlay wins. ``stages:`` and ``platforms:``
-    # are deep-merged below so an overlay can layer on top of the base.
+    # Merge top-level scalars: overlay wins. ``stages:``, ``platforms:``, and
+    # ``pd_disaggregation:`` are deep-merged below so an overlay can layer on
+    # top of the base without restating every nested field.
     merged = {
         **base_dict,
-        **{k: v for k, v in raw_dict.items() if k not in ("stages", "platforms")},
+        **{k: v for k, v in raw_dict.items() if k not in ("stages", "platforms", "pd_disaggregation", "pd_separation")},
     }
     merged["stages"] = _merge_stage_lists(base_dict.get("stages"), raw_dict.get("stages"))
     merged_platforms = _merge_platforms(base_dict.get("platforms"), raw_dict.get("platforms"))
     if merged_platforms is not None:
         merged["platforms"] = merged_platforms
+    merged_pd = _merge_pd_disaggregation(
+        base_dict.get("pd_disaggregation", base_dict.get("pd_separation")),
+        raw_dict.get("pd_disaggregation", raw_dict.get("pd_separation")),
+    )
+    if merged_pd is not None:
+        merged["pd_disaggregation"] = merged_pd
 
     return merged
 
@@ -581,6 +624,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "stages": stages,
         "platforms": raw_dict.get("platforms", None),
         "pipeline": raw_dict.get("pipeline", None),
+        "pd_disaggregation": raw_dict.get("pd_disaggregation", raw_dict.get("pd_separation", None)),
     }
     # Pipeline-wide engine settings: only set if explicitly present in YAML
     # so the DeployConfig dataclass defaults take effect otherwise.
@@ -643,6 +687,240 @@ def _apply_platform_overrides(
                 base.engine_extras[key] = val
 
     return deploy
+
+
+_STAGE_CONNECTOR_PATTERN = re.compile(r"^(from_stage_|to_stage_)(\d+)$")
+
+
+def _remap_split_stage_id(stage_id: int, target_stage_id: int) -> int:
+    """Shift stage IDs after inserting a decode stage after ``target_stage_id``."""
+    return stage_id + 1 if stage_id > target_stage_id else stage_id
+
+
+def _remap_split_source_id(source_id: int, target_stage_id: int) -> int:
+    """Remap a dependency/source edge across a PD thinker split.
+
+    Downstream consumers that previously depended on the original thinker stage
+    should now consume the decode stage (``target_stage_id + 1``).
+    """
+    if source_id == target_stage_id:
+        return target_stage_id + 1
+    if source_id > target_stage_id:
+        return source_id + 1
+    return source_id
+
+
+def _remap_stage_connectors(
+    connectors: dict[str, str] | None,
+    target_stage_id: int,
+) -> dict[str, str] | None:
+    """Rewrite ``from_stage_N`` / ``to_stage_N`` connector keys after a PD split."""
+    if not connectors:
+        return connectors
+
+    remapped: dict[str, str] = {}
+    for key, value in connectors.items():
+        match = _STAGE_CONNECTOR_PATTERN.match(key)
+        if match is None:
+            remapped[key] = value
+            continue
+        prefix, raw_stage_id = match.groups()
+        ref_stage_id = _remap_split_source_id(int(raw_stage_id), target_stage_id)
+        remapped[f"{prefix}{ref_stage_id}"] = value
+    return remapped
+
+
+def _pd_role_override(pd_cfg: dict[str, Any], role: str) -> dict[str, Any]:
+    """Return deploy overrides for a PD role from ``pd_disaggregation`` config."""
+    role_cfg = pd_cfg.get(f"{role}_stage")
+    if isinstance(role_cfg, dict):
+        return dict(role_cfg)
+
+    for entry in pd_cfg.get("stages", []) or []:
+        if entry.get("role") == role:
+            return dict(entry)
+    return {}
+
+
+def _pd_stage_override(pd_cfg: dict[str, Any], stage_id: int) -> dict[str, Any]:
+    """Return PD-only deploy overrides for one original stage_id."""
+    stage_cfg = pd_cfg.get(f"stage_{stage_id}")
+    if isinstance(stage_cfg, dict):
+        return dict(stage_cfg)
+
+    stage_overrides = pd_cfg.get("stage_overrides")
+    if isinstance(stage_overrides, dict):
+        for key in (stage_id, str(stage_id)):
+            entry = stage_overrides.get(key)
+            if isinstance(entry, dict):
+                return dict(entry)
+
+    for entry in stage_overrides or []:
+        if entry.get("stage_id") == stage_id:
+            return dict(entry)
+    return {}
+
+
+def _make_pd_stage_deploy(
+    base: StageDeployConfig,
+    *,
+    stage_id: int,
+    stage_override: dict[str, Any],
+    target_stage_id: int,
+) -> StageDeployConfig:
+    """Build one PD-mode stage deploy config from the original base stage."""
+    override = dict(stage_override)
+    override.pop("role", None)
+    override.pop("stage_id", None)
+    override_engine_extras = dict(override.pop("engine_extras", {}) or {})
+
+    return dataclasses.replace(
+        base,
+        stage_id=stage_id,
+        max_num_seqs=override.pop("max_num_seqs", base.max_num_seqs),
+        gpu_memory_utilization=override.pop("gpu_memory_utilization", base.gpu_memory_utilization),
+        tensor_parallel_size=override.pop("tensor_parallel_size", base.tensor_parallel_size),
+        enforce_eager=override.pop("enforce_eager", base.enforce_eager),
+        max_num_batched_tokens=override.pop("max_num_batched_tokens", base.max_num_batched_tokens),
+        max_model_len=override.pop("max_model_len", base.max_model_len),
+        async_scheduling=override.pop("async_scheduling", base.async_scheduling),
+        devices=override.pop("devices", base.devices),
+        output_connectors=_remap_stage_connectors(
+            override.pop("output_connectors", base.output_connectors),
+            target_stage_id,
+        ),
+        input_connectors=_remap_stage_connectors(
+            override.pop("input_connectors", base.input_connectors),
+            target_stage_id,
+        ),
+        default_sampling_params=override.pop("default_sampling_params", base.default_sampling_params),
+        engine_extras={
+            **base.engine_extras,
+            **override_engine_extras,
+            **override,
+        },
+    )
+
+
+def _apply_pd_disaggregation(
+    pipeline: PipelineConfig,
+    deploy: DeployConfig,
+    cli_overrides: dict[str, Any] | None = None,
+) -> tuple[PipelineConfig, DeployConfig]:
+    """Optionally split one pipeline stage into prefill + decode stages."""
+    pd_cfg = dict(deploy.pd_disaggregation or {})
+    if cli_overrides is not None and cli_overrides.get("enable_pd_disaggregation") is not None:
+        pd_cfg["enabled"] = bool(cli_overrides["enable_pd_disaggregation"])
+    if not pd_cfg.get("enabled", False):
+        return pipeline, deploy
+
+    target_stage_id = int(pd_cfg.get("target_stage_id", 0))
+    target_stage = pipeline.get_stage(target_stage_id)
+    if target_stage is None:
+        raise ValueError(f"PD {target_stage_id} not found in pipeline {pipeline.model_type!r}")
+    if target_stage.execution_type != StageExecutionType.LLM_AR:
+        raise ValueError(
+            f"PD disaggregation only supports LLM_AR stages; stage {target_stage_id} "
+            f"uses {target_stage.execution_type.value!r}"
+        )
+
+    deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
+    target_deploy = deploy_by_id.get(target_stage_id)
+    if target_deploy is None:
+        raise ValueError(f"PD disaggregation target stage {target_stage_id} missing deploy settings")
+
+    prefill_override = _pd_role_override(pd_cfg, "prefill")
+    decode_override = _pd_role_override(pd_cfg, "decode")
+    if not prefill_override or not decode_override:
+        raise ValueError("PD disaggregation requires both prefill and decode role configs")
+
+    prefill_stage = dataclasses.replace(
+        target_stage,
+        final_output=False,
+        final_output_type=None,
+        owns_tokenizer=False,
+        custom_process_input_func=None,
+        custom_process_next_stage_input_func=None,
+        async_chunk_process_next_stage_input_func=None,
+        sync_process_input_func=None,
+        extras={**target_stage.extras, "is_prefill_only": True},
+    )
+    decode_stage = dataclasses.replace(
+        target_stage,
+        stage_id=target_stage_id + 1,
+        input_sources=(target_stage_id,),
+        owns_tokenizer=target_stage.owns_tokenizer,
+        custom_process_next_stage_input_func=None,
+        async_chunk_process_next_stage_input_func=None,
+        sync_process_input_func=None,
+        extras={**target_stage.extras, "is_decode_only": True},
+    )
+
+    new_pipeline_stages: list[StagePipelineConfig] = []
+    for stage in pipeline.stages:
+        if stage.stage_id < target_stage_id:
+            new_pipeline_stages.append(stage)
+            continue
+        if stage.stage_id == target_stage_id:
+            new_pipeline_stages.extend((prefill_stage, decode_stage))
+            continue
+
+        new_pipeline_stages.append(
+            dataclasses.replace(
+                stage,
+                stage_id=_remap_split_stage_id(stage.stage_id, target_stage_id),
+                input_sources=tuple(
+                    _remap_split_source_id(source_id, target_stage_id) for source_id in stage.input_sources
+                ),
+            )
+        )
+
+    new_deploy_stages: list[StageDeployConfig] = []
+    for stage in deploy.stages:
+        if stage.stage_id < target_stage_id:
+            new_deploy_stages.append(stage)
+            continue
+        if stage.stage_id == target_stage_id:
+            new_deploy_stages.append(
+                _make_pd_stage_deploy(
+                    target_deploy,
+                    stage_id=target_stage_id,
+                    stage_override=prefill_override,
+                    target_stage_id=target_stage_id,
+                )
+            )
+            new_deploy_stages.append(
+                _make_pd_stage_deploy(
+                    target_deploy,
+                    stage_id=target_stage_id + 1,
+                    stage_override=decode_override,
+                    target_stage_id=target_stage_id,
+                )
+            )
+            continue
+
+        new_deploy_stages.append(
+            _make_pd_stage_deploy(
+                stage,
+                stage_id=_remap_split_stage_id(stage.stage_id, target_stage_id),
+                stage_override=_pd_stage_override(pd_cfg, stage.stage_id),
+                target_stage_id=target_stage_id,
+            )
+        )
+
+    effective_async_chunk = bool(pd_cfg.get("async_chunk", False))
+    if cli_overrides is not None and cli_overrides.get("async_chunk") is not None:
+        effective_async_chunk = bool(cli_overrides["async_chunk"])
+
+    return (
+        dataclasses.replace(pipeline, stages=tuple(new_pipeline_stages)),
+        dataclasses.replace(
+            deploy,
+            async_chunk=effective_async_chunk,
+            stages=new_deploy_stages,
+            pd_disaggregation=None,
+        ),
+    )
 
 
 _EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str | None]] = {
@@ -769,6 +1047,7 @@ def merge_pipeline_deploy(
         cli_overrides = {}
 
     deploy = _apply_platform_overrides(deploy)
+    pipeline, deploy = _apply_pd_disaggregation(pipeline, deploy, cli_overrides)
     deploy_by_id = {s.stage_id: s for s in deploy.stages}
 
     # A pipeline supports async_chunk if any stage has either an explicit

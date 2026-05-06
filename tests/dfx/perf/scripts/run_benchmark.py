@@ -43,7 +43,7 @@ CONFIG_FILE_PATH = _get_config_file_from_argv()
 if CONFIG_FILE_PATH is None:
     print(
         "No --test-config-file in argv, using default: tests/dfx/perf/tests/test_qwen_omni.json "
-        "(override with e.g. --test-config-file tests/dfx/perf/tests/test_tts.json)"
+        "(override with e.g. --test-config-file tests/dfx/perf/tests/test_qwen_omni_pd.json)"
     )
     CONFIG_FILE_PATH = _DEFAULT_CONFIG_FILE
 

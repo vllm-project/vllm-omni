@@ -117,7 +117,7 @@ def _get_prefill_stage(stage_list: list[Any], source_stage_id: int) -> Any | Non
     if not getattr(source_stage, "is_decode_only", False):
         return None
     prev_stage = stage_list[source_stage_id - 1]
-    if getattr(prev_stage, "is_prefill_only", False) and prev_stage.engine_outputs is not None:
+    if getattr(prev_stage, "is_prefill_only", False):
         return prev_stage
     return None
 
@@ -167,14 +167,11 @@ def _merge_pd_embeddings(
     return merged_emb, merged_hid
 
 
-def _get_prefill_multimodal_output(prefill_stage: Any, output_index: int) -> dict[str, Any] | None:
-    """Return multimodal_output dict from the PD prefill stage for a given batch index."""
-    try:
-        prefill_eos = prefill_stage.engine_outputs
-        prefill_eo = prefill_eos[min(output_index, len(prefill_eos) - 1)]
-        return prefill_eo.outputs[0].multimodal_output
-    except Exception:
-        return None
+def _get_prefill_multimodal_output(prefill_stage: Any, req_id: str) -> dict[str, Any] | None:
+    get_fn = getattr(prefill_stage, "get_pd_prefill_multimodal_output", None)
+    if callable(get_fn):
+        return get_fn(req_id)
+    return None
 
 
 def _resolve_tts_token_embedding(
@@ -479,7 +476,7 @@ def thinker2talker(
 
         prefill_mm: dict[str, Any] | None = None
         if prefill_stage is not None:
-            prefill_mm = _get_prefill_multimodal_output(prefill_stage, i)
+            prefill_mm = _get_prefill_multimodal_output(prefill_stage, req_id)
 
         if prefill_mm is not None:
             expected_total = len(prompt_token_ids) + len(output_ids)

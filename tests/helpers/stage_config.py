@@ -321,6 +321,9 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
     "qwen3_omni_moe": {
         "base_config": "qwen3_omni_moe.yaml",
         "async_chunk": False,
+        "pd_disaggregation": {
+            "enabled": False,
+        },
         "stages": [
             {
                 "stage_id": 0,
@@ -457,6 +460,157 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                     "localbuf": 64000000,
                     "proto": "tcp",
                 },
+            },
+        },
+    },
+    "qwen3_omni_moe_pd": {
+        "base_config": "qwen3_omni_moe.yaml",
+        "async_chunk": False,
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 5,
+                "max_model_len": 32768,
+                "mm_processor_cache_gb": 0,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 150, "ignore_eos": False},
+            },
+            {
+                "stage_id": 1,
+                "gpu_memory_utilization": 0.5,
+                "max_num_seqs": 5,
+                "max_model_len": 32768,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 1000},
+            },
+            {
+                "stage_id": 2,
+                "max_num_seqs": 5,
+                "max_num_batched_tokens": 100000,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 2000},
+            },
+        ],
+        "pd_disaggregation": {
+            "enabled": True,
+            "target_stage_id": 0,
+            "async_chunk": False,
+            "stages": [
+                {
+                    "role": "prefill",
+                    "max_num_seqs": 5,
+                    "devices": "0",
+                    "tensor_parallel_size": 1,
+                    "default_sampling_params": {
+                        "temperature": 0.4,
+                        "top_p": 0.9,
+                        "top_k": 1,
+                        "max_tokens": 150,
+                        "seed": 42,
+                        "repetition_penalty": 1.05,
+                        "ignore_eos": False,
+                    },
+                    "engine_extras": {
+                        "kv_transfer_config": {
+                            "kv_connector": "MooncakeConnector",
+                            "kv_role": "kv_producer",
+                            "kv_rank": 0,
+                            "kv_parallel_size": 2,
+                            "kv_connector_extra_config": {
+                                "mooncake_bootstrap_port": 25201,
+                            },
+                        },
+                    },
+                },
+                {
+                    "role": "decode",
+                    "max_num_seqs": 5,
+                    "devices": "1",
+                    "tensor_parallel_size": 1,
+                    "default_sampling_params": {
+                        "max_tokens": 150,
+                        "ignore_eos": False,
+                        "stop_token_ids": [151645],
+                    },
+                    "engine_extras": {
+                        "kv_transfer_config": {
+                            "kv_connector": "MooncakeConnector",
+                            "kv_role": "kv_consumer",
+                            "kv_rank": 1,
+                            "kv_parallel_size": 2,
+                            "kv_connector_extra_config": {
+                                "mooncake_bootstrap_port": 25202,
+                            },
+                        },
+                    },
+                },
+            ],
+            "stage_overrides": [
+                {
+                    "stage_id": 1,
+                    "devices": "2",
+                },
+                {
+                    "stage_id": 2,
+                    "devices": "2",
+                },
+            ],
+        },
+        "platforms": {
+            "rocm": {
+                "stages": [
+                    {"stage_id": 0, "max_num_seqs": 1, "default_sampling_params": {"max_tokens": 100}},
+                    {
+                        "stage_id": 1,
+                        "max_num_seqs": 1,
+                        "enforce_eager": True,
+                        "default_sampling_params": {"max_tokens": 100},
+                    },
+                    {
+                        "stage_id": 2,
+                        "max_num_seqs": 1,
+                        "max_num_batched_tokens": 1000000,
+                        "default_sampling_params": {"max_tokens": 200},
+                    },
+                ],
+            },
+            "xpu": {
+                "stages": [
+                    {
+                        "stage_id": 0,
+                        "gpu_memory_utilization": 0.85,
+                        "max_num_seqs": 1,
+                        "tensor_parallel_size": 4,
+                        "enforce_eager": True,
+                        "max_num_batched_tokens": 4096,
+                        "max_model_len": 4096,
+                        "max_cudagraph_capture_size": 0,
+                        "skip_mm_profiling": True,
+                        "devices": "0,1,2,3",
+                        "default_sampling_params": {"max_tokens": 100, "ignore_eos": False},
+                    },
+                    {
+                        "stage_id": 1,
+                        "gpu_memory_utilization": 0.6,
+                        "max_num_seqs": 1,
+                        "enforce_eager": True,
+                        "max_num_batched_tokens": 4096,
+                        "max_model_len": 4096,
+                        "max_cudagraph_capture_size": 0,
+                        "skip_mm_profiling": True,
+                        "devices": "4",
+                    },
+                    {
+                        "stage_id": 2,
+                        "gpu_memory_utilization": 0.3,
+                        "max_num_seqs": 1,
+                        "max_num_batched_tokens": 100000,
+                        "max_cudagraph_capture_size": 0,
+                        "skip_mm_profiling": True,
+                        "devices": "5",
+                        "default_sampling_params": {"max_tokens": 2000},
+                    },
+                ],
             },
         },
     },

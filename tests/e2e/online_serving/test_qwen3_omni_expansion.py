@@ -8,7 +8,7 @@ import os
 
 import pytest
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks, hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
@@ -34,7 +34,7 @@ LARGE_IMAGE_HEIGHT = 1080
 LONG_AUDIO_DURATION_SEC = 120
 
 
-def get_batch_token_config(default_path):
+def get_batch_token_config(default_path, *, stage_id: int = 1):
     """Override stage 1's max_num_batched_tokens to exercise small-batch paths.
 
     Uses the new flat-stage schema (``stages.<id>.<field>``); the legacy
@@ -44,7 +44,7 @@ def get_batch_token_config(default_path):
     return modify_stage_config(
         default_path,
         updates={
-            "stages": {1: {"max_num_batched_tokens": 64}},
+            "stages": {stage_id: {"max_num_batched_tokens": 64}},
         },
     )
 
@@ -61,39 +61,62 @@ def get_async_chunk_config(default_path):
     return modify_stage_config(
         default_path,
         updates={
+            "async_chunk": True,
             "stages": {0: {"default_sampling_params.max_tokens": 2048}},
         },
     )
 
 
 # CI deploy YAML (single file; xpu deltas applied via ``platforms:`` section).
-# The overlay explicitly sets ``async_chunk: False``, so ``default`` tests the
-# sync path and ``async_chunk`` tests the streaming path with a longer thinker
-# output — two distinct scenarios, kept as separate parametrizations.
+# Keep the three Qwen3-Omni launch modes independent:
+#   * default      -> non-PD CI overlay
+#   * async_chunk  -> non-PD overlay with async_chunk enabled
+#   * pd_default   -> PD-specific CI overlay (3-GPU layout)
 default_path = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
+async_chunk_path = get_async_chunk_config(default_path)
+pd_path = get_deploy_config_path("ci/qwen3_omni_moe_pd.yaml")
 
 test_params = [
     pytest.param(
         OmniServerParams(
-            model=model, stage_config_path=default_path, use_stage_cli=True, server_args=["--no-async-chunk"]
+            model=model,
+            stage_config_path=default_path,
+            use_stage_cli=True,
+            server_args=["--no-async-chunk"],
         ),
         id="default",
+        marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2),
     ),
     pytest.param(
         OmniServerParams(
             model=model,
-            stage_config_path=get_async_chunk_config(default_path),
+            stage_config_path=async_chunk_path,
             use_stage_cli=True,
-            server_args=["--async-chunk"],
         ),
         id="async_chunk",
+        marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2),
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=model,
+            stage_config_path=pd_path,
+            use_stage_cli=True,
+            server_args=["--no-async-chunk"],
+        ),
+        id="pd_default",
+        marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3),
     ),
 ]
 
 test_token_params = [
     pytest.param(
-        OmniServerParams(model=model, stage_config_path=get_batch_token_config(default_path), use_stage_cli=True),
+        OmniServerParams(
+            model=model,
+            stage_config_path=get_batch_token_config(default_path, stage_id=1),
+            use_stage_cli=True,
+        ),
         id="batch_token_64",
+        marks=hardware_marks(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2),
     )
 ]
 

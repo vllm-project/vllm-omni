@@ -450,9 +450,9 @@ class Orchestrator:
                     list(self._pd_kv_params[req_id].keys()),
                 )
             else:
-                logger.warning(
+                logger.debug(
                     "[Orchestrator][PD] prefill stage output for req=%s has no kv_transfer_params; "
-                    "KV transfer may fail. Ensure apply_mooncake_connector_patch() was called.",
+                    "continuing with transfer_id/bootstrap-based Mooncake routing.",
                     req_id,
                 )
 
@@ -491,6 +491,7 @@ class Orchestrator:
         if finished and stage_id == req_state.final_stage_id:
             # PD: clean up any lingering KV params for this request
             self._pd_kv_params.pop(req_id, None)
+            self._clear_pd_prefill_multimodal_output(req_id)
             self._cfg_tracker.cleanup_parent(req_id)
             self.request_states.pop(req_id, None)
 
@@ -548,14 +549,15 @@ class Orchestrator:
         if sp.extra_args is None:
             sp.extra_args = {}
 
-        # Get KV params captured from the prefill output (must include remote_request_id).
-        kv_prefill_params = self._pd_kv_params.pop(req_id, None)
-        if not kv_prefill_params or "remote_request_id" not in kv_prefill_params:
-            raise RuntimeError(
-                f"[Orchestrator][PD] Missing prefill kv_transfer_params.remote_request_id for req={req_id}"
-            )
+        # Newer Mooncake routing keys requests by transfer_id and uses
+        # remote_engine_id + remote_bootstrap_addr to discover the producer.
+        # Prefill-side kv_transfer_params are therefore optional; when present
+        # we only treat them as an overlay/fallback.
+        kv_prefill_params = self._pd_kv_params.pop(req_id, None) or {}
 
         decode_kv_params: dict[str, Any] = {
+            "do_remote_prefill": True,
+            "do_remote_decode": False,
             "transfer_id": f"xfer-{req_id}",
         }
 
@@ -565,8 +567,17 @@ class Orchestrator:
         if self._pd_prefill_engine_id:
             decode_kv_params["remote_engine_id"] = self._pd_prefill_engine_id
 
-        # Overlay params from prefill side (includes remote_request_id set by monkey patch).
+        # Overlay any prefill-side params (legacy patches may still thread
+        # remote_request_id or other connector-specific fields through outputs).
         decode_kv_params.update(kv_prefill_params)
+
+        missing = [
+            key for key in ("transfer_id", "remote_bootstrap_addr", "remote_engine_id") if not decode_kv_params.get(key)
+        ]
+        if missing:
+            raise RuntimeError(
+                f"[Orchestrator][PD] Missing decode kv_transfer_params fields for req={req_id}: {', '.join(missing)}"
+            )
 
         # Ensure these flags are set correctly after any overlay.
         decode_kv_params["do_remote_prefill"] = True
@@ -575,13 +586,14 @@ class Orchestrator:
             decode_kv_params["transfer_id"] = f"xfer-{req_id}"
 
         sp.extra_args["kv_transfer_params"] = decode_kv_params
-
-        logger.debug(
-            "[Orchestrator][PD] decode kv_transfer_params for req=%s: %s",
-            req_id,
-            decode_kv_params,
-        )
         return sp
+
+    def _clear_pd_prefill_multimodal_output(self, req_id: str) -> None:
+        if self._pd_pair is None:
+            return
+        clear_fn = getattr(self.stage_clients[self._pd_pair[0]], "clear_pd_prefill_multimodal_output", None)
+        if callable(clear_fn):
+            clear_fn(req_id)
 
     def _build_stage_metrics(
         self,
@@ -718,6 +730,7 @@ class Orchestrator:
                             }
                         )
                         self._pd_kv_params.pop(req_id, None)
+                        self._clear_pd_prefill_multimodal_output(req_id)
                         self._cfg_tracker.cleanup_parent(req_id)
                         self.request_states.pop(req_id, None)
                         return
@@ -748,8 +761,12 @@ class Orchestrator:
 
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
         if self._pd_pair is not None and (stage_id, next_stage_id) == self._pd_pair:
-            # Save prefill stage outputs so thinker2talker can merge embeddings later
-            self.stage_clients[stage_id].set_engine_outputs([output])
+            prefill_mm = None
+            try:
+                prefill_mm = output.outputs[0].multimodal_output
+            except Exception:
+                prefill_mm = None
+            self.stage_clients[stage_id].set_pd_prefill_multimodal_output(req_id, prefill_mm)
 
             params = self._build_pd_decode_params(req_id, params)
 
@@ -1095,6 +1112,7 @@ class Orchestrator:
             # EngineCoreOutput, so we must purge them explicitly.
             self.output_processors[stage_id].abort_requests(all_ids_to_abort, internal=True)
         for req_id in all_ids_to_abort:
+            self._clear_pd_prefill_multimodal_output(req_id)
             self.request_states.pop(req_id, None)
         logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
 
@@ -1210,6 +1228,7 @@ class Orchestrator:
                         "stage_id": self._fatal_error_stage_id,
                     }
                 )
+            self._clear_pd_prefill_multimodal_output(req_id)
             self.request_states.pop(req_id, None)
 
     def _shutdown_stages(self) -> None:

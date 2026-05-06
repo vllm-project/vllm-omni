@@ -609,3 +609,75 @@ async def test_run_abort(orchestrator_factory) -> None:
         assert "req-abort" not in orchestrator_fixture.orchestrator.request_states
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
+
+
+def test_build_pd_decode_params_uses_transfer_id_bootstrap_and_engine_id() -> None:
+    request_queue = janus.Queue()
+    output_queue = janus.Queue()
+    rpc_queue = janus.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=request_queue.async_q,
+        output_async_queue=output_queue.async_q,
+        rpc_async_queue=rpc_queue.async_q,
+        stage_clients=[FakeStageClient(), FakeStageClient()],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ],
+        pd_config={
+            "pd_pair": (0, 1),
+            "bootstrap_addr": "127.0.0.1:25201",
+            "prefill_engine_id": "prefill-engine-0",
+        },
+    )
+    sp = _sampling_params()
+
+    try:
+        result = orchestrator._build_pd_decode_params("req-pd", sp)
+        kv_params = result.extra_args["kv_transfer_params"]
+
+        assert kv_params["transfer_id"] == "xfer-req-pd"
+        assert kv_params["remote_bootstrap_addr"] == "127.0.0.1:25201"
+        assert kv_params["remote_engine_id"] == "prefill-engine-0"
+        assert kv_params["do_remote_prefill"] is True
+        assert kv_params["do_remote_decode"] is False
+    finally:
+        for q in (request_queue, output_queue, rpc_queue):
+            q.close()
+
+
+def test_build_pd_decode_params_preserves_prefill_overlay_fields() -> None:
+    request_queue = janus.Queue()
+    output_queue = janus.Queue()
+    rpc_queue = janus.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=request_queue.async_q,
+        output_async_queue=output_queue.async_q,
+        rpc_async_queue=rpc_queue.async_q,
+        stage_clients=[FakeStageClient(), FakeStageClient()],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ],
+        pd_config={
+            "pd_pair": (0, 1),
+            "bootstrap_addr": "127.0.0.1:25201",
+            "prefill_engine_id": "prefill-engine-0",
+        },
+    )
+    orchestrator._pd_kv_params["req-pd"] = {"remote_request_id": "legacy-prefill-id"}
+    sp = _sampling_params()
+
+    try:
+        result = orchestrator._build_pd_decode_params("req-pd", sp)
+        kv_params = result.extra_args["kv_transfer_params"]
+
+        assert kv_params["transfer_id"] == "xfer-req-pd"
+        assert kv_params["remote_bootstrap_addr"] == "127.0.0.1:25201"
+        assert kv_params["remote_engine_id"] == "prefill-engine-0"
+        assert kv_params["remote_request_id"] == "legacy-prefill-id"
+    finally:
+        for q in (request_queue, output_queue, rpc_queue):
+            q.close()
