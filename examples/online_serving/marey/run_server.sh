@@ -12,9 +12,6 @@
 #
 # Required env vars:
 #   MODEL                - Path to the Marey checkpoint directory (with config.yaml).
-#   MOONVALLEY_AI_PATH   - Path to the moonvalley_ai checkout (containing open_sora/).
-#                          Consumed by vllm_omni.diffusion.models.marey.pipeline_marey
-#                          to locate the opensora VAE source tree.
 #
 # Optional env vars:
 #   PORT                       - Server port (default: 8098).
@@ -32,7 +29,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 : "${MODEL:?MODEL must be set to the Marey checkpoint directory}"
-: "${MOONVALLEY_AI_PATH:?MOONVALLEY_AI_PATH must be set to the moonvalley_ai checkout}"
 
 PORT="${PORT:-8098}"
 FLOW_SHIFT="${FLOW_SHIFT:-3.0}"
@@ -42,13 +38,11 @@ VLLM_OMNI_PROJECT="${VLLM_OMNI_PROJECT:-${REPO_ROOT}}"
 
 echo "Starting Marey server..."
 echo "Model:              $MODEL"
-echo "MoonvalleyAI root:  $MOONVALLEY_AI_PATH"
 echo "Port:               $PORT"
 echo "Flow shift:         $FLOW_SHIFT"
 echo "Ulysses degree:     $ULYSSES_DEGREE"
 
 env_args=(
-    MOONVALLEY_AI_PATH="${MOONVALLEY_AI_PATH}"
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 )
 [[ -n "${HF_HOME:-}" ]]                && env_args+=("HF_HOME=${HF_HOME}")
@@ -65,4 +59,6 @@ uv run --project "${VLLM_OMNI_PROJECT}" vllm-omni serve "$MODEL" --omni \
     --model-class-name MareyPipeline \
     --flow-shift "$FLOW_SHIFT" \
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
-    --ulysses-degree "$ULYSSES_DEGREE"
+    --ulysses-degree "$ULYSSES_DEGREE" \
+    --use-hsdp \
+    --hsdp-shard-size "$ULYSSES_DEGREE"

@@ -27,3 +27,4 @@ lightning-utilities==0.15.3
 pytorch-lightning==2.6.1
 rotary-embedding-torch==0.8.9
 torchmetrics==1.9.0
+vllm==0.17.0

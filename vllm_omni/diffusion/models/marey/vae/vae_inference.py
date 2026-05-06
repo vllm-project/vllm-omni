@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import torch
 from omegaconf import MISSING
@@ -209,7 +209,9 @@ class TwoStageVAEInference(nn.Module):
 
     @torch.inference_mode()
     def encode(
-        self, x: torch.Tensor, compression: tuple[int, int, int] | None = None
+        self, x: torch.Tensor, compression: tuple[int, int, int] | None = None,
+        shard_fn: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
+        gather_fn: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """
         Encode a video into latents.
@@ -226,7 +228,7 @@ class TwoStageVAEInference(nn.Module):
             raise ValueError(
                 "number of frames must be 1 or divisible by frame_chunk_len"
             )
-        return self._encode(x, compression=compression)
+        return self._encode(x, compression=compression, shard_fn=shard_fn, gather_fn=gather_fn)
 
     @torch.inference_mode()
     def decode(
@@ -235,6 +237,8 @@ class TwoStageVAEInference(nn.Module):
         num_frames: int | None = None,
         spatial_size: tuple[int, int] | None = None,
         expansion: tuple[int, int, int] | None = None,
+        shard_fn: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
+        gather_fn: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """
         Decode latents into a video.
@@ -264,6 +268,8 @@ class TwoStageVAEInference(nn.Module):
             expansion=expansion,
             num_frames=num_frames,
             spatial_size=spatial_size,
+            shard_fn=shard_fn,
+            gather_fn=gather_fn,
         )
 
     def forward(
@@ -282,13 +288,20 @@ class TwoStageVAEInference(nn.Module):
         return self.encode(x, compression=compression)
 
     def _encode(
-        self, x: torch.Tensor, compression: tuple[int, int, int] | None = None
+        self, x: torch.Tensor, compression: tuple[int, int, int] | None = None,
+        shard_fn: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
+        gather_fn: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         effective = compression or self._active_compression
         if effective not in self._skip_n_blocks_for_compression:
             raise ValueError(f"'{effective}' is not a supported compression mode")
         skip_n_blocks = self._skip_n_blocks_for_compression[effective]
+        if shard_fn is not None:
+            x = shard_fn(x,0)
         z = self.model.encode(x, skip_first_n_down_blocks=skip_n_blocks).mean
+        if gather_fn is not None:
+            z = z.contiguous()
+            z = gather_fn(z,0)
         # apply scaling and bias
         z = (z + self.bias_factor) * self.scaling_factor  # type: ignore[operator]
         return z
@@ -299,6 +312,8 @@ class TwoStageVAEInference(nn.Module):
         expansion: tuple[int, int, int] | None = None,
         num_frames: int | None = None,
         spatial_size: tuple[int, int] | None = None,
+        shard_fn: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
+        gather_fn: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         effective_exp = expansion or self._active_expansion
         if effective_exp not in self._skip_n_blocks_for_expansion:
@@ -306,12 +321,17 @@ class TwoStageVAEInference(nn.Module):
         skip_n_blocks = self._skip_n_blocks_for_expansion[effective_exp]
         # undo scaling and bias
         z = z / self.scaling_factor - self.bias_factor  # type: ignore[operator]
+        if shard_fn is not None:
+            z = shard_fn(z,0)
         z = self.model.decode(
             z,
             num_frames=num_frames,
             spatial_size=spatial_size,
             skip_last_n_up_blocks=skip_n_blocks,
         )
+        if gather_fn is not None:
+            z = z.contiguous()
+            z = gather_fn(z,0)
         return z
 
 

@@ -23,15 +23,23 @@ import yaml
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPTextModel, CLIPTokenizer, T5EncoderModel
+from vllm.distributed import get_tensor_model_parallel_world_size
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import get_sp_group, get_world_group
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.marey_serving_runtime import (
     MareyVAEInitializationError,
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.marey.marey_transformer import MareyTransformer
-from vllm_omni.diffusion.models.marey.vae_loader import load_vae
+from vllm_omni.diffusion.models.marey.state_dict_offload import (
+    MareyStateDictOffloader,
+)
+from vllm_omni.diffusion.models.marey.vae_loader import (
+    build_marey_vae_sp_hooks,
+    load_vae,
+)
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -455,7 +463,7 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         self.ul2_max_length = te_cfg.get("ul2_max_length", 300)
 
         self.ul2_tokenizer = AutoTokenizer.from_pretrained(ul2_name)
-        self.ul2_model = T5EncoderModel.from_pretrained(ul2_name, torch_dtype=dtype, device_map="cpu").eval()
+        self.ul2_model = T5EncoderModel.from_pretrained(ul2_name, dtype=dtype, device_map="cpu").eval()
 
         # Second text encoder: MetaCLIP-sequence or CLIP-vector + ByT5
         metaclip_name = te_cfg.get("metaclip_pretrained")
@@ -465,7 +473,7 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
             self.clip_max_length = te_cfg.get("metaclip_max_length", 77)
             self.byt5_max_length = te_cfg.get("byt5_max_length", self.clip_max_length)
             self.clip_tokenizer = CLIPTokenizer.from_pretrained(metaclip_name)
-            self.clip_model = CLIPTextModel.from_pretrained(metaclip_name, torch_dtype=dtype, device_map="cpu").eval()
+            self.clip_model = CLIPTextModel.from_pretrained(metaclip_name, dtype=dtype, device_map="cpu").eval()
             # Alias MetaCLIP into the byt5 slot for reuse in encode_prompt
             self.byt5_tokenizer = self.clip_tokenizer
             self.byt5_model = self.clip_model
@@ -479,9 +487,9 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
             self.clip_max_length = te_cfg.get("clip_max_length", 77)
             self.byt5_max_length = te_cfg.get("byt5_max_length", 70)
             self.clip_tokenizer = CLIPTokenizer.from_pretrained(clip_name)
-            self.clip_model = CLIPTextModel.from_pretrained(clip_name, torch_dtype=dtype, device_map="cpu").eval()
+            self.clip_model = CLIPTextModel.from_pretrained(clip_name, dtype=dtype, device_map="cpu").eval()
             self.byt5_tokenizer = AutoTokenizer.from_pretrained(byt5_name)
-            self.byt5_model = T5EncoderModel.from_pretrained(byt5_name, torch_dtype=dtype, device_map="cpu").eval()
+            self.byt5_model = T5EncoderModel.from_pretrained(byt5_name, dtype=dtype, device_map="cpu").eval()
             caption_channels = [self.ul2_model.config.d_model, self.byt5_model.config.d_model]
             vector_cond_channels = self.clip_model.config.hidden_size
 
@@ -493,8 +501,9 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         self.vae_downsample_factors = tuple(self.vae.model.get_downsample_factors(0))
         self.vae_scale_factor_temporal = self.vae_downsample_factors[0]
         self.vae_scale_factor_spatial = self.vae_downsample_factors[1]
+        self.sp_shard, self.sp_gather = build_marey_vae_sp_hooks()
 
-        # -- Transformer ------------------------------------------------------
+        # -- Transformer & VAE ------------------------------------------------
         in_channels = self.vae.latent_dim
         self.transformer = _create_transformer_from_config(
             model_cfg,
@@ -503,6 +512,11 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
             caption_channels,
             vector_cond_channels,
         )
+
+        self._text_encoder_offloaders: list[MareyStateDictOffloader] = []
+        self._vae_offloader: MareyStateDictOffloader | None = None
+        self._transformer_offloader: MareyStateDictOffloader | None = None
+        self._init_text_and_vae_offloaders()
 
         # -- Scheduler config -------------------------------------------------
         self.num_train_timesteps = 1000
@@ -525,6 +539,14 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         self._num_timesteps = None
         self._current_timestep = None
 
+        # Parallel checks
+
+        world_size = get_world_group().world_size
+        tp_size = get_tensor_model_parallel_world_size()
+        assert tp_size == 1, "TP is not supported by Marey"
+        sp_size = get_sp_group().world_size
+        assert sp_size == world_size, "Only SP and HSDP are supported"
+
     # -- Properties -----------------------------------------------------------
 
     @property
@@ -542,6 +564,92 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
     @property
     def current_timestep(self):
         return self._current_timestep
+
+    # -- Whole-module state-dict offloading ----------------------------------
+
+    def _make_offloader(
+        self,
+        name: str,
+        module: nn.Module,
+        *,
+        source_group_fn,
+    ) -> MareyStateDictOffloader:
+        return MareyStateDictOffloader(
+            name=name,
+            module=module,
+            device=self.device,
+            source_group_fn=source_group_fn,
+            source_rank=0,
+        )
+
+    def _init_text_and_vae_offloaders(self) -> None:
+        seen: set[int] = set()
+        self.clip_model.to(self.device)
+        for name, module in (
+            ("ul2_model", self.ul2_model),
+            # ("clip_model", self.clip_model),
+            ("byt5_model", self.byt5_model),
+        ):
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+
+            offloader = self._make_offloader(
+                name,
+                module,
+                source_group_fn=get_world_group,
+            )
+            self._text_encoder_offloaders.append(offloader)
+
+        if self.vae is not None:
+            self._vae_offloader = self._make_offloader(
+                "vae",
+                self.vae,
+                source_group_fn=get_world_group,
+            )
+
+    def _init_transformer_offloader(self) -> None:
+        if self._transformer_offloader is not None:
+            return
+
+        logger.debug("Marey Pipeline: Initializing transformer offloader")
+        assert not self.od_config.parallel_config.use_hsdp, "Transformer offloading does not support HSDP"
+        source_group_fn = get_sp_group
+        self._transformer_offloader = self._make_offloader(
+            "transformer", self.transformer, source_group_fn=source_group_fn
+        )
+
+    def _enable_text_encoders(self) -> None:
+        for offloader in self._text_encoder_offloaders:
+            offloader.enable()
+
+    def _disable_text_encoders(self) -> None:
+        for offloader in self._text_encoder_offloaders:
+            offloader.disable()
+
+    def _enable_vae(self) -> None:
+        if self._vae_offloader is None:
+            return
+        self._vae_offloader.enable()
+
+    def _disable_vae(self) -> None:
+        if self._vae_offloader is None:
+            return
+        self._vae_offloader.disable()
+
+    def _enable_transformer(self) -> None:
+        if self.od_config.parallel_config.use_hsdp:  # HSDP disables transformer offloading
+            return
+        if self._transformer_offloader is None:
+            self._init_transformer_offloader()
+        self._transformer_offloader.enable()
+
+    def _disable_transformer(self) -> None:
+        if self.od_config.parallel_config.use_hsdp:
+            return
+        if self._transformer_offloader is None:
+            self._init_transformer_offloader()
+        self._transformer_offloader.disable()
 
     # -- Text encoding -------------------------------------------------------
 
@@ -674,7 +782,7 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         x = rearrange(x, "B C (Tl L) H W -> (B Tl) C L H W", L=1)
 
         with torch.no_grad():
-            enc = self.vae.encode(x)  # (T_kf, C_vae, 1, H_lat, W_lat)
+            enc = self.vae.encode(x, gather_fn=self.sp_gather, shard_fn=self.sp_shard)  # (T_kf, C_vae, 1, H_lat, W_lat)
         enc = enc.squeeze(2)
         cond_frames = rearrange(enc, "(B T) C H W -> B C T H W", T=T_kf).contiguous().to(dtype=dtype)
 
@@ -720,11 +828,8 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
             generator = torch.Generator(device=device).manual_seed(0)  # default seed
 
         # -- Text encoding (offload transformer, load encoders) ---------------
-        self.transformer.to("cpu")
-        torch.cuda.empty_cache()
-        self.ul2_model.to(device)
-        self.clip_model.to(device)
-        self.byt5_model.to(device)
+        self._disable_transformer()
+        self._enable_text_encoders()
 
         # Reference passes quote_override="" (ByT5 encodes empty string)
         prompt_embeds, prompt_masks, vector_cond = self.encode_prompt(
@@ -748,10 +853,7 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
             )
 
         # Offload encoders, reload transformer
-        self.ul2_model.to("cpu")
-        self.clip_model.to("cpu")
-        self.byt5_model.to("cpu")
-        torch.cuda.empty_cache()
+        self._disable_text_encoders()
 
         # -- I2V: encode conditioning frames (VAE only, transformer still offloaded) --
         cond_frames: torch.Tensor | None = None
@@ -760,22 +862,21 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         cond_images = additional_information.get("cond_images")
         cond_frame_indices = additional_information.get("cond_frame_indices")
         if cond_images is not None and cond_frame_indices:
-            self.vae.to(device)
+            self._enable_vae()
             cond_frames, cond_offsets = self._encode_cond_frames(
                 cond_images,
                 cond_frame_indices,
                 device=device,
                 dtype=dtype,
             )
-            self.vae.to("cpu")
-            torch.cuda.empty_cache()
+            self._disable_vae()
             logger.info(
                 "Marey I2V forward: cond_frames.shape=%s cond_offsets=%s",
                 tuple(cond_frames.shape),
                 cond_offsets.tolist(),
             )
 
-        self.transformer.to(device)
+        self._enable_transformer()
 
         # -- Timesteps --------------------------------------------------------
         timesteps = _create_flow_timesteps(
@@ -929,13 +1030,12 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         self._current_timestep = None
 
         # -- VAE decode -------------------------------------------------------
-        self.transformer.to("cpu")
-        torch.cuda.empty_cache()
+        self._disable_transformer()
         output_type = sp.output_type or self.od_config.output_type or "np"
         if output_type == "latent":
             output = z
         else:
-            self.vae.to(device)
+            self._enable_vae()
             vae_t_ds = self.vae_downsample_factors[0]
             num_latent_t = z.shape[2]
             num_pixel_frames = num_latent_t * vae_t_ds
@@ -950,12 +1050,12 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
                     z.to(dtype),
                     num_frames=num_pixel_frames,
                     spatial_size=(height, width),
+                    gather_fn=self.sp_gather,
+                    shard_fn=self.sp_shard,
                 )
             if isinstance(output, tuple):
                 output = output[0]
-            self.vae.to("cpu")
-        self.transformer.to(device)
-        torch.cuda.empty_cache()
+            self._disable_vae()
 
         return DiffusionOutput(output=output)
 
