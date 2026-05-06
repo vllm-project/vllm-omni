@@ -360,6 +360,47 @@ class TestLoadAndResolveStageConfigs:
         assert len(stage_configs) == 1
         assert "dtype" in stage_configs[0]["engine_args"]
 
+    def test_stage_configs_path_promotes_new_deploy_yaml_without_expanding_replicas(
+        self, tmp_path, mocker: MockerFixture
+    ):
+        deploy_path = tmp_path / "qwen3_multi.yaml"
+        deploy_path.write_text(
+            'stages:\n  - stage_id: 0\n    devices: "0"\n  - stage_id: 1\n    devices: "1,2,3"\n    num_replicas: 3\n',
+            encoding="utf-8",
+        )
+
+        returned_stage_configs = [
+            create_config({"stage_id": 0, "runtime": {"devices": "0"}, "engine_args": {"model": "dummy"}}),
+            create_config(
+                {
+                    "stage_id": 1,
+                    "runtime": {"devices": "1,2,3", "num_replicas": 3},
+                    "engine_args": {"model": "dummy"},
+                }
+            ),
+        ]
+        load_stage_configs = mocker.patch(
+            "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+            return_value=returned_stage_configs,
+        )
+
+        config_path, stage_configs = load_and_resolve_stage_configs(
+            model="dummy-model",
+            stage_configs_path=str(deploy_path),
+            kwargs={},
+        )
+
+        load_stage_configs.assert_called_once_with(
+            "dummy-model",
+            base_engine_args={},
+            deploy_config_path=str(deploy_path),
+            stage_overrides=None,
+        )
+        assert config_path == str(deploy_path)
+        assert len(stage_configs) == 2
+        assert stage_configs[1].runtime.num_replicas == 3
+        assert stage_configs[1].runtime.devices == "1,2,3"
+
 
 class TestLoadStageConfigsFromYaml:
     """Regression tests for stage-config loading and merging."""
