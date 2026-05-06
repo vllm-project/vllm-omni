@@ -49,7 +49,7 @@ def get_batch_token_config(default_path):
     )
 
 
-def get_async_chunk_config(default_path):
+def get_default_config(default_path):
     """Flip async_chunk on and bump stage 0 thinker output to 2048 tokens.
 
     Pipeline registry (qwen3_omni/pipeline.py) already wires
@@ -75,14 +75,17 @@ default_path = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 test_params = [
     pytest.param(
         OmniServerParams(
-            model=model, stage_config_path=default_path, use_stage_cli=True, server_args=["--no-async-chunk"]
+            model=model,
+            stage_config_path=get_default_config(default_path),
+            use_stage_cli=True,
+            server_args=["--no-async-chunk"],
         ),
         id="default",
     ),
     pytest.param(
         OmniServerParams(
             model=model,
-            stage_config_path=get_async_chunk_config(default_path),
+            stage_config_path=get_default_config(default_path),
             use_stage_cli=True,
             server_args=["--async-chunk"],
         ),

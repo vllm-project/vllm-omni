@@ -22,6 +22,19 @@ from vllm_omni.diffusion.layers.fourier import GaussianFourierProjection
 logger = init_logger(__name__)
 
 
+def _preprocess_stable_audio_weight(
+    param: torch.Tensor,
+    loaded_weight: torch.Tensor,
+) -> torch.Tensor:
+    if param.shape == loaded_weight.shape:
+        return loaded_weight
+
+    if loaded_weight.ndim + 1 == param.ndim and param.shape[-1] == 1 and loaded_weight.shape == param.shape[:-1]:
+        return loaded_weight.unsqueeze(-1)
+
+    return loaded_weight
+
+
 def apply_rotary_emb_stable_audio(
     hidden_states: torch.Tensor,
     freqs_cis: tuple[torch.Tensor, torch.Tensor],
@@ -54,6 +67,84 @@ def apply_rotary_emb_stable_audio(
 
     x_rot = (x_rot.float() * cos + x_rotated.float() * sin).to(hidden_states.dtype)
     return torch.cat([x_rot, x_pass], dim=-1)
+
+
+class StableAudioSchedulerWrapper:
+    def __init__(self, scheduler):
+        self.scheduler = scheduler
+
+    def __getattr__(self, name):
+        return getattr(self.scheduler, name)
+
+    def _get_step_index(self, timestep):
+        step_index = getattr(self.scheduler, "step_index", None)
+        if step_index is not None:
+            return step_index
+
+        timesteps = getattr(self.scheduler, "timesteps", None)
+        if timesteps is None:
+            return None
+
+        timestep = torch.as_tensor(
+            timestep,
+            device=timesteps.device,
+            dtype=timesteps.dtype,
+        )
+        indices = (timesteps == timestep).nonzero()
+        if len(indices) == 0:
+            return None
+
+        return indices[0].item()
+
+    def _is_final_zero_sigma_step(self, timestep):
+        step_index = self._get_step_index(timestep)
+        if step_index is None:
+            return False
+
+        sigmas = self.scheduler.sigmas
+        if step_index + 1 >= len(sigmas):
+            return False
+
+        sigma = sigmas[step_index]
+        next_sigma = sigmas[step_index + 1]
+        sigma_min = torch.as_tensor(
+            self.scheduler.config.sigma_min,
+            device=sigma.device,
+            dtype=sigma.dtype,
+        )
+
+        return torch.isclose(sigma, sigma_min) and torch.isclose(
+            next_sigma,
+            torch.zeros_like(next_sigma),
+        )
+
+    def step(self, model_output, timestep, sample, generator=None, return_dict=True):
+        use_zero_noise = self._is_final_zero_sigma_step(timestep)
+        old_noise_sampler = None
+
+        if use_zero_noise:
+            old_noise_sampler = getattr(self.scheduler, "noise_sampler", None)
+            self.scheduler.noise_sampler = _StableAudioZeroNoiseSampler(sample)
+
+        try:
+            return self.scheduler.step(
+                model_output,
+                timestep,
+                sample,
+                generator=generator,
+                return_dict=return_dict,
+            )
+        finally:
+            if use_zero_noise:
+                self.scheduler.noise_sampler = old_noise_sampler
+
+
+class _StableAudioZeroNoiseSampler:
+    def __init__(self, sample: torch.Tensor):
+        self.sample = sample
+
+    def __call__(self, sigma, next_sigma):
+        return torch.zeros_like(self.sample)
 
 
 class StableAudioGaussianFourierProjection(GaussianFourierProjection):
@@ -374,6 +465,7 @@ class StableAudioDiTModel(nn.Module):
     """
 
     _repeated_blocks = ["StableAudioDiTBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks"]
     _hsdp_shard_conditions = [is_transformer_block_module]
 
     def __init__(
@@ -594,8 +686,12 @@ class StableAudioDiTModel(nn.Module):
 
             if mapped_name in params_dict:
                 param = params_dict[mapped_name]
+                loaded_weight = _preprocess_stable_audio_weight(param, loaded_weight)
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                try:
+                    weight_loader(param, loaded_weight)
+                except AssertionError as err:
+                    raise AssertionError(f"Failed to load Stable Audio weight {name!r} as {mapped_name!r}") from err
                 loaded_params.add(mapped_name)
             else:
                 logger.debug(f"Skipping weight {name} - not found in model")

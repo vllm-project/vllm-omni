@@ -358,6 +358,31 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     }' --output cloned.wav
 ```
 
+### Voice Storage & Caching
+
+Uploaded voices are persisted to disk as a single `.safetensors` file per voice
+(audio samples + metadata — name, consent, ref_text, sample_rate, created_at —
+in the file header). On server restart the directory is scanned and all
+previously uploaded voices are restored automatically, so uploads survive
+process restarts.
+
+Uploading an existing name overwrites the previous entry (a warning is logged).
+
+Feature extraction artifacts (ref_code, speaker_embedding, DAC codes, etc.)
+are cached in-process with a shared LRU so repeated requests with the same
+`voice=...` skip the extraction pipeline. The cache is a true singleton across
+all TTS model types; deleting a voice invalidates every model-type slot at
+once.
+
+**Configuration (environment variables):**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SPEAKER_SAMPLES_DIR` | `~/.cache/vllm-omni/speakers` | Directory for persisted uploaded speakers (`.safetensors` files). |
+| `SPEAKER_MAX_UPLOADED` | `1000` | Maximum number of uploaded speakers kept on disk. Upload requests past the cap return 400. |
+
+The in-memory LRU has a fixed 512 MiB byte budget.
+
 ## Batch Speech Generation
 
 The batch endpoint synthesizes multiple texts in a single request, returning all results as JSON with base64-encoded audio.
@@ -542,6 +567,30 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 | Model | Description |
 |-------|-------------|
 | `mistralai/Voxtral-4B-TTS-2603` | 3B AR + FlowMatching TTS. Supports text-to-speech with preset voices. |
+
+### CosyVoice3
+
+| Model | Description |
+|-------|-------------|
+| `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | Voice cloning from `ref_audio` + `ref_text`. No built-in voice presets — upload a voice or pass `ref_audio`/`ref_text` per request. |
+
+### OmniVoice
+
+| Model | Description |
+|-------|-------------|
+| `k2-fsa/OmniVoice` | Pure-diffusion TTS. Supports voice cloning via `ref_audio` (with optional `ref_text`); no built-in voice presets. |
+
+### VoxCPM2
+
+| Model | Description |
+|-------|-------------|
+| `openbmb/VoxCPM2` | TTS + voice cloning with built-in speaker presets and uploaded-voice support. Accepts `voice` (preset or uploaded) or `ref_audio` + optional `ref_text`. |
+
+### MOSS-TTS-Nano
+
+| Model | Description |
+|-------|-------------|
+| `OpenMOSS-Team/MOSS-TTS-Nano` | Voice cloning only. Requires `ref_audio` (or an uploaded `voice`); no built-in voice presets. `ref_text` is accepted but ignored — upstream's `voice_clone` mode does not consume a transcript. |
 
 ## Error Responses
 

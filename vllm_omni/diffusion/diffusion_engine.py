@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import queue
 import threading
@@ -30,7 +31,7 @@ from vllm_omni.diffusion.registry import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -99,7 +100,17 @@ class DiffusionEngine:
             StepScheduler() if self.step_execution else RequestScheduler()
         )
         self.scheduler.initialize(od_config)
+        if self.scheduler.max_num_running_reqs > 1 and not self.step_execution:
+            max_num_seqs = self.scheduler.max_num_running_reqs
+            self.scheduler.max_num_running_reqs = 1
+            logger.warning(f"Non-stepwise-execution does not support max-num-seqs={max_num_seqs}, set it to 1.")
+        self.main_loop: asyncio.AbstractEventLoop | None = None
+        self.stop_event: threading.Event | None = None
+        self._loop_started = False
+        self._init_lock = asyncio.Lock()
         self._rpc_lock = threading.RLock()
+        self._cv = threading.Condition(self._rpc_lock)
+        self._out_queue: dict[str, asyncio.Future] = {}
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
 
@@ -110,7 +121,24 @@ class DiffusionEngine:
             self.close()
             raise e
 
-    def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
+    async def _check_and_start_background_loop(self):
+        if self._loop_started:
+            return
+
+        async with self._init_lock:
+            # double check, in case of lock queue issue
+            if self._loop_started:
+                return
+
+            self.main_loop = asyncio.get_running_loop()
+            self.stop_event = threading.Event()
+            self.worker_thread = threading.Thread(target=self._busy_loop)
+            self.worker_thread.start()
+            self._loop_started = True
+
+    async def step(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:
+        await self._check_and_start_background_loop()
+
         diffusion_engine_start_time = time.perf_counter()
 
         # Apply pre-processing if available
@@ -122,7 +150,7 @@ class DiffusionEngine:
             logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
 
         exec_start_time = time.perf_counter()
-        output = self.add_req_and_wait_for_response(request)
+        output = await self.async_add_req_and_wait_for_response(request)
         exec_total_time = time.perf_counter() - exec_start_time
 
         if output.aborted:
@@ -336,6 +364,62 @@ class DiffusionEngine:
 
             return results
 
+    def _busy_loop(self):
+        while not self.stop_event.is_set():
+            self._process_aborts_queue()
+
+            with self._cv:
+                while not self.scheduler.has_requests() and not self.stop_event.is_set():
+                    self._cv.wait(timeout=1.0)
+
+                if self.stop_event.is_set():
+                    break
+
+                sched_output = self.scheduler.schedule()
+
+            if sched_output.is_empty:
+                self._handle_finished_requests(sched_output.finished_req_ids, None)
+                continue
+
+            try:
+                runner_output = self.execute_fn(sched_output)
+            except Exception as exc:
+                logger.error(
+                    "Execution failed for diffusion requests %s", sched_output.scheduled_req_ids, exc_info=True
+                )
+                runner_output = BatchRunnerOutput.from_list(
+                    [
+                        RunnerOutput(
+                            req_id=req_id,
+                            step_index=None,
+                            finished=True,
+                            result=DiffusionOutput(error=str(exc)),
+                        )
+                        for req_id in sched_output.scheduled_req_ids
+                    ]
+                )
+
+            self._process_aborts_queue()
+            finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+            self._handle_finished_requests(finished_req_ids, runner_output)
+
+    def _handle_finished_requests(
+        self,
+        finished_ids: set[str],
+        runner_output: RunnerOutput | None = None,
+        missing_result_error: str = "Diffusion execution finished without a final output",
+    ):
+        for rid in finished_ids:
+            if rid in self._out_queue:
+                fut = self._out_queue.pop(rid)
+                if runner_output is not None:
+                    _output = runner_output.get_req_output(rid)
+                else:
+                    _output = None
+                out = self._finalize_finished_request(rid, _output, missing_result_error)
+                if not fut.done():
+                    self.main_loop.call_soon_threadsafe(fut.set_result, out)
+
     @staticmethod
     def make_engine(
         config: OmniDiffusionConfig,
@@ -350,6 +434,30 @@ class DiffusionEngine:
             An instance of DiffusionEngine.
         """
         return DiffusionEngine(config, scheduler=scheduler)
+
+    def add_request(self, request: OmniDiffusionRequest) -> str:
+        fut = self.main_loop.create_future()
+        with self._cv:
+            sched_req_id = self.scheduler.add_request(request)
+            self._out_queue[sched_req_id] = fut
+            self._cv.notify_all()
+
+        return sched_req_id
+
+    async def get_result(self, request_id: str) -> DiffusionOutput:
+        fut = self._out_queue.get(request_id)
+
+        if fut is None:
+            raise RuntimeError(f"Request {request_id} not found in output queue.")
+        try:
+            return await fut
+        except Exception as e:
+            logger.error(f"Wait for response failed: {e}")
+            raise
+
+    async def async_add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        sched_req_id = self.add_request(request)
+        return await self.get_result(sched_req_id)
 
     def add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         with self._rpc_lock:
@@ -366,10 +474,8 @@ class DiffusionEngine:
                         raise RuntimeError("Diffusion scheduler has no runnable requests.")
                     continue
 
-                # NOTE: add_req_and_wait_for_response() is synchronous, and
-                # the scheduler currently enforces _max_batch_size = 1 (see
-                # vllm_omni/diffusion/sched/base_scheduler.py), so we directly
-                # take the single scheduled request here.
+                # NOTE: add_req_and_wait_for_response() is synchronous, will be only called
+                # within _dummy_run, only one request will be scheduled
                 sched_req_id = sched_output.scheduled_req_ids[0]
                 try:
                     runner_output = self.execute_fn(sched_output)
@@ -387,7 +493,12 @@ class DiffusionEngine:
                 self._process_aborts_queue()
 
                 finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
+
+                # sync func should receive one result
+                if not isinstance(runner_output, RunnerOutput) and not len(runner_output) == 1:
+                    raise ValueError("Sync func should receive one result at one time")
                 if target_sched_req_id in finished_req_ids:
+                    runner_output = runner_output.get_req_output(target_sched_req_id)
                     return self._finalize_finished_request(
                         target_sched_req_id,
                         runner_output=runner_output,
@@ -510,13 +621,26 @@ class DiffusionEngine:
     def close(self) -> None:
         if hasattr(self, "scheduler"):
             self.scheduler.close()
+        if hasattr(self, "stop_event") and self.stop_event is not None:
+            with self._cv:
+                self.stop_event.set()
+                self._cv.notify_all()
+        if hasattr(self, "worker_thread") and self.worker_thread.is_alive():
+            self.worker_thread.join(timeout=10)
+            if self.worker_thread.is_alive():
+                logger.warning("Worker thread did not terminate within 10s, resources may not be released.")
+            else:
+                self._loop_started = False
         if hasattr(self, "executor"):
             self.executor.shutdown()
 
     def abort(self, request_id: str | Iterable[str]) -> None:
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
-        for req_id in request_ids:
-            self.abort_queue.put(req_id)
+
+        with self._cv:
+            for req_id in request_ids:
+                self.abort_queue.put(req_id)
+            self._cv.notify_all()
 
     def _process_aborts_queue(self) -> None:
         if self.abort_queue.empty():

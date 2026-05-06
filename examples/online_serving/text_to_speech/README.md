@@ -15,9 +15,11 @@ For the full list of supported architectures across all modalities, see
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 |---|---|---|---|---|---|
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
+| Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | — (caption-controlled) | — | caption fields (`instructions`) | — |
+| MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
-| VoxCPM | local model dir | ✓ | ✓ (PCM stream) | — | — |
+| VoxCPM | `openbmb/VoxCPM-0.5B` | ✓ | ✓ (PCM stream) | — | — |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
@@ -138,6 +140,105 @@ python fish_speech/gradio_demo.py --api-base http://localhost:8091  # if server 
 ### Notes
 - Output: 44.1 kHz mono.
 - Streaming PCM player command must use `-r 44100`.
+
+---
+
+## Ming-flash-omni-TTS
+
+Standalone talker-only deployment of Ming-flash-omni-2.0. Voice is controlled through caption text passed via `instructions`.
+
+### Launch
+```bash
+# from repo root
+bash examples/online_serving/text_to_speech/ming_flash_omni_tts/run_server.sh
+```
+Equivalent manual command:
+```bash
+vllm serve Jonathan1909/Ming-flash-omni-2.0 \
+    --deploy-config vllm_omni/deploy/ming_flash_omni_tts.yaml \
+    --host 0.0.0.0 --port 8091 \
+    --trust-remote-code --omni
+```
+
+### Sending requests
+```bash
+python examples/online_serving/text_to_speech/ming_flash_omni_tts/speech_client.py \
+    --text "我们当迎着阳光辛勤耕作，去摘取，去制作，去品尝，去馈赠。" \
+    --output ming_online.wav
+```
+
+ASMR-style caption via `instructions`:
+```bash
+python examples/online_serving/text_to_speech/ming_flash_omni_tts/speech_client.py \
+    --text "我会一直在这里陪着你，直到你慢慢、慢慢地沉入那个最温柔的梦里……好吗？" \
+    --instructions "这是一种ASMR耳语，属于一种旨在引发特殊感官体验的创意风格。这个女性使用轻柔的普通话进行耳语，声音气音成分重。" \
+    --output ming_online_asmr.wav
+```
+
+### Notes
+- Server uses `use_zero_spk_emb=True` and the cookbook decode defaults (`max_decode_steps=200`, `cfg=2.0`, `sigma=0.25`, `temperature=0.0`). For other caption fields (`语速`, `基频`, `IP`, BGM, etc.) or overriding decode args, use the offline example where `additional_information` is set explicitly.
+- This is the online counterpart of [`examples/offline_inference/text_to_speech/ming_flash_omni_tts/`](../../offline_inference/text_to_speech/ming_flash_omni_tts/).
+- For multimodal Ming-flash-omni online serving, see [`examples/online_serving/ming_flash_omni/`](../../ming_flash_omni/).
+
+---
+
+## MOSS-TTS-Nano
+
+Single-stage 0.1B AR LM + MOSS-Audio-Tokenizer-Nano codec at 48 kHz mono. Every request must include `ref_audio`; there are no built-in speaker presets.
+
+> The OpenAI-schema `voice` and `ref_text` fields are accepted but ignored — `voice_clone` does not consume a transcript, and upstream's `continuation` mode (the only path that accepts `prompt_text`) emits near-silent output, so it is not exposed here. Sample reference clips ship in the upstream repo under [`assets/audio/`](https://github.com/OpenMOSS/MOSS-TTS-Nano/tree/main/assets/audio).
+
+### Launch
+```bash
+vllm serve OpenMOSS-Team/MOSS-TTS-Nano --omni --port 8091
+# or:
+./moss_tts_nano/run_server.sh
+```
+The deploy config at `vllm_omni/deploy/moss_tts_nano.yaml` auto-loads; no `--stage-configs-path`, `--trust-remote-code`, or `--enforce-eager` flags are needed.
+
+### Sending requests
+```bash
+# One-off fetch of a sample reference clip; cache under XDG_CACHE_HOME.
+REF_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/moss-tts-nano"
+mkdir -p "$REF_DIR"
+REF_WAV="$REF_DIR/zh_1.wav"
+[ -s "$REF_WAV" ] || curl -L -o "$REF_WAV" https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS-Nano/main/assets/audio/zh_1.wav
+REF_AUDIO=$(base64 -w 0 "$REF_WAV")
+
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d "{
+        \"input\": \"你好，这是语音合成测试。\",
+        \"ref_audio\": \"data:audio/wav;base64,${REF_AUDIO}\",
+        \"response_format\": \"wav\"
+    }" --output output.wav
+```
+
+### Streaming PCM
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d "{
+        \"input\": \"Hello, streaming output from MOSS-TTS-Nano.\",
+        \"ref_audio\": \"data:audio/wav;base64,${REF_AUDIO}\",
+        \"stream\": true,
+        \"response_format\": \"pcm\"
+    }" --no-buffer | play -t raw -r 48000 -e signed -b 16 -c 1 -
+```
+
+### Gradio demo
+```bash
+# Option 1: launch server + Gradio together
+./moss_tts_nano/run_gradio_demo.sh
+
+# Option 2: server already running
+python moss_tts_nano/gradio_demo.py --api-base http://localhost:8091
+```
+Then open http://localhost:7860 in your browser.
+
+### Notes
+- Output is 48 kHz mono PCM (the upstream tokenizer is internally stereo at 48 kHz; the wrapper averages to mono before reaching the engine).
+- Standard `/v1/audio/speech` request shape: `input`, `ref_audio` (base64 data URL), `response_format`, `stream`, `max_new_tokens`. The `voice` and `ref_text` fields from the OpenAI schema are accepted but ignored.
 
 ---
 

@@ -761,6 +761,11 @@ class OmniDiffusionConfig:
                         self.model_class_name = "NextStep11Pipeline"
                     self.tf_model_config = TransformerConfig()
                     self.update_multimodal_support()
+                elif model_type == "s2v":
+                    if self.model_class_name is None:
+                        self.model_class_name = "WanS2VPipeline"
+                    self.tf_model_config = TransformerConfig()
+                    self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:
                     self.model_class_name = architectures[0]
                 else:

@@ -737,6 +737,16 @@ step-scoped phases. The reference implementation is
 Do not enable `step_execution=True` until those four methods are implemented
 and validated against the request-level path.
 
+If you want the pipeline to work with the experimental batched step-wise path
+(`max_num_seqs > 1`), also see:
+[Continuous Batching for Step-Wise Diffusion](../../design/feature/diffusion_continuous_batching.md).
+
+If you expose this in example scripts or recipes, keep it opt-in. Surface
+runtime features like `step_execution` as optional flags instead of silently
+turning them on. For Qwen-Image-style serving examples, document
+`--step-execution` as the feature gate and `--max-num-seqs N` as the
+companion batching knob.
+
 ### Cache Acceleration
 
 #### TeaCache
