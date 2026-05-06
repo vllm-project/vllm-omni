@@ -187,6 +187,8 @@ class RunnerOutput:
     # ── Temporal-PP micro-step fields ──
     chunk_idx: int | None = None
     chunk_completed: bool = False
+    micro_step_wall_ns: int | None = None
+    extra_task_outputs: list["RunnerOutput"] | None = None # for B>1 
 
     def get_req_output(self, sched_req_id: str) -> RunnerOutput | None:
         return self if self.req_id == sched_req_id else None

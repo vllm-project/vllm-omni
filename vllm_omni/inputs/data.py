@@ -224,6 +224,11 @@ class OmniDiffusionSamplingParams:
     # (temporal PP) to know how many chunks to admit through the pipeline.
     num_chunks: int = 1
 
+    # SLO-adaptive stream batching. ``slo_fps=None`` keeps B fixed at 1.
+    slo_fps: float | None = None
+    slo_max_batch: int = 8
+    slo_ema_alpha: float = 0.3
+
     # Original dimensions (before VAE scaling)
     height: int | None = None
     width: int | None = None

@@ -108,7 +108,7 @@ class CachedRequestData:
 
 @dataclass
 class RankTask:
-    """Used by ``StreamBatchScheduler`` to tell each rank which work to perform in the current micro-step."""
+    """One unit of work for a rank in a stream-batch micro-step."""
 
     sched_req_id: str
     chunk_idx: int
@@ -124,9 +124,8 @@ class DiffusionSchedulerOutput:
     finished_req_ids: set[str]
     num_running_reqs: int
     num_waiting_reqs: int
-    # Temporal-PP per-rank assignment table. Index = PP rank id. ``None`` entries
-    # mark idle ranks (warmup / cooldown).
-    per_rank_assignment: list[RankTask | None] | None = None
+    # Per-rank task list. Index = PP rank id.
+    per_rank_assignment: list[list[RankTask]] | None = None
 
     @cached_property
     def scheduled_req_ids(self) -> list[str]:
