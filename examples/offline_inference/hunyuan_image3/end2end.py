@@ -17,11 +17,21 @@ import argparse
 import os
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
-    _TASK_PRESETS,
     build_prompt_tokens,
 )
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniPromptType
+
+# task -> (sys_type, bot_task, trigger_tag)
+_TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
+    "t2t": ("en_unified", None, None),
+    "i2t": ("en_unified", None, None),
+    "it2i_think": ("en_unified", "think", "<think>"),
+    "it2i_recaption": ("en_unified", "recaption", "<recaption>"),
+    "t2i_think": ("en_unified", "think", "<think>"),
+    "t2i_recaption": ("en_unified", "recaption", "<recaption>"),
+    "t2i_vanilla": ("en_vanilla", "image", None),
+}
 
 # Modality → prompt_utils task mapping
 _MODALITY_TASK_MAP = {
