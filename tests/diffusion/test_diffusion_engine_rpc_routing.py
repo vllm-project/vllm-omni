@@ -25,7 +25,6 @@ import threading
 import time
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -33,7 +32,6 @@ from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, _RpcTask
 from vllm_omni.diffusion.sched import RequestScheduler
 from vllm_omni.diffusion.worker.utils import RunnerOutput
-
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -176,14 +174,10 @@ async def test_executor_only_called_from_busy_loop_thread():
         # Per-request path
         await engine.async_add_req_and_wait_for_response(_make_request("req1"))
         # Raw RPC path (sync from a worker thread)
-        result = await asyncio.to_thread(
-            engine.collective_rpc, "ping", args=("a",), unique_reply_rank=0
-        )
+        result = await asyncio.to_thread(engine.collective_rpc, "ping", args=("a",), unique_reply_rank=0)
         assert result.error == "rpc_result_for_a"
         # Raw RPC path (async)
-        result_async = await engine.async_collective_rpc(
-            "ping", args=("b",), unique_reply_rank=0
-        )
+        result_async = await engine.async_collective_rpc("ping", args=("b",), unique_reply_rank=0)
         assert result_async.error == "rpc_result_for_b"
     finally:
         _stop_engine(engine)
@@ -202,15 +196,12 @@ async def test_executor_calls_never_overlap_under_load():
     loop = asyncio.get_running_loop()
     engine = _make_engine_with_loop(loop, rpc_delay=0.005)
     try:
+
         async def _rpc(i: int):
-            return await engine.async_collective_rpc(
-                "ping", args=(f"x{i}",), unique_reply_rank=0
-            )
+            return await engine.async_collective_rpc("ping", args=(f"x{i}",), unique_reply_rank=0)
 
         async def _request(i: int):
-            return await engine.async_add_req_and_wait_for_response(
-                _make_request(f"r{i}")
-            )
+            return await engine.async_add_req_and_wait_for_response(_make_request(f"r{i}"))
 
         tasks = [_rpc(i) for i in range(20)] + [_request(i) for i in range(5)]
         results = await asyncio.gather(*tasks)
@@ -218,8 +209,7 @@ async def test_executor_calls_never_overlap_under_load():
         _stop_engine(engine)
 
     assert engine.executor.max_concurrent == 1, (
-        f"Detected concurrent executor calls (max_concurrent="
-        f"{engine.executor.max_concurrent})"
+        f"Detected concurrent executor calls (max_concurrent={engine.executor.max_concurrent})"
     )
     # All 25 calls should have a result.
     assert len(results) == 25
@@ -236,10 +226,9 @@ async def test_collective_rpc_results_routed_to_correct_caller():
     loop = asyncio.get_running_loop()
     engine = _make_engine_with_loop(loop, rpc_delay=0.01)
     try:
+
         async def _call(tag: str):
-            res = await engine.async_collective_rpc(
-                "ping", args=(tag,), unique_reply_rank=0
-            )
+            res = await engine.async_collective_rpc("ping", args=(tag,), unique_reply_rank=0)
             return tag, res
 
         tags = [f"t{i}" for i in range(15)]
@@ -248,9 +237,7 @@ async def test_collective_rpc_results_routed_to_correct_caller():
         _stop_engine(engine)
 
     for tag, res in results:
-        assert res.error == f"rpc_result_for_{tag}", (
-            f"caller for {tag!r} received {res.error!r}"
-        )
+        assert res.error == f"rpc_result_for_{tag}", f"caller for {tag!r} received {res.error!r}"
 
 
 @pytest.mark.asyncio
@@ -263,9 +250,7 @@ async def test_sync_collective_rpc_from_worker_thread():
         results: list[Any] = [None] * 8
 
         def _worker(idx: int):
-            results[idx] = engine.collective_rpc(
-                "ping", args=(f"s{idx}",), unique_reply_rank=0
-            )
+            results[idx] = engine.collective_rpc("ping", args=(f"s{idx}",), unique_reply_rank=0)
 
         threads = [threading.Thread(target=_worker, args=(i,)) for i in range(8)]
         for t in threads:
@@ -293,16 +278,17 @@ async def test_collective_rpc_times_out_when_busy_loop_busy():
     engine = _make_engine_with_loop(loop, rpc_delay=2.0)
     try:
         # Kick off one slow RPC to occupy the busy loop.
-        slow = asyncio.create_task(
-            engine.async_collective_rpc("slow", args=("s",), unique_reply_rank=0)
-        )
+        slow = asyncio.create_task(engine.async_collective_rpc("slow", args=("s",), unique_reply_rank=0))
         # Yield so the slow task is enqueued.
         await asyncio.sleep(0.05)
 
         with pytest.raises(TimeoutError):
             await asyncio.to_thread(
-                engine.collective_rpc, "ping", args=("x",),
-                unique_reply_rank=0, timeout=0.2,
+                engine.collective_rpc,
+                "ping",
+                args=("x",),
+                unique_reply_rank=0,
+                timeout=0.2,
             )
 
         # The slow call should still complete normally.
@@ -317,15 +303,11 @@ async def test_async_collective_rpc_times_out_when_busy_loop_busy():
     loop = asyncio.get_running_loop()
     engine = _make_engine_with_loop(loop, rpc_delay=2.0)
     try:
-        slow = asyncio.create_task(
-            engine.async_collective_rpc("slow", args=("s",), unique_reply_rank=0)
-        )
+        slow = asyncio.create_task(engine.async_collective_rpc("slow", args=("s",), unique_reply_rank=0))
         await asyncio.sleep(0.05)
 
         with pytest.raises(TimeoutError):
-            await engine.async_collective_rpc(
-                "ping", args=("x",), unique_reply_rank=0, timeout=0.2
-            )
+            await engine.async_collective_rpc("ping", args=("x",), unique_reply_rank=0, timeout=0.2)
 
         result = await slow
         assert result.error == "rpc_result_for_s"
@@ -343,15 +325,11 @@ async def test_pending_rpcs_failed_on_shutdown():
     engine = _make_engine_with_loop(loop, rpc_delay=0.5)
     try:
         # Start a slow RPC that occupies the busy loop, then queue more.
-        in_flight = asyncio.create_task(
-            engine.async_collective_rpc("slow", args=("s",), unique_reply_rank=0)
-        )
+        in_flight = asyncio.create_task(engine.async_collective_rpc("slow", args=("s",), unique_reply_rank=0))
         await asyncio.sleep(0.05)
 
         pending = [
-            asyncio.create_task(
-                engine.async_collective_rpc("ping", args=(f"p{i}",), unique_reply_rank=0)
-            )
+            asyncio.create_task(engine.async_collective_rpc("ping", args=(f"p{i}",), unique_reply_rank=0))
             for i in range(3)
         ]
         # Give them a moment to enqueue.
@@ -433,12 +411,8 @@ async def test_rpc_and_request_results_do_not_swap():
     loop = asyncio.get_running_loop()
     engine = _make_engine_with_loop(loop, rpc_delay=0.02)
     try:
-        rpc_task = asyncio.create_task(
-            engine.async_collective_rpc("ping", args=("rpc1",), unique_reply_rank=0)
-        )
-        req_task = asyncio.create_task(
-            engine.async_add_req_and_wait_for_response(_make_request("req1"))
-        )
+        rpc_task = asyncio.create_task(engine.async_collective_rpc("ping", args=("rpc1",), unique_reply_rank=0))
+        req_task = asyncio.create_task(engine.async_add_req_and_wait_for_response(_make_request("req1")))
         rpc_res, req_res = await asyncio.gather(rpc_task, req_task)
     finally:
         _stop_engine(engine)

@@ -456,9 +456,7 @@ class DiffusionEngine:
             if task.deadline is not None:
                 remaining = task.deadline - time.monotonic()
                 if remaining <= 0:
-                    fut.set_exception(
-                        TimeoutError(f"RPC call to {task.method} timed out before execution.")
-                    )
+                    fut.set_exception(TimeoutError(f"RPC call to {task.method} timed out before execution."))
                     continue
 
             try:
