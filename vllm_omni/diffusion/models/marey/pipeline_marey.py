@@ -528,6 +528,13 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         # `3.0` for 30B (distilled, transform on) and `0.0` for 7B
         self.flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 3.0
 
+        logger.info(f'Scheduler config:')
+        logger.info(f'  num_train_timesteps: {self.num_train_timesteps}')
+        logger.info(f'  sched_tmin: {self.sched_tmin}')
+        logger.info(f'  sched_tmax: {self.sched_tmax}')
+        logger.info(f'  sched_teacher_steps: {self.sched_teacher_steps}')
+        logger.info(f'  flow_shift: {self.flow_shift}')
+
         # -- Guidance defaults ------------------------------------------------
         self.skip_uncond = True  # distilled models skip uncond when scale=1.0
         self.default_clip_value = 10.0

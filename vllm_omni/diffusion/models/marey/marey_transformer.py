@@ -30,8 +30,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
-    RowParallelLinear,
+    ReplicatedLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
@@ -526,9 +525,9 @@ class SwiGLUFFN(nn.Module):
     def __init__(self, in_features: int, hidden_features: int, drop: float = 0.0):
         super().__init__()
         # SwiGLU needs 2x hidden for gating
-        self.w1 = ColumnParallelLinear(in_features, hidden_features, bias=True, gather_output=False, return_bias=False)
-        self.w2 = ColumnParallelLinear(in_features, hidden_features, bias=True, gather_output=False, return_bias=False)
-        self.w3 = RowParallelLinear(hidden_features, in_features, bias=True, input_is_parallel=True, return_bias=False)
+        self.w1 = ReplicatedLinear(in_features, hidden_features, bias=True, return_bias=False)
+        self.w2 = ReplicatedLinear(in_features, hidden_features, bias=True, return_bias=False)
+        self.w3 = ReplicatedLinear(hidden_features, in_features, bias=True, return_bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x1 = self.w1(x)
@@ -571,8 +570,8 @@ class MareyFluxAttention(nn.Module):
         kv_dim = self.num_kv_heads * self.head_dim
 
         # Visual stream projections
-        self.q_linear_x = ColumnParallelLinear(dim, dim, bias=qkv_bias, gather_output=False, return_bias=False)
-        self.kv_linear_x = ColumnParallelLinear(dim, kv_dim * 2, bias=qkv_bias, gather_output=False, return_bias=False)
+        self.q_linear_x = ReplicatedLinear(dim, dim, bias=qkv_bias, return_bias=False)
+        self.kv_linear_x = ReplicatedLinear(dim, kv_dim * 2, bias=qkv_bias, return_bias=False)
         tp_size = get_tensor_model_parallel_world_size()
         tp_num_heads = num_heads // tp_size
         tp_num_kv_heads = self.num_kv_heads // tp_size
@@ -580,17 +579,15 @@ class MareyFluxAttention(nn.Module):
         # Per-head QK norm (checkpoint stores weights of shape [head_dim])
         self.q_norm_x = LlamaRMSNorm(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm_x = LlamaRMSNorm(self.head_dim) if qk_norm else nn.Identity()
-        self.proj_x = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True, return_bias=False)
+        self.proj_x = ReplicatedLinear(dim, dim, bias=True, return_bias=False)
 
         # Text stream projections (separate or shared with visual)
         if not share_weights:
-            self.q_linear_y = ColumnParallelLinear(dim, dim, bias=qkv_bias, gather_output=False, return_bias=False)
-            self.kv_linear_y = ColumnParallelLinear(
-                dim, kv_dim * 2, bias=qkv_bias, gather_output=False, return_bias=False
-            )
+            self.q_linear_y = ReplicatedLinear(dim, dim, bias=qkv_bias, return_bias=False)
+            self.kv_linear_y = ReplicatedLinear(dim, kv_dim * 2, bias=qkv_bias, return_bias=False)
             self.q_norm_y = LlamaRMSNorm(self.head_dim) if qk_norm else nn.Identity()
             self.k_norm_y = LlamaRMSNorm(self.head_dim) if qk_norm else nn.Identity()
-            self.proj_y = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True, return_bias=False)
+            self.proj_y = ReplicatedLinear(dim, dim, bias=True, return_bias=False)
 
         self.tp_num_heads = tp_num_heads
         self.tp_num_kv_heads = tp_num_kv_heads
