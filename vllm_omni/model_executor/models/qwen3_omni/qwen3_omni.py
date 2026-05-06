@@ -986,9 +986,11 @@ class Qwen3OmniMoeForConditionalGeneration(
         start_index = meta.get("num_processed_tokens", 0)
         thinker_output_token_ids = ids.get("output", [])
         if start_index >= len(thinker_output_token_ids) - 1:
-            if meta.get("finished"):
+            # When the tokens output by the thinker are exhausted, an EOS token needs to be appended.
+            # Use the finished_flag to mark that all tokens output by thinker have been consumed.
+            if meta.get("eos_emitted", False):
                 return self.tts_pad_embed.to(device)
-            update_dict.setdefault("meta", {})["finished"] = True
+            update_dict.setdefault("meta", {})["eos_emitted"] = True
             return self.tts_eos_embed.to(device)
 
         if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
