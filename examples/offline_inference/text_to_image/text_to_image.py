@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
+from vllm_omni.diffusion.data import logger
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
@@ -342,17 +342,6 @@ def main():
             #       (e.g., QwenImagePipeline or FluxPipeline)
         }
 
-    # assert args.ring_degree == 1, "Ring attention is not supported yet"
-    parallel_config = DiffusionParallelConfig(
-        ulysses_degree=args.ulysses_degree,
-        ring_degree=args.ring_degree,
-        ulysses_mode=args.ulysses_mode,
-        cfg_parallel_size=args.cfg_parallel_size,
-        tensor_parallel_size=args.tensor_parallel_size,
-        vae_patch_parallel_size=args.vae_patch_parallel_size,
-        enable_expert_parallel=args.enable_expert_parallel,
-    )
-
     profiler_enabled = args.profiler_config is not None
 
     # Prepare LoRA kwargs for Omni initialization
@@ -388,7 +377,13 @@ def main():
         "cache_backend": args.cache_backend,
         "cache_config": cache_config,
         "enable_cache_dit_summary": args.enable_cache_dit_summary,
-        "parallel_config": parallel_config,
+        "ulysses_degree": args.ulysses_degree,
+        "ring_degree": args.ring_degree,
+        "ulysses_mode": args.ulysses_mode,
+        "cfg_parallel_size": args.cfg_parallel_size,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "vae_patch_parallel_size": args.vae_patch_parallel_size,
+        "enable_expert_parallel": args.enable_expert_parallel,
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
         "mode": "text-to-image",

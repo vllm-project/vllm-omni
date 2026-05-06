@@ -121,7 +121,8 @@ class TestTrajectoryRecording:
 
         assert trajectory_latents is not None
         assert trajectory_timesteps is not None
-        assert len(trajectory_latents) == EXPECTED_STEPS
+        # initial latent + one per denoising step
+        assert len(trajectory_latents) == EXPECTED_STEPS + 1
         assert len(trajectory_timesteps) == EXPECTED_STEPS
         # log_probs is None without a scheduler (default ODE path)
         assert trajectory_log_probs is None
@@ -165,6 +166,54 @@ class TestTrajectoryRecording:
         final_latent = torch.cat(unpacked, dim=0)
         assert torch.allclose(trajectory_latents[-1], final_latent, atol=1e-6), (
             "Last trajectory latent should match the final output"
+        )
+
+    def test_initial_latent_matches_input_noise(self, bagel_and_args):
+        """Regression: the first trajectory entry must be the initial noise (pre-denoising)."""
+        bagel, args = bagel_and_args
+        init_noise = args["packed_init_noises"].clone()
+
+        _, trajectory_latents, *_ = bagel.generate_image(**args, return_trajectory_latents=True)
+
+        assert torch.allclose(trajectory_latents[0], init_noise, atol=1e-6), (
+            "trajectory_latents[0] should be the initial noise before any denoising step"
+        )
+
+    def test_trajectory_timesteps_match_expected_schedule(self, bagel_and_args):
+        """Regression: trajectory_timesteps must record raw timesteps[i], not timesteps[i] - dts[i]."""
+        bagel, args = bagel_and_args
+
+        # Recompute the expected timestep schedule (mirrors generate_image logic)
+        ts = torch.linspace(1, 0, args["num_timesteps"])
+        shift = args.get("timestep_shift", 1.0)
+        ts = shift * ts / (1 + (shift - 1) * ts)
+        expected_timesteps = ts[:-1]  # last element is dropped
+
+        _, _, trajectory_timesteps, _ = bagel.generate_image(**args, return_trajectory_latents=True)
+
+        assert len(trajectory_timesteps) == len(expected_timesteps)
+        for i, (actual, expected) in enumerate(zip(trajectory_timesteps, expected_timesteps)):
+            assert abs(float(actual) - float(expected)) < 1e-6, (
+                f"Step {i}: trajectory_timestep={float(actual):.6f}, expected={float(expected):.6f}"
+            )
+
+    def test_latent_count_equals_timesteps_plus_one(self, bagel_and_args):
+        """Regression: len(trajectory_latents) == len(timesteps) + 1 (initial + one per step)."""
+        bagel, args = bagel_and_args
+
+        # Compute the number of denoising steps the same way generate_image does
+        ts = torch.linspace(1, 0, args["num_timesteps"])
+        shift = args.get("timestep_shift", 1.0)
+        ts = shift * ts / (1 + (shift - 1) * ts)
+        num_steps = len(ts) - 1  # timesteps = ts[:-1]
+
+        _, trajectory_latents, trajectory_timesteps, _ = bagel.generate_image(**args, return_trajectory_latents=True)
+
+        assert len(trajectory_latents) == num_steps + 1, (
+            f"Expected {num_steps + 1} latents (initial + {num_steps} steps), got {len(trajectory_latents)}"
+        )
+        assert len(trajectory_timesteps) == num_steps, (
+            f"Expected {num_steps} timesteps, got {len(trajectory_timesteps)}"
         )
 
 

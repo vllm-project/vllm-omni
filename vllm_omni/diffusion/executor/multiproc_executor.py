@@ -22,7 +22,7 @@ from vllm_omni.diffusion.worker import WorkerProc
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
-    from vllm_omni.diffusion.worker.utils import RunnerOutput
+    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -273,7 +273,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             logger.error(f"Generate call failed: {e}")
             raise
 
-    def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+    def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Adapt request-mode scheduler output to worker execute_model RPC."""
         from vllm_omni.diffusion.worker.utils import RunnerOutput
 
@@ -301,9 +301,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             result=result,
         )
 
-    def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+    def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Forward step-mode scheduler output to worker execute_stepwise RPC."""
-        from vllm_omni.diffusion.worker.utils import RunnerOutput
+        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, RunnerOutput
 
         self._ensure_open()
         result = self.collective_rpc(
@@ -313,7 +313,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             exec_all_ranks=True,
         )
 
-        if isinstance(result, RunnerOutput):
+        if isinstance(result, BaseRunnerOutput):
             return result
         # TODO: Remove this fallback; DiffusionOutput cannot faithfully represent
         # failed multi-request step batches.
@@ -385,9 +385,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             raise
 
     def check_health(self) -> None:
-        self._ensure_open()
         if self.is_failed:
             raise EngineDeadError()
+        self._ensure_open()
         for p in self._processes:
             if not p.is_alive():
                 self.is_failed = True

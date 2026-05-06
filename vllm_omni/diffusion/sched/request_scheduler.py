@@ -32,11 +32,12 @@ class RequestScheduler(_BaseScheduler):
 
         terminal_statuses: dict[str, DiffusionRequestStatus] = {}
         terminal_errors: dict[str, str | None] = {}
-        result = output.result
         for sched_req_id in scheduled_req_ids:
             state = self._request_states.get(sched_req_id)
             if state is None or state.is_finished():
                 continue
+            req_output = output.get_req_output(sched_req_id)
+            result = req_output.result if req_output is not None else None
             if result is None:
                 terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_ERROR
                 terminal_errors[sched_req_id] = "No output result"

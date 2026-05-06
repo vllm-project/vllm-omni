@@ -34,7 +34,7 @@ def get_cuda_graph_config():
     )
 
 
-if current_omni_platform.is_rocm() or current_omni_platform.is_xpu():
+if current_omni_platform.is_xpu():
     stage_configs = [_CI_DEPLOY]
 else:
     stage_configs = [get_cuda_graph_config()]
