@@ -1,10 +1,43 @@
+import os
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 import torch
 from PIL import Image
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+
+FTFY_SITECUSTOMIZE_MOCK_DIR = Path(__file__).with_name("ftfy_mock")
+
+
+class IdentityFtfy:
+    @staticmethod
+    def fix_text(text: str) -> str:
+        return text
+
+
+def apply_ftfy_mock(*, wan_i2v_module: Any | None = None) -> None:
+    """Mock ftfy library for test cases in the main process"""
+    if wan_i2v_module is None:
+        from diffusers.pipelines.wan import pipeline_wan_i2v as wan_i2v_module
+
+    if not hasattr(wan_i2v_module, "ftfy"):
+        wan_i2v_module.ftfy = IdentityFtfy()
+        print("ftfy (text encoding sanitizer) is not installed. Using mock ftfy implementation (identity function)")
+    else:
+        print("ftfy (text encoding sanitizer) is installed. Using actual ftfy implementation.")
+
+
+def env_to_apply_ftfy_mock_in_subproc(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Mock ftfy library for test cases in subprocesses, by prepending the sitecustomize.py directory to PYTHONPATH"""
+    env_dict = dict(env or {})
+    pythonpath = env_dict.get("PYTHONPATH", os.environ.get("PYTHONPATH", ""))
+    path_entries = [str(FTFY_SITECUSTOMIZE_MOCK_DIR)]
+    if pythonpath:
+        path_entries.append(pythonpath)
+    env_dict["PYTHONPATH"] = os.pathsep.join(path_entries)
+    return env_dict
 
 
 def reset_artifact_dir(path: Path) -> Path:

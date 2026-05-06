@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, override_forward_context
+from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -33,6 +34,7 @@ from vllm.multimodal.audio import AudioResampler
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 from .minicpm4_paged import MiniCPM4PagedForVoxCPM2, MiniCPM4PagedResidualLM
 from .voxcpm2_import_utils import import_voxcpm2_core
@@ -121,7 +123,9 @@ def build_voxcpm2_prompt(
         else:
             additional["reference_audio"] = [[ref_audio, ref_sr]]
             prefill_len += ref_len + 2  # ref_start / ref_end
-    return {"prompt_token_ids": [1] * prefill_len, "additional_information": additional}
+    prompt = tokens_input(prompt_token_ids=[1] * prefill_len)
+    prompt["additional_information"] = additional
+    return prompt
 
 
 def _encode_raw_audio(
@@ -175,8 +179,6 @@ class _RequestState:
     # Rolling tail of previously-decoded latents used as VAE receptive-field context.
     # Shape (n_pad_frames, feat_dim) on GPU. None before first decode.
     decode_pad: torch.Tensor | None = None
-    # Audio chunks already emitted (CPU float32), concatenated for cumulative output.
-    audio_chunks: list[torch.Tensor] = dataclasses.field(default_factory=list)
     decode_step_count: int = 0
     request_start_time: float = 0.0
     prefill_completed: bool = False
@@ -184,7 +186,6 @@ class _RequestState:
     prompt_cache: dict | None = None
     prefill_masks: tuple | None = None
     is_stopping: bool = False
-    last_decoded_audio: torch.Tensor | None = None
 
 
 @dataclasses.dataclass
@@ -408,13 +409,31 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         )
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
-        self._tts: nn.Module | None = None
+        # Eager-init tts_model so it registers in self.state_dict() before vLLM's
+        # post-__init__ profiling claims the remaining GPU memory for KV cache.
+        # Required for load_format=dummy: DummyModelLoader only randomizes
+        # already-registered nn.Parameters.
+        # NOTE: from_pretrained() is unconditional, so load_format=dummy still pays
+        # the checkpoint download/read cost at construction time; DummyModelLoader
+        # will then randomize the just-loaded _tts params — this is intended.
+        model_path = vllm_config.model_config.model
+        VoxCPM = import_voxcpm2_core()
+        native = VoxCPM.from_pretrained(model_path, load_denoiser=False, optimize=False)
+        self._tts: nn.Module = native.tts_model.to("cuda")
+        self._side_dtype = self._tts.fusion_concat_proj.weight.dtype
         self._device = "cuda"
-        self._side_dtype = torch.bfloat16
-
-        self._patch_size = getattr(self.config, "patch_size", 4)
-        self._feat_dim = getattr(self.config, "feat_dim", 64)
+        self._patch_size = self._tts.patch_size
+        self._feat_dim = self._tts.feat_dim
         self._sample_rate = getattr(self.config, "sample_rate", 48000)
+
+        # base_lm/residual_lm in native tts_model duplicate self.model and
+        # self.residual_model: copy residual weights over, drop both submodules.
+        self.residual_model.load_weights_from_native(self._tts.residual_lm)
+        del self._tts.base_lm
+        self._tts.base_lm = None
+        del self._tts.residual_lm
+        self._tts.residual_lm = None
+        torch.cuda.empty_cache()
 
         self._inference_timesteps = 10
         self._cfg_value = 2.0
@@ -427,6 +446,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._compile_vae = True
         self._max_decode_steps = 2000
         self._max_batch_size = getattr(vllm_config.scheduler_config, "max_num_seqs", 4)
+
+        # Speaker cache for ref_audio_feat across requests
+        self._speaker_cache = get_speaker_cache()
 
         self._perf = _PerfTimer(enabled=_ENABLE_PROFILING)
         self._cfm_buffers: _CFMBufferManager | None = None
@@ -452,7 +474,6 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
     @property
     def tts(self) -> nn.Module:
-        assert self._tts is not None, "Model not loaded yet"
         return self._tts
 
     # -------------------- request state management --------------------
@@ -1017,8 +1038,6 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         all_latents = vae_input  # [pad + new]
         state.decode_pad = all_latents[-self._n_decode_pad_frames :].detach()
 
-        state.audio_chunks.append(new_audio)
-        state.last_decoded_audio = new_audio
         self._perf.stop("vae_decode")
         return new_audio
 
@@ -1129,7 +1148,6 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             state = self._get_or_create_state(req_id)
             state.prefill_text = ""
             state.decode_pad = None
-            state.audio_chunks = []
             state.prefill_completed = False
             state.decode_step_count = 0
             state.precomputed_stop_logits = None
@@ -1138,7 +1156,6 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             state.prev_feat_embed = None
             state.curr_prefix_feat_cond = None
             state.is_stopping = False
-            state.last_decoded_audio = None
 
             # Voice clone / continuation
             ref_audio = info_dict.get("reference_audio") or info_dict.get("ref_audio")
@@ -1152,15 +1169,48 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 prompt_text = prompt_text[0] if prompt_text else None
 
             state.prompt_cache = None
+            voice_name = info_dict.get("voice_name")
+            if isinstance(voice_name, list):
+                voice_name = voice_name[0] if voice_name else None
+            _created_at = int(info_dict.get("voice_created_at") or 0)
+
             if ref_audio or (prompt_audio and prompt_text):
-                try:
-                    state.prompt_cache = self._build_prompt_cache(
-                        ref_audio=ref_audio,
-                        prompt_audio=prompt_audio,
-                        prompt_text=prompt_text,
+                # Check speaker cache for reference-only mode
+                if voice_name and ref_audio and not prompt_audio:
+                    _cache_key = self._speaker_cache.make_cache_key(
+                        voice_name, model_type="voxcpm2", created_at=_created_at
                     )
-                except Exception as e:
-                    logger.warning("build_prompt_cache failed: %s", e)
+                    cached = self._speaker_cache.get(_cache_key)
+                    if cached is not None:
+                        state.prompt_cache = {
+                            "mode": "reference",
+                            "ref_audio_feat": cached["ref_audio_feat"].clone(),
+                        }
+                        logger.debug("Speaker cache HIT for VoxCPM2 speaker '%s'", voice_name)
+
+                if state.prompt_cache is None:
+                    try:
+                        state.prompt_cache = self._build_prompt_cache(
+                            ref_audio=ref_audio,
+                            prompt_audio=prompt_audio,
+                            prompt_text=prompt_text,
+                        )
+                        if (
+                            voice_name
+                            and state.prompt_cache is not None
+                            and state.prompt_cache.get("mode") == "reference"
+                            and "ref_audio_feat" in state.prompt_cache
+                        ):
+                            _key = self._speaker_cache.make_cache_key(
+                                voice_name, model_type="voxcpm2", created_at=_created_at
+                            )
+                            self._speaker_cache.put(
+                                _key, {"ref_audio_feat": state.prompt_cache["ref_audio_feat"].cpu()}
+                            )
+                            logger.debug("Speaker cache STORE for VoxCPM2 speaker '%s'", voice_name)
+                    except Exception as e:
+                        logger.warning("build_prompt_cache failed: %s; falling back to zero-shot", e)
+                        state.prompt_cache = None
 
             inputs = self._build_prefill_inputs(token_ids, dev, req_id)
             tts = self.tts
@@ -1264,25 +1314,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(_base_lm_only(weights), mapper=self.hf_to_vllm_mapper)
 
-        model_path = self.vllm_config.model_config.model
-        VoxCPM = import_voxcpm2_core()
-        native = VoxCPM.from_pretrained(model_path, load_denoiser=False, optimize=False)
-        self._tts = native.tts_model.to("cuda")
-        self._side_dtype = self._tts.fusion_concat_proj.weight.dtype
-        self._device = "cuda"
-        self._patch_size = self._tts.patch_size
-        self._feat_dim = self._tts.feat_dim
-
-        n = self.residual_model.load_weights_from_native(self._tts.residual_lm)
-        for name, _ in self.residual_model.named_parameters():
-            loaded.add(f"residual_model.{name}")
-        logger.info("VoxCPM2: loaded %d params into paged residual_model", n)
-
-        del self._tts.base_lm
-        self._tts.base_lm = None
-        del self._tts.residual_lm
-        self._tts.residual_lm = None
-        torch.cuda.empty_cache()
+        # _tts and residual_model are constructed and populated eagerly in
+        # __init__ via VoxCPM.from_pretrained; here we only need to mark their
+        # params as loaded so AutoWeightsLoader's strict check doesn't flag
+        # them as missing from the checkpoint.
+        loaded |= {name for name, _ in self.named_parameters() if name.startswith(("_tts.", "residual_model."))}
 
         logger.info(
             "Loaded VoxCPM2 (patch=%d, feat_dim=%d, dtype=%s)", self._patch_size, self._feat_dim, self._side_dtype
