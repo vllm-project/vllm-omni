@@ -621,6 +621,29 @@ class TestStageDiffusionClientErrorPropagation:
         assert client._shutting_down is True
         assert client._engine_dead is True
 
+    def test_initialize_client_requires_replica_id(self):
+        from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
+
+        client = object.__new__(StageDiffusionClient)
+        metadata = SimpleNamespace(
+            stage_id=0,
+            final_output=True,
+            final_output_type="image",
+            default_sampling_params=None,
+            requires_multimodal_data=False,
+            custom_process_input_func=None,
+            engine_input_source=[],
+        )
+
+        with pytest.raises(AttributeError, match="replica_id"):
+            client._initialize_client(
+                metadata,
+                "tcp://req",
+                "tcp://resp",
+                proc=None,
+                batch_size=1,
+            )
+
 
 # ───────── monitor thread & death sentinel integration tests ─────────
 

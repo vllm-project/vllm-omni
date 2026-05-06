@@ -124,8 +124,8 @@ async def test_engine_dead_error_broadcasts_fatal_and_shuts_down(orchestrator_fa
 @pytest.mark.asyncio
 async def test_diffusion_error_output_routed_as_finished(orchestrator_factory) -> None:
     """When a diffusion stage returns an OmniRequestOutput with a non-None
-    error, the orchestrator must route it as a finished output message and
-    clean up the request state.
+    error, the orchestrator must route it as an error message and clean up
+    the request state.
     """
     stage0 = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
     orchestrator_fixture = orchestrator_factory([stage0])
@@ -148,10 +148,10 @@ async def test_diffusion_error_output_routed_as_finished(orchestrator_factory) -
 
         msg = await _get_any_output_message(orchestrator_fixture)
 
-        assert msg["type"] == "output"
+        assert msg["type"] == "error"
         assert msg["request_id"] == "req-err"
-        assert msg["finished"] is True
-        assert msg["engine_outputs"].error == "gpu fault"
+        assert msg["stage_id"] == 0
+        assert msg["error"] == "gpu fault"
 
         # Request state should be cleaned up.
         await _wait_for(lambda: "req-err" not in orchestrator_fixture.orchestrator.request_states)

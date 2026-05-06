@@ -10,19 +10,11 @@ TALKER_CODEC_END_TOKEN_ID = 8294
 
 
 def thinker2talker(
-    stage_list,
-    engine_input_source,
+    source_outputs,
     prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
 ):
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-    source_stage_id = engine_input_source[0]
-    if source_stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {source_stage_id}")
-    if stage_list[source_stage_id].engine_outputs is None:
-        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
-    thinker_outputs = stage_list[source_stage_id].engine_outputs
+    thinker_outputs = source_outputs
     talker_inputs = []
     if not isinstance(prompt, list):
         prompt = [prompt]
