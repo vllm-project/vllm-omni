@@ -547,7 +547,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 pp_group = get_pp_group()
                 pp_rank = pp_group.rank_in_group
                 tasks = assignment[pp_rank]
-                prev_task = assignment[pp_group.prev_rank] if pp_group.world_size > 1 else None
+                prev_tasks = assignment[pp_group.prev_rank] if pp_group.world_size > 1 else None
 
                 if is_new_request:
                     pp_group.reset_buffer()
