@@ -16,9 +16,11 @@ list of supported architectures across all modalities, see
 |---|---|---|---|---|---|---|
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ | — | 22.05 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ | — | 44.1 kHz |
+| Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | single (talker only) | — (caption-controlled) | — | style / IP / basic captions | 44.1 kHz |
+| MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | single (AR + codec) | ✓ (required) | ✓ | voice_clone, continuation | 48 kHz |
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design, language hint | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants | 24 kHz |
-| VoxCPM | local model dir | split | ✓ | ✓ | — | 24 kHz |
+| VoxCPM | `openbmb/VoxCPM-0.5B` | split | ✓ | ✓ | — | 24 kHz |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | ✓ (online) | continuation | 48 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets | 24 kHz |
 
@@ -123,6 +125,76 @@ Streaming requires `async_chunk: true` in the stage config.
 ### Notes
 - Output: 44.1 kHz mono WAV.
 - DAC codec weights (`codec.pth`) are loaded lazily from the model directory.
+
+---
+
+## Ming-flash-omni-TTS
+
+Standalone talker-only deployment of Ming-flash-omni-2.0 at 44.1 kHz. Voice is controlled through caption fields (`风格` / `IP` / `语速`/`基频`/`音量`) rather than reference audio.
+
+### Prerequisites
+The example calls into `vllm_omni.model_executor.models.ming_flash_omni.prompt_utils` for the default prompt and instruction builder; no extra pip install on top of the base vLLM-Omni install.
+
+### Quick start
+```bash
+python examples/offline_inference/text_to_speech/ming_flash_omni_tts/end2end.py --case style
+```
+
+### Cases
+```bash
+# ASMR-style whisper (caption-driven)
+python examples/offline_inference/text_to_speech/ming_flash_omni_tts/end2end.py --case style
+
+# IP voice (preset character voice via caption)
+python examples/offline_inference/text_to_speech/ming_flash_omni_tts/end2end.py --case ip
+
+# Basic speed/pitch/volume control
+python examples/offline_inference/text_to_speech/ming_flash_omni_tts/end2end.py --case basic
+```
+
+Override the default text per case with `--text`, write to a custom path with `--output`.
+
+### Notes
+- Talker-only deployment — for the multimodal Ming-flash-omni example, see [`examples/offline_inference/ming_flash_omni/`](../../ming_flash_omni/).
+- Deploy config: `vllm_omni/deploy/ming_flash_omni_tts.yaml` (single GPU, `enforce_eager`, `max_num_seqs: 1`).
+- Decode defaults from the Ming cookbook: `max_decode_steps=200`, `cfg=2.0`, `sigma=0.25`, `temperature=0.0`, `use_zero_spk_emb=True`.
+
+---
+
+## MOSS-TTS-Nano
+
+Single-stage 0.1B AR LM + MOSS-Audio-Tokenizer-Nano codec at 48 kHz mono (mixed down from upstream stereo). ZH / EN / JA. Every request requires a reference clip via `--ref-audio`.
+
+> **No built-in speaker presets.** `--ref-audio` is required on every call. Default `--mode voice_clone` matches upstream's recommended workflow; `--mode continuation` is exposed for completeness but upstream's continuation-with-prompt path emits very short / near-silent output, so it is rarely useful in practice. Sample reference clips ship in the upstream repo under [`assets/audio/`](https://github.com/OpenMOSS/MOSS-TTS-Nano/tree/main/assets/audio) (e.g. `zh_1.wav`, `en_2.wav`, `jp_2.wav`).
+
+### Quick start
+```bash
+# Fetch a sample reference clip (one-off, user-scoped cache).
+REF_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/moss-tts-nano"
+mkdir -p "$REF_DIR"
+[ -s "$REF_DIR/zh_1.wav" ] || \
+    curl -L -o "$REF_DIR/zh_1.wav" https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS-Nano/main/assets/audio/zh_1.wav
+
+python examples/offline_inference/text_to_speech/moss_tts_nano/end2end.py \
+    --text "你好，这是MOSS-TTS-Nano的语音合成演示。" \
+    --ref-audio "$REF_DIR/zh_1.wav"
+```
+The first run downloads `OpenMOSS-Team/MOSS-TTS-Nano` and `OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano` from Hugging Face.
+
+### Reproducible runs
+```bash
+python examples/offline_inference/text_to_speech/moss_tts_nano/end2end.py \
+    --text "Deterministic test." \
+    --ref-audio "$REF_DIR/en_2.wav" \
+    --seed 42
+```
+
+### Notes
+- Output: 48 kHz mono WAV (the tokenizer is internally stereo at 48 kHz; the wrapper averages to mono before reaching the engine).
+- Deploy config: `vllm_omni/deploy/moss_tts_nano.yaml` (auto-loaded; override with `--deploy-config`).
+- Default `--max-new-frames 375` ≈ 14 s of audio; raise for longer outputs.
+- `--ref-text` is rejected in `voice_clone` mode and required only with `--mode continuation`.
+- Run `--help` for the full sampling-knob surface (`--audio-temperature`, `--audio-top-k`, `--audio-top-p`, `--text-temperature`).
 
 ---
 

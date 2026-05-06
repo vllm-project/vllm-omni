@@ -512,6 +512,7 @@ steps:
         timeout_in_minutes: 180
         commands:
           - pytest -s -v tests/e2e/accuracy/test_qwen_image*.py --run-level full_model
+          - pytest -s -v tests/e2e/accuracy/test_diffusers_backend_similarity.py -k '2i_matches_diffusers' -m full_model --run-level full_model
         agents:
           queue: "mithril-h100-pool"
         plugins:
@@ -710,6 +711,7 @@ steps:
         commands:
           - pytest -s -v tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py -m full_model --run-level full_model
           - pytest -s -v tests/e2e/accuracy/test_ltx2_3_video_similarity.py -m advanced_model --run-level advanced_model
+          - pytest -s -v tests/e2e/accuracy/test_diffusers_backend_similarity.py -k '2v_matches_diffusers' -m full_model --run-level full_model
         agents:
           queue: "mithril-h100-pool"
         plugins:

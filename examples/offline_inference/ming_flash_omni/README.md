@@ -9,7 +9,7 @@ vLLM-Omni supports two deployment modes:
 | Thinker + Talker (omni-speech, default) | `vllm_omni/deploy/ming_flash_omni.yaml` | Text + Audio |
 | Thinker only (multimodal understanding) | `vllm_omni/deploy/ming_flash_omni_thinker_only.yaml` | Text |
 
-For standalone TTS (talker only), see [`examples/offline_inference/ming_flash_omni_tts/`](../ming_flash_omni_tts/).
+For standalone TTS (talker only), see the [Ming-flash-omni-TTS section in the Text-To-Speech hub](../text_to_speech/README.md#ming-flash-omni-tts).
 
 ## Setup
 

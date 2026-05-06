@@ -25,6 +25,8 @@ recipes/
 
 ## Available Recipes
 
+- [`Qwen/Qwen-Image.md`](./Qwen/Qwen-Image.md): text-to-image serving recipe for
+  Qwen-Image on `1x A100 80GB`, including optional step-wise continuous batching replay
 - [`Qwen/Qwen3-Omni.md`](./Qwen/Qwen3-Omni.md): online serving recipe for
   multimodal chat on `1x A100 80GB`
 - [`Wan-AI/Wan2.2-I2V.md`](./Wan-AI/Wan2.2-I2V.md): image-to-video serving
