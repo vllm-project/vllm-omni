@@ -16,7 +16,7 @@ from pytest_mock import MockerFixture
 
 from vllm_omni.diffusion.worker.diffusion_worker import (
     DiffusionWorker,
-    _create_worker_vllm_config,
+    _create_diffusion_worker_vllm_config,
     _make_diffusion_vllm_model_config,
 )
 
@@ -358,7 +358,7 @@ class TestDiffusionWorkerWakeUp:
 class TestWorkerVllmConfigAdditionalConfig:
     """Test worker-side VllmConfig construction with additional_config."""
 
-    def test_create_worker_vllm_config_passes_additional_config(self, mocker: MockerFixture):
+    def test_create_diffusion_worker_vllm_config_passes_additional_config(self, mocker: MockerFixture):
         mock_vllm_config = mocker.Mock()
         mock_vllm_cls = mocker.patch(
             "vllm_omni.diffusion.worker.diffusion_worker.VllmConfig",
@@ -366,12 +366,12 @@ class TestWorkerVllmConfigAdditionalConfig:
         )
         od_config = mocker.Mock(additional_config={"torchair_graph_config": {"enabled": True}})
 
-        result = _create_worker_vllm_config(torch.device("cpu"), od_config)
+        result = _create_diffusion_worker_vllm_config(torch.device("cpu"), od_config)
 
         assert result is mock_vllm_config
         assert mock_vllm_cls.call_args.kwargs["additional_config"] == od_config.additional_config
 
-    def test_create_worker_vllm_config_falls_back_when_constructor_rejects_additional_config(
+    def test_create_diffusion_worker_vllm_config_falls_back_when_constructor_rejects_additional_config(
         self, mocker: MockerFixture
     ):
         mock_vllm_config = mocker.Mock()
@@ -384,8 +384,18 @@ class TestWorkerVllmConfigAdditionalConfig:
         )
         od_config = mocker.Mock(additional_config={"ascend_scheduler_config": {"foo": "bar"}})
 
-        result = _create_worker_vllm_config(torch.device("cpu"), od_config)
+        result = _create_diffusion_worker_vllm_config(torch.device("cpu"), od_config)
 
         assert result is mock_vllm_config
         assert mock_vllm_cls.call_count == 2
         assert getattr(mock_vllm_config, "additional_config") == od_config.additional_config
+
+    def test_create_diffusion_worker_vllm_config_reraises_other_type_errors(self, mocker: MockerFixture):
+        mocker.patch(
+            "vllm_omni.diffusion.worker.diffusion_worker.VllmConfig",
+            side_effect=TypeError("additional_config values must be hashable"),
+        )
+        od_config = mocker.Mock(additional_config={"ascend_scheduler_config": {"foo": "bar"}})
+
+        with pytest.raises(TypeError, match="hashable"):
+            _create_diffusion_worker_vllm_config(torch.device("cpu"), od_config)

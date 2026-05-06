@@ -116,7 +116,9 @@ def parse_args():
         default=None,
         help=(
             "JSON object forwarded to Omni/additional_config, for example "
-            '\'{"torchair_graph_config":{"enabled":true}}\''
+            '\'{"torchair_graph_config":{"enabled":true}}\'. Different platforms may support different '
+            "configs. Make sure the configs are valid for the platform you are using. "
+            "Contents must be hashable."
         ),
     )
 
