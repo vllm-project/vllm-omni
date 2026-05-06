@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+import vllm.ir
 from vllm.config import VllmConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -145,6 +146,7 @@ def set_forward_context(
     )
     # vLLM CustomOp dispatch (e.g. QKVParallelLinear) requires a global
     # vLLM config set via set_current_vllm_config().
+    # Also set priority for vLLM IR ops (e.g. RMSNorm), copied from vllm/forward_context.py
     with override_forward_context(forward_context):
         if vllm_config is None:
             yield
@@ -152,5 +154,9 @@ def set_forward_context(
             # Local import to avoid importing vllm.config.vllm at module import time.
             from vllm.config.vllm import set_current_vllm_config
 
-            with set_current_vllm_config(vllm_config):
+            with (
+                set_current_vllm_config(vllm_config),
+                vllm_config.kernel_config.ir_op_priority.set_priority(),
+                vllm.ir.enable_torch_wrap(vllm_config.compilation_config.ir_enable_torch_wrap),
+            ):
                 yield
