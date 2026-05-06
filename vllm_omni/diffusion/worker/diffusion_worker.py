@@ -136,6 +136,7 @@ class DiffusionWorker:
             enable_return_routed_experts=False,
         )
         vllm_config.quant_config = self.od_config.quantization_config
+        vllm_config.kernel_config.ir_op_priority = current_omni_platform.get_default_ir_op_priority(vllm_config)
         self.vllm_config = vllm_config
 
         # Initialize distributed environment
