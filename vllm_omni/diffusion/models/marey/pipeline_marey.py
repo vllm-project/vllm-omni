@@ -879,9 +879,20 @@ class MareyPipeline(nn.Module, ProgressBarMixin):
         self._enable_transformer()
 
         # -- Timesteps --------------------------------------------------------
+        # Per-request flow_shift override (form field) wins over the CLI default
+        # set in __init__. Lets clients pin 0.0 (7B) vs 3.0 (30B distilled)
+        # without restarting the server.
+        req_flow_shift = sp.extra_args.get("flow_shift") if sp.extra_args else None
+        flow_shift = req_flow_shift if req_flow_shift is not None else self.flow_shift
+        logger.info(
+            "Marey flow_shift resolved: request=%s, pipeline_default=%s, effective=%s",
+            req_flow_shift,
+            self.flow_shift,
+            flow_shift,
+        )
         timesteps = _create_flow_timesteps(
             num_steps=num_steps,
-            shift=self.flow_shift if self.flow_shift > 0 else None,
+            shift=flow_shift if flow_shift > 0 else None,
             num_train_timesteps=self.num_train_timesteps,
             tmin=self.sched_tmin,
             tmax=self.sched_tmax,
