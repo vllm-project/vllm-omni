@@ -1,11 +1,12 @@
 # adapted from sglang and fastvideo
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import dataclasses
 import enum
 import os
 import random
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 from typing import TYPE_CHECKING, Any
 
 import diffusers
@@ -189,6 +190,56 @@ class DiffusionParallelConfig:
         if not isinstance(data, dict):
             raise TypeError(f"Expected parallel config dict, got {type(data)!r}")
         return cls(**data)
+
+
+# Field names on ``DiffusionParallelConfig`` (for merges and dropping YAML nulls).
+_DIFFUSION_PARALLEL_FIELD_NAMES: frozenset[str] = frozenset(f.name for f in fields(DiffusionParallelConfig))
+
+
+def _nested_parallel_config_to_plain_dict(parallel_config_field: Any) -> dict[str, Any]:
+    """Turn ``engine_args.parallel_config`` (dict, OmegaConf, dataclass, …) into a plain dict."""
+    if parallel_config_field is None:
+        return {}
+    try:
+        from omegaconf import DictConfig, OmegaConf
+
+        if isinstance(parallel_config_field, DictConfig):
+            boxed = OmegaConf.to_container(parallel_config_field, resolve=True)
+            return dict(boxed) if isinstance(boxed, Mapping) else {}
+    except ImportError:
+        pass
+    if dataclasses.is_dataclass(parallel_config_field) and not isinstance(parallel_config_field, type):
+        return dict(asdict(parallel_config_field))
+    if isinstance(parallel_config_field, Mapping):
+        return dict(parallel_config_field)
+    if hasattr(parallel_config_field, "__dict__"):
+        try:
+            return dict(vars(parallel_config_field))
+        except TypeError:
+            pass
+    return {}
+
+
+def build_parallel_config_dict_from_engine_args(engine_args: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve nested ``parallel_config`` plus top-level parallel CLI fields into one dict.
+
+    Explicit ``null`` / ``None`` under nested ``parallel_config`` is stripped for every
+    declared parallel field so top-level overrides are not blocked by YAML placeholders.
+    """
+    par = _nested_parallel_config_to_plain_dict(engine_args.get("parallel_config"))
+    for k in list(par.keys()):
+        if k in _DIFFUSION_PARALLEL_FIELD_NAMES and par[k] is None:
+            del par[k]
+    for key in _DIFFUSION_PARALLEL_FIELD_NAMES:
+        val = engine_args.get(key)
+        if val is not None and key not in par:
+            par[key] = val
+    return par
+
+
+def diffusion_parallel_config_from_engine_args(engine_args: Mapping[str, Any]) -> DiffusionParallelConfig:
+    """Validated ``DiffusionParallelConfig`` from ``engine_args`` (dict or OmegaConf-backed)."""
+    return DiffusionParallelConfig.from_dict(build_parallel_config_dict_from_engine_args(engine_args))
 
 
 @dataclass
@@ -802,15 +853,7 @@ class OmniDiffusionConfig:
 
         # Forward top-level parallel knobs (e.g. --tensor-parallel-size from CLI)
         # into parallel_config so the diffusion engine sees them.
-        par = kwargs.get("parallel_config", {})
-        if isinstance(par, Mapping):
-            par = dict(par)
-            if par.get("tensor_parallel_size") is None:
-                par.pop("tensor_parallel_size", None)
-            tensor_parallel_size = kwargs.get("tensor_parallel_size")
-            if tensor_parallel_size is not None and "tensor_parallel_size" not in par:
-                par["tensor_parallel_size"] = tensor_parallel_size
-            kwargs["parallel_config"] = par
+        kwargs["parallel_config"] = build_parallel_config_dict_from_engine_args(kwargs)
 
         # Filter kwargs to only include valid fields
         valid_fields = {f.name for f in fields(cls)}
