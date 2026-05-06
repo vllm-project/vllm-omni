@@ -31,6 +31,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.utils import reinit_rotary_inv_freq
 
 logger = init_logger(__name__)
 
@@ -85,11 +86,29 @@ _DEFAULT_AUDIO_TOP_P = 0.95
 _DEFAULT_AUDIO_TOP_K = 25
 _DEFAULT_AUDIO_REPETITION_PENALTY = 1.2
 _DEFAULT_MAX_NEW_FRAMES = 375
-_DEFAULT_VOICE = "Junhao"
-# "voice_clone" mirrors the mode used by offline examples and tests:
-# built-in voices (e.g. "Junhao") are backed by preset reference audio
-# upstream, so the default produces the expected voice timbre.
+# MOSS-TTS-Nano upstream supports two modes (voice_clone / continuation).
+# voice_clone is the recommended workflow; the serving layer routes by
+# whether ref_text was supplied (see _build_moss_tts_params in
+# vllm_omni/entrypoints/openai/serving_speech.py).
 _DEFAULT_MODE = "voice_clone"
+
+
+def _to_mono_1d(waveform: Any) -> torch.Tensor:
+    """Convert an upstream waveform event to a 1-D float32 mono tensor.
+
+    The MOSS audio tokenizer is configured for stereo (number_channels=2)
+    and emits ``(channels, samples)`` tensors. The downstream serving path
+    writes a single-channel WAV at the tokenizer's sample rate, so we mix
+    multi-channel audio down to mono via mean. Naively flattening with
+    ``.T.reshape(-1)`` interleaves L/R into a 2N-length stream that gets
+    re-interpreted at 1× the sample rate — playback ends up 2× too slow.
+    """
+    chunk = torch.as_tensor(waveform, dtype=torch.float32).cpu()
+    if chunk.ndim == 2:
+        if chunk.shape[0] > 1:
+            return chunk.mean(dim=0).contiguous()
+        return chunk.reshape(-1)
+    return chunk.reshape(-1)
 
 
 def _pick(info: dict, key: str, default):
@@ -176,6 +195,18 @@ class MossTTSNanoForGeneration(nn.Module):
                     logger.info("MOSS-TTS-Nano using sdpa (flash_attn not installed)")
             lm.to(device=device)
             lm.eval()
+
+            # ``trust_remote_code`` custom RoPE classes that register
+            # ``inv_freq`` with ``persistent=False`` and aren't in
+            # ``ROPE_INIT_FUNCTIONS`` come out of ``from_pretrained``'s
+            # post-init chain holding garbage (~ -1.7e38 / 9.9e33). The
+            # very first text-LM forward then emits NaN logits.
+            # See vllm_omni.model_executor.models.utils.reinit_rotary_inv_freq
+            # for the full mechanism and reproduction.
+            n_fixed = reinit_rotary_inv_freq(lm, base=10000.0)
+            if n_fixed > 0:
+                logger.info("MOSS-TTS-Nano: re-initialised %d rotary_emb.inv_freq buffers", n_fixed)
+
             self._lm = lm
             logger.info("MOSS-TTS-Nano LM loaded on %s", device)
 
@@ -209,7 +240,7 @@ class MossTTSNanoForGeneration(nn.Module):
     # ------------------------------------------------------------------
 
     def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict]:
-        return [{"text": "hello", "voice": _DEFAULT_VOICE, "_is_dummy": True}] * num_reqs
+        return [{"text": "hello", "_is_dummy": True}] * num_reqs
 
     # ------------------------------------------------------------------
     # Streaming generator management
@@ -316,11 +347,7 @@ class MossTTSNanoForGeneration(nn.Module):
                 if event_type == "audio":
                     waveform = event.get("waveform")
                     if waveform is not None:
-                        chunk = torch.as_tensor(waveform, dtype=torch.float32).cpu()
-                        if chunk.ndim == 2:
-                            chunk = chunk.T.reshape(-1)
-                        else:
-                            chunk = chunk.reshape(-1)
+                        chunk = _to_mono_1d(waveform)
                         audio_chunks.append(chunk)
                         # Yield each chunk as it arrives (is_last=False).
                         yield chunk, False
@@ -328,7 +355,7 @@ class MossTTSNanoForGeneration(nn.Module):
                     if not audio_chunks:
                         waveform = event.get("waveform")
                         if waveform is not None:
-                            chunk = torch.as_tensor(waveform, dtype=torch.float32).cpu().reshape(-1)
+                            chunk = _to_mono_1d(waveform)
                             yield chunk, True
                             return
         except Exception:
@@ -405,7 +432,16 @@ class MossTTSNanoForGeneration(nn.Module):
                 last_chunk_flags.append(True)
                 continue
 
-            request_key = str(info.get("_omni_req_id", "0"))
+            # Per-request key so concurrent / consecutive requests don't
+            # share a generator. ``global_request_id`` is set by the engine
+            # (see info keys ``['text', 'mode', 'prompt_audio_array',
+            # 'global_request_id', 'omni_final_stage_id', 'generated_len']``).
+            # ``_omni_req_id`` is a legacy fallback that is never set in
+            # the current engine; falling back to a constant collapses all
+            # requests onto one generator and lets a stale generator from
+            # request N replay its remaining chunks for request N+1, which
+            # surfaces as request N+1's audio matching request N's input.
+            request_key = str(info.get("global_request_id") or info.get("_omni_req_id") or id(info))
 
             # Create generator on first call for this request.
             if request_key not in self._stream_gens:

@@ -241,6 +241,12 @@ class FusedBlock(nn.Module):
 class FusionModel(nn.Module):
     _layerwise_offload_blocks_attrs = ["fused_blocks"]
 
+    @staticmethod
+    def _is_fused_block(name: str, module) -> bool:
+        return "fused_blocks" in name and name.split(".")[-1].isdigit()
+
+    _hsdp_shard_conditions = [_is_fused_block]
+
     def __init__(self, video_config=None, audio_config=None):
         super().__init__()
         has_video = True

@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
+from vllm import envs
+from vllm.config import VllmConfig
+from vllm.config.kernel import IrOpPriorityConfig
 from vllm.logger import init_logger
 from vllm.platforms.rocm import RocmPlatform
 
@@ -147,3 +150,21 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
 
         os.environ.pop("HIP_VISIBLE_DEVICES", None)
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+    @classmethod
+    def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> IrOpPriorityConfig:
+        """Copied from vllm/platforms/rocm/platform.py v0.20.0 with force using vllm_c kernels"""
+        # TODO(luka/TJ) use aiter, vllm_c, native by default on ROCm
+        cc = vllm_config.compilation_config
+        default = ["vllm_c", "native"]  # Originally using "native" here when compiling
+
+        # This (mostly) preserves previous CustomOp behavior
+        # Necessary on ROCm because it's common that users
+        # enable rms_norm to use the aiter kernel.
+        # TODO(luka/TJ) remove env vars completely
+        if cc.is_custom_op_enabled("rms_norm") and envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_RMSNORM:
+            rms_norm = ["aiter"] + default
+        else:
+            rms_norm = default
+
+        return IrOpPriorityConfig.with_default(default, rms_norm=rms_norm)

@@ -298,13 +298,6 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
         "platforms": {
-            "rocm": {
-                "stages": [
-                    {"stage_id": 0, "gpu_memory_utilization": 0.9},
-                    {"stage_id": 1, "gpu_memory_utilization": 0.4},
-                    {"stage_id": 2, "gpu_memory_utilization": 0.5, "devices": "2"},
-                ],
-            },
             "xpu": {
                 "stages": [
                     {
@@ -354,23 +347,6 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
         "platforms": {
-            "rocm": {
-                "stages": [
-                    {"stage_id": 0, "max_num_seqs": 1, "default_sampling_params": {"max_tokens": 100}},
-                    {
-                        "stage_id": 1,
-                        "max_num_seqs": 1,
-                        "enforce_eager": True,
-                        "default_sampling_params": {"max_tokens": 100},
-                    },
-                    {
-                        "stage_id": 2,
-                        "max_num_seqs": 1,
-                        "max_num_batched_tokens": 1000000,
-                        "default_sampling_params": {"max_tokens": 200},
-                    },
-                ],
-            },
             "xpu": {
                 "stages": [
                     {
@@ -410,6 +386,79 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 ],
             },
         },
+    },
+    "qwen3_omni_moe_multi_replicas_4gpu": {
+        "base_config": "qwen3_omni_moe.yaml",
+        "async_chunk": True,
+        "stages": [
+            {
+                "stage_id": 0,
+                "devices": "0",
+                "gpu_memory_utilization": 0.85,
+                "max_num_seqs": 6,
+                "max_model_len": 32768,
+                "mm_processor_cache_gb": 0,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 150, "ignore_eos": False},
+            },
+            {
+                "stage_id": 1,
+                "devices": "1,2,3",
+                "num_replicas": 3,
+                "gpu_memory_utilization": 0.6,
+                "max_num_seqs": 2,
+                "max_model_len": 32768,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 1000},
+            },
+            {
+                "stage_id": 2,
+                "devices": "1,2,3",
+                "num_replicas": 3,
+                "gpu_memory_utilization": 0.1,
+                "max_num_seqs": 2,
+                "max_num_batched_tokens": 65536,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 2000},
+            },
+        ],
+    },
+    "bagel_multi_replicas_4gpu": {
+        "base_config": "bagel.yaml",
+        "async_chunk": False,
+        "stages": [
+            {
+                "stage_id": 0,
+                "devices": "0",
+                "max_num_seqs": 6,
+                "max_num_batched_tokens": 16384,
+                "gpu_memory_utilization": 0.45,
+                "load_format": "dummy",
+                "default_sampling_params": {
+                    "temperature": 0.4,
+                    "top_p": 0.9,
+                    "top_k": 1,
+                    "max_tokens": 256,
+                    "detokenize": False,
+                },
+            },
+            {
+                "stage_id": 1,
+                "devices": "1,2,3",
+                "num_replicas": 3,
+                "max_num_seqs": 1,
+                "enforce_eager": True,
+                "gpu_memory_utilization": 0.7,
+                "load_format": "dummy",
+                "default_sampling_params": {
+                    "seed": 42,
+                    "num_inference_steps": 2,
+                    "guidance_scale": 0.0,
+                    "height": 512,
+                    "width": 512,
+                },
+            },
+        ],
     },
     "bagel": {
         "base_config": "bagel.yaml",
@@ -484,6 +533,52 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "ming_flash_omni": {
+        "base_config": "ming_flash_omni.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.74,
+                "max_model_len": 16384,
+                "max_num_batched_tokens": 16384,
+                "mm_processor_cache_gb": 0,
+                "skip_mm_profiling": True,
+                "enable_flashinfer_autotune": False,
+                "load_format": "dummy",
+                "default_sampling_params": {
+                    "temperature": 0.0,
+                    "max_tokens": 100,
+                },
+            },
+            {
+                "stage_id": 1,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.18,
+                "load_format": "dummy",
+            },
+        ],
+    },
+    "ming_flash_omni_thinker_only": {
+        "base_config": "ming_flash_omni_thinker_only.yaml",
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.9,
+                "max_model_len": 16384,
+                "max_num_batched_tokens": 16384,
+                "mm_processor_cache_gb": 0,
+                "skip_mm_profiling": True,
+                "enable_flashinfer_autotune": False,
+                "load_format": "dummy",
+                "default_sampling_params": {
+                    "temperature": 0.4,
+                    "max_tokens": 100,
+                },
+            },
+        ],
+    },
     # Single-stage thinker-only topology for the abort test.
     "qwen2_5_omni_thinker_only": {
         "async_chunk": False,
@@ -494,6 +589,7 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "max_num_seqs": 1,
                 "gpu_memory_utilization": 0.9,
                 "enforce_eager": True,
+                "enable_prefix_caching": False,
                 "max_num_batched_tokens": 16384,
                 "max_model_len": 16384,
                 "skip_mm_profiling": True,

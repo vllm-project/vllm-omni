@@ -25,7 +25,6 @@ import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -33,6 +32,8 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+from vllm_omni.diffusion.layers.norm import RMSNorm
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (

@@ -31,6 +31,14 @@ python end2end.py --model tencent/HunyuanImage-3.0-Instruct \
                   --prompts "A cute cat sitting on a windowsill watching the sunset"
 ```
 
+**With VAE tiling (required on A100 GPUs):**
+```bash
+python end2end.py --model tencent/HunyuanImage-3.0-Instruct \
+                  --modality text2img \
+                  --prompts "A cute cat sitting on a windowsill watching the sunset" \
+                  --vae-use-tiling
+```
+
 #### Image to Image (img2img)
 
 - **Pipeline**: Image + Text → AR (CoT + recaption + latent) → DiT → Edited Image
@@ -103,6 +111,7 @@ python end2end.py --modality text2img \
 | `--stage-configs-path` | string | auto                                 | Custom stage config YAML path                                |
 | `--enforce-eager`      | flag   | `False`                              | Disable torch.compile                                        |
 | `--init-timeout`       | int    | `300`                                | Initialization timeout (seconds)                             |
+| `--vae-use-tiling`     | flag   | `False`                              | Enable VAE tiling for memory optimization (required to avoid OOM on A100) |
 
 ------
 
@@ -135,23 +144,25 @@ python end2end.py --model tencent/HunyuanImage-3.0-Instruct \
 
 ## Prompt Format
 
-HunyuanImage-3.0 uses a pretrain template format:
+HunyuanImage-3.0-Instruct uses an instruct chat template:
 
 ```
-<|startoftext|>{system_prompt}{<img>}{trigger_tag}{user_prompt}
+<|startoftext|>{system_prompt}\n\nUser: {<img>?}{user_prompt}\n\nAssistant: {trigger_tag?}
 ```
 
-- `<img>`: Placeholder for each input image (auto-inserted by `prompt_utils.py`)
-- Trigger tags: `<think>` (CoT), `<recaption>` (recaptioning)
+- `<img>`: Placeholder for each input image (single token; expanded by the multimodal pipeline)
+- Trigger tags: `<think>` (CoT), `<recaption>` (recaptioning) — placed AFTER `Assistant: `
 - System prompt: Auto-selected based on task
+- `t2i_vanilla` is the only task that uses the bare pretrain template (no chat structure)
 
-The `prompt_utils.build_prompt()` handles this formatting automatically.
+The shared `vllm_omni.diffusion.models.hunyuan_image3.prompt_utils.build_prompt_tokens()`
+helper handles segment-by-segment tokenization (matches HF `apply_chat_template` byte-for-byte).
 
 ------
 
 ## FAQ
 
-- **OOM errors**: Decrease `gpu_memory_utilization` in the YAML stage config, or use a smaller `max_num_batched_tokens`.
+- **OOM errors**: Decrease `gpu_memory_utilization` in the YAML stage config, use a smaller `max_num_batched_tokens`, or enable VAE tiling with `--vae-use-tiling` (required on A100 GPUs).
 - **Custom image sizes**: Use `--height` and `--width` flags (multiples of 16 recommended).
 
 | Stage             | VRAM (approx)        |

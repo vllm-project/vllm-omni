@@ -72,19 +72,29 @@ class StepScheduler(_BaseScheduler):
 
         terminal_statuses: dict[str, DiffusionRequestStatus] = {}
         terminal_errors: dict[str, str | None] = {}
-        output_error = output.result.error if output.result is not None else None
         for sched_req_id in scheduled_req_ids:
             state = self._request_states.get(sched_req_id)
             progress = self._request_progress.get(sched_req_id)
             if state is None or progress is None or state.is_finished():
                 continue
+            req_output = output.get_req_output(sched_req_id)
+            if req_output is None:
+                logger.warning(
+                    "No RunnerOutput for request %s, treating as error",
+                    sched_req_id,
+                )
+                terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_ERROR
+                terminal_errors[sched_req_id] = "No output for request"
+                continue
 
+            req_result = req_output.result
+            output_error = req_result.error if req_result is not None else None
             if output_error is not None:
                 terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_ERROR
                 terminal_errors[sched_req_id] = output_error
                 continue
 
-            if output.step_index is None:
+            if req_output.step_index is None:
                 logger.warning(
                     "Received RunnerOutput with no step_index for request %s, treating as error",
                     sched_req_id,
@@ -94,9 +104,9 @@ class StepScheduler(_BaseScheduler):
                 continue
 
             # We assume that the decoding stage is executed immediately after the denoising stage completes.
-            progress.current_step = output.step_index
-            state.req.sampling_params.step_index = output.step_index
-            if output.finished:
+            progress.current_step = req_output.step_index
+            state.req.sampling_params.step_index = req_output.step_index
+            if req_output.finished:
                 terminal_statuses[sched_req_id] = DiffusionRequestStatus.FINISHED_COMPLETED
                 terminal_errors[sched_req_id] = None
             else:
