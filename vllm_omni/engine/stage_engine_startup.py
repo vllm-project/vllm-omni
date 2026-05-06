@@ -14,7 +14,7 @@ import zmq
 from omegaconf import OmegaConf
 from vllm.config import CacheConfig, VllmConfig
 from vllm.logger import init_logger
-from vllm.utils.network_utils import get_open_port, zmq_socket_ctx
+from vllm.utils.network_utils import get_open_ports_list, zmq_socket_ctx
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.utils import (
     STARTUP_POLL_PERIOD_MS,
@@ -120,9 +120,7 @@ class OmniMasterServer:
         for sid in stage_ids:
             self._stage_config_events[sid] = threading.Event()
             self._stage_coordinator_addresses[sid] = StageCoordinatorAddresses()
-            hs_port = get_open_port()
-            inp_port = get_open_port()
-            out_port = get_open_port()
+            hs_port, inp_port, out_port = get_open_ports_list(count=3)
             self._allocations[sid] = StageAllocation(
                 handshake_bind_address=f"tcp://{master_address}:{hs_port}",
                 handshake_connect_address=f"tcp://{master_address}:{hs_port}",

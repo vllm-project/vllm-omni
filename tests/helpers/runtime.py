@@ -615,7 +615,9 @@ class OmniResponse:
     e2e_latency: float | None = None
     success: bool = False
     error_message: str | None = None
+    prompt_tokens: int | None = None
     cached_tokens: int | None = None
+    logprobs: list | None = None
 
 
 @dataclass
@@ -623,7 +625,7 @@ class DiffusionResponse:
     text_content: str | None = None
     images: list[Image.Image] | None = None
     audios: list[Any] | None = None
-    videos: list[Any] | None = None
+    videos: list[bytes] | None = None
     e2e_latency: float | None = None
     success: bool = False
     error_message: str | None = None
@@ -679,10 +681,12 @@ class OpenAIClientHandler:
                     audio_data = choice.message.audio.data
                 if hasattr(choice.message, "content") and choice.message.content is not None:
                     text_content = choice.message.content
-            # Extract cached_tokens for prefix caching tests
+            # Extract cached & prompt token counts for prefix caching tests
             usage = getattr(chat_completion, "usage", None)
-            if usage and (details := getattr(usage, "prompt_tokens_details", None)):
-                result.cached_tokens = details.cached_tokens
+            if usage:
+                result.prompt_tokens = usage.prompt_tokens
+                if details := getattr(usage, "prompt_tokens_details", None):
+                    result.cached_tokens = details.cached_tokens
             result.e2e_latency = time.perf_counter() - start_time
             audio_content = None
             if audio_data:
@@ -690,6 +694,8 @@ class OpenAIClientHandler:
                 audio_content = convert_audio_bytes_to_text(result.audio_bytes)
             result.text_content = text_content
             result.audio_content = audio_content
+            if chat_completion.choices and chat_completion.choices[0].logprobs is not None:
+                result.logprobs = chat_completion.choices[0].logprobs.content
             result.success = True
         except Exception as e:
             result.error_message = f"Non-stream processing error: {str(e)}"
@@ -701,6 +707,7 @@ class OpenAIClientHandler:
         start_time = time.perf_counter()
         try:
             images = []
+            audios = []
             for choice in chat_completion.choices:
                 content = getattr(choice.message, "content", None)
                 if isinstance(content, list):
@@ -714,8 +721,21 @@ class OpenAIClientHandler:
                         if image_url and image_url.startswith("data:image"):
                             b64_data = image_url.split(",", 1)[1]
                             images.append(decode_b64_image(b64_data))
+
+                # OpenAI audio responses (e.g. AudioX text-to-audio) populate `message.audio`.
+                audio_obj = getattr(choice.message, "audio", None)
+                audio_b64 = getattr(audio_obj, "data", None) if audio_obj is not None else None
+                if audio_b64:
+                    audios.append(
+                        {
+                            "wav_bytes": base64.b64decode(audio_b64),
+                            "id": getattr(audio_obj, "id", None),
+                            "expires_at": getattr(audio_obj, "expires_at", None),
+                        }
+                    )
             result.e2e_latency = time.perf_counter() - start_time
             result.images = images if images else None
+            result.audios = audios if audios else None
             result.success = True
         except Exception as e:
             result.error_message = f"Diffusion response processing error: {str(e)}"
@@ -742,6 +762,10 @@ class OpenAIClientHandler:
             "stream": stream,
             "modalities": modalities,
         }
+        if "logprobs" in request_config:
+            create_kwargs["logprobs"] = request_config["logprobs"]
+        if "top_logprobs" in request_config:
+            create_kwargs["top_logprobs"] = request_config["top_logprobs"]
         if extra_body:
             create_kwargs["extra_body"] = extra_body
 
@@ -1030,7 +1054,9 @@ class OpenAIClientHandler:
                     responses.append(response)
         return responses
 
-    def send_video_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+    def send_video_diffusion_request(
+        self, request_config: dict[str, Any], request_num: int = 1
+    ) -> list[DiffusionResponse]:
         """
         Send native /v1/videos requests.
         """
@@ -1053,7 +1079,6 @@ class OpenAIClientHandler:
                 normalized_form_data["image_reference"] = json.dumps({"image_url": image_reference})
 
         result = DiffusionResponse()
-        start_time = time.perf_counter()
         create_url = self._build_url("/v1/videos")
         response = requests.post(
             create_url,
@@ -1062,14 +1087,16 @@ class OpenAIClientHandler:
             headers={"Accept": "application/json"},
             timeout=60,
         )
+        start_time = time.perf_counter()
         response.raise_for_status()
         job_data = response.json()
         video_id = job_data["id"]
         self._wait_until_video_completed(video_id)
+        end_time = time.perf_counter()
         video_content = self._download_video_content(video_id)
         result.success = True
         result.videos = [video_content]
-        result.e2e_latency = time.perf_counter() - start_time
+        result.e2e_latency = end_time - start_time
         assert_diffusion_response(result, request_config, run_level=self.run_level)
         return [result]
 
@@ -1216,7 +1243,7 @@ class OmniRunner:
         if isinstance(prompts, str):
             prompts = [prompts]
 
-        # Qwen-TTS: follow examples/offline_inference/qwen3_tts/end2end.py style.
+        # Qwen-TTS: follow examples/offline_inference/text_to_speech/qwen3_tts/end2end.py style.
         # Stage 0 expects token placeholders + additional_information (text/speaker/task_type/...),
         # and Talker replaces embeddings in preprocess based on additional_information only.
         is_tts_model = "Qwen3-TTS" in self.model_name or "qwen3_tts" in self.model_name.lower()

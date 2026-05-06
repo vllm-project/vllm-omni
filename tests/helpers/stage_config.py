@@ -298,13 +298,6 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
         "platforms": {
-            "rocm": {
-                "stages": [
-                    {"stage_id": 0, "gpu_memory_utilization": 0.9},
-                    {"stage_id": 1, "gpu_memory_utilization": 0.4},
-                    {"stage_id": 2, "gpu_memory_utilization": 0.5, "devices": "2"},
-                ],
-            },
             "xpu": {
                 "stages": [
                     {
@@ -354,23 +347,6 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
         "platforms": {
-            "rocm": {
-                "stages": [
-                    {"stage_id": 0, "max_num_seqs": 1, "default_sampling_params": {"max_tokens": 100}},
-                    {
-                        "stage_id": 1,
-                        "max_num_seqs": 1,
-                        "enforce_eager": True,
-                        "default_sampling_params": {"max_tokens": 100},
-                    },
-                    {
-                        "stage_id": 2,
-                        "max_num_seqs": 1,
-                        "max_num_batched_tokens": 1000000,
-                        "default_sampling_params": {"max_tokens": 200},
-                    },
-                ],
-            },
             "xpu": {
                 "stages": [
                     {
