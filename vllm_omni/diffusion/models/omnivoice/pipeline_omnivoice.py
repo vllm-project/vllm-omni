@@ -150,17 +150,57 @@ class OmniVoicePipeline(nn.Module, SupportAudioOutput):
 
         voice_name = None
         if isinstance(prompt, dict):
-            text = prompt.get("input", prompt.get("text", str(prompt)))
+            # Top-level keys (used by serving_speech.py /v1/audio/speech path)
+            text = prompt.get("input") or prompt.get("text") or prompt.get("prompt")
             ref_audio = prompt.get("ref_audio")
             ref_text = prompt.get("ref_text")
             voice_name = prompt.get("voice_name")
-            lang = prompt.get("lang") or "None"
-            instruct = prompt.get("instruct") or "None"
+            lang = prompt.get("lang")
+            instruct = prompt.get("instruct")
+
+            # OmniTextPrompt format (used by offline Omni.generate path):
+            # ref_audio comes via multi_modal_data["audio"] and the rest via
+            # mm_processor_kwargs. Fall back to those when top-level keys are
+            # absent so both invocation styles work.
+            mm_data = prompt.get("multi_modal_data") or {}
+            mm_kwargs = prompt.get("mm_processor_kwargs") or {}
+            if ref_audio is None:
+                audio_field = mm_data.get("audio")
+                # Standard multimodal shape allows a list of audios; OmniVoice
+                # voice cloning conditions on a single reference clip, so
+                # unwrap a length-1 list and reject multi-reference prompts up
+                # front (otherwise a list would later crash inside
+                # ``_encode_ref_audio`` when it calls ``audio.dim()``).
+                if isinstance(audio_field, list):
+                    if len(audio_field) == 1:
+                        audio_field = audio_field[0]
+                    elif len(audio_field) > 1:
+                        return DiffusionOutput(
+                            error=f"OmniVoice voice cloning supports a single reference audio; got {len(audio_field)}"
+                        )
+                    else:
+                        audio_field = None
+                if audio_field is not None:
+                    if isinstance(audio_field, tuple) and len(audio_field) == 2:
+                        ref_audio = audio_field
+                    else:
+                        sr = mm_kwargs.get("sample_rate") or self.sample_rate
+                        ref_audio = (audio_field, int(sr))
+            if ref_text is None:
+                ref_text = mm_kwargs.get("ref_text")
+            if lang is None:
+                lang = mm_kwargs.get("lang")
+            if instruct is None:
+                instruct = mm_kwargs.get("instruct")
+
+            if not text:
+                return DiffusionOutput(error="Empty text prompt")
+            lang = lang or "None"
+            instruct = instruct or "None"
         else:
             text = str(prompt)
-
-        if not text:
-            return DiffusionOutput(error="Empty text prompt")
+            if not text:
+                return DiffusionOutput(error="Empty text prompt")
 
         device = self.device
         num_cb = self.config.num_audio_codebook
