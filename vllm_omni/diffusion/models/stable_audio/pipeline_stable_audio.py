@@ -28,7 +28,10 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
-from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import StableAudioDiTModel
+from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import (
+    StableAudioDiTModel,
+    StableAudioSchedulerWrapper,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
@@ -134,10 +137,12 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         self.transformer = StableAudioDiTModel(od_config=od_config, **transformer_kwargs)
 
         # Load scheduler
-        self.scheduler = CosineDPMSolverMultistepScheduler.from_pretrained(
-            model,
-            subfolder="scheduler",
-            local_files_only=local_files_only,
+        self.scheduler = StableAudioSchedulerWrapper(
+            CosineDPMSolverMultistepScheduler.from_pretrained(
+                model,
+                subfolder="scheduler",
+                local_files_only=local_files_only,
+            )
         )
 
         # Compute rotary embedding dimension
@@ -560,7 +565,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
             # Scheduler step
-            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+            latents = self.scheduler.step(noise_pred, t, latents, generator).prev_sample
 
         self._current_timestep = None
 

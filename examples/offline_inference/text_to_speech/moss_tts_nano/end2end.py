@@ -9,20 +9,20 @@ the existing single-channel audio writer in vLLM-Omni stays correct).
 
 MOSS-TTS-Nano upstream supports two modes (matching ``infer.py``):
 
-* ``voice_clone`` (recommended): only ``--prompt-audio`` is required.
-* ``continuation``: ``--prompt-audio`` + ``--prompt-text`` together.
+* ``voice_clone`` (recommended): only ``--ref-audio`` is required.
+* ``continuation``: ``--ref-audio`` + ``--ref-text`` together.
 
 Usage:
   # Voice clone (recommended): ref audio only, no transcript needed.
   python end2end.py \\
     --text "Hello!" \\
-    --prompt-audio /path/to/ref.wav
+    --ref-audio /path/to/ref.wav
 
   # Continuation: ref audio + its transcript.
   python end2end.py \\
     --text "Hello!" \\
-    --prompt-audio /path/to/ref.wav \\
-    --prompt-text "Transcript of the reference clip." \\
+    --ref-audio /path/to/ref.wav \\
+    --ref-text "Transcript of the reference clip." \\
     --mode continuation
 
   # Sample reference clips ship in the upstream repo:
@@ -120,11 +120,11 @@ def main(args) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Synthesizing: {args.text!r}")
-    print(f"  ref_audio: {args.prompt_audio}")
+    print(f"  ref_audio: {args.ref_audio}")
     inputs = build_request(
         text=args.text,
-        prompt_audio_path=args.prompt_audio,
-        prompt_text=args.prompt_text,
+        prompt_audio_path=args.ref_audio,
+        prompt_text=args.ref_text,
         mode=args.mode,
         max_new_frames=args.max_new_frames,
         seed=args.seed,
@@ -158,15 +158,15 @@ def parse_args():
     parser = FlexibleArgumentParser(description="MOSS-TTS-Nano offline inference")
     parser.add_argument("--text", default="Hello, this is MOSS-TTS-Nano speaking.", help="Text to synthesize.")
     parser.add_argument(
-        "--prompt-audio",
+        "--ref-audio",
         required=True,
         help="Path to reference audio for voice cloning / continuation (required).",
     )
     parser.add_argument(
-        "--prompt-text",
+        "--ref-text",
         default=None,
         help=(
-            "Optional transcript of --prompt-audio. Required (and only meaningful) "
+            "Optional transcript of --ref-audio. Required (and only meaningful) "
             "in --mode continuation; rejected by upstream in --mode voice_clone."
         ),
     )
