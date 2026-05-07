@@ -25,16 +25,17 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch import nn
+import torchvision.transforms.functional
+
 from diffusers import AutoencoderKLWan
 from diffusers.schedulers import UniPCMultistepScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
-from torch import nn
 from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration
-from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.cosmos.cosmos_transformer import CosmosTransformer3DModel
@@ -74,7 +75,6 @@ def load_transformer_config(
 def get_cosmos_predict25_post_process_func(
     od_config: OmniDiffusionConfig,
 ):
-    from diffusers.video_processor import VideoProcessor
 
     video_processor = VideoProcessor(vae_scale_factor=8)
 
@@ -89,7 +89,7 @@ def get_cosmos_predict25_post_process_func(
     return post_process_func
 
 
-class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
+class CosmosPredict25Pipeline(nn.Module):
     def __init__(
         self,
         *,
@@ -164,23 +164,16 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
         if self.latents_mean is None or self.latents_std is None:
             raise ValueError("VAE configuration must define both `latents_mean` and `latents_std`.")
 
-        # Load vLLM-omni transformer with config
         transformer_config = load_transformer_config(
             model,
             subfolder="transformer",
             local_files_only=local_files_only,
             revision=od_config.revision,
         )
-
         self.transformer = CosmosTransformer3DModel(
             od_config=od_config,
             **transformer_config,
         )
-
-        # self.transformer = create_transformer_from_config(transformer_config)
-
-        # Store the active transformer config
-        # self.transformer_config = self.transformer.config
 
         self.scheduler = UniPCMultistepScheduler.from_pretrained(
             model,
@@ -195,6 +188,9 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
         if hasattr(self.scheduler, "betas") and isinstance(self.scheduler.betas, torch.Tensor):
             if self.scheduler.betas.is_cuda:
                 self.scheduler.betas = self.scheduler.betas.cpu()
+
+        self._guidance_scale = None
+        self._num_timesteps = None                
 
     @property
     def guidance_scale(self):
@@ -212,14 +208,20 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
     def current_timestep(self):
         return self._current_timestep
 
-    def _build_input_ids_batch(
-        self,
-        prompt_texts: list[str],
-        max_sequence_length: int,
-    ) -> torch.Tensor:
-        batch = []
 
-        for text in prompt_texts:
+    def _get_prompt_embeds(
+        self,
+        prompt: str | list[str] = None,
+        max_sequence_length: int = 512,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        device = device or self.device
+        dtype = dtype or self.text_encoder.dtype
+
+        input_ids_batch = []
+
+        for sample_idx in range(len(prompt)):
             conversations = [
                 {
                     "role": "system",
@@ -235,12 +237,11 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
                     "content": [
                         {
                             "type": "text",
-                            "text": text,
+                            "text": prompt[sample_idx],
                         }
                     ],
                 },
             ]
-
             input_ids = self.tokenizer.apply_chat_template(
                 conversations,
                 tokenize=True,
@@ -250,29 +251,31 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
                 truncation=True,
                 padding="max_length",
             )
-
             input_ids = (
                 input_ids["input_ids"] if not isinstance(input_ids, list) and "input_ids" in input_ids else input_ids
             )
-            batch.append(torch.tensor(input_ids, dtype=torch.long))
+            input_ids = torch.LongTensor(input_ids)
+            input_ids_batch.append(input_ids)
 
-        input_ids_batch = torch.stack(batch, dim=0)
-        return input_ids_batch
+        input_ids_batch = torch.stack(input_ids_batch, dim=0)
 
-    def _hidden_states_to_prompt_embeds(
-        self,
-        hidden_states: tuple[torch.Tensor, ...],
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
+        outputs = self.text_encoder(
+            input_ids_batch.to(device),
+            output_hidden_states=True,
+        )
+        hidden_states = outputs.hidden_states
+
         normalized_hidden_states = []
-        for h in hidden_states[1:]:
-            normalized = (h - h.mean(dim=-1, keepdim=True)) / (h.std(dim=-1, keepdim=True) + 1e-8)
-            normalized_hidden_states.append(normalized)
+        for layer_idx in range(1, len(hidden_states)):
+            normalized_state = (hidden_states[layer_idx] - hidden_states[layer_idx].mean(dim=-1, keepdim=True)) / (
+                hidden_states[layer_idx].std(dim=-1, keepdim=True) + 1e-8
+            )
+            normalized_hidden_states.append(normalized_state)
 
         prompt_embeds = torch.cat(normalized_hidden_states, dim=-1)
-        return prompt_embeds.to(dtype=dtype, device=device)
+        prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+
+        return prompt_embeds
 
     def encode_prompt(
         self,
@@ -284,25 +287,13 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
-        device = device or self.device
-        dtype = dtype or self.text_encoder.dtype
+
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
 
-        input_ids_batch = self._build_input_ids_batch(prompt, max_sequence_length)
-
-        with torch.no_grad():
-            outputs = self.text_encoder(
-                input_ids_batch.to(device),
-                output_hidden_states=True,
-            )
-        hidden_states = outputs.hidden_states
-
-        prompt_embeds = self._hidden_states_to_prompt_embeds(
-            hidden_states,
-            device=device,
-            dtype=dtype,
+        prompt_embeds = self._get_prompt_embeds(
+            prompt=prompt, max_sequence_length=max_sequence_length, device=device, dtype=dtype
         )
 
         _, seq_len, _ = prompt_embeds.shape
@@ -313,19 +304,9 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
         if do_classifier_free_guidance:
             negative_prompt = negative_prompt or DEFAULT_NEGATIVE_PROMPT
             negative_prompt = batch_size * [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
-            neg_input_ids_batch = self._build_input_ids_batch(negative_prompt, max_sequence_length)
 
-            with torch.no_grad():
-                neg_outputs = self.text_encoder(
-                    neg_input_ids_batch.to(device),
-                    output_hidden_states=True,
-                )
-            neg_hidden_states = neg_outputs.hidden_states
-
-            negative_prompt_embeds = self._hidden_states_to_prompt_embeds(
-                neg_hidden_states,
-                device=device,
-                dtype=dtype,
+            negative_prompt_embeds = self._get_prompt_embeds(
+                prompt=negative_prompt, max_sequence_length=max_sequence_length, device=device, dtype=dtype
             )
 
             _, seq_len, _ = negative_prompt_embeds.shape
@@ -348,6 +329,9 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
         generator: torch.Generator | list[torch.Generator] | None = None,        
         latents: torch.Tensor | None = None,
     ):
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(f"Generator list length {len(generator)} does not match batch size {batch_size}.")
+                
         B = batch_size
         C = num_channels_latents
         T = (num_frames_out - 1) // self.vae_scale_factor_temporal + 1
@@ -355,11 +339,12 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
         W = width // self.vae_scale_factor_spatial
         shape = (B, C, T, H, W)
 
-        #generator=torch.Generator().manual_seed(1)
         if num_frames_in == 0:
             if latents is None:
                 latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-
+            else:
+                latents = latents.to(device=device, dtype=dtype)
+                
             cond_mask = torch.zeros((B, 1, T, H, W), dtype=latents.dtype, device=latents.device)
             cond_indicator = torch.zeros((B, 1, T, 1, 1), dtype=latents.dtype, device=latents.device)
 
@@ -373,7 +358,7 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
             )
         else:
             if video is None:
-                raise ValueError("`video` must be provided when `num_frames_in` is greater than 0.")
+                raise ValueError("`video` must be provided when `num_frames_in` is greater than 0.")            
             needs_preprocessing = not (isinstance(video, torch.Tensor) and video.ndim == 5 and video.shape[1] == 3)
             if needs_preprocessing:
                 video = self.video_processor.preprocess_video(video, height, width)
@@ -419,11 +404,8 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
         negative_prompt,
         height,
         width,
-        num_frames,
         prompt_embeds=None,
         negative_prompt_embeds=None,
-        image=None,
-        video=None,
     ):
         if height % 16 != 0 or width % 16 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 16 but are {height} and {width}.")
@@ -450,119 +432,50 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
         ):
             raise ValueError(f"`negative_prompt` has to be of type `str` or `list` but is {type(negative_prompt)}")
 
-        if image is not None and video is not None:
-            raise ValueError(
-                "Cannot provide both `image` and `video`. "
-                "Use `image` for Image2World or `video` for Video2World, but not both."
-            )
-
-    def predict_noise(
-        self,
-        cond_mask: torch.Tensor | None = None,
-        gt_velocity: torch.Tensor | None = None,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        """
-        Predict noise with velocity replacement for conditioning.
-
-        Args:
-            cond_mask: Conditioning mask (B, 1, T, H, W)
-            gt_velocity: Ground truth velocity for conditioning frames
-            **kwargs: Arguments to pass to transformer
-
-        Returns:
-            Predicted noise with velocity replacement applied
-        """
-        noise_pred_raw = self.transformer(**kwargs)
-
-        if cond_mask is not None and gt_velocity is not None:
-            noise_pred = gt_velocity + noise_pred_raw * (1 - cond_mask)
-        else:
-            noise_pred = noise_pred_raw
-
-        return noise_pred
 
     def forward(
         self,
         req: OmniDiffusionRequest,
         prompt: str | None = None,
         negative_prompt: str | None = None,
-        image: torch.Tensor | None = None,
-        video: torch.Tensor | None = None,
         height: int = 704,
         width: int = 1280,
         num_inference_steps: int = 36,
-        guidance_scale: float | tuple[float, float] = 7.0,
+        guidance_scale: float = 7.0,
         frame_num: int = 93,
-        num_latent_conditional_frames: int = 2,
         output_type: str | None = "np",
         generator: torch.Generator | list[torch.Generator] | None = None,
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
-        conditional_frame_timestep: float = 0.1,
+        # Cosmos-specific
+        image: torch.Tensor | None = None,
+        video: torch.Tensor | None = None,
+        num_latent_conditional_frames: int = 2,
+        conditional_frame_timestep: float = 0.1,                
         **kwargs,
     ) -> DiffusionOutput:
         # Enforce safety checker requirement (NVIDIA Open Model License Agreement)
         if self.safety_checker is None:
-            message = (
+            raise ValueError(
                 f"You have disabled the safety checker for {self.__class__}. This is in violation of the "
-                "[NVIDIA Open Model License Agreement](https://www.nvidia.com/en-us/agreements/"
-                "enterprise-software/nvidia-open-model-license). "
+                "[NVIDIA Open Model License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license). "
                 f"Please ensure that you are compliant with the license agreement."
             )
-            raise ValueError(message)
 
-        # Get parameters from request or arguments
+        extra = getattr(req.sampling_params, "extra_args", {}) or {}
+        image = extra.get("image", image)
+        video = extra.get("video", video)        
+
+        if image is not None and video is not None:
+            raise ValueError("image and video cannot be provided simultaneously")
+        
         if len(req.prompts) == 1:  # If req.prompt is empty, default to prompt & neg_prompt in param list
             prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
             negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
         if prompt is None and prompt_embeds is None:
             raise ValueError("Prompt or prompt_embeds is required for Cosmos Predict 2.5 generation.")
-        extra = getattr(req.sampling_params, "extra_args", {}) or {}
-        image = extra.get("image", image)
-        video = extra.get("video", video)        
-
-        # Validate mutual exclusivity of image and video inputs
-        if image is not None and video is not None:
-            raise ValueError(
-                "Cannot provide both `image` and `video`. "
-                "Use `image` for Image2World or `video` for Video2World, but not both."
-            )
-
-        # Validate num_latent_conditional_frames
-        if num_latent_conditional_frames not in [1, 2]:
-            raise ValueError(
-                f"num_latent_conditional_frames must be 1 or 2, but got {num_latent_conditional_frames}"
-            )
-
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
-        num_frames = req.sampling_params.num_frames if req.sampling_params.num_frames else frame_num
-
-        # Ensure dimensions are compatible with VAE and patch size
-        # patch_size = self.transformer_config.patch_size
-        mod_value = 32  # self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
-        height = (height // mod_value) * mod_value
-        width = (width // mod_value) * mod_value
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-
-        # num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        guidance_scale = (
-            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale_provided else guidance_scale
-        )
-        num_videos_per_prompt = 1  # req.sampling_params.num_outputs_per_prompt or 1,
-
-        self._guidance_scale = guidance_scale
-        self._current_timestep = None
 
         device = self.device
-        dtype = self.transformer.dtype if self.transformer is not None else self.text_encoder.dtype
-
-        # Seed / generator
-        if generator is None:
-            generator = req.sampling_params.generator
-        if generator is None and req.sampling_params.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
 
         # Check text safety before generation (required by NVIDIA Open Model License Agreement)
         if self.safety_checker is not None:
@@ -576,21 +489,46 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
                             f"prompt abides by the NVIDIA Open Model License Agreement."
                         )
 
+        height = req.sampling_params.height or height
+        width = req.sampling_params.width or width
+        num_frames = req.sampling_params.num_frames if req.sampling_params.num_frames else frame_num
+        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_videos_per_prompt = req.sampling_params.num_outputs_per_prompt or 1
+        max_sequence_length=req.sampling_params.max_sequence_length or 512
+
+        # Ensure dimensions are compatible with VAE and patch size
+        patch_size = self.transformer.config.patch_size
+        mod_value = self.vae_scale_factor_spatial * patch_size[1]
+        height = (height // mod_value) * mod_value
+        width = (width // mod_value) * mod_value
+
+        if req.sampling_params.guidance_scale_provided:
+            guidance_scale = req.sampling_params.guidance_scale
+
+        self._guidance_scale = guidance_scale
+
         self.check_inputs(
             prompt=prompt,
             negative_prompt=negative_prompt,
             height=height,
             width=width,
-            num_frames=num_frames,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
-            image=image,
-            video=video,
         )
+
+        transformer_dtype = self.transformer.dtype
+        vae_dtype = self.vae.dtype
+        dtype = self.transformer.dtype if self.transformer is not None else self.text_encoder.dtype
 
         if num_frames % self.vae_scale_factor_temporal != 1:
             num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
         num_frames = max(num_frames, 1)
+
+        # Seed / generator
+        if generator is None:
+            generator = req.sampling_params.generator
+        if generator is None and req.sampling_params.seed is not None:
+            generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
 
         if prompt_embeds is None:
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
@@ -598,6 +536,7 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
                 negative_prompt=negative_prompt,
                 do_classifier_free_guidance=self.do_classifier_free_guidance,
                 num_videos_per_prompt=num_videos_per_prompt,
+                max_sequence_length=max_sequence_length,
                 device=device,
                 dtype=dtype,
             )
@@ -612,7 +551,6 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
 
         batch_size = prompt_embeds.shape[0]
 
-        import torchvision.transforms.functional
         num_frames_in = None
         if image is not None:
             if batch_size != 1:
@@ -663,14 +601,12 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
 
         assert num_frames_in <= num_frames_out, f"expected ({num_frames_in=}) <= ({num_frames_out=})"
 
-        # Empty cache before VAE encoding to prevent OOM (similar to line 843 before decode)
-        if num_frames_in > 0 and current_omni_platform.is_available():
-            current_omni_platform.empty_cache()
-
-        num_channels_latents = self.transformer.in_channels - 1
+        video = video.to(device=device, dtype=vae_dtype)
+                           
+        num_channels_latents = self.transformer.config.in_channels - 1
         latents, cond_latent, cond_mask, cond_indicator = self.prepare_latents(
             video=video,
-            batch_size=batch_size * num_videos_per_prompt,
+            batch_size=batch_size,
             num_channels_latents=num_channels_latents,            
             height=height,
             width=width,
@@ -679,17 +615,16 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
             dtype=torch.float32,
             device=self.device,
             generator=generator,
-            #latents=latents,
+            latents=req.sampling_params.latents,
         )
-
-        transformer_dtype = self.transformer.dtype
 
         cond_timestep = torch.ones_like(cond_indicator) * conditional_frame_timestep
         cond_mask = cond_mask.to(transformer_dtype)
 
         padding_mask = latents.new_zeros(1, 1, height, width, dtype=transformer_dtype)
 
-        self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+        # Timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
         self._num_timesteps = len(timesteps)
 
@@ -697,6 +632,7 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
 
         for i, t in enumerate(timesteps):
             self._current_timestep = t
+
             sigma_t = (
                 torch.tensor(self.scheduler.sigmas[i].item())
                 .unsqueeze(0)
@@ -706,40 +642,31 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
             in_latents = cond_mask * cond_latent + (1 - cond_mask) * latents
             in_latents = in_latents.to(transformer_dtype)
             in_timestep = cond_indicator * cond_timestep + (1 - cond_indicator) * sigma_t
+            noise_pred = self.transformer(
+                hidden_states=in_latents,
+                condition_mask=cond_mask,
+                timestep=in_timestep,
+                encoder_hidden_states=prompt_embeds,
+                padding_mask=padding_mask,
+                return_dict=False,
+            )[0]            
 
-            do_true_cfg = self.do_classifier_free_guidance and negative_prompt_embeds is not None
-            positive_kwargs = {
-                "cond_mask": cond_mask,
-                "gt_velocity": gt_velocity,
-                "hidden_states": in_latents,
-                "condition_mask": cond_mask,
-                "timestep": in_timestep,
-                "encoder_hidden_states": prompt_embeds,
-                "padding_mask": padding_mask,
-            }
+            noise_pred = gt_velocity + noise_pred * (1 - cond_mask)
 
-            if do_true_cfg:
-                negative_kwargs = {
-                    "cond_mask": cond_mask,
-                    "gt_velocity": gt_velocity,
-                    "hidden_states": in_latents,
-                    "condition_mask": cond_mask,
-                    "timestep": in_timestep,
-                    "encoder_hidden_states": negative_prompt_embeds,
-                    "padding_mask": padding_mask,
-                }
-            else:
-                negative_kwargs = None
+            if self.do_classifier_free_guidance:
+                noise_pred_neg = self.transformer(
+                    hidden_states=in_latents,
+                    condition_mask=cond_mask,
+                    timestep=in_timestep,
+                    encoder_hidden_states=negative_prompt_embeds,
+                    padding_mask=padding_mask,
+                    return_dict=False,
+                )[0]                
 
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg=do_true_cfg,
-                true_cfg_scale=guidance_scale,
-                positive_kwargs=positive_kwargs,
-                negative_kwargs=negative_kwargs,
-                cfg_normalize=False,
-            )
+                noise_pred_neg = gt_velocity + noise_pred_neg * (1 - cond_mask)
+                noise_pred = noise_pred + self.guidance_scale * (noise_pred - noise_pred_neg)
 
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
         # Empty cache before VAE decoding to avoid OOM errors
         if current_omni_platform.is_available():
@@ -750,21 +677,17 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
         if output_type == "latent":
             video = latents
         else:
-            # Denormalize latents
             latents_mean = self.latents_mean.to(latents.device, latents.dtype)
             latents_std = self.latents_std.to(latents.device, latents.dtype)
             latents = latents * latents_std + latents_mean
-
-            # Decode to video
             video = self.vae.decode(latents.to(self.vae.dtype), return_dict=False)[0]
 
             # Check video safety after decode (required by NVIDIA Open Model License Agreement)
             assert self.safety_checker is not None
-            self.safety_checker.to(device, dtype=torch.float32)
+
+            self.safety_checker.to(device)
             video_np = self.video_processor.postprocess_video(video, output_type="np")
             video_np = (video_np * 255).astype(np.uint8)
-
-            # Check safety for each video in batch
             video_batch = []
             for vid in video_np:
                 vid = self.safety_checker.check_video_safety(vid)
@@ -776,5 +699,6 @@ class CosmosPredict25Pipeline(nn.Module, CFGParallelMixin):
         return DiffusionOutput(output=video)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Load weights using AutoWeightsLoader for vLLM transformer
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
