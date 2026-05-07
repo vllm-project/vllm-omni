@@ -47,6 +47,24 @@ python x_to_video_audio.py \
 ```
 In the current test scenario (2 images + 2 audio inputs), the VRAM requirement is 72GB, regardless of whether cfg-parallel is enabled or disabled.
 The VRAM usage can be reduced by enabling CPU offload via --enable-cpu-offload.
+For multi-GPU memory reduction on the fused DreamID-Omni transformer, you can also enable HSDP:
+
+```python
+python x_to_video_audio.py \
+  --model /path/to/dreamid_omni \
+  --prompt "Two people walking together and singing happily" \
+  --image-path ./example0.png ./example1.png \
+  --audio-path ./example0.wav ./example1.wav \
+  --video-negative-prompt "jitter, bad hands, blur, distortion" \
+  --audio-negative-prompt "robotic, muffled, echo, distorted" \
+  --cfg-parallel-size 2 \
+  --num-inference-steps 45 \
+  --height 704 \
+  --width 1280 \
+  --use-hsdp \
+  --hsdp-shard-size 2 \
+  --output out_dreamid_omni_twoip.mp4
+```
 
 
 You could take reference images/audios from the test cases in the official repo: https://github.com/Guoxu1233/DreamID-Omni
@@ -77,6 +95,9 @@ Key arguments:
 - `--image-path`: path to the input image list.
 - `--audio-path`: path to the input audio list, indicate the timbre of the output video.
 - `--cfg-parallel-size`: number of parallel cfg parallel (defaults 1).
+- `--use-hsdp`: enable HSDP weight sharding for DreamID-Omni fused blocks.
+- `--hsdp-shard-size`: number of GPUs used for HSDP sharding.
+- `--hsdp-replicate-size`: number of HSDP replica groups.
 - `--num-inference-steps`: number of denoising steps (defaults 45).
 - `--video-negative-prompt`: negative prompt for video generation.
 - `--audio-negative-prompt`: negative prompt for audio generation.

@@ -4,6 +4,7 @@
 import pytest
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.config.stage_config import deploy_override_field_names
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand, _create_default_diffusion_stage_cfg
 
@@ -28,6 +29,15 @@ def test_default_stage_config_includes_cache_backend():
     assert engine_args["vae_use_slicing"] is True
     assert engine_args["parallel_config"].ulysses_degree == 2
     assert engine_args["model_stage"] == "diffusion"
+
+
+def test_default_stage_config_ignores_none_deploy_overrides():
+    """Ensure nullified deploy override defaults do not alter diffusion defaults."""
+    baseline = AsyncOmniEngine._create_default_diffusion_stage_cfg({})[0]
+    nullified_overrides = {name: None for name in deploy_override_field_names()}
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(nullified_overrides)[0]
+
+    assert stage_cfg == baseline
 
 
 def test_default_cache_config_used_when_missing():
@@ -119,6 +129,46 @@ def test_default_stage_config_includes_default_sampling_params():
         "generator_device": "cpu",
         "guidance_scale": 7.5,
     }
+
+
+def test_default_stage_config_engine_args():
+    """Ensure default diffusion-stage builder sets and propagates engine_args."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "distributed_executor_backend": "ray",
+            "boundary_ratio": 0.875,
+            "flow_shift": 5.0,
+            "trust_remote_code": True,
+        }
+    )[0]
+
+    engine_args = stage_cfg["engine_args"]
+    assert engine_args["distributed_executor_backend"] == "ray"
+    assert engine_args["boundary_ratio"] == 0.875
+    assert engine_args["flow_shift"] == 5.0
+    assert engine_args["trust_remote_code"] is True
+
+
+def test_default_stage_config_whitelist_none_fallback():
+    """DeployConfig / StageDeployConfig whitelist fields with value None
+    fall back to OmniDiffusionConfig dataclass defaults."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            # DeployConfig pipeline-wide
+            "trust_remote_code": None,
+            "distributed_executor_backend": None,
+            "dtype": None,
+            # StageDeployConfig
+            "enforce_eager": None,
+        }
+    )[0]
+
+    engine_args = stage_cfg["engine_args"]
+
+    assert engine_args["trust_remote_code"] is False
+    assert engine_args["distributed_executor_backend"] == "mp"
+    assert engine_args["dtype"] == "auto"
+    assert engine_args["enforce_eager"] is False
 
 
 def test_serve_cli_accepts_ulysses_mode():

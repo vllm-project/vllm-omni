@@ -13,6 +13,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import AsyncOmni, Omni
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
 DEFAULT_SYNC_STAGE_CONFIG = get_deploy_config_path("voxcpm.yaml")
 
@@ -185,6 +186,7 @@ def parse_args():
     )
     parser.add_argument("--stage-init-timeout", type=int, default=600, help="Stage initialization timeout in seconds.")
     parser.add_argument("--log-stats", action="store_true", help="Enable vLLM Omni stats logging.")
+    nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
     if (args.ref_audio is None) != (args.ref_text is None):
         raise ValueError("Voice cloning requires --ref-audio and --ref-text together.")
