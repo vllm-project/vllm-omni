@@ -1,7 +1,7 @@
 [run]
 source = vllm_omni
 
-omit = 
+omit =
     vllm_omni/platforms/npu/models/*
     vllm_omni/model_executor/*
     vllm_omni/diffusion/models/*
