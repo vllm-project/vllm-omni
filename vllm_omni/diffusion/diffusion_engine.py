@@ -456,7 +456,10 @@ class DiffusionEngine:
             if task.deadline is not None:
                 remaining = task.deadline - time.monotonic()
                 if remaining <= 0:
-                    fut.set_exception(TimeoutError(f"RPC call to {task.method} timed out before execution."))
+                    if not fut.done():
+                        fut.set_exception(
+                            TimeoutError(f"RPC call to {task.method} timed out before execution.")
+                        )
                     continue
 
             try:
@@ -467,9 +470,16 @@ class DiffusionEngine:
                     kwargs=task.kwargs,
                     unique_reply_rank=task.unique_reply_rank,
                 )
-                fut.set_result(result)
             except BaseException as exc:  # noqa: BLE001 - propagate to caller
-                fut.set_exception(exc)
+                # The future may have been cancelled (e.g. by a sync timeout
+                # or asyncio cancellation) while the executor call was
+                # running. Setting state on a cancelled/done future raises
+                # InvalidStateError, which would kill the busy loop.
+                if not fut.done():
+                    fut.set_exception(exc)
+            else:
+                if not fut.done():
+                    fut.set_result(result)
 
     def _fail_pending_rpcs(self, exc: BaseException) -> None:
         while True:
@@ -697,16 +707,24 @@ class DiffusionEngine:
         assert isinstance(method, str), "Only string method names are supported for now"
 
         # If the busy loop hasn't started yet (e.g. during _dummy_run in
-        # __init__), no other thread can be touching the executor, so it is
-        # safe to call directly.
+        # __init__, or before the first async request after construction),
+        # there is no busy-loop thread to drain the RPC queue. Fall back to
+        # calling the executor directly, but serialize concurrent callers
+        # via self._cv's underlying lock so multiple threads in this window
+        # cannot race on the shared broadcast_mq / result_mq transport.
         if not self._loop_started:
-            return self.executor.collective_rpc(
-                method=method,
-                timeout=timeout,
-                args=args,
-                kwargs=kwargs,
-                unique_reply_rank=unique_reply_rank,
-            )
+            with self._cv:
+                # Re-check under the lock: the busy loop may have started
+                # between the outer check and acquiring the lock, in which
+                # case we should use the queued path for proper ordering.
+                if not self._loop_started:
+                    return self.executor.collective_rpc(
+                        method=method,
+                        timeout=timeout,
+                        args=args,
+                        kwargs=kwargs,
+                        unique_reply_rank=unique_reply_rank,
+                    )
 
         task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank)
         try:

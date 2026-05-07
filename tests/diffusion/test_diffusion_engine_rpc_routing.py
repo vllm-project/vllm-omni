@@ -372,6 +372,8 @@ def test_collective_rpc_before_loop_starts_calls_executor_directly():
     """
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine._loop_started = False
+    engine._rpc_lock = threading.RLock()
+    engine._cv = threading.Condition(engine._rpc_lock)
     engine.executor = _ConcurrencyTrackingExecutor()
 
     caller_tid = threading.get_ident()
@@ -380,6 +382,74 @@ def test_collective_rpc_before_loop_starts_calls_executor_directly():
     assert result.error == "rpc_result_for_boot"
     # Critically: ran on the caller's thread, not a busy-loop thread.
     assert engine.executor.thread_ids == {caller_tid}
+
+
+def test_collective_rpc_before_loop_starts_serializes_concurrent_callers():
+    """Regression: between ``__init__`` returning and the first async
+    request starting the busy loop, multiple threads may call
+    ``collective_rpc`` concurrently. The pre-loop fast-path must
+    serialize them so they cannot race on the shared executor MQ pair.
+    """
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine._loop_started = False
+    engine._rpc_lock = threading.RLock()
+    engine._cv = threading.Condition(engine._rpc_lock)
+    # Non-trivial delay forces overlap if the lock is missing.
+    engine.executor = _ConcurrencyTrackingExecutor(rpc_delay=0.02)
+
+    n = 8
+    results: list[Any] = [None] * n
+
+    def _call(i: int) -> None:
+        results[i] = engine.collective_rpc("ping", args=(f"x{i}",), unique_reply_rank=0)
+
+    threads = [threading.Thread(target=_call, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert engine.executor.max_concurrent == 1, \
+        "Pre-loop collective_rpc must serialize concurrent callers"
+    for i, r in enumerate(results):
+        assert r is not None and r.error == f"rpc_result_for_x{i}"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_future_does_not_kill_busy_loop():
+    """Regression: if a queued RPC future is cancelled while the executor
+    call is in flight, ``_process_rpc_queue`` must not raise
+    ``InvalidStateError`` when trying to set the result/exception. Doing
+    so would crash the busy-loop thread and stall all later requests.
+    """
+    loop = asyncio.get_running_loop()
+    # Slow executor so we can cancel mid-flight.
+    engine = _make_engine_with_loop(loop, rpc_delay=0.3)
+    try:
+        # Submit an RPC and immediately cancel its future to simulate
+        # a sync timeout / asyncio cancellation racing the worker.
+        with pytest.raises(TimeoutError):
+            await asyncio.to_thread(
+                engine.collective_rpc,
+                "slow",
+                args=("cancelme",),
+                unique_reply_rank=0,
+                timeout=0.05,
+            )
+        # Give the busy loop time to finish the in-flight slow call and
+        # attempt to set state on the cancelled future.
+        await asyncio.sleep(0.5)
+
+        # If the busy loop crashed, this follow-up RPC would hang /
+        # never complete. Bound it with a timeout to fail fast.
+        result = await asyncio.wait_for(
+            engine.async_collective_rpc("ping", args=("after",), unique_reply_rank=0),
+            timeout=3.0,
+        )
+        assert result.error == "rpc_result_for_after"
+        assert engine.worker_thread.is_alive()
+    finally:
+        _stop_engine(engine)
 
 
 # ─────────────────────────── _RpcTask basics ───────────────────────────────
