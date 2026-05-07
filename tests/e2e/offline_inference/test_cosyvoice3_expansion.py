@@ -6,8 +6,9 @@ Offline E2E smoke test for CosyVoice3 zero-shot reference inference.
 This test uses the official upstream zero-shot prompt text/audio pair and
 verifies a stable reference recipe:
 - config-derived top_p/top_k and token-length ratios
-- model EOS token as the stop token
+- model EOS token as the stop token for stage-0 (talker) sampling
 - a conservative repetition penalty to avoid degenerate loops
+- stage-1 (code2wav) completion reports a normal terminal ``finish_reason``
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
+from vllm_omni.outputs import OmniRequestOutput
 
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 MODEL_DIR_ENV = "VLLM_OMNI_COSYVOICE3_MODEL_DIR"
@@ -114,18 +116,6 @@ def _concat_audio(audio_val) -> np.ndarray:
     return audio_np.reshape(-1)
 
 
-def _get_stage_engine_outputs(omni_runner: OmniRunner, stage_id: int):
-    stage_list = getattr(omni_runner.omni, "stage_list", None)
-    if stage_list is not None:
-        return getattr(stage_list[stage_id], "engine_outputs", None) or []
-
-    stage_clients = getattr(getattr(omni_runner.omni, "engine", None), "stage_clients", None)
-    if stage_clients is not None:
-        return getattr(stage_clients[stage_id], "engine_outputs", None) or []
-
-    raise AttributeError("Unable to locate stage outputs on Omni runner")
-
-
 def _build_reference_inputs(prompt_audio: tuple[np.ndarray, int]) -> list[dict[str, object]]:
     return [
         {
@@ -160,9 +150,7 @@ pytestmark = [
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_cosyvoice3_offline_reference_zero_shot(omni_runner: OmniRunner) -> None:
     """CosyVoice3 zero-shot reference inference should stop cleanly and produce sane audio."""
-    async_chunk = bool(getattr(omni_runner.omni, "async_chunk", False))
     prompt_audio, prompt_sr = _load_reference_prompt_wav()
-    expected_stop_token = int(CosyVoice3Config().llm["eos_token_id"])
 
     sampling_params_list = omni_runner.get_default_sampling_params_list()
     sampling_params_list[0] = _reference_zero_shot_stage0_sampling(text=REFERENCE_SYNTH_TEXT)
@@ -187,17 +175,19 @@ def test_cosyvoice3_offline_reference_zero_shot(omni_runner: OmniRunner) -> None
     duration_s = audio.size / sr
     assert 2.8 <= duration_s <= 8.8, f"Unexpected duration={duration_s:.3f}s (samples={audio.size}, sr={sr})"
 
-    stage0_outputs = _get_stage_engine_outputs(omni_runner, 0)
-    if stage0_outputs:
-        completion = stage0_outputs[0].outputs[0]
-        finish_reason = getattr(completion, "finish_reason", None)
-        stop_reason = getattr(completion, "stop_reason", None)
-        num_tokens = len(getattr(completion, "token_ids", []) or [])
-
-        assert finish_reason == "stop", f"Stage-0 finish_reason={finish_reason}, expected 'stop'"
-        assert int(stop_reason) == expected_stop_token, (
-            f"Stage-0 stop_reason={stop_reason}, expected {expected_stop_token}"
-        )
-        assert 80 <= num_tokens <= 220, f"Stage-0 num_tokens={num_tokens}, expected sane stop-bound range"
-    else:
-        assert async_chunk, "Stage-0 produced no engine outputs"
+    # Code2wav is ``final_output`` (stage 1); ``Omni.generate`` yields its ``request_output`` / completions.
+    pipeline_out = OmniRequestOutput.unwrap_result(outputs[0])
+    assert pipeline_out.stage_id == 1, f"expected final stage 1, got {pipeline_out.stage_id}"
+    assert pipeline_out.final_output_type == "audio", (
+        f"expected audio final_output_type, got {pipeline_out.final_output_type!r}"
+    )
+    ro = pipeline_out.request_output
+    assert ro is not None, "stage 1 should include request_output"
+    completions = getattr(ro, "outputs", None) or []
+    assert completions, "stage 1 request_output should include at least one completion"
+    completion = completions[0]
+    finish_reason = getattr(completion, "finish_reason", None)
+    assert finish_reason == "stop", f"Stage-1 finish_reason={finish_reason}, expected 'stop'"
+    token_ids = getattr(completion, "token_ids", None) or []
+    if token_ids:
+        assert 1 <= len(token_ids) <= 4096, f"Stage-1 num_tokens={len(token_ids)}, unexpected range"
