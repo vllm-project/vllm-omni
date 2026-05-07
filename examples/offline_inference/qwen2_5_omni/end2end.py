@@ -21,6 +21,7 @@ from vllm.multimodal.media.audio import load_audio
 from vllm.sampling_params import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 
 SEED = 42
@@ -325,7 +326,10 @@ def main(args):
     else:
         query_result = query_func()
     args.quantization_config = quantization_config
-    omni = Omni.from_cli_args(args, model=model_name)
+    omni_kwargs = vars(args).copy()
+    # Override CLI --model with the derived model_name.
+    omni_kwargs["model"] = model_name
+    omni = Omni(**omni_kwargs)
     thinker_sampling_params = SamplingParams(
         temperature=0.0,  # Deterministic - no randomness
         top_p=1.0,  # Disable nucleus sampling
@@ -550,6 +554,7 @@ def parse_args():
         default=False,
         help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
     )
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for step-level diffusion execution across runner / worker / executor / engine."""
 
+import contextlib
 import os
 import queue
 import threading
@@ -230,9 +231,20 @@ def _make_engine_request(req_id: str = "req-1", num_inference_steps: int = 2) ->
     )
 
 
+def _make_vllm_config():
+    @contextlib.contextmanager
+    def set_priority(*args, **kwargs):
+        yield
+
+    return SimpleNamespace(
+        kernel_config=SimpleNamespace(ir_op_priority=SimpleNamespace(set_priority=set_priority)),
+        compilation_config=SimpleNamespace(ir_enable_torch_wrap=True),
+    )
+
+
 def _make_runner():
     runner = object.__new__(DiffusionModelRunner)
-    runner.vllm_config = object()
+    runner.vllm_config = _make_vllm_config()
     runner.od_config = SimpleNamespace(
         cache_backend=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
@@ -248,7 +260,7 @@ def _make_runner():
 
 def _make_distributed_runner(mode: str, device: torch.device):
     runner = object.__new__(DiffusionModelRunner)
-    runner.vllm_config = object()
+    runner.vllm_config = _make_vllm_config()
     runner.od_config = SimpleNamespace(
         cache_backend=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
@@ -449,7 +461,7 @@ class TestRunner:
                 return False
 
         runner = object.__new__(DiffusionModelRunner)
-        runner.vllm_config = object()
+        runner.vllm_config = _make_vllm_config()
         runner.od_config = SimpleNamespace(
             enable_cpu_offload=False,
             enable_layerwise_offload=False,

@@ -35,6 +35,7 @@ class InlineStageDiffusionClient:
     """Runs DiffusionEngine in a thread executor inside the Orchestrator."""
 
     stage_type: str = "diffusion"
+    replica_id: int = 0
 
     def __init__(
         self,
@@ -46,9 +47,11 @@ class InlineStageDiffusionClient:
         self.model = model
         self.od_config = od_config
         self.stage_id = metadata.stage_id
+        self.replica_id = metadata.replica_id
         self.final_output = metadata.final_output
         self.final_output_type = metadata.final_output_type
         self.default_sampling_params = metadata.default_sampling_params
+        self.requires_multimodal_data = metadata.requires_multimodal_data
         self.custom_process_input_func = metadata.custom_process_input_func
         self.engine_input_source = metadata.engine_input_source
         self.batch_size = batch_size
@@ -62,8 +65,9 @@ class InlineStageDiffusionClient:
         self._shutting_down = False
 
         logger.info(
-            "[InlineStageDiffusionClient] Stage-%s initialized inline (batch_size=%d)",
+            "[InlineStageDiffusionClient] stage-%s [rep-%s] initialized inline (batch_size=%d)",
             self.stage_id,
+            self.replica_id,
             self.batch_size,
         )
 
@@ -82,6 +86,12 @@ class InlineStageDiffusionClient:
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> None:
+        logger.info(
+            "[InlineStageDiffusionClient] stage-%s [rep-%s] add request: %s",
+            self.stage_id,
+            self.replica_id,
+            request_id,
+        )
         task = asyncio.create_task(
             self._dispatch_request(
                 request_id,
@@ -134,6 +144,13 @@ class InlineStageDiffusionClient:
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> None:
+        logger.info(
+            "[InlineStageDiffusionClient] stage-%s [rep-%s] add batch request: %s (%d prompts)",
+            self.stage_id,
+            self.replica_id,
+            request_id,
+            len(prompts),
+        )
         task = asyncio.create_task(
             self._dispatch_batch(
                 request_id,
@@ -252,7 +269,7 @@ class InlineStageDiffusionClient:
             is_start = args[0] if args else True
             profile_prefix = args[1] if len(args) > 1 else None
             if is_start and profile_prefix is None:
-                profile_prefix = f"stage_{self.stage_id}_diffusion_{int(time.time())}"
+                profile_prefix = f"stage_{self.stage_id}_rep_{self.replica_id}_diffusion_{int(time.time())}"
             return await loop.run_in_executor(
                 self._executor,
                 self._engine.profile,

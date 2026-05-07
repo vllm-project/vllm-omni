@@ -32,6 +32,8 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
 
 - The benchmark talks to `http://<host>:<port>/v1/chat/completions`.
 - If you run the server on another host or port, pass `--base-url` accordingly.
+- To compare diffusion multi-replica serving, restart the server with different
+  `runtime.num_replicas` values and keep the benchmark parameters unchanged.
 
 ## 2. Supported Datasets
 
@@ -92,6 +94,35 @@ Current defaults:
 You can point to your own trace using `--dataset-path`.
 
 ## 3. Benchmark Parameters
+
+### Multi-replica sweep
+
+For replica scaling, use the same model, prompt count, image/video size, and
+step count for every run. Change only the serving stage config:
+
+```yaml
+runtime:
+  devices: "0,1,2,3"
+  num_replicas: 4
+```
+
+Then run a fixed benchmark and write one JSON file per replica count:
+
+```bash
+python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+  --base-url http://localhost:8099 \
+  --model Qwen/Qwen-Image \
+  --task t2i \
+  --dataset random \
+  --num-prompts 32 \
+  --max-concurrency 8 \
+  --request-rate inf \
+  --num-inference-steps 10 \
+  --width 512 --height 512 \
+  --output-file diffusion_replica_4.json
+```
+
+Repeat for `num_replicas=1`, `2`, `3`, and `4`, using matching `runtime.devices`.
 
 ### Basic flags
 
