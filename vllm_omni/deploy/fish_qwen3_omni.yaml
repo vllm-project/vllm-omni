@@ -24,6 +24,8 @@ stages:
     max_num_seqs: 4
     gpu_memory_utilization: 0.6
     enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
     async_scheduling: false
     # vLLM >=0.19 requires max_num_batched_tokens >= max_model_len when
     # enable_chunked_prefill=false. Bumped from legacy 3072 to match
@@ -46,6 +48,8 @@ stages:
     max_num_seqs: 1
     gpu_memory_utilization: 0.1
     enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
     async_scheduling: false
     max_num_batched_tokens: 16384
     max_model_len: 16384

@@ -96,7 +96,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    omni = Omni.from_cli_args(args, model=args.model)
+    omni = Omni(**vars(args))
 
     messages = get_messages(args.case, args.text)
     decode_args = {

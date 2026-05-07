@@ -351,10 +351,12 @@ class Qwen2_5OmniForConditionalGeneration(
                 )
             )
 
-            code = code[:-1] if code[-1] == TALKER_CODEC_EOS_TOKEN_ID else code
-            code = code[1:] if code[0] == TALKER_CODEC_BOS_TOKEN_ID else code
+            if code.numel() and code[-1] == TALKER_CODEC_EOS_TOKEN_ID:
+                code = code[:-1]
+            if code.numel() and code[0] == TALKER_CODEC_BOS_TOKEN_ID:
+                code = code[1:]
 
-            audio_tensor = self.generate_audio(code, voice_type)
+            audio_tensor = self.generate_audio(code, voice_type) if code.numel() else torch.zeros(0, device=code.device)
             return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": audio_tensor})
 
         return OmniOutput(

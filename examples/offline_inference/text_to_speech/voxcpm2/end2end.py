@@ -15,6 +15,7 @@ import torch
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni import Omni
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_STAGE_CONFIGS_PATH = str(REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "voxcpm2.yaml")
@@ -59,6 +60,7 @@ def parse_args():
         default=None,
         help="Optional transcript of --ref-audio (enables continuation mode).",
     )
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

@@ -44,16 +44,12 @@ def _transfer_manager(
 
 
 def test_text2flow_supports_batched_source_outputs():
-    stage_list = [
-        SimpleNamespace(
-            engine_outputs=[
-                _source_output("req-0", [10, 11], [1, 2, 3], {"speech_token": torch.tensor([[1, 2]])}),
-                _source_output("req-1", [20, 21], [4, 5], {"speech_token": torch.tensor([[3, 4]])}),
-            ]
-        )
+    source_outputs = [
+        _source_output("req-0", [10, 11], [1, 2, 3], {"speech_token": torch.tensor([[1, 2]])}),
+        _source_output("req-1", [20, 21], [4, 5], {"speech_token": torch.tensor([[3, 4]])}),
     ]
 
-    outputs = text2flow(stage_list=stage_list, engine_input_source=[0], prompt=None)
+    outputs = text2flow(source_outputs=source_outputs, prompt=None)
 
     assert len(outputs) == 2
     assert outputs[0]["prompt_token_ids"] == [1, 2, 3]
