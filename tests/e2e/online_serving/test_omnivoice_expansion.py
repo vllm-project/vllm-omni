@@ -15,7 +15,7 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import generate_synthetic_audio
+from tests.helpers.media import load_test_audio_data_url
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -47,14 +47,8 @@ TEST_PARAMS = [
 _DEFAULT_MIN_AUDIO_BYTES = 5000
 
 
-def _get_ref_audio_b64() -> str:
-    """Generate synthetic speech for reference audio.
-
-    Returns:
-        Base64 data URL string (data:audio/wav;base64,...)
-    """
-    audio_data = generate_synthetic_audio(duration=2, num_channels=1, sample_rate=24000)
-    return f"data:audio/wav;base64,{audio_data['base64']}"
+REF_AUDIO_URL = load_test_audio_data_url("qwen3_tts/clone_2.wav")
+REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 
 
 def get_prompt(prompt_type="text"):
@@ -92,7 +86,7 @@ class TestOmniVoiceVoiceCloning:
         request_config = {
             "model": omni_server.model,
             "input": get_prompt("text"),
-            "ref_audio": _get_ref_audio_b64(),
+            "ref_audio": REF_AUDIO_URL,
             "response_format": "wav",
             "timeout": 180.0,
             "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
@@ -105,8 +99,8 @@ class TestOmniVoiceVoiceCloning:
         request_config = {
             "model": omni_server.model,
             "input": get_prompt("text"),
-            "ref_audio": _get_ref_audio_b64(),
-            "ref_text": "This is the reference transcript.",
+            "ref_audio": REF_AUDIO_URL,
+            "ref_text": REF_TEXT,
             "response_format": "wav",
             "timeout": 180.0,
             "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
