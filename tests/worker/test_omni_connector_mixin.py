@@ -354,15 +354,15 @@ class TestFinishedLoadReqsDrain(unittest.TestCase):
 
 
 class TestLoadCustomFuncSelection(unittest.TestCase):
-    def test_skips_legacy_stage_list_processors_for_full_payload_mode(self):
-        legacy_paths = [
+    def test_skips_non_payload_stage_input_processors_for_full_payload_mode(self):
+        incompatible_paths = [
             "vllm_omni.model_executor.stage_input_processors.mimo_audio.llm2code2wav",
             "vllm_omni.model_executor.stage_input_processors.mammoth_moda2.ar2dit",
             "vllm_omni.model_executor.stage_input_processors.cosyvoice3.text2flow",
             "vllm_omni.model_executor.stage_input_processors.glm_image.ar2diffusion",
         ]
 
-        for func_path in legacy_paths:
+        for func_path in incompatible_paths:
             selected_path, func = MixinHost._load_custom_func(
                 SimpleNamespace(
                     async_chunk=False,

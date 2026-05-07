@@ -60,7 +60,11 @@ class OmniInputPreprocessor(InputPreprocessor):
             additional_information = parsed_content.get("additional_information")
             if additional_information is not None:
                 inputs["additional_information"] = additional_information
-        elif mm_processor_kwargs:
+        elif "mm_processor_kwargs" in parsed_content:
+            # Presence — not truthiness. An explicitly-set empty dict still
+            # signals "route through the multimodal processor" (needed for
+            # AR-based image-gen where the HF processor supplies its own
+            # defaults and scaffold).
             inputs = self._process_multimodal(
                 prompt_text,
                 {},

@@ -32,7 +32,6 @@ classifiers = [
 # Dependencies are now managed dynamically via setup.py based on detected hardware platform.
 # This allows automatic installation of the correct platform-specific dependencies (CUDA/ROCm/CPU/XPU/NPU)
 # without requiring extras like [cuda]. See requirements/ directory for platform-specific dependencies.
-# Note: vllm is intentionally excluded due to entrypoints overwrite issue.
 
 [project.optional-dependencies]
 
@@ -49,7 +48,7 @@ dev = [
     "soundfile>=0.13.1",
     "imageio[ffmpeg]>=0.6.0",
     "opencv-python>=4.12.0.88",
-    "mooncake-transfer-engine==0.3.8.post1",
+    "mooncake-transfer-engine-cuda13>=0.3.9",
     "av", # for ComfyUI tests
     "openpyxl>=3.0.0", # for nightly CI
     "pyttsx3>=2.99",
@@ -90,7 +89,6 @@ Documentation = "https://vllm-omni.readthedocs.io"
 "Bug Tracker" = "https://github.com/vllm-project/vllm-omni/issues"
 
 [project.scripts]
-vllm = "vllm_omni.entrypoints.cli.main:main"
 vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 
 
@@ -230,6 +228,10 @@ extend-ignore-identifiers-re = [
     ".*nin.*",
     ".*[Oo]no_[Aa]nna.*",
     ".*cann.*",
+    ".*[Nn][Dd]3.*",
+]
+extend-ignore-re = [
+    "\\.\\.\\.n,d->\\.\\.\\.nd",
 ]
 [tool.typos.default.extend-words]
 ue = "ue"

@@ -438,10 +438,9 @@ class OrchestratorArgs:
     parallel_config: Any = None
 
     # === Multi-stage guards ===
-    # --tokenizer is captured here so it does not propagate to every stage
-    # uniformly (different stages often need different tokenizers, e.g.
-    # qwen3_omni thinker vs talker). Users wanting a per-stage tokenizer
-    # should set it in the deploy YAML.
+    # --tokenizer is captured by the orchestrator and forwarded to stages
+    # only when the stage does not define tokenizer/tokenizer_subdir itself.
+    # Users wanting a per-stage tokenizer should set it in the deploy YAML.
     tokenizer: str | None = None
 
 
@@ -456,48 +455,10 @@ SHARED_FIELDS: frozenset[str] = frozenset(
     }
 )
 
-_DEPLOY_ENGINE_ARG_OVERRIDE_FIELDS: frozenset[str] = frozenset(
-    {
-        # Capacity / scheduling.
-        "async_scheduling",
-        "max_model_len",
-        "max_num_batched_tokens",
-        "max_num_seqs",
-        # Memory / parallelism.
-        "data_parallel_size",
-        "gpu_memory_utilization",
-        "pipeline_parallel_size",
-        "tensor_parallel_size",
-        # Execution / loading.
-        "enforce_eager",
-        "distributed_executor_backend",
-        "dtype",
-        "quantization",
-        "trust_remote_code",
-        # Caching / chunking.
-        "async_chunk",
-        "enable_prefix_caching",
-        "enable_chunked_prefill",
-        # Model-specific engine extras.
-        "subtalker_sampling_params",
-    }
-)
-
-_DEPLOY_RUNTIME_OVERRIDE_FIELDS: frozenset[str] = frozenset(
-    {
-        "devices",
-    }
-)
-
 
 def orchestrator_field_names() -> frozenset[str]:
     """Return the names of every field on OrchestratorArgs."""
     return frozenset(f.name for f in fields(OrchestratorArgs))
-
-
-def deploy_override_field_names() -> frozenset[str]:
-    """Return kwargs whose parser defaults must not override deploy YAML."""
-    return _DEPLOY_ENGINE_ARG_OVERRIDE_FIELDS | _DEPLOY_RUNTIME_OVERRIDE_FIELDS
 
 
 def internal_blacklist_keys() -> frozenset[str]:
@@ -653,6 +614,8 @@ def nullify_stage_engine_defaults(parser: argparse.ArgumentParser) -> None:
     """Reset stage-level engine flag defaults to ``None``; preserve real
     default in help text. Only deploy-YAML override fields are touched.
     Idempotent."""
+    from vllm_omni.config.stage_config import deploy_override_field_names
+
     override_dests = deploy_override_field_names()
 
     for action in parser._actions:

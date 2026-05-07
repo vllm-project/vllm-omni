@@ -59,7 +59,7 @@ def test_build_add_request_message_preserves_additional_information(mocker: Mock
     assert request.additional_information is not None
     assert request.additional_information.entries["text"].list_data == ["hello world"]
     assert request.additional_information.entries["speaker"].list_data == ["vivian"]
-    output_processor.add_request.assert_called_once()
+    output_processor.add_request.assert_not_called()
 
 
 def test_build_add_request_message_with_resumable_streaming(mocker: MockerFixture):

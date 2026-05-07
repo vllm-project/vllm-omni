@@ -100,20 +100,28 @@ class OmniRequestOutput:
     # memory usage info
     peak_memory_mb: float = 0.0
 
-    # Error information -- set when the output represents a failed request.
+    # error handling
     error: str | None = None
 
     @classmethod
     def from_error(
         cls,
         request_id: str,
-        error: str,
+        error_message: str,
     ) -> "OmniRequestOutput":
-        """Create an error output for a request that failed during generation."""
+        """Create a terminal error output.
+
+        Args:
+            request_id: Request identifier
+            error_message: Human-readable error description
+
+        Returns:
+            OmniRequestOutput with ``finished=True`` and the ``error`` field set.
+        """
         return cls(
             request_id=request_id,
             finished=True,
-            error=error,
+            error=error_message,
         )
 
     @classmethod
@@ -298,6 +306,72 @@ class OmniRequestOutput:
     def is_pipeline_output(self) -> bool:
         """Check if this is a pipeline stage output."""
         return self.stage_id is not None and self.request_output is not None
+
+    def unwrap(self) -> "OmniRequestOutput":
+        """Unwrap nested OmniRequestOutput to get the innermost result.
+
+        This helper handles the common pattern where pipeline outputs may wrap
+        other OmniRequestOutput instances. It recursively unwraps until it reaches
+        the final output with actual content (images, text, etc.).
+
+        Returns:
+            The innermost OmniRequestOutput containing the actual generation results.
+
+        Example:
+            ```python
+            result = omni.generate(...)
+            output = OmniRequestOutput.unwrap_result(result)
+            if output.images:
+                # Access images directly
+                video_frames = output.images
+            ```
+        """
+        current = self
+        # Unwrap nested pipeline outputs
+        while current.is_pipeline_output and current.request_output is not None:
+            if isinstance(current.request_output, OmniRequestOutput):
+                current = current.request_output
+            else:
+                break
+        return current
+
+    @staticmethod
+    def unwrap_result(result: Any) -> "OmniRequestOutput":
+        """Unwrap result from omni.generate() to get the final OmniRequestOutput.
+
+        This static helper handles the full unwrapping pattern including:
+        1. Extracting from list if needed
+        2. Type validation
+        3. Recursive unwrapping of nested pipeline outputs
+
+        Args:
+            result: The result from omni.generate() - may be a list or OmniRequestOutput
+
+        Returns:
+            The innermost OmniRequestOutput with actual content
+
+        Raises:
+            ValueError: If result is not an OmniRequestOutput or list containing one
+
+        Example:
+            ```python
+            result = omni.generate(...)
+            output = OmniRequestOutput.unwrap_result(result)
+            # output is guaranteed to be the final OmniRequestOutput
+            ```
+        """
+        # Handle list wrapper
+        if isinstance(result, list):
+            if not result:
+                raise ValueError("Result list is empty")
+            result = result[0]
+
+        # Validate type
+        if not isinstance(result, OmniRequestOutput):
+            raise ValueError(f"Expected OmniRequestOutput, got {type(result)}")
+
+        # Unwrap nested outputs
+        return result.unwrap()
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""

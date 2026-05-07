@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import fields
 
 from vllm.logger import init_logger
 
@@ -15,10 +16,22 @@ from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
     NewRequestData,
+    SamplingParamsKey,
     SchedulerInterface,
 )
 
 logger = init_logger(__name__)
+
+_KEY_FIELD_NAMES = frozenset(f.name for f in fields(SamplingParamsKey))
+
+
+def get_sampling_params_key(request: OmniDiffusionRequest) -> SamplingParamsKey | None:
+    """Build a batch-compatibility key from the request's sampling params."""
+    if len(request.prompts) != 1:
+        return None
+
+    sampling = request.sampling_params
+    return SamplingParamsKey(**{name: getattr(sampling, name) for name in _KEY_FIELD_NAMES})
 
 
 class _BaseScheduler(SchedulerInterface):
@@ -31,8 +44,9 @@ class _BaseScheduler(SchedulerInterface):
         self._step_id: int = 0
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
+        self._running_sampling_params_key: SamplingParamsKey | None = None
         self._finished_req_ids: set[str] = set()
-        self._max_batch_size: int = 1
+        self.max_num_running_reqs: int = 1
 
     def initialize(self, od_config: OmniDiffusionConfig) -> None:
         self.od_config = od_config
@@ -41,11 +55,13 @@ class _BaseScheduler(SchedulerInterface):
         self._step_id = 0
         self._waiting.clear()
         self._running.clear()
+        self._running_sampling_params_key = None
         self._finished_req_ids.clear()
-        # The current DiffusionEngine execution mode does not support real
-        # request batching well, so we keep this fixed at 1 for now.
-        # TODO: Add support for multiple concurrent requests
-        self.max_num_running_reqs = 1
+        max_num_seqs = getattr(od_config, "max_num_seqs", 1)
+        try:
+            self.max_num_running_reqs = max(1, int(max_num_seqs))
+        except (TypeError, ValueError):
+            self.max_num_running_reqs = 1
         self._reset_scheduler_state()
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
@@ -53,7 +69,7 @@ class _BaseScheduler(SchedulerInterface):
         return self._add_request_with_sched_req_id(sched_req_id, request)
 
     def _add_request_with_sched_req_id(self, sched_req_id: str, request: OmniDiffusionRequest) -> str:
-        state = DiffusionRequestState(sched_req_id=sched_req_id, req=request)
+        state = self._make_request_state(sched_req_id, request)
         self._request_states[sched_req_id] = state
         self._register_request_ids(request.request_ids, sched_req_id)
         self._waiting.append(sched_req_id)
@@ -82,6 +98,8 @@ class _BaseScheduler(SchedulerInterface):
 
             self._waiting.popleft()
             was_new_request = state.status == DiffusionRequestStatus.WAITING
+            if not self._running:
+                self._running_sampling_params_key = state.sampling_params_key
             state.status = DiffusionRequestStatus.RUNNING
             self._running.append(sched_req_id)
             if was_new_request:
@@ -124,6 +142,8 @@ class _BaseScheduler(SchedulerInterface):
             return False
         if sched_req_id in self._running:
             self._running.remove(sched_req_id)
+            if not self._running:
+                self._running_sampling_params_key = None
             self._waiting.appendleft(sched_req_id)
             self._request_states[sched_req_id].status = DiffusionRequestStatus.PREEMPTED
             return True
@@ -140,6 +160,7 @@ class _BaseScheduler(SchedulerInterface):
         self._request_id_to_sched_req_id.clear()
         self._waiting.clear()
         self._running.clear()
+        self._running_sampling_params_key = None
         self._finished_req_ids.clear()
         self._reset_scheduler_state()
 
@@ -169,6 +190,8 @@ class _BaseScheduler(SchedulerInterface):
 
         if running_to_remove:
             self._running = [sched_req_id for sched_req_id in self._running if sched_req_id not in running_to_remove]
+            if not self._running:
+                self._running_sampling_params_key = None
         if waiting_to_remove:
             self._waiting = deque(
                 sched_req_id for sched_req_id in self._waiting if sched_req_id not in waiting_to_remove
@@ -208,9 +231,26 @@ class _BaseScheduler(SchedulerInterface):
     def _pop_extra_request_state(self, sched_req_id: str) -> None:
         """Remove subclass-owned per-request state before popping request state."""
 
+    def _make_request_state(self, sched_req_id: str, request: OmniDiffusionRequest) -> DiffusionRequestState:
+        return DiffusionRequestState(
+            sched_req_id=sched_req_id,
+            req=request,
+            sampling_params_key=get_sampling_params_key(request),
+        )
+
     def _can_schedule_waiting(self, state: DiffusionRequestState) -> bool:
-        del state
-        return True
+        if not self._running:
+            return True
+
+        current_key = self._current_sampling_params_key()
+        return current_key is not None and current_key == state.sampling_params_key
+
+    def _current_sampling_params_key(self) -> SamplingParamsKey | None:
+        if self._running_sampling_params_key is not None or not self._running:
+            return self._running_sampling_params_key
+        state = self._request_states.get(self._running[0])
+        self._running_sampling_params_key = None if state is None else state.sampling_params_key
+        return self._running_sampling_params_key
 
     def _register_request_ids(self, request_ids: list[str], sched_req_id: str) -> None:
         for request_id in request_ids:
