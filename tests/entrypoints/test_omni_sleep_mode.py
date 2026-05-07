@@ -38,16 +38,16 @@ def get_vram_info(device_id: int) -> dict:
     """Per-**process** CUDA allocator stats (GiB). Does not see other processes' usage."""
     try:
         if current_omni_platform.is_rocm():
-            num_gpus = torch.cuda.device_count()
+            num_gpus = torch.accelerator.device_count()
             safe_id = device_id if device_id < num_gpus else 0
-            torch.cuda.synchronize(safe_id)
+            torch.accelerator.synchronize(safe_id)
             return {
                 "reserved": torch.cuda.memory_reserved(safe_id) / 1024**3,
                 "allocated": torch.cuda.memory_allocated(safe_id) / 1024**3,
             }
         else:
             with torch.cuda.device(device_id):
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
                 return {
                     "reserved": torch.cuda.memory_reserved() / 1024**3,
                     "allocated": torch.cuda.memory_allocated() / 1024**3,
@@ -66,7 +66,7 @@ def get_device_global_memory_used_gib(device_id: int) -> float:
     """
     try:
         with torch.cuda.device(device_id):
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             free_b, total_b = torch.cuda.mem_get_info()
         return (total_b - free_b) / 1024**3
     except Exception as e:
@@ -91,7 +91,7 @@ MODEL_DIFF = "riverclouds/qwen_image_random"
 
 
 def get_dynamic_devices(stage_idx: int, num_stages: int, tp_size: int) -> str:
-    total_gpus = torch.cuda.device_count()
+    total_gpus = torch.accelerator.device_count()
     gpus_per_stage = tp_size
     start_idx = stage_idx * gpus_per_stage
     if start_idx + gpus_per_stage > total_gpus:
@@ -309,7 +309,7 @@ class TestOmniSleepMode:
             await diffusion_engine.wake_up(stage_ids=[0])
 
             get_vram_info(device_id)
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             await asyncio.sleep(2)
 
             initial_vram = get_vram_info(device_id)["reserved"]
@@ -322,7 +322,7 @@ class TestOmniSleepMode:
             await diffusion_engine.sleep(stage_ids=[0], level=2)
 
             await asyncio.sleep(3.0)
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
 
             final_vram = get_vram_info(device_id)["reserved"]
             logger.info(f"GPU {device_id} Final VRAM after coordinated sleep: {final_vram:.2f} GiB")
@@ -345,7 +345,7 @@ class TestOmniSleepMode:
         device_id = 1
         try:
             get_vram_info(device_id)
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             vram_initial = get_vram_info(device_id)["reserved"]
             logger.info(f"Diffusion Initial VRAM: {vram_initial:.2f} GiB")
 
@@ -359,7 +359,7 @@ class TestOmniSleepMode:
 
             await asyncio.sleep(2)
             get_vram_info(device_id)
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
 
             vram_sleeping = get_vram_info(device_id)["reserved"]
             logger.info(f"External VRAM measurement during Sleep: {vram_sleeping:.2f} GiB")
@@ -374,7 +374,7 @@ class TestOmniSleepMode:
 
             await asyncio.sleep(2)
             get_vram_info(device_id)
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             vram_restored = get_vram_info(device_id)["reserved"]
             logger.info(f"VRAM after Wake-up: {vram_restored:.2f} GiB")
 
@@ -419,7 +419,7 @@ async def test_diffusion_model_sleep_tp(tp_size: int):
     """Two-stage BAGEL default config: warmup, sleep all, wake, verify generate."""
     if current_omni_platform.is_rocm():
         clean_gpu_envs()
-    num_gpus = torch.cuda.device_count()
+    num_gpus = torch.accelerator.device_count()
     if num_gpus < tp_size:
         pytest.skip(f"Skipping TP={tp_size}")
 
@@ -463,7 +463,7 @@ async def test_multistage_sleep_h100(tp_size: int):
     """Explicit 2-stage (llm + diffusion) + connectors; sleep/wake both stages."""
     if current_omni_platform.is_rocm():
         clean_gpu_envs()
-    num_gpus = torch.cuda.device_count()
+    num_gpus = torch.accelerator.device_count()
     if num_gpus < tp_size * 2:
         pytest.skip("Not enough GPUs")
 

@@ -114,7 +114,7 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
     @classmethod
     def get_device_count(cls) -> int:
-        return torch.cuda.device_count()
+        return torch.accelerator.device_count()
 
     @classmethod
     def get_device_version(cls) -> str | None:
@@ -122,7 +122,7 @@ class CudaOmniPlatform(OmniPlatform, CudaPlatformBase):
 
     @classmethod
     def synchronize(cls) -> None:
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
     @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:

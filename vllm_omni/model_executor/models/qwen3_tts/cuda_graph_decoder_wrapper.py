@@ -110,7 +110,7 @@ class CUDAGraphDecoderWrapper:
             with torch.no_grad():
                 _ = self.decoder(dummy)
 
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
 
         for size in self.capture_sizes:
             try:
@@ -126,7 +126,7 @@ class CUDAGraphDecoderWrapper:
         static_input = torch.zeros(1, self.num_quantizers, size, dtype=dtype, device=device)
         with torch.no_grad():
             _ = self.decoder(static_input)
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
 
         graph = CUDAGraph()
         with torch.no_grad():

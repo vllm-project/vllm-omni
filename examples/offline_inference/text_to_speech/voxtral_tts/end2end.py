@@ -184,7 +184,7 @@ async def run_streaming(inputs, sampling_params_list, model_name, args, output_d
     )
 
     async_omni.shutdown()
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     gc.collect()
 
 
@@ -223,7 +223,7 @@ def run_non_streaming(inputs, sampling_params_list, model_name, args, output_dir
     print(f"RTF: {output_audio_dur / vllm_elapsed:.4f}")
 
     del llm
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     gc.collect()
 
 
@@ -379,7 +379,7 @@ def main(args: Any) -> None:
             f"--num-prompts ({args.num_prompts}) must be divisible by --concurrency ({args.concurrency})"
         )
 
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     gc.collect()
 
     if args.streaming:

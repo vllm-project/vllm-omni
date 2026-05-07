@@ -276,7 +276,9 @@ class MiMoAudioDataParser(MultiModalDataParser):
                 self.device = torch.device(tokenizer_device)
         else:
             # Default to cuda (will use current GPU)
-            self.device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
+            self.device = torch.device(
+                f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
+            )
 
         self.audio_tokenizer_path = os.environ.get("MIMO_AUDIO_TOKENIZER_PATH", None)
         if not self.audio_tokenizer_path:

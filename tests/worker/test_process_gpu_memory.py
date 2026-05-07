@@ -68,7 +68,7 @@ class TestGetProcessGpuMemory:
         assert memory >= 0
 
         del tensor
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
 
     def test_raises_on_invalid_device(self, mocker: MockerFixture):
         from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory

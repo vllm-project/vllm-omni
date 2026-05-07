@@ -11,7 +11,7 @@ def default_env():
     previous = {key: os.environ.get(key) for key in keys}
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = previous["VLLM_WORKER_MULTIPROC_METHOD"] or "spawn"
     os.environ["VLLM_TARGET_DEVICE"] = previous["VLLM_TARGET_DEVICE"] or (
-        "cuda" if torch.cuda.is_available() and torch.cuda.device_count() > 0 else "cpu"
+        "cuda" if torch.cuda.is_available() and torch.accelerator.device_count() > 0 else "cpu"
     )
     yield
     for key, value in previous.items():
@@ -51,7 +51,7 @@ def default_vllm_config():
     from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 
     # Use CPU device if no GPU is available (e.g., in CI environments)
-    has_gpu = torch.cuda.is_available() and torch.cuda.device_count() > 0
+    has_gpu = torch.cuda.is_available() and torch.accelerator.device_count() > 0
     device = "cuda" if has_gpu else "cpu"
     device_config = DeviceConfig(device=device)
 
