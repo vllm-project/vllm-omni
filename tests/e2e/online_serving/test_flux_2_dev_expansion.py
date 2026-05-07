@@ -17,6 +17,8 @@ import pytest
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+
 MODEL = "black-forest-labs/FLUX.2-dev"
 PROMPT = "A cinematic mountain landscape at sunrise, dramatic clouds, ultra-detailed, realistic photography."
 NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
@@ -54,8 +56,6 @@ def _get_flux_2_dev_feature_cases(model: str):
     ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_flux_2_dev_feature_cases(MODEL),

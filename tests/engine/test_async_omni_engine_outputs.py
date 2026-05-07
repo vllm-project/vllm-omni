@@ -63,3 +63,39 @@ async def test_try_get_output_async_raises_after_orchestrator_dies(mocker: Mocke
 
     with pytest.raises(RuntimeError, match="Orchestrator died unexpectedly"):
         await engine.try_get_output_async()
+
+
+def test_fatal_error_message_surfaces_through_try_get_output(mocker: MockerFixture):
+    """When the orchestrator thread crashes, it enqueues a fatal error message.
+
+    ``try_get_output`` must return this message so the caller
+    (``OmniBase._handle_output_message``) can detect the fatal flag.
+    """
+    fatal_msg = {"type": "error", "error": "Orchestrator thread crashed", "fatal": True}
+
+    mock_queue = mocker.MagicMock()
+    mock_queue.sync_q.get.return_value = fatal_msg
+
+    engine = _make_engine(mock_queue, mocker, thread_alive=False)
+
+    msg = engine.try_get_output()
+    assert msg is not None
+    assert msg["type"] == "error"
+    assert msg["fatal"] is True
+    assert "crashed" in msg["error"]
+
+
+@pytest.mark.asyncio
+async def test_fatal_error_message_surfaces_through_try_get_output_async(mocker: MockerFixture):
+    """Async variant of the fatal error message test."""
+    fatal_msg = {"type": "error", "error": "Orchestrator thread crashed", "fatal": True}
+
+    mock_queue = mocker.MagicMock()
+    mock_queue.sync_q.get_nowait.return_value = fatal_msg
+
+    engine = _make_engine(mock_queue, mocker, thread_alive=False)
+
+    msg = await engine.try_get_output_async()
+    assert msg is not None
+    assert msg["type"] == "error"
+    assert msg["fatal"] is True

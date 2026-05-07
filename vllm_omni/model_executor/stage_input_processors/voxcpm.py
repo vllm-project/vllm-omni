@@ -42,24 +42,10 @@ def _coerce_finished_flag(value: Any) -> bool:
 
 
 def latent2vae(
-    stage_list: list[Any],
-    engine_input_source: list[int],
-    prompt: OmniTokensPrompt | TextPrompt | None = None,
-    requires_multimodal_data: bool = False,
+    source_outputs: list[Any],
+    _prompt: OmniTokensPrompt | TextPrompt | None = None,
+    _requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
-    del prompt, requires_multimodal_data
-
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-
-    source_stage_id = engine_input_source[0]
-    if source_stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {source_stage_id}")
-
-    source_outputs = stage_list[source_stage_id].engine_outputs
-    if source_outputs is None:
-        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
-
     vae_inputs: list[OmniTokensPrompt] = []
     for source_output in source_outputs:
         output = source_output.outputs[0]

@@ -67,6 +67,10 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert len(sampling_params_list) == 3
     assert sampling_params_list[0].temperature == 0.2
     assert sampling_params_list[0].seed == 0
+    assert sampling_params_list[0].extra_args == {"target_h": 768, "target_w": 1024}
+    assert sampling_params_list[1] is not gen_params
+    assert sampling_params_list[2] is not gen_params
+    assert sampling_params_list[1] is not sampling_params_list[2]
     assert sampling_params_list[1].height == 768
     assert sampling_params_list[1].width == 1024
     assert sampling_params_list[1].seed == 0
@@ -75,8 +79,15 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert sampling_params_list[1].num_outputs_per_prompt == 2
     assert sampling_params_list[1].true_cfg_scale == 5.0
     assert sampling_params_list[1].lora_request.name == "adapter-a"
+    assert sampling_params_list[1].lora_scale == 0.6
     assert sampling_params_list[2].height == 768
     assert sampling_params_list[2].width == 1024
+    assert sampling_params_list[2].seed == 0
     assert sampling_params_list[2].num_inference_steps == 28
+    assert sampling_params_list[2].lora_request.name == "adapter-a"
+    assert sampling_params_list[2].lora_scale == 0.6
+    assert gen_params.lora_request is None
     assert engine.default_sampling_params_list[1].height is None
+    assert engine.default_sampling_params_list[1].lora_request is None
     assert engine.default_sampling_params_list[2].resolution == 640
+    assert engine.default_sampling_params_list[2].lora_request is None

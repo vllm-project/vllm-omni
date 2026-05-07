@@ -63,15 +63,11 @@ def _decode_additional_information(raw_info: Any) -> dict[str, Any]:
 
 
 def text2flow(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+    source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt = None,
-    requires_multimodal_data: bool = True,
+    _requires_multimodal_data: bool = True,
 ):
     """Build stage-1 inputs by prefixing stage-0 prompt ids to its outputs."""
-    source_stage_id = engine_input_source[0]
-    source_outputs = stage_list[source_stage_id].engine_outputs
-
     engine_inputs: list[OmniTokensPrompt] = []
     for source_output in source_outputs:
         output = source_output.outputs[0]
@@ -79,10 +75,10 @@ def text2flow(
         if multi_modal_data is None:
             raise RuntimeError(f"Missing multimodal_output for request {source_output.request_id}")
 
-        output_ids = _ensure_list(output.token_ids)
+        output_ids = _ensure_list(output.cumulative_token_ids)
         prefix_ids = _ensure_list(source_output.prompt_token_ids)
         additional_info = dict(multi_modal_data)
-        additional_info["prefix_ids"] = prefix_ids
+        additional_info.setdefault("ids", {})["prompt"] = prefix_ids
         engine_inputs.append(OmniTokensPrompt(prompt_token_ids=output_ids, additional_information=additional_info))
     return engine_inputs
 
@@ -181,8 +177,8 @@ def talker2code2wav_async_chunk(
             if not finished:
                 return None
             payload: dict[str, Any] = {
-                "code_predictor_codes": [],
-                "finished": torch.tensor(True, dtype=torch.bool),
+                "codes": {"audio": []},
+                "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
             }
             if not state.get("sent_prompt", False):
                 payload.update(state.get("prompt_payload", {}))
@@ -193,8 +189,8 @@ def talker2code2wav_async_chunk(
         emitted_token_len = int(state.get("emitted_token_len", 0))
         if finished and length <= emitted_token_len:
             payload = {
-                "code_predictor_codes": [],
-                "finished": torch.tensor(True, dtype=torch.bool),
+                "codes": {"audio": []},
+                "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
             }
             if not state.get("sent_prompt", False):
                 payload.update(state.get("prompt_payload", {}))
@@ -225,12 +221,12 @@ def talker2code2wav_async_chunk(
             code_predictor_codes = [int(frame[0]) for frame in token_frames[:prefix_len]]
 
         payload = {
-            "code_predictor_codes": code_predictor_codes,
+            "codes": {"audio": code_predictor_codes},
+            "meta": {"finished": torch.tensor(finished, dtype=torch.bool)},
             "token_offset": token_offset,
             "left_context_size": token_offset,
             "req_id": [request_id],
             "stream_finished": torch.tensor(finished, dtype=torch.bool),
-            "finished": torch.tensor(finished, dtype=torch.bool),
         }
         if not state.get("sent_prompt", False):
             payload.update(state.get("prompt_payload", {}))

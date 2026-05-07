@@ -351,3 +351,138 @@ def test_ambiguous_field_non_strict_routes_to_orchestrator(caplog):
     assert orch.deploy_config == "x"
     assert "deploy_config" not in engine
     assert any("both OrchestratorArgs" in r.message for r in caplog.records)
+
+
+# Sentinel-default precedence invariants (#3035)
+
+
+def _build_full_serve_parser():
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    try:
+        from vllm.entrypoints.openai.cli_args import make_arg_parser
+    except ImportError:
+        pytest.skip("vllm parser not importable")
+    return make_arg_parser(FlexibleArgumentParser())
+
+
+def test_nullify_stage_engine_defaults_resets_inherited_defaults():
+    import argparse
+
+    from vllm_omni.config.stage_config import deploy_override_field_names
+    from vllm_omni.engine.arg_utils import (
+        nullify_stage_engine_defaults,
+    )
+
+    parser = _build_full_serve_parser()
+    nullify_stage_engine_defaults(parser)
+
+    override_dests = deploy_override_field_names()
+    offenders = [
+        (a.dest, a.default)
+        for a in parser._actions
+        if a.dest not in ("help", "version")
+        and a.option_strings
+        and a.dest in override_dests
+        and a.default is not None
+        and a.default is not argparse.SUPPRESS
+    ]
+    assert not offenders, f"Stage flags with non-None defaults after nullify: {offenders}"
+
+
+def test_non_override_flags_keep_real_defaults_after_nullify():
+    import argparse
+
+    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--hsdp-shard-size", type=int, default=-1, help="HSDP shard size.")
+    parser.add_argument("--max-num-seqs", type=int, default=64, help="Max num seqs.")
+    nullify_stage_engine_defaults(parser)
+
+    hsdp = next(a for a in parser._actions if a.dest == "hsdp_shard_size")
+    max_num_seqs = next(a for a in parser._actions if a.dest == "max_num_seqs")
+    assert hsdp.default == -1
+    assert max_num_seqs.default is None
+
+
+def test_help_text_preserves_default_after_nullify():
+    # Real defaults must stay visible in --help even though parser stores None.
+    import argparse
+
+    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max-num-seqs", type=int, default=42, help="Example knob.")
+    nullify_stage_engine_defaults(parser)
+
+    action = next(a for a in parser._actions if a.dest == "max_num_seqs")
+    assert action.default is None
+    assert "(default: 42)" in action.help
+
+
+_OMNIENGINEARGS_USER_INPUT_FIELDS = frozenset(
+    {
+        "model_stage",
+        "model_arch",
+        "engine_output_type",
+        "hf_config_name",
+        "custom_process_next_stage_input_func",
+        "subtalker_sampling_params",
+        "async_chunk",
+        "omni_kv_config",
+        "quantization_config",
+        "worker_type",
+        "task_type",
+        "worker_cls",
+        "enable_sleep_mode",
+        "omni_master_address",
+        "omni_master_port",
+        "stage_configs_path",
+        "output_modalities",
+        "log_stats",
+        "custom_pipeline_args",
+    }
+)
+
+
+def test_omniengineargs_user_input_fields_default_to_none():
+    try:
+        from vllm_omni.engine.arg_utils import OmniEngineArgs
+    except Exception as exc:
+        pytest.skip(f"OmniEngineArgs not importable: {exc}")
+
+    offenders = [
+        (f.name, f.default)
+        for f in fields(OmniEngineArgs)
+        if f.name in _OMNIENGINEARGS_USER_INPUT_FIELDS
+        and f.default is not dataclasses.MISSING
+        and f.default is not None
+    ]
+    assert not offenders, f"User-input fields with non-None defaults: {offenders}"
+
+
+def test_omniengineargs_create_tracks_explicit_fields():
+    try:
+        from vllm_omni.engine.arg_utils import OmniEngineArgs
+    except Exception as exc:
+        pytest.skip(f"OmniEngineArgs not importable: {exc}")
+
+    ea = OmniEngineArgs.create(model="x", gpu_memory_utilization=0.5)
+    assert ea._explicit_fields == frozenset({"model", "gpu_memory_utilization"})
+    assert ea.explicit_kwargs() == {"model": "x", "gpu_memory_utilization": 0.5}
+
+
+def test_omniengineargs_bare_constructor_has_no_explicit_tracking():
+    try:
+        from vllm_omni.engine.arg_utils import OmniEngineArgs
+    except Exception as exc:
+        pytest.skip(f"OmniEngineArgs not importable: {exc}")
+
+    ea = OmniEngineArgs(model="x")
+    assert not hasattr(ea, "_explicit_fields")
+    assert "model" in ea.explicit_kwargs()
+
+
+# dataclasses already imported via ``from dataclasses import dataclass, fields``
+import dataclasses  # noqa: E402  -- needed for MISSING sentinel above

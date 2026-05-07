@@ -5,6 +5,7 @@ This example shows how to use vLLM-Omni for running offline inference
 with the correct prompt format on Qwen2.5-Omni
 """
 
+import json
 import os
 import time
 from typing import NamedTuple
@@ -20,6 +21,7 @@ from vllm.multimodal.media.audio import load_audio
 from vllm.sampling_params import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 
 SEED = 42
@@ -289,7 +291,10 @@ query_map = {
 
 
 def main(args):
-    model_name = "Qwen/Qwen2.5-Omni-7B"
+    model_name = args.model
+    quantization_config = None
+    if args.quantization_config is not None:
+        quantization_config = json.loads(args.quantization_config)
 
     # Get paths from args
     video_path = getattr(args, "video_path", None)
@@ -320,7 +325,11 @@ def main(args):
         query_result = query_func(audio_path=audio_path, sampling_rate=sampling_rate)
     else:
         query_result = query_func()
-    omni = Omni.from_cli_args(args, model=model_name)
+    args.quantization_config = quantization_config
+    omni_kwargs = vars(args).copy()
+    # Override CLI --model with the derived model_name.
+    omni_kwargs["model"] = model_name
+    omni = Omni(**omni_kwargs)
     thinker_sampling_params = SamplingParams(
         temperature=0.0,  # Deterministic - no randomness
         top_p=1.0,  # Disable nucleus sampling
@@ -424,6 +433,18 @@ def main(args):
 
 def parse_args():
     parser = FlexibleArgumentParser(description="Demo on using vLLM for offline inference with audio language models")
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="Qwen/Qwen2.5-Omni-7B",
+        help="Model name or local path.",
+    )
+    parser.add_argument(
+        "--quantization-config",
+        type=str,
+        default=None,
+        help="Optional JSON string forwarded to Omni(quantization_config=...).",
+    )
     parser.add_argument(
         "--query-type",
         "-q",
@@ -533,6 +554,7 @@ def parse_args():
         default=False,
         help="Use py_generator mode. The returned type of Omni.generate() is a Python Generator object.",
     )
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

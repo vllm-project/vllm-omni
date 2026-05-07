@@ -46,6 +46,8 @@ class StageDiffusionProc:
     and ZMQ-based communication with StageDiffusionClient.
     """
 
+    DIFFUSION_PROC_DEAD = b"DIFFUSION_PROC_DEAD"
+
     def __init__(self, model: str, od_config: OmniDiffusionConfig) -> None:
         self._model = model
         self._od_config = od_config
@@ -101,8 +103,7 @@ class StageDiffusionProc:
             kv_sender_info=kv_sender_info,
         )
 
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(self._executor, self._engine.step, request)
+        results = await self._engine.step(request)
         result = results[0]
         if not result.request_id:
             result.request_id = request_id
@@ -132,8 +133,7 @@ class StageDiffusionProc:
             kv_sender_info=kv_sender_info,
         )
 
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(self._executor, self._engine.step, request)
+        results = await self._engine.step(request)
 
         # Merge per-prompt results into a single combined output.
         all_images: list = []
@@ -449,6 +449,16 @@ class StageDiffusionProc:
 
                 elif msg_type == "shutdown":
                     break
+
+        except Exception:
+            # Send the death sentinel so the client can detect the
+            # fatal failure promptly (mirrors EngineCoreProc._send_engine_dead).
+            try:
+                response_socket.setsockopt(zmq.LINGER, 4000)
+                await response_socket.send(StageDiffusionProc.DIFFUSION_PROC_DEAD)
+            except Exception:
+                logger.warning("Failed to send DIFFUSION_PROC_DEAD sentinel to client.")
+            raise
 
         finally:
             for task in tasks.values():

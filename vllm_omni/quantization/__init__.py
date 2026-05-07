@@ -13,6 +13,7 @@ Adds per-component quantization for multi-stage models.
 
 from .component_config import ComponentQuantizationConfig
 from .factory import SUPPORTED_QUANTIZATION_METHODS, build_quant_config
+from .inc_config import OmniINCConfig
 
 # DiffusionGGUFConfig is NOT imported here to avoid pulling in
 # GGUF -> fused_moe -> pynvml at module load time.
@@ -20,5 +21,6 @@ from .factory import SUPPORTED_QUANTIZATION_METHODS, build_quant_config
 __all__ = [
     "build_quant_config",
     "ComponentQuantizationConfig",
+    "OmniINCConfig",
     "SUPPORTED_QUANTIZATION_METHODS",
 ]

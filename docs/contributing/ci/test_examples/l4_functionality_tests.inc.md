@@ -1,6 +1,6 @@
 **Scope**
 
-For diffusion models, the L4 functionality test covers all or common *diffusion features* that are supported by this model, including several [parallelism acceleration methods](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/parallelism_acceleration/), [CPU offloading](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cpu_offload_diffusion/), [TeaCache](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/teacache/) and [Cache-DiT](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cache_dit_acceleration/) cache backends, [quantization methods](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/quantization/overview/).
+For diffusion models, the L4 functionality test covers all or common *diffusion features* that are supported by this model, including several [parallelism acceleration methods](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/parallelism_acceleration/), [CPU offloading](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cpu_offload_diffusion/), [TeaCache](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/teacache/) and [Cache-DiT](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cache_dit_acceleration/) cache backends, [quantization methods](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/quantization/overview/).
 
 **Test Case Design**
 
@@ -37,7 +37,7 @@ Currently all the features are available in online serving mode. Hence, only nee
 **Code Style**
 
 - Validation: test that the multimodal output files of your model have the correct shapes. `OpenAIClientHandler.send_diffusion_request` should have taken care of this.
-- Test marks: always add `advanced_model` and `diffusion`. Add GPU-related marks if needed. Ref: [Markers for Tests](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/ci/tests_markers/).
+- Test marks: always add `full_model` and `diffusion` for L4 nightly `test_*_expansion.py` cases. Add GPU-related marks if needed. Ref: [Markers for Tests](https://docs.vllm.ai/projects/vllm-omni/en/latest/contributing/ci/tests_markers/).
 - To maximize code reuse, you may refer to
     - `tests/conftest.py` for `omni_server` (running server in subprocess) and `openai_client` fixtures (sending requests and validating output), `generate_synthetic_image` and `assert_XXX_valid` helper.
     - `tests/helpers/mark.py` for `@hardware_test(...)` and `hardware_marks`.

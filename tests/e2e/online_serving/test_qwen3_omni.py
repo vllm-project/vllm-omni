@@ -37,19 +37,6 @@ def get_chunk_config(config_path: str | None = None):
     return modify_stage_config(config_path, updates={"async_chunk": True})
 
 
-def get_prefix_caching_config(config_path: str):
-    """Create a stage config with prefix caching enabled on the thinker (stage 0)."""
-    path = modify_stage_config(
-        config_path,
-        updates={
-            "stage_args": {
-                0: {"engine_args.enable_prefix_caching": True},
-            },
-        },
-    )
-    return path
-
-
 # Platform-specific overrides live inside the new deploy yaml's ``platforms:``
 # section, so a single ``_CI_DEPLOY`` path serves CUDA, ROCm, and XPU.
 # TODO: re-add VLLM_TEST_PD_MODE branch once the PD-disaggregation deploy
@@ -59,22 +46,27 @@ if current_omni_platform.is_xpu():
     stage_configs = [_CI_DEPLOY]
 else:  # CUDA + ROCm MI325 share the same deploy config
     stage_configs = [get_chunk_config()]
-prefix_caching_stage_configs = [get_prefix_caching_config(_CI_DEPLOY)]
 
 # Create parameter combinations for model and stage config
 test_params = [
     OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
 ]
-# For prefix caching, we need to enable prompt token details so that we
-# can determine if any tokens were cached.
+# For prefix caching, we enable it on the thinker (stage 0) via CLI override
+# and enable prompt token details so that we can determine if any tokens were cached.
+BLOCK_SIZE = 16
 prefix_test_params = [
     OmniServerParams(
         model=model,
-        stage_config_path=stage_config,
-        server_args=["--enable-prompt-tokens-details"],  # Enable prompt tokens details to get cached_tokens
+        stage_config_path=_CI_DEPLOY,
+        server_args=[
+            "--block-size",
+            str(BLOCK_SIZE),
+            "--stage-overrides",
+            '{"0": {"enable_prefix_caching": true}}',
+            "--enable-prompt-tokens-details",
+        ],
     )
     for model in models
-    for stage_config in prefix_caching_stage_configs
 ]
 
 
@@ -180,35 +172,62 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", prefix_test_params, indirect=True)
-@pytest.mark.skip(reason="issue: #2833")
-def test_thinker_prefix_caching(omni_server, openai_client) -> None:
+def test_thinker_prefix_caching(omni_server, openai_client, run_level) -> None:
     """
     Test thinker prefix caching by sending identical requests with an image (i.e.,
     a large shared prefix) and verifying that the second request uses cached tokens
-    & produces the same output.
+    & produces the same output with greedy decoding.
+
+    NOTE: The reason that we check against logprobs instead of direct text here is that
+    the outputs may still diverge a bit even though we set the seed and temperature.
+    This is mostly because the GEMM algorithm may vary based on the input tensors dims.
+    Because of this, we don't check the logprobs if it's a dummy load, since in that case
+    the top logprobs will all be very close.
     """
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    seed = 10
+    img_res = generate_synthetic_image(224, 224, seed=seed)
+    image_data_url = f"data:image/jpeg;base64,{img_res['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         image_data_url=image_data_url,
         content_text=get_prompt("text_image"),
     )
 
+    top_k = 10
+    sampling_params = {"seed": seed, "temperature": 0, "max_tokens": 8, "logprobs": top_k}
     request_config = {
         "model": omni_server.model,
         "messages": messages,
         "stream": False,
         "modalities": ["text"],
+        "logprobs": True,
+        "top_logprobs": top_k,
+        "sampling_params_list": [sampling_params] * 3,
     }
 
-    response_1 = openai_client.send_omni_request(request_config, request_num=1)[0]
-    response_2 = openai_client.send_omni_request(request_config, request_num=1)[0]
+    uncached_response = openai_client.send_omni_request(request_config, request_num=1)[0]
+    cached_response = openai_client.send_omni_request(request_config, request_num=1)[0]
 
-    assert response_1.success
-    assert response_2.success
-    assert response_2.cached_tokens is not None
-    # We should cache the vast majority of the prompt (image + up to last full block),
-    # and set seed in the CI config, so the second request should give an identical
-    # response for the generated input image, even if we use dummy weights
-    assert response_2.cached_tokens > 0
-    assert response_1.text_content == response_2.text_content
+    # Ensure that we have a prefix cache hit on the second request and that only the last
+    # partial block is uncached (since currently we don't cache partial blocks).
+    num_cached_tokens = cached_response.cached_tokens
+    num_prompt_tokens = cached_response.prompt_tokens
+    assert num_cached_tokens is not None and num_prompt_tokens is not None
+    num_uncached_tokens = num_prompt_tokens % BLOCK_SIZE
+    assert num_cached_tokens > 0
+    assert num_cached_tokens % BLOCK_SIZE == 0
+    assert (num_cached_tokens + num_uncached_tokens) == num_prompt_tokens
+
+    # Ensure that we have logprobs and tokens were generated for both requests
+    assert uncached_response.logprobs is not None
+    assert cached_response.logprobs is not None
+    n_tokens = min(len(uncached_response.logprobs), len(cached_response.logprobs))
+    assert n_tokens > 0
+
+    if run_level == "advanced_model":
+        # For each token index where both responses have an output, ensure that the greedy token
+        # predicted in the uncached case is in the top k logprobs for the cached case
+        for idx in range(n_tokens):
+            greedy_token = uncached_response.logprobs[idx].token
+            cached_top_k = {lp.token for lp in cached_response.logprobs[idx].top_logprobs}
+            assert greedy_token in cached_top_k

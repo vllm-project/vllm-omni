@@ -6,6 +6,8 @@ import pytest
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 @pytest.fixture(scope="function", autouse=True)
 def setup_sp_groups(mocker):
@@ -22,9 +24,6 @@ def setup_sp_groups(mocker):
     mock_tp_group.world_size = 1
     mock_get_tp_group.return_value = mock_tp_group
     yield
-
-
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_glm_image_sp_plan_defined():

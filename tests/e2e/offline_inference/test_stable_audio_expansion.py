@@ -22,6 +22,8 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
+pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+
 _SAMPLE_RATE = 44100
 _CLIP_DURATION_S = 2.0
 
@@ -54,13 +56,9 @@ def generate_stable_audio_short_clip(
 
     assert outputs is not None
     first_output = outputs[0]
-    # Outer OmniRequestOutput.final_output_type comes from get_stage_metadata.
-    # The nested request_output is the worker OmniRequestOutput
-    # (e.g. final_output_type="audio") and holds the multimodal payload.
-    # Follow-up: add StableAudioPipeline stage YAML, and pass model into
-    # _create_default_diffusion_stage_cfg so default diffusion metadata can set
-    # final_output_type to "audio" for future audio pipelines without YAML.
-    assert first_output.final_output_type == "image"
+    # Audio-output diffusion pipelines (those with ``support_audio_output = True``) now have
+    # ``final_output_type="audio"`` set on the outer stage metadata as well as the inner request.
+    assert first_output.final_output_type == "audio"
     assert hasattr(first_output, "request_output") and first_output.request_output
 
     req_out = first_output.request_output
@@ -72,8 +70,6 @@ def generate_stable_audio_short_clip(
     return audio
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.cache
 @hardware_test(res={"cuda": "L4", "xpu": "B60"})
 def test_stable_audio_quantization_and_teacache() -> None:

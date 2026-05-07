@@ -17,6 +17,9 @@ from tests.dfx.conftest import (
 )
 from tests.helpers.runtime import OmniServer
 
+pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+
+
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
@@ -62,11 +65,13 @@ def omni_server(request):
     Multi-stage initialization can take 10-20+ minutes.
     """
     with _omni_server_lock:
-        test_name, model, stage_config_path, stage_overrides, extra_cli_args = request.param
+        test_name, model, stage_config_path, stage_overrides, extra_cli_args, use_omni = request.param
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
-        server_args = ["--stage-init-timeout", "600", "--init-timeout", "900"]
+        server_args: list[str] = []
+        if use_omni:
+            server_args += ["--stage-init-timeout", "600", "--init-timeout", "900"]
         # --deploy-config and --stage-overrides compose at the CLI (see vllm_omni/entrypoints/utils.py):
         # deploy-config sets the base; stage-overrides are applied on top. Both can be set.
         if stage_config_path:
@@ -75,7 +80,7 @@ def omni_server(request):
             server_args = ["--stage-overrides", stage_overrides] + server_args
         if extra_cli_args:
             server_args = list(extra_cli_args) + server_args
-        with OmniServer(model, server_args) as server:
+        with OmniServer(model, server_args, use_omni=use_omni) as server:
             server.test_name = test_name
             print("OmniServer started successfully")
             yield server
@@ -293,6 +298,7 @@ def assert_result(
                 print(f"ERROR: Test results exceeded baseline: {metric_name}: {current_value} < {baseline_value}")
 
 
+@pytest.mark.benchmark
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.parametrize("benchmark_params", benchmark_indices, indirect=True)
 def test_performance_benchmark(omni_server, benchmark_params):
@@ -329,7 +335,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         raise ValueError("The number of prompts does not match the QPS or max_concurrency")
 
     args = ["--host", host, "--port", str(port)]
-    exclude_keys = {"request_rate", "baseline", "num_prompts", "max_concurrency"}
+    exclude_keys = {"request_rate", "baseline", "num_prompts", "max_concurrency", "task", "enabled", "eval_phase"}
 
     for key, value in params.items():
         if key in exclude_keys or value is None:

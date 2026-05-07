@@ -44,7 +44,6 @@ def test_i2v_preprocess_requires_image_and_resizes_to_480p_aspect() -> None:
     assert result.sampling_params.height == 432
     assert result.sampling_params.width == 880
     assert prompt["multi_modal_data"]["image"].size == (880, 432)
-    assert prompt["additional_information"]["preprocessed_image"].shape[-2:] == (432, 880)
 
     missing_image = SimpleNamespace(
         prompts=[{"prompt": "p", "multi_modal_data": {}}],

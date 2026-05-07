@@ -109,6 +109,7 @@ class TestVoxCPMServing:
         assert call.kwargs["prompt"] == {
             "prompt_token_ids": [1],
             "additional_information": tts_params,
+            "type": "token",
         }
         assert call.kwargs["output_modalities"] == ["audio"]
 
@@ -140,4 +141,5 @@ class TestVoxCPMServing:
         assert call.kwargs["prompt"] == {
             "prompt_token_ids": [1],
             "additional_information": tts_params,
+            "type": "token",
         }

@@ -260,18 +260,63 @@ class BailingMM2Config(PretrainedConfig):
         return self.llm_config
 
 
+class MingFlashOmniTalkerConfig(PretrainedConfig):
+    """Configuration class for Ming-flash-omni-2.0 talker (TTS) stage.
+
+    The talker uses a Qwen2 LLM backbone with CFM (Conditional Flow Matching)
+    via a DiT diffusion transformer, plus an Aggregator that maps generated
+    audio latents back to the LLM embedding space for autoregressive generation.
+    """
+
+    model_type = "ming_flash_omni_talker"
+
+    def __init__(
+        self,
+        llm_config: dict[str, Any] | None = None,
+        flowmodel: dict[str, Any] | None = None,
+        aggregator: dict[str, Any] | None = None,
+        steps: int = 10,
+        patch_size: int = 4,
+        history_patch_size: int = 32,
+        latent_dim: int = 64,
+        cfg_strength: float = 2.0,
+        audio_vae_path: str | None = None,
+        campplus_model: str | None = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.llm_config = llm_config
+        self.flowmodel = flowmodel or {}
+        self.aggregator = aggregator or {}
+        self.steps = steps
+        self.patch_size = patch_size
+        self.history_patch_size = history_patch_size
+        self.latent_dim = latent_dim
+        self.cfg_strength = cfg_strength
+        self.audio_vae_path = audio_vae_path
+        self.campplus_model = campplus_model
+
+    def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
+        if isinstance(self.llm_config, dict):
+            return PretrainedConfig.from_dict(self.llm_config)
+        return self.llm_config
+
+
 class MingFlashOmniConfig(PretrainedConfig):
     """Configuration class for unified Ming-flash-omni-2.0 model"""
 
     model_type = "ming_flash_omni"
     is_composition = True
-    sub_configs: ClassVar = {"thinker_config": BailingMM2Config}
+    sub_configs: ClassVar = {
+        "thinker_config": BailingMM2Config,
+        "talker_config": MingFlashOmniTalkerConfig,
+    }
 
     def __init__(
         self,
-        thinker_config: BailingMM2Config | None = None,
+        thinker_config: BailingMM2Config | dict[str, Any] | None = None,
         image_gen_config: dict[str, Any] | None = None,
-        talker_config: dict[str, Any] | None = None,
+        talker_config: MingFlashOmniTalkerConfig | dict[str, Any] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -284,8 +329,11 @@ class MingFlashOmniConfig(PretrainedConfig):
         # Image generation config (for future implementation)
         self.image_gen_config = image_gen_config
 
-        # Talker config (for future implementation)
-        self.talker_config = talker_config
+        # Talker config
+        if isinstance(talker_config, dict):
+            self.talker_config = MingFlashOmniTalkerConfig(**talker_config)
+        else:
+            self.talker_config = talker_config
 
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
         return self.thinker_config.get_text_config()
@@ -294,9 +342,11 @@ class MingFlashOmniConfig(PretrainedConfig):
 # Register model_type -> config class for AutoConfig
 AutoConfig.register(BailingMoeV2Config.model_type, BailingMoeV2Config)
 AutoConfig.register(BailingMM2Config.model_type, BailingMM2Config)
+AutoConfig.register(MingFlashOmniTalkerConfig.model_type, MingFlashOmniTalkerConfig)
 AutoConfig.register(MingFlashOmniConfig.model_type, MingFlashOmniConfig)
 
 # Register tokenizer mapping for composition configs so that
 # AutoTokenizer.from_pretrained can resolve the tokenizer class
 AutoTokenizer.register(BailingMM2Config, fast_tokenizer_class=PreTrainedTokenizerFast)
+AutoTokenizer.register(MingFlashOmniTalkerConfig, fast_tokenizer_class=PreTrainedTokenizerFast)
 AutoTokenizer.register(MingFlashOmniConfig, fast_tokenizer_class=PreTrainedTokenizerFast)

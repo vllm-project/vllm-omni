@@ -10,6 +10,8 @@ The ar2diffusion function bridges these two stages, following the same
 signature pattern as glm_image.ar2diffusion.
 """
 
+from __future__ import annotations
+
 from typing import Any
 
 import torch
@@ -22,33 +24,20 @@ logger = init_logger(__name__)
 
 
 def ar2diffusion(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+    source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | list | None = None,
     requires_multimodal_data: bool = False,
 ) -> list[dict[str, Any]]:
     """Process AR stage outputs to create Diffusion stage inputs.
 
     Args:
-        stage_list: List of stage clients (set by orchestrator).
-        engine_input_source: List of source stage IDs (from YAML).
         prompt: Original user prompt (may contain multimodal data).
         requires_multimodal_data: Whether to forward multimodal data.
 
     Returns:
         List of dicts, each consumable by the HunyuanImage3 diffusion pipeline.
     """
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-
-    source_stage_id = engine_input_source[0]
-    if source_stage_id >= len(stage_list):
-        raise IndexError(f"Invalid source stage_id: {source_stage_id}")
-
-    if stage_list[source_stage_id].engine_outputs is None:
-        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
-
-    ar_outputs = stage_list[source_stage_id].engine_outputs
+    ar_outputs = source_outputs
     diffusion_inputs = []
 
     # Normalize prompt to list
@@ -57,7 +46,7 @@ def ar2diffusion(
 
     for i, ar_output in enumerate(ar_outputs):
         output = ar_output.outputs[0]
-        generated_token_ids = output.token_ids
+        generated_token_ids = output.cumulative_token_ids
         generated_text = getattr(output, "text", "") or ""
 
         # Get original prompt info
@@ -74,6 +63,7 @@ def ar2diffusion(
         height = original_prompt.get("height", 1024)
         width = original_prompt.get("width", 1024)
         text_prompt = original_prompt.get("prompt", "")
+        use_system_prompt = original_prompt.get("use_system_prompt")
 
         logger.info(
             "[ar2diffusion] Request %d: AR generated %d tokens, text length=%d, target size=%dx%d",
@@ -96,16 +86,20 @@ def ar2diffusion(
             },
         }
 
-        # Forward multimodal data (original image for IT2I conditioning)
+        # Forward use_system_prompt so the DiT can build the same system prefix
+        if use_system_prompt is not None:
+            diffusion_input["use_system_prompt"] = use_system_prompt
+
+        # Forward multimodal data (original image for IT2I conditioning).
+        # The diffusion pre_process_func reads multi_modal_data["image"], which
+        # matches vLLM's standard prompt schema, so we only need to pass it once.
         mm_data = original_prompt.get("multi_modal_data")
         if mm_data:
-            pil_image = mm_data.get("image")
-            if pil_image is None:
-                images = mm_data.get("images")
-                if images:
-                    pil_image = images[0] if isinstance(images, list) else images
-            if pil_image is not None:
-                diffusion_input["pil_image"] = pil_image
+            prompt_images = mm_data.get("image")
+            if prompt_images is None:
+                prompt_images = mm_data.get("images")
+            if prompt_images is not None:
+                diffusion_input["multi_modal_data"] = {"image": prompt_images}
 
         # Forward multimodal output from AR (if any)
         if hasattr(ar_output, "multimodal_output") and ar_output.multimodal_output:

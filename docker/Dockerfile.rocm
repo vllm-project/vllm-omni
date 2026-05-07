@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.19.0
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.20.0
 FROM ${BASE_IMAGE} AS base
 
 # Declare a variable to know if we want to use the nightly build or the stable build.

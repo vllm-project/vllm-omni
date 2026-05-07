@@ -106,22 +106,6 @@
         },
         "benchmark_params": [
             {
-                "name": "512x512_steps20",
-                "dataset": "random",
-                "task": "t2i",
-                "width": 512,
-                "height": 512,
-                "num-inference-steps": 20,
-                "num-prompts": 10,
-                "max-concurrency": 1,
-                "enable-negative-prompt": true,
-                "baseline": {
-                    "throughput_qps": 0.1,
-                    "latency_mean": 2.7,
-                    "peak_memory_mb_mean": 61000
-                }
-            },
-            {
                 "name": "1536x1536_steps35",
                 "dataset": "random",
                 "task": "t2i",
