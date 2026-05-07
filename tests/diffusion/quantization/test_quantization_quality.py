@@ -201,8 +201,6 @@ def _unload(omni):
 _marks = hardware_marks(res={"cuda": "H100"})
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 def _quality_param(c: QualityTestConfig):
     marks = list(_marks)
     if c.id == "fp8_qwen_image":
@@ -212,6 +210,8 @@ def _quality_param(c: QualityTestConfig):
     return pytest.param(c, id=c.id, marks=marks)
 
 
+@pytest.mark.full_model
+@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "config",
     [_quality_param(c) for c in QUALITY_CONFIGS],
