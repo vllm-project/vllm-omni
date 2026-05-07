@@ -10,14 +10,14 @@ steps:
       - |
         timeout 20m pytest -v -s -m 'core_model and cpu' \
         --cov=vllm_omni --cov-branch --cov-report=
-      
+
         timeout 10m pytest -v -s -m 'core_model and cuda and L4 and not distributed_cuda' \
         --cov=vllm_omni --cov-branch --cov-append --cov-report= \
         --ignore=tests/e2e --ignore=tests/engine/test_async_omni_engine_abort.py
-      
+
         timeout 10m pytest -v -s -m 'core_model and cuda and L4 and distributed_cuda' \
         --cov=vllm_omni --cov-branch --cov-append --cov-report=
-      
+
         coverage html
         coverage xml
         coverage report -m
@@ -33,4 +33,3 @@ steps:
             - "HF_TOKEN"
           volumes:
             - "/fsx/hf_cache:/fsx/hf_cache"
-  
