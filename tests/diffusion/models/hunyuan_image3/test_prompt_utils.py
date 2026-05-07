@@ -114,7 +114,6 @@ def test_stop_token_ids_for_bot_task_are_resolved_from_tokenizer():
 
 
 class FakeSamplingParams:
-
     def __init__(self, stop_token_ids: list[int] | None = None, max_tokens: int = 16) -> None:
         self.stop_token_ids = stop_token_ids
         self.max_tokens = max_tokens

@@ -95,9 +95,7 @@ def stop_token_ids_for_bot_task(
     eos_id = _eos_token_id(tokenizer)
 
     if image_size == "auto":
-        extra_auto_stops = [
-            _token_id(tokenizer, f"<img_ratio_{i}>") for i in range(33)
-        ]
+        extra_auto_stops = [_token_id(tokenizer, f"<img_ratio_{i}>") for i in range(33)]
     else:
         extra_auto_stops = [_token_id(tokenizer, "<boi>")]
 
@@ -129,10 +127,7 @@ def apply_bot_task_to_sampling_params(
 ) -> list[Any]:
     """Apply a per-request HunyuanImage3 bot_task to one AR stage."""
     if stage_index < 0 or stage_index >= len(sampling_params_list):
-        raise IndexError(
-            f"stage_index {stage_index} is out of range for "
-            f"{len(sampling_params_list)} sampling params"
-        )
+        raise IndexError(f"stage_index {stage_index} is out of range for {len(sampling_params_list)} sampling params")
 
     updated_params_list = list(sampling_params_list)
     params = updated_params_list[stage_index]
