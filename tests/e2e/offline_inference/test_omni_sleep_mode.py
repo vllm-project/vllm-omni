@@ -26,7 +26,7 @@ def get_ack_info(ack, key, default=None):
 
 
 def get_dynamic_devices(stage_idx, num_stages, tp_size):
-    total_gpus = torch.cuda.device_count()
+    total_gpus = torch.accelerator.device_count()
     gpus_per_stage = tp_size
     start_idx = stage_idx * gpus_per_stage
     if start_idx + gpus_per_stage > total_gpus:
@@ -42,7 +42,7 @@ def get_dynamic_devices(stage_idx, num_stages, tp_size):
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.asyncio
 async def test_diffusion_model_sleep_tp(tp_size):
-    num_gpus = torch.cuda.device_count()
+    num_gpus = torch.accelerator.device_count()
     if num_gpus < tp_size:
         pytest.skip(f"Skipping TP={tp_size}")
 
@@ -88,7 +88,7 @@ async def test_diffusion_model_sleep_tp(tp_size):
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.asyncio
 async def test_multistage_sleep_h100(tp_size):
-    num_gpus = torch.cuda.device_count()
+    num_gpus = torch.accelerator.device_count()
     if num_gpus < tp_size * 2:
         pytest.skip("Not enough GPUs")
 

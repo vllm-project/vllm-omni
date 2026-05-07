@@ -503,7 +503,7 @@ class CustomPipelineWorkerExtension:
         if self.model_runner.pipeline is not None:
             del self.model_runner.pipeline
             gc.collect()
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
 
         # Get custom pipeline class name
         custom_pipeline_name = custom_pipeline_args["pipeline_class"]

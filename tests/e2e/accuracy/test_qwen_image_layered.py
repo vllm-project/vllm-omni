@@ -125,7 +125,7 @@ def _run_diffusers_qwen_image_layered(*, model: str, input_image: Image.Image, o
         del pipe
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
         run_post_test_cleanup(enable_force=True)
 
 

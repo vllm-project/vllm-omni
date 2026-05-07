@@ -172,7 +172,7 @@ def run_pipeline_forward(
 
 def _synchronize(device: str) -> None:
     if device.startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
 
 def _latency_summary(values_ms: list[float]) -> dict[str, float]:

@@ -227,7 +227,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         batch_descriptor=batch_desc,
                     ):
                         self.talker_mtp(ids, emb, hid, ts)
-                    torch.cuda.synchronize()
+                    torch.accelerator.synchronize()
 
             logger.info("Captured talker_mtp graphs for %d sizes", len(capture_sizes))
         except RuntimeError as e:

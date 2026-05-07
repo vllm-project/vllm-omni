@@ -327,7 +327,7 @@ def _generate_image(omni: Omni, use_system_prompt: str | None) -> Image.Image:
     return _extract_generated_image(outputs)
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="Need at least 8 CUDA GPUs for this test.")
+@pytest.mark.skipif(torch.accelerator.device_count() < 8, reason="Need at least 8 CUDA GPUs for this test.")
 @pytest.mark.parametrize("system_prompt_name,use_system_prompt,expected_embedding", SYSTEM_PROMPT_CASES)
 def test_system_prompt_scores(
     omni: Omni,

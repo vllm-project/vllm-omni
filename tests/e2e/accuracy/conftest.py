@@ -230,7 +230,7 @@ def _build_accuracy_server_config(
     run_level: str,
     model_prefix: str,
 ) -> AccuracyServerConfig:
-    if torch.cuda.device_count() < 1:
+    if torch.accelerator.device_count() < 1:
         pytest.skip("Need at least 1 CUDA GPU for accuracy benchmark smoke tests.")
 
     if not generate_model:
