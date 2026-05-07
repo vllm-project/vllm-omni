@@ -117,10 +117,6 @@ class ImageGenerationRequest(BaseModel):
         le=20.0,
         description="True CFG scale (model-specific parameter, may be ignored if not supported)",
     )
-    bot_task: str | None = Field(
-        default=None,
-        description="HunyuanImage3 AR bot_task for this request: auto, image, recaption, or think_recaption.",
-    )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
     generator_device: str | None = Field(
         default=None,

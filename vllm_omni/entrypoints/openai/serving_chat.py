@@ -197,25 +197,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if tokenizer is None:
                 tokenizer = await self.engine_client.get_tokenizer()
 
-            extra_body = self._get_extra_body_from_request(request)
-            bot_task = (
-                extra_body.get("bot_task")
-                if self._get_hunyuan_image3_ar_stage_index(list(getattr(self.engine_client, "stage_configs", []) or []))
-                is not None
-                else None
-            )
-            request_chat_template_kwargs = request.chat_template_kwargs or {}
-            if bot_task is not None:
-                from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import resolve_bot_task
-
-                tokenizer_bot_task = resolve_bot_task(bot_task).tokenizer_bot_task
-                request_chat_template_kwargs = dict(request_chat_template_kwargs)
-                request_chat_template_kwargs["bot_task"] = tokenizer_bot_task
-
             reasoning_parser: ReasoningParser | None = None
             if self.reasoning_parser_cls:
                 chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
-                    request_chat_template_kwargs,
+                    request.chat_template_kwargs,
                     self.default_chat_template_kwargs,
                 )
                 reasoning_parser = self.reasoning_parser_cls(
@@ -263,13 +248,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if not self.use_harmony:
                 error_check_ret = self._validate_chat_template(
                     request_chat_template=request.chat_template,
-                    chat_template_kwargs=request_chat_template_kwargs,
+                    chat_template_kwargs=request.chat_template_kwargs,
                     trust_request_chat_template=self.trust_request_chat_template,
                 )
                 if error_check_ret is not None:
                     return error_check_ret
 
-                chat_template_kwargs = dict(request_chat_template_kwargs)
+                chat_template_kwargs = request.chat_template_kwargs or {}
                 chat_template_kwargs.update(reasoning_effort=request.reasoning_effort)
 
                 # Merge chat_template_kwargs with defaults
@@ -336,7 +321,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 #   `extra_body` is flattented and merged into the payload's root.
                 #   These extra fields are accessible via `model_extra` property (from Pydantic base class).
                 #   When sending raw request with curl, no flattening happens. Directly read the `extra_body` dict.
-                extra_body = self._get_extra_body_from_request(request)
+                extra_body = getattr(request, "extra_body", None)
+                if not extra_body:
+                    extra_body = request.model_extra or {}
 
                 height, width = self._resolve_height_width_from_extra_body(extra_body)
 
@@ -380,9 +367,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     mm_processor_kwargs["target_h"] = height
                 if width is not None:
                     mm_processor_kwargs["target_w"] = width
-                if bot_task is not None:
-                    mm_processor_kwargs["bot_task"] = tokenizer_bot_task
-                    tprompt["bot_task"] = bot_task
                 tprompt["mm_processor_kwargs"] = mm_processor_kwargs
                 if engine_prompt_image is not None:
                     tprompt["multi_modal_data"] = engine_prompt_image
@@ -420,12 +404,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # to delta to ensure emitted outputs are correctly drained. Otherwise
                 # convert cumulative to Final Only to ensure the output is correct.
                 sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
-                sampling_params_list = await self._apply_hunyuan_image3_bot_task_sampling_params(
-                    engine=self.engine_client,
-                    sampling_params_list=sampling_params_list,
-                    bot_task=bot_task,
-                    tokenizer=tokenizer,
-                )
 
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):
@@ -706,89 +684,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 raise ValueError(f"Invalid sampling params: {sampling_params}")
         return final_sampling_params_list
-
-    @staticmethod
-    def _get_extra_body_from_request(request: Any) -> dict[str, Any]:
-        body: dict[str, Any] = {}
-        model_extra = getattr(request, "model_extra", None)
-        if isinstance(model_extra, dict):
-            body.update(model_extra)
-        extra_body = getattr(request, "extra_body", None)
-        if isinstance(extra_body, dict):
-            body.update(extra_body)
-        return body
-
-    @staticmethod
-    def _stage_config_get(stage_config: Any, key: str) -> Any:
-        if isinstance(stage_config, dict):
-            return stage_config.get(key)
-        if hasattr(stage_config, "get"):
-            try:
-                return stage_config.get(key)
-            except Exception:
-                pass
-        return getattr(stage_config, key, None)
-
-    @classmethod
-    def _is_hunyuan_image3_stage(cls, stage_config: Any) -> bool:
-        model_arch = cls._stage_config_get(stage_config, "model_arch")
-        if model_arch == "HunyuanImage3ForCausalMM":
-            return True
-
-        engine_args = cls._stage_config_get(stage_config, "engine_args")
-        if isinstance(engine_args, dict):
-            return engine_args.get("model_arch") == "HunyuanImage3ForCausalMM"
-        if engine_args is not None and hasattr(engine_args, "get"):
-            try:
-                return engine_args.get("model_arch") == "HunyuanImage3ForCausalMM"
-            except Exception:
-                pass
-        return getattr(engine_args, "model_arch", None) == "HunyuanImage3ForCausalMM"
-
-    @classmethod
-    def _get_hunyuan_image3_ar_stage_index(cls, stage_configs: list[Any]) -> int | None:
-        for idx, stage_config in enumerate(stage_configs):
-            if cls._is_hunyuan_image3_stage(stage_config) and get_stage_type(stage_config) != "diffusion":
-                return idx
-        return None
-
-    async def _apply_hunyuan_image3_bot_task_sampling_params(
-        self,
-        *,
-        engine: Any,
-        sampling_params_list: list[Any],
-        bot_task: Any,
-        tokenizer: Any | None = None,
-    ) -> list[Any]:
-        if bot_task is None:
-            return sampling_params_list
-
-        stage_configs = list(getattr(engine, "stage_configs", []) or [])
-        stage_index = self._get_hunyuan_image3_ar_stage_index(stage_configs)
-        if stage_index is None:
-            return sampling_params_list
-
-        from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
-            BOT_TASKS,
-            apply_bot_task_to_sampling_params,
-            resolve_bot_task,
-        )
-
-        if bot_task not in BOT_TASKS:
-            raise ValueError(f"Unknown HunyuanImage3 bot_task {bot_task!r}. Choose from: {list(BOT_TASKS)}")
-        resolve_bot_task(bot_task)
-
-        if tokenizer is None and hasattr(engine, "get_tokenizer"):
-            tokenizer = await engine.get_tokenizer()
-        if tokenizer is None:
-            raise ValueError("Cannot resolve tokenizer to apply HunyuanImage3 bot_task stop tokens.")
-
-        return apply_bot_task_to_sampling_params(
-            sampling_params_list,
-            tokenizer,
-            bot_task,
-            stage_index=stage_index,
-        )
 
     def _get_comprehension_stage_index(self) -> int:
         for idx, stage in enumerate(self.engine_client.stage_configs):
@@ -2254,11 +2149,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         lora_body = extra_body.get("lora")
         layers = extra_body.get("layers")
         resolution = extra_body.get("resolution")
-        bot_task = (
-            extra_body.get("bot_task")
-            if self._get_hunyuan_image3_ar_stage_index(list(stage_configs)) is not None
-            else None
-        )
 
         engine_prompt_data: dict[str, Any] | None = None
         modalities = ["image"]
@@ -2297,11 +2187,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             mm_processor_kwargs["target_h"] = height
         if width is not None:
             mm_processor_kwargs["target_w"] = width
-        if bot_task is not None:
-            from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import resolve_bot_task
-
-            mm_processor_kwargs["bot_task"] = resolve_bot_task(bot_task).tokenizer_bot_task
-            engine_prompt["bot_task"] = bot_task
         if mm_processor_kwargs:
             engine_prompt["mm_processor_kwargs"] = mm_processor_kwargs
         if engine_prompt_data is not None:
@@ -2398,7 +2283,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         negative_prompt = extra_body.get("negative_prompt")
         num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
         lora_body = extra_body.get("lora")
-        bot_task = extra_body.get("bot_task")
 
         pil_images: list[Image.Image] = []
         for img_b64 in reference_images:
@@ -2482,12 +2366,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 engine_prompt = gen_prompt
                 sampling_params_list = [gen_params]
 
-            sampling_params_list = await self._apply_hunyuan_image3_bot_task_sampling_params(
-                engine=diffusion_engine,
-                sampling_params_list=sampling_params_list,
-                bot_task=bot_task,
-            )
-
             result = None
             async for output in diffusion_engine.generate(
                 prompt=engine_prompt,
@@ -2556,7 +2434,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             #   `extra_body` is flattented and merged into the payload's root.
             #   These extra fields are accessible via `model_extra` property (from Pydantic base class).
             #   When sending raw request with curl, no flattening happens. Directly read the `extra_body` dict.
-            extra_body = self._get_extra_body_from_request(request)
+            extra_body = getattr(request, "extra_body", None)
+            if not extra_body:
+                extra_body = request.model_extra or {}
 
             # Parse size if provided (supports "1024x1024" format)
             height, width = self._resolve_height_width_from_extra_body(extra_body)
@@ -2575,7 +2455,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 seed = getattr(request, "seed", None)
             negative_prompt = extra_body.get("negative_prompt")
             num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
-            bot_task = extra_body.get("bot_task")
 
             # Text-to-video parameters (ref: text_to_video.py)
             num_frames = extra_body.get("num_frames")
@@ -2689,15 +2568,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Generate image or audio (e.g. AudioX) via AsyncOmni
             diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
             stage_configs = list(getattr(diffusion_engine, "stage_configs", []) or [])
-            if self._get_hunyuan_image3_ar_stage_index(stage_configs) is None:
-                bot_task = None
-            elif bot_task is not None:
-                from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import resolve_bot_task
-
-                gen_prompt["bot_task"] = bot_task
-                gen_prompt["mm_processor_kwargs"] = {
-                    "bot_task": resolve_bot_task(bot_task).tokenizer_bot_task,
-                }
             sampling_params_list = build_stage_sampling_params_list(
                 stage_configs,
                 get_default_sampling_params_list(diffusion_engine),
@@ -2707,12 +2577,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             if not sampling_params_list:
                 sampling_params_list = [gen_params]
-
-            sampling_params_list = await self._apply_hunyuan_image3_bot_task_sampling_params(
-                engine=diffusion_engine,
-                sampling_params_list=sampling_params_list,
-                bot_task=bot_task,
-            )
 
             result = None
             async for output in diffusion_engine.generate(

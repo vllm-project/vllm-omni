@@ -24,7 +24,6 @@ import pathlib
 import pytest
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
-    apply_bot_task_to_sampling_params,
     available_prompt_bot_tasks,
     available_tasks,
     build_prompt,
@@ -173,30 +172,6 @@ def test_resolve_bot_task_resolves_stop_ids_from_prompt_task():
 def test_sys_type_for_task_returns_prompt_preset_default():
     assert sys_type_for_task("i2t_think") == "en_unified"
     assert sys_type_for_task("t2i_vanilla") == "en_vanilla"
-
-
-class FakeSamplingParams:
-    def __init__(self, stop_token_ids: list[int] | None = None, max_tokens: int = 16) -> None:
-        self.stop_token_ids = stop_token_ids
-        self.max_tokens = max_tokens
-
-
-def test_apply_bot_task_to_sampling_params_updates_only_target_stage():
-    tok = FakeTokenizer()
-    stage0 = FakeSamplingParams(stop_token_ids=[999])
-    stage1 = FakeSamplingParams(stop_token_ids=[888])
-
-    updated = apply_bot_task_to_sampling_params(
-        [stage0, stage1],
-        tok,
-        "think_recaption",
-        stage_index=0,
-    )
-
-    assert updated[0] is stage0
-    assert updated[0].stop_token_ids == [6, 7, 5]
-    assert updated[1] is stage1
-    assert stage0.stop_token_ids == [6, 7, 5]
 
 
 @pytest.mark.parametrize(

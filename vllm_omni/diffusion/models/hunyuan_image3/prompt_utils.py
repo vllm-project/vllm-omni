@@ -259,28 +259,6 @@ def _eos_token_id(tokenizer) -> int:
     return _token_id(tokenizer, "<|endoftext|>")
 
 
-def apply_bot_task_to_sampling_params(
-    sampling_params_list: list[Any],
-    tokenizer: Any,
-    bot_task: str,
-    *,
-    stage_index: int = 0,
-    image_size: int | str | None = None,
-) -> list[Any]:
-    """Apply a per-request HunyuanImage3 bot_task to one AR stage."""
-    if stage_index < 0 or stage_index >= len(sampling_params_list):
-        raise IndexError(f"stage_index {stage_index} is out of range for {len(sampling_params_list)} sampling params")
-
-    updated_params_list = list(sampling_params_list)
-    params = updated_params_list[stage_index]
-    stop_token_ids = resolve_bot_task(bot_task, tokenizer=tokenizer, image_size=image_size).stop_token_ids
-    assert stop_token_ids is not None
-    params.stop_token_ids = stop_token_ids
-
-    updated_params_list[stage_index] = params
-    return updated_params_list
-
-
 def build_prompt(
     user_prompt: str,
     task: str = "it2i_think",
@@ -392,7 +370,6 @@ __all__ = [
     "BotTaskResolution",
     "available_tasks",
     "available_prompt_bot_tasks",
-    "apply_bot_task_to_sampling_params",
     "BOT_TASKS",
     "build_prompt",
     "build_prompt_tokens",
