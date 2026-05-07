@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Any, ClassVar, Literal
+from typing import ClassVar, Literal
 
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
@@ -219,7 +219,7 @@ class Mammothmoda2Config(PretrainedConfig):
     def __init__(
         self,
         *,
-        llm_config: dict | None = None,
+        llm_config: dict | PretrainedConfig | None = None,
         gen_vae_config: dict | None = None,
         gen_dit_config: dict | None = None,
         gen_condition_mode: Literal["text", "image", "text_image"] = "image",
@@ -231,8 +231,19 @@ class Mammothmoda2Config(PretrainedConfig):
         architectures: list[str] | None = None,
         **kwargs,
     ) -> None:
+        # HF `validate_token_ids` / composition validation can consult `get_text_config`
+        # from inside `PretrainedConfig.__init__`. Populate `llm_config` before `super().__init__`
+        # so the attribute always exists during parent validation (avoids orchestrator-thread crash).
+        if llm_config is None:
+            _resolved_llm = None
+        elif isinstance(llm_config, dict):
+            _resolved_llm = AutoConfig.for_model(**llm_config)
+        elif isinstance(llm_config, PretrainedConfig):
+            _resolved_llm = llm_config
+        else:
+            raise TypeError(f"llm_config must be dict, PretrainedConfig, or None; got {type(llm_config)}")
+        object.__setattr__(self, "llm_config", _resolved_llm)
         super().__init__(**kwargs)
-        self.llm_config = AutoConfig.for_model(**llm_config) if llm_config is not None else None
         self.gen_vae_config = gen_vae_config
         self.gen_dit_config = gen_dit_config
 
@@ -245,23 +256,11 @@ class Mammothmoda2Config(PretrainedConfig):
         self.tokenizer_class = "MammothUTokenizer"
         self.architectures = ["Mammothmoda2Model"]
 
-    @classmethod
-    def from_dict(cls, config_dict: dict[str, Any] | None = None, **kwargs: Any):  # type: ignore[misc,no-untyped-def]
-        cfg = super().from_dict(config_dict=config_dict, **kwargs)
-        # HF / trust_remote_code paths sometimes hydrate composition models without assigning
-        # nested sub-config attrs; DiT pipeline and multimodal proxies require `llm_config`.
-        if not hasattr(cfg, "llm_config") and isinstance(config_dict, dict):
-            lc_raw = config_dict.get("llm_config")
-            if isinstance(lc_raw, dict):
-                object.__setattr__(cfg, "llm_config", AutoConfig.for_model(**lc_raw))
-            elif lc_raw is None:
-                object.__setattr__(cfg, "llm_config", None)
-            else:
-                object.__setattr__(cfg, "llm_config", lc_raw)
-        return cfg
-
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
-        return self.llm_config
+        lc = getattr(self, "llm_config", None)
+        if lc is None:
+            raise AttributeError("Mammothmoda2Config.llm_config is unset or None; cannot validate text token IDs.")
+        return lc
 
     def _require_llm_config(self) -> PretrainedConfig:
         if self.llm_config is None:

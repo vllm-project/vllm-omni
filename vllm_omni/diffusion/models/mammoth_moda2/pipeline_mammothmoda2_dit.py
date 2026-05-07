@@ -54,9 +54,8 @@ class MammothModa2DiTPipeline(nn.Module):
         self.gen_vae = AutoencoderKL.from_config(self.config.gen_vae_config)
         self.gen_transformer = Transformer2DModel.from_config(self.config.gen_dit_config)
 
-        # Do not reference `config.llm_config` directly: getattr(..., ..., default) still
-        # evaluates `config.llm_config` first — missing nested attr raises AttributeError.
-        llm_part = getattr(self.config, "llm_config", None)
+        # Hidden size: prefer nested VL `llm_config`, else ModelConfig fallback (e.g. odd hub layouts).
+        llm_part = self.config.llm_config
         llm_hidden_size = int(getattr(llm_part, "hidden_size", 0) or 0) if llm_part is not None else 0
         if llm_hidden_size <= 0:
             try:

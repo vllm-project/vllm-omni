@@ -1,16 +1,26 @@
 """
-End-to-end test for MammothModa2 text-to-image generation.
+End-to-end text-to-image test for MammothModa2 (AR -> DiT).
 
-Verifies that the AR->DiT pipeline produces an image tensor whose pixel values
-match a golden reference.
+Asserts:
 
-Model Hub repo id: env var ``MAMMOTHMODA2_MODEL_PATH`` (must be a Hugging Face repo id;
-  default: ``bytedance-research/MammothModa2-Preview``)
-Stage config:  env var ``MAMMOTHMODA2_T2I_STAGE_CONFIG``
-  (default: ``get_deploy_config_path("mammoth_moda2.yaml")`` → ``vllm_omni/deploy/mammoth_moda2.yaml``)
+- The two-stage YAML brings the pipeline up.
+- Stage-1 outputs include an image tensor.
+- Sparse pixel samples match the golden fixture (difference < ``1e-4`` per sample).
 
-Golden pixel file: ``tests/e2e/offline_inference/fixtures/mammoth_moda2_t2i_golden.json``
-  Regenerate with: ``UPDATE_GOLDEN=1 pytest .../test_mammoth_moda2_expansion.py``
+Configuration (module-level constants):
+
+- ``MODEL_PATH``: Hugging Face repo id (default ``bytedance-research/MammothModa2-Preview``);
+  overridden by env ``MAMMOTHMODA2_MODEL_PATH``.
+- ``T2I_STAGE_CONFIG``: path to the two-stage config; default
+  ``get_deploy_config_path("mammoth_moda2.yaml")`` (usually
+  ``vllm_omni/deploy/mammoth_moda2.yaml``); overridden by ``MAMMOTHMODA2_T2I_STAGE_CONFIG``.
+
+Golden file: ``tests/e2e/offline_inference/fixtures/mammoth_moda2_t2i_golden.json``.
+Regenerate: ``UPDATE_GOLDEN=1 pytest tests/e2e/offline_inference/test_mammoth_moda2_expansion.py``
+
+Requires ``hardware_test(res={"cuda": "H100"})``; pytest marks ``full_model`` and ``diffusion``.
+Per-stage engine args (including ``trust_remote_code``) come from the stage YAML only; this
+test does not pass a third ``OmniRunner`` tuple element for overrides.
 """
 
 from __future__ import annotations
@@ -37,13 +47,16 @@ _VISION_START_TOKEN_ID = 151652  # "<|vision_start|>"
 _VISION_END_TOKEN_ID = 151653  # "<|vision_end|>"
 _AR_PATCH_SIZE = 16
 
-MODEL_PATH = "bytedance-research/MammothModa2-Preview"
-T2I_STAGE_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
+MODEL_PATH = os.environ.get(
+    "MAMMOTHMODA2_MODEL_PATH",
+    "bytedance-research/MammothModa2-Preview",
+)
+T2I_STAGE_CONFIG = os.environ.get(
+    "MAMMOTHMODA2_T2I_STAGE_CONFIG",
+    get_deploy_config_path("mammoth_moda2.yaml"),
+)
 
-# trust_remote_code=False: use AutoConfig/tokenizer registrations in vLLM-Omni. True loads
-# upstream configuration_mammothmoda2.py whose Mammothmoda2Config may omit `llm_config`
-# attrs and breaks DiT orchestration.
-_OMNI_RUNNER_PARAM = (MODEL_PATH, T2I_STAGE_CONFIG, {"trust_remote_code": False})
+_OMNI_RUNNER_PARAM = (MODEL_PATH, T2I_STAGE_CONFIG)
 
 # Golden pixel reference file.  Set UPDATE_GOLDEN=1 to regenerate.
 _GOLDEN_T2I_PATH = Path(__file__).parent / "fixtures" / "mammoth_moda2_t2i_golden.json"
