@@ -2424,6 +2424,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             cfg_text_scale = extra_body.get("cfg_text_scale")
             cfg_img_scale = extra_body.get("cfg_img_scale")
             seed = extra_body.get("seed")
+            if seed is None:
+                seed = getattr(request, "seed", None)
             negative_prompt = extra_body.get("negative_prompt")
             num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
 
