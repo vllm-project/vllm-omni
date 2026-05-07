@@ -649,7 +649,12 @@ class AsyncOmniEngine:
                 with ExitStack() as launch_stack:
                     with llm_stage_launch_lock:
                         previous_visible_devices = os.environ.get(device_control_env)
+                        previous_runtime_env: dict[str, str | None] = {}
                         try:
+                            previous_runtime_env = apply_stage_runtime_env(
+                                plan.metadata.stage_id,
+                                plan.metadata.runtime_cfg,
+                            )
                             setup_stage_devices(plan.metadata.stage_id, plan.metadata.runtime_cfg)
                             vllm_config = plan.stage_vllm_config
                             executor_class = plan.executor_class
@@ -689,6 +694,7 @@ class AsyncOmniEngine:
                                 plan.metadata.stage_id,
                             )
                         finally:
+                            restore_stage_runtime_env(previous_runtime_env)
                             if previous_visible_devices is None:
                                 current_omni_platform.unset_device_control_env_var()
                             else:
@@ -785,7 +791,12 @@ class AsyncOmniEngine:
                 device_control_env = current_omni_platform.device_control_env_var
                 with stage_launch_lock:
                     previous_visible_devices = os.environ.get(device_control_env)
+                    previous_runtime_env: dict[str, str | None] = {}
                     try:
+                        previous_runtime_env = apply_stage_runtime_env(
+                            plan.metadata.stage_id,
+                            plan.metadata.runtime_cfg,
+                        )
                         setup_stage_devices(plan.metadata.stage_id, plan.metadata.runtime_cfg)
                         omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
                         if omni_conn_cfg:
@@ -841,6 +852,7 @@ class AsyncOmniEngine:
                                 use_inline=self.num_stages == 1 and plan.num_replicas == 1,
                             )
                     finally:
+                        restore_stage_runtime_env(previous_runtime_env)
                         if previous_visible_devices is None:
                             current_omni_platform.unset_device_control_env_var()
                         else:
