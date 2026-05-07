@@ -206,9 +206,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             )
             request_chat_template_kwargs = request.chat_template_kwargs or {}
             if bot_task is not None:
-                from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import tokenizer_bot_task_for_bot_task
+                from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import resolve_bot_task
 
-                tokenizer_bot_task = tokenizer_bot_task_for_bot_task(bot_task)
+                tokenizer_bot_task = resolve_bot_task(bot_task).tokenizer_bot_task
                 request_chat_template_kwargs = dict(request_chat_template_kwargs)
                 request_chat_template_kwargs["bot_task"] = tokenizer_bot_task
 
@@ -771,12 +771,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
             BOT_TASKS,
             apply_bot_task_to_sampling_params,
-            tokenizer_bot_task_for_bot_task,
+            resolve_bot_task,
         )
 
         if bot_task not in BOT_TASKS:
             raise ValueError(f"Unknown HunyuanImage3 bot_task {bot_task!r}. Choose from: {list(BOT_TASKS)}")
-        tokenizer_bot_task_for_bot_task(bot_task)
+        resolve_bot_task(bot_task)
 
         if tokenizer is None and hasattr(engine, "get_tokenizer"):
             tokenizer = await engine.get_tokenizer()
@@ -2298,9 +2298,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if width is not None:
             mm_processor_kwargs["target_w"] = width
         if bot_task is not None:
-            from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import tokenizer_bot_task_for_bot_task
+            from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import resolve_bot_task
 
-            mm_processor_kwargs["bot_task"] = tokenizer_bot_task_for_bot_task(bot_task)
+            mm_processor_kwargs["bot_task"] = resolve_bot_task(bot_task).tokenizer_bot_task
             engine_prompt["bot_task"] = bot_task
         if mm_processor_kwargs:
             engine_prompt["mm_processor_kwargs"] = mm_processor_kwargs
@@ -2692,11 +2692,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if self._get_hunyuan_image3_ar_stage_index(stage_configs) is None:
                 bot_task = None
             elif bot_task is not None:
-                from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import tokenizer_bot_task_for_bot_task
+                from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import resolve_bot_task
 
                 gen_prompt["bot_task"] = bot_task
                 gen_prompt["mm_processor_kwargs"] = {
-                    "bot_task": tokenizer_bot_task_for_bot_task(bot_task),
+                    "bot_task": resolve_bot_task(bot_task).tokenizer_bot_task,
                 }
             sampling_params_list = build_stage_sampling_params_list(
                 stage_configs,

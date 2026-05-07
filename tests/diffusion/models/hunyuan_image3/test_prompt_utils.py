@@ -30,8 +30,6 @@ from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     build_prompt,
     build_prompt_tokens,
     resolve_bot_task,
-    stop_token_ids_for_bot_task,
-    stop_token_ids_for_task,
     sys_type_for_task,
 )
 
@@ -122,7 +120,7 @@ def test_resolve_bot_task_matches_prompt_presets(task: str, expected_bot_task: s
         ("text2text", "none", "t2t"),
     ],
 )
-def test_task_for_modality_and_bot_task_composes_prompt_task(
+def test_resolve_bot_task_composes_prompt_task(
     modality: str,
     bot_task: str,
     expected_task: str,
@@ -151,25 +149,25 @@ def test_resolve_bot_task_maps_tokenizer_task_and_stop_ids():
     assert resolution.stop_token_ids == [6, 7, 5]
 
 
-def test_stop_token_ids_for_bot_task_are_resolved_from_tokenizer():
+def test_resolve_bot_task_resolves_stop_ids_from_bot_task():
     tok = FakeTokenizer()
 
-    assert stop_token_ids_for_bot_task(tok, "auto") == [5, 8]
-    assert stop_token_ids_for_bot_task(tok, "image") == [5]
-    assert stop_token_ids_for_bot_task(tok, "think_recaption") == [6, 7, 5]
-    assert stop_token_ids_for_bot_task(tok, "recaption") == [6, 7, 5]
-    assert stop_token_ids_for_bot_task(tok, "auto", image_size="auto") == [
+    assert resolve_bot_task("auto", tokenizer=tok).stop_token_ids == [5, 8]
+    assert resolve_bot_task("image", tokenizer=tok).stop_token_ids == [5]
+    assert resolve_bot_task("think_recaption", tokenizer=tok).stop_token_ids == [6, 7, 5]
+    assert resolve_bot_task("recaption", tokenizer=tok).stop_token_ids == [6, 7, 5]
+    assert resolve_bot_task("auto", tokenizer=tok, image_size="auto").stop_token_ids == [
         5,
         *range(1000, 1033),
     ]
 
 
-def test_stop_token_ids_for_task_are_resolved_from_prompt_task():
+def test_resolve_bot_task_resolves_stop_ids_from_prompt_task():
     tok = FakeTokenizer()
 
-    assert stop_token_ids_for_task(tok, "i2t") == [5, 8]
-    assert stop_token_ids_for_task(tok, "i2t_think") == [6, 7, 5]
-    assert stop_token_ids_for_task(tok, "t2i_vanilla") == [5]
+    assert resolve_bot_task(task="i2t", tokenizer=tok).stop_token_ids == [5, 8]
+    assert resolve_bot_task(task="i2t_think", tokenizer=tok).stop_token_ids == [6, 7, 5]
+    assert resolve_bot_task(task="t2i_vanilla", tokenizer=tok).stop_token_ids == [5]
 
 
 def test_sys_type_for_task_returns_prompt_preset_default():

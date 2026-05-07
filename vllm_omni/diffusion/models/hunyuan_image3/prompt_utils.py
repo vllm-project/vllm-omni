@@ -159,18 +159,6 @@ def _task_for_modality_and_prompt_bot_task(modality: str, bot_task: str | None =
     return _TASK_BY_PREFIX_AND_BOT_TASK[task_key]
 
 
-def _bot_task_for_preset_bot_task(preset_bot_task: str | None) -> str:
-    if preset_bot_task == "think":
-        return "think_recaption"
-    return preset_bot_task or "auto"
-
-
-def _tokenizer_bot_task_for_bot_task(bot_task: str) -> str:
-    if bot_task not in _BOT_TASK_TO_TOKENIZER_TASK:
-        raise ValueError(f"Unknown bot_task {bot_task!r}. Choose from: {list(BOT_TASKS)}")
-    return _BOT_TASK_TO_TOKENIZER_TASK[bot_task]
-
-
 def _stop_token_ids_for_tokenizer_bot_task(
     tokenizer,
     tokenizer_bot_task: str,
@@ -222,7 +210,7 @@ def resolve_bot_task(
 
     if task is not None:
         sys_type, preset_bot_task, trigger_tag = _task_preset(task)
-        resolved_bot_task = _bot_task_for_preset_bot_task(preset_bot_task)
+        resolved_bot_task = "think_recaption" if preset_bot_task == "think" else preset_bot_task or "auto"
         prompt_bot_task = preset_bot_task
     else:
         sys_type = None
@@ -230,7 +218,9 @@ def resolve_bot_task(
         prompt_bot_task = None
         resolved_bot_task = "auto" if bot_task is None else bot_task.strip().lower()
 
-    tokenizer_bot_task = _tokenizer_bot_task_for_bot_task(resolved_bot_task)
+    if resolved_bot_task not in _BOT_TASK_TO_TOKENIZER_TASK:
+        raise ValueError(f"Unknown bot_task {resolved_bot_task!r}. Choose from: {list(BOT_TASKS)}")
+    tokenizer_bot_task = _BOT_TASK_TO_TOKENIZER_TASK[resolved_bot_task]
     stop_token_ids = (
         _stop_token_ids_for_tokenizer_bot_task(tokenizer, tokenizer_bot_task, image_size=image_size)
         if tokenizer is not None
@@ -248,28 +238,11 @@ def resolve_bot_task(
     )
 
 
-def task_for_modality_and_bot_task(modality: str, bot_task: str | None = "auto") -> str:
-    """Return the canonical prompt task for an input/output modality."""
-    task = resolve_bot_task(bot_task, modality=modality).task
-    assert task is not None
-    return task
-
-
 def sys_type_for_task(task: str) -> str:
     """Return the default system prompt type for a canonical prompt task."""
     sys_type = resolve_bot_task(task=task).sys_type
     assert sys_type is not None
     return sys_type
-
-
-def bot_task_for_task(task: str) -> str:
-    """Return the HunyuanImage3 bot_task associated with a prompt task."""
-    return resolve_bot_task(task=task).bot_task
-
-
-def tokenizer_bot_task_for_bot_task(bot_task: str) -> str:
-    """Map the public HunyuanImage3 bot_task to tokenizer-internal task."""
-    return resolve_bot_task(bot_task).tokenizer_bot_task
 
 
 def _token_id(tokenizer, token: str) -> int:
@@ -284,34 +257,6 @@ def _eos_token_id(tokenizer) -> int:
     if token_id is not None:
         return int(token_id)
     return _token_id(tokenizer, "<|endoftext|>")
-
-
-def stop_token_ids_for_bot_task(
-    tokenizer,
-    bot_task: str,
-    image_size: int | str | None = None,
-) -> list[int]:
-    """Return AR stop token ids for a HunyuanImage3 bot_task.
-
-    Mirrors the official HunyuanImage-3.0 generation logic: `auto`
-    additionally stops on image-start markers, text/image tasks stop on
-    their structural end tokens, and all ids are resolved from the
-    tokenizer instead of being hard-coded in deploy YAML.
-    """
-    stop_token_ids = resolve_bot_task(bot_task, tokenizer=tokenizer, image_size=image_size).stop_token_ids
-    assert stop_token_ids is not None
-    return stop_token_ids
-
-
-def stop_token_ids_for_task(
-    tokenizer,
-    task: str,
-    image_size: int | str | None = None,
-) -> list[int]:
-    """Return AR stop token ids for a canonical prompt task."""
-    stop_token_ids = resolve_bot_task(task=task, tokenizer=tokenizer, image_size=image_size).stop_token_ids
-    assert stop_token_ids is not None
-    return stop_token_ids
 
 
 def apply_bot_task_to_sampling_params(
@@ -448,15 +393,10 @@ __all__ = [
     "available_tasks",
     "available_prompt_bot_tasks",
     "apply_bot_task_to_sampling_params",
-    "bot_task_for_task",
     "BOT_TASKS",
     "build_prompt",
     "build_prompt_tokens",
     "PROMPT_BOT_TASKS",
     "resolve_bot_task",
-    "stop_token_ids_for_bot_task",
-    "stop_token_ids_for_task",
     "sys_type_for_task",
-    "task_for_modality_and_bot_task",
-    "tokenizer_bot_task_for_bot_task",
 ]
