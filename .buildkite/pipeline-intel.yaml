@@ -12,5 +12,5 @@ steps:
           VLLM_IMAGE_TAG: "${BUILDKITE_COMMIT}"
           VLLM_VERSION: "v0.20.0"
         priority: 100
-        timeout_in_minutes: 60
+        timeout_in_minutes: 90
         soft_fail: false

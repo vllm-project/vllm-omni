@@ -40,7 +40,10 @@ _AR_PATCH_SIZE = 16
 MODEL_PATH = "bytedance-research/MammothModa2-Preview"
 T2I_STAGE_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
 
-_OMNI_RUNNER_PARAM = (MODEL_PATH, T2I_STAGE_CONFIG, {"trust_remote_code": True})
+# trust_remote_code=False: use AutoConfig/tokenizer registrations in vLLM-Omni. True loads
+# upstream configuration_mammothmoda2.py whose Mammothmoda2Config may omit `llm_config`
+# attrs and breaks DiT orchestration.
+_OMNI_RUNNER_PARAM = (MODEL_PATH, T2I_STAGE_CONFIG, {"trust_remote_code": False})
 
 # Golden pixel reference file.  Set UPDATE_GOLDEN=1 to regenerate.
 _GOLDEN_T2I_PATH = Path(__file__).parent / "fixtures" / "mammoth_moda2_t2i_golden.json"

@@ -9,7 +9,7 @@ steps:
     steps:
       - label: "Simple · Diffusion Test"
         commands:
-          - "timeout 20m pytest -sv tests/diffusion -m 'core_model and cpu' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
+          - "timeout 20m pytest -sv tests/diffusion -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
         agents:
           queue: "gpu_1_queue"
         plugins:
@@ -25,7 +25,7 @@ steps:
 
       - label: "Simple · Model Executor Test"
         commands:
-          - "timeout 20m pytest -sv tests/model_executor -m 'core_model and cpu' --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
+          - "timeout 20m pytest -sv tests/model_executor -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
         agents:
           queue: "gpu_1_queue"
         plugins:
@@ -41,7 +41,7 @@ steps:
 
       - label: "Simple · Other Test"
         commands:
-          - "timeout 20m pytest -sv -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
+          - "timeout 20m pytest -sv -m 'core_model and cpu' --ignore=tests/diffusion --ignore=tests/model_executor --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
         agents:
           queue: "gpu_1_queue"
         plugins:

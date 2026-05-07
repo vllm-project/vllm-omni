@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
@@ -244,6 +244,21 @@ class Mammothmoda2Config(PretrainedConfig):
         self.initializer_range = initializer_range
         self.tokenizer_class = "MammothUTokenizer"
         self.architectures = ["Mammothmoda2Model"]
+
+    @classmethod
+    def from_dict(cls, config_dict: dict[str, Any] | None = None, **kwargs: Any):  # type: ignore[misc,no-untyped-def]
+        cfg = super().from_dict(config_dict=config_dict, **kwargs)
+        # HF / trust_remote_code paths sometimes hydrate composition models without assigning
+        # nested sub-config attrs; DiT pipeline and multimodal proxies require `llm_config`.
+        if not hasattr(cfg, "llm_config") and isinstance(config_dict, dict):
+            lc_raw = config_dict.get("llm_config")
+            if isinstance(lc_raw, dict):
+                object.__setattr__(cfg, "llm_config", AutoConfig.for_model(**lc_raw))
+            elif lc_raw is None:
+                object.__setattr__(cfg, "llm_config", None)
+            else:
+                object.__setattr__(cfg, "llm_config", lc_raw)
+        return cfg
 
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
         return self.llm_config
