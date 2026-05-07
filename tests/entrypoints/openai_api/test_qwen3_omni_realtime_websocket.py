@@ -31,7 +31,8 @@ MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 
 # Synthetic input for realtime E2E (``generate_synthetic_audio``); distinct cache file per phrase.
 REALTIME_SYNTH_PHRASE_TEXT = (
-    "Translate into Chinese: Beijing is the Capital of China. It is the center of culture and politics")
+    "Translate into Chinese: Beijing is the Capital of China. It is the center of culture and politics"
+)
 
 # The new-schema CI overlay bakes in async_chunk: False and covers CUDA/ROCm/XPU
 # via its ``platforms:`` section, so one path serves all three.
