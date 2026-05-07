@@ -25,7 +25,6 @@ import pytest
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     apply_bot_task_to_sampling_params,
-    apply_task_to_sampling_params,
     available_prompt_bot_tasks,
     available_tasks,
     bot_task_for_task,
@@ -35,8 +34,6 @@ from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     stop_token_ids_for_task,
     sys_type_for_task,
     task_for_modality_and_bot_task,
-    task_for_modality_and_request_bot_task,
-    tokenizer_bot_task_for_task,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -142,24 +139,6 @@ def test_task_for_modality_and_bot_task_rejects_invalid_combinations():
         task_for_modality_and_bot_task("img2img", "vanilla")
 
 
-@pytest.mark.parametrize(
-    "modality,bot_task,expected_task",
-    [
-        ("text2img", "think", "t2i_think"),
-        ("text2img", "think_recaption", "t2i_think"),
-        ("text2img", "image", "t2i_vanilla"),
-        ("img2img", "recaption", "it2i_recaption"),
-        ("img2text", "auto", "i2t"),
-    ],
-)
-def test_task_for_modality_and_request_bot_task_accepts_legacy_and_unified_values(
-    modality: str,
-    bot_task: str,
-    expected_task: str,
-):
-    assert task_for_modality_and_request_bot_task(modality, bot_task) == expected_task
-
-
 def test_stop_token_ids_for_bot_task_are_resolved_from_tokenizer():
     tok = FakeTokenizer()
 
@@ -186,11 +165,6 @@ def test_sys_type_for_task_returns_prompt_preset_default():
     assert sys_type_for_task("t2i_vanilla") == "en_vanilla"
 
 
-def test_tokenizer_bot_task_for_task_returns_internal_task_name():
-    assert tokenizer_bot_task_for_task("t2i_think") == "think"
-    assert tokenizer_bot_task_for_task("t2i_vanilla") == "image"
-
-
 class FakeSamplingParams:
     def __init__(self, stop_token_ids: list[int] | None = None, max_tokens: int = 16) -> None:
         self.stop_token_ids = stop_token_ids
@@ -213,23 +187,6 @@ def test_apply_bot_task_to_sampling_params_updates_only_target_stage():
     assert updated[0].stop_token_ids == [6, 7, 5]
     assert updated[1] is stage1
     assert stage0.stop_token_ids == [6, 7, 5]
-
-
-def test_apply_task_to_sampling_params_updates_only_target_stage():
-    tok = FakeTokenizer()
-    stage0 = FakeSamplingParams(stop_token_ids=[999])
-    stage1 = FakeSamplingParams(stop_token_ids=[888])
-
-    updated = apply_task_to_sampling_params(
-        [stage0, stage1],
-        tok,
-        "i2t_think",
-        stage_index=0,
-    )
-
-    assert updated[0] is stage0
-    assert updated[0].stop_token_ids == [6, 7, 5]
-    assert updated[1] is stage1
 
 
 @pytest.mark.parametrize(
