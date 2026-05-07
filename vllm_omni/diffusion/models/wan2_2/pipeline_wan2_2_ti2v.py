@@ -195,10 +195,13 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
             model, subfolder="vae", torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
 
+        # Build quantization config
+        quant_config = self._build_quant_config()
+
         # Single transformer (TI2V uses dense 5B model, not MoE)
         # Load config from model to get correct dimensions
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(transformer_config)
+        self.transformer = create_transformer_from_config(transformer_config, quant_config)
 
         self._sample_solver = "unipc"
         self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
@@ -214,6 +217,12 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         self._guidance_scale = None
         self._num_timesteps = None
         self._current_timestep = None
+
+    def _build_quant_config(self):
+        """Build quantization config from OmniDiffusionConfig."""
+        from vllm_omni.quantization import build_quant_config
+
+        return build_quant_config(self.od_config.quantization_config)
 
     @property
     def guidance_scale(self):

@@ -55,11 +55,19 @@ def _build_inc(**kw: Any) -> QuantizationConfig:
     return OmniINCConfig(**filtered)
 
 
+def _build_mxfp4(**kw: Any) -> QuantizationConfig:
+    """Lazy import for MXFP4 diffusion config (W4A16, Marlin kernel)."""
+    from .mxfp4_config import DiffusionMXFP4Config
+
+    return DiffusionMXFP4Config(**kw)
+
+
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "gguf": _build_gguf,
     "int8": _build_int8,
     "inc": _build_inc,
     "auto-round": _build_inc,
+    "mxfp4": _build_mxfp4,
 }
 
 SUPPORTED_QUANTIZATION_METHODS: list[str] = list(dict.fromkeys(QUANTIZATION_METHODS + list(_OVERRIDES.keys())))

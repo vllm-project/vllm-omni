@@ -219,13 +219,16 @@ class Wan22I2VPipeline(
             model, subfolder="vae", torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
 
+        # Build quantization config
+        quant_config = self._build_quant_config()
+
         # Transformers (weights loaded via load_weights)
         # Load config from model directory or HF Hub to get correct in_channels for I2V models
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(transformer_config)
+        self.transformer = create_transformer_from_config(transformer_config, quant_config)
         if self.has_transformer_2:
             transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            self.transformer_2 = create_transformer_from_config(transformer_2_config)
+            self.transformer_2 = create_transformer_from_config(transformer_2_config, quant_config)
         else:
             self.transformer_2 = None
 
@@ -250,6 +253,12 @@ class Wan22I2VPipeline(
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
+
+    def _build_quant_config(self):
+        """Build quantization config from OmniDiffusionConfig."""
+        from vllm_omni.quantization import build_quant_config
+
+        return build_quant_config(self.od_config.quantization_config)
 
     @property
     def guidance_scale(self):
