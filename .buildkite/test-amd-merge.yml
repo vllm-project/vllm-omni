@@ -79,6 +79,14 @@ steps:
   commands:
     - pytest -s -v tests/diffusion/distributed/test_zimage_parallelism.py
 
+- label: "Diffusion Model Test"
+  agent_pool: mi325_1
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: Blocking
+  commands:
+    - timeout 30m pytest -s -v tests/e2e/offline_inference/test_z_image.py
+
 - label: "Diffusion GPU Worker Test"
   agent_pool: mi325_2
   depends_on: amd-build

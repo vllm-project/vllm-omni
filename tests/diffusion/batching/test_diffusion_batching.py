@@ -381,7 +381,7 @@ async def main(model: str, num_prompts: int, mode: str, batch_size: int = 1) -> 
 # ==================================================================
 
 
-@pytest.mark.full_model
+@pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
 @pytest.mark.parametrize("model_name", models)
@@ -412,7 +412,7 @@ def test_diffusion_batching_sync_sequential(model_name: str):
         raise
 
 
-@pytest.mark.full_model
+@pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
 @pytest.mark.parametrize("model_name", models)
@@ -452,7 +452,7 @@ def test_diffusion_batching_sync_multi_prompt(model_name: str):
         raise
 
 
-@pytest.mark.full_model
+@pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
 @pytest.mark.parametrize("model_name", models)
@@ -491,7 +491,7 @@ def test_diffusion_batching_async_concurrent(model_name: str):
     asyncio.run(_inner())
 
 
-@pytest.mark.full_model
+@pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
 @pytest.mark.parametrize("model_name", models)
@@ -536,7 +536,7 @@ def test_diffusion_batching_async_explicit_batch(model_name: str):
     asyncio.run(_inner())
 
 
-@pytest.mark.full_model
+@pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
 @pytest.mark.parametrize("model_name", models)
@@ -568,7 +568,7 @@ def test_diffusion_batching_num_outputs(model_name: str):
         raise
 
 
-@pytest.mark.full_model
+@pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})
 @pytest.mark.parametrize("model_name", models)

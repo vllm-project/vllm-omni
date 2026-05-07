@@ -106,6 +106,22 @@ steps:
               volumes:
                 - "/fsx/hf_cache:/fsx/hf_cache"
 
+      - label: "Diffusion · Batch Test"
+        commands:
+          - timeout 15m pytest -sv tests/diffusion/batching -m 'core_model and cuda' --run-level "core_model"
+        agents:
+          queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
       - label: "Diffusion · Distributed Test"
         commands:
           - timeout 20m pytest -sv tests/diffusion/distributed -m 'core_model and cuda' --run-level "core_model"
