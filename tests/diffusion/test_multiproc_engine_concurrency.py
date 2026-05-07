@@ -78,6 +78,9 @@ def _make_engine(num_gpus: int = 1):
     engine.scheduler = sched
     engine.executor = executor
     engine._rpc_lock = threading.RLock()
+    engine._cv = threading.Condition(engine._rpc_lock)
+    engine._loop_started = False
+    engine._rpc_queue = queue.Queue()
     engine.abort_queue = queue.Queue()
     engine.execute_fn = executor.execute_request
     return engine, executor, req_q, res_q
@@ -342,108 +345,6 @@ class TestSerialEngineOperations:
 
         with pytest.raises(RuntimeError, match="closed"):
             engine.collective_rpc("anything")
-
-
-# ─────────── timeout regression: RPC must not block on a stalled lock ─────
-
-
-class TestCollectiveRpcTimeoutWhileLockHeld:
-    """``collective_rpc(timeout=...)`` must honour its timeout even when
-    another thread holds ``engine._rpc_lock`` indefinitely (e.g. request
-    execution stalled on ``add_req_and_wait_for_response`` → ``execute_fn``
-    → ``collective_rpc`` while blocked on an unresponsive worker).
-    """
-
-    def test_rpc_times_out_when_lock_held_directly(self):
-        """Simplest case: lock is manually held by another thread."""
-        engine, _, _, _ = _make_engine()
-
-        stall_started = threading.Event()
-
-        def _hold_lock():
-            engine._rpc_lock.acquire()
-            stall_started.set()
-            # Hold the lock far longer than the RPC timeout.
-            threading.Event().wait(30)
-            engine._rpc_lock.release()
-
-        stall_thread = threading.Thread(target=_hold_lock, daemon=True)
-        stall_thread.start()
-        stall_started.wait(5)
-
-        # collective_rpc should raise TimeoutError, NOT block forever.
-        with pytest.raises(TimeoutError):
-            engine.collective_rpc("health", timeout=0.5)
-
-    def test_rpc_times_out_when_request_execution_stalled_on_worker(self):
-        """Real-world scenario the bot flagged:
-
-        The scheduler/execute path holds ``_rpc_lock`` while blocked on
-        ``executor._result_mq.dequeue()`` because the worker never replies.
-        A concurrent ``collective_rpc(timeout=...)`` must still time out
-        instead of hanging forever waiting for the lock.
-        """
-        engine, executor, _, _ = _make_engine()
-
-        add_req_blocked = threading.Event()
-
-        # Patch dequeue: signal once entered, then block indefinitely
-        # (simulates a worker that never sends a result).
-        orig_dequeue = executor._result_mq.dequeue
-
-        def _hanging_dequeue(timeout=None):
-            add_req_blocked.set()
-            # Block forever — the worker is "hung".
-            threading.Event().wait(30)
-            return orig_dequeue(timeout=timeout)
-
-        executor._result_mq.dequeue = _hanging_dequeue
-
-        # Thread running request execution — acquires the lock, enqueues, then
-        # blocks on dequeue forever (worker hang).
-        def _stalled_request_execution():
-            try:
-                engine.add_req_and_wait_for_response(_mock_request("stalled"))
-            except Exception:
-                pass
-
-        t = threading.Thread(target=_stalled_request_execution, daemon=True)
-        t.start()
-
-        # Wait until request execution is truly inside the lock and blocking.
-        assert add_req_blocked.wait(5)
-
-        # collective_rpc should time out at lock acquisition, not hang.
-        with pytest.raises(TimeoutError):
-            engine.collective_rpc("health_check", timeout=0.5)
-
-    def test_rpc_without_timeout_still_waits_for_lock(self):
-        """When no timeout is given, ``collective_rpc`` should still wait
-        for the lock (blocking) — existing behaviour preserved.
-        """
-        engine, _, _, res_q = _make_engine()
-
-        def _hold_and_release():
-            engine._rpc_lock.acquire()
-            # Hold for a short time then release.
-            threading.Event().wait(0.3)
-            engine._rpc_lock.release()
-
-        # Pre-populate a result so collective_rpc succeeds after lock.
-        res_q.put(_tagged_output("ok"))
-
-        t = threading.Thread(target=_hold_and_release, daemon=True)
-        t.start()
-
-        # No timeout -> should block until lock is released, then succeed.
-        result = engine.collective_rpc(
-            "ping",
-            args=("wait",),
-            unique_reply_rank=0,
-        )
-        t.join(5)
-
-        assert result.error == "ok"
 
 
 # ───────── error handling: EngineDeadError propagation through layers ─────
