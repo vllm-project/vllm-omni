@@ -27,13 +27,12 @@ from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     apply_bot_task_to_sampling_params,
     available_prompt_bot_tasks,
     available_tasks,
-    bot_task_for_task,
     build_prompt,
     build_prompt_tokens,
+    resolve_bot_task,
     stop_token_ids_for_bot_task,
     stop_token_ids_for_task,
     sys_type_for_task,
-    task_for_modality_and_bot_task,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -104,8 +103,10 @@ def test_available_tasks_covers_all_modalities():
         ("t2i_vanilla", "image"),
     ],
 )
-def test_bot_task_for_task_matches_prompt_presets(task: str, expected_bot_task: str):
-    assert bot_task_for_task(task) == expected_bot_task
+def test_resolve_bot_task_matches_prompt_presets(task: str, expected_bot_task: str):
+    resolution = resolve_bot_task(task=task)
+    assert resolution.task == task
+    assert resolution.bot_task == expected_bot_task
 
 
 @pytest.mark.parametrize(
@@ -126,17 +127,28 @@ def test_task_for_modality_and_bot_task_composes_prompt_task(
     bot_task: str,
     expected_task: str,
 ):
-    assert task_for_modality_and_bot_task(modality, bot_task) == expected_task
+    assert resolve_bot_task(bot_task, modality=modality).task == expected_task
 
 
-def test_task_for_modality_and_bot_task_rejects_invalid_combinations():
+def test_resolve_bot_task_rejects_invalid_combinations():
     assert available_prompt_bot_tasks() == ["auto", "none", "recaption", "think", "vanilla"]
 
     with pytest.raises(ValueError, match="not supported"):
-        task_for_modality_and_bot_task("img2text", "recaption")
+        resolve_bot_task("recaption", modality="img2text")
 
     with pytest.raises(ValueError, match="not supported"):
-        task_for_modality_and_bot_task("img2img", "vanilla")
+        resolve_bot_task("vanilla", modality="img2img")
+
+
+def test_resolve_bot_task_maps_tokenizer_task_and_stop_ids():
+    tok = FakeTokenizer()
+
+    resolution = resolve_bot_task("think_recaption", tokenizer=tok)
+
+    assert resolution.task is None
+    assert resolution.bot_task == "think_recaption"
+    assert resolution.tokenizer_bot_task == "think"
+    assert resolution.stop_token_ids == [6, 7, 5]
 
 
 def test_stop_token_ids_for_bot_task_are_resolved_from_tokenizer():
@@ -359,11 +371,9 @@ def test_end2end_routes_through_shared_prompt_utils():
             imported_from_prompt_utils.update(alias.name for alias in node.names)
     expected_imports = {
         "available_prompt_bot_tasks",
-        "bot_task_for_task",
         "build_prompt_tokens",
-        "stop_token_ids_for_task",
+        "resolve_bot_task",
         "sys_type_for_task",
-        "task_for_modality_and_bot_task",
     }
     assert expected_imports <= imported_from_prompt_utils, (
         "end2end.py must import the HunyuanImage3 prompt and stop-token helpers from "

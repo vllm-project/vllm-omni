@@ -19,11 +19,9 @@ from pathlib import Path
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     available_prompt_bot_tasks,
-    bot_task_for_task,
     build_prompt_tokens,
-    stop_token_ids_for_task,
+    resolve_bot_task,
     sys_type_for_task,
-    task_for_modality_and_bot_task,
 )
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniPromptType
@@ -124,8 +122,10 @@ def main():
     os.makedirs(args.output, exist_ok=True)
 
     # Determine task for prompt formatting from modality + bot behavior.
-    task = task_for_modality_and_bot_task(args.modality, args.bot_task)
-    bot_task = bot_task_for_task(task)
+    bot_task_resolution = resolve_bot_task(args.bot_task, modality=args.modality)
+    task = bot_task_resolution.task
+    assert task is not None
+    bot_task = bot_task_resolution.bot_task
 
     if args.deploy_config is not None and args.stage_configs_path is not None:
         raise ValueError("--deploy-config and --stage-configs-path are mutually exclusive.")
@@ -209,7 +209,8 @@ def main():
     # Override diffusion params if applicable
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    ar_stop_token_ids = stop_token_ids_for_task(tokenizer, task)
+    ar_stop_token_ids = resolve_bot_task(task=task, tokenizer=tokenizer).stop_token_ids
+    assert ar_stop_token_ids is not None
     for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
             sp.num_inference_steps = args.steps
