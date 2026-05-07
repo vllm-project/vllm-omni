@@ -25,11 +25,15 @@ import pytest
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     apply_bot_task_to_sampling_params,
+    available_prompt_bot_tasks,
     available_tasks,
     bot_task_for_task,
     build_prompt,
     build_prompt_tokens,
     stop_token_ids_for_bot_task,
+    stop_token_ids_for_task,
+    sys_type_for_task,
+    task_for_modality_and_bot_task,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -75,7 +79,9 @@ def test_available_tasks_covers_all_modalities():
     tasks = set(available_tasks())
     assert tasks >= {
         "t2t",
+        "t2t_think",
         "i2t",
+        "i2t_think",
         "it2i_think",
         "it2i_recaption",
         "t2i_think",
@@ -88,7 +94,9 @@ def test_available_tasks_covers_all_modalities():
     "task,expected_bot_task",
     [
         ("t2t", "auto"),
+        ("t2t_think", "think_recaption"),
         ("i2t", "auto"),
+        ("i2t_think", "think_recaption"),
         ("it2i_think", "think_recaption"),
         ("it2i_recaption", "recaption"),
         ("t2i_think", "think_recaption"),
@@ -98,6 +106,37 @@ def test_available_tasks_covers_all_modalities():
 )
 def test_bot_task_for_task_matches_prompt_presets(task: str, expected_bot_task: str):
     assert bot_task_for_task(task) == expected_bot_task
+
+
+@pytest.mark.parametrize(
+    "modality,bot_task,expected_task",
+    [
+        ("text2text", "auto", "t2t"),
+        ("img2text", "auto", "i2t"),
+        ("text2img", "auto", "t2i_think"),
+        ("img2img", "auto", "it2i_think"),
+        ("i2t", "think", "i2t_think"),
+        ("ti2i", "recaption", "it2i_recaption"),
+        ("t2i", "vanilla", "t2i_vanilla"),
+        ("text2text", "none", "t2t"),
+    ],
+)
+def test_task_for_modality_and_bot_task_composes_prompt_task(
+    modality: str,
+    bot_task: str,
+    expected_task: str,
+):
+    assert task_for_modality_and_bot_task(modality, bot_task) == expected_task
+
+
+def test_task_for_modality_and_bot_task_rejects_invalid_combinations():
+    assert available_prompt_bot_tasks() == ["auto", "none", "recaption", "think", "vanilla"]
+
+    with pytest.raises(ValueError, match="not supported"):
+        task_for_modality_and_bot_task("img2text", "recaption")
+
+    with pytest.raises(ValueError, match="not supported"):
+        task_for_modality_and_bot_task("img2img", "vanilla")
 
 
 def test_stop_token_ids_for_bot_task_are_resolved_from_tokenizer():
@@ -111,6 +150,19 @@ def test_stop_token_ids_for_bot_task_are_resolved_from_tokenizer():
         5,
         *range(1000, 1033),
     ]
+
+
+def test_stop_token_ids_for_task_are_resolved_from_prompt_task():
+    tok = FakeTokenizer()
+
+    assert stop_token_ids_for_task(tok, "i2t") == [5, 8]
+    assert stop_token_ids_for_task(tok, "i2t_think") == [6, 7, 5]
+    assert stop_token_ids_for_task(tok, "t2i_vanilla") == [5]
+
+
+def test_sys_type_for_task_returns_prompt_preset_default():
+    assert sys_type_for_task("i2t_think") == "en_unified"
+    assert sys_type_for_task("t2i_vanilla") == "en_vanilla"
 
 
 class FakeSamplingParams:
@@ -141,7 +193,9 @@ def test_apply_bot_task_to_sampling_params_updates_only_target_stage():
     "task",
     [
         "t2t",
+        "t2t_think",
         "i2t",
+        "i2t_think",
         "it2i_think",
         "it2i_recaption",
         "t2i_think",
@@ -170,7 +224,7 @@ def test_build_prompt_string_structure_chat_template(task: str):
     # documentation, so substring index() catches the wrong occurrence -- use
     # endswith() which directly captures "trigger is at the tail" (the Part A
     # fix: trigger goes AFTER `Assistant: `, not before user_prompt).
-    if task in ("it2i_think", "t2i_think"):
+    if task in ("t2t_think", "i2t_think", "it2i_think", "t2i_think"):
         assert s.endswith("Assistant: <think>"), (
             f"Trigger <think> must be appended right after `Assistant: ` (Part A fix). Got tail: ...{s[-40:]!r}"
         )
@@ -238,7 +292,14 @@ def test_build_prompt_tokens_no_image_for_text_only_tasks():
 
 @pytest.mark.parametrize(
     "task,trigger_id",
-    [("it2i_think", 3), ("t2i_think", 3), ("it2i_recaption", 4), ("t2i_recaption", 4)],
+    [
+        ("t2t_think", 3),
+        ("i2t_think", 3),
+        ("it2i_think", 3),
+        ("t2i_think", 3),
+        ("it2i_recaption", 4),
+        ("t2i_recaption", 4),
+    ],
 )
 def test_build_prompt_tokens_trigger_is_last_token(task: str, trigger_id: int):
     """Trigger tag id must be the LAST token (after `Assistant: ` segment)."""
@@ -297,9 +358,12 @@ def test_end2end_routes_through_shared_prompt_utils():
         if isinstance(node, ast.ImportFrom) and node.module and node.module.endswith("hunyuan_image3.prompt_utils"):
             imported_from_prompt_utils.update(alias.name for alias in node.names)
     expected_imports = {
+        "available_prompt_bot_tasks",
         "bot_task_for_task",
         "build_prompt_tokens",
-        "stop_token_ids_for_bot_task",
+        "stop_token_ids_for_task",
+        "sys_type_for_task",
+        "task_for_modality_and_bot_task",
     }
     assert expected_imports <= imported_from_prompt_utils, (
         "end2end.py must import the HunyuanImage3 prompt and stop-token helpers from "

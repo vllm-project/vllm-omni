@@ -110,7 +110,7 @@ python examples/offline_inference/hunyuan_image3/end2end.py \
 | `--steps` | Number of diffusion inference steps for image generation. |
 | `--guidance-scale` | Classifier-free guidance scale for image generation. |
 | `--height`, `--width` | Output image size for `text2img`. |
-| `--bot-task` | Override the prompt task, for example `t2i_think` or `t2i_recaption`. |
+| `--bot-task` | Prompt behavior. `auto` selects the default from `--modality`; `think` adds `<think>`; `recaption` adds `<recaption>`; `vanilla` uses the text-to-image pretrain template. |
 | `--sys-type` | Override the system prompt type, for example `en_unified` or `en_vanilla`. |
 | `--vae-use-tiling` | Enable VAE tiling for memory reduction. |
 
@@ -137,6 +137,9 @@ Assistant: {trigger_tag?}
 - Trigger tags: `<think>` for CoT and `<recaption>` for recaptioning, placed after `Assistant: `.
 - System prompt: Auto-selected based on task.
 - `t2i_vanilla` is the only task that uses the bare pretrain template without chat structure.
+- The example composes the internal prompt task from `--modality` and `--bot-task`
+  before calling `prompt_utils`; for example, `img2text + think` becomes
+  `i2t_think` for prompt and stop-token lookup.
 
 The shared `vllm_omni.diffusion.models.hunyuan_image3.prompt_utils.build_prompt_tokens()`
 helper handles segment-by-segment tokenization and matches HF `apply_chat_template`.

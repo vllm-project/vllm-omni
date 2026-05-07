@@ -18,32 +18,15 @@ import os
 from pathlib import Path
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+    available_prompt_bot_tasks,
     bot_task_for_task,
     build_prompt_tokens,
-    stop_token_ids_for_bot_task,
+    stop_token_ids_for_task,
+    sys_type_for_task,
+    task_for_modality_and_bot_task,
 )
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniPromptType
-
-# task -> (sys_type, bot_task, trigger_tag)
-_TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
-    "t2t": ("en_unified", None, None),
-    "i2t": ("en_unified", None, None),
-    "it2i_think": ("en_unified", "think", "<think>"),
-    "it2i_recaption": ("en_unified", "recaption", "<recaption>"),
-    "t2i_think": ("en_unified", "think", "<think>"),
-    "t2i_recaption": ("en_unified", "recaption", "<recaption>"),
-    "t2i_vanilla": ("en_vanilla", "image", None),
-}
-
-# Modality → prompt_utils task mapping
-_MODALITY_TASK_MAP = {
-    "text2img": "t2i_think",
-    "img2img": "it2i_think",
-    "img2text": "i2t",
-    "text2text": "t2t",
-}
-
 
 # Default deploy configs are absolute so this example works from any cwd.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -108,8 +91,13 @@ def parse_args():
     parser.add_argument(
         "--bot-task",
         type=str,
-        default=None,
-        help="Override prompt task (e.g. it2i_think, t2i_recaption). Default: auto from modality.",
+        default="auto",
+        choices=available_prompt_bot_tasks(),
+        help=(
+            "Prompt behavior. 'auto' selects the default for the modality; "
+            "'think' adds <think>; 'recaption' adds <recaption>; "
+            "'vanilla' uses the t2i pretrain template."
+        ),
     )
     parser.add_argument(
         "--sys-type",
@@ -135,8 +123,8 @@ def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
 
-    # Determine task for prompt formatting
-    task = args.bot_task or _MODALITY_TASK_MAP[args.modality]
+    # Determine task for prompt formatting from modality + bot behavior.
+    task = task_for_modality_and_bot_task(args.modality, args.bot_task)
     bot_task = bot_task_for_task(task)
 
     if args.deploy_config is not None and args.stage_configs_path is not None:
@@ -188,8 +176,7 @@ def main():
     formatted_prompts: list[OmniPromptType] = []
     for p in prompts:
         token_ids = build_prompt_tokens(p, tokenizer, task=task, sys_type=args.sys_type)
-        preset_sys_type, _, _ = _TASK_PRESETS[task]
-        effective_sys_type = args.sys_type or preset_sys_type
+        effective_sys_type = args.sys_type or sys_type_for_task(task)
 
         # `prompt_token_ids` drives the AR stage (matches HF byte-for-byte).
         # `prompt` and `use_system_prompt` are forwarded by ar2diffusion to
@@ -222,7 +209,7 @@ def main():
     # Override diffusion params if applicable
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    ar_stop_token_ids = stop_token_ids_for_bot_task(tokenizer, bot_task)
+    ar_stop_token_ids = stop_token_ids_for_task(tokenizer, task)
     for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
             sp.num_inference_steps = args.steps
@@ -241,6 +228,7 @@ def main():
     print("HunyuanImage-3.0 Generation Configuration:")
     print(f"  Model: {args.model}")
     print(f"  Modality: {args.modality}")
+    print(f"  Prompt task: {task}")
     print(f"  Bot task: {bot_task}")
     if deploy_config is not None:
         print(f"  Deploy config: {deploy_config}")
