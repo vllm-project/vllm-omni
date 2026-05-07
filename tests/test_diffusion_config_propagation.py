@@ -6,14 +6,18 @@ Regression tests for https://github.com/vllm-project/vllm-omni/issues/1862
 """
 
 from collections.abc import Mapping
+from types import SimpleNamespace
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from vllm_omni.config.stage_config import StageConfigFactory
 from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
     OmniDiffusionConfig,
+    _nested_parallel_config_to_plain_dict,
+    build_parallel_config_dict_from_engine_args,
 )
 from vllm_omni.diffusion.model_metadata import QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
 
@@ -68,6 +72,15 @@ class TestParallelConfigPropagation:
         assert od.parallel_config.cfg_parallel_size == 2
         assert od.parallel_config.world_size == 2
 
+    def test_top_level_cfg_parallel_into_engine_args_dict(self):
+        """Multi-stage paths pass ``cfg_parallel_size`` at engine_args top-level."""
+        engine_args = {"cfg_parallel_size": 2}
+        merged = build_parallel_config_dict_from_engine_args(engine_args)
+        assert merged.get("cfg_parallel_size") == 2
+        dpc = DiffusionParallelConfig.from_dict(merged)
+        assert dpc.cfg_parallel_size == 2
+        assert dpc.world_size == 2
+
     def test_no_parallel_config_defaults_to_tp1(self):
         od = _roundtrip_diffusion_config(model="x")
         assert od.parallel_config.tensor_parallel_size == 1
@@ -77,6 +90,97 @@ class TestParallelConfigPropagation:
         pc = DiffusionParallelConfig(tensor_parallel_size=2)
         od = _roundtrip_diffusion_config(model="x", parallel_config=pc)
         assert od.num_gpus == 2
+
+
+class TestParallelConfigHelpers:
+    """Cover parallel merge helpers defined in ``vllm_omni/diffusion/data.py`` (CPU-only).
+
+    These functions merge nested ``engine_args.parallel_config`` with overlapping top-level
+    diffusion parallel keys before ``OmniDiffusionConfig.from_kwargs`` builds
+    ``DiffusionParallelConfig``. **Multi-stage** flows are the sharp edge: YAML/OmegaConf often supplies
+    a ``parallel_config`` subtree while CLI or stage merges add the same fields at ``engine_args`` top
+    level—we assert coercion, YAML-null stripping, and nested-vs-top-level precedence.
+
+    Symbols: ``_nested_parallel_config_to_plain_dict``, ``build_parallel_config_dict_from_engine_args``
+    """
+
+    def test_nested_parallel_config_dictconfig_to_plain_dict(self):
+        """OmegaConf DictConfig → plain dict (deploy/YAML merged engine_args)."""
+        cfg = OmegaConf.create({"tensor_parallel_size": 2, "pipeline_parallel_size": 1})
+        out = _nested_parallel_config_to_plain_dict(cfg)
+        assert isinstance(out, dict)
+        assert type(out) is dict  # plain dict, not OmegaConf container
+        assert out["tensor_parallel_size"] == 2
+        assert out["pipeline_parallel_size"] == 1
+
+    def test_nested_parallel_config_dataclass_like_asdict(self):
+        pc = DiffusionParallelConfig(tensor_parallel_size=4)
+        out = _nested_parallel_config_to_plain_dict(pc)
+        assert isinstance(out, dict)
+        assert out["tensor_parallel_size"] == 4
+
+    def test_nested_parallel_config_simple_namespace(self):
+        ns = SimpleNamespace(tensor_parallel_size=2, cfg_parallel_size=1)
+        out = _nested_parallel_config_to_plain_dict(ns)
+        assert out["tensor_parallel_size"] == 2
+        assert out["cfg_parallel_size"] == 1
+
+    def test_build_merge_top_level_when_missing_nested(self):
+        """Top-level parallel CLI knobs fill absent keys inside merged parallel dict."""
+        merged = build_parallel_config_dict_from_engine_args(
+            {
+                "parallel_config": {},
+                "cfg_parallel_size": 2,
+                "tensor_parallel_size": 2,
+            }
+        )
+        assert merged["cfg_parallel_size"] == 2
+        assert merged["tensor_parallel_size"] == 2
+
+    @pytest.mark.parametrize(
+        "nested_parallel",
+        [
+            pytest.param({"cfg_parallel_size": 1, "tensor_parallel_size": 1}, id="plain_dict"),
+            pytest.param(OmegaConf.create({"cfg_parallel_size": 1, "tensor_parallel_size": 1}), id="dictconfig"),
+        ],
+    )
+    def test_build_nested_yaml_wins_over_top_level_when_key_present(self, nested_parallel):
+        """Nested deploy subtree wins for keys it defines; CLI only fills absent slots."""
+        merged = build_parallel_config_dict_from_engine_args(
+            {
+                "parallel_config": nested_parallel,
+                "cfg_parallel_size": 2,
+                "tensor_parallel_size": 4,
+            }
+        )
+        assert merged["cfg_parallel_size"] == 1
+        assert merged["tensor_parallel_size"] == 1
+
+    @pytest.mark.parametrize(
+        ("field", "nested", "override", "expect"),
+        [
+            ("tensor_parallel_size", {"tensor_parallel_size": None}, 2, 2),
+            ("cfg_parallel_size", {"cfg_parallel_size": None}, 2, 2),
+        ],
+    )
+    def test_build_strip_none_so_top_level_applies(self, field, nested, override, expect):
+        """YAML null for a declared parallel field drops the key so top-level knobs can populate it."""
+        engine_args = {"parallel_config": nested, field: override}
+        merged = build_parallel_config_dict_from_engine_args(engine_args)
+        assert merged[field] == expect
+
+    def test_build_dictconfig_nested_with_null_placeholder_plus_top_level(self):
+        """Nested DictConfig with YAML nulls: strip Nones then apply top-level overrides."""
+        nested = OmegaConf.create({"tensor_parallel_size": None, "cfg_parallel_size": None})
+        merged = build_parallel_config_dict_from_engine_args(
+            {
+                "parallel_config": nested,
+                "tensor_parallel_size": 2,
+                "cfg_parallel_size": 2,
+            }
+        )
+        assert merged["tensor_parallel_size"] == 2
+        assert merged["cfg_parallel_size"] == 2
 
 
 class TestCreateDefaultDiffusion:

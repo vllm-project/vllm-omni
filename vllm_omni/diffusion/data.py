@@ -231,15 +231,13 @@ def build_parallel_config_dict_from_engine_args(engine_args: Mapping[str, Any]) 
         if k in _DIFFUSION_PARALLEL_FIELD_NAMES and par[k] is None:
             del par[k]
     for key in _DIFFUSION_PARALLEL_FIELD_NAMES:
-        val = engine_args.get(key)
+        val = engine_args.get(key)  # top-level field value
+
+        # Only apply top-level fields if it doesn't exist in parallel_config 
+        # This also means the YAML file's config will win unless with --stage-overrides
         if val is not None and key not in par:
             par[key] = val
     return par
-
-
-def diffusion_parallel_config_from_engine_args(engine_args: Mapping[str, Any]) -> DiffusionParallelConfig:
-    """Validated ``DiffusionParallelConfig`` from ``engine_args`` (dict or OmegaConf-backed)."""
-    return DiffusionParallelConfig.from_dict(build_parallel_config_dict_from_engine_args(engine_args))
 
 
 @dataclass
