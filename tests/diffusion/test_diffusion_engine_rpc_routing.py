@@ -409,8 +409,7 @@ def test_collective_rpc_before_loop_starts_serializes_concurrent_callers():
     for t in threads:
         t.join()
 
-    assert engine.executor.max_concurrent == 1, \
-        "Pre-loop collective_rpc must serialize concurrent callers"
+    assert engine.executor.max_concurrent == 1, "Pre-loop collective_rpc must serialize concurrent callers"
     for i, r in enumerate(results):
         assert r is not None and r.error == f"rpc_result_for_x{i}"
 
