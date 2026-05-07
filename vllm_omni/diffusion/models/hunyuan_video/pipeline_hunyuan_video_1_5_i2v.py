@@ -153,7 +153,9 @@ class HunyuanVideo15I2VPipeline(
             self.scheduler._shift = od_config.flow_shift
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, HunyuanVideo15Transformer3DModel)
-        self.transformer = HunyuanVideo15Transformer3DModel(od_config=od_config, **transformer_kwargs)
+        self.transformer = HunyuanVideo15Transformer3DModel(
+            od_config=od_config, quant_config=od_config.quantization_config, **transformer_kwargs
+        )
 
         self.use_meanflow = getattr(od_config.tf_model_config, "use_meanflow", False)
 

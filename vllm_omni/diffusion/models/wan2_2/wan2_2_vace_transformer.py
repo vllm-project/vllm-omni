@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -20,6 +20,9 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
     WanTransformerBlock,
 )
 
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
 
 class VaceWanTransformerBlock(WanTransformerBlock):
     """VACE variant of WanTransformerBlock with proj_in/proj_out for skip connections."""
@@ -33,8 +36,19 @@ class VaceWanTransformerBlock(WanTransformerBlock):
         added_kv_proj_dim: int | None = None,
         cross_attn_norm: bool = False,
         block_id: int = 0,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
-        super().__init__(dim, ffn_dim, num_heads, eps, added_kv_proj_dim, cross_attn_norm)
+        super().__init__(
+            dim,
+            ffn_dim,
+            num_heads,
+            eps,
+            added_kv_proj_dim,
+            cross_attn_norm,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
         self.proj_in = nn.Linear(dim, dim) if block_id == 0 else None
         self.proj_out = nn.Linear(dim, dim)
 
@@ -83,9 +97,10 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
         *,
         vace_layers: list[int] | None = None,
         vace_in_channels: int | None = None,
+        quant_config: QuantizationConfig | None = None,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        super().__init__(quant_config=quant_config, **kwargs)
 
         self.vace_blocks = None
         self.vace_patch_embedding = None
@@ -118,6 +133,8 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
                         self.config.added_kv_proj_dim,
                         self.config.cross_attn_norm,
                         block_id=i,
+                        quant_config=quant_config,
+                        prefix=f"vace_blocks.{i}",
                     )
                     for i in range(len(vace_layers))
                 ]

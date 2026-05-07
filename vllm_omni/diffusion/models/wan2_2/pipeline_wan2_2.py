@@ -117,9 +117,11 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     return {}
 
 
-def create_transformer_from_config(config: dict) -> WanTransformer3DModel:
+def create_transformer_from_config(config: dict, quant_config=None) -> WanTransformer3DModel:
     """Create WanTransformer3DModel from config dict."""
     kwargs = {}
+    if quant_config is not None:
+        kwargs["quant_config"] = quant_config
 
     if "patch_size" in config:
         kwargs["patch_size"] = tuple(config["patch_size"])
@@ -371,7 +373,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
 
     def _create_transformer(self, config: dict) -> WanTransformer3DModel:
         """Create a transformer from a config dict. Subclasses may override."""
-        return create_transformer_from_config(config)
+        return create_transformer_from_config(config, quant_config=self.od_config.quantization_config)
 
     @property
     def guidance_scale(self):

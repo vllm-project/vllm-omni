@@ -198,7 +198,9 @@ class Wan22TI2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin, Progress
         # Single transformer (TI2V uses dense 5B model, not MoE)
         # Load config from model to get correct dimensions
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(transformer_config)
+        self.transformer = create_transformer_from_config(
+            transformer_config, quant_config=od_config.quantization_config
+        )
 
         self._sample_solver = "unipc"
         self._flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0
