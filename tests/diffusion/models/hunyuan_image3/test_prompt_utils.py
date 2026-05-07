@@ -24,9 +24,12 @@ import pathlib
 import pytest
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+    apply_bot_task_to_sampling_params,
     available_tasks,
+    bot_task_for_task,
     build_prompt,
     build_prompt_tokens,
+    stop_token_ids_for_bot_task,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -49,10 +52,16 @@ class FakeTokenizer:
         "<img>": 2,
         "<think>": 3,
         "<recaption>": 4,
+        "<|endoftext|>": 5,
+        "</recaption>": 6,
+        "</answer>": 7,
+        "<boi>": 8,
+        **{f"<img_ratio_{i}>": 1000 + i for i in range(33)},
     }
 
     def __init__(self) -> None:
         self.encode_calls: list[str] = []
+        self.eos_token_id = self.SPECIAL["<|endoftext|>"]
 
     def convert_tokens_to_ids(self, tok: str) -> int:
         return self.SPECIAL.get(tok, 0)
@@ -73,6 +82,60 @@ def test_available_tasks_covers_all_modalities():
         "t2i_recaption",
         "t2i_vanilla",
     }
+
+
+@pytest.mark.parametrize(
+    "task,expected_bot_task",
+    [
+        ("t2t", "auto"),
+        ("i2t", "auto"),
+        ("it2i_think", "think_recaption"),
+        ("it2i_recaption", "recaption"),
+        ("t2i_think", "think_recaption"),
+        ("t2i_recaption", "recaption"),
+        ("t2i_vanilla", "image"),
+    ],
+)
+def test_bot_task_for_task_matches_prompt_presets(task: str, expected_bot_task: str):
+    assert bot_task_for_task(task) == expected_bot_task
+
+
+def test_stop_token_ids_for_bot_task_are_resolved_from_tokenizer():
+    tok = FakeTokenizer()
+
+    assert stop_token_ids_for_bot_task(tok, "auto") == [5, 8]
+    assert stop_token_ids_for_bot_task(tok, "image") == [5]
+    assert stop_token_ids_for_bot_task(tok, "think_recaption") == [6, 7, 5]
+    assert stop_token_ids_for_bot_task(tok, "recaption") == [6, 7, 5]
+    assert stop_token_ids_for_bot_task(tok, "auto", image_size="auto") == [
+        5,
+        *range(1000, 1033),
+    ]
+
+
+class FakeSamplingParams:
+
+    def __init__(self, stop_token_ids: list[int] | None = None, max_tokens: int = 16) -> None:
+        self.stop_token_ids = stop_token_ids
+        self.max_tokens = max_tokens
+
+
+def test_apply_bot_task_to_sampling_params_updates_only_target_stage():
+    tok = FakeTokenizer()
+    stage0 = FakeSamplingParams(stop_token_ids=[999])
+    stage1 = FakeSamplingParams(stop_token_ids=[888])
+
+    updated = apply_bot_task_to_sampling_params(
+        [stage0, stage1],
+        tok,
+        "think_recaption",
+        stage_index=0,
+    )
+
+    assert updated[0] is stage0
+    assert updated[0].stop_token_ids == [6, 7, 5]
+    assert updated[1] is stage1
+    assert stage0.stop_token_ids == [6, 7, 5]
 
 
 @pytest.mark.parametrize(
@@ -234,10 +297,16 @@ def test_end2end_routes_through_shared_prompt_utils():
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module and node.module.endswith("hunyuan_image3.prompt_utils"):
             imported_from_prompt_utils.update(alias.name for alias in node.names)
-    assert "build_prompt_tokens" in imported_from_prompt_utils, (
-        "end2end.py must import build_prompt_tokens from "
+    expected_imports = {
+        "bot_task_for_task",
+        "build_prompt_tokens",
+        "stop_token_ids_for_bot_task",
+    }
+    assert expected_imports <= imported_from_prompt_utils, (
+        "end2end.py must import the HunyuanImage3 prompt and stop-token helpers from "
         "vllm_omni.diffusion.models.hunyuan_image3.prompt_utils -- the shared "
-        "helper is the single source of truth for the AR-prefill template."
+        "module is the single source of truth for the AR-prefill template and "
+        "bot_task-derived AR stop token ids."
     )
 
 

@@ -18,7 +18,9 @@ import os
 from pathlib import Path
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+    bot_task_for_task,
     build_prompt_tokens,
+    stop_token_ids_for_bot_task,
 )
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniPromptType
@@ -135,6 +137,7 @@ def main():
 
     # Determine task for prompt formatting
     task = args.bot_task or _MODALITY_TASK_MAP[args.modality]
+    bot_task = bot_task_for_task(task)
 
     if args.deploy_config is not None and args.stage_configs_path is not None:
         raise ValueError("--deploy-config and --stage-configs-path are mutually exclusive.")
@@ -219,7 +222,8 @@ def main():
     # Override diffusion params if applicable
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    for i, sp in enumerate(params_list):
+    ar_stop_token_ids = stop_token_ids_for_bot_task(tokenizer, bot_task)
+    for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
             sp.num_inference_steps = args.steps
             sp.guidance_scale = args.guidance_scale
@@ -229,12 +233,15 @@ def main():
             if args.modality in ("text2img",):
                 sp.height = args.height
                 sp.width = args.width
+        elif hasattr(sp, "stop_token_ids"):
+            sp.stop_token_ids = ar_stop_token_ids
 
     # Print configuration
     print(f"\n{'=' * 60}")
     print("HunyuanImage-3.0 Generation Configuration:")
     print(f"  Model: {args.model}")
     print(f"  Modality: {args.modality}")
+    print(f"  Bot task: {bot_task}")
     if deploy_config is not None:
         print(f"  Deploy config: {deploy_config}")
     else:

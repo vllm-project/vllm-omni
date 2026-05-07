@@ -17,12 +17,24 @@ canonical mapping for both flows.
 
 from __future__ import annotations
 
+from typing import Any
+
 from .system_prompt import get_system_prompt
+
+BOT_TASKS = ("auto", "image", "recaption", "think_recaption")
+_BOT_TASK_TO_TOKENIZER_TASK = {
+    "auto": "auto",
+    "image": "image",
+    "recaption": "recaption",
+    "think_recaption": "think",
+}
 
 # task -> (sys_type, bot_task, trigger_tag)
 _TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
     "t2t": ("en_unified", None, None),
+    "t2t_think": ("en_unified", "think", "<think>"),
     "i2t": ("en_unified", None, None),
+    "i2t_think": ("en_unified", "think", "<think>"),
     "it2i_think": ("en_unified", "think", "<think>"),
     "it2i_recaption": ("en_unified", "recaption", "<recaption>"),
     "t2i_think": ("en_unified", "think", "<think>"),
@@ -34,6 +46,100 @@ _TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
 def available_tasks() -> list[str]:
     """Sorted list of task keys accepted by `build_prompt` / `build_prompt_tokens`."""
     return sorted(_TASK_PRESETS)
+
+
+def bot_task_for_task(task: str) -> str:
+    """Return the HunyuanImage3 bot_task associated with a prompt task."""
+    if task not in _TASK_PRESETS:
+        raise ValueError(f"Unknown task {task!r}. Choose from: {available_tasks()}")
+
+    _, preset_bot_task, _ = _TASK_PRESETS[task]
+    if preset_bot_task == "think":
+        return "think_recaption"
+    return preset_bot_task or "auto"
+
+
+def tokenizer_bot_task_for_bot_task(bot_task: str) -> str:
+    """Map the public HunyuanImage3 bot_task to tokenizer-internal task."""
+    if bot_task not in _BOT_TASK_TO_TOKENIZER_TASK:
+        raise ValueError(f"Unknown bot_task {bot_task!r}. Choose from: {list(BOT_TASKS)}")
+    return _BOT_TASK_TO_TOKENIZER_TASK[bot_task]
+
+
+def _token_id(tokenizer, token: str) -> int:
+    token_id = tokenizer.convert_tokens_to_ids(token)
+    if token_id is None:
+        raise ValueError(f"Tokenizer does not know special token {token!r}")
+    return int(token_id)
+
+
+def _eos_token_id(tokenizer) -> int:
+    token_id = getattr(tokenizer, "eos_token_id", None)
+    if token_id is not None:
+        return int(token_id)
+    return _token_id(tokenizer, "<|endoftext|>")
+
+
+def stop_token_ids_for_bot_task(
+    tokenizer,
+    bot_task: str,
+    image_size: int | str | None = None,
+) -> list[int]:
+    """Return AR stop token ids for a HunyuanImage3 bot_task.
+
+    Mirrors the official HunyuanImage-3.0 generation logic: `auto`
+    additionally stops on image-start markers, text/image tasks stop on
+    their structural end tokens, and all ids are resolved from the
+    tokenizer instead of being hard-coded in deploy YAML.
+    """
+    eos_id = _eos_token_id(tokenizer)
+
+    if image_size == "auto":
+        extra_auto_stops = [
+            _token_id(tokenizer, f"<img_ratio_{i}>") for i in range(33)
+        ]
+    else:
+        extra_auto_stops = [_token_id(tokenizer, "<boi>")]
+
+    tokenizer_bot_task = tokenizer_bot_task_for_bot_task(bot_task)
+    stop_token_id = {
+        "auto": [eos_id] + extra_auto_stops,
+        "image": [eos_id],
+        "recaption": [
+            _token_id(tokenizer, "</recaption>"),
+            _token_id(tokenizer, "</answer>"),
+            eos_id,
+        ],
+        "think": [
+            _token_id(tokenizer, "</recaption>"),
+            _token_id(tokenizer, "</answer>"),
+            eos_id,
+        ],
+    }
+    return stop_token_id[tokenizer_bot_task]
+
+
+def apply_bot_task_to_sampling_params(
+    sampling_params_list: list[Any],
+    tokenizer: Any,
+    bot_task: str,
+    *,
+    stage_index: int = 0,
+    image_size: int | str | None = None,
+) -> list[Any]:
+    """Apply a per-request HunyuanImage3 bot_task to one AR stage."""
+    if stage_index < 0 or stage_index >= len(sampling_params_list):
+        raise IndexError(
+            f"stage_index {stage_index} is out of range for "
+            f"{len(sampling_params_list)} sampling params"
+        )
+
+    updated_params_list = list(sampling_params_list)
+    params = updated_params_list[stage_index]
+    params.stop_token_ids = stop_token_ids_for_bot_task(tokenizer, bot_task, image_size=image_size)
+
+    updated_params_list[stage_index] = params
+    return updated_params_list
 
 
 def build_prompt(
@@ -149,4 +255,13 @@ def build_prompt_tokens(
     return ids
 
 
-__all__ = ["build_prompt", "build_prompt_tokens", "available_tasks"]
+__all__ = [
+    "available_tasks",
+    "apply_bot_task_to_sampling_params",
+    "bot_task_for_task",
+    "BOT_TASKS",
+    "build_prompt",
+    "build_prompt_tokens",
+    "stop_token_ids_for_bot_task",
+    "tokenizer_bot_task_for_bot_task",
+]

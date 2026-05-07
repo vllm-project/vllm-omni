@@ -21,7 +21,6 @@ stages:
       top_p: 0.95
       top_k: 1024
       max_tokens: 4096
-      stop_token_ids: [127957]
       detokenize: false
 
   - stage_id: 1
