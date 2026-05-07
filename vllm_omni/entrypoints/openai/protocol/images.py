@@ -119,8 +119,34 @@ class ImageGenerationRequest(BaseModel):
     )
     bot_task: str | None = Field(
         default=None,
-        description="HunyuanImage3 AR bot_task for this request: auto, image, recaption, or think_recaption.",
+        description=(
+            "HunyuanImage3 prompt behavior for this request. Preferred values: "
+            "auto, none, think, recaption, vanilla. Legacy values auto, image, "
+            "recaption, and think_recaption are also accepted."
+        ),
     )
+
+    @field_validator("bot_task")
+    @classmethod
+    def validate_bot_task(cls, v):
+        """Validate HunyuanImage3 bot_task / prompt behavior."""
+        if v is None:
+            return None
+
+        normalized = v.strip().lower()
+        valid_values = {
+            "auto",
+            "none",
+            "think",
+            "recaption",
+            "vanilla",
+            "image",
+            "think_recaption",
+        }
+        if normalized not in valid_values:
+            raise ValueError(f"Invalid bot_task: {v}. Must be one of: {sorted(valid_values)}")
+        return normalized
+
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
     generator_device: str | None = Field(
         default=None,

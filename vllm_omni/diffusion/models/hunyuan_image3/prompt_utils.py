@@ -90,6 +90,11 @@ _PROMPT_BOT_TASK_ALIASES: dict[str, str | None] = {
     "vanilla": "vanilla",
 }
 
+_REQUEST_BOT_TASK_ALIASES: dict[str, str | None] = {
+    **_PROMPT_BOT_TASK_ALIASES,
+    "image": "vanilla",
+}
+
 
 def available_tasks() -> list[str]:
     """Sorted list of task keys accepted by `build_prompt` / `build_prompt_tokens`."""
@@ -121,6 +126,17 @@ def _normalize_prompt_bot_task(bot_task: str | None) -> str | None:
     return _PROMPT_BOT_TASK_ALIASES[normalized]
 
 
+def _normalize_request_bot_task(bot_task: str | None) -> str | None:
+    if bot_task is None:
+        return "auto"
+
+    normalized = bot_task.strip().lower()
+    if normalized not in _REQUEST_BOT_TASK_ALIASES:
+        valid_bot_tasks = sorted(set(PROMPT_BOT_TASKS) | set(BOT_TASKS))
+        raise ValueError(f"Unknown bot_task {bot_task!r}. Choose from: {valid_bot_tasks}")
+    return _REQUEST_BOT_TASK_ALIASES[normalized]
+
+
 def task_for_modality_and_bot_task(modality: str, bot_task: str | None = "auto") -> str:
     """Return the canonical prompt task for an input/output modality.
 
@@ -149,6 +165,20 @@ def task_for_modality_and_bot_task(modality: str, bot_task: str | None = "auto")
         )
 
     return _TASK_BY_PREFIX_AND_BOT_TASK[task_key]
+
+
+def task_for_modality_and_request_bot_task(modality: str, bot_task: str | None = "auto") -> str:
+    """Resolve a request bot_task into a canonical prompt task.
+
+    Request values accept both the unified public bot_task vocabulary
+    (`think`, `recaption`, `vanilla`, `none`, `auto`) and the legacy
+    HunyuanImage3 values (`auto`, `image`, `recaption`,
+    `think_recaption`).
+    """
+    return task_for_modality_and_bot_task(
+        modality,
+        _normalize_request_bot_task(bot_task),
+    )
 
 
 def sys_type_for_task(task: str) -> str:
@@ -236,6 +266,11 @@ def stop_token_ids_for_task(
     )
 
 
+def tokenizer_bot_task_for_task(task: str) -> str:
+    """Return the tokenizer-internal bot_task for a canonical prompt task."""
+    return tokenizer_bot_task_for_bot_task(bot_task_for_task(task))
+
+
 def apply_bot_task_to_sampling_params(
     sampling_params_list: list[Any],
     tokenizer: Any,
@@ -254,6 +289,24 @@ def apply_bot_task_to_sampling_params(
 
     updated_params_list[stage_index] = params
     return updated_params_list
+
+
+def apply_task_to_sampling_params(
+    sampling_params_list: list[Any],
+    tokenizer: Any,
+    task: str,
+    *,
+    stage_index: int = 0,
+    image_size: int | str | None = None,
+) -> list[Any]:
+    """Apply a canonical prompt task to one AR stage's stop tokens."""
+    return apply_bot_task_to_sampling_params(
+        sampling_params_list,
+        tokenizer,
+        bot_task_for_task(task),
+        stage_index=stage_index,
+        image_size=image_size,
+    )
 
 
 def build_prompt(
@@ -367,6 +420,7 @@ __all__ = [
     "available_tasks",
     "available_prompt_bot_tasks",
     "apply_bot_task_to_sampling_params",
+    "apply_task_to_sampling_params",
     "bot_task_for_task",
     "BOT_TASKS",
     "build_prompt",
@@ -376,5 +430,7 @@ __all__ = [
     "stop_token_ids_for_task",
     "sys_type_for_task",
     "task_for_modality_and_bot_task",
+    "task_for_modality_and_request_bot_task",
+    "tokenizer_bot_task_for_task",
     "tokenizer_bot_task_for_bot_task",
 ]

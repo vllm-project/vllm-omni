@@ -578,6 +578,103 @@ def test_multistage_images_async_omni_construction(async_omni_test_client):
     assert captured[1].guidance_scale == 6.5
 
 
+def test_multistage_hunyuan_images_accept_unified_bot_task():
+    """Regression: /v1/images/generations maps unified bot_task values for HunyuanImage3."""
+
+    class FakeTokenizer:
+        eos_token_id = 5
+
+        def convert_tokens_to_ids(self, token):
+            mapping = {
+                "</recaption>": 6,
+                "</answer>": 7,
+                "<boi>": 8,
+            }
+            mapping.update({f"<img_ratio_{i}>": 1000 + i for i in range(33)})
+            return mapping[token]
+
+    class FakeAsyncOmniClass(AsyncOmni):
+        def __init__(self):
+            stage_configs = [
+                SimpleNamespace(
+                    stage_type="llm",
+                    is_comprehension=True,
+                    model_arch="HunyuanImage3ForCausalMM",
+                ),
+                SimpleNamespace(
+                    stage_type="diffusion",
+                    is_comprehension=False,
+                    model_arch="HunyuanImage3Pipeline",
+                ),
+            ]
+            default_sampling_params_list = [
+                SamplingParams(temperature=0.1),
+                OmniDiffusionSamplingParams(),
+            ]
+            self.engine = SimpleNamespace(
+                stage_configs=stage_configs,
+                default_sampling_params_list=default_sampling_params_list,
+            )
+            self.default_sampling_params_list = default_sampling_params_list
+            self.captured_sampling_params_list = None
+            self.captured_prompt = None
+            self._images = [Image.new("RGB", (64, 64), color="green")]
+            self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
+
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+            self.captured_sampling_params_list = (
+                sampling_params_list if sampling_params_list is not None else [sampling_params]
+            )
+            self.captured_prompt = prompt
+            yield MockGenerationResult([img.copy() for img in self._images])
+
+        async def get_tokenizer(self):
+            return FakeTokenizer()
+
+        def __class_getitem__(cls, item):
+            return cls
+
+        def get_diffusion_od_config(self):
+            return self.od_config
+
+    app = FastAPI()
+    app.include_router(router)
+
+    engine = FakeAsyncOmniClass()
+    chat_handler = object.__new__(OmniOpenAIServingChat)
+    chat_handler.engine_client = engine
+    chat_handler._diffusion_engine = None
+    app.state.openai_serving_chat = chat_handler
+    app.state.engine_client = engine
+    app.state.stage_configs = engine.engine.stage_configs
+    app.state.args = Namespace(
+        default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
+        max_generated_image_size=1048576,
+    )
+    app.state.openai_serving_models = _DiffusionServingModels(
+        [BaseModelPath(name="tencent/HunyuanImage-3.0-Instruct", model_path="tencent/HunyuanImage-3.0-Instruct")]
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "bot_task": "think",
+            "size": "128x256",
+        },
+    )
+    assert response.status_code == 200
+
+    captured_prompt = engine.captured_prompt
+    assert captured_prompt["bot_task"] == "think_recaption"
+    assert captured_prompt["mm_processor_kwargs"]["bot_task"] == "think"
+
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert captured[0].stop_token_ids == [6, 7, 5]
+
+
 def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
     """GLM-Image multistage: stage-0 gets target_h/w from requested size.
 
@@ -906,6 +1003,8 @@ def test_parameter_validation():
     assert req.size is None  # Engine will use model defaults
     assert req.num_inference_steps is None  # Engine will use model defaults
     assert req.true_cfg_scale is None  # Engine will use model defaults
+    assert ImageGenerationRequest(prompt="test", bot_task="think").bot_task == "think"
+    assert ImageGenerationRequest(prompt="test", bot_task="think_recaption").bot_task == "think_recaption"
 
     # Invalid num_inference_steps (out of range)
     with pytest.raises(ValueError):
@@ -927,6 +1026,9 @@ def test_parameter_validation():
 
     with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", layers=11)
+
+    with pytest.raises(ValueError):
+        ImageGenerationRequest(prompt="test", bot_task="bogus")
 
 
 # Pass-Through Tests

@@ -91,3 +91,72 @@ def test_build_multistage_generation_inputs_applies_stage_specific_overrides(ser
     assert engine.default_sampling_params_list[1].lora_request is None
     assert engine.default_sampling_params_list[2].resolution == 640
     assert engine.default_sampling_params_list[2].lora_request is None
+
+
+@pytest.mark.parametrize(
+    "output_modalities,messages,bot_task,expected_task",
+    [
+        (["image"], [{"role": "user", "content": "draw a cat"}], "think", "t2i_think"),
+        (
+            ["image"],
+            [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}]}],
+            "recaption",
+            "it2i_recaption",
+        ),
+        (
+            ["text"],
+            [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}]}],
+            "think_recaption",
+            "i2t_think",
+        ),
+        (["text"], [{"role": "user", "content": "describe"}], "none", "t2t"),
+    ],
+)
+def test_resolve_hunyuan_image3_request_task(serving_chat, output_modalities, messages, bot_task, expected_task):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    stage_configs = [SimpleNamespace(stage_type="llm", model_arch="HunyuanImage3ForCausalMM", is_comprehension=True)]
+    task = OmniOpenAIServingChat._resolve_hunyuan_image3_request_task(
+        stage_configs=stage_configs,
+        output_modalities=output_modalities,
+        messages=messages,
+        bot_task=bot_task,
+    )
+
+    assert task == expected_task
+
+
+def test_build_multistage_generation_inputs_maps_unified_bot_task_for_hunyuan(serving_chat):
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    engine = SimpleNamespace(
+        stage_configs=[
+            SimpleNamespace(
+                stage_type="llm",
+                is_comprehension=True,
+                model_arch="HunyuanImage3ForCausalMM",
+            ),
+            SimpleNamespace(
+                stage_type="diffusion",
+                is_comprehension=False,
+                model_arch="HunyuanImage3Pipeline",
+            ),
+        ],
+        default_sampling_params_list=[
+            SamplingParams(temperature=0.2, seed=11),
+            OmniDiffusionSamplingParams(),
+        ],
+    )
+
+    engine_prompt, _sampling_params_list = OmniOpenAIServingChat._build_multistage_generation_inputs(
+        serving_chat,
+        engine=engine,
+        prompt="draw a robot",
+        extra_body={"bot_task": "think"},
+        reference_images=[],
+        gen_params=OmniDiffusionSamplingParams(height=768, width=1024, seed=0, num_outputs_per_prompt=1),
+    )
+
+    assert engine_prompt["modalities"] == ["image"]
+    assert engine_prompt["bot_task"] == "think_recaption"
+    assert engine_prompt["mm_processor_kwargs"]["bot_task"] == "think"
