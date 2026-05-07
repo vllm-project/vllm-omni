@@ -359,6 +359,24 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             self.parent_requests[parent_req.request_id] = parent_req
         self.external_req_ids[req_state.external_req_id].append(request_id)
 
+    def remove_request(self, request_id: str) -> None:
+        """Rollback one previously registered request if it was never submitted."""
+        req_state = self.request_states.pop(request_id, None)
+        if req_state is None:
+            return
+
+        external_req_id = getattr(req_state, "external_req_id", None)
+        if external_req_id is not None:
+            request_ids = self.external_req_ids.get(external_req_id)
+            if request_ids is not None:
+                self.external_req_ids[external_req_id] = [rid for rid in request_ids if rid != request_id]
+                if not self.external_req_ids[external_req_id]:
+                    self.external_req_ids.pop(external_req_id, None)
+
+        parent_req = getattr(req_state, "parent_req", None)
+        if parent_req is not None:
+            self.parent_requests.pop(parent_req.request_id, None)
+
     def process_outputs(
         self,
         engine_core_outputs: list[EngineCoreOutput],
