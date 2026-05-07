@@ -15,7 +15,7 @@ vLLM-Omni supports various advanced features for diffusion models:
 - Acceleration: **cache methods**, **parallelism methods**, **startup optimizations**
 - Memory optimization: **cpu offloading**, **quantization**
 - Extensions: **LoRA inference**, **frame interpolation**
-- Execution modes: **step execution**, **multi-replica serving**
+- Execution modes: **step execution**
 
 ## Supported Features
 
@@ -43,7 +43,6 @@ Parallelism methods distribute computation across GPUs without quality loss (mat
 | **[Tensor Parallelism](diffusion/parallelism/tensor_parallel.md)** | Shards model weights across devices | Large models that don't fit in single GPU, with 2+ GPUs |
 | **[HSDP](diffusion/parallelism/hsdp.md)** | Weight sharding via FSDP2, redistributed on-demand at runtime | Very large models (14B+) on limited VRAM, combinable with SP |
 | **[Expert Parallelism](diffusion/parallelism/expert_parallel.md)** | Shards MoE expert MLP blocks across devices | MoE diffusion models (e.g., HunyuanImage3.0) |
-| **[Multi-Replica Serving](diffusion/multi_replica_serving.md)** | Runs multiple independent diffusion stage replicas and routes requests across them | Online serving throughput with many concurrent requests |
 
 #### Startup Optimization
 
