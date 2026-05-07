@@ -233,7 +233,7 @@ def build_parallel_config_dict_from_engine_args(engine_args: Mapping[str, Any]) 
     for key in _DIFFUSION_PARALLEL_FIELD_NAMES:
         val = engine_args.get(key)  # top-level field value
 
-        # Only apply top-level fields if it doesn't exist in parallel_config 
+        # Only apply top-level fields if it doesn't exist in parallel_config
         # This also means the YAML file's config will win unless with --stage-overrides
         if val is not None and key not in par:
             par[key] = val
