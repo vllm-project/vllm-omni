@@ -1,5 +1,4 @@
-# Stage config for running GLM-Image with Sequence Parallelism on Diffusion
-#
+# Stage config for running GLM-Image
 stage_args:
   # Stage 0: AR Model (GlmImageForConditionalGeneration) with TP
   - stage_id: 0
@@ -11,7 +10,6 @@ stage_args:
         HCCL_IF_BASE_PORT: 23000
         HCCL_HOST_SOCKET_PORT_RANGE: "23000-23199"
         HCCL_NPU_SOCKET_PORT_RANGE: "23200-23399"
-        HCCL_SOCKET_IFNAME: enp189s0f0
       requires_multimodal_data: true
     engine_args:
       model_stage: ar
@@ -55,7 +53,6 @@ stage_args:
         HCCL_IF_BASE_PORT: 24000
         HCCL_HOST_SOCKET_PORT_RANGE: "24000-24199"
         HCCL_NPU_SOCKET_PORT_RANGE: "24200-24399"
-        HCCL_SOCKET_IFNAME: enp189s0f0
       requires_multimodal_data: true
     engine_args:
       model_stage: dit
