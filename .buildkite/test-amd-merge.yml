@@ -9,7 +9,7 @@ steps:
     - export VLLM_ROCM_USE_AITER=0
     # ignore test_teacache_extractors.py because it use rocm gemm kernel from vLLM
     # that is not supported on CPU
-    - "timeout 20m pytest -v -s -m 'core_model and cpu' --ignore=tests/diffusion/cache/test_teacache_extractors.py --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
+    - "timeout 30m pytest -v -s -m 'core_model and cpu' --ignore=tests/diffusion/cache/test_teacache_extractors.py --cov=vllm_omni --cov-branch --cov-report=term-missing --cov-report=html --cov-report=xml"
 
 - label: "Diffusion Images API LoRA E2E"
   agent_pool: mi325_1

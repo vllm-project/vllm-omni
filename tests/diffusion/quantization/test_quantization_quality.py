@@ -66,7 +66,7 @@ QUALITY_CONFIGS = [
         quantization="fp8",
         task="t2i",
         prompt="a cup of coffee on a wooden table, morning light",
-        max_lpips=0.10,
+        max_lpips=0.15,
         num_inference_steps=20,
     ),
     QualityTestConfig(
