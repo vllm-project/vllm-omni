@@ -18,6 +18,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni import AsyncOmni, Omni
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
 logger = logging.getLogger(__name__)
 
@@ -383,7 +384,10 @@ def main(args):
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    omni = Omni.from_cli_args(args, model=model_name)
+    omni_kwargs = vars(args).copy()
+    # Override CLI --model with the derived model_name.
+    omni_kwargs["model"] = model_name
+    omni = Omni(**omni_kwargs)
 
     batch_size = args.batch_size
     for batch_start in range(0, len(inputs), batch_size):
@@ -399,7 +403,10 @@ async def main_streaming(args):
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
-    omni = AsyncOmni.from_cli_args(args, model=model_name)
+    omni_kwargs = vars(args).copy()
+    # Override CLI --model with the derived model_name.
+    omni_kwargs["model"] = model_name
+    omni = AsyncOmni(**omni_kwargs)
 
     for i, prompt in enumerate(inputs):
         request_id = str(i)
@@ -541,6 +548,7 @@ def parse_args():
         help="Number of prompts per batch (default: 1, sequential).",
     )
 
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

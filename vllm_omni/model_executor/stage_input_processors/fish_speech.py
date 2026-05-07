@@ -24,16 +24,14 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
 
 
 def slow_ar_to_dac_decoder(
-    stage_list: list[Any],
-    engine_input_source: list[int],
-    prompt: Any = None,
-    requires_multimodal_data: bool = False,
+    source_outputs: list[Any],
+    _prompt: Any = None,
+    _requires_multimodal_data: bool = False,
 ) -> list[Any]:
     """Non-async processor: wait for Slow AR to finish, then pass all codes to DAC decoder."""
     from vllm_omni.inputs.data import OmniTokensPrompt
-    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import _validate_stage_inputs
 
-    slow_ar_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    slow_ar_outputs = source_outputs
     dac_inputs: list[OmniTokensPrompt] = []
 
     for output in slow_ar_outputs:
