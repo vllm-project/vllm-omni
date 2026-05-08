@@ -7,6 +7,7 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeTalkerConfig,
 )
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeAudioAttention,
     Qwen3OmniMoeAudioEncoder,
 )
 from vllm.config import VllmConfig
@@ -27,6 +28,9 @@ from vllm.model_executor.models.utils import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.model_executor.models.qwen2_5_omni.audio_flash_attn import (
+    patch_audio_tower_attention,
+)
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_code_predictor_mtp import (
     Qwen3OmniMoeTalkerCodePredictor,
 )
@@ -38,12 +42,6 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerProcessingInfo,
 )
 from vllm_omni.quantization.component_config import ComponentQuantizationConfig
-
-try:
-    import flash_attn
-except (ImportError, ModuleNotFoundError):
-    flash_attn = None
-
 
 logger = init_logger(__name__)
 
@@ -233,6 +231,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
             thinker_config: Configuration from the thinker model (for reference only)
         """
         self.audio_tower = Qwen3OmniMoeAudioEncoder(thinker_config.audio_config)
+        patch_audio_tower_attention(self.audio_tower, Qwen3OmniMoeAudioAttention)
         self.visual = Qwen3Omni_VisionTransformer(
             vision_config=thinker_config.vision_config,
             norm_eps=getattr(thinker_config.text_config, "rms_norm_eps", 1e-6),

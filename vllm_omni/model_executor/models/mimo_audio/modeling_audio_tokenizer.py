@@ -9,22 +9,17 @@ from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.attention.backends.utils.fa import HAS_FLASH_ATTN, flash_attn_varlen_func
+
 from .config_mimo_audio import MiMoAudioTokenizerConfig
 from .modeling_rope_utils import ROPE_INIT_FUNCTIONS, apply_rotary_pos_emb, dynamic_rope_update
 from .quantization import ResidualVectorQuantizer
 
 logger = init_logger(__name__)
-is_flash_atth_available = False
-try:
-    from flash_attn import flash_attn_varlen_func
-
-    is_flash_atth_available = True
-except Exception:
-    logger.warning("flash_attn not installed")
 
 
 def _should_use_flash_attn(hidden_states: torch.Tensor) -> bool:
-    return hidden_states.is_cuda and is_flash_atth_available
+    return hidden_states.is_cuda and HAS_FLASH_ATTN
 
 
 def _build_varlen_attn_mask(
@@ -422,12 +417,12 @@ class Attention(nn.Module):
                 query_states,
                 key_states,
                 value_states,
-                cu_len,
-                cu_len,
-                max_seqlen,
-                max_seqlen,
+                cu_seqlens_q=cu_len,
+                cu_seqlens_k=cu_len,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
                 causal=self.causal,
-                window_size=self.window_size,
+                window_size=list(self.window_size),
             )
             attn_output = attn_output.reshape(total_seq_len, self.embed_dim)
 

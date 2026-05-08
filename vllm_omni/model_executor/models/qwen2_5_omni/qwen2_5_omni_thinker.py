@@ -9,6 +9,7 @@ from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import (
     Qwen2_5OmniThinkerConfig,
 )
 from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+    Qwen2_5OmniAudioAttention,
     Qwen2_5OmniAudioEncoder,
 )
 from vllm.config import VllmConfig
@@ -64,14 +65,13 @@ from vllm.multimodal.processing.processor import (
 )
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.model_executor.models.qwen2_5_omni.audio_flash_attn import (
+    patch_audio_tower_attention,
+)
 from vllm_omni.quantization.component_config import (
     resolve_encoder_quant_config,
 )
 
-try:
-    import flash_attn
-except (ImportError, ModuleNotFoundError):
-    flash_attn = None
 logger = init_logger(__name__)
 
 
@@ -346,19 +346,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         self.config = thinker_config
         self.multimodal_config = multimodal_config
 
-        # force "use_flash_attention_2=True" to audio tower to align
-        # the results.
-        if flash_attn is not None:
-            audio_config = thinker_config.audio_config
-            audio_config._attn_implementation_autoset = True
-            audio_config._attn_implementation = "flash_attention_2"
-        else:
-            logger.warning(
-                "flash_attn is not available, the model may not yield the "
-                "exactly same result as the transformers implementation "
-                "in the audio tower part."
-            )
-
         self.quant_config = quant_config
 
         # Pre-quantized checkpoints (modelopt NVFP4/FP8/MXFP8) only quantize
@@ -370,6 +357,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         with self._mark_tower_model(vllm_config, "audio"):
             if multimodal_config.get_limit_per_prompt("audio"):
                 self.audio_tower = Qwen2_5OmniAudioEncoder(thinker_config.audio_config)
+                patch_audio_tower_attention(self.audio_tower, Qwen2_5OmniAudioAttention)
             else:
                 self.audio_tower = None
 

@@ -125,11 +125,6 @@ from vllm_omni.quantization.component_config import (
     ComponentQuantizationConfig,
 )
 
-try:
-    import flash_attn
-except (ImportError, ModuleNotFoundError):
-    flash_attn = None
-
 logger = init_logger(__name__)
 
 

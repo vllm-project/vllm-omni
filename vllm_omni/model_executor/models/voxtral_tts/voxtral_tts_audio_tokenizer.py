@@ -11,6 +11,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.config import VllmConfig
 
+from vllm_omni.diffusion.attention.backends.utils.fa import (
+    HAS_FLASH_ATTN,
+    flash_attn_func,
+    flash_attn_varlen_func,
+)
 from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation import (
     AudioSpecialTokens,
     FeedForward,
@@ -18,14 +23,6 @@ from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation im
     from_nested_dict,
 )
 from vllm_omni.platforms import current_omni_platform
-
-try:
-    from flash_attn import flash_attn_func
-
-    HAS_FLASH_ATTN = True
-except ImportError:
-    flash_attn_func = None
-    HAS_FLASH_ATTN = False
 
 try:
     from apex.normalization import FusedRMSNorm
@@ -585,17 +582,39 @@ class Attention(nn.Module):
 
         if HAS_FLASH_ATTN:
             alibi_slopes = self.alibi_slopes.to(torch.float32)
-            output = flash_attn_func(
-                xq,
-                xk,
-                xv,
-                causal=self.args.causal,
-                window_size=(
-                    self.sliding_window,
-                    0 if self.args.causal else self.sliding_window,
-                ),
-                alibi_slopes=alibi_slopes,
-            )
+            window_size = [
+                self.sliding_window,
+                0 if self.args.causal else self.sliding_window,
+            ]
+            if flash_attn_func is not None:
+                output = flash_attn_func(
+                    xq,
+                    xk,
+                    xv,
+                    causal=self.args.causal,
+                    window_size=window_size,
+                    alibi_slopes=alibi_slopes,
+                )
+            else:
+                # Fall back to varlen (vllm.vllm_flash_attn only exposes that)
+                # by flattening the uniform-length batch into one varlen call.
+                q_flat = xq.reshape(bsz * seqlen, self.n_local_heads, self.args.head_dim)
+                k_flat = xk.reshape(bsz * seqlen, self.n_local_kv_heads, self.args.head_dim)
+                v_flat = xv.reshape(bsz * seqlen, self.n_local_kv_heads, self.args.head_dim)
+                cu_seqlens = torch.arange(0, (bsz + 1) * seqlen, step=seqlen, dtype=torch.int32, device=xq.device)
+                output = flash_attn_varlen_func(
+                    q_flat,
+                    k_flat,
+                    v_flat,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                    max_seqlen_q=seqlen,
+                    max_seqlen_k=seqlen,
+                    causal=self.args.causal,
+                    window_size=window_size,
+                    alibi_slopes=alibi_slopes,
+                )
+                output = output.reshape(bsz, seqlen, self.n_local_heads, self.args.head_dim)
         else:
             output = self._native_attention(xq, xk, xv)
 
