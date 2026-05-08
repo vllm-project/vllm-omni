@@ -1,6 +1,3 @@
-from collections.abc import Callable
-from typing import cast
-
 import pytest
 import torch.nn as nn
 
@@ -18,20 +15,20 @@ def test_longcat_image_exposes_hsdp_shard_conditions_for_both_block_lists():
     model.single_transformer_blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(3)])
     model.proj_out = nn.Linear(4, 4)
 
-    conditions = cast(
-        list[Callable[[str, nn.Module], bool]],
-        getattr(model, "_hsdp_shard_conditions"),
-    )
+    conditions = getattr(model, "_hsdp_shard_conditions", None)
 
+    assert conditions is not None
     assert len(conditions) == 1
 
-    condition = conditions[0]
+    matched: list[str] = []
+    for name, module in model.named_modules():
+        if any(cond(name, module) for cond in conditions):
+            matched.append(name)
 
-    assert condition("transformer_blocks.0", model.transformer_blocks[0])
-    assert condition("transformer_blocks.1", model.transformer_blocks[1])
-    assert condition("single_transformer_blocks.0", model.single_transformer_blocks[0])
-    assert condition("single_transformer_blocks.1", model.single_transformer_blocks[1])
-    assert condition("single_transformer_blocks.2", model.single_transformer_blocks[2])
-    assert not condition("transformer_blocks", model.transformer_blocks)
-    assert not condition("single_transformer_blocks", model.single_transformer_blocks)
-    assert not condition("proj_out", model.proj_out)
+    assert matched == [
+        "transformer_blocks.0",
+        "transformer_blocks.1",
+        "single_transformer_blocks.0",
+        "single_transformer_blocks.1",
+        "single_transformer_blocks.2",
+    ]
