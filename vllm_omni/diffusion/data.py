@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any
 
+import diffusers
 import torch
 from PIL import Image
 from pydantic import model_validator
@@ -460,6 +461,8 @@ class OmniDiffusionConfig:
     diffusers_load_kwargs: dict[str, Any] = field(default_factory=dict)
     # kwargs forwarded to pipeline.__call__()
     diffusers_call_kwargs: dict[str, Any] = field(default_factory=dict)
+    # Actual diffusers pipeline object (to determine inputs of the dummy run)
+    diffusers_pipeline_cls: type[diffusers.DiffusionPipeline] | None = None  # pyright: ignore[reportPrivateImportUsage]
 
     # http server endpoint config, would be ignored in local mode
     host: str | None = None
@@ -714,6 +717,15 @@ class OmniDiffusionConfig:
                 # (non-DiT models don't have a separate transformer folder/config)
                 if self.diffusion_load_format == "diffusers":
                     self.tf_model_config = TransformerConfig()
+                    try:
+                        diffusers_pipeline_cls_name = config_dict["_class_name"]
+                        self.diffusers_pipeline_cls = getattr(diffusers, diffusers_pipeline_cls_name)
+                    except (KeyError, AttributeError) as exc:
+                        logger.warning(
+                            f"Could not find valid _class_name for diffusers pipeline in model_index.json: {exc}. "
+                            "Without knowing the underlying diffusers pipeline class, the dummy run will input only "
+                            "text prompt, which may cause errors for pipelines that require additional inputs."
+                        )
                 else:
                     tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model)
                     self.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
@@ -724,6 +736,13 @@ class OmniDiffusionConfig:
             # (non-DiT models don't have a separate transformer folder/config)
             if self.diffusion_load_format == "diffusers":
                 self.tf_model_config = TransformerConfig()
+                logger.warning(
+                    "Could not find valid model_index.json per diffusers format. "
+                    "This model is suspectedly unsupported by the diffusers backend. "
+                    "Also, without knowing the underlying diffusers pipeline class from model_index.json, "
+                    "the dummy run will input only text prompt, which may cause errors for pipelines "
+                    "that require additional inputs."
+                )
             else:
                 cfg = get_hf_file_to_dict("config.json", self.model)
                 if cfg is None:
@@ -740,6 +759,11 @@ class OmniDiffusionConfig:
                 elif model_type == "nextstep":
                     if self.model_class_name is None:
                         self.model_class_name = "NextStep11Pipeline"
+                    self.tf_model_config = TransformerConfig()
+                    self.update_multimodal_support()
+                elif model_type == "s2v":
+                    if self.model_class_name is None:
+                        self.model_class_name = "WanS2VPipeline"
                     self.tf_model_config = TransformerConfig()
                     self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:
@@ -759,7 +783,7 @@ class OmniDiffusionConfig:
 
         # Backwards-compatibility: map "quantization" to "quantization_config"
         # so callers using the old field name still work.
-        if "quantization" in kwargs and "quantization_config" not in kwargs:
+        if "quantization" in kwargs and kwargs.get("quantization_config", None) is None:
             kwargs["quantization_config"] = kwargs.pop("quantization")
         else:
             kwargs.pop("quantization", None)
@@ -775,6 +799,18 @@ class OmniDiffusionConfig:
             kwargs["diffusers_load_kwargs"] = {}
         if "diffusers_call_kwargs" in kwargs and kwargs["diffusers_call_kwargs"] is None:
             kwargs["diffusers_call_kwargs"] = {}
+
+        # Forward top-level parallel knobs (e.g. --tensor-parallel-size from CLI)
+        # into parallel_config so the diffusion engine sees them.
+        par = kwargs.get("parallel_config", {})
+        if isinstance(par, Mapping):
+            par = dict(par)
+            if par.get("tensor_parallel_size") is None:
+                par.pop("tensor_parallel_size", None)
+            tensor_parallel_size = kwargs.get("tensor_parallel_size")
+            if tensor_parallel_size is not None and "tensor_parallel_size" not in par:
+                par["tensor_parallel_size"] = tensor_parallel_size
+            kwargs["parallel_config"] = par
 
         # Filter kwargs to only include valid fields
         valid_fields = {f.name for f in fields(cls)}

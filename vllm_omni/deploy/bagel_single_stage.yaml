@@ -1,0 +1,26 @@
+# BAGEL-7B-MoT single-stage deploy: all modalities handled by the DiT stage.
+#
+# The DiT stage contains a full LLM (Qwen2-MoT), ViT, VAE, and tokenizer,
+# so it supports text2img, img2img, img2text, text2text, and think mode
+# without a separate Thinker (AR) stage.
+#
+# Select this topology via:
+#   vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
+#       --deploy-config vllm_omni/deploy/bagel_single_stage.yaml
+#
+# Or programmatically:
+#   Omni(model="...", deploy_config_path="vllm_omni/deploy/bagel_single_stage.yaml")
+
+pipeline: bagel_single_stage
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 32768
+    max_num_seqs: 1
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0"
+    default_sampling_params:
+      seed: 52

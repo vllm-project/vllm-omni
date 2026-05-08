@@ -32,6 +32,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -350,10 +351,12 @@ class Qwen2_5OmniForConditionalGeneration(
                 )
             )
 
-            code = code[:-1] if code[-1] == TALKER_CODEC_EOS_TOKEN_ID else code
-            code = code[1:] if code[0] == TALKER_CODEC_BOS_TOKEN_ID else code
+            if code.numel() and code[-1] == TALKER_CODEC_EOS_TOKEN_ID:
+                code = code[:-1]
+            if code.numel() and code[0] == TALKER_CODEC_BOS_TOKEN_ID:
+                code = code[1:]
 
-            audio_tensor = self.generate_audio(code, voice_type)
+            audio_tensor = self.generate_audio(code, voice_type) if code.numel() else torch.zeros(0, device=code.device)
             return OmniOutput(text_hidden_states=None, multimodal_outputs={"model_outputs": audio_tensor})
 
         return OmniOutput(
@@ -666,6 +669,8 @@ class Qwen2_5OmniForConditionalGeneration(
         # - For Decode segments, if per-request auxiliary decode embeddings are provided (optional),
         #   add them; otherwise, keep the original embedding.
 
+        payload: OmniPayload = info_dict
+
         # Ensure we have base embeddings when only ids are provided
         if input_embeds is None and input_ids is not None:
             input_embeds = self.talker.embed_input_ids(input_ids)
@@ -673,23 +678,27 @@ class Qwen2_5OmniForConditionalGeneration(
         span_len = input_ids.shape[0]
         if span_len > 1:
             # prefill
-            return self.thinker_to_talker_process(input_ids, input_embeds, **info_dict)
+            return self.thinker_to_talker_process(input_ids, input_embeds, payload)
         else:
             # decode
-            return self.thinker_to_talker_decode_one_step(input_ids, input_embeds, **info_dict)
+            return self.thinker_to_talker_decode_one_step(input_ids, input_embeds, payload)
 
     def thinker_to_talker_process(
         self,
         input_ids: torch.Tensor,
         input_embeds: torch.Tensor,
-        **info_dict: object,
+        payload: OmniPayload,
     ):
+        embed = payload.get("embed", {})
+        hs = payload.get("hidden_states", {})
+        ids = payload.get("ids", {})
+
         update_dict = {}
 
-        prompt_embeds = info_dict.get("prompt_embeds")  # Tensor [P,H]
-        thinker_result = info_dict.get("thinker_result")  # Tensor [K,H]
-        prompt_token_ids = info_dict.get("prompt_token_ids")  # list[int]
-        thinker_output_token_ids = info_dict.get("thinker_output_token_ids")  # list[int]
+        prompt_embeds = embed.get("prefill")  # Tensor [P,H]
+        thinker_result = hs.get("output")  # Tensor [K,H]
+        prompt_token_ids = ids.get("prompt")  # list[int]
+        thinker_output_token_ids = ids.get("output")  # list[int]
 
         if not isinstance(prompt_embeds, torch.Tensor):
             prompt_embeds = torch.zeros(
@@ -714,7 +723,7 @@ class Qwen2_5OmniForConditionalGeneration(
         )
 
         if thinker_result.ndim == 2 and thinker_result.shape[0] > 0:
-            update_dict["thinker_reply_part"] = thinker_result[1:].detach().to("cpu").contiguous()
+            update_dict.setdefault("embed", {})["thinker_reply"] = thinker_result[1:].detach().to("cpu").contiguous()
 
         return req_input_ids, req_embeds, update_dict
 
@@ -763,18 +772,20 @@ class Qwen2_5OmniForConditionalGeneration(
             )
         return prompt_token_ids_processed, prompt_embeds
 
-    def thinker_to_talker_decode_one_step(self, input_ids, input_embeds, **info_dict):
+    def thinker_to_talker_decode_one_step(self, input_ids, input_embeds, payload: OmniPayload):
+        embed = payload.get("embed", {})
+
         update_dict = {}
         # choose step vector in priority order
         step_vec = None
-        q = info_dict.get("thinker_reply_part", None)
+        q = embed.get("thinker_reply", None)
         if isinstance(q, torch.Tensor) and q.numel() > 0:
             step_vec = q[0:1]
             new_q = q[1:].detach().to("cpu").contiguous()
-            update_dict["thinker_reply_part"] = new_q
+            update_dict.setdefault("embed", {})["thinker_reply"] = new_q
         else:
             # B) per-request provided decode vector (optional)
-            dv = info_dict.get("decode_output_prompt_embeds") if isinstance(info_dict, dict) else None
+            dv = embed.get("decode")
             if isinstance(dv, torch.Tensor) and dv.numel() > 0:
                 step_vec = dv[0:1] if dv.ndim == 2 else dv.view(1, -1)
             elif (

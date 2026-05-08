@@ -23,6 +23,7 @@ from message_convert import (
 from vllm import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -309,7 +310,10 @@ def main(args):
             lines.append("Prompt:\n")
             lines.append(str(prompt_text) + "\n")
             lines.append("vllm_text_output:\n")
-            lines.append(str(text_output).strip() + "\n")
+            output_text = str(text_output)
+            if "<chinese>" in output_text or "<english>" in output_text:
+                output_text = output_text.replace("<chinese>", "").replace("<english>", "").strip()
+            lines.append(output_text + "\n")
             try:
                 with open(out_txt, "w", encoding="utf-8") as f:
                     print("lines", lines)
@@ -351,7 +355,7 @@ def parse_args():
         "--text",
         "-t",
         type=str,
-        default="The weather is so nice today.",
+        default="",
         help="input text",
     )
     parser.add_argument(
@@ -435,6 +439,7 @@ def parse_args():
         "vllm_omni/deploy/mimo_audio.yaml based on the HF model_type.",
     )
 
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

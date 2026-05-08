@@ -1,15 +1,16 @@
 """
 Performance benchmark CI runner for diffusion models.
 
-Supports vLLM-Omni server backend:
-  - vllm-omni (default): starts DiffusionServer via vllm_omni.entrypoints.cli.main,
-    benchmarks with diffusion_benchmark_serving.py --backend vllm-omni
+This runner separates two concepts:
+
+1. ``server_type``: how the serving process is started.
+   Currently only ``vllm-omni`` is supported here.
+2. ``benchmark_backend``: which serving API the benchmark client calls.
+   Examples: ``vllm-omni`` for ``/v1/chat/completions`` and ``v1/videos``
+   for async video jobs.
 
 A config JSON file is REQUIRED via --test-config-file:
   pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
-
-JSON config entries use a "server_type" field, and this runner executes
-the vllm-omni path.
 
 All benchmark results for a session are consolidated into a single JSON file under
 BENCHMARK_RESULT_DIR (override via the DIFFUSION_BENCHMARK_DIR environment variable).
@@ -389,17 +390,18 @@ def _unique_server_params(configs: list[dict[str, Any]]) -> list[dict[str, Any]]
         if test_name in seen:
             continue
         seen.add(test_name)
-        if cfg.get("server_type", "vllm-omni") != "vllm-omni":
-            raise ValueError(f"Unsupported server_type in config: {cfg.get('server_type')}")
+        server_type = cfg.get("server_type", "vllm-omni")
+        if server_type != "vllm-omni":
+            raise ValueError(f"Unsupported server_type in config: {server_type}")
         serve_args_dict = cfg["server_params"].get("serve_args", {})
         result.append(
             {
                 "test_name": test_name,
-                "server_type": "vllm-omni",
+                "server_type": server_type,
                 "model": cfg["server_params"]["model"],
                 "serve_args_dict": serve_args_dict,
                 "serve_args": _build_serve_args(serve_args_dict),
-                "benchmark_backend": "vllm-omni",
+                "benchmark_backend": cfg.get("benchmark_backend"),
                 "server_params": cfg["server_params"],
             }
         )
@@ -499,12 +501,13 @@ def run_benchmark(
 
     log_dir = BENCHMARK_RESULT_DIR / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / f"{test_name}_{backend}_{timestamp}.log"
+    backend_label = backend.replace("/", "_")
+    log_file = log_dir / f"{test_name}_{backend_label}_{timestamp}.log"
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", prefix="diffusion_bench_tmp_", delete=False) as tmp:
         tmp_result_file = Path(tmp.name)
 
-    exclude_keys = {"baseline", "dataset", "task", "name"}
+    exclude_keys = {"baseline", "dataset", "task", "name", "skip-performance-assertion"}
 
     cmd = [
         sys.executable,
@@ -585,6 +588,7 @@ def run_benchmark(
         tmp_result_file.unlink(missing_ok=True)
 
     server_cfg = server_cfg or {}
+    server_type = cast(str, server_cfg.get("server_type", "vllm-omni"))
     serve_args_dict = server_cfg.get("serve_args_dict", {})
     if not isinstance(serve_args_dict, dict):
         serve_args_dict = {}
@@ -601,18 +605,19 @@ def run_benchmark(
         "result": metrics,
         "log_file": str(log_file),
         "Model": model,
-        "Framework": backend,
+        "Framework": server_type,
+        "API Backend": backend,
         "Hardware": "",
         "Deployment": "",
         "Task": params.get("task", "t2i"),
         "Dataset": params.get("dataset", "random"),
         "resolution": _to_resolution_string(params),
-        "Parallelism": _to_parallelism_string(backend, serve_args_dict),
+        "Parallelism": _to_parallelism_string(server_type, serve_args_dict),
         "max_concurrency": params.get("max-concurrency", ""),
-        "Cache": _to_cache_string(backend, serve_args_dict),
-        "Quantization": _to_quantization_value(backend, serve_args_dict),
-        "offload": _to_offload_string(backend, serve_args_dict),
-        "compile": _to_compile_value(backend, serve_args_dict),
+        "Cache": _to_cache_string(server_type, serve_args_dict),
+        "Quantization": _to_quantization_value(server_type, serve_args_dict),
+        "offload": _to_offload_string(server_type, serve_args_dict),
+        "compile": _to_compile_value(server_type, serve_args_dict),
         "Attn_backend": os.environ.get("DIFFUSION_ATTENTION_BACKEND", ""),
         "num_inference_steps": params.get("num-inference-steps", ""),
         "completed": completed,
@@ -652,6 +657,10 @@ def assert_result(result: dict[str, Any], params: dict[str, Any]) -> None:
     completed = result.get("completed_requests", result.get("completed", 0))
     assert completed == num_prompts, f"Expected {num_prompts} completed requests, got {completed}"
 
+    if params.get("skip-performance-assertion", False):
+        print("Skipping performance assertions.")
+        return
+
     for metric, threshold in params.get("baseline", {}).items():
         current = result.get(metric)
         assert current is not None, f"Metric '{metric}' not found in result: {list(result.keys())}"
@@ -659,6 +668,23 @@ def assert_result(result: dict[str, Any], params: dict[str, Any]) -> None:
             assert current >= threshold, f"{metric}: {current:.4f} < baseline {threshold}"
         else:
             assert current <= threshold, f"{metric}: {current:.4f} > baseline {threshold}"
+
+
+def _default_benchmark_backend_for_task(task: str) -> str:
+    """Return the default client-side benchmark backend for a diffusion task."""
+    if task in {"t2v", "i2v", "ti2v"}:
+        return "v1/videos"
+    if task in {"t2i", "i2i", "ti2i"}:
+        return "vllm-omni"
+    raise ValueError(f"Unsupported task for benchmark backend resolution: {task}")
+
+
+def _resolve_benchmark_backend(server_cfg: dict[str, Any], params: dict[str, Any]) -> str:
+    """Resolve which serving API the benchmark client should call."""
+    configured = server_cfg.get("benchmark_backend")
+    if configured:
+        return cast(str, configured)
+    return _default_benchmark_backend_for_task(cast(str, params.get("task", "t2i")))
 
 
 # ---------------------------------------------------------------------------
@@ -685,7 +711,8 @@ def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
     """
     test_name = benchmark_params["test_name"]
     params = benchmark_params["params"]
-    backend = diffusion_server.server_type  # "vllm-omni"
+    server_cfg = getattr(diffusion_server, "server_cfg", {})
+    backend = _resolve_benchmark_backend(server_cfg, params)
 
     result = run_benchmark(
         host=diffusion_server.host,
@@ -694,7 +721,7 @@ def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
         params=params,
         test_name=test_name,
         backend=backend,
-        server_cfg=getattr(diffusion_server, "server_cfg", {}),
+        server_cfg=server_cfg,
         source_file=cast(str, CONFIG_FILE_PATH),
     )
 

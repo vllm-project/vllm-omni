@@ -40,9 +40,6 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
-        from vllm_omni.model_executor.models.voxtral_tts.configuration_voxtral_tts import (
-            VoxtralTTSConfig,
-        )
         from vllm_omni.transformers_utils.configs.voxcpm import VoxCPMConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
@@ -61,7 +58,6 @@ def _register_omni_hf_configs() -> None:
         ("qwen3_tts", Qwen3TTSConfig),
         ("cosyvoice3", CosyVoice3Config),
         ("omnivoice", OmniVoiceConfig),
-        ("voxtral_tts", VoxtralTTSConfig),
         ("voxcpm", VoxCPMConfig),
         ("voxcpm2", VoxCPM2Config),
     ]:
@@ -185,7 +181,25 @@ class OmniEngineArgs(EngineArgs):
     def from_cli_args(cls, args: argparse.Namespace) -> "OmniEngineArgs":
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         engine_args = cls(**{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)})
+        engine_args._explicit_fields = frozenset(
+            attr for attr in attrs if hasattr(args, attr) and getattr(args, attr) is not None
+        )
         return engine_args
+
+    @classmethod
+    def create(cls, **explicit: Any) -> "OmniEngineArgs":
+        """Tracks caller-set fields for ``Omni(..., engine_args=ea)``."""
+        ea = cls(**explicit)
+        ea._explicit_fields = frozenset(explicit.keys())
+        return ea
+
+    def explicit_kwargs(self) -> dict[str, Any]:
+        explicit = getattr(self, "_explicit_fields", None)
+        if explicit is None:
+            return {
+                f.name: getattr(self, f.name) for f in dataclasses.fields(self) if getattr(self, f.name) is not None
+            }
+        return {k: getattr(self, k) for k in explicit}
 
     def _ensure_omni_models_registered(self):
         if hasattr(self, "_omni_models_registered"):
@@ -424,10 +438,9 @@ class OrchestratorArgs:
     parallel_config: Any = None
 
     # === Multi-stage guards ===
-    # --tokenizer is captured here so it does not propagate to every stage
-    # uniformly (different stages often need different tokenizers, e.g.
-    # qwen3_omni thinker vs talker). Users wanting a per-stage tokenizer
-    # should set it in the deploy YAML.
+    # --tokenizer is captured by the orchestrator and forwarded to stages
+    # only when the stage does not define tokenizer/tokenizer_subdir itself.
+    # Users wanting a per-stage tokenizer should set it in the deploy YAML.
     tokenizer: str | None = None
 
 
@@ -595,3 +608,25 @@ def orchestrator_args_from_argparse(args: Any) -> OrchestratorArgs:
             if value is not None or f.default is None:
                 kwargs[f.name] = value
     return OrchestratorArgs(**kwargs)
+
+
+def nullify_stage_engine_defaults(parser: argparse.ArgumentParser) -> None:
+    """Reset stage-level engine flag defaults to ``None``; preserve real
+    default in help text. Only deploy-YAML override fields are touched.
+    Idempotent."""
+    from vllm_omni.config.stage_config import deploy_override_field_names
+
+    override_dests = deploy_override_field_names()
+
+    for action in parser._actions:
+        if action.dest in ("help", "version") or not action.option_strings:
+            continue
+        if action.dest not in override_dests:
+            continue
+        if action.default is None or action.default is argparse.SUPPRESS:
+            continue
+        if action.help and "(default:" not in action.help and "%(default)" not in action.help:
+            action.help = f"{action.help} (default: {action.default})"
+        action.default = None
+
+    parser._omni_nullified = True  # type: ignore[attr-defined]

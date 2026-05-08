@@ -130,9 +130,21 @@ Warmup flags:
 
 - `--warmup-requests`: Number of warmup requests.
 - `--warmup-num-inference-steps`: Steps used during warmup.
+- `--warmup-concurrency`: Maximum concurrent warmup requests. Use this to warm
+  the same batch shape as the measured run instead of warming only batch=`1`.
 - For `--task t2v`: warmup requests are forced to use `num_frames=1` to make warmup faster and less noisy.
 
 Traffic / concurrency flags:
 
 - `--request-rate`: Target request rate (requests/second). If set to `inf`, the script sends all requests immediately.
 - `--max-concurrency`: Max number of in-flight requests (default: `1`). This can hard-cap the achieved QPS: if it is too small, requests will queue behind the semaphore, and both achieved throughput and observed SLO attainment can be skewed.
+
+### Batched warmup note
+
+For batched serving runs, warm the same in-flight shape you plan to measure.
+For example, a run with `--max-concurrency 8` should usually also use
+`--warmup-requests 8 --warmup-concurrency 8`; otherwise the first measured
+batch may still pay compile or CUDA-graph capture cost.
+
+For a Qwen-Image continuous-batching replay example, see
+[`performance_dashboard/qwen_image_serving_performance.md`](./performance_dashboard/qwen_image_serving_performance.md).

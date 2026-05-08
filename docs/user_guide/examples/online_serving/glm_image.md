@@ -1,99 +1,96 @@
 # GLM-Image Online Serving
 
-Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/glm_image>.
+GLM-Image is a 2-stage image generation model (AR + Diffusion) supported by vLLM-Omni's
+declarative config system. The pipeline topology and stage structure are declared in
+`vllm_omni/model_executor/models/glm_image/pipeline.py`; deployment knobs (GPU placement,
+memory, sampling params) live in `vllm_omni/deploy/glm_image.yaml`.
 
-
-This example demonstrates how to deploy GLM-Image for online image generation using vLLM-Omni.
-
-## 🛠️ Installation
-
-Please refer to [README.md](https://github.com/vllm-project/vllm-omni/tree/main/README.md)
-
-## Run examples (GLM-Image)
-
-**Note**: These examples work with the default configuration on **2× NVIDIA A100 (80GB)** or equivalent. Stage 0 (AR) and Stage 1 (Diffusion) each use one GPU by default. For single-GPU setups, modify the stage configuration to share the same device.
-
-### Launch the Server
+## Start Server
 
 ```bash
-# Use default configuration
 vllm serve zai-org/GLM-Image --omni --port 8091
 ```
 
-Or use the convenience script:
+The config system auto-detects the pipeline from the model's `model_index.json` — no
+manual `--stage-configs-path` or `--deploy-config` needed.
+
+By default, stage 0 (AR) runs on GPU 0 and stage 1 (Diffusion) on GPU 1. To colocate
+both stages on a single GPU, override per stage:
 
 ```bash
-cd examples/online_serving/glm_image
-bash run_server.sh
+vllm serve zai-org/GLM-Image --omni --port 8091 \
+    --stage-0-devices 0 --stage-1-devices 0
 ```
 
-If you have a custom stage configs file:
-
-```bash
-vllm serve zai-org/GLM-Image --omni --port 8091 --stage-configs-path /path/to/glm_image.yaml
-```
-
-### Send Requests
-
-Get into the glm_image folder:
-
-```bash
-cd examples/online_serving/glm_image
-```
-
-Send request via Python:
-
-```bash
-python openai_chat_client.py --prompt "A cute cat sitting on a window sill"
-```
-
-The Python client supports the following command-line arguments:
-
-- `--prompt` (or `-p`): Text prompt for generation (default: `A beautiful sunset over the ocean with sailing boats`)
-- `--output` (or `-o`): Output file path (default: `glm_image_output.png`)
-- `--server` (or `-s`): Server URL (default: `http://localhost:8091`)
-- `--image` (or `-i`): Input image path (for image-to-image editing)
-- `--height`: Image height in pixels (default: 1024)
-- `--width`: Image width in pixels (default: 1024)
-- `--steps`: Number of inference steps (default: 50)
-- `--guidance-scale`: Classifier-free guidance scale (default: 1.5)
-- `--seed`: Random seed (default: 42)
-- `--negative`: Negative prompt
-
-## Modality Control
-
-GLM-Image supports **text-to-image** and **image-to-image** modes.
-
-The default yaml configuration deploys AR on GPU 0 and DiT on GPU 1. You can use the default configuration file: [`glm_image.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/model_executor/stage_configs/glm_image.yaml)
-
-| Mode           | Input        | Output | Description                        |
-| -------------- | ------------ | ------ | ---------------------------------- |
-| Text-to-Image  | Text         | Image  | Generate images from text prompts  |
-| Image-to-Image | Image + Text | Image  | Edit images with text instructions |
+## API Calls
 
 ### Text-to-Image
 
 ```bash
-python openai_chat_client.py \
-    --prompt "A photorealistic mountain landscape at sunset" \
-    --height 1024 \
-    --width 1024 \
-    --output landscape.png
-
-# Or use the curl script:
-bash run_curl_text_to_image.sh "A futuristic city skyline at night"
+curl -s http://localhost:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "A photorealistic mountain landscape at sunset"}
+    ],
+    "extra_body": {
+      "height": 1024,
+      "width": 1024,
+      "num_inference_steps": 50,
+      "guidance_scale": 1.5,
+      "seed": 42
+    }
+  }' | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2- | base64 -d > output.png
 ```
 
 ### Image-to-Image (Image Editing)
 
 ```bash
-python openai_chat_client.py \
-    --prompt "Convert this image to watercolor style" \
-    --image input.png \
-    --output watercolor.png
+curl -s http://localhost:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "text": "Convert this image to watercolor style"},
+          {"type": "image_url", "image_url": {"url": "data:image/png;base64,$(base64 -w0 input.png)}"}
+        ]
+      }
+    ],
+    "extra_body": {
+      "height": 1024,
+      "width": 1024,
+      "num_inference_steps": 50,
+      "guidance_scale": 1.5
+    }
+  }' | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2- | base64 -d > output.png
+```
 
-# Or use the curl script:
-bash run_curl_image_edit.sh input.png "Convert to watercolor style"
+### Using the OpenAI Python SDK
+
+```python
+from openai import OpenAI
+import base64
+
+client = OpenAI(base_url="http://localhost:8091/v1", api_key="none")
+
+response = client.chat.completions.create(
+    model="zai-org/GLM-Image",
+    messages=[{"role": "user", "content": "A beautiful sunset over the ocean"}],
+    extra_body={
+        "height": 1024,
+        "width": 1024,
+        "num_inference_steps": 50,
+        "guidance_scale": 1.5,
+        "seed": 42,
+    },
+)
+
+img_url = response.choices[0].message.content[0].image_url.url
+_, b64_data = img_url.split(",", 1)
+with open("output.png", "wb") as f:
+    f.write(base64.b64decode(b64_data))
 ```
 
 For general-purpose request methods (curl, OpenAI SDK, Python `requests`), see
@@ -116,7 +113,7 @@ dimensions and count, use `size` and `n` rather than `height` or `width`.
 | `width`               | int   | 1024    | Image width in pixels               |
 | `num_inference_steps` | int   | 50      | Number of diffusion denoising steps |
 | `guidance_scale`      | float | 1.5     | Classifier-free guidance scale      |
-| `seed`                | int   | None    | Optional random seed; `/v1/images/*` generates one server-side if omitted |
+| `seed`                | int   | None    | Optional random seed                |
 | `negative_prompt`     | str   | None    | Negative prompt                     |
 
 ## Response Format
@@ -150,13 +147,12 @@ dimensions and count, use `size` and `n` rather than `height` or `width`.
 ## Extract Image
 
 ```bash
-# From a saved JSON response
 cat response.json | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2- | base64 -d > output.png
 ```
 
 ## Architecture
 
-GLM-Image uses a 2-stage multistage pipeline:
+GLM-Image uses a 2-stage pipeline:
 
 ```
 Stage 0 (AR Model)                Stage 1 (Diffusion)
@@ -181,41 +177,13 @@ Stage 0 (AR Model)                Stage 1 (Diffusion)
 | Stage-1 (DiT+VAE) | **~20 GiB**            |
 | Total             | **~38 GiB + KV Cache** |
 
-## File Description
-
-| File                        | Description                           |
-| --------------------------- | ------------------------------------- |
-| `run_server.sh`             | Server startup script                 |
-| `run_curl_text_to_image.sh` | Text-to-image curl example            |
-| `run_curl_image_edit.sh`    | Image-to-image (editing) curl example |
-| `openai_chat_client.py`     | Python client (t2i + i2i)             |
-
 ## FAQ
 
-- If you encounter OOM errors, adjust `gpu_memory_utilization` in the stage config:
+- If you encounter OOM errors, adjust `gpu_memory_utilization` in the deploy config:
 
 ```yaml
-# In glm_image.yaml, reduce from default 0.6:
+# In vllm_omni/deploy/glm_image.yaml, reduce from default 0.6:
 gpu_memory_utilization: 0.5
 ```
 
 - The first request may be slow due to model warmup. Subsequent requests will be faster.
-
-## Example materials
-
-??? abstract "openai_chat_client.py"
-    ``````py
-    --8<-- "examples/online_serving/glm_image/openai_chat_client.py"
-    ``````
-??? abstract "run_curl_image_edit.sh"
-    ``````sh
-    --8<-- "examples/online_serving/glm_image/run_curl_image_edit.sh"
-    ``````
-??? abstract "run_curl_text_to_image.sh"
-    ``````sh
-    --8<-- "examples/online_serving/glm_image/run_curl_text_to_image.sh"
-    ``````
-??? abstract "run_server.sh"
-    ``````sh
-    --8<-- "examples/online_serving/glm_image/run_server.sh"
-    ``````

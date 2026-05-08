@@ -115,6 +115,12 @@ def parse_args() -> argparse.Namespace:
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
     parser.add_argument(
+        "--enable-cpu-offload", action="store_true", help="Enable ModelWise cpu offloading to save gpu memory"
+    )
+    parser.add_argument(
+        "--enable-layerwise-offload", action="store_true", help="Enable Layerwise cpu offloading to save gpu memory"
+    )
+    parser.add_argument(
         "--use-hsdp",
         action="store_true",
         help="Enable HSDP for Stable Audio DiT weight sharding.",
@@ -130,6 +136,44 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of HSDP replica groups. Default 1 means pure sharding.",
+    )
+    parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+    )
+    parser.add_argument(
+        "--ulysses-degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ulysses sequence parallelism.",
+    )
+    parser.add_argument(
+        "--ulysses-mode",
+        type=str,
+        default="strict",
+        choices=["strict", "advanced_uaa"],
+        help="Ulysses sequence-parallel mode: 'strict' (divisibility required) or 'advanced_uaa' (UAA).",
+    )
+    parser.add_argument(
+        "--ring-degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ring sequence parallelism.",
+    )
+    parser.add_argument(
+        "--cfg-parallel-size",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Number of GPUs used for classifier free guidance parallel size.",
+    )
+    parser.add_argument(
+        "--vae-patch-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for VAE patch/tile parallelism (decode).",
     )
     return parser.parse_args()
 
@@ -176,6 +220,8 @@ def main():
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Guidance scale: {args.guidance_scale}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    print(f"  ModelWise Offload: {'Enabled' if args.enable_cpu_offload else 'None'}")
+    print(f"  LayerWise Offload: {'Enabled' if args.enable_layerwise_offload else 'None'}")
     if args.use_hsdp:
         print(f"  HSDP: enabled (shard_size={args.hsdp_shard_size}, replicate_size={args.hsdp_replicate_size})")
     else:
@@ -196,6 +242,8 @@ def main():
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
+        enable_cpu_offload=args.enable_cpu_offload,
+        enable_layerwise_offload=args.enable_layerwise_offload,
     )
 
     # Calculate audio end time

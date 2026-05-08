@@ -17,7 +17,7 @@ Both strategies use pinned memory for faster CPU-GPU transfers. The strategies a
 Model-level offloading implements mutual exclusion between DiT transformer and encoder modules using pre forward hooks:
 
 - **When encoders run**: DiT transformer is offloaded to CPU
-- **When DiT runs**: Encoders are offloaded to CPU
+- **When DiT runs**: Encoders are offloaded to CPU, if more than one dit models, only one loaded on GPU, others get offloaded to CPU.
 - **VAE**: Stays resident on GPU
 
 Before each module's forward pass, the hook automatically moves it to GPU while offloading the other module group to CPU. Transfers use pinned memory for speed.
@@ -195,6 +195,7 @@ Factory function `get_offload_backend()` selects the appropriate backend based o
 | StableDiffusion3Pipeline | `stabilityai/stable-diffusion-3.5-medium` | `SD3Transformer2DModel` | - | ✓ | `"transformer_blocks"` |
 | Wan22I2VPipeline | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
 | Wan22Pipeline | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `WanTransformer3DModel` | ✓ | ✓ | `"blocks"` |
+| BagelPipeline | `ByteDance-Seed/BAGEL-7B-MoT` | `Qwen2MoTModel` | - | ✓ | `"layers"`, `"customized modules"` |
 
 **Notes:**
 - Model-Level Offloading is expected to be supported by all common diffusion models (DiT and encoders) naturally

@@ -38,7 +38,7 @@ def default_comprehension_params():
         temperature=0.4,
         top_p=0.9,
         top_k=1,
-        max_tokens=2048,
+        max_tokens=4353,
         seed=42,
         repetition_penalty=1.05,
     )
@@ -146,7 +146,7 @@ def test_preserves_yaml_defaults_when_no_request_params(serving_chat, mock_reque
     assert comprehension_params.temperature == 0.4
     assert comprehension_params.top_p == 0.9
     assert comprehension_params.top_k == 1  # YAML custom param preserved
-    assert comprehension_params.max_tokens == 2048
+    assert comprehension_params.max_tokens == 4353
     assert comprehension_params.seed == 42
     assert comprehension_params.repetition_penalty == 1.05  # YAML custom param preserved
 
@@ -190,7 +190,7 @@ def test_max_tokens_uses_yaml_default_when_not_specified(serving_chat, mock_requ
     """Test that max_tokens falls back to YAML default when not in request."""
     result = serving_chat._build_sampling_params_list_from_request(mock_request)
 
-    assert result[0].max_tokens == 2048
+    assert result[0].max_tokens == 4353
 
 
 def test_request_seed_overrides_yaml_default(serving_chat, mock_request):
@@ -588,12 +588,17 @@ class TestResolveHeightWidth:
 
 
 # =============================================================================
-# Tests for _apply_request_overrides with GLM-Image (max_tokens computation)
+# Tests for _apply_request_overrides with GLM-Image (target_h/w injection)
 # =============================================================================
 
 
 class TestApplyRequestOverridesGLMImage:
-    """Test dynamic max_tokens computation for GLM-Image AR stage."""
+    """Test target_h/w injection for GLM-Image AR stage.
+
+    max_tokens is NOT computed dynamically — it comes from the deploy YAML
+    default (e.g. 4353). _apply_request_overrides only injects target_h/w
+    into extra_args so the model can build M-RoPE position grids.
+    """
 
     @pytest.fixture
     def glm_serving_chat(self, mock_engine_client, mocker: MockerFixture):
@@ -601,7 +606,6 @@ class TestApplyRequestOverridesGLMImage:
 
         instance = object.__new__(OmniOpenAIServingChat)
         instance.engine_client = mock_engine_client
-        # Mock the image extraction to return no reference images (t2i by default)
         instance._extract_diffusion_prompt_and_images_from_messages = mocker.MagicMock(return_value=("a cat", []))
         return instance
 
@@ -623,40 +627,41 @@ class TestApplyRequestOverridesGLMImage:
         req.model_fields_set = set()
         return req
 
-    def test_t2i_computes_max_tokens(self, glm_serving_chat, glm_request, default_comprehension_params):
-        """t2i mode: max_tokens computed from height/width, no reference images."""
+    def test_t2i_injects_target_h_w(self, glm_serving_chat, glm_request, default_comprehension_params):
+        """t2i mode: target_h/w injected into extra_args, max_tokens unchanged."""
         result = glm_serving_chat._apply_request_overrides(default_comprehension_params, glm_request)
-        # t2i 1024x1024 = 256 + 1024 + 1 = 1281
-        assert result.max_tokens == 1281
         assert result.extra_args["target_h"] == 1024
         assert result.extra_args["target_w"] == 1024
+        # max_tokens stays at YAML default (not dynamically computed)
+        assert result.max_tokens == 4353
 
-    def test_i2i_computes_fewer_tokens(
+    def test_i2i_injects_target_h_w(
         self, glm_serving_chat, glm_request, default_comprehension_params, mocker: MockerFixture
     ):
-        """i2i mode: max_tokens should be smaller than t2i for same dimensions."""
-        # Make it detect reference images
+        """i2i mode: target_h/w injected, max_tokens unchanged."""
         glm_serving_chat._extract_diffusion_prompt_and_images_from_messages = mocker.MagicMock(
             return_value=("edit this", ["fake_image"])
         )
-
         result = glm_serving_chat._apply_request_overrides(default_comprehension_params, glm_request)
-        # i2i 1024x1024 = 1024 + 1 = 1025
-        assert result.max_tokens == 1025
+        assert result.extra_args["target_h"] == 1024
+        assert result.extra_args["target_w"] == 1024
+        # max_tokens stays at YAML default regardless of t2i/i2i
+        assert result.max_tokens == 4353
 
-    def test_dynamic_max_tokens_overrides_user_value(self, glm_serving_chat, glm_request, default_comprehension_params):
-        """When height/width are provided, dynamic computation overrides user max_tokens."""
+    def test_user_max_tokens_preserved(self, glm_serving_chat, glm_request, default_comprehension_params):
+        """User-provided max_tokens is respected (not overridden by dynamic computation)."""
         glm_request.max_tokens = 500
         glm_request.model_fields_set = {"max_tokens"}
 
         result = glm_serving_chat._apply_request_overrides(default_comprehension_params, glm_request)
-        # Dynamic computation from height/width always wins when present
-        assert result.max_tokens == 1281
+        assert result.max_tokens == 500
+        assert result.extra_args["target_h"] == 1024
+        assert result.extra_args["target_w"] == 1024
 
     def test_no_height_width_preserves_default(
         self, glm_serving_chat, mocker: MockerFixture, default_comprehension_params
     ):
-        """When no height/width in extra_body, keep YAML default max_tokens."""
+        """When no height/width in extra_body, keep YAML default max_tokens, no target_h/w."""
         req = mocker.MagicMock()
         req.temperature = None
         req.top_p = None
@@ -673,7 +678,9 @@ class TestApplyRequestOverridesGLMImage:
         req.model_fields_set = set()
 
         result = glm_serving_chat._apply_request_overrides(default_comprehension_params, req)
-        assert result.max_tokens == 2048  # YAML default
+        assert result.max_tokens == 4353  # YAML default
+        # No target_h/w injected when dimensions not provided
+        assert not result.extra_args or "target_h" not in (result.extra_args or {})
 
     def test_size_string_parsed_for_glm_image(
         self, glm_serving_chat, mocker: MockerFixture, default_comprehension_params
@@ -695,5 +702,7 @@ class TestApplyRequestOverridesGLMImage:
         req.model_fields_set = set()
 
         result = glm_serving_chat._apply_request_overrides(default_comprehension_params, req)
-        # 512x512 t2i = 256 + 256 + 1 = 513
-        assert result.max_tokens == 513
+        assert result.extra_args["target_h"] == 512
+        assert result.extra_args["target_w"] == 512
+        # max_tokens stays at YAML default (not dynamically computed)
+        assert result.max_tokens == 4353

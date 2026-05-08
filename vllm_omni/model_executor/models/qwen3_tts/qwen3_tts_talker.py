@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-import dataclasses
+import copy
 import io
 import os
 from collections.abc import Callable, Iterable, Mapping
@@ -26,9 +26,10 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, 
 from vllm.multimodal.audio import AudioResampler
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.audio import mel_filter_bank
-from vllm_omni.utils.voice_cache import VoiceEmbeddingCache
+from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
@@ -343,7 +344,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self.mtp_hidden_size = int(self.talker_config.hidden_size)
         # OmniGPUModelRunner will store talker_mtp output under this key in
         # per-request additional_information.
-        self.talker_mtp_output_key = "audio_codes"
+        self.talker_mtp_output_key = ("codes", "audio")
 
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
 
@@ -370,16 +371,30 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             bias=True,
         )
 
-        # Speaker encoder is only needed for Base voice cloning and may be missing in some checkpoints.
-        # Keep it optional to avoid strict weight-loading failures.
-        self.speaker_encoder: Qwen3TTSSpeakerEncoder | None = None
+        # Initialize speaker_encoder from config (random weights).
+        # For load_format: dummy this is the final state; for normal loading,
+        # load_weights() overwrites with real weights when the checkpoint
+        # provides speaker_encoder.* tensors. Constructing eagerly here
+        # (rather than lazily inside load_weights) ensures voice-cloning code
+        # paths work under load_format: dummy, which bypasses load_weights
+        # entirely (DummyModelLoader fills existing params in-place and never
+        # iterates a checkpoint).
+        self.speaker_encoder = Qwen3TTSSpeakerEncoder(self.config.speaker_encoder_config)
 
         # Code predictor uses an isolated vLLM config so its KV cache doesn't
         # pollute the main engine's static_forward_context (shallow-copy shares
         # the dict by reference — must assign a fresh one).
-        predictor_compilation = dataclasses.replace(vllm_config.compilation_config)
+        # Use copy.copy rather than dataclasses.replace: CompilationConfig /
+        # VllmConfig are pydantic dataclasses, so `replace` re-runs
+        # __init__→pydantic validators + __post_init__. If a backend has
+        # already rebound compilation_config.backend to a non-stock value, the
+        # piecewise-backend validator in vllm/config/compilation.py rejects it
+        # and the clone raises. copy.copy goes through __reduce_ex__, skips
+        # validation, and leaves the parent's already-initialized state intact.
+        predictor_compilation = copy.copy(vllm_config.compilation_config)
         predictor_compilation.static_forward_context = {}
-        self._code_predictor_vllm_config = dataclasses.replace(vllm_config, compilation_config=predictor_compilation)
+        self._code_predictor_vllm_config = copy.copy(vllm_config)
+        self._code_predictor_vllm_config.compilation_config = predictor_compilation
         from vllm.config.vllm import set_current_vllm_config as _set_cfg
 
         with _set_cfg(self._code_predictor_vllm_config):
@@ -402,19 +417,18 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         # Keys that should stay on GPU in model_intermediate_buffer to avoid
         # CPU-to-GPU round-trips on every decode step.
-        self.gpu_resident_buffer_keys: set[str] = {
-            "audio_codes",
-            "last_talker_hidden",
-            "tts_pad_embed",
-            "tailing_text_hidden",
+        self.gpu_resident_buffer_keys: set[tuple[str, str]] = {
+            ("codes", "audio"),
+            ("hidden_states", "last"),
+            ("embed", "tts_pad"),
+            ("hidden_states", "trailing_text"),
         }
 
         # Tokenizer for prompt building.
         self._tokenizer = None
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
 
-        # In-memory LRU cache for voice extraction artifacts (Base voice clone).
-        self._voice_cache = VoiceEmbeddingCache()
+        self._speaker_cache = get_speaker_cache()
         raw_subtalker_sampling = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
         self._subtalker_sampling_params: dict[str, Any] = (
             dict(raw_subtalker_sampling) if isinstance(raw_subtalker_sampling, Mapping) else {}
@@ -475,18 +489,20 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         for info in info_dicts:
             if not isinstance(info, dict):
                 continue
-            ac = info.get("audio_codes")
+            codes = info.get("codes", {})
+            meta = info.get("meta", {})
+            ac = codes.get("audio")
             if isinstance(ac, torch.Tensor):
                 audio_codes_list.append(ac)
-                cs = info.get("codec_streaming")
+                cs = meta.get("codec_streaming")
                 if isinstance(cs, bool):
                     codec_streaming_list.append(
                         torch.full((int(ac.shape[0]),), int(cs), dtype=torch.int8, device=ac.device)
                     )
-            ref_code = info.get("ref_code")
+            ref_code = codes.get("ref")
             if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
                 ref_code_tensor = ref_code
-            ref_len = info.get("ref_code_len")
+            ref_len = meta.get("ref_code_len")
             if ref_len is None:
                 continue
             if isinstance(ref_len, torch.Tensor):
@@ -511,13 +527,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         audio_codes = torch.cat(audio_codes_list, dim=0)
         span_len = int(audio_codes.shape[0])
         hidden = hidden[:span_len]
-        mm: dict[str, torch.Tensor] = {"audio_codes": audio_codes}
+        mm: OmniPayload = {"codes": {"audio": audio_codes}}
         if ref_code_len_list:
-            mm["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:span_len]
+            mm.setdefault("meta", {})["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:span_len]
         if ref_code_tensor is not None:
-            mm["ref_code"] = [ref_code_tensor]
+            mm.setdefault("codes", {})["ref"] = [ref_code_tensor]
         if codec_streaming_list:
-            mm["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:span_len]
+            mm.setdefault("meta", {})["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:span_len]
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
 
     # -------------------- preprocess / postprocess --------------------
@@ -536,6 +552,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 merged.setdefault(k, v)
             info_dict = merged
 
+        payload: OmniPayload = info_dict
+        embed = payload.get("embed", {})
+        hs = payload.get("hidden_states", {})
+        meta = payload.get("meta", {})
+
         span_len = int(input_ids.shape[0])
         if span_len <= 0:
             return input_ids, input_embeds if input_embeds is not None else self.embed_input_ids(input_ids), {}
@@ -545,7 +566,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             raise ValueError("Missing additional_information.text for Qwen3-TTS AR talker.")
 
         task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
-        codec_streaming_val = info_dict.get("codec_streaming")
+        codec_streaming_val = meta.get("codec_streaming")
         if isinstance(codec_streaming_val, list):
             codec_streaming_raw = codec_streaming_val[0] if codec_streaming_val else None
         else:
@@ -557,8 +578,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         if span_len > 1:
             # Prefill (prompt embeddings)
-            prompt_embeds_cpu = info_dict.get("talker_prompt_embeds")
-            tts_pad_embed_cpu = info_dict.get("tts_pad_embed")
+            prompt_embeds_cpu = embed.get("prefill")
+            tts_pad_embed_cpu = embed.get("tts_pad")
             tts_pad_embed = None
             if isinstance(tts_pad_embed_cpu, torch.Tensor) and tts_pad_embed_cpu.numel() > 0:
                 tts_pad_embed = tts_pad_embed_cpu.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
@@ -573,17 +594,18 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 # Store full prompt embeddings on CPU (large, prefill-only).
                 # tailing_text_hidden and tts_pad_embed stay on GPU (gpu_resident_buffer_keys).
                 prompt_embeds_cpu = full_prompt_embeds.detach().to("cpu").contiguous()
-                info_update: dict[str, Any] = {
-                    "talker_prompt_embeds": prompt_embeds_cpu,
-                    "tailing_text_hidden": tailing_text_hidden.detach(),
-                    "tts_pad_embed": tts_pad_embed.detach(),
-                    "talker_prefill_offset": 0,
-                    "codec_streaming": codec_streaming,
+                info_update: OmniPayload = {
+                    "embed": {
+                        "prefill": prompt_embeds_cpu,
+                        "tts_pad": tts_pad_embed.detach(),
+                    },
+                    "hidden_states": {"trailing_text": tailing_text_hidden.detach()},
+                    "meta": {"talker_prefill_offset": 0, "codec_streaming": codec_streaming},
                 }
                 if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-                    info_update["ref_code"] = ref_code.detach().to("cpu").contiguous()
+                    info_update.setdefault("codes", {})["ref"] = ref_code.detach().to("cpu").contiguous()
                 if ref_code_len is not None:
-                    info_update["ref_code_len"] = int(ref_code_len)
+                    info_update["meta"]["ref_code_len"] = int(ref_code_len)
                 # Always return a span_len slice; if the scheduled placeholder is longer, pad with tts_pad_embed.
                 # This preserves placeholder/embedding alignment.
                 offset = 0
@@ -595,12 +617,12 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
                     take = torch.cat([take, pad_rows], dim=0)
                 prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
-                info_update["talker_prefill_offset"] = int(offset + span_len)
+                info_update["meta"]["talker_prefill_offset"] = int(offset + span_len)
             else:
                 # Subsequent prefill chunk: slice from stored embeddings at running offset.
                 if tts_pad_embed is None:
                     raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must initialize it.")
-                offset = int(info_dict.get("talker_prefill_offset", 0) or 0)
+                offset = int(meta.get("talker_prefill_offset", 0) or 0)
                 if offset < 0:
                     offset = 0
                 s = max(0, min(offset, int(prompt_embeds_cpu.shape[0])))
@@ -611,8 +633,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                     pad_rows = tts_pad_embed.reshape(1, -1).to("cpu").expand(pad_n, -1)
                     take = torch.cat([take, pad_rows], dim=0)
                 prompt_embeds = take.to(device=input_ids.device, dtype=torch.bfloat16)
-                info_update = {"talker_prefill_offset": int(offset + span_len)}
-                info_update["codec_streaming"] = codec_streaming
+                info_update = {
+                    "meta": {"talker_prefill_offset": int(offset + span_len), "codec_streaming": codec_streaming}
+                }
 
             # When inputs_embeds is set, token ids are ignored by the model but must stay in-vocab for vLLM bookkeeping.
             input_ids_out = input_ids.clone()
@@ -623,18 +646,18 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 device=input_ids.device,
                 dtype=torch.long,
             )
-            info_update["audio_codes"] = zeros
+            info_update.setdefault("codes", {})["audio"] = zeros
             return input_ids_out, prompt_embeds, info_update
 
         # Decode: span_len == 1
         # Pop one text-step vector from tailing_text_hidden queue.
         # These tensors stay on GPU via gpu_resident_buffer_keys - .to() is a no-op.
-        tts_pad_embed_buf = info_dict.get("tts_pad_embed")
+        tts_pad_embed_buf = embed.get("tts_pad")
         if not isinstance(tts_pad_embed_buf, torch.Tensor):
             raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must run first.")
         tts_pad_embed = tts_pad_embed_buf.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
 
-        tail = info_dict.get("tailing_text_hidden")
+        tail = hs.get("trailing_text")
         if isinstance(tail, torch.Tensor) and tail.ndim == 2 and tail.shape[0] > 0:
             text_step = tail[:1].to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
             new_tail = tail[1:] if tail.shape[0] > 1 else tail[:0]
@@ -642,9 +665,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             text_step = tts_pad_embed
             new_tail = tail if isinstance(tail, torch.Tensor) else torch.empty((0, tts_pad_embed.shape[-1]))
 
-        last_hidden = info_dict.get("last_talker_hidden")
+        last_hidden = hs.get("last")
         if not isinstance(last_hidden, torch.Tensor):
-            raise RuntimeError("Missing `last_talker_hidden` in additional_information; postprocess must run.")
+            raise RuntimeError("Missing hidden_states['last'] in additional_information; postprocess must run.")
         past_hidden = last_hidden.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
 
         # Use OmniGPUModelRunner talker_mtp fast-path for residual codebooks and per-step inputs_embeds update.
@@ -654,9 +677,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         inputs_embeds_out = last_id_hidden.reshape(1, -1)
 
         info_update = {
-            "tailing_text_hidden": new_tail,
+            "hidden_states": {"trailing_text": new_tail},
             "mtp_inputs": (past_hidden, text_step),
-            "codec_streaming": codec_streaming,
+            "meta": {"codec_streaming": codec_streaming},
         }
         return input_ids, inputs_embeds_out, info_update
 
@@ -666,7 +689,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         if hidden_states.numel() == 0:
             return {}
         last = hidden_states[-1, :].detach()
-        return {"last_talker_hidden": last}
+        return {"hidden_states": {"last": last}}
 
     # -------------------- prompt construction helpers --------------------
 
@@ -1081,11 +1104,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         return wav_np, sr
 
     def _extract_speaker_embedding(self, wav: np.ndarray, sr: int) -> torch.Tensor:
-        if self.speaker_encoder is None:
-            raise ValueError(
-                "This checkpoint does not provide `speaker_encoder` weights; "
-                "cannot compute ref_spk_embedding from ref_audio."
-            )
         # vLLM workers do not automatically move arbitrary torch.nn.Modules to
         # CUDA. Ensure the speaker encoder is on the same device/dtype as the
         # main model before running it.
@@ -1345,23 +1363,36 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             in_context_mode = not xvec_only
             voice_clone_prompt = _normalize_voice_clone_prompt(info_dict.get("voice_clone_prompt"))
 
-            # Voice cache: only for uploaded voices (created_at > 0)
-            _voice_cache_key = None
+            # Speaker cache: only for uploaded (named) speakers
+            _speaker_cache_key = None
             if voice_clone_prompt is None:
                 _speaker_list = info_dict.get("speaker")
                 if isinstance(_speaker_list, list) and _speaker_list:
                     _voice_name = str(_speaker_list[0]).lower()
-                    _voice_created_at = float((info_dict.get("voice_created_at") or [0])[0])
-                    if _voice_created_at > 0:
-                        _voice_cache_key = self._voice_cache.make_cache_key(_voice_name, xvec_only, _voice_created_at)
-                    _cached = self._voice_cache.get(_voice_cache_key) if _voice_cache_key is not None else None
+                    # Per-mode namespace — xvec and icl produce different artifacts
+                    # for the same voice, so they must not share a cache slot.
+                    _mode = "xvec" if xvec_only else "icl"
+                    _voice_created_at = int((info_dict.get("voice_created_at") or [0])[0])
+                    _speaker_cache_key = self._speaker_cache.make_cache_key(
+                        _voice_name,
+                        model_type=f"qwen3_tts_{_mode}",
+                        created_at=_voice_created_at,
+                    )
+                    _cached = self._speaker_cache.get(_speaker_cache_key)
                     if _cached is not None:
+                        # Transfer cached tensors to current device
+                        ref_code_cached = _cached.get("ref_code")
+                        ref_spk_embed_cached = _cached.get("ref_spk_embedding")
+                        if isinstance(ref_code_cached, torch.Tensor):
+                            ref_code_cached = ref_code_cached.to(device=input_ids.device)
+                        if isinstance(ref_spk_embed_cached, torch.Tensor):
+                            ref_spk_embed_cached = ref_spk_embed_cached.to(device=input_ids.device)
                         voice_clone_prompt = {
-                            "ref_code": _cached.get("ref_code"),
-                            "ref_spk_embedding": _cached.get("ref_spk_embedding"),
+                            "ref_code": ref_code_cached,
+                            "ref_spk_embedding": ref_spk_embed_cached,
                             "icl_mode": _cached.get("icl_mode"),
                         }
-                        _voice_cache_key = None  # hit -> don't store again
+                        _speaker_cache_key = None  # hit → don't store again
 
             # Official implementation may pass `voice_clone_prompt.icl_mode`.
             if voice_clone_prompt is not None and "icl_mode" in voice_clone_prompt:
@@ -1413,9 +1444,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
                 speaker_embed = self._extract_speaker_embedding(wav_np, sr).view(1, 1, -1)
 
             # Cache miss: store extraction result
-            if _voice_cache_key is not None and speaker_embed is not None:
-                self._voice_cache.put(
-                    _voice_cache_key,
+            if _speaker_cache_key is not None and speaker_embed is not None:
+                self._speaker_cache.put(
+                    _speaker_cache_key,
                     {
                         "ref_code": ref_code_prompt.detach().cpu()
                         if isinstance(ref_code_prompt, torch.Tensor)
@@ -1627,9 +1658,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         loaded = loader.load_weights(_talker_and_collect_speaker(weights), mapper=self.hf_to_vllm_mapper)
 
         if speaker_weights:
-            if self.speaker_encoder is None:
-                self.speaker_encoder = Qwen3TTSSpeakerEncoder(self.config.speaker_encoder_config)
+            # speaker_encoder module is already constructed in __init__; here we
+            # only copy checkpoint tensors into its existing parameters.
             loaded |= loader.load_weights(speaker_weights, mapper=self.hf_to_vllm_mapper)
+        else:
+            # Some checkpoints do not include speaker_encoder weights; keep the
+            # eagerly initialized module and satisfy the strict loader check.
+            loaded |= {name for name, _ in self.named_parameters() if name.startswith("speaker_encoder.")}
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
         return loaded
 
@@ -1646,6 +1681,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         temperature: float | None = None,
         top_k: int | None = None,
         top_p: float | None = None,
+        generator: torch.Generator | None = None,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """GPU fast-path used by OmniGPUModelRunner to predict residual codebooks (1..Q-1).
         Returns (inputs_embeds, audio_codes) for the current step."""
@@ -1682,6 +1719,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
+            generator=generator,
         )  # [B, Q]
 
         # Map invalid layer-0 ids (e.g. EOS) to PAD=0 so SpeechTokenizer sees only real codes.

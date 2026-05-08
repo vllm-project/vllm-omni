@@ -55,7 +55,7 @@ def prepend_and_flatten_colmajor(x: torch.Tensor, pad_vec: torch.Tensor) -> torc
 
 def _make_finished_sentinel() -> dict[str, Any]:
     """Return a minimal payload with finished=True so Stage-1 can end the request."""
-    return {"code_predictor_codes": [], "finished": torch.tensor(True, dtype=torch.bool)}
+    return {"codes": {"audio": []}, "meta": {"finished": torch.tensor(True, dtype=torch.bool)}}
 
 
 def _flush_remaining_codes(
@@ -79,12 +79,14 @@ def _flush_remaining_codes(
     flat_codes = torch.tensor(accumulated[-end_index:]).reshape(-1).tolist()
 
     return {
-        "code_predictor_codes": flat_codes,
-        "left_context_size": left_ctx_frames,
-        "codec_chunk_frames": chunk_size,
-        "codec_left_context_frames": left_context_size,
-        "code_flat_numel": len(flat_codes),
-        "finished": torch.tensor(True, dtype=torch.bool),
+        "codes": {"audio": flat_codes},
+        "meta": {
+            "left_context_size": left_ctx_frames,
+            "codec_chunk_frames": chunk_size,
+            "codec_left_context_frames": left_context_size,
+            "code_flat_numel": len(flat_codes),
+            "finished": torch.tensor(True, dtype=torch.bool),
+        },
     }
 
 
@@ -122,7 +124,6 @@ def llm2code2wav_async_chunk(
     Accumulates codes in connector per request_id,
     returns payload only when chunk_size is full or request is finished; returns None when waiting.
     """
-
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
@@ -131,14 +132,14 @@ def llm2code2wav_async_chunk(
 
     request_id = getattr(request, "external_req_id", None)
 
-    codes = pooling_output.get("code_predictor_codes")
-
-    if _is_codes_empty(codes):
+    po_codes = pooling_output.get("codes", {})
+    if "audio" not in po_codes:
         if is_finished:
             return _flush_remaining_codes(transfer_manager, request_id, chunk_size, left_context_size)
         return None
 
-    code_tensor = _to_code_tensor(codes)
+    code_predictor_codes = po_codes["audio"]
+    code_tensor = _to_code_tensor(code_predictor_codes)
     if code_tensor is None:
         if is_finished:
             return _flush_remaining_codes(transfer_manager, request_id, chunk_size, left_context_size)
@@ -167,18 +168,21 @@ def llm2code2wav_async_chunk(
     flat_codes = torch.tensor(transfer_manager.code_prompt_token_ids[request_id][-end_index:]).reshape(-1).tolist()
 
     return {
-        "code_predictor_codes": flat_codes,
-        "left_context_size": left_ctx_frames,
-        "codec_chunk_frames": chunk_size,
-        "codec_left_context_frames": left_context_size,
-        "code_flat_numel": len(flat_codes),
-        "finished": torch.tensor(is_finished, dtype=torch.bool),
+        "codes": {
+            "audio": flat_codes,
+        },
+        "meta": {
+            "left_context_size": left_ctx_frames,
+            "codec_chunk_frames": chunk_size,
+            "codec_left_context_frames": left_context_size,
+            "code_flat_numel": len(flat_codes),
+            "finished": torch.tensor(is_finished, dtype=torch.bool),
+        },
     }
 
 
 def llm2code2wav(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+    source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | None = None,
     requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
@@ -191,25 +195,13 @@ def llm2code2wav(
     3. Package for code2wav stage
 
     Args:
-        stage_list: List of stage objects
-        engine_input_source: Source stage IDs (typically [1] for talker)
         prompt: Original prompt data
         requires_multimodal_data: Whether multimodal data is required
 
     Returns:
         List of OmniTokensPrompt for code2wav stage
     """
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-
-    source_stage_id = engine_input_source[0]
-    if source_stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {source_stage_id}")
-
-    if stage_list[source_stage_id].engine_outputs is None:
-        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
-
-    talker_outputs = stage_list[source_stage_id].engine_outputs
+    talker_outputs = source_outputs
     code2wav_inputs = []
 
     # Process each talker output
@@ -218,8 +210,11 @@ def llm2code2wav(
 
         # Extract codec codes from talker output
         # Expected shape: [8, seq_len] (8-layer RVQ codes)
-        if "code_predictor_codes" in output.multimodal_output:
-            codec_codes = output.multimodal_output["code_predictor_codes"].to(torch.long)  # [seq_batch_size, 1, 8, 4]
+        mm = output.multimodal_output
+        mm_codes = mm.get("codes", {})
+        mm_hs = mm.get("hidden_states", {})
+        if "audio" in mm_codes:
+            codec_codes = mm_codes["audio"].to(torch.long)  # [seq_batch_size, 1, 8, 4]
             is_all_zero = (codec_codes == 0).all(dim=(1, 2, 3))
             non_zero_indices = (~is_all_zero).nonzero(as_tuple=True)[0]
             if len(non_zero_indices) == 0:
@@ -233,7 +228,7 @@ def llm2code2wav(
             else:
                 if len(non_zero_indices) < codec_codes.shape[0]:
                     codec_codes = codec_codes[non_zero_indices]
-        elif "latent" in output.multimodal_output and "code_predictor_codes" not in output.multimodal_output:
+        elif "output" in mm_hs and "audio" not in mm_codes:
             codec_codes = torch.zeros(1, 1, 8, 4, dtype=torch.long)
         else:
             raise ValueError(f"Invalid multimodal_output: {output.multimodal_output}")

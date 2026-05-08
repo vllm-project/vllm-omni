@@ -15,7 +15,13 @@ they just no longer need to self-register via ``register_pipeline(...)``.
 Adding a new pipeline:
     1. Define the ``PipelineConfig`` instance as a module-level variable in
        ``vllm_omni/.../pipeline.py``.
-    2. Add one line to ``_OMNI_PIPELINES`` or ``_DIFFUSION_PIPELINES`` below.
+    2. Add one line to ``_OMNI_PIPELINES`` below.
+
+Single-stage diffusion models continue to use the
+``_create_default_diffusion_stage_cfg`` fallback in
+``async_omni_engine.py`` — they don't need a registry entry. The empty
+``_DIFFUSION_PIPELINES`` placeholder previously here (#2915) was removed
+once #2987 (which would have populated it) was deferred.
 
 ``register_pipeline(config)`` in ``stage_config`` is still supported for
 out-of-tree plugins and tests that create pipelines at runtime; those override
@@ -43,6 +49,18 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.qwen3_tts.pipeline",
         "QWEN3_TTS_PIPELINE",
     ),
+    "bagel": (
+        "vllm_omni.model_executor.models.bagel.pipeline",
+        "BAGEL_PIPELINE",
+    ),
+    "bagel_think": (
+        "vllm_omni.model_executor.models.bagel.pipeline",
+        "BAGEL_THINK_PIPELINE",
+    ),
+    "bagel_single_stage": (
+        "vllm_omni.model_executor.models.bagel.pipeline",
+        "BAGEL_SINGLE_STAGE_PIPELINE",
+    ),
     "glm_image": (
         "vllm_omni.model_executor.models.glm_image.pipeline",
         "GLM_IMAGE_PIPELINE",
@@ -67,13 +85,20 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.fish_speech.pipeline",
         "FISH_SPEECH_PIPELINE",
     ),
-}
-
-# --- Single-stage diffusion pipelines (populated in PR 3/N) ---
-_DIFFUSION_PIPELINES: dict[str, tuple[str, str]] = {}
-
-# Union view used by ``_LazyPipelineRegistry``; don't mutate at runtime.
-_VLLM_OMNI_PIPELINES: dict[str, tuple[str, str]] = {
-    **_OMNI_PIPELINES,
-    **_DIFFUSION_PIPELINES,
+    "ming_flash_omni": (
+        "vllm_omni.model_executor.models.ming_flash_omni.pipeline",
+        "MING_FLASH_OMNI_PIPELINE",
+    ),
+    "ming_flash_omni_tts": (
+        "vllm_omni.model_executor.models.ming_flash_omni.pipeline",
+        "MING_FLASH_OMNI_TTS_PIPELINE",
+    ),
+    "ming_flash_omni_thinker_only": (
+        "vllm_omni.model_executor.models.ming_flash_omni.pipeline",
+        "MING_FLASH_OMNI_THINKER_ONLY_PIPELINE",
+    ),
+    "moss_tts_nano": (
+        "vllm_omni.model_executor.models.moss_tts_nano.pipeline",
+        "MOSS_TTS_NANO_PIPELINE",
+    ),
 }

@@ -10,18 +10,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig, PreTrainedModel, Qwen2Config, Qwen2Model
+from transformers.utils import is_flash_attn_2_available
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
-try:
-    import flash_attn  # noqa: F401
-except (ImportError, ModuleNotFoundError):
-    flash_attn = None
-    logger.warning(
-        "flash_attn is not available, the model may not yield the "
-        "exactly same result as the transformers implementation "
-        "in the audio tower part."
-    )
 
 
 class AudioVAEConfig(PretrainedConfig):
@@ -200,8 +192,13 @@ class Decoder(nn.Module):
     def __init__(self, decoder_args, output_dim=320, latent_dim=64, patch_size=-1):
         super().__init__()
         config = Qwen2Config.from_dict(config_dict=decoder_args)
-        if flash_attn is None:
+        if is_flash_attn_2_available():
+            config._attn_implementation_autoset = True
+            config._attn_implementation = "flash_attention_2"
+        else:
             config._attn_implementation = "sdpa"
+
+        logger.info("AudioVAE Decoder: using attn_implementation=%r", config._attn_implementation)
         self.decoder = Qwen2Model(config)
         self.output_dim = output_dim
         self.latent_dim = latent_dim
@@ -276,8 +273,13 @@ class Encoder(nn.Module):
     def __init__(self, encoder_args, input_dim=320, hop_size=320, latent_dim=64, patch_size=-1):
         super().__init__()
         config = Qwen2Config.from_dict(config_dict=encoder_args)
-        if flash_attn is None:
+        if is_flash_attn_2_available():
+            config._attn_implementation_autoset = True
+            config._attn_implementation = "flash_attention_2"
+        else:
             config._attn_implementation = "sdpa"
+
+        logger.info("AudioVAE Encoder: using attn_implementation=%r", config._attn_implementation)
         self.encoder = Qwen2Model(config)
         self.input_dim = input_dim
         self.hop_size = hop_size

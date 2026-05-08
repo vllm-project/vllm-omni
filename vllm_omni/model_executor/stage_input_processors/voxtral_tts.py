@@ -10,22 +10,12 @@ logger = init_logger(__name__)
 
 
 def generator2tokenizer(
-    stage_list,
-    engine_input_source,
-    prompt: OmniTokensPrompt | TextPrompt = None,
-    requires_multimodal_data: bool = False,
+    source_outputs: list[Any],
+    _prompt: OmniTokensPrompt | TextPrompt = None,
+    _requires_multimodal_data: bool = False,
 ):
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-    source_stage_id = engine_input_source[0]
-    if source_stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {source_stage_id}")
-    if stage_list[source_stage_id].engine_outputs is None:
-        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
-
-    generator_outputs = stage_list[source_stage_id].engine_outputs
     tokenizer_inputs = []
-    for generator_output in generator_outputs:
+    for generator_output in source_outputs:
         output = generator_output.outputs[0]
         audio_tokens = torch.cat(output.multimodal_output["audio"], dim=-1).flatten().detach().cpu().tolist()
         tokenizer_inputs.append(
@@ -82,8 +72,8 @@ def generator2tokenizer_async_chunk(
     if length <= 0:
         if finished:
             return {
-                "code_predictor_codes": [],
-                "finished": torch.tensor(True, dtype=torch.bool),
+                "codes": {"audio": []},
+                "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
             }
         return None
 
@@ -105,6 +95,6 @@ def generator2tokenizer_async_chunk(
     code_predictor_codes = torch.tensor(window_frames).reshape(-1).tolist()
 
     return {
-        "code_predictor_codes": [int(ctx_frames)] + [int(context_length)] + code_predictor_codes,
-        "finished": torch.tensor(finished, dtype=torch.bool),
+        "codes": {"audio": [int(ctx_frames)] + [int(context_length)] + code_predictor_codes},
+        "meta": {"finished": torch.tensor(finished, dtype=torch.bool)},
     }

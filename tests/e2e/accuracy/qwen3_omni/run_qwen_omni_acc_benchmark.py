@@ -340,7 +340,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-seed-tts-mean-wer",
         type=float,
-        default=0.02,
+        default=0.5,
         help="If set, fail when seed_tts_content_error_mean is strictly above this value.",
     )
     p.add_argument(

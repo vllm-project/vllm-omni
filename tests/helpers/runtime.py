@@ -2,6 +2,7 @@
 
 import base64
 import concurrent.futures
+import errno
 import io
 import json
 import os
@@ -9,7 +10,9 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from collections.abc import Generator
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -54,10 +57,37 @@ except Exception:  # pragma: no cover
         return None
 
 
-def get_open_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
+    """Return a local TCP port that is suitable for binding a new listener.
+
+    A single ``bind(host, 0)`` / close cycle leaves a race where another process can
+    take the same port number before PyTorch/vLLM bind it, yielding
+    ``EADDRINUSE`` / ``DistNetworkError``. We therefore:
+
+    #. Allocate an ephemeral port on *host*.
+    #. Immediately attempt ``bind(host, port)`` again. If that fails with
+       ``errno.EADDRINUSE``, retry from step 1.
+
+    Raises ``RuntimeError`` if no free port is found after *max_attempts* (e.g. port
+    exhaustion under heavy parallel tests).
+    """
+    last_exc: OSError | None = None
+    for _ in range(max_attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((host, 0))
+            port = int(s.getsockname()[1])
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind((host, port))
+        except OSError as exc:
+            last_exc = exc
+            if exc.errno == errno.EADDRINUSE:
+                continue
+            raise
+        return port
+    raise RuntimeError(
+        f"Could not obtain a free TCP port on {host!r} after {max_attempts} attempts (last error: {last_exc!r})"
+    ) from last_exc
 
 
 def dummy_messages_from_mix_data(
@@ -118,6 +148,89 @@ class OmniServerParams(NamedTuple):
     use_stage_cli: bool = False
     init_timeout: int | None = None
     stage_init_timeout: int | None = None  # None: fixture supplies default (600 s)
+
+
+def run_omni_server(
+    request: Any,
+    run_level: str,
+    model_prefix: str,
+    omni_fixture_lock: threading.Lock,
+) -> Generator["OmniServer", Any, None]:
+    from tests.helpers.stage_config import modify_stage_config
+
+    with omni_fixture_lock:
+        params: OmniServerParams = request.param
+        model = model_prefix + params.model
+        port = params.port
+        stage_config_path = params.stage_config_path
+        if run_level in {"advanced_model", "full_model"} and stage_config_path is not None:
+            with open(stage_config_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            # Strip ``load_format: dummy`` (CI overlay default) so advanced_model
+            # tests use real weights. New schema (``stages:``) writes the field
+            # flat at stage level; legacy schema (``stage_args:``) nests it as
+            # ``engine_args.load_format``. Handle both.
+            new_schema_stages = cfg.get("stages")
+            stage_key = "stages" if new_schema_stages is not None else "stage_args"
+            delete_path = "load_format" if new_schema_stages is not None else "engine_args.load_format"
+            stage_entries = cfg.get(stage_key, [])
+            stage_ids = [stage["stage_id"] for stage in stage_entries if "stage_id" in stage]
+            stage_config_path = modify_stage_config(
+                stage_config_path,
+                deletes={stage_key: {stage_id: [delete_path] for stage_id in stage_ids}},
+            )
+
+        server_args = params.server_args or []
+        if params.use_omni and params.stage_init_timeout is not None:
+            server_args = [*server_args, "--stage-init-timeout", str(params.stage_init_timeout)]
+        else:
+            server_args = [*server_args, "--stage-init-timeout", "600"]
+        if params.init_timeout is not None:
+            server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
+        else:
+            server_args = [*server_args, "--init-timeout", "900"]
+        if params.use_stage_cli:
+            if not params.use_omni:
+                raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
+            if stage_config_path is None:
+                raise ValueError("omni_server with use_stage_cli=True requires a stage_config_path")
+            server_args += ["--stage-configs-path", stage_config_path]
+
+            with OmniServerStageCli(
+                model,
+                stage_config_path,
+                server_args,
+                port=port,
+                env_dict=params.env_dict,
+            ) as server:
+                print("OmniServer started successfully")
+                yield server
+                print("OmniServer stopping...")
+        else:
+            if stage_config_path is not None:
+                server_args += ["--stage-configs-path", stage_config_path]
+
+            with (
+                OmniServer(
+                    model,
+                    server_args,
+                    port=port,
+                    env_dict=params.env_dict,
+                    use_omni=params.use_omni,
+                )
+                if port
+                else OmniServer(
+                    model,
+                    server_args,
+                    env_dict=params.env_dict,
+                    use_omni=params.use_omni,
+                )
+            ) as server:
+                print("OmniServer started successfully")
+                yield server
+                print("OmniServer stopping...")
+
+        print("OmniServer stopped")
 
 
 class OmniServer:
@@ -272,7 +385,8 @@ class OmniServerStageCli(OmniServer):
         self.stage_ids = stage_ids or self._load_stage_ids(resolved_cfg)
         if 0 not in self.stage_ids:
             raise ValueError(f"Stage CLI test requires stage_id=0 in config: {stage_config_path}")
-        self.stage_procs: dict[int, subprocess.Popen] = {}
+        self.stage_replica_counts = self._load_stage_replica_counts(resolved_cfg)
+        self.stage_procs: dict[tuple[int, int], subprocess.Popen] = {}
         self.proc = None
 
     @staticmethod
@@ -301,6 +415,19 @@ class OmniServerStageCli(OmniServer):
             if stage_id is not None and devices:
                 runtime_devices[int(stage_id)] = str(devices)
         return runtime_devices
+
+    @staticmethod
+    def _load_stage_replica_counts(resolved_config: dict) -> dict[int, int]:
+        replica_counts: dict[int, int] = {}
+        for stage in OmniServerStageCli._stage_entries(resolved_config):
+            stage_id = stage.get("stage_id")
+            if stage_id is None:
+                continue
+            replica_counts[int(stage_id)] = max(
+                1,
+                int(stage.get("num_replicas") or stage.get("runtime", {}).get("num_replicas", 1)),
+            )
+        return replica_counts
 
     @classmethod
     def _parse_device_list(cls, devices: str | int) -> list[str]:
@@ -339,13 +466,29 @@ class OmniServerStageCli(OmniServer):
 
         return ",".join(visible_device_list[idx] for idx in logical_ids)
 
-    def _set_stage_device_env(self, stage_id: int, env: dict[str, str], devices: str) -> None:
-        mapped_devices = self._map_stage_devices(stage_id, self.visible_device_list, devices)
+    def _devices_for_replica(self, stage_id: int, devices: str, replica_id: int) -> str:
+        replica_count = self.stage_replica_counts.get(stage_id, 1)
+        if replica_count == 1:
+            return devices
+
+        device_list = self._parse_device_list(devices)
+        if len(device_list) % replica_count != 0:
+            raise ValueError(
+                f"Stage {stage_id} has {len(device_list)} device(s) for {replica_count} replica(s); "
+                "device count must be divisible by replica count"
+            )
+        devices_per_replica = len(device_list) // replica_count
+        start = replica_id * devices_per_replica
+        return ",".join(device_list[start : start + devices_per_replica])
+
+    def _set_stage_device_env(self, stage_id: int, env: dict[str, str], devices: str, replica_id: int = 0) -> None:
+        replica_devices = self._devices_for_replica(stage_id, devices, replica_id)
+        mapped_devices = self._map_stage_devices(stage_id, self.visible_device_list, replica_devices)
         env_var = getattr(current_omni_platform, "device_control_env_var", None)
         if env_var:
             env[env_var] = mapped_devices
 
-    def _build_stage_cmd(self, stage_id: int, *, headless: bool) -> list[str]:
+    def _build_stage_cmd(self, stage_id: int, *, headless: bool, replica_id: int = 0) -> list[str]:
         cmd = [
             sys.executable,
             "-m",
@@ -361,6 +504,8 @@ class OmniServerStageCli(OmniServer):
             self.host,
             "--omni-master-port",
             str(self.master_port),
+            "--replica-id",
+            str(replica_id),
         ]
 
         if headless:
@@ -371,7 +516,7 @@ class OmniServerStageCli(OmniServer):
         cmd += self.serve_args
         return cmd
 
-    def _launch_stage(self, stage_id: int, *, headless: bool) -> None:
+    def _launch_stage(self, stage_id: int, *, headless: bool, replica_id: int = 0) -> None:
         env = os.environ.copy()
         env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
         if self.env_dict is not None:
@@ -379,19 +524,20 @@ class OmniServerStageCli(OmniServer):
 
         devices = self.stage_runtime_devices.get(stage_id)
         if devices:
-            self._set_stage_device_env(stage_id, env, devices)
+            self._set_stage_device_env(stage_id, env, devices, replica_id=replica_id)
 
-        cmd = self._build_stage_cmd(stage_id, headless=headless)
-        print(f"Launching OmniServerStageCli stage {stage_id}: {' '.join(cmd)}")
+        cmd = self._build_stage_cmd(stage_id, headless=headless, replica_id=replica_id)
+        print(f"Launching OmniServerStageCli stage {stage_id} replica {replica_id}: {' '.join(cmd)}")
         # Capture each subprocess's stdout+stderr to a per-stage log file so
         # debugging "Stage N exited before API server ready" doesn't rely on
         # guessing; the file is surfaced in the RuntimeError message.
-        log_path = Path(tempfile.gettempdir()) / f"omni_stage_{stage_id}_{self.master_port}.log"
+        log_path = Path(tempfile.gettempdir()) / f"omni_stage_{stage_id}_replica_{replica_id}_{self.master_port}.log"
         self._stage_log_paths = getattr(self, "_stage_log_paths", {})
-        self._stage_log_paths[stage_id] = log_path
+        stage_key = (stage_id, replica_id)
+        self._stage_log_paths[stage_key] = log_path
         log_fh = open(log_path, "w", buffering=1)  # noqa: SIM115 - closed in __exit__
         self._stage_log_files = getattr(self, "_stage_log_files", {})
-        self._stage_log_files[stage_id] = log_fh
+        self._stage_log_files[stage_key] = log_fh
         proc = subprocess.Popen(
             cmd,
             env=env,
@@ -399,36 +545,39 @@ class OmniServerStageCli(OmniServer):
             stdout=log_fh,
             stderr=subprocess.STDOUT,
         )
-        self.stage_procs[stage_id] = proc
-        if stage_id == 0:
+        self.stage_procs[stage_key] = proc
+        if stage_id == 0 and replica_id == 0:
             self.proc = proc
 
     def _ensure_stage_processes_alive(self) -> None:
-        for stage_id, proc in self.stage_procs.items():
+        for (stage_id, replica_id), proc in self.stage_procs.items():
             ret = proc.poll()
             if ret is not None:
-                log_path = getattr(self, "_stage_log_paths", {}).get(stage_id)
+                log_path = getattr(self, "_stage_log_paths", {}).get((stage_id, replica_id))
                 tail = ""
                 if log_path and log_path.exists():
                     try:
                         with open(log_path, encoding="utf-8", errors="replace") as f:
                             lines = f.readlines()
-                        tail = "\n=== Last 60 lines of stage {} log ({}) ===\n{}".format(
-                            stage_id, log_path, "".join(lines[-60:]) or "<empty>"
+                        tail = "\n=== Last 60 lines of stage {} replica {} log ({}) ===\n{}".format(
+                            stage_id, replica_id, log_path, "".join(lines[-60:]) or "<empty>"
                         )
                     except Exception as exc:  # pragma: no cover - diagnostic only
                         tail = f"\n<failed to read stage log {log_path}: {exc}>"
-                raise RuntimeError(f"Stage {stage_id} exited with code {ret} before API server became ready.{tail}")
+                raise RuntimeError(
+                    f"Stage {stage_id} replica {replica_id} exited with code {ret} before API server became ready.{tail}"
+                )
 
     def _start_server(self) -> None:
         ordered_stage_ids = [0, *[stage_id for stage_id in self.stage_ids if stage_id != 0]]
 
-        self._launch_stage(0, headless=False)
+        self._launch_stage(0, headless=False, replica_id=0)
         time.sleep(2)
         self._ensure_stage_processes_alive()
 
         for stage_id in ordered_stage_ids[1:]:
-            self._launch_stage(stage_id, headless=True)
+            for replica_id in range(self.stage_replica_counts.get(stage_id, 1)):
+                self._launch_stage(stage_id, headless=True, replica_id=replica_id)
 
         max_wait = 1200
         start_time = time.time()
@@ -455,15 +604,15 @@ class OmniServerStageCli(OmniServer):
         whatever state the stage was in when it was torn down.
         """
         log_paths = getattr(self, "_stage_log_paths", {}) or {}
-        for stage_id in sorted(log_paths):
-            log_path = log_paths[stage_id]
+        for stage_id, replica_id in sorted(log_paths):
+            log_path = log_paths[(stage_id, replica_id)]
             if not log_path or not log_path.exists():
                 continue
             try:
                 with open(log_path, encoding="utf-8", errors="replace") as f:
                     lines = f.readlines()
             except Exception as exc:  # pragma: no cover - diagnostic only
-                print(f"[OmniServerStageCli] stage {stage_id} log read failed: {exc}", flush=True)
+                print(f"[OmniServerStageCli] stage {stage_id} replica {replica_id} log read failed: {exc}", flush=True)
                 continue
             total = len(lines)
             if total <= head_lines + tail_lines:
@@ -474,18 +623,18 @@ class OmniServerStageCli(OmniServer):
                 head_chunk = lines[:head_lines]
                 tail_chunk = lines[-tail_lines:]
                 elided = total - head_lines - tail_lines
-            print(f"\n=== stage {stage_id} log HEAD ({log_path}) ===", flush=True)
+            print(f"\n=== stage {stage_id} replica {replica_id} log HEAD ({log_path}) ===", flush=True)
             print("".join(head_chunk).rstrip("\n"), flush=True)
             if tail_chunk:
                 print(f"\n... [{elided} lines elided] ...", flush=True)
-                print(f"\n=== stage {stage_id} log TAIL ({log_path}) ===", flush=True)
+                print(f"\n=== stage {stage_id} replica {replica_id} log TAIL ({log_path}) ===", flush=True)
                 print("".join(tail_chunk).rstrip("\n"), flush=True)
-            print(f"=== end stage {stage_id} log ===\n", flush=True)
+            print(f"=== end stage {stage_id} replica {replica_id} log ===\n", flush=True)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._dump_stage_logs_for_debug()
-        for stage_id in sorted(self.stage_procs, reverse=True):
-            proc = self.stage_procs[stage_id]
+        for stage_key in sorted(self.stage_procs, reverse=True):
+            proc = self.stage_procs[stage_key]
             if proc.poll() is None:
                 self._kill_process_tree(proc.pid)
         run_forced_gpu_cleanup_round()
@@ -502,7 +651,9 @@ class OmniResponse:
     e2e_latency: float | None = None
     success: bool = False
     error_message: str | None = None
+    prompt_tokens: int | None = None
     cached_tokens: int | None = None
+    logprobs: list | None = None
 
 
 @dataclass
@@ -510,7 +661,7 @@ class DiffusionResponse:
     text_content: str | None = None
     images: list[Image.Image] | None = None
     audios: list[Any] | None = None
-    videos: list[Any] | None = None
+    videos: list[bytes] | None = None
     e2e_latency: float | None = None
     success: bool = False
     error_message: str | None = None
@@ -566,10 +717,12 @@ class OpenAIClientHandler:
                     audio_data = choice.message.audio.data
                 if hasattr(choice.message, "content") and choice.message.content is not None:
                     text_content = choice.message.content
-            # Extract cached_tokens for prefix caching tests
+            # Extract cached & prompt token counts for prefix caching tests
             usage = getattr(chat_completion, "usage", None)
-            if usage and (details := getattr(usage, "prompt_tokens_details", None)):
-                result.cached_tokens = details.cached_tokens
+            if usage:
+                result.prompt_tokens = usage.prompt_tokens
+                if details := getattr(usage, "prompt_tokens_details", None):
+                    result.cached_tokens = details.cached_tokens
             result.e2e_latency = time.perf_counter() - start_time
             audio_content = None
             if audio_data:
@@ -577,6 +730,8 @@ class OpenAIClientHandler:
                 audio_content = convert_audio_bytes_to_text(result.audio_bytes)
             result.text_content = text_content
             result.audio_content = audio_content
+            if chat_completion.choices and chat_completion.choices[0].logprobs is not None:
+                result.logprobs = chat_completion.choices[0].logprobs.content
             result.success = True
         except Exception as e:
             result.error_message = f"Non-stream processing error: {str(e)}"
@@ -588,6 +743,7 @@ class OpenAIClientHandler:
         start_time = time.perf_counter()
         try:
             images = []
+            audios = []
             for choice in chat_completion.choices:
                 content = getattr(choice.message, "content", None)
                 if isinstance(content, list):
@@ -601,8 +757,21 @@ class OpenAIClientHandler:
                         if image_url and image_url.startswith("data:image"):
                             b64_data = image_url.split(",", 1)[1]
                             images.append(decode_b64_image(b64_data))
+
+                # OpenAI audio responses (e.g. AudioX text-to-audio) populate `message.audio`.
+                audio_obj = getattr(choice.message, "audio", None)
+                audio_b64 = getattr(audio_obj, "data", None) if audio_obj is not None else None
+                if audio_b64:
+                    audios.append(
+                        {
+                            "wav_bytes": base64.b64decode(audio_b64),
+                            "id": getattr(audio_obj, "id", None),
+                            "expires_at": getattr(audio_obj, "expires_at", None),
+                        }
+                    )
             result.e2e_latency = time.perf_counter() - start_time
             result.images = images if images else None
+            result.audios = audios if audios else None
             result.success = True
         except Exception as e:
             result.error_message = f"Diffusion response processing error: {str(e)}"
@@ -620,12 +789,19 @@ class OpenAIClientHandler:
             mm = dict(extra_body.get("mm_processor_kwargs") or {})
             mm["use_audio_in_video"] = True
             extra_body["mm_processor_kwargs"] = mm
+        if "sampling_params_list" in request_config:
+            extra_body["sampling_params_list"] = request_config["sampling_params_list"]
+
         create_kwargs: dict[str, Any] = {
             "model": request_config.get("model"),
             "messages": request_config.get("messages"),
             "stream": stream,
             "modalities": modalities,
         }
+        if "logprobs" in request_config:
+            create_kwargs["logprobs"] = request_config["logprobs"]
+        if "top_logprobs" in request_config:
+            create_kwargs["top_logprobs"] = request_config["top_logprobs"]
         if extra_body:
             create_kwargs["extra_body"] = extra_body
 
@@ -914,7 +1090,9 @@ class OpenAIClientHandler:
                     responses.append(response)
         return responses
 
-    def send_video_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+    def send_video_diffusion_request(
+        self, request_config: dict[str, Any], request_num: int = 1
+    ) -> list[DiffusionResponse]:
         """
         Send native /v1/videos requests.
         """
@@ -937,7 +1115,6 @@ class OpenAIClientHandler:
                 normalized_form_data["image_reference"] = json.dumps({"image_url": image_reference})
 
         result = DiffusionResponse()
-        start_time = time.perf_counter()
         create_url = self._build_url("/v1/videos")
         response = requests.post(
             create_url,
@@ -946,14 +1123,16 @@ class OpenAIClientHandler:
             headers={"Accept": "application/json"},
             timeout=60,
         )
+        start_time = time.perf_counter()
         response.raise_for_status()
         job_data = response.json()
         video_id = job_data["id"]
         self._wait_until_video_completed(video_id)
+        end_time = time.perf_counter()
         video_content = self._download_video_content(video_id)
         result.success = True
         result.videos = [video_content]
-        result.e2e_latency = time.perf_counter() - start_time
+        result.e2e_latency = end_time - start_time
         assert_diffusion_response(result, request_config, run_level=self.run_level)
         return [result]
 
@@ -996,7 +1175,14 @@ class OmniRunner:
         seed: int = 42,
         stage_init_timeout: int = 600,
         batch_timeout: int = 10,
-        init_timeout: int = 900,
+        # Bumped from 900s -> 1800s to give CI cold-cache loads of large
+        # diffusion models enough headroom (Buildkite #8418 hit a 6-second
+        # overrun loading Tongyi-MAI/Z-Image-Turbo: weights alone took 690s,
+        # the full stage was ready at ~896s, but the orchestrator wrapper
+        # finished at ~906s, just past the previous 900s ceiling). Engine
+        # production default in AsyncOmniEngine remains 600s; this only
+        # affects the test runner wrapper.
+        init_timeout: int = 1800,
         shm_threshold_bytes: int = 65536,
         log_stats: bool = False,
         stage_configs_path: str | None = None,
@@ -1093,7 +1279,7 @@ class OmniRunner:
         if isinstance(prompts, str):
             prompts = [prompts]
 
-        # Qwen-TTS: follow examples/offline_inference/qwen3_tts/end2end.py style.
+        # Qwen-TTS: follow examples/offline_inference/text_to_speech/qwen3_tts/end2end.py style.
         # Stage 0 expects token placeholders + additional_information (text/speaker/task_type/...),
         # and Talker replaces embeddings in preprocess based on additional_information only.
         is_tts_model = "Qwen3-TTS" in self.model_name or "qwen3_tts" in self.model_name.lower()

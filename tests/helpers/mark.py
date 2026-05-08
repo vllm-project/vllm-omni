@@ -3,7 +3,7 @@
 """Pytest marks and decorators for hardware / resource selection (CUDA, ROCm, …)."""
 
 import pytest
-from vllm.utils.torch_utils import cuda_device_count_stateless
+from vllm.platforms import current_platform
 
 # Re-exported from tests.helpers.env (GPU wait + DeviceMemoryMonitor).
 
@@ -20,8 +20,9 @@ def cuda_marks(*, res: str, num_cards: int):
     if num_cards == 1:
         return marks
     test_distributed = pytest.mark.distributed_cuda(num_cards=num_cards)
+
     test_skipif = pytest.mark.skipif_cuda(
-        cuda_device_count_stateless() < num_cards,
+        not current_platform.is_cuda() or (current_platform.device_count() < num_cards),
         reason=f"Need at least {num_cards} CUDA GPUs to run the test.",
     )
     return marks + [test_distributed, test_skipif]

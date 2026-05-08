@@ -17,12 +17,11 @@ from vllm_omni.model_executor.stage_input_processors.mimo_audio import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _make_stage_list(codec_codes: torch.Tensor, request_id: str = "req-0"):
-    """Build a minimal stage_list[0] with a single talker output carrying codec_codes."""
-    output = SimpleNamespace(multimodal_output={"code_predictor_codes": codec_codes})
+def _make_source_outputs(codec_codes: torch.Tensor, request_id: str = "req-0"):
+    output = SimpleNamespace(multimodal_output={"codes": {"audio": codec_codes}})
+    """Build minimal source_outputs with one talker output carrying codec codes."""
     talker_output = SimpleNamespace(outputs=[output], request_id=request_id)
-    stage0 = SimpleNamespace(engine_outputs=[talker_output])
-    return [stage0]
+    return [talker_output]
 
 
 def test_llm2code2wav_truncates_when_flat_exceeds_max(caplog):
@@ -33,7 +32,7 @@ def test_llm2code2wav_truncates_when_flat_exceeds_max(caplog):
     frames = (MAX_CODE2WAV_TOKENS // 36) + 100
     codec_codes = torch.ones(frames, 1, 8, 4, dtype=torch.long)
 
-    stage_list = _make_stage_list(codec_codes, request_id="req-long")
+    source_outputs = _make_source_outputs(codec_codes, request_id="req-long")
 
     # Attach caplog's handler directly to the module logger so the warning is
     # captured regardless of propagation (vllm's logger configuration can
@@ -43,7 +42,7 @@ def test_llm2code2wav_truncates_when_flat_exceeds_max(caplog):
     prev_level = target_logger.level
     target_logger.setLevel(logging.WARNING)
     try:
-        prompts = llm2code2wav(stage_list, engine_input_source=[0])
+        prompts = llm2code2wav(source_outputs)
     finally:
         target_logger.removeHandler(caplog.handler)
         target_logger.setLevel(prev_level)
@@ -58,9 +57,9 @@ def test_llm2code2wav_truncates_when_flat_exceeds_max(caplog):
 def test_llm2code2wav_short_sequence_unchanged():
     """Short codec sequences are returned without truncation."""
     codec_codes = torch.ones(4, 1, 8, 4, dtype=torch.long)
-    stage_list = _make_stage_list(codec_codes, request_id="req-short")
+    source_outputs = _make_source_outputs(codec_codes, request_id="req-short")
 
-    prompts = llm2code2wav(stage_list, engine_input_source=[0])
+    prompts = llm2code2wav(source_outputs)
 
     assert len(prompts) == 1
     # 4 frames + 1 pad row, flattened col-major → well below the cap

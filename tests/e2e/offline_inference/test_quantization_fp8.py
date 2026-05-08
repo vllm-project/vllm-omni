@@ -27,7 +27,9 @@ Usage:
 """
 
 import os
-from pathlib import Path
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
 from typing import Any
 
 import pytest
@@ -35,6 +37,7 @@ import torch
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
@@ -64,7 +67,7 @@ def _generate_single_stage_image(
         omni_kwargs["quantization"] = quantization
 
     with OmniRunner(model, **omni_kwargs) as runner:
-        torch.cuda.reset_peak_memory_stats()
+        torch.accelerator.reset_peak_memory_stats()
 
         generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
         outputs = runner.omni.generate(
@@ -78,7 +81,7 @@ def _generate_single_stage_image(
             ),
         )
 
-        peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+        peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
         first_output = outputs[0]
         assert first_output.final_output_type == "image"
@@ -101,7 +104,7 @@ def _generate_bagel_image(
 
     Returns (generated_image, peak_memory_gib).
     """
-    config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
+    config_path = get_deploy_config_path("ci/bagel.yaml")
     omni_kwargs: dict[str, Any] = {
         "model": "ByteDance-Seed/BAGEL-7B-MoT",
         "stage_configs_path": config_path,
@@ -113,7 +116,7 @@ def _generate_bagel_image(
     model_name = omni_kwargs.pop("model")
     with OmniRunner(model_name, **omni_kwargs) as runner:
         omni = runner.omni
-        torch.cuda.reset_peak_memory_stats()
+        torch.accelerator.reset_peak_memory_stats()
 
         params_list = omni.default_sampling_params_list
         if len(params_list) > 1:
@@ -131,7 +134,7 @@ def _generate_bagel_image(
             )
         )
 
-        peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+        peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
         # Extract image
         generated_image = None
@@ -187,7 +190,7 @@ def test_single_stage_zimage_fp8_uses_less_memory():
         model="Tongyi-MAI/Z-Image-Turbo",
         quantization=None,
     )
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
 
     _, mem_fp8 = _generate_single_stage_image(
         model="Tongyi-MAI/Z-Image-Turbo",
@@ -238,7 +241,7 @@ def test_single_stage_flux_fp8_uses_less_memory():
         width=512,
         num_inference_steps=4,
     )
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
 
     _, mem_fp8 = _generate_single_stage_image(
         model="black-forest-labs/FLUX.1-dev",

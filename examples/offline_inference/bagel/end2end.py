@@ -53,7 +53,12 @@ def parse_args():
     parser.add_argument("--shm-threshold-bytes", type=int, default=65536)
     parser.add_argument("--worker-backend", type=str, default="process", choices=["process", "ray"])
     parser.add_argument("--ray-address", type=str, default=None)
-    parser.add_argument("--stage-configs-path", type=str, default=None)
+    parser.add_argument(
+        "--deploy-config",
+        type=str,
+        default=None,
+        help="Path to deploy YAML. If unset, auto-loads vllm_omni/deploy/bagel.yaml based on the HF model_type.",
+    )
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
 
     parser.add_argument("--cfg-text-scale", type=float, default=4.0, help="Text CFG scale (default: 4.0)")
@@ -116,6 +121,9 @@ def parse_args():
         help="Temperature for text generation sampling (default: 0.3).",
     )
 
+    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+
+    nullify_stage_engine_defaults(parser)
     args = parser.parse_args()
     return args
 
@@ -145,32 +153,20 @@ def main():
 
     from vllm_omni.entrypoints.omni import Omni
 
-    omni_kwargs = {}
-    stage_configs_path = args.stage_configs_path
-    is_single_stage = stage_configs_path and "single_stage" in stage_configs_path
-    if args.think and stage_configs_path is None:
-        stage_configs_path = "vllm_omni/model_executor/stage_configs/bagel_think.yaml"
-        print(f"[Info] Think mode enabled, using stage config: {stage_configs_path}")
-    if stage_configs_path:
-        omni_kwargs["stage_configs_path"] = stage_configs_path
-        is_single_stage = "single_stage" in stage_configs_path
+    omni_kwargs = vars(args).copy()
+    deploy_config = args.deploy_config
+    if args.think and deploy_config is None:
+        deploy_config = "vllm_omni/deploy/bagel_think.yaml"
+        print(f"[Info] Think mode enabled, using deploy config: {deploy_config}")
+    if deploy_config:
+        omni_kwargs["deploy_config"] = deploy_config
 
-    omni_kwargs.update(
-        {
-            "log_stats": args.log_stats,
-            "init_sleep_seconds": args.init_sleep_seconds,
-            "batch_timeout": args.batch_timeout,
-            "init_timeout": args.init_timeout,
-            "shm_threshold_bytes": args.shm_threshold_bytes,
-            "worker_backend": args.worker_backend,
-            "ray_address": args.ray_address,
-            "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
-        }
-    )
     if args.quantization:
         omni_kwargs["quantization_config"] = args.quantization
 
-    omni = Omni(model=model_name, **omni_kwargs)
+    # Override CLI --model with the derived model_name.
+    omni_kwargs["model"] = model_name
+    omni = Omni(**omni_kwargs)
 
     formatted_prompts = []
     for p in prompts:
@@ -215,9 +211,11 @@ def main():
             formatted_prompts.append(prompt_dict)
 
     params_list = omni.default_sampling_params_list
+    # Bagel exposes 1 sampling param set for single-stage (DiT-only) and
+    # 2 for two-stage (Thinker + DiT).  This heuristic may need updating
+    # if future pipelines break that 1:1 mapping.
+    is_single_stage = len(params_list) == 1
 
-    # For single-stage DiT, think/text params go into the diffusion sampling params extra_args.
-    # For 2-stage, diffusion params are at index 1.
     diffusion_params_idx = 0 if is_single_stage else (1 if len(params_list) > 1 else 0)
     diffusion_params = params_list[diffusion_params_idx]
 

@@ -9,15 +9,12 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 
 
 def ar2dit(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+    source_outputs: list[Any],
     prompts: OmniTokensPrompt | TextPrompt | None = None,
-    requires_multimodal_data: bool = False,  # noqa: ARG001 — interface param, unused for ar2dit
+    _requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
     """Convert AR stage outputs to DiT stage inputs."""
-
-    source_stage_id = engine_input_source[0]
-    ar_outputs = stage_list[source_stage_id].engine_outputs
+    ar_outputs = source_outputs
 
     dit_inputs: list[OmniTokensPrompt] = []
     for ar_output, prompt in zip(ar_outputs, prompts):
@@ -34,7 +31,7 @@ def ar2dit(
         prompt_token_ids = ar_output.prompt_token_ids
         # exclude the last token because it has no corresponding hidden state
         completion_output = ar_output.outputs[0]
-        gen_token_ids = completion_output.token_ids[:-1]
+        gen_token_ids = completion_output.cumulative_token_ids[:-1]
         full_token_ids = prompt_token_ids + gen_token_ids
 
         mm_output = getattr(completion_output, "multimodal_output", None)
