@@ -4,78 +4,96 @@
 """Inference-only EarTTS model definition for vLLM-Omni.
 
 The model architecture (RMSNorm, MLP, MLPLayer, GatedProjectedSumRMSNorm,
-SubwordFlagEmbedding, BOSEOSEmbedding, CharAwareSubwordEncoder,
-EarTTSInputEmbedding, MoGHead, MaskGITSampler, EarTTSModel) is preserved
-from the original vLLM fork implementation but with all CFG / classifier-
-free guidance code paths removed (vLLM-Omni does not support CFG).
+PrecomputedSubwordEmbedding, EarTTSInputEmbedding, MoGHead,
+MaskGITSampler, EarTTSModel) is preserved from the original vLLM fork
+implementation but with all CFG / classifier-free guidance code paths
+removed (vLLM-Omni does not support CFG).
+
+The original NeMo model used a character-aware subword encoder (a small
+transformer over per-character embeddings) followed by additive
+subword-continuation and BOS/EOS flag embeddings to embed text tokens.
+Those operations are deterministic per token id, so the checkpoint
+converter runs them once over the full vocabulary and stores the result
+as a single ``nn.Embedding`` (see :class:`PrecomputedSubwordEmbedding`).
 
 The outer :class:`EarTTSForCausalLM` exposes the minimal vLLM-Omni
 preprocess/postprocess hooks. Per-request inputs are passed via
 ``additional_information``.
 
-Two input modes are supported:
+Inputs (only one mode — streaming text token ids):
 
-1. **Cached-text mode** (default): the full synthesis text is provided
-   up front via ``text`` and tokenized + padded once during the first
-   prefill chunk. The padded text tokens are then consumed one per
-   decode step from a GPU-resident cache.
+* ``speaker_latent`` (prefill only): Tensor of shape
+  ``(Tref, hidden_size)``. The user-supplied speaker latent that
+  replaces ``embed_code(rvq_sum(acoustic_tokens))`` on every pre-BOS
+  prefill position. ``Tref`` is also the prefill placeholder length
+  (the user passes ``prompt_token_ids = [0] * Tref``).
+* ``input_text_tokens`` (every step including chunk 0): Python
+  ``list[int]`` that **grows** by one entry every step. Step ``k``
+  carries the cumulative sampled-token sequence ``[t1, ..., t_{k+1}]``.
+  :meth:`preprocess` indexes it at the per-request ``ear_decode_offset``
+  so decode step ``k`` consumes ``t_k``.
 
-   * ``reference_audio_tokens`` — Tensor of shape ``(Tref, 31)`` with the
-     reference speaker's acoustic tokens. ``Tref`` is also the prefill
-     placeholder length (the user passes ``prompt_token_ids = [0] * Tref``).
-   * ``text`` — string to synthesize. The model tokenizes it once during
-     the first prefill chunk and pads the result to ``round(4.0 * N)``
-     text tokens (where ``N = len(tokenize(text))``) — one padded token
-     is consumed per decode step.
-
-2. **Streaming-text mode**: the synthesis is driven by per-step
-   ``additional_information`` updates carrying the cumulative list of
-   text tokens. Each step (whether delivered via the user's
-   :class:`StreamingInput` or by an upstream stage in an
-   ``async_chunk`` pipeline such as ``nemotron_voicechat``) replaces
-   ``input_text_tokens`` with the full sequence sampled so far.
-
-   * ``reference_audio_tokens`` — same as above (delivered in the
-     first prefill chunk).
-   * ``input_text_tokens`` — a Python ``list[int]`` that **grows** by
-     one entry every step: step ``k`` carries the cumulative
-     sampled-token sequence ``[t1, ..., t_{k+1}]``. The
-     :meth:`preprocess` decode branch indexes ``input_text_tokens`` at
-     the per-request ``ear_decode_offset`` (advanced internally each
-     decode step) so decode step ``k`` consumes ``t_k``.
-   * Simply omit ``text`` from the first prefill chunk's
-     ``additional_information`` to select this mode.
+The full synthesis text path (passing a Python ``str`` and tokenizing
+it once at prefill) has been removed; callers must always provide token
+ids via the streaming-text contract above.
 
 Per-step flow:
-  1. ``preprocess`` builds (or reads from cached buffers) the per-token
-     tensors consumed by :class:`EarTTSInputEmbedding` —
-     ``acoustic_tokens (BTx31)``, ``text_tokens (BT)``,
-     ``text_mask (BT)``, ``bos_mask (BT)`` — and writes them into the
-     model-owned static-address buffers at the request's flat-batch
-     offset. Returns placeholder ``input_ids`` and a zero
-     ``inputs_embeds`` (the actual embedding is computed inside the
-     compiled ``forward`` so the text transformer encoder runs inside
-     CUDA graphs).
-  2. ``forward`` slices the buffers up to ``num_tokens`` and calls the
-     compiled :class:`EarTTSModel` (embedding + Gemma3 backbone +
-     MaskGIT sampler). The generated codes are copied into a stable
-     ``_out_codes`` buffer for :meth:`make_omni_output`.
-  3. ``compute_logits`` returns trivial 2-class logits (``[0, -inf]``)
-     so vLLM's standard sampler always picks index ``0`` — the actual
-     audio output is the codes tensor exposed via :meth:`make_omni_output`.
-  4. ``postprocess`` stashes the last frame's codes as
-     ``last_acoustic_codes`` for the next step's :meth:`preprocess` to
-     consume as the decode input.
+
+1. ``preprocess`` writes the per-token tensors consumed by
+   :class:`EarTTSInputEmbedding` —  ``acoustic_tokens (BTx31)``,
+   ``text_tokens (BT)``, ``text_mask (BT)``, ``bos_mask (BT)``,
+   ``speaker_latent (BT x hidden_size)`` — into the model-owned
+   static-address buffers at the request's flat-batch offset. Returns
+   placeholder ``input_ids`` and the ``inputs_embeds`` slice it
+   received from the runner unchanged (the actual embedding is
+   computed inside the compiled ``forward``; the buffer's contents
+   are ignored).
+
+   Prefill is fully derived from ``speaker_latent``:
+
+     * ``acoustic_tokens`` = ``model.sil_tokens`` broadcast to every
+       prefill position (only the BOS frame's audio embedding actually
+       contributes to the model output; the rest are replaced by the
+       speaker latent inside :class:`EarTTSInputEmbedding`).
+     * ``text_tokens`` = ``[PAD] * (Tref - 1) + [EOS]``.
+     * ``text_mask``   = ``[0] * (Tref - 2) + [1, 1]``.
+     * ``bos_mask``    = ``[0] * (Tref - 1) + [1]``.
+     * ``speaker_latent`` = the user-supplied tensor.
+
+   Decode each step (chooses ``acoustic_tokens`` in this order):
+
+     * ``text_token == EOS`` (``2``) → ``model.sil_tokens``.
+     * First decode step (``ear_decode_offset == 0``) → broadcast
+       acoustic pad id (``codebook_size``); matches the reference S2S
+       inference script's ``[1024] * 31`` seed.
+     * Otherwise → previous-step codes stashed by :meth:`postprocess`
+       as ``last_acoustic_codes``.
+
+     ``text_tokens = input_text_tokens[ear_decode_offset]``,
+     ``text_mask = 1``, ``bos_mask = 0``,
+     ``speaker_latent = 0`` (no replacement on decode).
+
+2. ``forward`` slices the buffers up to ``num_tokens`` and calls the
+   compiled :class:`EarTTSModel` (embedding + Gemma3 backbone). The
+   compiled :class:`EarTTSSamplerModel` (MaskGIT) is invoked
+   conditionally on decode positions. Generated codes are copied into
+   a stable ``_out_codes`` buffer for :meth:`make_omni_output`.
+
+3. ``compute_logits`` returns trivial logits so vLLM's standard
+   sampler always picks index ``0`` — the actual audio output is the
+   codes tensor exposed via :meth:`make_omni_output`.
+
+4. ``postprocess`` stashes the last frame's codes as
+   ``last_acoustic_codes`` for the next step's :meth:`preprocess`.
 """
 
 import bisect
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from typing import Any, Optional, Union
 
 import numpy as np
 import torch
 from torch import nn
-from transformers import AutoConfig, AutoTokenizer
 from transformers.generation.logits_process import (
     TopKLogitsWarper,
     TopPLogitsWarper,
@@ -93,21 +111,14 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-from .optimized_t5gemma import OptimizedT5GemmaEncoderModel
-
-# Number of EarTTS frames per text token (one frame ≈ 80ms of audio; English
-# speech at ~150wpm with ~1.3-1.5 BPE subwords/word lands around 3-4 frames
-# per text token). 4.0 is a safe default that gives the model breathing room.
-EARTTS_FRAMES_PER_TEXT_TOKEN = 4.0
-
-# Hardcoded prefix string placed at the start of the prefill text positions
-# (immediately followed by an EOS, then padding, then a final EOS).
-# Matches the reference EarTTS prefill data layout.
-_PREFILL_PREFIX_TEXT = "fisher"
-
-# Pad token used to fill prefill text and decode text padding.
+# Pad token used to fill prefill text positions.
 # Corresponds to ``<SPECIAL_12>`` in the EarTTS tokenizer vocab.
 _TEXT_PAD_TOKEN_ID = 12
+
+# EOS token id placed at the last prefill text position and used to
+# detect "end of speech" during decode (when the incoming text token is
+# EOS, the per-step acoustic input is forced to ``model.sil_tokens``).
+_EOS_TOKEN_ID = 2
 
 
 # ---------------------------------------------------------------------------
@@ -220,206 +231,23 @@ class GatedProjectedSumRMSNorm(nn.Module):
         return h
 
 
-class SubwordFlagEmbedding(nn.Module):
-    """
-    Adds a small continuation embedding for subwords (tokens without
-    word-boundary marker). Automatically adds a custom padding token at
-    index ``vocab_size``. Ignores special tokens (starting with ``<``)
-    when computing continuation flags.
+class PrecomputedSubwordEmbedding(nn.Module):
+    """Per-token text embedding lookup baked out at checkpoint-conversion time.
+
+    The original NeMo model embeds text with a character-aware subword
+    encoder (a small transformer over per-character embeddings) followed
+    by additive subword-continuation and BOS/EOS flag embeddings. All of
+    those operations are deterministic per token id, so the converter
+    runs them once over the full vocabulary and stores the result here
+    as a single ``nn.Embedding``.
     """
 
-    def __init__(self, model_name: str, d_model: int):
+    def __init__(self, vocab_size: int, hidden_size: int):
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.vocab_size = self.tokenizer.vocab_size
-        self.d_model = d_model
-
-        # Custom pad token at vocab_size
-        self.pad_id = self.vocab_size
-        # register pad_id as a tensor buffer to avoid device issues
-        self.pad_tensor = nn.Parameter(
-            torch.tensor(self.pad_id, dtype=torch.long), requires_grad=False
-        )
-
-        # Precompute continuation flags
-        tokens = [
-            self.tokenizer.convert_ids_to_tokens(i) for i in range(self.vocab_size)
-        ]
-        cont_flags = [
-            1
-            if not (tok.startswith("Ġ") or tok.startswith("▁") or tok.startswith("<"))
-            else 0
-            for tok in tokens
-        ]
-        cont_flags.append(0)  # for the custom pad token
-        self.is_continuation = nn.Parameter(
-            torch.tensor(cont_flags, dtype=torch.long), requires_grad=False
-        )
-
-        # Continuation embedding
-        init_std = self.d_model ** -0.5
-        self.cont_emb = nn.Embedding(2, self.d_model)
-        nn.init.normal_(self.cont_emb.weight, mean=0.0, std=init_std)
-        self.cont_emb.weight.data[0].zero_()
-
-    def forward(self, subword_embeds: torch.Tensor, token_ids: torch.LongTensor):
-        # Replace OOV token IDs with pad_id safely
-        token_ids_clamped = torch.where(
-            token_ids >= self.vocab_size, self.pad_tensor, token_ids
-        )
-        # Continuation flags
-        cont_flags = self.is_continuation[token_ids_clamped]
-        # Add continuation embedding
-        cont_emb = self.cont_emb(cont_flags)
-        return subword_embeds + cont_emb
-
-
-class BOSEOSEmbedding(nn.Module):
-    """
-    Adds independent embeddings for BOS and EOS tokens using a single
-    embedding table. Index 0 = regular token (ignored), 1 = BOS, 2 = EOS.
-    Compatible with Hugging Face tokenizers that may or may not have
-    BOS/EOS.
-    """
-
-    def __init__(self, model_name: str, d_model: int):
-        super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        # vocab size that includes special tokens
-        vocab_dict = self.tokenizer.get_vocab()
-        self.vocab_size = max(vocab_dict.values())
-        self.d_model = d_model
-
-        # Custom pad token for OOVs
-        self.pad_id = self.vocab_size
-        self.pad_tensor = nn.Parameter(
-            torch.tensor(self.pad_id, dtype=torch.long), requires_grad=False
-        )
-
-        # Identify BOS and EOS tokens (may be None)
-        tokens = [
-            self.tokenizer.convert_ids_to_tokens(i) for i in range(self.vocab_size)
-        ]
-
-        if "Qwen2.5" in model_name:
-            # For Qwen, '<|im_start|>' is a common choice for a BOS token.
-            # You can check your tokenizer's vocabulary for the best candidate.
-            print(
-                "Tokenizer does not have a `bos_token`. Setting it to "
-                "'<|im_start|>'.",
-                flush=True,
-            )
-            self.tokenizer.bos_token = "<|im_start|>"
-            self.tokenizer.eos_token = "<|im_end|>"
-
-        special_flags = []
-        for tok in tokens:
-            if (
-                self.tokenizer.bos_token is not None
-                and tok == self.tokenizer.bos_token
-            ):
-                special_flags.append(1)
-            elif (
-                self.tokenizer.eos_token is not None
-                and tok == self.tokenizer.eos_token
-            ):
-                special_flags.append(2)
-            else:
-                special_flags.append(0)
-        special_flags.append(0)  # for custom pad token
-        self.special_flags = nn.Parameter(
-            torch.tensor(special_flags, dtype=torch.long), requires_grad=False
-        )
-        # Embedding table: 0 = regular, 1 = BOS, 2 = EOS
-        init_std = self.d_model ** -0.5
-        self.special_emb = nn.Embedding(3, d_model)
-        nn.init.normal_(self.special_emb.weight, mean=0.0, std=init_std)
-        self.special_emb.weight.data[0].zero_()  # regular tokens ignored
-
-    def forward(self, token_embeds: torch.Tensor, token_ids: torch.LongTensor):
-        """
-        token_embeds: (B, T, d_model)
-        token_ids:    (B, T)
-        """
-        # Clamp OOVs to custom pad token
-        safe_ids = torch.where(
-            token_ids >= self.vocab_size, self.pad_tensor, token_ids
-        )
-
-        # Lookup flags (0=regular, 1=BOS, 2=EOS)
-        flags = self.special_flags[safe_ids]
-        return token_embeds + self.special_emb(flags)
-
-
-class CharAwareSubwordEncoder(nn.Module):
-    """
-    An encoder that creates subword embeddings from character-level
-    embeddings. This module replaces a standard subword embedding
-    layer. It breaks down each subword into its constituent characters,
-    embeds the characters, and then aggregates these character
-    embeddings (e.g., via mean pooling) to form the final subword
-    representation. This allows the model to handle rare or
-    out-of-vocabulary subwords more gracefully.
-    """
-
-    def __init__(
-        self,
-        out_size: int,
-        vocab_size: int,
-        char_vocab_size: int,
-        max_char_len: int,
-        backbone_type: str,
-        backbone_config: dict,
-    ):
-        super().__init__()
-        self.max_char_len = max_char_len
-        # 1. Initialize the backbone model for encoding characters
-        config = AutoConfig.for_model(backbone_type, **backbone_config)
-        self.backbone = OptimizedT5GemmaEncoderModel(config)
-        self.backbone.eval()
-        self.hidden_size = self.backbone.get_input_embeddings().weight.size(-1)
-        delattr(self.backbone.encoder, "embed_tokens")
-        # 2. Initialize embedding layer to embed characters
-        self.embed_tokens = nn.Embedding(
-            char_vocab_size + 1,
-            self.hidden_size,
-            padding_idx=char_vocab_size,
-        )
-        # 3. Initialize embedding layer to convert subword ids to char ids.
-        # Also requires a layer which creates a mask for the backbone transformer
-        self.embed_subwords = nn.Embedding(
-            vocab_size,
-            max_char_len,
-        )
-        self.embed_subwords_mask = nn.Embedding(
-            vocab_size,
-            max_char_len,
-        )
-        self.proj_embedding = nn.Linear(self.hidden_size, out_size, bias=False)
+        self.embed_subwords = nn.Embedding(vocab_size, hidden_size)
 
     def forward(self, subword_ids: torch.Tensor) -> torch.Tensor:
-        char_ids = torch.round(self.embed_subwords(subword_ids)).to(
-            torch.int32
-        )  # BT x 128
-        char_ids_mask = self.embed_subwords_mask(subword_ids)  # BT x 128
-        char_embeds = self.embed_tokens(char_ids)  # bt x 128 x hidden_size
-
-        char_hidden_states = self.backbone(
-            inputs_embeds=char_embeds, attention_mask=char_ids_mask
-        ).last_hidden_state  # BT x 128 x hidden_size
-        # 3. Aggregate character embeddings to form subword embeddings (mean pooling)
-        # We mask the padding characters before summing to get a correct mean.
-        masked_sum = (char_hidden_states * char_ids_mask.unsqueeze(-1)).sum(
-            dim=1
-        )  # BT x hidden_size
-        # Avoid division by zero for empty sequences
-        char_ids_lengths = char_ids_mask.sum(dim=1)  # (bt,)
-        mean_emb = masked_sum / (
-            char_ids_lengths.unsqueeze(-1).clamp(min=1)
-        )  # BT x hidden_size
-        # 4. Scatter the aggregated embeddings back to the original subword sequence shape
-        out_emb = self.proj_embedding(mean_emb)  # bt x hidden_size
-        return out_emb
+        return self.embed_subwords(subword_ids)
 
 
 class EarTTSInputEmbedding(nn.Module):
@@ -432,10 +260,6 @@ class EarTTSInputEmbedding(nn.Module):
 
         hidden_size = config.hidden_size
         vocab_size = config.emb_vocab_size
-        char_vocab_size = config.emb_char_vocab_size
-        max_char_len = config.max_char_len
-        backbone_type = config.emb_backbone_type
-        backbone_config = config.emb_backbone_config
 
         # allows to embed acoustic tokens into a single embeddings
         self.rvq_embs = nn.ModuleList(
@@ -445,27 +269,14 @@ class EarTTSInputEmbedding(nn.Module):
             ]
         )
         self.embed_code = nn.Linear(config.latent_size, hidden_size, bias=False)
-        self.embed_subword = CharAwareSubwordEncoder(
-            out_size=hidden_size,
-            vocab_size=vocab_size,
-            char_vocab_size=char_vocab_size,
-            max_char_len=max_char_len,
-            backbone_type=backbone_type,
-            backbone_config=backbone_config,
-        )
+        # Pre-computed per-token text embedding lookup. Replaces the
+        # original char-aware subword encoder + subword-flag + BOS/EOS
+        # additive embeddings; all of those are deterministic per token
+        # id and are baked into this single table by the checkpoint
+        # converter.
+        self.embed_subword = PrecomputedSubwordEmbedding(vocab_size, hidden_size)
         self.bos_emb = nn.Parameter(torch.empty(hidden_size))
 
-        self.use_subword_flag_emb = config.use_subword_flag_emb
-        pretrained_tokenizer_name = config.pretrained_tokenizer_name
-        if self.use_subword_flag_emb:
-            self.subword_flag_emb = SubwordFlagEmbedding(
-                pretrained_tokenizer_name, hidden_size
-            )
-        self.use_bos_eos_emb = config.use_bos_eos_emb
-        if self.use_bos_eos_emb:
-            self.bos_eos_emb = BOSEOSEmbedding(
-                pretrained_tokenizer_name, hidden_size
-            )
         self.use_gated_fusion_for_text_audio = config.use_gated_fusion_for_text_audio
         if self.use_gated_fusion_for_text_audio:
             self.gated_fusion_audio_text = GatedProjectedSumRMSNorm(
@@ -487,6 +298,7 @@ class EarTTSInputEmbedding(nn.Module):
         text_tokens: torch.Tensor,
         text_mask: torch.Tensor,
         bos_mask: torch.Tensor,
+        speaker_latent: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Works for context and generation phases to prepare total input
@@ -497,6 +309,11 @@ class EarTTSInputEmbedding(nn.Module):
             text_tokens: (BT) - text token to embed
             text_mask: (BT) - masks text embeddings for prefill
             bos_mask: (BT) - specifies where BOS is applied (first frame of prefill)
+            speaker_latent: (BT x hidden_size) - external speaker latent.
+                Non-zero rows replace ``embed_code(rvq_sum(...))`` at
+                pre-BOS prefill positions; zero rows (decode steps and
+                the BOS frame) leave ``audio_emb`` untouched. Pass an
+                all-zero tensor on decode.
 
         Returns:
             embedding of shape (BT x dim)
@@ -512,31 +329,54 @@ class EarTTSInputEmbedding(nn.Module):
         audio_emb = self.embed_code(audio_emb)  # BT x hidden_size
 
         if self.use_audio_prompt_frozen_projection:
-            # need to compute audio_prompt_lantent and use it instead of audio_emb
-            audio_prompt_lantent = torch.nn.functional.linear(
-                audio_emb, self.audio_prompt_projection_W.T
-            )
-            # WARNING! this is a hack! this only works if bos_mask is
-            # [0, 0, ..., 0, 1] for prompt requests and [0] for decoding ones.
-            # NeMo does pre_bos_mask = (bos_mask.cumsum(dim=1) == 0), but since
-            # we have multiple bos_mask concatenated, we can't do that.
-            # we just invert the bos_mask
-            pre_bos_mask = (bos_mask == 0).unsqueeze(-1)  # BT x 1
-            audio_emb = torch.where(pre_bos_mask, audio_prompt_lantent, audio_emb)
+            if speaker_latent is None:
+                # No external latent at all -> behave like NeMo's
+                # prefill-with-no-latent (compute it from acoustic
+                # tokens). vLLM-Omni callers always pass a real or
+                # zero latent so they hit the other branch and skip
+                # replacement entirely; this branch exists only to
+                # keep parity with the upstream model definition.
+                latent_provided = torch.zeros_like(bos_mask).unsqueeze(-1)
+                latent = torch.nn.functional.linear(
+                    audio_emb, self.audio_prompt_projection_W.T
+                )
+            else:
+                # ``latent_provided`` is non-zero exactly on the rows
+                # the user populated with a real speaker latent
+                # (prefill pre-BOS positions). Decode rows are filled
+                # with zeros by ``preprocess``, so they read as "not
+                # provided" here.
+                latent_provided = (
+                    speaker_latent.abs().sum(-1, keepdim=True) > 0
+                )  # (BT, 1)
+                latent = speaker_latent
+
+            # Replace only at pre-BOS positions of prefill -- i.e.
+            # ``bos_mask == 0 AND latent was actually provided``. This
+            # excludes:
+            #   * the BOS frame (``bos_mask == 1``), where
+            #     ``embed_code(acoustic_tokens)`` of ``sil_tokens``
+            #     survives (this is the audio_emb the backbone sees on
+            #     the BOS frame).
+            #   * AR decode steps (``latent_provided == False`` because
+            #     ``speaker_latent`` is all zeros).
+            replace_mask = (bos_mask.unsqueeze(-1) == 0) & latent_provided
+            audio_emb = torch.where(replace_mask, latent, audio_emb)
 
         audio_emb = audio_emb + bos_emb
 
-        # embed text tokens by expanding them to chars and passing through transformer
-        # apply the mask that turns this embedding to zeros for prefill tokens
+        # Embed text tokens via the pre-computed lookup (subword-flag and
+        # BOS/EOS additions are baked into the table at conversion time).
+        # Apply the mask that zeroes this embedding on prefill positions.
         text_emb = self.embed_subword(text_tokens) * text_mask.unsqueeze(1)  # BT x dim
-        # update text embeddings with flags
-        if self.use_subword_flag_emb:
-            text_emb = self.subword_flag_emb(text_emb, text_tokens)
-        if self.use_bos_eos_emb:
-            text_emb = self.bos_eos_emb(text_emb, text_tokens)
 
-        # prepare total embedding by adding all components
+        # prepare total embedding by combining audio and text branches
         if self.use_gated_fusion_for_text_audio:
+            # Gated fusion needs ``audio_emb`` and ``text_emb`` as
+            # separate inputs (it learns a per-feature gate to mix
+            # them), which is why neither branch can be folded into a
+            # single precomputed ``inputs_embeds`` tensor outside the
+            # compiled forward.
             total_emb = self.gated_fusion_audio_text(audio_emb, text_emb)
         else:
             total_emb = audio_emb + text_emb  # BT x dim
@@ -813,8 +653,20 @@ class EarTTSModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.total_emb = EarTTSInputEmbedding(vllm_config.model_config.hf_config)
+        config = vllm_config.model_config.hf_config
+        self.total_emb = EarTTSInputEmbedding(config)
         self.backbone = Gemma3Model(vllm_config=vllm_config, prefix=prefix)
+
+        # Per-codebook silence acoustic tokens. Registered as a
+        # persistent int32 buffer (loaded from the checkpoint under
+        # ``model.sil_tokens``) rather than nn.Parameter so that vLLM's
+        # automatic float dtype casting (e.g. ``model.to(bfloat16)``)
+        # leaves it untouched.
+        self.register_buffer(
+            "sil_tokens",
+            torch.empty(int(config.num_quantizers), dtype=torch.int32),
+            persistent=True,
+        )
 
     def forward(
         self,
@@ -825,6 +677,7 @@ class EarTTSModel(nn.Module):
         text_tokens: torch.Tensor,
         text_mask: torch.Tensor,
         bos_mask: torch.Tensor,
+        speaker_latent: torch.Tensor,
     ) -> torch.Tensor:
         """Forward pass through embeddings and backbone transformer.
         Returns the backbone's ``hidden_states``.
@@ -834,6 +687,7 @@ class EarTTSModel(nn.Module):
             text_tokens=text_tokens,
             text_mask=text_mask,
             bos_mask=bos_mask,
+            speaker_latent=speaker_latent,
         )
         hidden_states = self.backbone(
             input_ids, positions, intermediate_tensors, inputs_embeds=total_emb
@@ -930,28 +784,31 @@ class EarTTSForCausalLM(nn.Module):
 
     Inputs (passed via ``additional_information``):
 
-      * ``reference_audio_tokens`` — Tensor of shape ``(Tref, 31)`` with
-        the reference speaker's acoustic tokens. The user must also pass
-        ``prompt_token_ids = [0] * Tref`` so the prefill placeholder
-        length matches.
-      * ``text`` — string to synthesize. The model tokenizes it once
-        during the first prefill chunk and pads the result to
-        ``round(EARTTS_FRAMES_PER_TEXT_TOKEN * N)`` tokens.
+      * ``speaker_latent`` (prefill chunk 0 only) — Tensor of shape
+        ``(Tref, hidden_size)`` carrying the user-supplied speaker
+        latent. The user must also pass ``prompt_token_ids = [0] *
+        Tref`` so the prefill placeholder length matches.
+      * ``input_text_tokens`` — Python ``list[int]`` that grows by one
+        entry per decode step. Step ``k`` carries the cumulative
+        sampled-token sequence ``[t1, ..., t_{k+1}]``; preprocess
+        indexes it at ``ear_decode_offset`` so decode step ``k``
+        consumes ``t_k``.
 
     Per-step flow (see module docstring for details):
 
-    ``preprocess`` populates four model-owned buffers
+    ``preprocess`` populates five model-owned buffers
     (:attr:`_acoustic_tokens`, :attr:`_text_tokens`, :attr:`_text_mask`,
-    :attr:`_bos_mask`) at each request's flat-batch offset. ``forward``
-    slices them up to ``num_tokens`` and runs the compiled
-    :class:`EarTTSModel` (text transformer + Gemma3 backbone) for
-    every position, then conditionally invokes the compiled
-    :class:`EarTTSSamplerModel` (MaskGIT) to produce codes. The sampler
-    is skipped on prefill positions — see :meth:`forward` for details.
-    The generated codes (BTx31) are written to :attr:`_out_codes` and
-    exposed under the conventional ``"audio_codes"`` multimodal key by
-    :meth:`make_omni_output`. ``postprocess`` stashes the final-frame
-    codes under ``last_acoustic_codes`` for the next decode step's
+    :attr:`_bos_mask`, :attr:`_speaker_latent`) at each request's
+    flat-batch offset. ``forward`` slices them up to ``num_tokens`` and
+    runs the compiled :class:`EarTTSModel` (embedding + Gemma3
+    backbone) for every position, then conditionally invokes the
+    compiled :class:`EarTTSSamplerModel` (MaskGIT) to produce codes.
+    The sampler is skipped on prefill positions — see :meth:`forward`
+    for details. The generated codes (BTx31) are written to
+    :attr:`_out_codes` and exposed under the conventional
+    ``"audio_codes"`` multimodal key by :meth:`make_omni_output`.
+    ``postprocess`` stashes the final-frame codes under
+    ``last_acoustic_codes`` for the next decode step's
     :meth:`preprocess`.
 
     Sampler skipping mirrors the qwen3-tts code-predictor pattern:
@@ -965,12 +822,11 @@ class EarTTSForCausalLM(nn.Module):
       overridden to the padded decode-batch size so the right captured
       graph is replayed.
     * **Prefill-only batches**: the sampler is skipped entirely.
-    * For prefill positions, :attr:`_out_codes` is initialized from
-      :attr:`_acoustic_tokens` (i.e. the input reference audio frames),
-      so :meth:`postprocess` on a request whose last position falls in
-      prefill returns the last reference audio frame as
-      ``last_acoustic_codes`` — the natural acoustic input for the
-      first decode step that follows.
+    * Prefill rows of :attr:`_out_codes` are intentionally not
+      written. ``last_acoustic_codes`` returned by :meth:`postprocess`
+      after prefill is therefore undefined — :meth:`_preprocess_decode`
+      seeds the first decode step's acoustic input with the acoustic
+      pad id (``codebook_size``) so this never matters.
     """
 
     # Map raw HuggingFace checkpoint names to the vLLM module layout.
@@ -989,35 +845,28 @@ class EarTTSForCausalLM(nn.Module):
     has_postprocess = True
     have_multimodal_outputs = True
 
-    # Hardcoded prefix string placed at the start of the prefill text
-    # positions (immediately followed by an EOS, padding, then a final
-    # EOS). Matches the reference EarTTS prefill data layout.
-    PREFILL_PREFIX_TEXT: str = _PREFILL_PREFIX_TEXT
-
-    # Pad token id used to fill prefill text positions and to pad the
-    # tokenized synthesis text up to the per-step decode length.
+    # Pad token id used to fill prefill text positions.
     TEXT_PAD_TOKEN_ID: int = _TEXT_PAD_TOKEN_ID
 
-    # Keys whose tensors should stay on GPU in ``model_intermediate_buffer``
-    # to avoid a D2H/H2D round-trip on every step. These are consumed only
-    # in eager ``preprocess``/``postprocess`` Python (where they're copied
-    # into the static-address ``_acoustic_tokens`` / ``_text_tokens`` /
-    # ``_text_mask`` / ``_bos_mask`` buffers used by the compiled forward),
-    # so address stability across steps is not required.
+    # EOS token id placed at the last prefill text position and used
+    # to detect "force silence" on the decode acoustic input.
+    EOS_TOKEN_ID: int = _EOS_TOKEN_ID
+
+    # Keys whose tensors should stay on GPU in
+    # ``model_intermediate_buffer`` to avoid a D2H/H2D round-trip on
+    # every step. These are consumed only in eager
+    # ``preprocess`` / ``postprocess`` Python (where they're copied
+    # into the static-address per-token buffers used by the compiled
+    # forward), so address stability across steps is not required.
     gpu_resident_buffer_keys: set[str] = {
         "last_acoustic_codes",
-        "ear_prefill_text_tokens",
-        "ear_prefill_text_mask",
-        "ear_prefill_acoustic_tokens",
-        "ear_prefill_bos_mask",
-        "ear_decode_text_tokens",
+        "ear_prefill_speaker_latent",
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.vllm_config = vllm_config
-        self.model_path = vllm_config.model_config.model
 
         # Embedding + Gemma3 backbone — runs on every position. Built
         # under the default ``"backbone"`` model tag (vLLM's compile
@@ -1047,18 +896,10 @@ class EarTTSForCausalLM(nn.Module):
         # ``codebook_size`` is the trailing "no audio" pad row in
         # ``rvq_embs`` (which has ``codebook_size + 1`` entries).
         self._num_quantizers: int = int(self.config.num_quantizers)
+        self._hidden_size: int = int(self.config.hidden_size)
         self._acoustic_pad_id: int = int(self.config.codebook_size)
         self._text_pad_id: int = int(self.TEXT_PAD_TOKEN_ID)
-
-        # HF tokenizer loaded from the model directory. The ids it
-        # produces must match the vocab expected by
-        # :class:`SubwordFlagEmbedding` / :class:`BOSEOSEmbedding`.
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-        self._eos_token_id: int = int(
-            self.tokenizer.eos_token_id
-            if self.tokenizer.eos_token_id is not None
-            else 2
-        )
+        self._eos_token_id: int = int(self.EOS_TOKEN_ID)
 
         # ── Persistent stable-address buffers ────────────────────────
         # Plain tensor attributes (not nn.Parameter / not register_buffer):
@@ -1075,15 +916,25 @@ class EarTTSForCausalLM(nn.Module):
         #     data_ptr() at capture time and expects the same pointer at
         #     replay time — that holds with plain tensors.
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        model_dtype = vllm_config.model_config.dtype
 
         self._acoustic_tokens = torch.full(
             (max_num_tokens, self._num_quantizers),
             self._acoustic_pad_id,
             dtype=torch.long,
         )
-        self._text_tokens = torch.zeros(max_num_tokens, dtype=torch.long)
+        self._text_tokens = torch.full(
+            (max_num_tokens,), self._text_pad_id, dtype=torch.long
+        )
         self._text_mask = torch.zeros(max_num_tokens, dtype=torch.long)
         self._bos_mask = torch.zeros(max_num_tokens, dtype=torch.long)
+        # Speaker latent buffer — model dtype, hidden_size wide.
+        # Decode rows stay all-zero (which the embedding module reads
+        # as "latent not provided" so ``audio_emb`` is preserved).
+        # Prefill rows are populated from the user-supplied tensor.
+        self._speaker_latent = torch.zeros(
+            max_num_tokens, self._hidden_size, dtype=model_dtype
+        )
         self._out_codes = torch.zeros(
             max_num_tokens, self._num_quantizers, dtype=torch.long
         )
@@ -1103,175 +954,60 @@ class EarTTSForCausalLM(nn.Module):
         return self.get_input_embeddings(input_ids)
 
     @staticmethod
-    def _first_str(value: Any) -> str:
-        """Return the first element of a list-wrapped scalar, or the
-        scalar itself.
-        """
-        if isinstance(value, list):
-            return str(value[0]) if value else ""
-        if value is None:
-            return ""
-        return str(value)
-
-    @staticmethod
     def _unwrap_singleton(value: Any) -> Any:
         """Unwrap a possibly list-wrapped scalar (e.g. ``[tensor]``)."""
         if isinstance(value, list):
             return value[0] if value else None
         return value
 
-    @staticmethod
-    def _coerce_ref_audio_tokens(value: Any) -> Optional[torch.Tensor]:
-        """Normalize ``reference_audio_tokens`` to a 2D LongTensor on CPU.
-
-        Accepts ``torch.Tensor``, ``np.ndarray``, ``list``-wrapped
-        variants of either. Returns ``None`` when the input cannot be
-        interpreted as acoustic tokens.
-        """
-        x = EarTTSForCausalLM._unwrap_singleton(value)
-        if x is None:
-            return None
-        if isinstance(x, torch.Tensor):
-            t = x
-        elif isinstance(x, np.ndarray):
-            t = torch.from_numpy(x)
-        elif isinstance(x, list):
-            try:
-                t = torch.as_tensor(x)
-            except Exception:
-                return None
-        else:
-            return None
-        if t.numel() == 0:
-            return None
-        if t.ndim == 3:
-            t = t[0]
-        return t.to(dtype=torch.long).contiguous()
-
-    def _zero_buffers_at(self, start: int, length: int) -> None:
-        """Reset the per-token buffers in [start, start+length)."""
-        s, e = int(start), int(start + length)
-        self._acoustic_tokens[s:e].fill_(self._acoustic_pad_id)
-        self._text_tokens[s:e].fill_(self._text_pad_id)
-        self._text_mask[s:e].zero_()
-        self._bos_mask[s:e].zero_()
+    def _validate_speaker_latent(self, value: Any) -> torch.Tensor:
+        """Assert ``speaker_latent`` has shape ``(Tref, hidden_size)``."""
+        x = self._unwrap_singleton(value)
+        assert isinstance(x, torch.Tensor), (
+            f"speaker_latent must be a torch.Tensor; got {type(x).__name__}."
+        )
+        assert x.ndim == 2 and x.shape[1] == self._hidden_size, (
+            "speaker_latent must have shape (Tref, hidden_size="
+            f"{self._hidden_size}); got {tuple(x.shape)}."
+        )
+        return x.to(dtype=self._speaker_latent.dtype).contiguous()
 
     def _build_prefill_tensors(
         self,
-        text: Optional[str],
-        ref_audio_tokens: torch.Tensor,
+        speaker_latent: torch.Tensor,
         device: torch.device,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        Optional[torch.Tensor],
-    ]:
-        """Construct the full prefill per-token tensors and (optionally)
-        the cached padded text tokens for decode.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build the cached prefill ``(text_tokens, text_mask, bos_mask,
+        speaker_latent)`` of length ``prefill_len = speaker_latent.shape[0]``.
 
-        Layout (length ``num = ref_audio_tokens.shape[0]``):
-
-          * ``acoustic`` = ``ref_audio_tokens`` (Tref, 31), copied as-is
-          * ``text_tokens``: ``tokenize(PREFILL_PREFIX_TEXT) + [EOS] +
-            [PAD] * missing + [EOS]`` (length ``num``). Truncated from
-            the front if the prefix doesn't fit; this should never happen
-            in practice since ``num`` is the reference audio length and
-            comfortably exceeds the few-token prefix.
-          * ``text_mask`` = ``[0] * num``; ``mask[-2:] = 1`` so only the
-            last two positions contribute text embeddings.
-          * ``bos_mask`` = ``[0] * num``; ``bos_mask[-1] = 1`` (BOS
-            transition at the final prefill frame).
-
-        Decode-side cache (returned separately):
-
-          * ``decode_text_tokens`` = ``tokenize(text) + [PAD] * pad_n``
-            with total length ``round(EARTTS_FRAMES_PER_TEXT_TOKEN * N)``
-            where ``N = len(tokenize(text))``. One entry is consumed per
-            decode step.
-
-        When ``text`` is ``None`` (streaming-text mode), the decode-side
-        cache is not built and ``None`` is returned in its place — the
-        per-step text token will be supplied externally via the
-        per-chunk ``input_ids``.
+        Layout: ``text_tokens = [PAD] * (n - 1) + [EOS]``,
+        ``text_mask = [0] * (n - 2) + [1, 1]``,
+        ``bos_mask = [0] * (n - 1) + [1]``. Acoustic tokens are not
+        cached — :meth:`preprocess` broadcasts ``model.sil_tokens`` at
+        every prefill position.
         """
-        num = int(ref_audio_tokens.shape[0])
-        if num <= 0:
-            raise ValueError(
-                "reference_audio_tokens must have at least one frame "
-                f"(got shape={tuple(ref_audio_tokens.shape)})."
-            )
-
-        prefix_ids: list[int] = list(
-            self.tokenizer.encode(
-                self.PREFILL_PREFIX_TEXT, add_special_tokens=False
-            )
-        )
-        prefix_ids.append(self._eos_token_id)
-
-        # Reserve one slot for the trailing EOS; pad the rest. Truncate
-        # the prefix from the front if num is unrealistically small.
-        usable = max(0, num - 1)
-        if len(prefix_ids) > usable:
-            prefix_ids = prefix_ids[-usable:] if usable > 0 else []
-        missing = max(0, usable - len(prefix_ids))
-        prefill_text_ids = (
-            prefix_ids
-            + [self._text_pad_id] * missing
-            + [self._eos_token_id]
-        )
-        full_text_tokens = torch.tensor(
-            prefill_text_ids[:num], dtype=torch.long, device=device
+        prefill_len = int(speaker_latent.shape[0])
+        assert prefill_len > 0, (
+            "speaker_latent must have at least one frame "
+            f"(got shape={tuple(speaker_latent.shape)})."
         )
 
-        full_text_mask = torch.zeros(num, dtype=torch.long, device=device)
-        # Only the last two positions carry text contribution.
-        full_text_mask[-min(2, num):] = 1
-
-        full_bos_mask = torch.zeros(num, dtype=torch.long, device=device)
-        full_bos_mask[-1] = 1
-
-        full_acoustic = ref_audio_tokens.to(
-            device=device, dtype=torch.long, non_blocking=True
+        text_tokens = torch.full(
+            (prefill_len,), self._text_pad_id, dtype=torch.long, device=device
         )
-        if full_acoustic.shape != (num, self._num_quantizers):
-            raise ValueError(
-                "reference_audio_tokens must have shape "
-                f"(Tref, {self._num_quantizers}); got "
-                f"{tuple(full_acoustic.shape)}."
-            )
+        text_tokens[-1] = self._eos_token_id
 
-        # Cached padded text tokens consumed one-per-step in decode.
-        # Skipped in streaming-text mode (text is None) — the per-step
-        # text token is supplied externally via input_ids.
-        decode_text_tokens: Optional[torch.Tensor]
-        if text is None:
-            decode_text_tokens = None
-        else:
-            text_ids = list(
-                self.tokenizer.encode(text, add_special_tokens=True)
-            )
-            n = len(text_ids)
-            if n <= 0:
-                raise ValueError("text tokenized to an empty sequence.")
-            total_frames = max(
-                n, int(round(n * EARTTS_FRAMES_PER_TEXT_TOKEN))
-            )
-            pad_n = max(0, total_frames - n)
-            decode_text_tokens = torch.tensor(
-                text_ids + [self._text_pad_id] * pad_n,
-                dtype=torch.long,
-                device=device,
-            )
+        text_mask = torch.zeros(prefill_len, dtype=torch.long, device=device)
+        text_mask[max(0, prefill_len - 2):] = 1
 
-        return (
-            full_text_tokens,
-            full_text_mask,
-            full_acoustic,
-            full_bos_mask,
-            decode_text_tokens,
-        )
+        bos_mask = torch.zeros(prefill_len, dtype=torch.long, device=device)
+        bos_mask[-1] = 1
+
+        speaker_latent = speaker_latent.to(
+            device=device, dtype=self._speaker_latent.dtype, non_blocking=True
+        ).contiguous()
+
+        return text_tokens, text_mask, bos_mask, speaker_latent
 
     # ------------------------------------------------------------------
     # preprocess
@@ -1290,48 +1026,41 @@ class EarTTSForCausalLM(nn.Module):
 
         Prefill (``span_len > 1``):
             On the first prefill chunk, constructs the per-position
-            prefill tensors of length ``num =
-            reference_audio_tokens.shape[0]``:
+            prefill tensors of length
+            ``prefill_len = speaker_latent.shape[0]``:
 
-            * ``acoustic_tokens`` = ``reference_audio_tokens`` (copy)
-            * ``text_tokens``     = ``tokenize(PREFILL_PREFIX_TEXT) +
-              [EOS] + [PAD] * missing + [EOS]`` (length ``num``)
-            * ``text_mask``       = ``[0] * num``; ``mask[-2:] = 1``
-            * ``bos_mask``        = ``[0] * num``; ``mask[-1] = 1``
+            * ``text_tokens``     = ``[PAD] * (prefill_len - 1) + [EOS]``
+            * ``text_mask``       = ``[0] * (prefill_len - 2) + [1, 1]``
+            * ``bos_mask``        = ``[0] * (prefill_len - 1) + [1]``
+            * ``acoustic_tokens`` = ``model.sil_tokens`` broadcast at
+              every position (only the BOS frame's ``audio_emb`` is
+              actually consumed; the others are replaced by
+              ``speaker_latent`` inside the embedding module).
+            * ``speaker_latent``  = the user-supplied tensor.
 
-            When ``additional_information['text']`` is provided
-            (cached-text mode), the synthesis text is also tokenized
-            and padded once and cached under ``ear_decode_text_tokens``
-            for the decode phase. When it's omitted (streaming-text
-            mode), no decode-text cache is built — each decode step's
-            text token is read out of the cumulative
-            ``input_text_tokens`` list delivered with the per-step
-            ``additional_information``.
-
-            The full prefill per-position tensors are cached on GPU
-            under ``ear_prefill_*`` keys (kept device-resident via
-            :attr:`gpu_resident_buffer_keys`) and a running
-            ``ear_prefill_offset`` tracks how much of the prefill has
-            already been copied into the static-address buffers across
-            multi-chunk prefill.
+            ``speaker_latent`` is the only required
+            ``additional_information`` field. Multi-chunk prefill is
+            tracked by ``ear_prefill_offset``; the cached
+            ``ear_prefill_speaker_latent`` is sliced into each chunk.
 
         Decode (``span_len == 1``):
-            Reads ``last_acoustic_codes`` (stashed by
-            :meth:`postprocess` after the previous step) into
-            :attr:`_acoustic_tokens` at the request's offset, picks the
-            next text token, and sets ``text_mask = 1`` /
-            ``bos_mask = 0``.
+            Picks the next text token from the cumulative
+            ``input_text_tokens`` list at ``ear_decode_offset``; the
+            producer (a user-driven :class:`StreamingInput` or an
+            upstream stage in an ``async_chunk`` pipeline such as
+            ``nemotron_voicechat``) replaces ``input_text_tokens``
+            with the full ``[t1, ..., t_{k+1}]`` sequence at every
+            step.
 
-            * If the cached ``ear_decode_text_tokens`` is present
-              (cached-text mode), the next text token is read from it
-              at ``ear_decode_offset``.
-            * Otherwise (streaming-text mode), the next text token is
-              read from the cumulative ``input_text_tokens`` list at
-              ``ear_decode_offset`` — the producer (a user-driven
-              :class:`StreamingInput` or an upstream stage in an
-              ``async_chunk`` pipeline) replaces ``input_text_tokens``
-              with the full ``[t1, ..., t_{k+1}]`` sequence at every
-              step.
+            Acoustic input rules (in order):
+              * ``text_token == EOS`` → ``model.sil_tokens``.
+              * First decode (``ear_decode_offset == 0``) →
+                broadcast acoustic pad id (``codebook_size``).
+              * Otherwise → ``last_acoustic_codes`` (stashed by
+                :meth:`postprocess` after the previous step).
+
+            ``text_mask = 1``, ``bos_mask = 0``,
+            ``speaker_latent = 0``.
         """
         # Normalize: some runner paths still pass per-request state
         # nested under ``additional_information`` instead of flattened.
@@ -1354,179 +1083,147 @@ class EarTTSForCausalLM(nn.Module):
             )
             return input_ids, base, {}
 
-        # ----- Prefill ----------------------------------------------
         if span_len > 1:
-            cached_text_tokens = info_dict.get("ear_prefill_text_tokens")
-            cached_text_mask = info_dict.get("ear_prefill_text_mask")
-            cached_acoustic = info_dict.get("ear_prefill_acoustic_tokens")
-            cached_bos_mask = info_dict.get("ear_prefill_bos_mask")
-            cached_decode_text = info_dict.get("ear_decode_text_tokens")
-            # The decode-text cache is intentionally absent in
-            # streaming-text mode — only the four prefill caches are
-            # needed to recognise a follow-up multi-chunk prefill step.
-            is_first = not (
-                isinstance(cached_text_tokens, torch.Tensor)
-                and isinstance(cached_text_mask, torch.Tensor)
-                and isinstance(cached_acoustic, torch.Tensor)
-                and isinstance(cached_bos_mask, torch.Tensor)
-            )
-
-            info_update: dict[str, Any] = {}
-            if is_first:
-                # First prefill chunk: build the full per-position
-                # tensors + (optionally) decode text cache once.
-                # Allocate them on GPU so the runner's
-                # ``model_intermediate_buffer`` keeps them
-                # device-resident across multi-chunk prefill and decode
-                # (avoids per-chunk / per-step H2D uploads).
-                #
-                # If ``text`` is omitted, the model runs in
-                # streaming-text mode: each decode step's text token is
-                # picked from the cumulative ``input_text_tokens`` list
-                # delivered with the per-step
-                # ``additional_information``, and no decode-text cache
-                # is built here.
-                text = self._first_str(info_dict.get("text")) or None
-                ref_audio_tokens = self._coerce_ref_audio_tokens(
-                    info_dict.get("reference_audio_tokens")
-                )
-                if ref_audio_tokens is None:
-                    raise ValueError(
-                        "EarTTS preprocess requires "
-                        "additional_information['reference_audio_tokens'] "
-                        "as a (Tref, num_quantizers) tensor for prefill."
-                    )
-
-                (
-                    cached_text_tokens,
-                    cached_text_mask,
-                    cached_acoustic,
-                    cached_bos_mask,
-                    cached_decode_text,
-                ) = self._build_prefill_tensors(
-                    text=text,
-                    ref_audio_tokens=ref_audio_tokens,
-                    device=device,
-                )
-
-                info_update["ear_prefill_text_tokens"] = cached_text_tokens
-                info_update["ear_prefill_text_mask"] = cached_text_mask
-                info_update["ear_prefill_acoustic_tokens"] = cached_acoustic
-                info_update["ear_prefill_bos_mask"] = cached_bos_mask
-                if cached_decode_text is not None:
-                    info_update["ear_decode_text_tokens"] = cached_decode_text
-                info_update["ear_prefill_offset"] = 0
-                info_update["ear_decode_offset"] = 0
-
-            offset = int(info_dict.get("ear_prefill_offset", 0) or 0)
-            full_len = int(cached_text_tokens.shape[0])
-            s = max(0, min(offset, full_len))
-            e = max(0, min(offset + span_len, full_len))
-            take_len = e - s
-
-            # Slice the chunk out of the GPU-resident cached prefill
-            # tensors and D2D-copy into the static-address buffers at
-            # this request's offset. Pad with the trailing layout
-            # (text_mask=0, bos_mask=0, acoustic=pad) when the scheduled
-            # chunk overshoots — this shouldn't happen if the scheduler
-            # placeholder length matches the true prefill length.
-            buf_s = int(start)
-            buf_e = buf_s + span_len
-
-            self._zero_buffers_at(buf_s, span_len)
-
-            if take_len > 0:
-                self._text_tokens[buf_s:buf_e].copy_(cached_text_tokens[s:e])
-                self._text_mask[buf_s:buf_e].copy_(cached_text_mask[s:e])
-                self._acoustic_tokens[buf_s:buf_e].copy_(cached_acoustic[s:e])
-                self._bos_mask[buf_s:buf_e].copy_(cached_bos_mask[s:e])
-
-            info_update["ear_prefill_offset"] = offset + span_len
-
-            # Token ids for the prefill span — the runner uses them only
-            # for vLLM bookkeeping; the actual decode-vs-prefill
-            # behaviour is driven by the buffers above. Using a constant
-            # in-vocab placeholder keeps everything simple.
-            input_ids_out = torch.full_like(input_ids, _DUMMY_TOKEN_ID)
-            inputs_embeds_out = torch.zeros(
-                (span_len, self.config.hidden_size),
+            return self._preprocess_prefill(
+                input_ids=input_ids,
+                input_embeds=input_embeds,
+                start=int(start),
+                span_len=span_len,
                 device=device,
-                dtype=self.vllm_config.model_config.dtype,
+                info_dict=info_dict,
             )
-            return input_ids_out, inputs_embeds_out, info_update
+        return self._preprocess_decode(
+            input_ids=input_ids,
+            input_embeds=input_embeds,
+            start=int(start),
+            device=device,
+            info_dict=info_dict,
+        )
 
-        # ----- Decode (span_len == 1) -------------------------------
-        # Acoustic input = previous-step codes (stashed by postprocess).
-        # Text input is selected, in priority order, from one of two
-        # sources:
-        #
-        #   (a) ``ear_decode_text_tokens`` (cached-text mode): the
-        #       padded sequence built once at prefill time from the
-        #       user-supplied ``text``. Indexed by ``ear_decode_offset``.
-        #
-        #   (b) ``input_text_tokens`` (streaming-text mode): a Python
-        #       list grown one entry per step by the producer (a
-        #       user-driven ``StreamingInput`` or an upstream stage in
-        #       an ``async_chunk`` pipeline such as
-        #       ``nemotron_voicechat``). Indexed by ``ear_decode_offset``.
-        #
-        # ``text_mask = 1`` and ``bos_mask = 0`` for every decode step.
-        last_codes = info_dict.get("last_acoustic_codes")
-        cached_decode_text = info_dict.get("ear_decode_text_tokens")
+    def _preprocess_prefill(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        input_embeds: Optional[torch.Tensor],
+        start: int,
+        span_len: int,
+        device: torch.device,
+        info_dict: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Prefill branch of :meth:`preprocess`. Writes one chunk-slice of
+        the cached prefill tensors into the static buffers."""
+        cached_speaker_latent = info_dict.get("ear_prefill_speaker_latent")
+
+        info_update: dict[str, Any] = {}
+        if not isinstance(cached_speaker_latent, torch.Tensor):
+            # First chunk: build & cache prefill tensors from the
+            # user-supplied speaker_latent.
+            speaker_latent = self._validate_speaker_latent(
+                info_dict.get("speaker_latent")
+            )
+            (
+                cached_text_tokens,
+                cached_text_mask,
+                cached_bos_mask,
+                cached_speaker_latent,
+            ) = self._build_prefill_tensors(speaker_latent, device=device)
+
+            info_update["ear_prefill_text_tokens"] = cached_text_tokens
+            info_update["ear_prefill_text_mask"] = cached_text_mask
+            info_update["ear_prefill_bos_mask"] = cached_bos_mask
+            info_update["ear_prefill_speaker_latent"] = cached_speaker_latent
+            info_update["ear_prefill_offset"] = 0
+            info_update["ear_decode_offset"] = 0
+        else:
+            cached_text_tokens = info_dict["ear_prefill_text_tokens"]
+            cached_text_mask = info_dict["ear_prefill_text_mask"]
+            cached_bos_mask = info_dict["ear_prefill_bos_mask"]
+
+        offset = int(info_dict.get("ear_prefill_offset", 0) or 0)
+        full_len = int(cached_speaker_latent.shape[0])
+        s, e = offset, offset + span_len
+        assert 0 <= s and e <= full_len, (
+            "prefill chunk overshoots cached prefill: offset="
+            f"{offset}, span_len={span_len}, prefill_len={full_len}. "
+            "User must pass prompt_token_ids of length "
+            "speaker_latent.shape[0]."
+        )
+
+        buf_s = start
+        buf_e = buf_s + span_len
+        self._text_tokens[buf_s:buf_e].copy_(cached_text_tokens[s:e])
+        self._text_mask[buf_s:buf_e].copy_(cached_text_mask[s:e])
+        self._bos_mask[buf_s:buf_e].copy_(cached_bos_mask[s:e])
+        self._speaker_latent[buf_s:buf_e].copy_(cached_speaker_latent[s:e])
+        # Acoustic input is sil_tokens broadcast — only the BOS-frame's
+        # audio_emb is consumed (the rest get replaced by speaker_latent
+        # inside EarTTSInputEmbedding).
+        self._acoustic_tokens[buf_s:buf_e] = self.model.sil_tokens.to(
+            self._acoustic_tokens.dtype
+        )
+
+        info_update["ear_prefill_offset"] = offset + span_len
+
+        # Placeholder input_ids; compiled forward reads the buffers, not these.
+        input_ids_out = torch.full_like(input_ids, _DUMMY_TOKEN_ID)
+        return input_ids_out, input_embeds, info_update
+
+    def _preprocess_decode(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        input_embeds: Optional[torch.Tensor],
+        start: int,
+        device: torch.device,
+        info_dict: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Decode branch of :meth:`preprocess`. Writes one row at ``start``."""
+        chunk_text_tokens = info_dict.get("input_text_tokens")
+        assert isinstance(chunk_text_tokens, list) and chunk_text_tokens, (
+            "EarTTS decode requires a non-empty ``input_text_tokens`` "
+            "list in additional_information."
+        )
+
         decode_offset = int(info_dict.get("ear_decode_offset", 0) or 0)
+        # Clamp under-runs (producer keeps sending until ``finished``).
+        idx = min(decode_offset, len(chunk_text_tokens) - 1)
+        text_token_id = int(chunk_text_tokens[idx])
 
-        buf_s = int(start)
-        self._zero_buffers_at(buf_s, 1)
+        buf_s = start
 
-        if isinstance(last_codes, torch.Tensor) and last_codes.numel() > 0:
+        # Acoustic input selection:
+        #   * EOS subword → force sil_tokens (return to silence).
+        #   * First decode after prefill → seed with acoustic pad
+        #     (codebook_size); matches the reference S2S inference
+        #     script's ``[1024] * 31`` seed.
+        #   * Otherwise → previous-step predicted codes.
+        if text_token_id == self._eos_token_id:
+            self._acoustic_tokens[buf_s].copy_(
+                self.model.sil_tokens.to(self._acoustic_tokens.dtype)
+            )
+        elif decode_offset == 0:
+            self._acoustic_tokens[buf_s].fill_(self._acoustic_pad_id)
+        else:
+            last_codes = info_dict.get("last_acoustic_codes")
+            assert isinstance(last_codes, torch.Tensor) and last_codes.numel() > 0, (
+                "EarTTS decode (offset > 0) requires "
+                "``last_acoustic_codes`` from the previous step's "
+                "postprocess."
+            )
             ac = (
                 last_codes.to(device=device, dtype=torch.long)
                 .reshape(-1)[: self._num_quantizers]
             )
             self._acoustic_tokens[buf_s, : ac.shape[0]].copy_(ac)
 
-        chunk_text_tokens = info_dict.get("input_text_tokens")
-        if (
-            isinstance(cached_decode_text, torch.Tensor)
-            and cached_decode_text.numel() > 0
-        ):
-            total = int(cached_decode_text.shape[0])
-            idx = decode_offset if decode_offset < total else total - 1
-            text_tok = cached_decode_text[idx].to(
-                device=device, dtype=torch.long
-            )
-        elif isinstance(chunk_text_tokens, list) and chunk_text_tokens:
-            # Streaming-text mode: ``input_text_tokens`` grows
-            # over time; clamp to its current end on premature decode
-            # so we never read past the end (the producer keeps
-            # sending until ``finished``).
-            total = len(chunk_text_tokens)
-            idx = decode_offset if decode_offset < total else total - 1
-            text_tok = torch.tensor(
-                int(chunk_text_tokens[idx]),
-                dtype=torch.long,
-                device=device,
-            )
-        else:
-            raise ValueError(
-                "EarTTS decode requires either cached "
-                "``ear_decode_text_tokens`` (cached-text mode, set when "
-                "``text`` is passed in the first prefill chunk) or a "
-                "non-empty ``input_text_tokens`` list "
-                "(streaming-text mode) in additional_information; "
-                "neither was provided."
-            )
-        self._text_tokens[buf_s].copy_(text_tok)
+        self._text_tokens[buf_s] = text_token_id
         self._text_mask[buf_s] = 1
+        self._bos_mask[buf_s] = 0
+        # Decode never replaces audio_emb with a latent.
+        self._speaker_latent[buf_s].zero_()
 
         info_update: dict[str, Any] = {"ear_decode_offset": decode_offset + 1}
-
-        inputs_embeds_out = torch.zeros(
-            (1, self.config.hidden_size),
-            device=device,
-            dtype=self.vllm_config.model_config.dtype,
-        )
-        return input_ids, inputs_embeds_out, info_update
+        return input_ids, input_embeds, info_update
 
     # ------------------------------------------------------------------
     # forward — runs the compiled embedding + backbone, then the sampler
@@ -1597,36 +1294,13 @@ class EarTTSForCausalLM(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         **_: Any,
     ) -> torch.Tensor:
-        """Forward pass.
-
-        1. Slice the per-token input buffers populated by
-           :meth:`preprocess` up to ``num_tokens`` and call the compiled
-           :class:`EarTTSModel` (embedding + backbone) on every position.
-        2. Initialize :attr:`_out_codes` from :attr:`_acoustic_tokens`
-           so prefill positions carry the input reference-audio frames
-           (decode positions are overwritten in step 3 below). This way
-           :meth:`postprocess` on a request whose last position falls in
-           prefill returns the last reference audio frame as
-           ``last_acoustic_codes`` — the natural acoustic input for the
-           first decode step that follows.
-        3. Conditionally invoke the compiled :class:`EarTTSSamplerModel`:
-
-           * **No ``attn_metadata`` (dummy / profile run)** or
-             **decode-only batch**: run sampler on every position; the
-             compiled forward replays the captured CUDA graph for the
-             matching ``cudagraph_capture_sizes`` entry.
-           * **Mixed prefill+decode batch**: gather decode positions
-             into a contiguous tensor, override the sampler's
-             ``BatchDescriptor`` to the padded decode-batch size so the
-             right captured graph is replayed, and scatter the produced
-             codes back into the corresponding rows of
-             :attr:`_out_codes`.
-           * **Prefill-only batch**: skip the sampler entirely.
-
-        ``inputs_embeds`` is ignored: ``preprocess`` returns zeros for
-        it and the actual embedding is built inside the compiled
-        :class:`EarTTSInputEmbedding` (this keeps the text transformer
-        encoder inside the CUDA graph).
+        """Run the compiled embedding + backbone over every position,
+        then run the compiled MaskGIT sampler only on decode positions
+        (the sampler is skipped on prefill-only batches and on prefill
+        rows of mixed batches). ``inputs_embeds`` is ignored — the
+        actual embedding is assembled inside the compiled
+        :class:`EarTTSInputEmbedding` from the per-token buffers
+        populated by :meth:`preprocess`.
         """
         num_tokens = int(input_ids.shape[0])
 
@@ -1634,8 +1308,8 @@ class EarTTSForCausalLM(nn.Module):
         text_tokens = self._text_tokens[:num_tokens]
         text_mask = self._text_mask[:num_tokens]
         bos_mask = self._bos_mask[:num_tokens]
+        speaker_latent = self._speaker_latent[:num_tokens]
 
-        # Step 1: embedding + backbone on every position (compiled).
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
@@ -1644,28 +1318,18 @@ class EarTTSForCausalLM(nn.Module):
             text_tokens=text_tokens,
             text_mask=text_mask,
             bos_mask=bos_mask,
+            speaker_latent=speaker_latent,
         )
 
-        # Step 2: prefill fallback. Initialize _out_codes from the input
-        # acoustic tokens so prefill rows always contain something
-        # sensible (the reference-audio frame at that position). Decode
-        # rows are overwritten by the sampler in step 3 below.
-        self._out_codes[:num_tokens].copy_(acoustic_tokens)
-
-        # Step 3: conditionally run the (separately compiled) sampler.
         decode_idx, num_req = self._get_decode_idxs()
         if decode_idx is None:
-            # Dummy / profile run, or decode-only batch: sample every
-            # position. The captured CUDA-graph for the sampler is
-            # selected by num_tokens, which is in cudagraph_capture_sizes.
+            # Dummy/profile run or decode-only batch: sample everywhere.
             codes = self.sampler_module.sample(hidden_states)
             self._out_codes[:num_tokens].copy_(codes.to(dtype=torch.long))
         elif num_req > 0:
-            # Mixed batch: gather decode positions and run sampler only
-            # on those. Override the BatchDescriptor so the sampler's
-            # CUDA-graph cache is hit at the padded decode-batch size
-            # (set by _get_decode_idxs to the next cudagraph_capture
-            # bucket above num_req).
+            # Mixed batch: gather decode positions, override the
+            # BatchDescriptor so the sampler's CUDA-graph cache is hit
+            # at the padded decode-batch size.
             ctx = get_forward_context()
             orig_batch_descriptor = ctx.batch_descriptor
             ctx.batch_descriptor = BatchDescriptor(
@@ -1679,7 +1343,11 @@ class EarTTSForCausalLM(nn.Module):
             self._out_codes[valid_dec_idx] = codes[:num_req].to(
                 dtype=torch.long
             )
-        # else: prefill-only batch — sampler is skipped entirely.
+        # Prefill-only batch: sampler skipped. ``_out_codes`` rows for
+        # those positions are not written here on purpose — callers
+        # must not rely on them; the public per-decode-step contract
+        # is driven by ``last_acoustic_codes`` from postprocess and
+        # the seed rules in :meth:`_preprocess_decode`.
 
         return hidden_states
 
@@ -1811,50 +1479,33 @@ class EarTTSForCausalLM(nn.Module):
                 else:
                     yield name, w
 
+        # ``AutoWeightsLoader`` only dispatches into child modules and
+        # ``nn.Parameter``s, so any registered buffer (e.g.
+        # ``model.sil_tokens``) needs to be routed manually. Resolve the
+        # buffer names *after* applying ``hf_to_vllm_mapper`` so the
+        # checkpoint key matches the in-model attribute path.
+        buffers_dict = dict(self.named_buffers())
+        loaded_buffer_names: set[str] = set()
+
+        def _route_buffers(
+            stream: Iterable[tuple[str, torch.Tensor]],
+        ) -> Iterable[tuple[str, torch.Tensor]]:
+            for name, weight in stream:
+                if name in buffers_dict:
+                    buf = buffers_dict[name]
+                    with torch.no_grad():
+                        buf.copy_(weight.to(buf.dtype))
+                    loaded_buffer_names.add(name)
+                    continue
+                yield name, weight
+
         # ``hf_to_vllm_mapper`` rewrites ``model.sampler.*`` to
         # ``sampler_module.sampler.*`` so the upstream EarTTS checkpoint
         # (which still places the MaskGIT sampler under ``model.``) lands
         # on the dedicated :attr:`sampler_module` compile group.
         loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
-        return loader.load_weights(
-            _adjusted_weights(), mapper=self.hf_to_vllm_mapper
+        loaded = loader.load_weights(
+            _route_buffers(_adjusted_weights()), mapper=self.hf_to_vllm_mapper
         )
-
-    # ------------------------------------------------------------------
-    # Generation length estimation
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def estimate_generation_len(
-        additional_information: Optional[dict[str, Any]] = None,
-        *,
-        tokenize_prompt: Callable[[str], list[int]],
-        frames_per_text_token: float = EARTTS_FRAMES_PER_TEXT_TOKEN,
-    ) -> int:
-        """Compute the number of decode steps required to synthesize
-        ``additional_information['text']``.
-
-        The synthesis text is tokenized (with special tokens, matching
-        :meth:`preprocess`) and padded to ``round(frames_per_text_token *
-        N)`` tokens, where ``N`` is the tokenized length. Each decode
-        step consumes one padded text token, so the returned value is
-        also the total number of decode steps (``max_tokens``).
-
-        Mirrors the qwen3-tts pattern of accepting a ``tokenize_prompt``
-        callback so callers (e.g. ``serving_speech.py``) can plug in
-        their own pre-loaded tokenizer without paying for a second copy.
-        """
-        info: dict[str, Any] = additional_information or {}
-        text_value = info.get("text")
-        if isinstance(text_value, list):
-            text = text_value[0] if text_value else ""
-        else:
-            text = text_value or ""
-        if not isinstance(text, str) or not text:
-            return 1
-
-        text_ids = tokenize_prompt(text)
-        n = len(list(text_ids))
-        if n <= 0:
-            return 1
-        return max(n, int(round(n * float(frames_per_text_token))))
+        loaded.update(loaded_buffer_names)
+        return loaded

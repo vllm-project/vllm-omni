@@ -21,13 +21,14 @@ reads from ``vllm_config.model_config.hf_config``:
   ``latent_size``, ``mog_low_rank``, ``mog_num_layers``,
   ``mog_num_predictions``, ``mog_min_log_std``, ``mog_eps``).
 
-* Character-aware subword encoder fields consumed by
-  :class:`CharAwareSubwordEncoder` (``emb_backbone_config``,
-  ``emb_backbone_type``, ``max_char_len``, ``emb_char_vocab_size``,
-  ``emb_vocab_size``, ``pretrained_tokenizer_name``,
-  ``use_subword_flag_emb``, ``use_bos_eos_emb``,
+* Subword embedding / fusion fields consumed by
+  :class:`EarTTSInputEmbedding` (``emb_vocab_size``,
   ``use_gated_fusion_for_text_audio``,
-  ``use_audio_prompt_frozen_projection``).
+  ``use_audio_prompt_frozen_projection``). The original NeMo model used
+  a character-aware subword encoder + subword-flag + BOS/EOS additive
+  embeddings; all of those operations are deterministic per token id
+  and are baked out at checkpoint-conversion time into a single
+  ``nn.Embedding`` of size ``(emb_vocab_size, hidden_size)``.
 
 vLLM's ``patch_rope_parameters`` (transformers-v4 path) auto-populates
 ``config.rope_parameters`` from ``rope_scaling`` + ``rope_theta`` during
@@ -37,7 +38,7 @@ config loading, so the Gemma3 backbone (which expects
 
 from typing import Optional
 
-from transformers import PretrainedConfig
+from transformers import AutoConfig, PretrainedConfig
 
 
 class EarTTSConfig(PretrainedConfig):
@@ -95,15 +96,13 @@ class EarTTSConfig(PretrainedConfig):
         attn_logits_soft_cap: Optional[float] = None,
         use_bidirectional_attention: bool = False,
         is_causal: bool = True,
-        # Subword encoding
-        emb_backbone_config: Optional[dict] = None,
-        emb_backbone_type: str = "t5gemma",
-        max_char_len: int = 128,
-        emb_char_vocab_size: int = 256,
+        # Subword encoding. The character-aware subword encoder /
+        # subword-flag / BOS-EOS embedding tables that NeMo applied at
+        # runtime are precomputed at checkpoint conversion time into a
+        # single ``(emb_vocab_size, hidden_size)`` lookup, so only the
+        # vocab size and the audio-side fusion / projection toggles
+        # remain as runtime config.
         emb_vocab_size: int = 151936,
-        pretrained_tokenizer_name: str = "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
-        use_subword_flag_emb: bool = True,
-        use_bos_eos_emb: bool = True,
         use_gated_fusion_for_text_audio: bool = True,
         use_audio_prompt_frozen_projection: bool = False,
         # HF-canonical model dtype (replaces the deprecated
@@ -157,15 +156,8 @@ class EarTTSConfig(PretrainedConfig):
         self.use_bidirectional_attention = use_bidirectional_attention
         self.is_causal = is_causal
 
-        # Subword encoding
-        self.emb_backbone_config = emb_backbone_config
-        self.emb_backbone_type = emb_backbone_type
-        self.max_char_len = max_char_len
-        self.emb_char_vocab_size = emb_char_vocab_size
+        # Subword encoding (precomputed lookup; see class docstring).
         self.emb_vocab_size = emb_vocab_size
-        self.pretrained_tokenizer_name = pretrained_tokenizer_name
-        self.use_subword_flag_emb = use_subword_flag_emb
-        self.use_bos_eos_emb = use_bos_eos_emb
         self.use_gated_fusion_for_text_audio = use_gated_fusion_for_text_audio
         self.use_audio_prompt_frozen_projection = use_audio_prompt_frozen_projection
 
@@ -179,3 +171,13 @@ class EarTTSConfig(PretrainedConfig):
             dtype=dtype,
             **kwargs,
         )
+
+
+# Register on import so subprocesses that unpickle/import the config module
+# (e.g. StageEngineCoreProc) can resolve ``model_type: "eartts"`` via
+# ``AutoConfig.from_pretrained``. Mirrors the pattern used by other
+# vllm-omni custom configs (voxcpm, fish_speech, mammoth_moda2, ...).
+try:
+    AutoConfig.register(EarTTSConfig.model_type, EarTTSConfig)
+except ValueError:
+    pass
