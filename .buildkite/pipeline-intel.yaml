@@ -13,4 +13,4 @@ steps:
           VLLM_VERSION: "v0.20.0"
         priority: 100
         timeout_in_minutes: 60
-        soft_fail: true
+        soft_fail: false

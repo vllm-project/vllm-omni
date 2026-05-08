@@ -199,7 +199,7 @@ def _run_diffusers_baseline(model: str, output_dir: Path) -> list[Image.Image]:
         del pipe
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
         run_post_test_cleanup(enable_force=True)
 
 
@@ -278,7 +278,7 @@ def _run_with_custom_transformer(model: str, output_dir: Path) -> list[Image.Ima
     del pipe, result, our_transformer
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
     return frames
 
 

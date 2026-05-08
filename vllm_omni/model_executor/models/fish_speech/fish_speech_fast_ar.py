@@ -372,7 +372,7 @@ class FishSpeechFastAR(nn.Module):
                 dtype=torch.long,
             )
             self(hidden, semantic, do_sample=False)
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
 
     @torch.inference_mode()
     def _run_model(self, step_input: torch.Tensor, step_pos_ids: torch.Tensor, bsz: int) -> torch.Tensor:

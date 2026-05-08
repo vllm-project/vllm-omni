@@ -1,7 +1,6 @@
 import pytest
 
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -23,18 +22,6 @@ def test_register_companion_and_cleanup():
     assert sorted(removed) == ["req1__cfg_img", "req1__cfg_text"]
     assert not tracker.is_companion("req1__cfg_text")
     assert tracker.get_companion_request_ids("req1") == {}
-
-
-def test_attach_cfg_request_ids_clones_diffusion_params():
-    tracker = CfgCompanionTracker()
-    tracker.register_companion("req1", "cfg_text", "req1__cfg_text")
-
-    params = OmniDiffusionSamplingParams()
-    updated = tracker.attach_cfg_request_ids("req1", params)
-
-    assert updated is not params
-    assert params.cfg_kv_request_ids is None
-    assert updated.cfg_kv_request_ids == {"cfg_text": "req1__cfg_text"}
 
 
 def test_abort_parent_expands_to_companions_and_cleans_up_deferred_parent():

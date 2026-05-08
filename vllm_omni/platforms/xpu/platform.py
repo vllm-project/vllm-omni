@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
+from vllm.config import VllmConfig
+from vllm.config.kernel import IrOpPriorityConfig
 from vllm.logger import init_logger
 from vllm.platforms.xpu import XPUPlatform
 
@@ -79,3 +81,10 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
     def get_profiler_cls(cls) -> str:
         """Return XPU-specific profiler that handles XPU events."""
         return "vllm_omni.platforms.xpu.profiler.XPUTorchProfilerWrapper"
+
+    @classmethod
+    def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> IrOpPriorityConfig:
+        """Copied from vllm/platforms/xpu/platform.py v0.20.0 with force using xpu_kernels kernels"""
+        default = ["xpu_kernels", "native"]  # Originally using "native" here when compiling
+
+        return IrOpPriorityConfig.with_default(default)

@@ -23,6 +23,7 @@ from message_convert import (
 from vllm import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -438,6 +439,7 @@ def parse_args():
         "vllm_omni/deploy/mimo_audio.yaml based on the HF model_type.",
     )
 
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 
