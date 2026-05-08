@@ -185,6 +185,16 @@ _DIFFUSION_MODELS = {
         "pipeline_flux",
         "FluxPipeline",
     ),
+    "FluxDMD2Pipeline": (
+        "flux",
+        "pipeline_flux",
+        "FluxDMD2Pipeline",
+    ),
+    "QwenImageDMD2Pipeline": (
+        "qwen_image",
+        "pipeline_qwen_image",
+        "QwenImageDMD2Pipeline",
+    ),
     "OmniGen2Pipeline": (
         "omnigen2",
         "pipeline_omnigen2",
@@ -452,6 +462,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "ErnieImagePipeline": "get_ernie_image_post_process_func",
     "NextStep11Pipeline": "get_nextstep11_post_process_func",
     "FluxPipeline": "get_flux_post_process_func",
+    "FluxDMD2Pipeline": "get_flux_post_process_func",
+    "QwenImageDMD2Pipeline": "get_qwen_image_post_process_func",
     "OmniGen2Pipeline": "get_omnigen2_post_process_func",
     "HeliosPipeline": "get_helios_post_process_func",
     "HeliosPyramidPipeline": "get_helios_post_process_func",
