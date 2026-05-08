@@ -408,6 +408,7 @@ class StageDeployConfig:
     stage_id: int
     devices: str | None = None
     num_replicas: int = 1
+    env: dict[str, Any] | None = None
 
     # Inter-stage connector wiring and request defaults.
     output_connectors: dict[str, str] | None = None
@@ -478,6 +479,7 @@ _STAGE_NON_ENGINE_KEYS = frozenset(
         "stage_id",
         "devices",
         "num_replicas",
+        "env",
         "output_connectors",
         "input_connectors",
         "default_sampling_params",
@@ -496,15 +498,18 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
         engine_args = dict(stage_data["engine_args"])
         devices = stage_data.get("runtime", {}).get("devices", stage_data.get("devices"))
         num_replicas = runtime_cfg.get("num_replicas", stage_data.get("num_replicas", 1))
+        env = runtime_cfg.get("env", stage_data.get("env"))
     else:
         engine_args = {k: v for k, v in stage_data.items() if k not in _STAGE_NON_ENGINE_KEYS and k != "stage_id"}
         devices = stage_data.get("devices")
         num_replicas = stage_data.get("num_replicas", stage_data.get("runtime", {}).get("num_replicas", 1))
+        env = stage_data.get("env", stage_data.get("runtime", {}).get("env"))
 
     kwargs: dict[str, Any] = {
         "stage_id": stage_data["stage_id"],
         "devices": devices,
         "num_replicas": int(num_replicas),
+        "env": env,
     }
     for name, f in _STAGE_DEPLOY_FIELDS.items():
         if name in engine_args:
@@ -634,8 +639,8 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     return DeployConfig(**kwargs)
 
 
-def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
-    """Return ``(overrides, devices)`` from a platform stage entry.
+def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str | None, dict[str, Any] | None]:
+    """Return ``(overrides, devices, env)`` from a platform stage entry.
 
     Handles both the nested layout (``engine_args:`` / ``runtime.devices``) and
     the flat layout. ``devices`` is ``None`` when no override is set.
@@ -645,9 +650,9 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str
         runtime_cfg = ps.get("runtime", {})
         if "num_replicas" in runtime_cfg:
             overrides["num_replicas"] = runtime_cfg["num_replicas"]
-        return overrides, runtime_cfg.get("devices")
-    overrides = {k: v for k, v in ps.items() if k not in ("stage_id", "devices")}
-    return overrides, ps.get("devices")
+        return overrides, runtime_cfg.get("devices"), runtime_cfg.get("env")
+    overrides = {k: v for k, v in ps.items() if k not in ("stage_id", "devices", "env")}
+    return overrides, ps.get("devices"), ps.get("env")
 
 
 def _apply_platform_overrides(
@@ -672,9 +677,14 @@ def _apply_platform_overrides(
         base = base_by_id.get(ps["stage_id"])
         if base is None:
             continue
-        overrides, devices = _extract_platform_overrides(ps)
+        overrides, devices, env = _extract_platform_overrides(ps)
         if devices is not None:
             base.devices = devices
+        if env is not None:
+            if isinstance(base.env, dict) and isinstance(env, dict):
+                base.env = {**base.env, **env}
+            else:
+                base.env = env
         for key, val in overrides.items():
             if hasattr(base, key):
                 # Deep-merge dict-valued fields listed in _DEEP_MERGE_KEYS so
@@ -863,6 +873,8 @@ def merge_pipeline_deploy(
             if ds.devices is not None:
                 runtime["devices"] = ds.devices
             runtime["num_replicas"] = ds.num_replicas
+            if ds.env is not None:
+                runtime["env"] = ds.env
 
         result.append(
             StageConfig(
