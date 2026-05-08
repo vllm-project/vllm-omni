@@ -249,8 +249,7 @@ class LongCatImageEditPipeline(nn.Module, CFGParallelMixin, SupportImageInput, D
         )
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
-        )
-        self.text_encoder.to(self.device)
+        ).to(self.device)
         self.text_processor = Qwen2VLProcessor.from_pretrained(
             model, subfolder="text_processor", local_files_only=local_files_only
         )

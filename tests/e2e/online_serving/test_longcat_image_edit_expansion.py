@@ -89,4 +89,4 @@ def test_longcat_image_edit(omni_server: OmniServer, openai_client: OpenAIClient
         },
     }
 
-    _ = openai_client.send_diffusion_request(request_config)
+    openai_client.send_diffusion_request(request_config)
