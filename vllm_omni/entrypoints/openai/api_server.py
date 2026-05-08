@@ -1696,10 +1696,12 @@ async def edit_images(
     # vllm-omni extension for layered models (e.g., Qwen-Image-Layered)
     layers: int | None = Form(None),
     resolution: int | None = Form(None),  # See SUPPORTED_LAYERED_RESOLUTIONS
+    bot_task: str | None = Form(None),
 ) -> ImageGenerationResponse:
     """
     OpenAI-compatible image edit endpoint.
     """
+
     # 1. get engine and model
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
     if model is not None and model != model_name:
@@ -1899,6 +1901,8 @@ async def edit_images(
                 lora_dict = _get_lora_from_json_str(lora)
                 _parse_lora_request(lora_dict)
                 extra_body["lora"] = lora_dict
+            if bot_task is not None:
+                extra_body["bot_task"] = bot_task
 
             prompt_text = prompt.get("prompt", "")
             generation_result = await chat_handler.generate_diffusion_images(
@@ -2218,6 +2222,7 @@ async def _load_input_images(
                 images.append(img)
             except Exception as e:
                 raise ValueError(f"Failed to open uploaded file: {e}")
+
         else:
             raise ValueError(f"Unsupported input: {inp}")
 
