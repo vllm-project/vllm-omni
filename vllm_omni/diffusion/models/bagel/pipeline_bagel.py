@@ -251,6 +251,7 @@ class BagelPipeline(nn.Module, SupportsModuleOffload, DiffusionPipelineProfilerM
         self.language_model = Qwen2MoTForCausalLM(
             llm_config, parallel_config=parallel_config, quant_config=quant_config, prefix="bagel.language_model"
         )
+        self.transformer = self.language_model.model
         ae_params: AutoEncoderParams = default_ae_params()
         self.vae = AutoEncoder(ae_params)
 
@@ -284,11 +285,15 @@ class BagelPipeline(nn.Module, SupportsModuleOffload, DiffusionPipelineProfilerM
             )
         ]
 
-        # When quantization is enabled, vLLM linear layers live on meta
-        # device until the weight loader materializes them. Calling
-        # .to(device) would fail on those meta tensors, so we skip it
-        # entirely and let the weight loader handle device placement.
-        if quant_config is None and not od_config.enable_layerwise_offload:
+        # Defer device placement to the weight-loading/offload path in three cases:
+        # 1. Quantization: When quantization is enabled, vLLM linear layers live on meta
+        #    device until the weight loader materializes them. Calling .to(device) would fail on those meta tensors,
+        #    so we skip it entirely and let the weight loader handle device placement.
+        # 2. Layerwise offload: modules should be initialized on CPU first, then
+        #    selectively materialized/moved by the offloader.
+        # 3. HSDP: weights should be loaded on CPU first and sharded afterwards,
+        #    rather than eagerly placing the full model on one GPU.
+        if quant_config is None and not (od_config.enable_layerwise_offload or od_config.parallel_config.use_hsdp):
             self.to(self.device)
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
