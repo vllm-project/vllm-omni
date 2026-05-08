@@ -65,12 +65,14 @@ def available_tasks() -> list[str]:
 
 def resolve_stop_token_ids(
     task: str = "it2i_think",
-    bot_task: str = "think", 
-    tokenizer: Any | None = None):
-    tkw = tokenizer
-    preset_sys_type, preset_bot_task, trigger_tag = _TASK_PRESETS[task]
+    bot_task: str = "think",
+    tokenizer: Any | None = None,
+):
+    _, _, trigger_tag = _TASK_PRESETS[task]
     stop_token_ids = [127957]
-    if trigger_tag:
+    if task in ("t2t_think", "i2t_think"):
+        stop_token_ids.append(HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"])
+    elif trigger_tag:
         stop_token_ids.append(tokenizer.convert_tokens_to_ids(trigger_tag))
     return stop_token_ids
 
