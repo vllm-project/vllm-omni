@@ -12,13 +12,62 @@ Verifies that get_rpc_lock_stats() reflects:
 
 from __future__ import annotations
 
+import importlib.util
+import os
+import sys
 import threading
 import time
+import types
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+
+def _load_engine_module():
+    """Load diffusion_engine.py with mocked heavy dependencies."""
+    engine_path = os.path.normpath(
+        os.path.join(
+            os.path.dirname(__file__),
+            os.pardir,
+            os.pardir,
+            "vllm_omni",
+            "diffusion",
+            "diffusion_engine.py",
+        )
+    )
+
+    mocks = {
+        "vllm_omni": MagicMock(),
+        "vllm_omni.diffusion": types.ModuleType("vllm_omni.diffusion"),
+        "vllm_omni.diffusion.data": MagicMock(),
+        "vllm_omni.diffusion.executor": MagicMock(),
+        "vllm_omni.diffusion.executor.abstract": MagicMock(),
+        "vllm_omni.diffusion.registry": MagicMock(),
+        "vllm_omni.diffusion.request": MagicMock(),
+        "vllm_omni.diffusion.sched": MagicMock(),
+        "vllm_omni.diffusion.sched.interface": MagicMock(),
+        "vllm_omni.diffusion.worker": MagicMock(),
+        "vllm_omni.diffusion.worker.utils": MagicMock(),
+        "vllm_omni.inputs": MagicMock(),
+        "vllm_omni.inputs.data": MagicMock(),
+        "vllm_omni.outputs": MagicMock(),
+        "vllm": types.ModuleType("vllm"),
+        "vllm.v1": types.ModuleType("vllm.v1"),
+        "vllm.v1.engine": types.ModuleType("vllm.v1.engine"),
+        "vllm.v1.engine.exceptions": MagicMock(),
+        "vllm.logger": MagicMock(init_logger=lambda name: MagicMock()),
+        "PIL": MagicMock(),
+        "PIL.Image": MagicMock(),
+    }
+    with patch.dict(sys.modules, mocks):
+        spec = importlib.util.spec_from_file_location("diffusion_engine", engine_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    return mod
+
+
+DiffusionEngine = _load_engine_module().DiffusionEngine
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
