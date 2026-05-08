@@ -10,10 +10,10 @@ The recommended way to use vLLM-Omni on NPU is through the vllm-ascend pre-built
 ```bash
 # Update the vllm-ascend image
 # Atlas A2:
-# export IMAGE=quay.io/ascend/vllm-ascend:v0.17.0rc1
+# export IMAGE=quay.io/ascend/vllm-ascend:v0.18.0rc1
 # Atlas A3:
-# export IMAGE=quay.io/ascend/vllm-ascend:v0.17.0rc1-a3
-export IMAGE=quay.io/ascend/vllm-ascend:v0.17.0rc1
+# export IMAGE=quay.io/ascend/vllm-ascend:v0.18.0rc1-a3
+export IMAGE=quay.io/ascend/vllm-ascend:v0.18.0rc1
 docker run --rm \
     --name vllm-omni-npu \
     --shm-size=1g \
@@ -32,17 +32,6 @@ docker run --rm \
     -v /root/.cache:/root/.cache \
     -p 8000:8000 \
     -it $IMAGE bash
-
-cd /vllm-workspace/vllm
-git fetch origin --tags
-git checkout v0.18.0
-
-# Because vllm-ascend will release v0.18.0rc1 after vllm-omni 0.16.0,
-# we have to pin vllm-ascend at the current commit.
-cd /vllm-workspace/vllm-ascend
-git pull origin main
-git checkout d781902ce9dbda8ab1e11bb0f2f0c1bc508fee7a
-pip install -v -e .
 
 # Inside the container, install vLLM-Omni from source
 cd /vllm-workspace
@@ -68,15 +57,10 @@ You can also build vLLM-Omni from the latest main branch if you want to use the 
 
 ```bash
 # Pin vLLM version to 0.18.0
-cd /vllm-workspace/vllm
-git fetch origin --tags
-git checkout v0.18.0
+git clone -b v0.18.0 https://github.com/vllm-project/vllm.git
+VLLM_TARGET_DEVICE=empty pip install -v -e .
 
-# Because vllm-ascend has not yet entered continuous development and has not been officially released, we need to pin it to a specific commit. Please note that this commit may change over time.
-cd /vllm-workspace/vllm-ascend
-git pull origin main
-git fetch origin --tags
-git checkout d781902ce9dbda8ab1e11bb0f2f0c1bc508fee7a
+git clone -b v0.18.0rc1 https://github.com/vllm-project/vllm-ascend.git
 pip install -v -e .
 
 # Install vLLM-Omni from the latest main branch

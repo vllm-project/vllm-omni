@@ -6,7 +6,8 @@
 This pipeline follows the structure of the user's reference implementation:
 - supports pre-tokenized prompt IDs via OmniCustomPrompt-style dict input
 - uses an SDE scheduler that can return step logprobs
-- returns rich custom_output fields for testing
+- returns structured trajectory_* fields (latents, timesteps, log_probs)
+  consistent with the BAGEL trajectory recording design
 """
 
 from __future__ import annotations
@@ -393,10 +394,10 @@ class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
 
         return DiffusionOutput(
             output=_maybe_to_cpu(image),
+            trajectory_latents=_maybe_to_cpu(all_latents),
+            trajectory_log_probs=_maybe_to_cpu(all_log_probs),
+            trajectory_timesteps=_maybe_to_cpu(all_timesteps),
             custom_output={
-                "all_latents": _maybe_to_cpu(all_latents),
-                "all_log_probs": _maybe_to_cpu(all_log_probs),
-                "all_timesteps": _maybe_to_cpu(all_timesteps),
                 "prompt_embeds": _maybe_to_cpu(prompt_embeds),
                 "prompt_embeds_mask": _maybe_to_cpu(prompt_embeds_mask),
                 "negative_prompt_embeds": _maybe_to_cpu(negative_prompt_embeds),

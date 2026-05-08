@@ -17,12 +17,13 @@ import io
 import urllib.request
 from urllib.parse import urlparse
 
-import librosa
 import numpy as np
 import soundfile as sf
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoConfig, AutoFeatureExtractor, AutoModel
+from vllm.multimodal.audio import AudioResampler
+from vllm.multimodal.media.audio import load_audio as _load_audio_file
 
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2Config
 from .tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
@@ -154,13 +155,14 @@ class Qwen3TTSTokenizer:
             with io.BytesIO(wav_bytes) as f:
                 audio, sr = sf.read(f, dtype="float32", always_2d=False)
         else:
-            audio, sr = librosa.load(x, sr=None, mono=True)
+            audio, sr = _load_audio_file(x, sr=None, mono=True)
 
         if audio.ndim > 1:
             audio = np.mean(audio, axis=-1)
 
         if sr != target_sr:
-            audio = librosa.resample(y=audio, orig_sr=sr, target_sr=target_sr)
+            resampler = AudioResampler(target_sr=target_sr)
+            audio = resampler.resample(audio, orig_sr=sr)
 
         return audio.astype(np.float32)
 
@@ -208,7 +210,8 @@ class Qwen3TTSTokenizer:
             if a.ndim > 1:
                 a = np.mean(a, axis=-1)
             if int(sr) != target_sr:
-                a = librosa.resample(y=a.astype(np.float32), orig_sr=int(sr), target_sr=target_sr)
+                resampler = AudioResampler(target_sr=target_sr)
+                a = resampler.resample(a.astype(np.float32), orig_sr=int(sr))
             out.append(a.astype(np.float32))
         return out
 

@@ -1,0 +1,16 @@
+# BAGEL-7B-MoT think-mode deploy.
+#
+# Inherits all settings from bagel.yaml; only overrides the pipeline to
+# bagel_think which uses expand_cfg_prompts_think and omits
+# kv_transfer_criteria so the Thinker decodes <think> tokens before
+# transferring KV to DiT.
+#
+# Select this topology via:
+#   python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT --think
+#
+# Or explicitly:
+#   vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \
+#       --deploy-config vllm_omni/deploy/bagel_think.yaml
+
+base_config: bagel.yaml
+pipeline: bagel_think

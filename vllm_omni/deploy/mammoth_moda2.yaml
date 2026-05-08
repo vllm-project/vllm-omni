@@ -1,0 +1,42 @@
+# MammothModa2 AR→DiT (text-to-image). Canonical copy lives at
+# ``vllm_omni/model_executor/stage_configs/mammoth_moda2.yaml``; keep in sync.
+#
+# Must remain legacy ``stage_args`` layout (no top-level ``stages``): Omni resolves
+# explicit ``--stage-configs-path`` via ``load_stage_configs_from_yaml``.
+
+stage_args:
+  - stage_id: 0
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: ar
+      max_num_seqs: 100
+      model_arch: MammothModa2ForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      max_model_len: 8192
+      gpu_memory_utilization: 0.5
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+    final_output: false
+
+  - stage_id: 1
+    runtime:
+      devices: "0"
+    engine_args:
+      model_stage: dit
+      max_num_seqs: 1
+      model_arch: MammothModa2ForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.3
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: image
+      enable_prefix_caching: false
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.mammoth_moda2.ar2dit
+    final_output: true
+    final_output_type: image

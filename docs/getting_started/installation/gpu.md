@@ -22,6 +22,10 @@ vLLM-Omni is a Python library that supports the following GPU variants. The libr
 
     --8<-- "docs/getting_started/installation/gpu/xpu.inc.md:requirements"
 
+=== "MThreads MUSA"
+
+    --8<-- "docs/getting_started/installation/gpu/musa.inc.md:requirements"
+
 ## Set up using Python
 
 ### Create a new Python environment
@@ -44,6 +48,10 @@ Note: Pre-built wheels are currently available for vLLM-Omni 0.11.0rc1, 0.12.0rc
 
     --8<-- "docs/getting_started/installation/gpu/xpu.inc.md:pre-built-wheels"
 
+=== "MThreads MUSA"
+
+    --8<-- "docs/getting_started/installation/gpu/musa.inc.md:pre-built-wheels"
+
 [](){ #build-from-source }
 
 ### Build wheel from source
@@ -59,6 +67,10 @@ Note: Pre-built wheels are currently available for vLLM-Omni 0.11.0rc1, 0.12.0rc
 === "Intel XPU"
 
     --8<-- "docs/getting_started/installation/gpu/xpu.inc.md:build-wheel-from-source"
+
+=== "MThreads MUSA"
+
+    --8<-- "docs/getting_started/installation/gpu/musa.inc.md:build-wheel-from-source"
 
 ## Set up using Docker
 
@@ -76,6 +88,10 @@ Note: Pre-built wheels are currently available for vLLM-Omni 0.11.0rc1, 0.12.0rc
 
     --8<-- "docs/getting_started/installation/gpu/xpu.inc.md:pre-built-images"
 
+=== "MThreads MUSA"
+
+    --8<-- "docs/getting_started/installation/gpu/musa.inc.md:pre-built-images"
+
 ### Build your own docker image
 
 === "AMD ROCm"
@@ -85,3 +101,7 @@ Note: Pre-built wheels are currently available for vLLM-Omni 0.11.0rc1, 0.12.0rc
 === "Intel XPU"
 
     --8<-- "docs/getting_started/installation/gpu/xpu.inc.md:build-docker"
+
+=== "MThreads MUSA"
+
+    --8<-- "docs/getting_started/installation/gpu/musa.inc.md:build-docker"

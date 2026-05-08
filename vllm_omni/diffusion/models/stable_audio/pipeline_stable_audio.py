@@ -28,7 +28,10 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
-from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import StableAudioDiTModel
+from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import (
+    StableAudioDiTModel,
+    StableAudioSchedulerWrapper,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
@@ -134,10 +137,12 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         self.transformer = StableAudioDiTModel(od_config=od_config, **transformer_kwargs)
 
         # Load scheduler
-        self.scheduler = CosineDPMSolverMultistepScheduler.from_pretrained(
-            model,
-            subfolder="scheduler",
-            local_files_only=local_files_only,
+        self.scheduler = StableAudioSchedulerWrapper(
+            CosineDPMSolverMultistepScheduler.from_pretrained(
+                model,
+                subfolder="scheduler",
+                local_files_only=local_files_only,
+            )
         )
 
         # Compute rotary embedding dimension
@@ -360,7 +365,6 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         negative_prompt: str | list[str] | None = None,
         audio_end_in_s: float | None = None,
         audio_start_in_s: float = 0.0,
-        num_inference_steps: int = 100,
         guidance_scale: float = 7.0,
         num_waveforms_per_prompt: int = 1,
         generator: torch.Generator | list[torch.Generator] | None = None,
@@ -378,7 +382,6 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
             negative_prompt: Negative prompt for CFG
             audio_end_in_s: Audio end time in seconds (max ~47s for stable-audio-open-1.0)
             audio_start_in_s: Audio start time in seconds
-            num_inference_steps: Number of denoising steps
             guidance_scale: CFG scale
             num_waveforms_per_prompt: Number of audio outputs per prompt
             generator: Random generator for reproducibility
@@ -398,8 +401,12 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
             negative_prompt = None
         elif req.prompts:
             negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
-
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = req.sampling_params.num_inference_steps
+        if num_inference_steps is None:
+            num_inference_steps = 100  # Default steps
+        num_inference_steps = req.sampling_params.num_inference_steps
+        if num_inference_steps is None:
+            num_inference_steps = 50  # Default steps
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
 
@@ -558,7 +565,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
             # Scheduler step
-            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+            latents = self.scheduler.step(noise_pred, t, latents, generator).prev_sample
 
         self._current_timestep = None
 

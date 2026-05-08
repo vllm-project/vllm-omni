@@ -12,13 +12,10 @@ See docs/user_guide/diffusion_acceleration.md.
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-    dummy_messages_from_mix_data,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 T2I_PROMPT = "A photo of a cat sitting on a laptop keyboard, digital art style."
 NEGATIVE_PROMPT = "blurry, low quality"
@@ -28,6 +25,11 @@ PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 def _get_diffusion_feature_cases(model: str):
     return [
+        pytest.param(
+            OmniServerParams(model=model, server_args=["--step-execution"]),
+            id="step_execution",
+            marks=SINGLE_CARD_FEATURE_MARKS,
+        ),
         pytest.param(
             OmniServerParams(model=model, server_args=["--cache-backend", "tea_cache"]),
             id="cache_tea_cache",
@@ -102,11 +104,21 @@ def _get_diffusion_feature_cases(model: str):
             id="vae_patch_parallel_2",
             marks=PARALLEL_FEATURE_MARKS,
         ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--use-hsdp",
+                    "--hsdp-shard-size",
+                    "2",
+                ],
+            ),
+            id="parallel_hsdp",
+            marks=PARALLEL_FEATURE_MARKS,
+        ),
     ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases("Qwen/Qwen-Image"),
@@ -130,8 +142,6 @@ def test_qwen_image(omni_server: OmniServer, openai_client: OpenAIClientHandler)
     openai_client.send_diffusion_request(request_config)
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases("Qwen/Qwen-Image-2512"),

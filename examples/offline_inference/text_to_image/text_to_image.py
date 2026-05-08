@@ -2,14 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
-import os
+import json
 import time
 from pathlib import Path
 from typing import Any
 
 import torch
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig, logger
+from vllm_omni.diffusion.data import logger
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
@@ -28,6 +28,16 @@ def is_nextstep_model(model_name: str) -> bool:
     except Exception:
         pass
     return False
+
+
+def parse_profiler_config(value: str) -> dict[str, Any]:
+    try:
+        config = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"--profiler-config must be valid JSON: {e}") from e
+    if not isinstance(config, dict):
+        raise argparse.ArgumentTypeError("--profiler-config must be a JSON object")
+    return config
 
 
 def parse_args() -> argparse.Namespace:
@@ -145,6 +155,23 @@ def parse_args() -> argparse.Namespace:
         help="Enable layerwise (blockwise) offloading on DiT modules.",
     )
     parser.add_argument(
+        "--use-hsdp",
+        action="store_true",
+        help="Enable HSDP (Hybrid Sharded Data Parallel) for diffusion models.",
+    )
+    parser.add_argument(
+        "--hsdp-shard-size",
+        type=int,
+        default=1,
+        help="Number of GPUs to shard weights across for HSDP.",
+    )
+    parser.add_argument(
+        "--hsdp-replicate-size",
+        type=int,
+        default=1,
+        help="Number of HSDP replica groups.",
+    )
+    parser.add_argument(
         "--quantization",
         type=str,
         default=None,
@@ -238,10 +265,45 @@ def parse_args() -> argparse.Namespace:
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
     parser.add_argument(
+        "--profiler-config",
+        type=parse_profiler_config,
+        default=None,
+        help='JSON profiler config for torch/cuda profiling, e.g. \'{"profiler":"torch","torch_profiler_dir":"./perf"}\'.',
+    )
+    parser.add_argument(
         "--log-stats",
         action="store_true",
         help="Enable logging of diffusion pipeline stats.",
     )
+    parser.add_argument(
+        "--init-timeout",
+        type=int,
+        default=600,
+        help="Timeout for initializing a single stage in seconds (default: 600s)",
+    )
+    parser.add_argument(
+        "--stage-init-timeout",
+        type=int,
+        default=600,
+        help="Timeout for initializing a single stage in seconds (default: 600s)",
+    )
+    parser.add_argument(
+        "--use-system-prompt",
+        type=str,
+        default=None,
+        choices=["None", "dynamic", "en_vanilla", "en_recaption", "en_think_recaption", "en_unified", "custom"],
+        help="System prompt preset for generation. Recommended: en_unified.",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help=("Custom system prompt. Used when --use-system-prompt is custom. "),
+    )
+    current_omni_platform.pre_register_and_update(parser)
+    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
+
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 
@@ -280,19 +342,7 @@ def main():
             #       (e.g., QwenImagePipeline or FluxPipeline)
         }
 
-    # assert args.ring_degree == 1, "Ring attention is not supported yet"
-    parallel_config = DiffusionParallelConfig(
-        ulysses_degree=args.ulysses_degree,
-        ring_degree=args.ring_degree,
-        ulysses_mode=args.ulysses_mode,
-        cfg_parallel_size=args.cfg_parallel_size,
-        tensor_parallel_size=args.tensor_parallel_size,
-        vae_patch_parallel_size=args.vae_patch_parallel_size,
-        enable_expert_parallel=args.enable_expert_parallel,
-    )
-
-    # Check if profiling is requested via environment variable
-    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+    profiler_enabled = args.profiler_config is not None
 
     # Prepare LoRA kwargs for Omni initialization
     lora_args: dict[str, Any] = {}
@@ -327,12 +377,21 @@ def main():
         "cache_backend": args.cache_backend,
         "cache_config": cache_config,
         "enable_cache_dit_summary": args.enable_cache_dit_summary,
-        "parallel_config": parallel_config,
+        "ulysses_degree": args.ulysses_degree,
+        "ring_degree": args.ring_degree,
+        "ulysses_mode": args.ulysses_mode,
+        "cfg_parallel_size": args.cfg_parallel_size,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "vae_patch_parallel_size": args.vae_patch_parallel_size,
+        "enable_expert_parallel": args.enable_expert_parallel,
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
         "mode": "text-to-image",
         "log_stats": args.log_stats,
         "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
+        "profiler_config": args.profiler_config,
+        "init_timeout": args.init_timeout,
+        "stage_init_timeout": args.stage_init_timeout,
         **lora_args,
         **quant_kwargs,
     }
@@ -363,7 +422,7 @@ def main():
         f"vae_patch_parallel_size={args.vae_patch_parallel_size}, "
         f"enable_expert_parallel={args.enable_expert_parallel}."
     )
-    print(f"  CPU offload: {args.enable_cpu_offload}")
+    print(f"  CPU offload: {args.enable_cpu_offload}; CPU Layerwise Offload: {args.enable_layerwise_offload}")
     print(f"  Image size: {args.width}x{args.height}")
     if args.lora_path:
         print(f"  LoRA: scale={args.lora_scale}")
@@ -382,13 +441,13 @@ def main():
         )
 
     generation_start = time.perf_counter()
-
     extra_args = {
         "timesteps_shift": args.timesteps_shift,
         "cfg_schedule": args.cfg_schedule,
         "use_norm": args.use_norm,
+        "use_system_prompt": args.use_system_prompt,
+        "system_prompt": args.system_prompt,
     }
-
     if lora_request:
         extra_args["lora_request"] = lora_request
         extra_args["lora_scale"] = args.lora_scale

@@ -8,11 +8,15 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property
+from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.utils import RunnerOutput
 
 logger = init_logger(__name__)
 
@@ -34,6 +38,34 @@ class DiffusionRequestStatus(enum.IntEnum):
         return status >= DiffusionRequestStatus.FINISHED_COMPLETED
 
 
+@dataclass(frozen=True, eq=True)
+class SamplingParamsKey:
+    """Batch-compatibility key derived from ``OmniDiffusionSamplingParams``.
+
+    Only requests with the same key can be batched together.
+    Fields not included here are treated as request-local and do not
+    participate in the current homogeneous batching policy.
+    """
+
+    # Spatial / temporal shape.
+    height: int | None = None
+    width: int | None = None
+    num_frames: int = 1
+    resolution: int | str | None = None
+    fps: int | None = None
+    frame_rate: float | None = None
+    boundary_ratio: float | None = None
+
+    # CFG / guidance.
+    do_classifier_free_guidance: bool = False
+    guidance_scale: float = 0.0
+    guidance_scale_provided: bool = False
+    guidance_scale_2: float | None = None
+    guidance_rescale: float = 0.0
+    true_cfg_scale: float | None = None
+    cfg_normalize: bool = False
+
+
 @dataclass
 class DiffusionRequestState:
     """Scheduler-owned state for one queued OmniDiffusionRequest."""
@@ -43,6 +75,7 @@ class DiffusionRequestState:
     # TODO: Align this with OmniDiffusionRequest.request_ids once scheduler batching is supported.
     sched_req_id: str
     req: OmniDiffusionRequest
+    sampling_params_key: SamplingParamsKey | None = None
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
 
@@ -77,7 +110,7 @@ class CachedRequestData:
 class DiffusionSchedulerOutput:
     """Output of a single scheduling cycle."""
 
-    step_id: int
+    step_id: int  # global step index
     scheduled_new_reqs: list[NewRequestData]
     scheduled_cached_reqs: CachedRequestData
     finished_req_ids: set[str]
@@ -141,7 +174,7 @@ class SchedulerInterface(ABC):
         """Run one scheduling cycle."""
 
     @abstractmethod
-    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: DiffusionOutput) -> set[str]:
+    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
         """Update scheduler state from executor output."""
 
     @abstractmethod

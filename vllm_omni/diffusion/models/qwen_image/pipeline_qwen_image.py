@@ -26,6 +26,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.qwen_image.cfg_parallel import (
     QwenImageCFGParallelMixin,
 )
@@ -34,9 +35,16 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.prompt_utils import (
+    validate_prompt_sequence_lengths,
+)
+from vllm_omni.diffusion.utils.size_utils import (
+    normalize_min_aligned_size,
+)
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.worker.input_batch import InputBatch
     from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -268,12 +276,20 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         # Check if model is a local path
         local_files_only = os.path.exists(model)
 
+        # See pipeline_qwen_image_edit_plus: guard against transformers v5
+        # multi-worker race on partial subfolder shard sets (Buildkite #1043).
+        prefetch_subfolders(
+            model,
+            ["scheduler", "text_encoder", "vae", "tokenizer"],
+            local_files_only=local_files_only,
+        )
+
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
-        )
+        ).to(self.device)
         self.vae = DistributedAutoencoderKLQwenImage.from_pretrained(
             model, subfolder="vae", local_files_only=local_files_only
         ).to(self.device)
@@ -360,8 +376,10 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
                 "that was used to generate `negative_prompt_embeds`."
             )
 
-        if max_sequence_length is not None and max_sequence_length > 1024:
-            raise ValueError(f"`max_sequence_length` cannot be greater than 1024 but is {max_sequence_length}")
+        if max_sequence_length is not None and max_sequence_length > self.tokenizer_max_length:
+            raise ValueError(
+                f"`max_sequence_length` cannot be greater than {self.tokenizer_max_length} but is {max_sequence_length}"
+            )
 
     def _extract_masked_hidden(self, hidden_states: torch.Tensor, mask: torch.Tensor):
         bool_mask = mask.bool()
@@ -375,6 +393,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         self,
         prompt: str | list[str] = None,
         dtype: torch.dtype | None = None,
+        max_sequence_length: int | None = None,
+        prompt_name: str = "prompt",
     ):
         dtype = dtype or self.text_encoder.dtype
 
@@ -385,12 +405,27 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         txt = [template.format(e) for e in prompt]
         txt_tokens = self.tokenizer(
             txt,
-            max_length=self.tokenizer_max_length + drop_idx,
             padding=True,
-            truncation=True,
+            truncation=False,
             return_tensors="pt",
         ).to(self.device)
-        # print(f"attention mask: {txt_tokens.attention_mask}")
+        # Validate only the user prompt contribution. The Qwen template also
+        # adds a fixed suffix after the user text, so subtracting only
+        # prompt_template_encode_start_idx would overcount near-limit prompts.
+        template_tokens = self.tokenizer(
+            [template.format("")],
+            padding=True,
+            truncation=False,
+            return_tensors="pt",
+        ).to(self.device)
+        validate_prompt_sequence_lengths(
+            txt_tokens.attention_mask,
+            max_sequence_length=max_sequence_length or self.tokenizer_max_length,
+            supported_max_sequence_length=self.tokenizer_max_length,
+            prompt_name=prompt_name,
+            baseline_attention_mask=template_tokens.attention_mask,
+            error_context="after applying the Qwen prompt template",
+        )
         encoder_hidden_states = self.text_encoder(
             input_ids=txt_tokens.input_ids,
             attention_mask=txt_tokens.attention_mask,
@@ -419,6 +454,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         prompt_embeds: torch.Tensor | None = None,
         prompt_embeds_mask: torch.Tensor | None = None,
         max_sequence_length: int = 1024,
+        prompt_name: str = "prompt",
     ):
         r"""
 
@@ -436,7 +472,11 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         batch_size = len(prompt) if prompt_embeds is None else prompt_embeds.shape[0]
 
         if prompt_embeds is None:
-            prompt_embeds, prompt_embeds_mask = self._get_qwen_prompt_embeds(prompt)
+            prompt_embeds, prompt_embeds_mask = self._get_qwen_prompt_embeds(
+                prompt,
+                max_sequence_length=max_sequence_length,
+                prompt_name=prompt_name,
+            )
 
         prompt_embeds = prompt_embeds[:, :max_sequence_length]
         prompt_embeds_mask = prompt_embeds_mask[:, :max_sequence_length]
@@ -629,6 +669,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
                 prompt_embeds_mask=negative_prompt_embeds_mask,
                 num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
+                prompt_name="negative_prompt",
             )
         else:
             negative_prompt_embeds = None
@@ -700,7 +741,7 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
             num_images_per_prompt=sampling.num_outputs_per_prompt if sampling.num_outputs_per_prompt > 0 else 1,
             generator=sampling.generator,
             true_cfg_scale=sampling.true_cfg_scale or 4.0,
-            max_sequence_length=sampling.max_sequence_length or 512,
+            max_sequence_length=sampling.max_sequence_length or self.tokenizer_max_length,
             attention_kwargs=kwargs.get("attention_kwargs"),
         )
 
@@ -824,54 +865,48 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
 
     def denoise_step(
         self,
-        state: "DiffusionRequestState",
+        input_batch: "InputBatch",
         **kwargs: Any,
     ) -> torch.Tensor | None:
-        """One denoise step: read from *state*, delegate to CFGParallelMixin.
+        """One denoise step: read from *input_batch*, delegate to CFGParallelMixin.
 
         Reuses ``predict_noise_maybe_with_cfg`` so that CFG-parallel,
         sequential-CFG, and no-CFG paths are handled identically to
         ``diffuse()``.
         """
+        del kwargs
         if self.interrupt:
             return None
 
-        t = state.current_timestep
+        t = input_batch.timesteps
         self._current_timestep = t
-        self.transformer.do_true_cfg = state.do_true_cfg
-
-        # Normalize timestep to [batch_size] tensor
-        if not torch.is_tensor(t):
-            t = torch.tensor(t, device=state.latents.device, dtype=state.latents.dtype)
+        self.transformer.do_true_cfg = input_batch.do_true_cfg
 
         positive_kwargs, negative_kwargs, output_slice = self._build_denoise_kwargs(
-            latents=state.latents,
+            latents=input_batch.latents,
             timestep=t,
-            guidance=state.guidance,
-            prompt_embeds=state.prompt_embeds,
-            prompt_embeds_mask=state.prompt_embeds_mask,
-            img_shapes=state.img_shapes,
-            txt_seq_lens=state.txt_seq_lens,
-            do_true_cfg=state.do_true_cfg,
-            negative_prompt_embeds=state.negative_prompt_embeds,
-            negative_prompt_embeds_mask=state.negative_prompt_embeds_mask,
-            negative_txt_seq_lens=state.negative_txt_seq_lens,
-            image_latents=state.sampling.image_latent,
+            guidance=input_batch.guidance,
+            prompt_embeds=input_batch.prompt_embeds,
+            prompt_embeds_mask=input_batch.prompt_embeds_mask,
+            img_shapes=input_batch.img_shapes,
+            txt_seq_lens=input_batch.txt_seq_lens,
+            do_true_cfg=input_batch.do_true_cfg,
+            negative_prompt_embeds=input_batch.negative_prompt_embeds,
+            negative_prompt_embeds_mask=input_batch.negative_prompt_embeds_mask,
+            negative_txt_seq_lens=input_batch.negative_txt_seq_lens,
+            image_latents=input_batch.image_latents,
             extra_transformer_kwargs={
                 "attention_kwargs": self.attention_kwargs,
                 "return_dict": False,
             },
         )
 
-        true_cfg_scale = state.sampling.true_cfg_scale or 4.0
-        cfg_normalize = state.sampling.cfg_normalize
-
         return self.predict_noise_maybe_with_cfg(
-            state.do_true_cfg,
-            true_cfg_scale,
+            input_batch.do_true_cfg,
+            input_batch.true_cfg_scale,
             positive_kwargs,
             negative_kwargs,
-            cfg_normalize,
+            input_batch.cfg_normalize,
             output_slice,
         )
 
@@ -931,13 +966,14 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
         output_type: str | None = "pil",
         attention_kwargs: dict[str, Any] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
-        max_sequence_length: int = 512,
+        max_sequence_length: int = 1024,
     ) -> DiffusionOutput:
         extracted_prompt, negative_prompt = self._extract_prompts(req.prompts)
         prompt = extracted_prompt or prompt
 
         height = req.sampling_params.height or self.default_sample_size * self.vae_scale_factor
         width = req.sampling_params.width or self.default_sample_size * self.vae_scale_factor
+        height, width = normalize_min_aligned_size(height, width, self.vae_scale_factor * 2)
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
         sigmas = req.sampling_params.sigmas or sigmas
         max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length

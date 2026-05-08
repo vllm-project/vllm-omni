@@ -15,6 +15,14 @@ def main():
         vllm_main()
         return
     else:
+        # Force colored logging even when piped (e.g. `| tee`).
+        # Must be set before any vLLM import because the logger
+        # formatter is configured at import time via _use_color().
+        import os
+
+        if "VLLM_LOGGING_COLOR" not in os.environ:
+            os.environ["VLLM_LOGGING_COLOR"] = "1"
+
         from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
         from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -27,6 +35,10 @@ def main():
         ]
 
         cli_env_setup()
+
+        from vllm_omni.entrypoints.cli.serve import _ensure_vllm_platform
+
+        _ensure_vllm_platform()
 
         parser = FlexibleArgumentParser(
             description="vLLM OMNI CLI",

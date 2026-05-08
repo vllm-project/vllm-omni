@@ -62,10 +62,16 @@ def apply_rotary_emb_helios(
     """
     x_1, x_2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
     cos, sin = freqs_cis.unsqueeze(-2).chunk(2, dim=-1)
-    out = torch.empty_like(hidden_states)
-    out[..., 0::2] = x_1 * cos[..., 0::2] - x_2 * sin[..., 1::2]
-    out[..., 1::2] = x_1 * sin[..., 1::2] + x_2 * cos[..., 0::2]
-    return out.type_as(hidden_states)
+    # Use stack+flatten instead of strided slice assignment for contiguous
+    # memory layout and better performance on GPU/NPU (#2436, cf. PR #2393).
+    rotated = torch.stack(
+        (
+            x_1 * cos[..., 0::2] - x_2 * sin[..., 1::2],
+            x_1 * sin[..., 1::2] + x_2 * cos[..., 0::2],
+        ),
+        dim=-1,
+    )
+    return rotated.flatten(-2, -1).type_as(hidden_states)
 
 
 class DistributedRMSNorm(nn.Module):
@@ -576,7 +582,7 @@ class HeliosTransformer3DModel(nn.Module):
     """
 
     _repeated_blocks = ["HeliosTransformerBlock"]
-    _layerwise_offload_blocks_attr = "blocks"
+    _layerwise_offload_blocks_attrs = ["blocks"]
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
     }

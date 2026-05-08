@@ -7,7 +7,7 @@ import re
 import time
 from collections.abc import Generator, Iterable
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 from huggingface_hub import hf_hub_download
@@ -26,13 +26,18 @@ from vllm.model_executor.model_loader.weight_utils import (
     multi_thread_safetensors_weights_iterator,
     safetensors_weights_iterator,
 )
+from vllm.transformers_utils.repo_utils import file_exists
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig
 from vllm_omni.diffusion.model_loader.gguf_adapters import get_gguf_adapter
+from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.registry import initialize_model
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
 
@@ -45,6 +50,8 @@ def _natural_sort_key(filepath: str) -> list:
 
 MODEL_INDEX = "model_index.json"
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
+TRANSFORMER_WEIGHTS_INDEX = "model.safetensors.index.json"
+INDEX_FILES = [DIFFUSION_MODEL_WEIGHTS_INDEX, TRANSFORMER_WEIGHTS_INDEX]
 
 
 class DiffusersPipelineLoader:
@@ -95,8 +102,17 @@ class DiffusersPipelineLoader:
         is_local = os.path.isdir(model_name_or_path)
         load_format = self.load_config.load_format
         use_safetensors = False
-        index_file = DIFFUSION_MODEL_WEIGHTS_INDEX
-        index_file_with_subfolder = f"{subfolder}/{index_file}" if subfolder else index_file
+        possible_index_files = [
+            f"{subfolder}/{index_file}" if subfolder is not None else index_file for index_file in INDEX_FILES
+        ]
+        available_index_file = [
+            f for f in possible_index_files if file_exists(model_name_or_path, f, revision=revision)
+        ]
+        if len(available_index_file) > 1:
+            raise ValueError(
+                f"Multiple index files found in {model_name_or_path} with subfolder {subfolder}: {available_index_file}"
+            )
+        index_file = available_index_file[0] if available_index_file else ""
 
         # only hf is supported currently
         if load_format == "auto":
@@ -114,19 +130,20 @@ class DiffusersPipelineLoader:
         if allow_patterns_overrides is not None:
             allow_patterns = allow_patterns_overrides
 
-        if subfolder is not None:
-            allow_patterns = [f"{subfolder}/{pattern}" for pattern in allow_patterns]
-
         if not is_local:
             hf_folder = download_weights_from_hf(
                 model_name_or_path,
                 self.load_config.download_dir,
                 allow_patterns,
                 revision,
+                subfolder=subfolder,
                 ignore_patterns=self.load_config.ignore_patterns,
             )
         else:
             hf_folder = model_name_or_path
+
+        if subfolder is not None:
+            hf_folder = os.path.join(hf_folder, subfolder)
 
         hf_weights_files: list[str] = []
         for pattern in allow_patterns:
@@ -145,22 +162,12 @@ class DiffusersPipelineLoader:
             if not is_local:
                 download_safetensors_index_file_from_hf(
                     model_name_or_path,
-                    index_file_with_subfolder,
-                    self.load_config.download_dir,
-                    revision,
+                    index_file,
+                    cache_dir=self.load_config.download_dir,
+                    subfolder=subfolder,
+                    revision=revision,
                 )
-            # Some diffusers pipelines keep component weights under a
-            # subfolder (e.g. "transformer/") and the corresponding index file
-            # uses filenames relative to that subfolder. vLLM's
-            # `filter_duplicate_safetensors_files` expects weight_map entries
-            # to be relative to the `hf_folder` we pass in, so we point it to
-            # the component subfolder to avoid filtering out all shards.
-            filter_folder = os.path.join(hf_folder, subfolder) if subfolder is not None else hf_folder
-            hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files,
-                filter_folder,
-                index_file,
-            )
+            hf_weights_files = filter_duplicate_safetensors_files(hf_weights_files, hf_folder, index_file)
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
@@ -254,11 +261,14 @@ class DiffusersPipelineLoader:
         self,
         od_config: OmniDiffusionConfig,
         load_device: str,
-        load_format: str = "default",
+        load_format: str | None = "default",
         custom_pipeline_name: str | None = None,
         device: torch.device | None = None,
     ) -> nn.Module:
         """Load a model with the given configurations."""
+        if load_format is None:
+            load_format = "default"
+
         # CPU offload + FP8: load weights on device for FP8 quantization
         if load_device == "cpu" and od_config.quantization_config is not None:
             load_device = device.type
@@ -274,11 +284,21 @@ class DiffusersPipelineLoader:
                 with target_device:
                     if load_format == "default":
                         model = initialize_model(od_config)
+                    elif load_format == "diffusers":
+                        model = DiffusersAdapterPipeline(od_config=od_config, device=target_device)
                     elif load_format == "custom_pipeline":
                         model_cls = resolve_obj_by_qualname(custom_pipeline_name)
                         model = model_cls(od_config=od_config)
+                    else:
+                        # 'dummy' format should not call this function at all
+                        raise ValueError(f"Unknown load_format: {load_format}")
                 logger.debug("Loading weights on %s ...", load_device)
-                if self._is_gguf_quantization(od_config):
+                if load_format == "diffusers":
+                    # DiffusersAdapterPipeline.load_weights() calls
+                    # DiffusionPipeline.from_pretrained() internally — it does
+                    # NOT use our native (customized) pipeline classes.
+                    cast(DiffusersAdapterPipeline, model).load_weights()
+                elif self._is_gguf_quantization(od_config):
                     self._load_weights_with_gguf(model, od_config)
                 else:
                     # Quantization does not happen in `load_weights` but after it
@@ -332,11 +352,59 @@ class DiffusersPipelineLoader:
             weights_scale_not_loaded = {name for name in weights_not_loaded if name.endswith("weight_scale")}
             weights_not_loaded = weights_not_loaded - weights_scale_not_loaded
             if weights_not_loaded:
-                raise ValueError(f"Following weights were not initialized from checkpoint: {weights_not_loaded}")
+                self._check_unloaded_weights(weights_not_loaded)
             if weights_scale_not_loaded:
                 logger.warning(
                     f"Following weight_scale weights were not initialized from checkpoint: {weights_scale_not_loaded}"
                 )
+
+    @staticmethod
+    def _is_expected_quantized_weight(name: str) -> bool:
+        """Return True if *name* is a quantization-specific parameter.
+
+        Quantization methods (GPTQ, AWQ, FP8, GGUF, Autoround, etc.) create extra
+        parameters that have no counterpart in an unquantized checkpoint.
+        These are expected to be absent and should not trigger a load error.
+        """
+        # Weight suffixes that quantization methods register in the model but
+        # are not present in unquantized checkpoints.
+        _QUANTIZED_WEIGHT_SUFFIXES = (
+            # GPTQ / AWQ / AutoRound – g_idx is optional (not all checkpoints include it)
+            ".g_idx",
+            # FP8
+            ".weight_scale",
+            ".weight_scale_inv",
+            ".input_scale",
+            # GGUF
+            ".qweight_type",
+            # INT8  (weight_scale already covered above)
+        )
+        return name.endswith(_QUANTIZED_WEIGHT_SUFFIXES)
+
+    def _check_unloaded_weights(
+        self,
+        weights_not_loaded: set[str],
+    ) -> None:
+        """Validate unloaded weights, tolerating expected quantization artifacts.
+
+        For quantized models, weights matching known quant-specific suffixes
+        are logged as a warning.  Any *other* missing weight raises
+        ``ValueError`` regardless of quantization.
+        """
+        od_config = getattr(self, "od_config", None)
+        if od_config is None or od_config.quantization_config is None:
+            raise ValueError(f"Following weights were not initialized from checkpoint: {weights_not_loaded}")
+
+        expected_missing = {w for w in weights_not_loaded if self._is_expected_quantized_weight(w)}
+        unexpected_missing = weights_not_loaded - expected_missing
+
+        if expected_missing:
+            logger.warning(
+                "Following weights were not initialized from checkpoint (expected for quantized models): %s",
+                expected_missing,
+            )
+        if unexpected_missing:
+            raise ValueError(f"Following weights were not initialized from checkpoint: {unexpected_missing}")
 
     def _is_gguf_quantization(self, od_config: OmniDiffusionConfig) -> bool:
         quant_config = od_config.quantization_config

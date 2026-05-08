@@ -8,6 +8,8 @@ from typing import Any
 import torch
 from vllm.v1.request import Request, RequestStatus
 
+from vllm_omni.data_entry_keys import unflatten_payload
+
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec
 from ..utils.logging import get_connector_logger
@@ -58,6 +60,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
+        self.requests_origin_status = {}
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -149,26 +152,38 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Update connector state
             self.get_req_chunk[req_id] += 1
 
+            meta = payload_data.get("meta", {})
             if self.model_mode == "ar":
-                self._update_request_payload(external_req_id, payload_data)
-                request.additional_information = payload_data
-                if payload_data.get("finished"):
+                merged_payload = self._update_request_payload(external_req_id, payload_data)
+                request.additional_information = merged_payload
+                if meta.get("finished"):
                     self.finished_requests.add(req_id)
             else:
-                if payload_data.get("finished"):
+                if meta.get("finished"):
                     self.finished_requests.add(req_id)
 
-                new_ids = payload_data.get("code_predictor_codes", [])
+                new_ids = payload_data.get("codes", {}).get("audio", [])
                 request.prompt_token_ids = new_ids
-                # Pass additional fields (like left_context_size) to the request
-                # Only pass chunk context metadata in additional_information
-                request.additional_information = {}
-                if "left_context_size" in payload_data:
-                    request.additional_information["left_context_size"] = payload_data["left_context_size"]
+                prev_info = getattr(request, "additional_information", None)
+                info = dict(prev_info) if isinstance(prev_info, dict) else {}
+                for key, value in payload_data.items():
+                    if key == "codes":
+                        continue
+                    if isinstance(value, dict):
+                        existing_sub = info.get(key)
+                        merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
+                        for sk, sv in value.items():
+                            if key == "meta" and sk == "finished":
+                                continue
+                            merged_sub[sk] = sv
+                        info[key] = merged_sub
+                        continue
+                    info[key] = value
+                request.additional_information = info
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.
-                if not new_ids and not payload_data.get("finished"):
+                if not new_ids and not meta.get("finished"):
                     return True
 
             # Mark as finished for consumption
@@ -179,33 +194,36 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return False
 
     def _update_request_payload(self, req_id: str, payload_data: dict[str, Any]) -> dict[str, Any]:
-        """Update the payload data for a request in the connector.
-
-        Args:
-            connector: OmniConnectorBase instance
-            req_id: Request ID to update
-            payload_data: New payload data to store
-        """
+        """Update the stored payload for *req_id* with the latest chunk."""
         if req_id not in self.request_payload:
             self.request_payload[req_id] = payload_data
             return payload_data
-        origin_payload = self.request_payload[req_id]
-        override_keys = payload_data.pop("override_keys", [])
-        for key, value in payload_data.items():
-            if key == "finished":
+        origin = self.request_payload[req_id]
+        raw_ok = payload_data.get("meta", {}).pop("override_keys", [])
+        override_keys = {tuple(k) if isinstance(k, list) else k for k in raw_ok}
+
+        for type_key, new_val in payload_data.items():
+            if not isinstance(new_val, dict):
                 continue
-            elif key in override_keys:
-                payload_data[key] = value
-            elif isinstance(value, torch.Tensor) and key in origin_payload:
-                payload_data[key] = torch.cat([origin_payload[key], value], dim=0)
-            elif isinstance(value, list) and key in origin_payload:
-                payload_data[key] = origin_payload[key] + value
+            origin_sub = origin.get(type_key)
+            if not isinstance(origin_sub, dict):
+                continue
+            for qual, value in new_val.items():
+                if type_key == "meta" and qual == "finished":
+                    continue
+                if (type_key, qual) in override_keys:
+                    continue
+                if isinstance(value, torch.Tensor) and qual in origin_sub:
+                    new_val[qual] = torch.cat([origin_sub[qual], value], dim=0)
+                elif isinstance(value, list) and qual in origin_sub:
+                    new_val[qual] = origin_sub[qual] + value
 
         self.request_payload[req_id] = payload_data
         return payload_data
 
     def _send_single_request(self, task: dict):
-        pooling_output = task["pooling_output"]
+        raw_po = task["pooling_output"]
+        pooling_output = unflatten_payload(raw_po) if isinstance(raw_po, dict) else raw_po
         request = task["request"]
         is_finished = task["is_finished"]
         stage_id = self.connector.stage_id
@@ -240,9 +258,23 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if success:
             self.put_req_chunk[external_req_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+            finished_flag = payload_data.get("meta", {}).get("finished", payload_data.get("finished"))
+            is_payload_finished = False
+            if isinstance(finished_flag, torch.Tensor):
+                is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())
+            elif finished_flag is not None:
+                is_payload_finished = bool(finished_flag)
+
+            # Reclaim per-request async state only after the terminal payload
+            # has been sent successfully. This avoids cleanup->save races.
+            if is_payload_finished:
+                self.cleanup(request.request_id, external_req_id)
 
         if is_finished:
-            self.cleanup_sender(external_req_id)
+            self.code_prompt_token_ids.pop(external_req_id, None)
+            cached_ic = getattr(self, "_cached_ic", None)
+            if cached_ic is not None:
+                cached_ic.pop(external_req_id, None)
 
     ########################################################################
     # Cleanup
@@ -261,6 +293,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.get_req_chunk.pop(request_id, None)
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
+        self.requests_origin_status.pop(request_id, None)
 
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
@@ -390,6 +423,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     self.requests_with_ready_chunks.add(request.request_id)
                     continue
             queue.remove(request)
+            self.requests_origin_status[request.request_id] = target_status
             waiting_for_chunk_list.append(request)
 
     def _clear_chunk_ready(self, scheduler_output: Any) -> None:
@@ -402,3 +436,23 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
                 if req_id in self.requests_with_ready_chunks:
                     self.requests_with_ready_chunks.remove(req_id)
+
+    def finish_requests(
+        self, request_ids: Any, finished_status: RequestStatus, requests: dict[str, Request] | None = None
+    ) -> list[tuple[str, int]]:
+        assert RequestStatus.is_finished(finished_status)
+        if isinstance(request_ids, str):
+            request_ids = (request_ids,)
+        elif request_ids is not None:
+            request_ids = set(request_ids)
+        else:
+            request_ids = requests.keys()
+
+        # First pass: collect requests to remove from queues
+        for req_id in request_ids:
+            request = requests.get(req_id) if requests else None
+            if request is None or request.is_finished():
+                # Invalid request ID.
+                continue
+            if req_id in self.requests_origin_status:
+                request.status = self.requests_origin_status.pop(req_id)

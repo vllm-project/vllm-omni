@@ -24,16 +24,14 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
 
 
 def slow_ar_to_dac_decoder(
-    stage_list: list[Any],
-    engine_input_source: list[int],
-    prompt: Any = None,
-    requires_multimodal_data: bool = False,
+    source_outputs: list[Any],
+    _prompt: Any = None,
+    _requires_multimodal_data: bool = False,
 ) -> list[Any]:
     """Non-async processor: wait for Slow AR to finish, then pass all codes to DAC decoder."""
     from vllm_omni.inputs.data import OmniTokensPrompt
-    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import _validate_stage_inputs
 
-    slow_ar_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    slow_ar_outputs = source_outputs
     dac_inputs: list[OmniTokensPrompt] = []
 
     for output in slow_ar_outputs:
@@ -110,8 +108,8 @@ def slow_ar_to_dac_decoder_async_chunk(
     if length <= 0:
         if finished:
             return {
-                "code_predictor_codes": [],
-                "finished": True,
+                "codes": {"audio": []},
+                "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
             }
         return None
 
@@ -143,7 +141,6 @@ def slow_ar_to_dac_decoder_async_chunk(
     code_predictor_codes = stacked_frames.transpose(0, 1).reshape(-1).tolist()
 
     return {
-        "code_predictor_codes": code_predictor_codes,
-        "left_context_size": left_context_size,
-        "finished": finished,
+        "codes": {"audio": code_predictor_codes},
+        "meta": {"left_context_size": left_context_size, "finished": torch.tensor(finished, dtype=torch.bool)},
     }

@@ -1,8 +1,8 @@
 import math
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 _MAX_EMBEDDING_DIM = 8192
 
@@ -10,8 +10,12 @@ _MAX_EMBEDDING_DIM = 8192
 class OpenAICreateSpeechRequest(BaseModel):
     input: str
     model: str | None = None
+    # Accept both "voice" (OpenAI convention) and "speaker" (model/internal
+    # convention) as input keys.  Intentionally global — all TTS backends
+    # (Qwen3-TTS, Voxtral, Fish Speech) use this field for the speaker name.
     voice: str | None = Field(
         default=None,
+        validation_alias=AliasChoices("voice", "speaker"),
         description="Speaker/voice to use. For Qwen3-TTS: vivian, ryan, aiden, etc.",
     )
     instructions: str | None = Field(
@@ -65,10 +69,21 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Maximum tokens to generate",
     )
+    seed: int | None = Field(
+        default=None,
+        ge=0,
+        le=2**63 - 1,
+        description="Random seed for reproducible generation. When set, ensures "
+        "deterministic output for the same input text and seed value.",
+    )
     initial_codec_chunk_frames: int | None = Field(
         default=None,
         ge=0,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
+    )
+    extra_params: dict[str, Any] | None = Field(
+        default=None,
+        description=("Optional model-specific parameters passed directly to the model's extra_args."),
     )
 
     @field_validator("stream_format")
@@ -107,6 +122,53 @@ class OpenAICreateSpeechRequest(BaseModel):
                     "Speed adjustment is not supported when streaming (stream=true). Set speed=1.0 or omit it."
                 )
         return self
+
+
+class OpenAICreateAudioGenerateRequest(BaseModel):
+    """Request model for audio generation via diffusion models (e.g. Stable Audio)."""
+
+    input: str = Field(
+        description="Text prompt describing the audio to generate",
+    )
+    model: str | None = None
+    response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
+    speed: float | None = Field(
+        default=1.0,
+        ge=0.25,
+        le=4.0,
+    )
+    stream_format: Literal["sse", "audio"] | None = "audio"
+    audio_length: float | None = Field(
+        default=None,
+        description="Audio length in seconds",
+    )
+    audio_start: float | None = Field(
+        default=0.0,
+        description="Audio start time in seconds",
+    )
+    negative_prompt: str | None = Field(
+        default=None,
+        description="Negative prompt for classifier-free guidance",
+    )
+    guidance_scale: float | None = Field(
+        default=None,
+        description="Guidance scale for diffusion models",
+    )
+    num_inference_steps: int | None = Field(
+        default=None,
+        description="Number of inference steps",
+    )
+    seed: int | None = Field(
+        default=None,
+        description="Random seed for reproducibility",
+    )
+
+    @field_validator("stream_format")
+    @classmethod
+    def validate_stream_format(cls, v: str) -> str:
+        if v == "sse":
+            raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
+        return v
 
 
 class CreateAudio(BaseModel):

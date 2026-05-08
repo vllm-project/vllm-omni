@@ -78,7 +78,7 @@ def _parse_device_list(devices: str | int) -> list[str]:
 
 
 def _map_device_list(stage_id: int, device_list: list[str], visible_device_list: list[str]) -> list[str]:
-    """Maps logical to physical devices if we have enough visible devices available.
+    """Map logical stage devices onto the currently available device pool.
 
     Args:
         stage_id: The stage ID currently configuring devices.
@@ -87,22 +87,42 @@ def _map_device_list(stage_id: int, device_list: list[str], visible_device_list:
         visible_device_list: List of physical devices available.
     """
     num_visible = len(visible_device_list)
-    num_logical = len(device_list)
-    if num_visible < num_logical:
-        raise ValueError(f"Stage {stage_id} requires {num_logical} devices, but only {num_visible} devices are visible")
 
     # Ensure that the logical IDs are actually in range to avoid index errors;
-    # If the check above passes and those below fail, the logical devices are wrong,
-    # i.e., not actually 0, 1, ..., n
+    # if some requested ids exceed the available pool, we will fall back to the
+    # subset that can be mapped and leave the final capacity check to the later
+    # parallel-config validation path.
     if not all(device.isdigit() for device in device_list):
         raise ValueError("Logical devices must be non-negative integers")
 
     logical_ids = [int(device) for device in device_list]
-    if max(logical_ids) >= num_visible:
+    mapped_devices = [visible_device_list[idx] for idx in logical_ids if idx < num_visible]
+    mapping_pairs = [
+        f"{logical_id}->{visible_device_list[logical_id]}" for logical_id in logical_ids if logical_id < num_visible
+    ]
+    if not mapped_devices:
         raise ValueError(
-            f"Stage {stage_id} has logical IDs {device_list}, one or more of which exceed the number of visible devices"
+            f"Stage {stage_id} has logical IDs {device_list}, none of which map to the visible devices "
+            f"{visible_device_list}"
         )
-    return [visible_device_list[idx] for idx in logical_ids]
+    if len(mapped_devices) < len(logical_ids):
+        logger.warning(
+            "Stage %s requested logical devices %s, but only %d device(s) are currently available: %s. "
+            "Resolved logical-to-physical mapping: %s. Falling back to mapped subset %s",
+            stage_id,
+            device_list,
+            num_visible,
+            visible_device_list,
+            ", ".join(mapping_pairs) if mapping_pairs else "(none)",
+            mapped_devices,
+        )
+    else:
+        logger.info(
+            "Stage %s logical-to-physical device mapping: %s",
+            stage_id,
+            ", ".join(mapping_pairs),
+        )
+    return mapped_devices
 
 
 def serialize_obj(obj: Any) -> bytes:

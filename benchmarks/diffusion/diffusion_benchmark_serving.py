@@ -12,15 +12,15 @@ Supports multiple backends:
     - v1/videos: Use /v1/videos endpoint
 
 Usage:
-    # Video (vllm-omni backend)
+    # Video (v1/videos backend)
     t2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend vllm-omni --dataset vbench --task t2v --num-prompts 10 \
+        --backend v1/videos --dataset vbench --task t2v --num-prompts 10 \
         --height 480 --width 640 --fps 16 --num-frames 80
 
     i2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend vllm-omni --dataset vbench --task i2v --num-prompts 10
+        --backend v1/videos --dataset vbench --task i2v --num-prompts 10
 
 
     # Image (vllm-omni backend)
@@ -49,7 +49,7 @@ Usage:
         --backend openai --dataset vbench --task t2i --num-prompts 10 \
         --height 1024 --width 1024 --port 3000
 
-    # Video (v1/vedeos)
+    # Video (v1/videos)
     t2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
         --backend v1/videos --dataset random --task t2v --num-prompts 1 \
@@ -558,6 +558,7 @@ class RandomDataset(BaseDataset):
         super().__init__(args, api_url, model)
         self.num_prompts = args.num_prompts
         self.enable_negative_prompt = enable_negative_prompt
+        self.num_input_images = max(1, args.num_input_images)
         self.random_request_config = getattr(args, "random_request_config", None)
         if self.random_request_config:
             self.random_request_config = json.loads(self.random_request_config)
@@ -580,11 +581,7 @@ class RandomDataset(BaseDataset):
 
         # Random image generate
         if self.args.task in ["i2v", "ti2v", "ti2i", "i2i"]:
-            img = Image.new("RGB", (512, 512), (255, 255, 255))
-
-            image_path = os.path.join(tempfile.gettempdir(), "diffusion_benchmark_random_image.png")
-            self._random_image_path = [image_path]
-            img.save(image_path)
+            self._random_image_path = self._generate_random_image_paths()
         else:
             self._random_image_path = None
 
@@ -618,6 +615,18 @@ class RandomDataset(BaseDataset):
 
     def get_requests(self) -> list[RequestFuncInput]:
         return [self[i] for i in range(len(self))]
+
+    def _generate_random_image_paths(self) -> list[str]:
+        image_paths: list[str] = []
+        for image_idx in range(self.num_input_images):
+            img = Image.new("RGB", (512, 512), (255, 255, 255))
+            image_path = os.path.join(
+                tempfile.gettempdir(),
+                f"diffusion_benchmark_random_image_{image_idx}.png",
+            )
+            img.save(image_path)
+            image_paths.append(image_path)
+        return image_paths
 
 
 def _compute_expected_latency_ms_from_base(req: RequestFuncInput, args, base_time_ms: float | None) -> float | None:
@@ -740,6 +749,52 @@ async def iter_requests(
             interval_s = random.expovariate(request_rate)
             await asyncio.sleep(interval_s)
         yield req
+
+
+def _make_warmup_request(
+    requests_list: list[RequestFuncInput],
+    index: int,
+    args,
+) -> RequestFuncInput:
+    warm_req = requests_list[index % len(requests_list)]
+    if args.warmup_num_inference_steps is not None:
+        warm_req = replace(
+            warm_req,
+            num_inference_steps=args.warmup_num_inference_steps,
+        )
+    if args.task == "t2v":
+        warm_req = replace(warm_req, num_frames=1)
+    return warm_req
+
+
+async def _run_warmups(
+    requests_list: list[RequestFuncInput],
+    args,
+    session: aiohttp.ClientSession,
+    request_func,
+) -> list[tuple[RequestFuncInput, RequestFuncOutput]]:
+    if not args.warmup_requests or not requests_list:
+        return []
+
+    warmup_requests = [_make_warmup_request(requests_list, i, args) for i in range(args.warmup_requests)]
+    warmup_concurrency = min(int(args.warmup_concurrency), len(warmup_requests))
+    warmup_semaphore = asyncio.Semaphore(warmup_concurrency)
+
+    print(
+        f"Running {len(warmup_requests)} warmup request(s) "
+        f"with num_inference_steps={args.warmup_num_inference_steps} "
+        f"and warmup_concurrency={warmup_concurrency}..."
+    )
+
+    async def limited_warmup_request_func(
+        req: RequestFuncInput,
+    ) -> RequestFuncOutput:
+        async with warmup_semaphore:
+            return await request_func(req, session, None)
+
+    warmup_tasks = [asyncio.create_task(limited_warmup_request_func(req)) for req in warmup_requests]
+    warmup_outputs = await asyncio.gather(*warmup_tasks)
+    return list(zip(warmup_requests, warmup_outputs))
 
 
 def calculate_metrics(
@@ -891,23 +946,12 @@ async def benchmark(args):
     pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
 
     async with aiohttp.ClientSession() as session:
-        warmup_pairs: list[tuple[RequestFuncInput, RequestFuncOutput]] = []
-        if args.warmup_requests and requests_list:
-            print(
-                f"Running {args.warmup_requests} warmup request(s) \
-                with num_inference_steps={args.warmup_num_inference_steps}..."
-            )
-            for i in range(args.warmup_requests):
-                warm_req = requests_list[i % len(requests_list)]
-                if args.warmup_num_inference_steps is not None:
-                    warm_req = replace(
-                        warm_req,
-                        num_inference_steps=args.warmup_num_inference_steps,
-                    )
-                if args.task == "t2v":
-                    warm_req = replace(warm_req, num_frames=1)
-                warm_out = await limited_request_func(warm_req, session, None)
-                warmup_pairs.append((warm_req, warm_out))
+        warmup_pairs = await _run_warmups(
+            requests_list=requests_list,
+            args=args,
+            session=session,
+            request_func=request_func,
+        )
 
         if args.slo:
             # Prefer trace-provided per-request slo_ms. Only populate when missing.
@@ -1063,6 +1107,13 @@ if __name__ == "__main__":
         default=1,
         help="num_inference_steps used for warmup requests.",
     )
+    parser.add_argument(
+        "--warmup-concurrency",
+        type=int,
+        default=1,
+        help="Maximum number of warmup requests to run concurrently. "
+        "Set this to match the real batch shape when warming up torch.compile or CUDA graphs.",
+    )
     parser.add_argument("--width", type=int, default=None, help="Image/Video width.")
     parser.add_argument("--height", type=int, default=None, help="Image/Video height.")
     parser.add_argument("--num-frames", type=int, default=None, help="Number of frames (for video).")
@@ -1115,7 +1166,15 @@ if __name__ == "__main__":
             '{"width":768,"height":768,"num_inference_steps":20,"weight":0.85}]'
         ),
     )
+    parser.add_argument(
+        "--num-input-images",
+        type=int,
+        default=1,
+        help=(
+            "Number of synthetic input images to attach for image-conditioned tasks "
+            "(i2v, ti2v, ti2i, i2i) when using random dataset."
+        ),
+    )
 
     args = parser.parse_args()
-
     asyncio.run(benchmark(args))

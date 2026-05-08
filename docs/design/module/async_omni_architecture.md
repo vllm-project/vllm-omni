@@ -69,7 +69,7 @@
 [5] Orchestrator._orchestration_loop (loop)
     -> poll stage output
        - llm stage: await get_output_async()
-       - diffusion stage: get_diffusion_output_async()
+       - diffusion stage: get_diffusion_output_nowait()
     -> (llm stage) output_processors[i].process_outputs(...)
     -> _route_output(...)
     -> if finished and not final_stage and non-async-chunk:
@@ -112,7 +112,7 @@ sequenceDiagram
     ORCH->>S0: add_request_async
 
     loop poll route forward
-        ORCH->>S0: get_output_async / get_diffusion_output_async
+        ORCH->>S0: get_output_async / get_diffusion_output_nowait
         ORCH->>ORCH: _route_output
         alt need forward to next stage
             ORCH->>SN: add_request_async

@@ -1,0 +1,80 @@
+# Stage config for running Hunyuan-Image3.0 with architecture of OmniLLM.
+# Stage 0: AR Model (vLLM implementation)
+
+# The following config has been verified on 8x Max 1550 GPU.
+modes:
+  - mode: text-to-image
+    stages: [1]
+  - mode: image-to-text
+    stages: [0]
+stage_args:
+  - stage_id: 0
+    stage_type: llm  # Use llm stage type to launch OmniLLM
+    runtime:
+      process: true  # Run this stage in a separate process
+      devices: "0,1,2,3,4,5,6,7"  # Visible devices for this stage
+      max_batch_size: 1
+    engine_args:
+      model_stage: AR
+      model_arch: HunyuanImage3ForCausalMM
+      worker_cls: vllm_omni.platforms.xpu.worker.xpu_ar_worker.XPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.95
+      enforce_eager: true  # Now we only support eager mode
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32784
+      tensor_parallel_size: 8
+      pipeline_parallel_size: 1
+      enable_expert_parallel: true
+      quantization: "fp8"
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.1
+  - stage_id: 1
+    stage_type: diffusion
+    runtime:
+      process: true
+      devices: "0,1,2,3,4,5,6,7"
+      max_batch_size: 1
+    engine_args:
+      model_stage: diffusion
+      gpu_memory_utilization: 0.9
+      enforce_eager: true
+      engine_output_type: image
+      distributed_executor_backend: "mp"
+      enable_prefix_caching: false
+      vae_use_slicing: false
+      vae_use_tiling: false
+      cache_backend: null
+      cache_config: null
+      enable_cache_dit_summary: false
+      quantization: "fp8"
+      parallel_config:
+        pipeline_parallel_size: 1
+        data_parallel_size: 1
+        tensor_parallel_size: 8
+        enable_expert_parallel: true
+        sequence_parallel_size: 1
+        ulysses_degree: 1
+        ring_degree: 1
+        cfg_parallel_size: 1
+        vae_patch_parallel_size: 1
+        use_hsdp: false
+        hsdp_shard_size: -1
+        hsdp_replicate_size: 1
+    final_output: true
+    final_output_type: image
+
+# Top-level runtime config (concise): default windows and stage edges
+runtime:
+  enabled: true

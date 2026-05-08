@@ -15,28 +15,17 @@ Each server instance runs a single model (specified at startup via `vllm serve <
 ```bash
 # Qwen3-TTS: CustomVoice model (predefined speakers)
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
     --enforce-eager
 
 # Fish Speech S2 Pro
-vllm-omni serve fishaudio/s2-pro \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/fish_speech_s2_pro.yaml \
-    --omni \
-    --port 8091 \
-    --trust-remote-code \
-    --enforce-eager \
-    --gpu-memory-utilization 0.9
+vllm serve fishaudio/s2-pro --omni --port 8091
 
 # Voxtral TTS
-vllm serve mistralai/Voxtral-4B-TTS-2603 \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/voxtral_tts.yaml \
-    --omni \
-    --port 8091 \
-    --trust-remote-code \
-    --enforce-eager
+vllm serve mistralai/Voxtral-4B-TTS-2603 --omni --port 8091
 ```
 
 ### Generate Speech
@@ -118,6 +107,7 @@ Content-Type: application/json
 | `instructions` | string | "" | Voice style/emotion instructions |
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
 | `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
+| `stream` | bool | false | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`) |
 
 **Supported languages:** Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
 
@@ -143,9 +133,23 @@ Lists available voices for the loaded model.
 
 ```json
 {
-    "voices": ["aiden", "dylan", "eric", "ono_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian"]
+    "voices": ["aiden", "dylan", "eric", "ono_anna", "ryan", "serena", "sohee", "uncle_fu", "vivian", "custom_voice_1"],
+    "uploaded_voices": [
+        {
+            "name": "custom_voice_1",
+            "consent": "user_consent_id",
+            "created_at": 1738660000,
+            "file_size": 1024000,
+            "mime_type": "audio/wav",
+            "ref_text": "The exact transcript of the audio sample.",
+            "speaker_description": "warm narrator"
+        }
+    ]
 }
 ```
+
+`uploaded_voices` is always present (empty list when no custom voices have been uploaded). Fields `ref_text` and `speaker_description` are omitted per-entry when not provided at upload time.
+
 ```
 POST /v1/audio/voices
 Content-Type: multipart/form-data
@@ -161,6 +165,7 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 | `consent` | string | Yes | Consent recording ID |
 | `name` | string | Yes | Name for the new voice |
 | `ref_text` | string | No | Transcript of the audio. When provided, enables in-context voice cloning (higher quality). Without it, only the speaker embedding is extracted. |
+| `speaker_description` | string | No | Free-form description of the voice (e.g. "warm narrator", "energetic presenter"). Stored as metadata and returned in `GET /v1/audio/voices`. |
 
 **Response Example:**
 
@@ -172,10 +177,14 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
     "consent": "user_consent_id",
     "created_at": 1738660000,
     "mime_type": "audio/wav",
-    "file_size": 1024000
+    "file_size": 1024000,
+    "ref_text": "The exact transcript of the audio sample.",
+    "speaker_description": "warm narrator"
   }
 }
 ```
+
+Fields `ref_text` and `speaker_description` are omitted when not provided at upload time.
 
 **Usage Example:**
 
@@ -184,7 +193,8 @@ curl -X POST http://localhost:8091/v1/audio/voices \
   -F "audio_sample=@/path/to/voice_sample.wav" \
   -F "consent=user_consent_id" \
   -F "name=custom_voice_1" \
-  -F "ref_text=The exact transcript of the audio sample."
+  -F "ref_text=The exact transcript of the audio sample." \
+  -F "speaker_description=warm narrator"
 ```
 
 ## Streaming Text Input (WebSocket)
@@ -279,7 +289,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 ```bash
 # Start server with VoiceDesign model first
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
@@ -301,7 +311,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 ```bash
 # Start server with Base model first
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \
@@ -347,6 +357,31 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "voice": "custom_voice_1"
     }' --output cloned.wav
 ```
+
+### Voice Storage & Caching
+
+Uploaded voices are persisted to disk as a single `.safetensors` file per voice
+(audio samples + metadata — name, consent, ref_text, sample_rate, created_at —
+in the file header). On server restart the directory is scanned and all
+previously uploaded voices are restored automatically, so uploads survive
+process restarts.
+
+Uploading an existing name overwrites the previous entry (a warning is logged).
+
+Feature extraction artifacts (ref_code, speaker_embedding, DAC codes, etc.)
+are cached in-process with a shared LRU so repeated requests with the same
+`voice=...` skip the extraction pipeline. The cache is a true singleton across
+all TTS model types; deleting a voice invalidates every model-type slot at
+once.
+
+**Configuration (environment variables):**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SPEAKER_SAMPLES_DIR` | `~/.cache/vllm-omni/speakers` | Directory for persisted uploaded speakers (`.safetensors` files). |
+| `SPEAKER_MAX_UPLOADED` | `1000` | Maximum number of uploaded speakers kept on disk. Upload requests past the cap return 400. |
+
+The in-memory LRU has a fixed 512 MiB byte budget.
 
 ## Batch Speech Generation
 
@@ -496,15 +531,16 @@ for result in response.json()["results"]:
 
 All items are fanned out to `generate()` concurrently. The engine's stage worker automatically batches them up to the configured `max_batch_size` and queues the rest — no client-side throttling needed.
 
-For best throughput, use a batch-optimized stage config with `max_batch_size > 1`:
+For best throughput, set both stages' `max_num_seqs` to ≥4 via `--stage-overrides`:
 
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts_batch.yaml \
-    --omni --port 8091 --trust-remote-code --enforce-eager
+    --omni --port 8091 --trust-remote-code --enforce-eager \
+    --stage-overrides '{"0":{"max_num_seqs":4,"gpu_memory_utilization":0.2},
+                        "1":{"max_num_seqs":4,"gpu_memory_utilization":0.2}}'
 ```
 
-The default `qwen3_tts.yaml` uses `max_batch_size: 1` (single request). The `qwen3_tts_batch.yaml` config sets `max_batch_size: 4` for ~4x throughput.
+The bundled `qwen3_tts.yaml` uses `max_num_seqs: 1` (single request) on both stages. Bumping to 4 yields roughly 4× throughput on the talker and lets stage 1 batch chunks across in-flight requests.
 
 ## Supported Models
 
@@ -524,13 +560,37 @@ The default `qwen3_tts.yaml` uses `max_batch_size: 1` (single request). The `qwe
 |-------|-------------|
 | `fishaudio/s2-pro` | 4B dual-AR TTS with DAC codec (44.1 kHz). Supports text-to-speech and voice cloning. |
 
-Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` needed). The `voice` field should be set to `"default"`. See the [Fish Speech online serving example](../user_guide/examples/online_serving/fish_speech.md) for details.
+Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` needed). The `voice` field should be set to `"default"`. See the [Fish Speech section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#fish-speech-s2-pro) for details.
 
 ### Voxtral TTS
 
 | Model | Description |
 |-------|-------------|
 | `mistralai/Voxtral-4B-TTS-2603` | 3B AR + FlowMatching TTS. Supports text-to-speech with preset voices. |
+
+### CosyVoice3
+
+| Model | Description |
+|-------|-------------|
+| `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | Voice cloning from `ref_audio` + `ref_text`. No built-in voice presets — upload a voice or pass `ref_audio`/`ref_text` per request. |
+
+### OmniVoice
+
+| Model | Description |
+|-------|-------------|
+| `k2-fsa/OmniVoice` | Pure-diffusion TTS. Supports voice cloning via `ref_audio` (with optional `ref_text`); no built-in voice presets. |
+
+### VoxCPM2
+
+| Model | Description |
+|-------|-------------|
+| `openbmb/VoxCPM2` | TTS + voice cloning with built-in speaker presets and uploaded-voice support. Accepts `voice` (preset or uploaded) or `ref_audio` + optional `ref_text`. |
+
+### MOSS-TTS-Nano
+
+| Model | Description |
+|-------|-------------|
+| `OpenMOSS-Team/MOSS-TTS-Nano` | Voice cloning only. Requires `ref_audio` (or an uploaded `voice`); no built-in voice presets. `ref_text` is accepted but ignored — upstream's `voice_clone` mode does not consume a transcript. |
 
 ## Error Responses
 
@@ -596,7 +656,7 @@ Enable debug logging:
 
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml \
+    --deploy-config vllm_omni/deploy/qwen3_tts.yaml \
     --omni \
     --port 8091 \
     --trust-remote-code \

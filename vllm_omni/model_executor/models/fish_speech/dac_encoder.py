@@ -54,6 +54,9 @@ def _load_dac_codec(
     if "generator" in state_dict:
         state_dict = state_dict["generator"]
     codec.load_state_dict(state_dict, strict=False)
+    # Encoder path only uses encoder + quantizer.forward(); prune the
+    # decoder before moving to device to avoid unnecessary GPU allocation.
+    codec.decoder = None
     codec = codec.to(device=device, dtype=dtype)
     codec.eval()
 
@@ -66,42 +69,22 @@ def _load_dac_codec(
 def _get_resample_kernel(
     source_sr: int,
     target_sr: int,
-    device_type: str,
-    device_index: int | None,
-    dtype_name: str,
+    device: torch.device,
+    dtype: torch.dtype,
 ):
     import torchaudio
 
-    device = torch.device(device_type, device_index) if device_index is not None else torch.device(device_type)
-    dtype = getattr(torch, dtype_name)
+    # lru_cache requires hashable key parts; torch.device and torch.dtype are.
     return torchaudio.transforms.Resample(source_sr, target_sr).to(device=device, dtype=dtype)
 
 
-@torch.no_grad()
-def encode_reference_audio(
-    model_path: str,
+def _prepare_reference_audio_tensor(
     wav_samples: list[float] | np.ndarray | torch.Tensor,
     sample_rate: int,
     *,
-    device: torch.device | str | None = None,
-) -> list[int]:
-    """Encode reference audio into semantic token IDs for prompt conditioning.
-
-    Args:
-        model_path: HuggingFace model path (for locating codec.pth).
-        wav_samples: Audio waveform samples (mono, float).
-        sample_rate: Sample rate of the input audio.
-
-    Returns:
-        List of semantic token IDs (151678 + code_value for each frame).
-    """
-    if device is None:
-        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    else:
-        device = torch.device(device)
-    dtype = torch.float32
-    codec = _load_dac_codec(model_path, device=device, dtype=dtype)
-
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
     if isinstance(wav_samples, torch.Tensor):
         wav_tensor = wav_samples.detach()
     else:
@@ -124,28 +107,52 @@ def encode_reference_audio(
         resampler = _get_resample_kernel(
             int(sample_rate),
             DAC_SAMPLE_RATE,
-            device.type,
-            device.index,
-            "float32",
+            device,
+            dtype,
         )
         wav_tensor = resampler(wav_tensor.unsqueeze(0)).squeeze(0)
+    return wav_tensor
 
-    # Encode: [1, 1, T] -> codes [1, num_codebooks, num_frames]
+
+@torch.no_grad()
+def encode_reference_audio_codes(
+    model_path: str,
+    wav_samples: list[float] | np.ndarray | torch.Tensor,
+    sample_rate: int,
+    *,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Encode reference audio into DAC codebook indices.
+
+    Returns:
+        Tensor of shape [num_frames, num_codebooks] on the requested device
+        (dtype=torch.long).
+    """
+    if device is None:
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    else:
+        device = torch.device(device)
+    dtype = torch.float32
+    codec = _load_dac_codec(model_path, device=device, dtype=dtype)
+    wav_tensor = _prepare_reference_audio_tensor(
+        wav_samples,
+        sample_rate,
+        device=device,
+        dtype=dtype,
+    )
+
     wav_tensor = wav_tensor.unsqueeze(0).unsqueeze(0)
     feature_lengths = torch.tensor([wav_tensor.shape[-1]], device=device, dtype=torch.long)
-    codes, feature_lengths_out = codec.encode(wav_tensor, feature_lengths)
+    codes, _ = codec.encode(wav_tensor, feature_lengths)
+    prepared_num_samples = int(wav_tensor.shape[-1])
 
-    # Extract semantic codebook (index 0) - shape [num_frames].
-    semantic_codes = codes[0, 0, :].to(device="cpu", dtype=torch.long).tolist()
-
-    # Convert to semantic token IDs: <|semantic:{i}|> = 151678 + i
-    SEMANTIC_TOKEN_OFFSET = 151678
-    semantic_token_ids = [SEMANTIC_TOKEN_OFFSET + int(c) for c in semantic_codes]
-
+    # [1, num_codebooks, num_frames] -> [num_frames, num_codebooks]
+    codes_fq = codes[0].transpose(0, 1).to(dtype=torch.long).contiguous()
     logger.info(
-        "Encoded reference audio: %d samples @ %dHz -> %d semantic tokens",
-        int(wav_tensor.shape[-1]),
+        "Encoded reference audio codes: %d samples @ %dHz -> frames=%d codebooks=%d",
+        prepared_num_samples,
         sample_rate,
-        len(semantic_token_ids),
+        int(codes_fq.shape[0]),
+        int(codes_fq.shape[1]),
     )
-    return semantic_token_ids
+    return codes_fq

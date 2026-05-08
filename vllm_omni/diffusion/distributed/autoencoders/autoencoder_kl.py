@@ -28,6 +28,12 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
         model.init_distributed()
         return model
 
+    @classmethod
+    def from_config(cls, *args: Any, **kwargs: Any):
+        model = super().from_config(*args, **kwargs)
+        model.init_distributed()
+        return model
+
     def tile_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
         # mostly copy from AutoencoderKL
         overlap_size = int(self.tile_latent_min_size * (1 - self.tile_overlap_factor))
@@ -93,7 +99,7 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
 
         _, _, latent_h, latent_w = z.shape
         scale = int(2 ** (len(self.config.block_out_channels) - 1))
-        max_parallel_size = self.distributed_decoder.parallel_size
+        max_parallel_size = self.distributed_executor.parallel_size
 
         root = int(math.sqrt(max_parallel_size))
         for rows in range(root, 0, -1):
@@ -187,7 +193,7 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
         if split is not None:
             strategy = "tile" if split == self.tile_split else "patch"
             logger.info(f"Decode run with distributed executor, split strategy is {strategy}")
-            result = self.distributed_decoder.execute(
+            result = self.distributed_executor.execute(
                 z, DistributedOperator(split=split, exec=exec, merge=merge), broadcast_result=False
             )
             if not return_dict:

@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from typing import Any
 
 import torch
+import torch.nn as nn
 from vllm.logger import init_logger
 from vllm_ascend.platform import NPUPlatform
 
@@ -11,6 +13,12 @@ from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBa
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 logger = init_logger(__name__)
+
+_DIFFUSION_PACKED_MODULES_MAPPING = {
+    "HunyuanImage3Pipeline": {
+        "experts": ["experts.0.gate_up_proj", "experts.0.down_proj"],
+    },
+}
 
 
 class NPUOmniPlatform(OmniPlatform, NPUPlatform):
@@ -53,6 +61,13 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         prepare_hunyuan_fused_moe_runtime()
 
     @classmethod
+    def get_diffusion_packed_modules_mapping(
+        cls,
+        model_class: type[nn.Module],
+    ) -> dict[str, list[str]] | None:
+        return _DIFFUSION_PACKED_MODULES_MAPPING.get(model_class.__name__, None)
+
+    @classmethod
     def get_diffusion_attn_backend_cls(
         cls,
         selected_backend: str | None,
@@ -68,6 +83,9 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
         # Try FLASH_ATTN if mindiesd is available, otherwise fall back to SDPA
         if find_spec("mindiesd"):
+            # Configure ASCEND_CUSTOM_OPP_PATH for mindiesd custom ops upon import
+            import mindiesd  # noqa: F401
+
             logger.info("Defaulting to diffusion attention backend FLASH_ATTN")
             return DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
 
@@ -105,6 +123,24 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         device_props = torch.npu.get_device_properties(device_id)
         return device_props.total_memory
+
+    @classmethod
+    def create_autocast_context(cls, *, device_type, dtype, enabled=True):
+        if device_type != "npu":
+            return super().create_autocast_context(
+                device_type=device_type,
+                dtype=dtype,
+                enabled=enabled,
+            )
+        if not enabled:
+            return nullcontext()
+
+        # NPU-specific fallback
+        try:
+            return torch.npu.amp.autocast(dtype=dtype)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            logger.warning("autocast unavailable for device_type=%s dtype=%s: %s", device_type, dtype, exc)
+        return nullcontext()
 
     @classmethod
     def get_profiler_cls(cls) -> str:

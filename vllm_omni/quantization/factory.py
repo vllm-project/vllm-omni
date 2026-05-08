@@ -41,9 +41,25 @@ def _build_int8(**kw: Any) -> QuantizationConfig:
     return DiffusionInt8Config(**kw)
 
 
+def _build_inc(**kw: Any) -> QuantizationConfig:
+    """Lazy import for INC/AutoRound config with checkpoint kwarg normalization."""
+    from .inc_config import OmniINCConfig
+
+    # Map checkpoint key 'bits' to INCConfig's 'weight_bits'
+    if "bits" in kw and "weight_bits" not in kw:
+        kw["weight_bits"] = kw.pop("bits")
+
+    # Filter to only valid INCConfig params
+    valid = set(inspect.signature(OmniINCConfig.__init__).parameters) - {"self"}
+    filtered = {k: v for k, v in kw.items() if k in valid}
+    return OmniINCConfig(**filtered)
+
+
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "gguf": _build_gguf,
     "int8": _build_int8,
+    "inc": _build_inc,
+    "auto-round": _build_inc,
 }
 
 SUPPORTED_QUANTIZATION_METHODS: list[str] = list(dict.fromkeys(QUANTIZATION_METHODS + list(_OVERRIDES.keys())))

@@ -25,7 +25,9 @@ In standard Classifier-Free Guidance, each diffusion step requires two forward p
 1. **Positive/Conditional**: Guided by the text prompt
 2. **Negative/Unconditional**: Typically using empty or negative prompt
 
-CFG-Parallel eliminates this bottleneck by distributing the two forward passes across different GPU ranks, allowing them to execute simultaneously rather than sequentially.
+Some models require 3 or more CFG branches (see [N-Branch CFG](#n-branch-cfg-3-branches)).
+
+CFG-Parallel eliminates this bottleneck by distributing the forward passes across different GPU ranks, allowing them to execute simultaneously rather than sequentially.
 
 ### Architecture
 
@@ -33,9 +35,11 @@ vLLM-omni provides `CFGParallelMixin` that encapsulates all CFG parallel logic. 
 
 | Method | Purpose | Automatic Behavior |
 |--------|---------|-------------------|
-| [`predict_noise_maybe_with_cfg()`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/distributed/cfg_parallel/) | Predict noise with CFG | Detects parallel mode, distributes computation, gathers results |
-| [`scheduler_step_maybe_with_cfg()`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/distributed/cfg_parallel/) | Step scheduler with sync | Rank 0 steps, broadcasts latents to all ranks |
-| [`combine_cfg_noise()`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/distributed/cfg_parallel/) | Combine positive/negative | Applies CFG formula with optional normalization |
+| [`predict_noise_maybe_with_cfg()`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/distributed/cfg_parallel/) | Predict noise with 2-branch CFG | Detects parallel mode, distributes computation, gathers results |
+| [`predict_noise_with_multi_branch_cfg()`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/distributed/cfg_parallel/) | Predict noise with N-branch CFG | Round-robin dispatches N branches across M GPUs |
+| [`scheduler_step_maybe_with_cfg()`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/distributed/cfg_parallel/) | Step scheduler | All ranks step locally (no broadcast needed) |
+| [`combine_cfg_noise()`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/distributed/cfg_parallel/) | Combine 2-branch predictions | Applies CFG formula with optional normalization |
+| [`combine_multi_branch_cfg_noise()`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/distributed/cfg_parallel/) | Combine N-branch predictions | Override for custom multi-branch combine logic |
 | [`predict_noise()`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/distributed/cfg_parallel/) | Forward pass wrapper | Override for custom transformer calls |
 | [`cfg_normalize_function()`](https://docs.vllm.ai/projects/vllm-omni/en/latest/api/vllm_omni/diffusion/distributed/cfg_parallel/) | Normalize CFG output | Override for custom normalization |
 
@@ -47,7 +51,7 @@ vLLM-omni provides `CFGParallelMixin` that encapsulates all CFG parallel logic. 
   - Rank 0 computes positive prompt prediction
   - Rank 1 computes negative prompt prediction
   - Results are gathered via `all_gather()`
-  - Combined on rank 0 using CFG formula
+  - All ranks compute CFG combine locally (deterministic, identical results)
 
 - **Sequential mode** (when `cfg_world_size == 1`):
   - Single rank computes both positive and negative predictions
@@ -55,14 +59,23 @@ vLLM-omni provides `CFGParallelMixin` that encapsulates all CFG parallel logic. 
 
 `scheduler_step_maybe_with_cfg()` ensures consistent latent states across all ranks:
 
-- **CFG-Parallel mode**:
-  - Only rank 0 performs the scheduler step (applies noise prediction to update latents)
-  - Updated latents are broadcast to all other ranks via `broadcast()`
-  - All ranks maintain synchronized latent states for the next iteration
+- All ranks compute the scheduler step locally — no broadcast needed because `predict_noise_maybe_with_cfg` already ensures all ranks have identical noise predictions after `all_gather` + local combine.
 
-- **Sequential mode**:
-  - Single rank directly performs the scheduler step
-  - No synchronization needed
+### N-Branch CFG (3+ branches)
+
+Some models require more than 2 CFG branches. For example, Bagel and OmniGen2 use 3 branches, DreamID Omni uses 4 branches.
+
+`predict_noise_with_multi_branch_cfg()` handles these by automatically dispatching N branches across M GPUs using round-robin (rule: branch `i` → rank `i % M`):
+
+| Branches (N) | GPUs (M) | Dispatch |
+|:---:|:---:|:---|
+| 3 | 2 | `[[0, 2], [1]]` |
+| 3 | 3 | `[[0], [1], [2]]` |
+| 4 | 2 | `[[0, 2], [1, 3]]` |
+| 4 | 3 | `[[0, 3], [1], [2]]` |
+| 4 | 4 | `[[0], [1], [2], [3]]` |
+
+When a rank handles multiple branches, it runs them sequentially. After `all_gather`, all ranks execute `combine_multi_branch_cfg_noise()` locally, producing identical results.
 
 ---
 
@@ -105,6 +118,7 @@ class YourModelPipeline(nn.Module, CFGParallelMixin):
 - `positive_kwargs`: transformer arguments for conditional (text-guided) prediction
 - `negative_kwargs`: transformer arguments for unconditional prediction (set to `None` if CFG disabled)
 - For image editing pipelines, add `output_slice=image_seq_len` to extract the generative image portion
+- For models with 3+ CFG branches, see [Multi-Branch CFG](#multi-branch-cfg-3-branches) in the Customization section
 
 ### Step 2: Call `diffuse`
 
@@ -177,6 +191,92 @@ class LongCatImagePipeline(nn.Module, CFGParallelMixin):
         # return noise_pred
 ```
 
+
+### Multi-Branch CFG (3+ branches)
+
+For models with 3 or more CFG branches, use `predict_noise_with_multi_branch_cfg()` instead of `predict_noise_maybe_with_cfg()`, and override `combine_multi_branch_cfg_noise()` for custom combine logic. This interface also works for standard 2-branch CFG — just pass 2 branches in `branches_kwargs`.
+
+**Example (3-branch with dual guidance scale):**
+
+```python
+class YourMultiBranchPipeline(nn.Module, CFGParallelMixin):
+    def combine_multi_branch_cfg_noise(self, predictions, true_cfg_scale, cfg_normalize=False):
+        text_scale = true_cfg_scale["text"]
+        image_scale = true_cfg_scale["image"]
+        pos, ref, uncond = predictions
+        return uncond + image_scale * (ref - uncond) + text_scale * (pos - ref)
+
+    def diffuse(self, ...):
+        for i, t in enumerate(timesteps):
+            positive_kwargs = {...}   # conditional prompt
+            ref_neg_kwargs = {...}    # negative prompt + reference
+            uncond_kwargs = {...}     # unconditional
+
+            noise_pred = self.predict_noise_with_multi_branch_cfg(
+                do_true_cfg=do_true_cfg,
+                true_cfg_scale={"text": text_guidance_scale, "image": image_guidance_scale},
+                branches_kwargs=[positive_kwargs, ref_neg_kwargs, uncond_kwargs],
+            )
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+
+        return latents
+```
+
+### Override Combine Functions
+
+There are two combine functions for different scenarios:
+
+- **`combine_cfg_noise()`** — Used by `predict_noise_maybe_with_cfg()`. Override when `predict_noise()` returns a tuple (e.g., video + audio) and you need per-element CFG logic.
+- **`combine_multi_branch_cfg_noise()`** — Used by `predict_noise_with_multi_branch_cfg()`. Override to implement custom multi-branch combine formulas (see [Multi-Branch CFG](#multi-branch-cfg-3-branches) above).
+
+### Implement a Composite Scheduler for Multi-Output Models
+
+When each output has its own denoising schedule, implement a composite scheduler that dispatches to per-output schedulers. Assign it to `self.scheduler` so the default `scheduler_step()` works without override.
+
+**Complete example (video + audio with separate schedulers and diffuse loop):**
+
+```python
+class VideoAudioScheduler:
+    """Composite scheduler dispatching to video and audio schedulers."""
+    def __init__(self, video_scheduler, audio_scheduler):
+        self.video_scheduler = video_scheduler
+        self.audio_scheduler = audio_scheduler
+
+    def step(self, noise_pred, t, latents, return_dict=False, generator=None):
+        video_out = self.video_scheduler.step(noise_pred[0], t[0], latents[0], return_dict=False, generator=generator)[0]
+        audio_out = self.audio_scheduler.step(noise_pred[1], t[1], latents[1], return_dict=False, generator=generator)[0]
+        return ((video_out, audio_out),)
+
+class MyVideoAudioPipeline(nn.Module, CFGParallelMixin):
+    def __init__(self, ...):
+        self.scheduler = VideoAudioScheduler(video_sched, audio_sched)
+
+    def predict_noise(self, **kwargs):
+        video_pred, audio_pred = self.transformer(**kwargs)
+        return (video_pred, audio_pred)
+
+    def combine_cfg_noise(self, positive_noise_pred, negative_noise_pred, scale, normalize):
+        # ... (as above)
+
+    def diffuse(self, video_latents, audio_latents, timesteps_video, timesteps_audio, ...):
+        for t_v, t_a in zip(timesteps_video, timesteps_audio):
+            positive_kwargs = {...}  
+            negative_kwargs = {...} if do_true_cfg else None
+
+            video_pred, audio_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=do_true_cfg, true_cfg_scale=self.guidance_scale,
+                positive_kwargs=positive_kwargs, negative_kwargs=negative_kwargs,
+            )
+            video_latents, audio_latents = self.scheduler_step_maybe_with_cfg(
+                (video_pred, audio_pred), (t_v, t_a),
+                (video_latents, audio_latents), do_true_cfg=do_true_cfg,
+                generator=generator,
+            )
+        return video_latents, audio_latents
+```
+
+> **Note:** If you use a non-deterministic scheduler, e.g., DDPM, please set `self.scheduler_step_maybe_with_cfg(..., generator=torch.Generator(device).manual_seed(seed))` explicitly to control the randomness of scheduler step among ranks.
+
 ---
 
 ## Testing
@@ -246,4 +346,5 @@ Adding CFG-Parallel support:
 
 1. ✅ **Create mixin** - Inherit from `CFGParallelMixin` and implement `diffuse()` method
 2. ✅ **(Optional) Customize** - Override `predict_noise()` or `cfg_normalize_function()` for custom behavior
-3. ✅ **Test** - Verify with `--cfg-parallel-size 2` and compare performance
+3. ✅ **(Optional) Multi-branch** - For 3+ branch models, use `predict_noise_with_multi_branch_cfg()` and override `combine_multi_branch_cfg_noise()`
+4. ✅ **Test** - Verify with `--cfg-parallel-size 2` (or 3/4 for multi-branch) and compare performance
