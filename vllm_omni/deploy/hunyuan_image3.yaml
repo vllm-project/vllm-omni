@@ -3,11 +3,13 @@
 # (4 GPUs for AR, 4 GPUs for DiT). Platform overrides below fold in the
 # verified NPU/XPU stage configs that previously lived under stage_configs/.
 pipeline: hunyuan_image3
+async_chunk: false
 
 stages:
   - stage_id: 0
     max_num_seqs: 1
     gpu_memory_utilization: 0.9
+    trust_remote_code: true
     enforce_eager: true
     max_num_batched_tokens: 32768
     devices: "0,1,2,3"
@@ -34,18 +36,12 @@ stages:
     cache_config:
     enable_cache_dit_summary: false
     parallel_config:
-      pipeline_parallel_size: 1
-      data_parallel_size: 1
       tensor_parallel_size: 4
       enable_expert_parallel: true
       sequence_parallel_size: 1
       ulysses_degree: 1
-      ring_degree: 1
       cfg_parallel_size: 1
       vae_patch_parallel_size: 1
-      use_hsdp: false
-      hsdp_shard_size: -1
-      hsdp_replicate_size: 1
     default_sampling_params:
       seed: 42
 
