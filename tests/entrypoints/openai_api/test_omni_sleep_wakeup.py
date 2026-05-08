@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from unittest.mock import AsyncMock, MagicMock
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -25,7 +25,6 @@ def _make_app(engine_client):
     app.state.engine_client = engine_client
     app.state.sleeping_stages = set()
     return app
-
 
 
 @pytest.fixture
@@ -241,4 +240,3 @@ def test_pure_diffusion_wakeup_skipped(pure_diffusion_app, pure_diffusion_engine
     assert response.status_code == 200
     assert response.json()["status"] == "SKIPPED"
     pure_diffusion_engine.wake_up.assert_not_awaited()
-
