@@ -50,7 +50,6 @@ HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS: dict[str, int] = {
 _TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
     "t2t": ("en_unified", None, None),
     "i2t": ("en_unified", None, None),
-    "i2t_think": ("en_unified", "think", "<think>"),
     "it2i_think": ("en_unified", "think", "<think>"),
     "it2i_recaption": ("en_unified", "recaption", "<recaption>"),
     "t2i_think": ("en_unified", "think", "<think>"),
@@ -63,6 +62,7 @@ def available_tasks() -> list[str]:
     """Sorted list of task keys accepted by `build_prompt` / `build_prompt_tokens`."""
     return sorted(_TASK_PRESETS)
 
+
 def resolve_stop_token_ids(
     task: str = "it2i_think",
     bot_task: str = "think",
@@ -70,12 +70,9 @@ def resolve_stop_token_ids(
 ):
     _, _, trigger_tag = _TASK_PRESETS[task]
     stop_token_ids = [127957]
-    if task in ("t2t_think", "i2t_think"):
-        stop_token_ids.append(HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"])
-    elif trigger_tag:
+    if trigger_tag:
         stop_token_ids.append(tokenizer.convert_tokens_to_ids(trigger_tag))
     return stop_token_ids
-
 
 
 def build_prompt(

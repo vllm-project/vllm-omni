@@ -18,9 +18,9 @@ import os
 from pathlib import Path
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+    _TASK_PRESETS,
     build_prompt_tokens,
     resolve_stop_token_ids,
-    _TASK_PRESETS
 )
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniPromptType
@@ -50,6 +50,7 @@ _MODALITY_TASK_MAP = {
     "img2text": "i2t",
     "text2text": "t2t",
 }
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="HunyuanImage-3.0-Instruct end-to-end inference.")
@@ -132,6 +133,16 @@ def main():
     bot_task = args.bot_task
     if bot_task != "auto":
         task = task + "_" + bot_task
+    if task not in _TASK_PRESETS:
+        valid_bot_tasks = {
+            "text2img": ["think", "recaption", "vanilla"],
+            "img2img": ["think", "recaption"],
+            "img2text": ["auto"],
+            "text2text": ["auto"],
+        }[args.modality]
+        raise ValueError(
+            f"--bot-task {bot_task!r} is not supported for {args.modality}. Choose from: {valid_bot_tasks}"
+        )
 
     if args.deploy_config is not None and args.stage_configs_path is not None:
         raise ValueError("--deploy-config and --stage-configs-path are mutually exclusive.")

@@ -75,23 +75,12 @@ def test_available_tasks_covers_all_modalities():
     assert tasks >= {
         "t2t",
         "i2t",
-        "i2t_think",
         "it2i_think",
         "it2i_recaption",
         "t2i_think",
         "t2i_recaption",
         "t2i_vanilla",
     }
-
-
-def test_resolve_stop_token_ids_uses_end_think_for_i2t_think():
-    tok = FakeTokenizer()
-
-    eos_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|endoftext|>"]
-    assert resolve_stop_token_ids(task="i2t_think", tokenizer=tok) == [
-        eos_id,
-        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"],
-    ]
 
 
 def test_resolve_stop_token_ids_uses_trigger_for_generation_tasks():
@@ -110,7 +99,6 @@ def test_resolve_stop_token_ids_uses_trigger_for_generation_tasks():
     [
         "t2t",
         "i2t",
-        "i2t_think",
         "it2i_think",
         "it2i_recaption",
         "t2i_think",
@@ -139,7 +127,7 @@ def test_build_prompt_string_structure_chat_template(task: str):
     # documentation, so substring index() catches the wrong occurrence -- use
     # endswith() which directly captures "trigger is at the tail" (the Part A
     # fix: trigger goes AFTER `Assistant: `, not before user_prompt).
-    if task in ("i2t_think", "it2i_think", "t2i_think"):
+    if task in ("it2i_think", "t2i_think"):
         assert s.endswith("Assistant: <think>"), (
             f"Trigger <think> must be appended right after `Assistant: ` (Part A fix). Got tail: ...{s[-40:]!r}"
         )
@@ -208,7 +196,6 @@ def test_build_prompt_tokens_no_image_for_text_only_tasks():
 @pytest.mark.parametrize(
     "task,trigger_id",
     [
-        ("i2t_think", FakeTokenizer.SPECIAL["<think>"]),
         ("it2i_think", FakeTokenizer.SPECIAL["<think>"]),
         ("t2i_think", FakeTokenizer.SPECIAL["<think>"]),
         ("it2i_recaption", FakeTokenizer.SPECIAL["<recaption>"]),
