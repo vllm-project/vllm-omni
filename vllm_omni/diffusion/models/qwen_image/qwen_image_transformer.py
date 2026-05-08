@@ -49,25 +49,9 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 logger = init_logger(__name__)
 
 
-def _qwen_image_prefix(prefix: str, name: str) -> str:
-    return f"{prefix}.{name}" if prefix else name
-
-
-def resolve_qwen_image_quant_config(
-    od_config: OmniDiffusionConfig,
-) -> QuantizationConfig | None:
-    """Adopt the embedded transformer quant config for Qwen-Image pipelines."""
-    quant_config = od_config.quantization_config
-    if quant_config is None and od_config.tf_model_config.quant_config is not None:
-        quant_config = od_config.tf_model_config.quant_config
-        od_config.quantization_config = quant_config
-    return quant_config
-
-
-def _qwen_image_modulation_quant_config(
+def _resolve_txt_mod_quant_config(
     quant_config: QuantizationConfig | None,
 ) -> QuantizationConfig | None:
-    """Checkpoint-based AutoRound Qwen-Image models quantize block modulation linears."""
     get_name = getattr(quant_config, "get_name", None)
     if callable(get_name) and get_name() == "inc":
         return quant_config
@@ -485,7 +469,7 @@ class ColumnParallelApproxGELU(nn.Module):
             gather_output=False,
             return_bias=False,
             quant_config=quant_config,
-            prefix=_qwen_image_prefix(prefix, "proj"),
+            prefix=f"{prefix}.proj" if prefix else "proj",
         )
         self.approximate = approximate
 
@@ -520,7 +504,7 @@ class FeedForward(nn.Module):
                 approximate="tanh",
                 bias=bias,
                 quant_config=quant_config,
-                prefix=_qwen_image_prefix(prefix, "net.0"),
+                prefix=f"{prefix}.net.0",
             ),
             nn.Identity(),  # placeholder for weight loading
             RowParallelLinear(
@@ -529,7 +513,7 @@ class FeedForward(nn.Module):
                 input_is_parallel=True,
                 return_bias=False,
                 quant_config=quant_config,
-                prefix=_qwen_image_prefix(prefix, "net.2"),
+                prefix=f"{prefix}.net.2",
             ),
         ]
 
@@ -573,7 +557,7 @@ class QwenImageCrossAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=num_heads,
             quant_config=quant_config,
-            prefix=_qwen_image_prefix(prefix, "to_qkv"),
+            prefix=f"{prefix}.to_qkv",
         )
         self.query_num_heads = self.to_qkv.num_heads
         self.kv_num_heads = self.to_qkv.num_kv_heads
@@ -589,7 +573,7 @@ class QwenImageCrossAttention(nn.Module):
             head_size=head_dim,
             total_num_heads=num_heads,
             quant_config=quant_config,
-            prefix=_qwen_image_prefix(prefix, "add_kv_proj"),
+            prefix=f"{prefix}.add_kv_proj",
         )
         self.add_query_num_heads = self.add_kv_proj.num_heads
         self.add_kv_num_heads = self.add_kv_proj.num_kv_heads
@@ -602,7 +586,7 @@ class QwenImageCrossAttention(nn.Module):
             input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix=_qwen_image_prefix(prefix, "to_add_out"),
+            prefix=f"{prefix}.to_add_out",
         )
 
         assert not pre_only
@@ -613,7 +597,7 @@ class QwenImageCrossAttention(nn.Module):
             input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix=_qwen_image_prefix(prefix, "to_out.0"),
+            prefix=f"{prefix}.to_out.0",
         )
 
         self.norm_added_q = RMSNorm(head_dim, eps=eps)
@@ -754,11 +738,10 @@ class QwenImageTransformerBlock(nn.Module):
         self.dim = dim
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
-        modulation_quant_config = _qwen_image_modulation_quant_config(quant_config)
+        txt_mod_quant_config = _resolve_txt_mod_quant_config(quant_config)
 
         # Image processing modules.
-        # AutoRound checkpoints quantize modulation linears inside
-        # transformer_blocks. Keep the online/non-INC path full precision.
+        # The re-quantized W4A16 checkpoint keeps img_mod.1 in full precision.
         self.img_mod = nn.Sequential(
             nn.SiLU(),
             ReplicatedLinear(
@@ -766,8 +749,8 @@ class QwenImageTransformerBlock(nn.Module):
                 6 * dim,
                 bias=True,
                 return_bias=False,
-                quant_config=modulation_quant_config,
-                prefix=_qwen_image_prefix(prefix, "img_mod.1"),
+                quant_config=None,
+                prefix=f"{prefix}.img_mod.1",
             ),
         )
         self.img_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -778,17 +761,18 @@ class QwenImageTransformerBlock(nn.Module):
             context_pre_only=False,
             head_dim=attention_head_dim,
             quant_config=quant_config,
-            prefix=_qwen_image_prefix(prefix, "attn"),
+            prefix=f"{prefix}.attn",
         )
         self.img_norm2 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
         self.img_mlp = FeedForward(
             dim=dim,
             dim_out=dim,
             quant_config=quant_config,
-            prefix=_qwen_image_prefix(prefix, "img_mlp"),
+            prefix=f"{prefix}.img_mlp",
         )
 
         # Text processing modules.
+        # AutoRound keeps txt_mod.1 quantized inside transformer_blocks.
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
             ReplicatedLinear(
@@ -796,8 +780,8 @@ class QwenImageTransformerBlock(nn.Module):
                 6 * dim,
                 bias=True,
                 return_bias=False,
-                quant_config=modulation_quant_config,
-                prefix=_qwen_image_prefix(prefix, "txt_mod.1"),
+                quant_config=txt_mod_quant_config,
+                prefix=f"{prefix}.txt_mod.1",
             ),
         )
         self.txt_norm1 = AdaLayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -807,7 +791,7 @@ class QwenImageTransformerBlock(nn.Module):
             dim=dim,
             dim_out=dim,
             quant_config=quant_config,
-            prefix=_qwen_image_prefix(prefix, "txt_mlp"),
+            prefix=f"{prefix}.txt_mlp",
         )
 
         self.zero_cond_t = zero_cond_t
@@ -1012,8 +996,6 @@ class QwenImageTransformer2DModel(CachedTransformer):
         quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
-        if quant_config is None:
-            quant_config = resolve_qwen_image_quant_config(od_config)
         self.parallel_config = od_config.parallel_config
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
