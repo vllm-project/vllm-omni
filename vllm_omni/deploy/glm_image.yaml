@@ -54,7 +54,7 @@ platforms:
         devices: "0,1,2,3"
         env:
           # When multiple business processes share a single NPU simultaneously,
-          # port conflict issues may occur. You can refer to the link below to set different parameters for different processes, 
+          # port conflict issues may occur. You can refer to the link below to set different parameters for different processes,
           # replacing the default parameter configuration.
           # https://www.hiascend.com/document/detail/zh/canncommercial/850/maintenref/envvar/envref_07_0143.html
           HCCL_IF_BASE_PORT: 23000
