@@ -2,14 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import ClassVar, Literal
 
-from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
+from transformers import AutoConfig, PretrainedConfig
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLTextConfig,
     Qwen2_5_VLVisionConfig,
 )
-
-from vllm_omni.tokenizers.mammoth_moda2_tokenizer import MammothUTokenizer
 
 __all__ = [
     "Mammothmoda2Config",
@@ -219,7 +217,7 @@ class Mammothmoda2Config(PretrainedConfig):
     def __init__(
         self,
         *,
-        llm_config: dict | PretrainedConfig | None = None,
+        llm_config: dict | None = None,
         gen_vae_config: dict | None = None,
         gen_dit_config: dict | None = None,
         gen_condition_mode: Literal["text", "image", "text_image"] = "image",
@@ -231,19 +229,8 @@ class Mammothmoda2Config(PretrainedConfig):
         architectures: list[str] | None = None,
         **kwargs,
     ) -> None:
-        # HF `validate_token_ids` / composition validation can consult `get_text_config`
-        # from inside `PretrainedConfig.__init__`. Populate `llm_config` before `super().__init__`
-        # so the attribute always exists during parent validation (avoids orchestrator-thread crash).
-        if llm_config is None:
-            _resolved_llm = None
-        elif isinstance(llm_config, dict):
-            _resolved_llm = AutoConfig.for_model(**llm_config)
-        elif isinstance(llm_config, PretrainedConfig):
-            _resolved_llm = llm_config
-        else:
-            raise TypeError(f"llm_config must be dict, PretrainedConfig, or None; got {type(llm_config)}")
-        object.__setattr__(self, "llm_config", _resolved_llm)
         super().__init__(**kwargs)
+        self.llm_config = AutoConfig.for_model(**llm_config) if llm_config is not None else None
         self.gen_vae_config = gen_vae_config
         self.gen_dit_config = gen_dit_config
 
@@ -257,10 +244,7 @@ class Mammothmoda2Config(PretrainedConfig):
         self.architectures = ["Mammothmoda2Model"]
 
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
-        lc = getattr(self, "llm_config", None)
-        if lc is None:
-            raise AttributeError("Mammothmoda2Config.llm_config is unset or None; cannot validate text token IDs.")
-        return lc
+        return self.llm_config
 
     def _require_llm_config(self) -> PretrainedConfig:
         if self.llm_config is None:
@@ -297,12 +281,3 @@ AutoConfig.register(Mammothmoda2Config.model_type, Mammothmoda2Config)
 AutoConfig.register(Mammothmoda2Qwen2_5_VLConfig.model_type, Mammothmoda2Qwen2_5_VLConfig)
 AutoConfig.register(Mammothmoda2Qwen2_5_VLTextConfig.model_type, Mammothmoda2Qwen2_5_VLTextConfig)
 AutoConfig.register(Mammothmoda2Qwen2_5_VLVisionConfig.model_type, Mammothmoda2Qwen2_5_VLVisionConfig)
-
-# Tokenizer registration lives here (not only under model_executor.models.mammoth_moda2):
-# AsyncOmniEngine loads the tokenizer before lazy-importing model weights, so the
-# mammoth_moda2 package __init__ may never run yet — configs/mammoth_moda2 is
-# eagerly imported via transformers_utils.configs and guarantees MammothUTokenizer
-# is registered before tokenizer-from-config runs.
-
-AutoTokenizer.register(config_class=Mammothmoda2Config, slow_tokenizer_class=MammothUTokenizer)
-AutoTokenizer.register(config_class=Mammothmoda2Qwen2_5_VLConfig, slow_tokenizer_class=MammothUTokenizer)

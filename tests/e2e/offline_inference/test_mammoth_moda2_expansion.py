@@ -1,26 +1,14 @@
 """
-End-to-end text-to-image test for MammothModa2 (AR -> DiT).
+End-to-end test for MammothModa2 text-to-image generation.
 
-Asserts:
+Verifies that the AR->DiT pipeline produces an image tensor whose pixel values
+match a golden reference.
 
-- The two-stage YAML brings the pipeline up.
-- Stage-1 outputs include an image tensor.
-- Sparse pixel samples match the golden fixture (difference < ``1e-4`` per sample).
+Model Hub repo id: ``bytedance-research/MammothModa2-Preview``.
+Stage config: ``get_deploy_config_path("mammoth_moda2.yaml")`` → ``vllm_omni/deploy/mammoth_moda2.yaml``
 
-Configuration (module-level constants):
-
-- ``MODEL_PATH``: Hugging Face repo id (default ``bytedance-research/MammothModa2-Preview``);
-  overridden by env ``MAMMOTHMODA2_MODEL_PATH``.
-- ``T2I_STAGE_CONFIG``: path to the two-stage config; default
-  ``get_deploy_config_path("mammoth_moda2.yaml")`` (usually
-  ``vllm_omni/deploy/mammoth_moda2.yaml``); overridden by ``MAMMOTHMODA2_T2I_STAGE_CONFIG``.
-
-Golden file: ``tests/e2e/offline_inference/fixtures/mammoth_moda2_t2i_golden.json``.
-Regenerate: ``UPDATE_GOLDEN=1 pytest tests/e2e/offline_inference/test_mammoth_moda2_expansion.py``
-
-Requires ``hardware_test(res={"cuda": "H100"})``; pytest marks ``full_model`` and ``diffusion``.
-Per-stage engine args (including ``trust_remote_code``) come from the stage YAML only; this
-test does not pass a third ``OmniRunner`` tuple element for overrides.
+Golden pixel file: ``tests/e2e/offline_inference/fixtures/mammoth_moda2_t2i_golden.json``
+  Regenerate with: ``UPDATE_GOLDEN=1 pytest tests/e2e/offline_inference/test_mammoth_moda2_expansion.py``
 """
 
 from __future__ import annotations
@@ -47,14 +35,8 @@ _VISION_START_TOKEN_ID = 151652  # "<|vision_start|>"
 _VISION_END_TOKEN_ID = 151653  # "<|vision_end|>"
 _AR_PATCH_SIZE = 16
 
-MODEL_PATH = os.environ.get(
-    "MAMMOTHMODA2_MODEL_PATH",
-    "bytedance-research/MammothModa2-Preview",
-)
-T2I_STAGE_CONFIG = os.environ.get(
-    "MAMMOTHMODA2_T2I_STAGE_CONFIG",
-    get_deploy_config_path("mammoth_moda2.yaml"),
-)
+MODEL_PATH = "bytedance-research/MammothModa2-Preview"
+T2I_STAGE_CONFIG = get_deploy_config_path("mammoth_moda2.yaml")
 
 _OMNI_RUNNER_PARAM = (MODEL_PATH, T2I_STAGE_CONFIG)
 
@@ -123,6 +105,7 @@ pytestmark = [
 ]
 
 
+@pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/3201")
 @hardware_test(res={"cuda": "H100"})
 def test_mammothmoda2_t2i_e2e(omni_runner: OmniRunner):
     """

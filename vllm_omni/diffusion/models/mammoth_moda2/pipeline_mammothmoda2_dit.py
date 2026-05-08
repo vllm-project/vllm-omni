@@ -54,19 +54,9 @@ class MammothModa2DiTPipeline(nn.Module):
         self.gen_vae = AutoencoderKL.from_config(self.config.gen_vae_config)
         self.gen_transformer = Transformer2DModel.from_config(self.config.gen_dit_config)
 
-        # Hidden size: prefer nested VL `llm_config`, else ModelConfig fallback (e.g. odd hub layouts).
-        llm_part = self.config.llm_config
-        llm_hidden_size = int(getattr(llm_part, "hidden_size", 0) or 0) if llm_part is not None else 0
+        llm_hidden_size = int(getattr(self.config.llm_config, "hidden_size", 0) or 0)
         if llm_hidden_size <= 0:
-            try:
-                llm_hidden_size = int(vllm_config.model_config.get_hidden_size())
-            except Exception:
-                llm_hidden_size = 0
-        if llm_hidden_size <= 0:
-            raise ValueError(
-                "Failed to infer llm hidden_size from Mammothmoda2Config.llm_config.hidden_size "
-                "or ModelConfig.get_hidden_size()."
-            )
+            raise ValueError("Failed to infer llm hidden_size from Mammothmoda2Config.llm_config.hidden_size")
         self._reinit_caption_embedder(llm_hidden_size)
 
         # Optional: image condition refiner (Q-Former)
