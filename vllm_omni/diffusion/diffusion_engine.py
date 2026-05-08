@@ -394,7 +394,7 @@ class DiffusionEngine:
                 traj_timesteps = output.trajectory_timesteps if i == 0 else None
                 traj_log_probs = output.trajectory_log_probs if i == 0 else None
                 traj_decoded = output.trajectory_decoded if i == 0 else None
-                custom = (custom_output if i == 0 else {})
+                custom = custom_output if i == 0 else {}
                 durations = output.stage_durations if i == 0 else None
                 peak_mem = output.peak_memory_mb if i == 0 else None
 
