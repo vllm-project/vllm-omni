@@ -21,6 +21,7 @@ class OmniPlatformEnum(Enum):
     NPU = "npu"
     XPU = "xpu"
     MUSA = "musa"
+    OOT = "oot"
     UNSPECIFIED = "unspecified"
 
 
@@ -49,6 +50,9 @@ class OmniPlatform(Platform):
 
     def is_musa(self) -> bool:
         return self._omni_enum == OmniPlatformEnum.MUSA
+
+    def is_out_of_tree(self) -> bool:
+        return self._omni_enum == OmniPlatformEnum.OOT
 
     @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
@@ -109,6 +113,25 @@ class OmniPlatform(Platform):
     def has_flash_attn_package(cls) -> bool:
         """Check if a Flash Attention package is available and usable on this platform."""
         return False
+
+    @classmethod
+    def get_diffusion_worker_cls(cls) -> str:
+        """Get the diffusion worker class path for this platform.
+
+        Returns a fully qualified class path string that will be resolved
+        and instantiated by WorkerWrapperBase. The class must be compatible
+        with the DiffusionWorker interface.
+        """
+        return "vllm_omni.diffusion.worker.diffusion_worker.DiffusionWorker"
+
+    @classmethod
+    def get_diffusion_model_runner_cls(cls) -> str:
+        """Get the diffusion model runner class path for this platform.
+
+        Returns a fully qualified class path string. The class must be
+        compatible with the DiffusionModelRunner interface.
+        """
+        return "vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner"
 
     @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:

@@ -84,8 +84,10 @@ class DiffusionWorker:
         self.lora_manager: DiffusionLoRAManager | None = None
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
-        # Create model runner
-        self.model_runner = DiffusionModelRunner(
+        # Create model runner using the platform-specified class
+        model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
+        model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
+        self.model_runner = model_runner_cls(
             vllm_config=self.vllm_config,
             od_config=self.od_config,
             device=self.device,
@@ -567,11 +569,14 @@ class WorkerProc:
         custom_pipeline_args: dict[str, Any] | None = None,
     ) -> DiffusionWorker:
         """Create a worker instance. Override in subclasses for different worker types."""
+        worker_cls_path = current_omni_platform.get_diffusion_worker_cls()
+        base_worker_class = resolve_obj_by_qualname(worker_cls_path)
         wrapper = WorkerWrapperBase(
             gpu_id=gpu_id,
             od_config=od_config,
             worker_extension_cls=worker_extension_cls,
             custom_pipeline_args=custom_pipeline_args,
+            base_worker_class=base_worker_class,
         )
         return wrapper
 
