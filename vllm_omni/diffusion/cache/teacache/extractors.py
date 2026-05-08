@@ -277,7 +277,8 @@ def extract_qwen_context(
 
     def postprocess(h):
         """Apply Qwen-specific output postprocessing."""
-        h = module.norm_out(h, temb)
+        t = temb.chunk(2, dim=0)[0] if module.zero_cond_t else temb
+        h = module.norm_out(h, t)
         output = module.proj_out(h)
         if not return_dict:
             return (output,)
