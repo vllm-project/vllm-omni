@@ -28,7 +28,7 @@ For the bundled 3x-GPU multi-replica layout (talker/code2wav scale-out),
 use:
 
 ```bash
-vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8000 \
     --deploy-config vllm_omni/deploy/qwen3_omni_moe_multi_replicas.yaml
 ```
 

@@ -16,7 +16,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 # Modify OpenAI's API key and API base to use vLLM's API server.
 openai_api_key = "EMPTY"
-openai_api_base = "http://localhost:18091/v1"
+openai_api_base = "http://localhost:8000/v1"
 
 
 # Modify OpenAI's API key and API base to use vLLM's API server.
