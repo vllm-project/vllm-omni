@@ -60,6 +60,9 @@ dev = [
     "zhconv>=1.4.2",
     "scipy>=1.10.0",
     "funasr>=1.0.0",
+    "lpips>=0.1.4", # for quantization fp8
+    "orjson>=3.11.7", # to make v1/embeddings API fast
+    "voxcpm>=2.0.2" # for voxcpm model test
 ]
 
 demo = [
@@ -182,6 +185,7 @@ markers = [
     # function module markers
     "diffusion: Diffusion model tests",
     "omni: Omni model tests",
+    "tts: TTS model tests",
     "cache: Cache backend tests",
     "parallel: Parallelism/distributed tests",
     "example: Doc example code tests",

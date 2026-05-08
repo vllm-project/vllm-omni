@@ -282,7 +282,7 @@ def _run_with_custom_transformer(model: str, output_dir: Path) -> list[Image.Ima
     return frames
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @pytest.mark.skipif(
@@ -381,7 +381,7 @@ def _run_vllm_omni_serving(model: str, output_dir: Path) -> list[Image.Image]:
     return frames
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @pytest.mark.skipif(

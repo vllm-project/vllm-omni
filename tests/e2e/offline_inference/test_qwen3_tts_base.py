@@ -68,7 +68,7 @@ def get_prompt():
 
 
 @pytest.mark.advanced_model
-@pytest.mark.omni
+@pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("omni_runner", tts_server_params, indirect=True)
 def test_text_to_audio_001(omni_runner, omni_runner_handler) -> None:

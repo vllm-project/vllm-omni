@@ -7,13 +7,13 @@ Example online tests for Dynin-Omni model.
 import base64
 import os
 from io import BytesIO
-from pathlib import Path
 
 import pytest
 from vllm.assets.image import ImageAsset
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
+from tests.helpers.stage_config import get_deploy_config_path
 
 pytestmark = [pytest.mark.full_model, pytest.mark.omni]
 
@@ -21,7 +21,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "snu-aidas/Dynin-Omni"
-STAGE_CONFIG = str(Path(__file__).parent.parent / "stage_configs" / "dynin_omni_ci.yaml")
+STAGE_CONFIG = get_deploy_config_path("dynin_omni_ci.yaml")
 
 T2I_PROMPT = "A high quality detailed living room interior photo."
 T2S_PROMPT = "Please read this sentence naturally: Hello from online serving."

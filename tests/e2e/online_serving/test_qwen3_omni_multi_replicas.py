@@ -87,7 +87,7 @@ def _assert_audio_outputs(responses: list[OmniResponse], *, expect_text: bool) -
         )
 
 
-@pytest.mark.core_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -104,7 +104,7 @@ def test_text_only_batch_uses_multi_replica_talker(omni_server, openai_client) -
     _assert_text_outputs(responses)
 
 
-@pytest.mark.core_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -121,7 +121,7 @@ def test_text_to_audio_stream_batch_uses_multi_replica_vocoder(omni_server, open
     _assert_audio_outputs(responses, expect_text=False)
 
 
-@pytest.mark.core_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=4)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
