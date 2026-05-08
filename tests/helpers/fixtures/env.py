@@ -28,10 +28,21 @@ def model_prefix() -> str:
 
 
 @pytest.fixture(autouse=True)
-def clean_gpu_memory_between_tests():
+def clean_gpu_memory_between_tests(request):
+    """Run GPU memory cleanup between tests unless the item has ``@pytest.mark.cpu``.
+
+    CPU-only / mocked suites should not trigger pre/post device probes (see
+    ``tests.helpers.env`` / ``VLLM_TEST_CLEAN_GPU_MEMORY``). Class- or
+    module-level ``pytestmark = [..., pytest.mark.cpu]`` is respected via
+    ``get_closest_marker``.
+    """
     # Import here so ``tests.helpers.env`` (and vLLM platform modules) load only
     # after session autouse fixtures like ``default_env`` have run (RFC #2299).
     from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
+
+    if request.node.get_closest_marker("cpu") is not None:
+        yield
+        return
 
     print("\n=== PRE-TEST GPU CLEANUP ===")
     run_pre_test_cleanup()
