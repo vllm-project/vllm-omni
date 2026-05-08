@@ -18,10 +18,9 @@ import os
 from pathlib import Path
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
-    available_prompt_bot_tasks,
     build_prompt_tokens,
-    resolve_bot_task,
-    sys_type_for_task,
+    resolve_stop_token_ids,
+    _TASK_PRESETS
 )
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniPromptType
@@ -45,6 +44,12 @@ _MODALITY_MODE = {
     "text2text": "text-to-text",
 }
 
+_MODALITY_TASK_MAP = {
+    "text2img": "t2i",
+    "img2img": "it2i",
+    "img2text": "i2t",
+    "text2text": "t2t",
+}
 
 def parse_args():
     parser = argparse.ArgumentParser(description="HunyuanImage-3.0-Instruct end-to-end inference.")
@@ -90,7 +95,7 @@ def parse_args():
         "--bot-task",
         type=str,
         default="auto",
-        choices=available_prompt_bot_tasks(),
+        choices=["auto", "think", "recaption", "vanilla"],
         help=(
             "Prompt behavior. 'auto' selects the default for the modality; "
             "'think' adds <think>; 'recaption' adds <recaption>; "
@@ -122,10 +127,11 @@ def main():
     os.makedirs(args.output, exist_ok=True)
 
     # Determine task for prompt formatting from modality + bot behavior.
-    bot_task_resolution = resolve_bot_task(args.bot_task, modality=args.modality)
-    task = bot_task_resolution.task
+    task = _MODALITY_TASK_MAP[args.modality]
     assert task is not None
-    bot_task = bot_task_resolution.bot_task
+    bot_task = args.bot_task
+    if bot_task != "auto":
+        task = task + "_" + bot_task
 
     if args.deploy_config is not None and args.stage_configs_path is not None:
         raise ValueError("--deploy-config and --stage-configs-path are mutually exclusive.")
@@ -176,7 +182,8 @@ def main():
     formatted_prompts: list[OmniPromptType] = []
     for p in prompts:
         token_ids = build_prompt_tokens(p, tokenizer, task=task, sys_type=args.sys_type)
-        effective_sys_type = args.sys_type or sys_type_for_task(task)
+        preset_sys_type, _, _ = _TASK_PRESETS[task]
+        effective_sys_type = args.sys_type or preset_sys_type
 
         # `prompt_token_ids` drives the AR stage (matches HF byte-for-byte).
         # `prompt` and `use_system_prompt` are forwarded by ar2diffusion to
@@ -209,7 +216,7 @@ def main():
     # Override diffusion params if applicable
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    ar_stop_token_ids = resolve_bot_task(task=task, tokenizer=tokenizer).stop_token_ids
+    ar_stop_token_ids = resolve_stop_token_ids(task=task, bot_task=bot_task, tokenizer=tokenizer)
     assert ar_stop_token_ids is not None
     for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
