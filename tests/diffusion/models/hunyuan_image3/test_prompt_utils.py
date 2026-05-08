@@ -25,12 +25,10 @@ import pytest
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
     HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
-    available_prompt_bot_tasks,
     available_tasks,
     build_prompt,
     build_prompt_tokens,
-    resolve_bot_task,
-    sys_type_for_task,
+    resolve_stop_token_ids,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -76,7 +74,6 @@ def test_available_tasks_covers_all_modalities():
     tasks = set(available_tasks())
     assert tasks >= {
         "t2t",
-        "t2t_think",
         "i2t",
         "i2t_think",
         "it2i_think",
@@ -87,127 +84,31 @@ def test_available_tasks_covers_all_modalities():
     }
 
 
-@pytest.mark.parametrize(
-    "task,expected_bot_task",
-    [
-        ("t2t", "auto"),
-        ("t2t_think", "think_recaption"),
-        ("i2t", "auto"),
-        ("i2t_think", "think_recaption"),
-        ("it2i_think", "think_recaption"),
-        ("it2i_recaption", "recaption"),
-        ("t2i_think", "think_recaption"),
-        ("t2i_recaption", "recaption"),
-        ("t2i_vanilla", "image"),
-    ],
-)
-def test_resolve_bot_task_matches_prompt_presets(task: str, expected_bot_task: str):
-    resolution = resolve_bot_task(task=task)
-    assert resolution.task == task
-    assert resolution.bot_task == expected_bot_task
-
-
-@pytest.mark.parametrize(
-    "modality,bot_task,expected_task",
-    [
-        ("text2text", "auto", "t2t"),
-        ("img2text", "auto", "i2t"),
-        ("text2img", "auto", "t2i_think"),
-        ("img2img", "auto", "it2i_think"),
-        ("i2t", "think", "i2t_think"),
-        ("ti2i", "recaption", "it2i_recaption"),
-        ("t2i", "vanilla", "t2i_vanilla"),
-        ("text2text", "none", "t2t"),
-    ],
-)
-def test_resolve_bot_task_composes_prompt_task(
-    modality: str,
-    bot_task: str,
-    expected_task: str,
-):
-    assert resolve_bot_task(bot_task, modality=modality).task == expected_task
-
-
-def test_resolve_bot_task_rejects_invalid_combinations():
-    assert available_prompt_bot_tasks() == ["auto", "none", "recaption", "think", "vanilla"]
-
-    with pytest.raises(ValueError, match="not supported"):
-        resolve_bot_task("recaption", modality="img2text")
-
-    with pytest.raises(ValueError, match="not supported"):
-        resolve_bot_task("vanilla", modality="img2img")
-
-
-def test_resolve_bot_task_maps_tokenizer_task_and_stop_ids():
-    tok = FakeTokenizer()
-
-    resolution = resolve_bot_task("think_recaption", tokenizer=tok)
-
-    assert resolution.task is None
-    assert resolution.bot_task == "think_recaption"
-    assert resolution.tokenizer_bot_task == "think"
-    assert resolution.stop_token_ids == [
-        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"],
-        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</answer>"],
-        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|endoftext|>"],
-    ]
-
-
-def test_resolve_bot_task_resolves_stop_ids_from_bot_task():
+def test_resolve_stop_token_ids_uses_end_think_for_i2t_think():
     tok = FakeTokenizer()
 
     eos_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|endoftext|>"]
-    boi_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<boi>"]
-    end_recaption_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"]
-    end_answer_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</answer>"]
-
-    assert resolve_bot_task("auto", tokenizer=tok).stop_token_ids == [eos_id, boi_id]
-    assert resolve_bot_task("image", tokenizer=tok).stop_token_ids == [eos_id]
-    assert resolve_bot_task("think_recaption", tokenizer=tok).stop_token_ids == [
-        end_recaption_id,
-        end_answer_id,
+    assert resolve_stop_token_ids(task="i2t_think", tokenizer=tok) == [
         eos_id,
-    ]
-    assert resolve_bot_task("recaption", tokenizer=tok).stop_token_ids == [
-        end_recaption_id,
-        end_answer_id,
-        eos_id,
-    ]
-    assert resolve_bot_task("auto", tokenizer=tok, image_size="auto").stop_token_ids == [
-        eos_id,
-        *range(
-            HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_0>"],
-            HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_32>"] + 1,
-        ),
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"],
     ]
 
 
-def test_resolve_bot_task_resolves_stop_ids_from_prompt_task():
+def test_resolve_stop_token_ids_uses_trigger_for_generation_tasks():
     tok = FakeTokenizer()
 
     eos_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|endoftext|>"]
-    assert resolve_bot_task(task="i2t", tokenizer=tok).stop_token_ids == [
+    assert resolve_stop_token_ids(task="t2i_think", tokenizer=tok) == [eos_id, FakeTokenizer.SPECIAL["<think>"]]
+    assert resolve_stop_token_ids(task="t2i_recaption", tokenizer=tok) == [
         eos_id,
-        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<boi>"],
+        FakeTokenizer.SPECIAL["<recaption>"],
     ]
-    assert resolve_bot_task(task="i2t_think", tokenizer=tok).stop_token_ids == [
-        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"],
-        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</answer>"],
-        eos_id,
-    ]
-    assert resolve_bot_task(task="t2i_vanilla", tokenizer=tok).stop_token_ids == [eos_id]
-
-
-def test_sys_type_for_task_returns_prompt_preset_default():
-    assert sys_type_for_task("i2t_think") == "en_unified"
-    assert sys_type_for_task("t2i_vanilla") == "en_vanilla"
 
 
 @pytest.mark.parametrize(
     "task",
     [
         "t2t",
-        "t2t_think",
         "i2t",
         "i2t_think",
         "it2i_think",
@@ -238,7 +139,7 @@ def test_build_prompt_string_structure_chat_template(task: str):
     # documentation, so substring index() catches the wrong occurrence -- use
     # endswith() which directly captures "trigger is at the tail" (the Part A
     # fix: trigger goes AFTER `Assistant: `, not before user_prompt).
-    if task in ("t2t_think", "i2t_think", "it2i_think", "t2i_think"):
+    if task in ("i2t_think", "it2i_think", "t2i_think"):
         assert s.endswith("Assistant: <think>"), (
             f"Trigger <think> must be appended right after `Assistant: ` (Part A fix). Got tail: ...{s[-40:]!r}"
         )
@@ -294,31 +195,24 @@ def test_build_prompt_tokens_segments_each_boundary():
 def test_build_prompt_tokens_image_placeholder_present_for_image_tasks():
     tok = FakeTokenizer()
     ids = build_prompt_tokens("hi", tok, task="i2t")
-    assert ids[0] == HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|startoftext|>"], (
-        "BOS (<|startoftext|>) must be the first token"
-    )
-    assert HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img>"] in ids, (
-        "<img> placeholder must be present for i2t/it2i tasks"
-    )
+    assert ids[0] == FakeTokenizer.SPECIAL["<|startoftext|>"], "BOS (<|startoftext|>) must be the first token"
+    assert FakeTokenizer.SPECIAL["<img>"] in ids, "<img> placeholder must be present for i2t/it2i tasks"
 
 
 def test_build_prompt_tokens_no_image_for_text_only_tasks():
     tok = FakeTokenizer()
     ids = build_prompt_tokens("hi", tok, task="t2t")
-    assert HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img>"] not in ids, (
-        "<img> must NOT appear for text-only tasks"
-    )
+    assert FakeTokenizer.SPECIAL["<img>"] not in ids, "<img> must NOT appear for text-only tasks"
 
 
 @pytest.mark.parametrize(
     "task,trigger_id",
     [
-        ("t2t_think", HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<think>"]),
-        ("i2t_think", HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<think>"]),
-        ("it2i_think", HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<think>"]),
-        ("t2i_think", HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<think>"]),
-        ("it2i_recaption", HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<recaption>"]),
-        ("t2i_recaption", HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<recaption>"]),
+        ("i2t_think", FakeTokenizer.SPECIAL["<think>"]),
+        ("it2i_think", FakeTokenizer.SPECIAL["<think>"]),
+        ("t2i_think", FakeTokenizer.SPECIAL["<think>"]),
+        ("it2i_recaption", FakeTokenizer.SPECIAL["<recaption>"]),
+        ("t2i_recaption", FakeTokenizer.SPECIAL["<recaption>"]),
     ],
 )
 def test_build_prompt_tokens_trigger_is_last_token(task: str, trigger_id: int):
@@ -333,8 +227,8 @@ def test_build_prompt_tokens_no_trigger_for_plain_tasks():
     tok = FakeTokenizer()
     ids = build_prompt_tokens("hi", tok, task="t2t")
     assert ids[-1] not in {
-        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<think>"],
-        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<recaption>"],
+        FakeTokenizer.SPECIAL["<think>"],
+        FakeTokenizer.SPECIAL["<recaption>"],
     }
 
 
@@ -381,10 +275,9 @@ def test_end2end_routes_through_shared_prompt_utils():
         if isinstance(node, ast.ImportFrom) and node.module and node.module.endswith("hunyuan_image3.prompt_utils"):
             imported_from_prompt_utils.update(alias.name for alias in node.names)
     expected_imports = {
-        "available_prompt_bot_tasks",
+        "_TASK_PRESETS",
         "build_prompt_tokens",
-        "resolve_bot_task",
-        "sys_type_for_task",
+        "resolve_stop_token_ids",
     }
     assert expected_imports <= imported_from_prompt_utils, (
         "end2end.py must import the HunyuanImage3 prompt and stop-token helpers from "
