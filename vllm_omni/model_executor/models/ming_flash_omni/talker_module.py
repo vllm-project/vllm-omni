@@ -21,7 +21,6 @@
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
 import logging
-import math
 from functools import cached_property
 from queue import Queue
 from threading import Lock
@@ -32,6 +31,8 @@ import torch.nn.functional as F
 from transformers import PreTrainedTokenizerBase, Qwen2Config, Qwen2Model, StaticCache
 from vllm.logger import init_logger
 from x_transformers.x_transformers import RotaryEmbedding, apply_rotary_pos_emb
+
+from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
 
 from .audio_vae import AudioVAE
 
@@ -231,34 +232,6 @@ class FinalLayer(nn.Module):
         return x
 
 
-class SinusPositionEmbedding(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, x: torch.Tensor, scale: float = 1000) -> torch.Tensor:
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device).float() * -emb)
-        emb = scale * x.unsqueeze(1) * emb.unsqueeze(0)
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
-
-
-class TimestepEmbedder(nn.Module):
-    def __init__(self, dim: int, freq_embed_dim: int = 256):
-        super().__init__()
-        self.time_embed = SinusPositionEmbedding(freq_embed_dim)
-        self.time_mlp = nn.Sequential(nn.Linear(freq_embed_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
-
-    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
-        time_hidden = self.time_embed(timestep)
-        time_hidden = time_hidden.to(timestep.dtype)
-        time = self.time_mlp(time_hidden)
-        return time
-
-
 class CondEmbedder(nn.Module):
     """Embeds LLM hidden states with optional CFG dropout."""
 
@@ -288,7 +261,7 @@ class DiT(nn.Module):
         self.out_channels = in_channels
         self.num_heads = num_heads
 
-        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.t_embedder = DiTTimestepEmbedding(hidden_size)
         self.x_embedder = nn.Linear(in_channels, hidden_size)
         self.c_embedder = CondEmbedder(llm_cond_dim, hidden_size)
         if "spk_dim" in kwargs:
@@ -912,6 +885,10 @@ class MingAudioGenerator:
 
         self._use_cuda_graphs = use_cuda_graphs
 
+        # For FA2, let it see a full-length seq Q
+        # trailing latent frames prepended on each decode call
+        self._vae_decode_pad_frames = 32
+
     @cached_property
     def _sampler_pool(self) -> CFMGraphExecutorPool | None:
         device = next(self._model.parameters()).device
@@ -986,7 +963,7 @@ class MingAudioGenerator:
                     )
 
             if step > min_new_token and stop_prob > 0.5:
-                logger.info("Stopping at step %d with stop_prob=%.4f", step, stop_prob)
+                logger.debug("Stopping at step %d with stop_prob=%.4f", step, stop_prob)
                 break
 
         return all_latents
@@ -1114,21 +1091,33 @@ class MingAudioGenerator:
     # VAE streaming decode
     def _stream_decode(self, latents: list[torch.Tensor]) -> torch.Tensor:
         sr = int(self._audio_vae.config.sample_rate)
-        vae_cache = {"past_key_values": None, "stream_state": (None, None, None)}
+        decode_pad: torch.Tensor | None = None
         sil_cache: dict | None = None
         wav_chunks: list[torch.Tensor] = []
 
         for i, lat in enumerate(latents):
             last_chunk = i == (len(latents) - 1)
-            speech, stream_state, past_key_values = self._audio_vae.decode(
-                lat,
-                past_key_values=vae_cache["past_key_values"],
-                use_cache=True,
-                stream_state=vae_cache["stream_state"],
-                last_chunk=last_chunk,
+
+            if decode_pad is not None:
+                vae_input = torch.cat([decode_pad, lat], dim=1)
+                pad_frames = decode_pad.shape[1]
+            else:
+                vae_input = lat
+                pad_frames = 0
+
+            # Stateless, no KV cache accum intentionally.
+            speech, _, _ = self._audio_vae.decode(
+                vae_input,
+                use_cache=False,
+                stream_state=(None, None, None),
+                last_chunk=True,
             )
-            vae_cache = {"past_key_values": past_key_values, "stream_state": stream_state}
-            speech_chunk = speech[0].detach().float()
+
+            total_frames = vae_input.shape[1]
+            dcs = speech.shape[-1] // total_frames
+
+            # keep only the new audio.
+            speech_chunk = speech[:, :, pad_frames * dcs :][0].detach().float()
             speech_chunk, sil_cache = silence_holder(
                 speech_chunk,
                 sr,
@@ -1137,6 +1126,9 @@ class MingAudioGenerator:
             )
             if speech_chunk.numel() > 0:
                 wav_chunks.append(speech_chunk)
+
+            # Advance the sliding buffer
+            decode_pad = vae_input[:, -self._vae_decode_pad_frames :, :].detach()
 
         if not wav_chunks:
             device = next(self._model.parameters()).device

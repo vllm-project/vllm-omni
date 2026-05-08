@@ -10,19 +10,11 @@ TALKER_CODEC_END_TOKEN_ID = 8294
 
 
 def thinker2talker(
-    stage_list,
-    engine_input_source,
+    source_outputs,
     prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
 ):
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-    source_stage_id = engine_input_source[0]
-    if source_stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {source_stage_id}")
-    if stage_list[source_stage_id].engine_outputs is None:
-        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
-    thinker_outputs = stage_list[source_stage_id].engine_outputs
+    thinker_outputs = source_outputs
     talker_inputs = []
     if not isinstance(prompt, list):
         prompt = [prompt]
@@ -64,3 +56,28 @@ def thinker2talker(
             )
         )
     return talker_inputs
+
+
+def talker2code2wav(
+    source_outputs,
+    _prompt: OmniTokensPrompt | TextPrompt = None,
+    _requires_multimodal_data: bool = False,
+):
+    code2wav_inputs = []
+    for talker_output in source_outputs:
+        output = talker_output.outputs[0]
+        token_ids = list(output.cumulative_token_ids)
+        if token_ids and token_ids[0] == TALKER_CODEC_START_TOKEN_ID:
+            token_ids = token_ids[1:]
+        if token_ids and token_ids[-1] == TALKER_CODEC_END_TOKEN_ID:
+            token_ids = token_ids[:-1]
+        if not token_ids:
+            continue
+        code2wav_inputs.append(
+            OmniTokensPrompt(
+                prompt_token_ids=token_ids,
+                multi_modal_data=None,
+                mm_processor_kwargs=None,
+            )
+        )
+    return code2wav_inputs

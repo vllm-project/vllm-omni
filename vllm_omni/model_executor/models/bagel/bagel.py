@@ -562,12 +562,18 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         *,
         num_computed_tokens: int | None = None,
     ) -> dict[str, Any] | None:
+        # NOTE: num_computed_tokens will not include async placeholders
         meta = self._ropes_metadata.pop(req_id, None)
         if meta is None:
             return None
         if num_computed_tokens is not None and "image_shape" in meta:
             prefill_rope = meta["ropes"][0] if meta.get("ropes") else 0
-            if num_computed_tokens > prefill_rope:
+            prefill_position_count = meta.get("prefill_position_count")
+            if prefill_position_count is not None:
+                num_decoded = num_computed_tokens - prefill_position_count
+                if num_decoded > 0:
+                    meta["ropes"] = [prefill_rope + num_decoded]
+            elif num_computed_tokens > prefill_rope:
                 meta["ropes"] = [num_computed_tokens]
         return meta
 
@@ -849,6 +855,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                         {
                             "ropes": [rope],
                             "image_shape": [img_H, img_W],
+                            "prefill_position_count": req_len,
                         }
                     )
                     img2img_idx += 1

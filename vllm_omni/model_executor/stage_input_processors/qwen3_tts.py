@@ -20,16 +20,14 @@ logger = init_logger(__name__)
 
 
 def talker2code2wav(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+    source_outputs: list[Any],
     prompt: Any = None,
-    requires_multimodal_data: bool = False,
+    _requires_multimodal_data: bool = False,
 ) -> list[Any]:
     """Non-async: collect all talker codes, then pass to code2wav at once."""
     from vllm_omni.inputs.data import OmniTokensPrompt
-    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import _validate_stage_inputs
 
-    talker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    talker_outputs = source_outputs
     code2wav_inputs: list[OmniTokensPrompt] = []
     for i, talker_output in enumerate(talker_outputs):
         if not talker_output.finished:

@@ -26,6 +26,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     multi_thread_safetensors_weights_iterator,
     safetensors_weights_iterator,
 )
+from vllm.transformers_utils.repo_utils import file_exists
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -33,6 +34,7 @@ from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig
 from vllm_omni.diffusion.model_loader.gguf_adapters import get_gguf_adapter
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
+from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.registry import initialize_model
 
 if TYPE_CHECKING:
@@ -49,6 +51,8 @@ def _natural_sort_key(filepath: str) -> list:
 
 MODEL_INDEX = "model_index.json"
 DIFFUSION_MODEL_WEIGHTS_INDEX = "diffusion_pytorch_model.safetensors.index.json"
+TRANSFORMER_WEIGHTS_INDEX = "model.safetensors.index.json"
+INDEX_FILES = [DIFFUSION_MODEL_WEIGHTS_INDEX, TRANSFORMER_WEIGHTS_INDEX]
 
 
 class DiffusersPipelineLoader:
@@ -99,8 +103,17 @@ class DiffusersPipelineLoader:
         is_local = os.path.isdir(model_name_or_path)
         load_format = self.load_config.load_format
         use_safetensors = False
-        index_file = DIFFUSION_MODEL_WEIGHTS_INDEX
-        index_file_with_subfolder = f"{subfolder}/{index_file}" if subfolder else index_file
+        possible_index_files = [
+            f"{subfolder}/{index_file}" if subfolder is not None else index_file for index_file in INDEX_FILES
+        ]
+        available_index_file = [
+            f for f in possible_index_files if file_exists(model_name_or_path, f, revision=revision)
+        ]
+        if len(available_index_file) > 1:
+            raise ValueError(
+                f"Multiple index files found in {model_name_or_path} with subfolder {subfolder}: {available_index_file}"
+            )
+        index_file = available_index_file[0] if available_index_file else ""
 
         # only hf is supported currently
         if load_format == "auto":
@@ -118,19 +131,20 @@ class DiffusersPipelineLoader:
         if allow_patterns_overrides is not None:
             allow_patterns = allow_patterns_overrides
 
-        if subfolder is not None:
-            allow_patterns = [f"{subfolder}/{pattern}" for pattern in allow_patterns]
-
         if not is_local:
             hf_folder = download_weights_from_hf(
                 model_name_or_path,
                 self.load_config.download_dir,
                 allow_patterns,
                 revision,
+                subfolder=subfolder,
                 ignore_patterns=self.load_config.ignore_patterns,
             )
         else:
             hf_folder = model_name_or_path
+
+        if subfolder is not None:
+            hf_folder = os.path.join(hf_folder, subfolder)
 
         hf_weights_files: list[str] = []
         for pattern in allow_patterns:
@@ -149,22 +163,12 @@ class DiffusersPipelineLoader:
             if not is_local:
                 download_safetensors_index_file_from_hf(
                     model_name_or_path,
-                    index_file_with_subfolder,
-                    self.load_config.download_dir,
-                    revision,
+                    index_file,
+                    cache_dir=self.load_config.download_dir,
+                    subfolder=subfolder,
+                    revision=revision,
                 )
-            # Some diffusers pipelines keep component weights under a
-            # subfolder (e.g. "transformer/") and the corresponding index file
-            # uses filenames relative to that subfolder. vLLM's
-            # `filter_duplicate_safetensors_files` expects weight_map entries
-            # to be relative to the `hf_folder` we pass in, so we point it to
-            # the component subfolder to avoid filtering out all shards.
-            filter_folder = os.path.join(hf_folder, subfolder) if subfolder is not None else hf_folder
-            hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files,
-                filter_folder,
-                index_file,
-            )
+            hf_weights_files = filter_duplicate_safetensors_files(hf_weights_files, hf_folder, index_file)
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
@@ -275,7 +279,7 @@ class DiffusersPipelineLoader:
         with set_default_torch_dtype(od_config.dtype):
             if od_config.parallel_config.use_hsdp:
                 model = self._load_model_with_hsdp(
-                    od_config, load_format=load_format, custom_pipeline_name=custom_pipeline_name
+                    od_config, target_device=device, load_format=load_format, custom_pipeline_name=custom_pipeline_name
                 )
             else:
                 with target_device:
@@ -526,6 +530,7 @@ class DiffusersPipelineLoader:
     def _load_model_with_hsdp(
         self,
         od_config: OmniDiffusionConfig,
+        target_device: torch.device,
         load_format: str = "default",
         custom_pipeline_name: str | None = None,
     ) -> nn.Module:
@@ -575,4 +580,19 @@ class DiffusersPipelineLoader:
         for name, trans in transformers_to_shard:
             logger.debug("Applying HSDP to %s", name)
             apply_hsdp_to_model(trans, hsdp_config)
+
+        # # HSDP only shards transformer modules. All other runtime modules must
+        # # be placed on the execution device explicitly after sharding.
+        discovered_modules = ModuleDiscovery.discover(model)
+        modules_to_move: list[nn.Module] = []
+        if discovered_modules.vaes is not None:
+            modules_to_move.extend(discovered_modules.vaes)
+        if discovered_modules.encoders is not None:
+            modules_to_move.extend(discovered_modules.encoders)
+        if discovered_modules.resident_modules is not None:
+            modules_to_move.extend(discovered_modules.resident_modules)
+
+        for module in modules_to_move:
+            module.to(target_device)
+
         return model

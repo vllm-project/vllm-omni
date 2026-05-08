@@ -1,0 +1,232 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+E2E online serving tests for Ming-flash-omni-2.0 model (Thinker stage).
+Tests multimodal understanding via OpenAI-compatible API.
+"""
+
+import os
+
+import pytest
+
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import (
+    generate_synthetic_audio,
+    generate_synthetic_image,
+    generate_synthetic_video,
+)
+from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
+from tests.helpers.stage_config import get_deploy_config_path
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
+
+pytestmark = [pytest.mark.omni, pytest.mark.full_model]
+
+_SKIP_NEED_4_H100_NOT_CI = pytest.mark.skip(
+    reason="Requires 4x H100 GPUs; skipped in CI for now.",
+)
+
+models = ["Jonathan1909/Ming-flash-omni-2.0"]
+
+# Use thinker-only topology to test text outputs
+_CI_DEPLOY = get_deploy_config_path("ci/ming_flash_omni_thinker_only.yaml")
+
+stage_configs = [_CI_DEPLOY]
+
+# Create parameter combinations for model and stage config
+test_params = [
+    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
+]
+
+
+def get_system_prompt():
+    return {
+        "role": "system",
+        "content": [
+            {
+                "type": "text",
+                "text": "你是一个友好的AI助手。\n\ndetailed thinking off",
+            }
+        ],
+    }
+
+
+def get_prompt(prompt_type="text_only"):
+    prompts = {
+        "text_only": "What is the capital of China? Answer in 20 words.",
+        "text_image": "What is in this image?",
+        "text_audio": "What is in this audio?",
+        "text_video": "What is in this video?",
+        "mix": "What is recited in the audio? What is in this image? What is in this video?",
+    }
+    return prompts.get(prompt_type, prompts["text_only"])
+
+
+def get_max_batch_size(size_type="few"):
+    batch_sizes = {"few": 5, "medium": 100, "large": 256}
+    return batch_sizes.get(size_type, 5)
+
+
+@_SKIP_NEED_4_H100_NOT_CI
+@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_text_to_text_001(omni_server, openai_client) -> None:
+    """
+    Input Modal: text
+    Output Modal: text
+    Input Setting: stream=False
+    Datasets: single request
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt("text_only"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "modalities": ["text"],
+        "key_words": {"text": ["beijing"]},
+    }
+
+    openai_client.send_omni_request(request_config)
+
+
+@_SKIP_NEED_4_H100_NOT_CI
+@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_text_to_text_stream_001(omni_server, openai_client) -> None:
+    """
+    Input Modal: text
+    Output Modal: text
+    Input Setting: stream=True
+    Datasets: few requests
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt("text_only"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "modalities": ["text"],
+        "key_words": {"text": ["beijing"]},
+    }
+
+    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
+
+
+@_SKIP_NEED_4_H100_NOT_CI
+@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_image_to_text_001(omni_server, openai_client) -> None:
+    """
+    Input Modal: image + text
+    Output Modal: text
+    Input Setting: stream=True
+    Datasets: single request
+    """
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        image_data_url=image_data_url,
+        content_text=get_prompt("text_image"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "modalities": ["text"],
+    }
+
+    openai_client.send_omni_request(request_config)
+
+
+@_SKIP_NEED_4_H100_NOT_CI
+@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_audio_to_text_001(omni_server, openai_client) -> None:
+    """
+    Input Modal: audio + text
+    Output Modal: text
+    Input Setting: stream=True
+    Datasets: single request
+    """
+    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(2, 1)['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        audio_data_url=audio_data_url,
+        content_text=get_prompt("text_audio"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "modalities": ["text"],
+    }
+
+    openai_client.send_omni_request(request_config)
+
+
+@_SKIP_NEED_4_H100_NOT_CI
+@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_video_to_text_001(omni_server, openai_client) -> None:
+    """
+    Input Modal: video + text
+    Output Modal: text
+    Input Setting: stream=False
+    Datasets: single request
+    """
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        video_data_url=video_data_url,
+        content_text=get_prompt("text_video"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "modalities": ["text"],
+    }
+
+    openai_client.send_omni_request(request_config)
+
+
+@_SKIP_NEED_4_H100_NOT_CI
+@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_mix_to_text_001(omni_server, openai_client) -> None:
+    """
+    Input Modal: text + audio + image + video
+    Output Modal: text
+    Input Setting: stream=True
+    Datasets: single request
+    """
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(2, 1)['base64']}"
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        video_data_url=video_data_url,
+        image_data_url=image_data_url,
+        audio_data_url=audio_data_url,
+        content_text=get_prompt("mix"),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "modalities": ["text"],
+    }
+
+    openai_client.send_omni_request(request_config)

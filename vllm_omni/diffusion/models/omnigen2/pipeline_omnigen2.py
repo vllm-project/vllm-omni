@@ -32,7 +32,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportsModuleOffload
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.omnigen2.omnigen2_transformer import (
     OmniGen2RotaryPosEmbed,
     OmniGen2Transformer2DModel,
@@ -621,7 +621,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsModuleOffload):
+class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
     """
     Pipeline for text-to-image generation using OmniGen2.
 

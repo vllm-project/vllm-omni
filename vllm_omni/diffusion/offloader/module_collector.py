@@ -7,7 +7,7 @@ from operator import attrgetter
 from torch import nn
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.models.interface import SupportsModuleOffload
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 
 logger = init_logger(__name__)
 
@@ -24,16 +24,16 @@ class PipelineModules:
 
 
 class ModuleDiscovery:
-    """Discovers pipeline components for offloading.
+    """Discovers pipeline components.
 
-    If the pipeline implements :class:`SupportsModuleOffload`,
+    If the pipeline implements :class:`SupportsComponentDiscovery`,
     its ``_dit_modules``, ``_encoder_modules``, and ``_vae_modules``
     class variables are used directly.  Otherwise, falls back to
     scanning well-known attribute names.
     """
 
     # Fallback attribute names for pipelines that do not implement
-    # SupportsModuleOffload.
+    # SupportsComponentDiscovery.
     _FALLBACK_DIT_ATTRS = [
         "transformer",
         "transformer_2",
@@ -104,7 +104,7 @@ class ModuleDiscovery:
         Returns:
             PipelineModules with lists of discovered modules and names
         """
-        declared = isinstance(pipeline, SupportsModuleOffload)
+        declared = isinstance(pipeline, SupportsComponentDiscovery)
         if declared:
             dit_attrs = pipeline._dit_modules
             enc_attrs = pipeline._encoder_modules

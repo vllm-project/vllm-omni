@@ -80,7 +80,7 @@ Our test scripts use the pytest framework. First, please use `git clone https://
 
     ```bash
     cd tests
-    pytest -s -v -m "full_model and omni and H100" --run-level=full_model
+    pytest -s -v -m "full_model and (omni or tts) and H100" --run-level=full_model
     ```
 
 === "L5 level"

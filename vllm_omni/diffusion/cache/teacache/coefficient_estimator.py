@@ -212,7 +212,7 @@ class TeaCacheCoefficientEstimator:
         trajectory = self.hook.stop_collection()
         if trajectory:
             self.collected_data.append(trajectory)
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
 
     def estimate(self, poly_order: int = 4) -> list[float]:
         """Estimate polynomial coefficients from collected data.

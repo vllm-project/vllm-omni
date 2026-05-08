@@ -9,6 +9,7 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler as AsyncVLLMScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
@@ -40,12 +41,9 @@ class KVCacheTransferData:
 
 
 class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
-    """
-    OmniARScheduler: Scheduler for vLLM-Omni multimodal processing.
-
-    This scheduler extends vLLM's scheduler to support multimodal and
-    non-autoregressive processing with additional fields and methods
-    specific to vLLM-Omni.
+    """Synchronous AutoRegressive scheduler for vLLM-Omni. This class is also
+    used as a base class for the OmniARAsyncScheduler and holds most of the
+    core scheduling logic.
     """
 
     def __init__(self, *args, **kwargs):
@@ -79,6 +77,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
+
+    def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
+        """num_computed_tokens minus async placeholders (KV actually on GPU)."""
+        # Output placeholders are zero when async scheduling isn't used
+        return request.num_computed_tokens - request.num_output_placeholders
 
     def _get_kv_transfer_criteria(self) -> dict | None:
         # Note: vllm_config is available in Scheduler after super().__init__
@@ -146,10 +149,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 return True
             return False
 
+        # seq_len for KV transfer must exclude async placeholders.
+        confirmed_computed = self._get_confirmed_num_computed_tokens(request)
+
         if criteria_type == "prefill_finished":
-            if request.num_computed_tokens >= request.num_prompt_tokens:
+            if confirmed_computed >= request.num_prompt_tokens:
                 self.transfer_triggered_requests.add(request.request_id)
-                self._mark_request_for_kv_transfer(request.request_id, request.num_computed_tokens)
+                self._mark_request_for_kv_transfer(request.request_id, confirmed_computed)
                 actually_queued = request.request_id in self.requests_needing_kv_transfer
 
                 if stop_decode_on_trigger and actually_queued:
@@ -169,9 +175,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 try:
                     idx = new_token_ids.index(target_token_id)
                     tokens_to_exclude = len(new_token_ids) - (idx + 1)
-                    snapshot_len = request.num_computed_tokens - tokens_to_exclude
+                    snapshot_len = confirmed_computed - tokens_to_exclude
                 except ValueError:
-                    snapshot_len = request.num_computed_tokens
+                    snapshot_len = confirmed_computed
 
                 self._mark_request_for_kv_transfer(request.request_id, snapshot_len)
                 actually_queued = request.request_id in self.requests_needing_kv_transfer
@@ -622,7 +628,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     )
             else:
                 self.waiting_for_transfer_free.add(request_id)
-                self._mark_request_for_kv_transfer(request_id, request.num_computed_tokens)
+                confirmed_computed = self._get_confirmed_num_computed_tokens(request)
+                self._mark_request_for_kv_transfer(request_id, confirmed_computed)
                 # Return KV transfer metadata so it propagates to RequestOutput
                 if request_id in self.requests_needing_kv_transfer:
                     transfer_data = self.requests_needing_kv_transfer[request_id]
@@ -756,3 +763,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         self.requests_needing_kv_transfer.clear()
         return requests
+
+
+class OmniARAsyncScheduler(OmniARScheduler, AsyncVLLMScheduler):
+    """Asynchronous AutoRegressive scheduler."""

@@ -10,7 +10,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
-    from vllm_omni.diffusion.worker.utils import RunnerOutput
+    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 
 class DiffusionExecutor(ABC):
@@ -74,12 +74,12 @@ class DiffusionExecutor(ABC):
         pass
 
     @abstractmethod
-    def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+    def execute_request(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute request-mode work from a scheduler output."""
         pass
 
     @abstractmethod
-    def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+    def execute_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute step-mode work from a scheduler output."""
         pass
 

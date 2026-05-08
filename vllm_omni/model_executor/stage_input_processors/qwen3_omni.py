@@ -28,6 +28,17 @@ _EMBED_LAYER_KEY = "0"
 _HIDDEN_LAYER_KEY = "24"
 
 
+def _layer_tensor(layers: dict[Any, Any], key: str) -> torch.Tensor | None:
+    """Fetch layer tensor with tolerant key lookup (str/int)."""
+    if not isinstance(layers, dict):
+        return None
+    key_int = int(key)
+    val = layers.get(key_int)
+    if val is None:
+        val = layers.get(key)
+    return val if isinstance(val, torch.Tensor) else None
+
+
 def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | str = "cuda") -> int:
     im_start_token_id = 151644
     system_token_id = 8948
@@ -79,36 +90,23 @@ def _ensure_list(x):
     return list(x)
 
 
-def _validate_stage_inputs(stage_list, engine_input_source):
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-
-    stage_id = engine_input_source[0]
-    if stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {stage_id}")
-
-    stage = stage_list[stage_id]
-    if stage.engine_outputs is None:
-        raise RuntimeError(f"Stage {stage_id} has no outputs yet")
-
-    return stage.engine_outputs
-
-
 # =========================
 # PD disaggregation helpers
 # =========================
 
 
-def _get_prefill_stage(stage_list: list[Any], source_stage_id: int) -> Any | None:
-    if source_stage_id <= 0:
+def _get_prefill_multimodal_output(
+    request_id: str,
+    streaming_context: Any | None,
+) -> dict[str, Any] | None:
+    bridge_states = getattr(streaming_context, "bridge_states", None)
+    if not isinstance(bridge_states, dict):
         return None
-    source_stage = stage_list[source_stage_id]
-    if not getattr(source_stage, "is_decode_only", False):
+    by_req = bridge_states.get("pd_prefill_multimodal_output_by_req")
+    if not isinstance(by_req, dict):
         return None
-    prev_stage = stage_list[source_stage_id - 1]
-    if getattr(prev_stage, "is_prefill_only", False) and prev_stage.engine_outputs is not None:
-        return prev_stage
-    return None
+    prefill_mm = by_req.get(request_id)
+    return prefill_mm if isinstance(prefill_mm, dict) else None
 
 
 def _merge_pd_embeddings(
@@ -154,16 +152,6 @@ def _merge_pd_embeddings(
     merged_emb = torch.cat([p_emb, decode_emb[overlap:]], dim=0)
     merged_hid = torch.cat([p_hid, decode_hid[overlap:]], dim=0)
     return merged_emb, merged_hid
-
-
-def _get_prefill_multimodal_output(prefill_stage: Any, output_index: int) -> dict[str, Any] | None:
-    """Return multimodal_output dict from the PD prefill stage for a given batch index."""
-    try:
-        prefill_eos = prefill_stage.engine_outputs
-        prefill_eo = prefill_eos[min(output_index, len(prefill_eos) - 1)]
-        return prefill_eo.outputs[0].multimodal_output
-    except Exception:
-        return None
 
 
 def _resolve_tts_token_embedding(
@@ -300,9 +288,23 @@ def thinker2talker_async_chunk(
 
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
+    if not isinstance(pooling_output, dict):
+        logger.debug("thinker2talker_async_chunk: skip non-dict pooling_output for req=%s", request_id)
+        return None
+
     thinker_hs = pooling_output.get("hidden_states", {})
-    thinker_layers = thinker_hs.get("layers", {})
-    thinker_embed = pooling_output.get("embed", {})
+    thinker_layers = thinker_hs.get("layers", {}) if isinstance(thinker_hs, dict) else {}
+    thinker_embed = pooling_output.get("embed", {}) if isinstance(pooling_output.get("embed", {}), dict) else {}
+    thinker_emb = _layer_tensor(thinker_layers, _EMBED_LAYER_KEY)
+    thinker_hid = _layer_tensor(thinker_layers, _HIDDEN_LAYER_KEY)
+    if thinker_emb is None or thinker_hid is None:
+        logger.debug(
+            "thinker2talker_async_chunk: missing thinker layers for req=%s (embed=%s hidden=%s)",
+            request_id,
+            thinker_emb is not None,
+            thinker_hid is not None,
+        )
+        return None
 
     if chunk_id == 0:
         all_token_ids = request.all_token_ids  # prefill + decode
@@ -312,13 +314,19 @@ def thinker2talker_async_chunk(
         prompt_token_ids = _ensure_list(prompt_token_ids)
         payload: OmniPayload = {
             "embed": {
-                "prefill": thinker_layers[int(_EMBED_LAYER_KEY)].detach().cpu(),
+                "prefill": thinker_emb.detach().cpu(),
                 # Provide thinker-side TTS token embeddings for talker projection
-                "tts_bos": thinker_embed["tts_bos"].detach().cpu(),
-                "tts_eos": thinker_embed["tts_eos"].detach().cpu(),
-                "tts_pad": thinker_embed["tts_pad"].detach().cpu(),
+                "tts_bos": thinker_embed.get("tts_bos").detach().cpu()
+                if isinstance(thinker_embed.get("tts_bos"), torch.Tensor)
+                else None,
+                "tts_eos": thinker_embed.get("tts_eos").detach().cpu()
+                if isinstance(thinker_embed.get("tts_eos"), torch.Tensor)
+                else None,
+                "tts_pad": thinker_embed.get("tts_pad").detach().cpu()
+                if isinstance(thinker_embed.get("tts_pad"), torch.Tensor)
+                else None,
             },
-            "hidden_states": {"output": thinker_layers[int(_HIDDEN_LAYER_KEY)].detach().cpu()},
+            "hidden_states": {"output": thinker_hid.detach().cpu()},
             "ids": {"all": all_token_ids, "prompt": prompt_token_ids},
             "meta": {"finished": torch.tensor(is_finished, dtype=torch.bool)},
         }
@@ -366,18 +374,17 @@ def thinker2talker_async_chunk(
 
         if output_token_ids:
             talker_additional_info["meta"]["override_keys"] = [("embed", "decode"), ("ids", "output")]
-            talker_additional_info["embed"] = {"decode": thinker_layers[int(_EMBED_LAYER_KEY)].detach().cpu()}
+            talker_additional_info["embed"] = {"decode": thinker_emb.detach().cpu()}
             talker_additional_info["ids"] = {"output": output_token_ids}
         else:
             # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
-            talker_additional_info["embed"] = {"prefill": thinker_layers[0].detach().cpu()}
-            talker_additional_info["hidden_states"] = {"output": thinker_layers[24].detach().cpu()}
+            talker_additional_info["embed"] = {"prefill": thinker_emb.detach().cpu()}
+            talker_additional_info["hidden_states"] = {"output": thinker_hid.detach().cpu()}
     return talker_additional_info
 
 
 def thinker2talker(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+    source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | None = None,
     requires_multimodal_data: bool = False,
     streaming_context: Any | None = None,
@@ -394,22 +401,16 @@ def thinker2talker(
     decode-stage generated embeddings before handing off to the talker.
 
     Args:
-        stage_list: List of stage objects
-        engine_input_source: Source stage IDs (typically [0] for thinker)
         prompt: Original prompt data
         requires_multimodal_data: Whether multimodal data is required
 
     Returns:
         List of OmniTokensPrompt for talker stage
     """
-    thinker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    thinker_outputs = source_outputs
     talker_inputs: list[OmniTokensPrompt] = []
 
     device = torch.device(current_platform.device_type)
-
-    # PD disaggregation: look up the preceding prefill stage (if any)
-    source_stage_id = engine_input_source[0]
-    prefill_stage = _get_prefill_stage(stage_list, source_stage_id)
 
     # Process each thinker output
     for i, thinker_output in enumerate(thinker_outputs):
@@ -431,15 +432,23 @@ def thinker2talker(
             thinker_sequences = prompt_token_ids + output_ids
             thinker_input_ids = prompt_token_ids
         new_seq_length = len(prompt_token_ids + output_ids) - 1
-        thinker_mm: OmniPayload = output.multimodal_output
+        thinker_mm_raw = getattr(output, "multimodal_output", None)
+        if not isinstance(thinker_mm_raw, dict):
+            logger.debug("thinker2talker: skip req=%s due to empty multimodal_output", req_id)
+            continue
+        thinker_mm: OmniPayload = thinker_mm_raw
         mm_hs = thinker_mm.get("hidden_states", {})
-        mm_layers = mm_hs.get("layers", {})
-        thinker_emb = mm_layers[int(_EMBED_LAYER_KEY)].detach().to(device=device, dtype=torch.float)[-new_seq_length:]
-        thinker_hid = mm_layers[int(_HIDDEN_LAYER_KEY)].detach().to(device=device, dtype=torch.float)[-new_seq_length:]
+        mm_layers = mm_hs.get("layers", {}) if isinstance(mm_hs, dict) else {}
+        emb_layer = _layer_tensor(mm_layers, _EMBED_LAYER_KEY)
+        hid_layer = _layer_tensor(mm_layers, _HIDDEN_LAYER_KEY)
+        if emb_layer is None or hid_layer is None:
+            logger.debug("thinker2talker: skip req=%s due to missing hidden-state layers", req_id)
+            continue
+        thinker_emb = emb_layer.detach().to(device=device, dtype=torch.float)[-new_seq_length:]
+        thinker_hid = hid_layer.detach().to(device=device, dtype=torch.float)[-new_seq_length:]
 
         prefill_mm: dict[str, Any] | None = None
-        if prefill_stage is not None:
-            prefill_mm = _get_prefill_multimodal_output(prefill_stage, i)
+        prefill_mm = _get_prefill_multimodal_output(req_id, streaming_context)
 
         if prefill_mm is not None:
             expected_total = len(prompt_token_ids) + len(output_ids)
@@ -507,7 +516,11 @@ def talker2code2wav_async_chunk(
     """
     Pooling version.
     """
+    if not isinstance(pooling_output, dict):
+        return None
     talker_codes = pooling_output.get("codes", {})
+    if not isinstance(talker_codes, dict):
+        return None
     code_predictor_codes = talker_codes.get("audio")
     if code_predictor_codes is None:
         return None
@@ -566,10 +579,9 @@ def talker2code2wav_async_chunk(
 
 
 def talker2code2wav(
-    stage_list: list[Any],
-    engine_input_source: list[int],
-    prompt: OmniTokensPrompt | TextPrompt | None = None,
-    requires_multimodal_data: bool = False,
+    source_outputs: list[Any],
+    _prompt: OmniTokensPrompt | TextPrompt | None = None,
+    _requires_multimodal_data: bool = False,
     streaming_context: Any | None = None,
 ) -> list[OmniTokensPrompt]:
     """
@@ -581,15 +593,10 @@ def talker2code2wav(
     3. Package for code2wav stage
 
     Args:
-        stage_list: List of stage objects
-        engine_input_source: Source stage IDs (typically [1] for talker)
-        prompt: Original prompt data
-        requires_multimodal_data: Whether multimodal data is required
-
     Returns:
         List of OmniTokensPrompt for code2wav stage
     """
-    talker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    talker_outputs = source_outputs
     code2wav_inputs: list[OmniTokensPrompt] = []
     # Process each talker output
     for i, talker_output in enumerate(talker_outputs):
@@ -600,7 +607,14 @@ def talker2code2wav(
         is_streaming_session = bool(getattr(streaming_context, "enabled", False))
         if is_streaming_session:
             seq_len = _get_streaming_codec_delta_len(cur_seq_len, req_id, talker_output, streaming_context)
-        mm: OmniPayload = output.multimodal_output
+        mm_raw = getattr(output, "multimodal_output", None)
+        if not isinstance(mm_raw, dict):
+            logger.debug("talker2code2wav: skip req=%s due to empty multimodal_output", req_id)
+            continue
+        mm: OmniPayload = mm_raw
+        if "codes" not in mm or not isinstance(mm.get("codes"), dict) or "audio" not in mm["codes"]:
+            logger.debug("talker2code2wav: skip req=%s due to missing codes.audio", req_id)
+            continue
         # Extract codec codes from talker output
         # Expected shape: [8, seq_len] (8-layer RVQ codes)
         codec_codes = (

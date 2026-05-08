@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
+import functools
 from threading import Lock
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
@@ -11,10 +15,19 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.logits_processor.state import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 
-from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
+
+
+@functools.lru_cache(maxsize=1)
+def _cosyvoice3_model_and_runner():
+    """Defer heavy Omni/vLLM imports until a test runs (avoids duplicate CustomOp init)."""
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
+    return CosyVoice3Model, GPUARModelRunner
 
 
 class _DummyCode2Wav:
@@ -59,6 +72,7 @@ def _make_code2wav_model(
     num_samples: int = 32,
     outputs: list[tuple[torch.Tensor, dict[str, object] | None]] | None = None,
 ) -> CosyVoice3Model:
+    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
     model.model_stage = "cosyvoice3_code2wav"
@@ -79,6 +93,7 @@ def _make_code2wav_model(
 
 
 def _make_talker_model() -> CosyVoice3Model:
+    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
     model.model_stage = "cosyvoice3_talker"
@@ -124,12 +139,14 @@ def _make_sampling_metadata(
 
 
 def test_split_request_ids_uses_seq_token_counts():
+    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
     ids = torch.tensor([10, 11, 12, 13, 14], dtype=torch.long)
     chunks = CosyVoice3Model._split_request_ids(ids, [2, 2, 2])
     assert [c.tolist() for c in chunks] == [[10, 11], [12, 13], [14]]
 
 
 def test_split_request_ids_honors_single_request_seq_token_counts():
+    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
     ids = torch.tensor([10, 11, 12, 13, 14], dtype=torch.long)
     chunks = CosyVoice3Model._split_request_ids(ids, [3])
     assert [c.tolist() for c in chunks] == [[10, 11, 12]]
@@ -376,6 +393,7 @@ def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
         def update_async_output_token_ids(self):
             self.updated = True
 
+    _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
     runner.model = SimpleNamespace(
@@ -407,6 +425,7 @@ def test_gpu_ar_model_runner_supplies_req_output_history_to_model_sampler():
         def update_async_output_token_ids(self):
             raise AssertionError("fallback async repair should not run for model sampler path")
 
+    _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
     runner.model = SimpleNamespace(
@@ -446,6 +465,7 @@ def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
         def update_async_output_token_ids(self):
             raise AssertionError("fallback async repair should not run for model sampler path")
 
+    _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
     runner.model = SimpleNamespace(

@@ -45,7 +45,7 @@ from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
@@ -84,8 +84,10 @@ class DiffusionWorker:
         self.lora_manager: DiffusionLoRAManager | None = None
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
-        # Create model runner
-        self.model_runner = DiffusionModelRunner(
+        # Create model runner using the platform-specified class
+        model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
+        model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
+        self.model_runner = model_runner_cls(
             vllm_config=self.vllm_config,
             od_config=self.od_config,
             device=self.device,
@@ -136,6 +138,12 @@ class DiffusionWorker:
             enable_return_routed_experts=False,
         )
         vllm_config.quant_config = self.od_config.quantization_config
+        # Since vLLM v0.20.0, IR wraps GPU ops. Set IR op priority preference to enforce GPU op fusion during wrapping.
+        # Also need to log, because vLLM internally logs another line in VllmConfig.__post_init__. Avoid confusion.
+        vllm_config.kernel_config.ir_op_priority = current_omni_platform.get_default_ir_op_priority(vllm_config)
+        logger.info(
+            "Final IR op priority after setting vLLM-Omni overrides: %s", vllm_config.kernel_config.ir_op_priority
+        )
         self.vllm_config = vllm_config
 
         # Initialize distributed environment
@@ -262,7 +270,7 @@ class DiffusionWorker:
             profiler.step()
         return output
 
-    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
         if self.lora_manager is not None:
@@ -497,7 +505,7 @@ class CustomPipelineWorkerExtension:
         if self.model_runner.pipeline is not None:
             del self.model_runner.pipeline
             gc.collect()
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
 
         # Get custom pipeline class name
         custom_pipeline_name = custom_pipeline_args["pipeline_class"]
@@ -561,11 +569,14 @@ class WorkerProc:
         custom_pipeline_args: dict[str, Any] | None = None,
     ) -> DiffusionWorker:
         """Create a worker instance. Override in subclasses for different worker types."""
+        worker_cls_path = current_omni_platform.get_diffusion_worker_cls()
+        base_worker_class = resolve_obj_by_qualname(worker_cls_path)
         wrapper = WorkerWrapperBase(
             gpu_id=gpu_id,
             od_config=od_config,
             worker_extension_cls=worker_extension_cls,
             custom_pipeline_args=custom_pipeline_args,
+            base_worker_class=base_worker_class,
         )
         return wrapper
 
@@ -834,7 +845,7 @@ class WorkerWrapperBase:
         """
         return self.worker.execute_model(reqs, od_config)
 
-    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""
         return self.worker.execute_stepwise(scheduler_output)
 

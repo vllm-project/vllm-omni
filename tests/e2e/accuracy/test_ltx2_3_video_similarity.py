@@ -199,7 +199,7 @@ def _run_diffusers_baseline(model: str, output_dir: Path) -> list[Image.Image]:
         del pipe
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
         run_post_test_cleanup(enable_force=True)
 
 
@@ -278,11 +278,11 @@ def _run_with_custom_transformer(model: str, output_dir: Path) -> list[Image.Ima
     del pipe, result, our_transformer
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
     return frames
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @pytest.mark.skipif(
@@ -381,7 +381,7 @@ def _run_vllm_omni_serving(model: str, output_dir: Path) -> list[Image.Image]:
     return frames
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.benchmark
 @pytest.mark.diffusion
 @pytest.mark.skipif(

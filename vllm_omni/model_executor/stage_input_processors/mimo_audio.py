@@ -182,8 +182,7 @@ def llm2code2wav_async_chunk(
 
 
 def llm2code2wav(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+    source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | None = None,
     requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
@@ -196,25 +195,13 @@ def llm2code2wav(
     3. Package for code2wav stage
 
     Args:
-        stage_list: List of stage objects
-        engine_input_source: Source stage IDs (typically [1] for talker)
         prompt: Original prompt data
         requires_multimodal_data: Whether multimodal data is required
 
     Returns:
         List of OmniTokensPrompt for code2wav stage
     """
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-
-    source_stage_id = engine_input_source[0]
-    if source_stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {source_stage_id}")
-
-    if stage_list[source_stage_id].engine_outputs is None:
-        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
-
-    talker_outputs = stage_list[source_stage_id].engine_outputs
+    talker_outputs = source_outputs
     code2wav_inputs = []
 
     # Process each talker output
