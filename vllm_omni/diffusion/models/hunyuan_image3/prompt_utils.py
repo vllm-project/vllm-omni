@@ -24,6 +24,29 @@ from .system_prompt import get_system_prompt
 
 BOT_TASKS = ("auto", "image", "recaption", "think_recaption")
 PROMPT_BOT_TASKS = ("auto", "none", "think", "recaption", "vanilla")
+
+# HunyuanImage-3.0-Instruct special token ids from tokenizer.json.
+# Keep offline AR prompt/stop-token behavior independent of runtime
+# tokenizer lookup for these fixed control tokens.
+HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS: dict[str, int] = {
+    "<|endoftext|>": 127957,
+    "<|startoftext|>": 127958,
+    "<boi>": 128000,
+    "<eoi>": 128001,
+    "<img>": 128006,
+    "<cfg>": 128010,
+    "<recaption>": 128018,
+    "</recaption>": 128019,
+    "<think>": 128023,
+    "</think>": 128024,
+    "<answer>": 128025,
+    "</answer>": 128026,
+    "<img_size_1024>": 128037,
+    "<img_ratio_0>": 128044,
+    "<img_ratio_32>": 128076,
+    "<img_ratio_33>": 130103,
+    "<img_ratio_36>": 130106,
+}
 _BOT_TASK_TO_TOKENIZER_TASK = {
     "auto": "auto",
     "image": "image",
@@ -167,7 +190,9 @@ def _stop_token_ids_for_tokenizer_bot_task(
     eos_id = _eos_token_id(tokenizer)
 
     if image_size == "auto":
-        extra_auto_stops = [_token_id(tokenizer, f"<img_ratio_{i}>") for i in range(33)]
+        start_ratio_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_0>"]
+        end_ratio_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_32>"]
+        extra_auto_stops = list(range(start_ratio_id, end_ratio_id + 1))
     else:
         extra_auto_stops = [_token_id(tokenizer, "<boi>")]
 
@@ -246,6 +271,9 @@ def sys_type_for_task(task: str) -> str:
 
 
 def _token_id(tokenizer, token: str) -> int:
+    if token in HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS:
+        return HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS[token]
+
     token_id = tokenizer.convert_tokens_to_ids(token)
     if token_id is None:
         raise ValueError(f"Tokenizer does not know special token {token!r}")
@@ -253,10 +281,7 @@ def _token_id(tokenizer, token: str) -> int:
 
 
 def _eos_token_id(tokenizer) -> int:
-    token_id = getattr(tokenizer, "eos_token_id", None)
-    if token_id is not None:
-        return int(token_id)
-    return _token_id(tokenizer, "<|endoftext|>")
+    return HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|endoftext|>"]
 
 
 def build_prompt(
@@ -334,9 +359,9 @@ def build_prompt_tokens(
     preset_sys_type, preset_bot_task, trigger_tag = _task_preset(task)
     effective_sys_type = sys_type or preset_sys_type
 
-    bos_id = tokenizer.convert_tokens_to_ids("<|startoftext|>")
-    img_id = tokenizer.convert_tokens_to_ids("<img>")
-    trig_id = tokenizer.convert_tokens_to_ids(trigger_tag) if trigger_tag else None
+    bos_id = _token_id(tokenizer, "<|startoftext|>")
+    img_id = _token_id(tokenizer, "<img>")
+    trig_id = _token_id(tokenizer, trigger_tag) if trigger_tag else None
 
     has_image_input = _task_has_image_input(task)
 
@@ -373,6 +398,7 @@ __all__ = [
     "BOT_TASKS",
     "build_prompt",
     "build_prompt_tokens",
+    "HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS",
     "PROMPT_BOT_TASKS",
     "resolve_bot_task",
     "sys_type_for_task",
