@@ -191,10 +191,9 @@ def test_resolve_bot_task_resolves_stop_ids_from_prompt_task():
         HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<boi>"],
     ]
     assert resolve_bot_task(task="i2t_think", tokenizer=tok).stop_token_ids == [
-        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"],
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"],
         HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</answer>"],
         eos_id,
-        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<boi>"],
     ]
     assert resolve_bot_task(task="t2i_vanilla", tokenizer=tok).stop_token_ids == [eos_id]
 
