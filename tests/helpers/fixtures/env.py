@@ -29,18 +29,16 @@ def model_prefix() -> str:
 
 @pytest.fixture(autouse=True)
 def clean_gpu_memory_between_tests(request):
-    """Run GPU memory cleanup between tests unless the item has ``@pytest.mark.cpu``.
+    """Run GPU memory cleanup between tests unless the item is CPU-only (no ``cuda`` mark).
 
-    CPU-only / mocked suites should not trigger pre/post device probes (see
-    ``tests.helpers.env`` / ``VLLM_TEST_CLEAN_GPU_MEMORY``). Class- or
-    module-level ``pytestmark = [..., pytest.mark.cpu]`` is respected via
-    ``get_closest_marker``.
+    If ``@pytest.mark.cpu`` is applied (e.g. module ``pytestmark``) but a test also has
+    ``@pytest.mark.cuda``, pre/post GPU hooks still run (e.g. ``VLLM_TEST_CLEAN_GPU_MEMORY=1``).
     """
     # Import here so ``tests.helpers.env`` (and vLLM platform modules) load only
     # after session autouse fixtures like ``default_env`` have run (RFC #2299).
     from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 
-    if request.node.get_closest_marker("cpu") is not None:
+    if request.node.get_closest_marker("cpu") is not None and request.node.get_closest_marker("cuda") is None:
         yield
         return
 
