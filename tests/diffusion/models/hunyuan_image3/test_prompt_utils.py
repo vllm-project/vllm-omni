@@ -24,6 +24,7 @@ import pathlib
 import pytest
 
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+    HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS,
     available_prompt_bot_tasks,
     available_tasks,
     build_prompt,
@@ -41,7 +42,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 class FakeTokenizer:
     """Minimal tokenizer stub that records every encode() call.
 
-    Returns deterministic ids: special tokens map to small ints (1-4),
+    Returns deterministic ids from convert_tokens_to_ids while
     encode() returns one id per character starting at 100. This lets
     tests both verify segmentation (by inspecting `encode_calls`) and
     locate substrings inside the returned id list.
@@ -145,28 +146,56 @@ def test_resolve_bot_task_maps_tokenizer_task_and_stop_ids():
     assert resolution.task is None
     assert resolution.bot_task == "think_recaption"
     assert resolution.tokenizer_bot_task == "think"
-    assert resolution.stop_token_ids == [6, 7, 5]
+    assert resolution.stop_token_ids == [
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"],
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</answer>"],
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|endoftext|>"],
+    ]
 
 
 def test_resolve_bot_task_resolves_stop_ids_from_bot_task():
     tok = FakeTokenizer()
 
-    assert resolve_bot_task("auto", tokenizer=tok).stop_token_ids == [5, 8]
-    assert resolve_bot_task("image", tokenizer=tok).stop_token_ids == [5]
-    assert resolve_bot_task("think_recaption", tokenizer=tok).stop_token_ids == [6, 7, 5]
-    assert resolve_bot_task("recaption", tokenizer=tok).stop_token_ids == [6, 7, 5]
+    eos_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|endoftext|>"]
+    boi_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<boi>"]
+    end_recaption_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"]
+    end_answer_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</answer>"]
+
+    assert resolve_bot_task("auto", tokenizer=tok).stop_token_ids == [eos_id, boi_id]
+    assert resolve_bot_task("image", tokenizer=tok).stop_token_ids == [eos_id]
+    assert resolve_bot_task("think_recaption", tokenizer=tok).stop_token_ids == [
+        end_recaption_id,
+        end_answer_id,
+        eos_id,
+    ]
+    assert resolve_bot_task("recaption", tokenizer=tok).stop_token_ids == [
+        end_recaption_id,
+        end_answer_id,
+        eos_id,
+    ]
     assert resolve_bot_task("auto", tokenizer=tok, image_size="auto").stop_token_ids == [
-        5,
-        *range(1000, 1033),
+        eos_id,
+        *range(
+            HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_0>"],
+            HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img_ratio_32>"] + 1,
+        ),
     ]
 
 
 def test_resolve_bot_task_resolves_stop_ids_from_prompt_task():
     tok = FakeTokenizer()
 
-    assert resolve_bot_task(task="i2t", tokenizer=tok).stop_token_ids == [5, 8]
-    assert resolve_bot_task(task="i2t_think", tokenizer=tok).stop_token_ids == [6, 7, 5]
-    assert resolve_bot_task(task="t2i_vanilla", tokenizer=tok).stop_token_ids == [5]
+    eos_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|endoftext|>"]
+    assert resolve_bot_task(task="i2t", tokenizer=tok).stop_token_ids == [
+        eos_id,
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<boi>"],
+    ]
+    assert resolve_bot_task(task="i2t_think", tokenizer=tok).stop_token_ids == [
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"],
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</answer>"],
+        eos_id,
+    ]
+    assert resolve_bot_task(task="t2i_vanilla", tokenizer=tok).stop_token_ids == [eos_id]
 
 
 def test_sys_type_for_task_returns_prompt_preset_default():
@@ -265,25 +294,31 @@ def test_build_prompt_tokens_segments_each_boundary():
 def test_build_prompt_tokens_image_placeholder_present_for_image_tasks():
     tok = FakeTokenizer()
     ids = build_prompt_tokens("hi", tok, task="i2t")
-    assert ids[0] == 1, "BOS (<|startoftext|>) must be the first token"
-    assert 2 in ids, "<img> placeholder must be present for i2t/it2i tasks"
+    assert ids[0] == HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|startoftext|>"], (
+        "BOS (<|startoftext|>) must be the first token"
+    )
+    assert HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img>"] in ids, (
+        "<img> placeholder must be present for i2t/it2i tasks"
+    )
 
 
 def test_build_prompt_tokens_no_image_for_text_only_tasks():
     tok = FakeTokenizer()
     ids = build_prompt_tokens("hi", tok, task="t2t")
-    assert 2 not in ids, "<img> must NOT appear for text-only tasks"
+    assert HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<img>"] not in ids, (
+        "<img> must NOT appear for text-only tasks"
+    )
 
 
 @pytest.mark.parametrize(
     "task,trigger_id",
     [
-        ("t2t_think", 3),
-        ("i2t_think", 3),
-        ("it2i_think", 3),
-        ("t2i_think", 3),
-        ("it2i_recaption", 4),
-        ("t2i_recaption", 4),
+        ("t2t_think", HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<think>"]),
+        ("i2t_think", HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<think>"]),
+        ("it2i_think", HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<think>"]),
+        ("t2i_think", HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<think>"]),
+        ("it2i_recaption", HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<recaption>"]),
+        ("t2i_recaption", HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<recaption>"]),
     ],
 )
 def test_build_prompt_tokens_trigger_is_last_token(task: str, trigger_id: int):
@@ -297,7 +332,10 @@ def test_build_prompt_tokens_no_trigger_for_plain_tasks():
     """Tasks without trigger_tag (t2t / i2t) must NOT append a trigger id."""
     tok = FakeTokenizer()
     ids = build_prompt_tokens("hi", tok, task="t2t")
-    assert ids[-1] not in {3, 4}  # neither <think> nor <recaption>
+    assert ids[-1] not in {
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<think>"],
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<recaption>"],
+    }
 
 
 # -------------------- end2end.py wiring guard --------------------
