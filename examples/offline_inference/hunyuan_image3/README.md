@@ -108,6 +108,7 @@ python examples/offline_inference/hunyuan_image3/end2end.py \
 | `--stage-configs-path` | Legacy stage config path, kept only for compatibility. Prefer `--deploy-config`. |
 | `--modality` | Offline-only convenience flag. One of `text2img`, `img2img`, `img2text`, `text2text`. It selects prompt formatting, internal `mode`, and default deploy config for this script. Online serving uses `--deploy-config` plus the endpoint and, for chat completions, request `modalities` instead. |
 | `--steps` | Number of diffusion inference steps for image generation. |
+| `--num-outputs-per-prompt` | Number of images to generate for each prompt. Defaults to `1`. |
 | `--guidance-scale` | Classifier-free guidance scale for image generation. |
 | `--height`, `--width` | Output image size for `text2img`. |
 | `--bot-task` | Prompt behavior. `auto` selects the default from `--modality`; `think` adds `<think>`; `recaption` adds `<recaption>`; `vanilla` uses the text-to-image pretrain template. |

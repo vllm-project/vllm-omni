@@ -86,6 +86,12 @@ def parse_args():
     parser.add_argument("--height", type=int, default=1024, help="Output image height.")
     parser.add_argument("--width", type=int, default=1024, help="Output image width.")
     parser.add_argument(
+        "--num-outputs-per-prompt",
+        type=int,
+        default=1,
+        help="Number of images to generate for each prompt.",
+    )
+    parser.add_argument(
         "--vae-use-tiling",
         action="store_true",
         help="Enable VAE tiling for memory optimization.",
@@ -232,6 +238,7 @@ def main():
     for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
             sp.num_inference_steps = args.steps
+            sp.num_outputs_per_prompt = args.num_outputs_per_prompt
             sp.guidance_scale = args.guidance_scale
             sp.guidance_scale_provided = True
             if args.seed is not None:
@@ -256,6 +263,7 @@ def main():
     print(f"  Num stages: {omni.num_stages}")
     if args.modality in ("text2img", "img2img"):
         print(f"  Inference steps: {args.steps}")
+        print(f"  Outputs per prompt: {args.num_outputs_per_prompt}")
         print(f"  Guidance scale: {args.guidance_scale}")
         print(f"  Seed: {args.seed}")
     if args.modality == "text2img":
