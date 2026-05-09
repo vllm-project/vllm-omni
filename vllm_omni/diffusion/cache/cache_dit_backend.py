@@ -1421,9 +1421,7 @@ def enable_cache_for_helios(pipeline: Any, cache_config: Any) -> Callable[[int],
 
     def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(
-                pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose
-            )
+            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
         else:
             cache_dit.refresh_context(
                 pipeline.transformer,
