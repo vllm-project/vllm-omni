@@ -61,7 +61,6 @@ stages:
       vae_patch_parallel_size: 1
     default_sampling_params:
       seed: 42
-      num_outputs_per_prompt: 1
     input_connectors:
       from_stage_0: rdma_connector
 

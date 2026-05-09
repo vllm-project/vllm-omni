@@ -31,7 +31,6 @@ stages:
       hsdp_replicate_size: 1
     default_sampling_params:
       seed: 42
-      num_outputs_per_prompt: 1
 
 platforms:
   npu:
