@@ -491,6 +491,7 @@ _STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name n
 
 def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     """Parse a single stage entry from deploy YAML into StageDeployConfig."""
+    explicit_engine_extras = dict(stage_data.get("engine_extras", {}) or {})
     if "engine_args" in stage_data:
         runtime_cfg = dict(stage_data.get("runtime", {}))
         engine_args = dict(stage_data["engine_args"])
@@ -513,7 +514,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
-    kwargs["engine_extras"] = engine_args
+    kwargs["engine_extras"] = {**engine_args, **explicit_engine_extras}
     return StageDeployConfig(**kwargs)
 
 

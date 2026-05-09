@@ -405,3 +405,79 @@ def ar2diffusion(
     )
 
     return diffusion_inputs
+
+
+def _extract_latent_payload(source_output: Any) -> dict[str, Any] | None:
+    candidates: list[Any] = [
+        source_output,
+        getattr(source_output, "custom_output", None),
+        getattr(source_output, "_custom_output", None),
+        getattr(source_output, "multimodal_output", None),
+    ]
+
+    request_output = getattr(source_output, "request_output", None)
+    if request_output is not None:
+        candidates.extend(
+            [
+                request_output,
+                getattr(request_output, "custom_output", None),
+                getattr(request_output, "_custom_output", None),
+                getattr(request_output, "multimodal_output", None),
+            ]
+        )
+
+    outputs = getattr(source_output, "outputs", None)
+    if outputs:
+        first_output = outputs[0]
+        candidates.extend(
+            [
+                first_output,
+                getattr(first_output, "custom_output", None),
+                getattr(first_output, "_custom_output", None),
+                getattr(first_output, "multimodal_output", None),
+            ]
+        )
+
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate.get("latents") is not None:
+            return candidate
+    return None
+
+
+def latent2vae(
+    source_outputs: list[Any],
+    prompt: OmniTokensPrompt | TextPrompt | list | None = None,
+    requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Process GLM-Image denoise-stage outputs into VAE-stage inputs."""
+    del prompt, requires_multimodal_data, streaming_context
+
+    vae_inputs: list[dict[str, Any]] = []
+    for idx, source_output in enumerate(source_outputs):
+        payload = _extract_latent_payload(source_output)
+        if payload is None:
+            raise ValueError(
+                "GLM-Image VAE split expects denoise stage output with "
+                f"'latents' in custom_output. request_id={getattr(source_output, 'request_id', None)}"
+            )
+
+        latents = payload.get("latents")
+        if latents is None:
+            raise ValueError(f"GLM-Image latent2vae missing latents for request index {idx}")
+
+        vae_inputs.append(
+            {
+                "prompt": "vae decode",
+                "height": payload.get("height"),
+                "width": payload.get("width"),
+                "extra": {
+                    "latents": latents,
+                    "height": payload.get("height"),
+                    "width": payload.get("width"),
+                    "seed": payload.get("seed"),
+                },
+            }
+        )
+
+    return vae_inputs

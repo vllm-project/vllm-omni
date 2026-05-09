@@ -356,6 +356,7 @@ class DiffusionCacheConfig:
 class OmniDiffusionConfig:
     # Model and path configuration (for convenience)
     stage_id: int = 0
+    model_stage: str = "diffusion"
 
     model: str | None = None
 
