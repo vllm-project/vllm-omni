@@ -11,8 +11,8 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.backends.utils.segmented import (
-    segmented_attn,
+from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
+    piecewise_attn,
 )
 
 logger = init_logger(__name__)
@@ -159,23 +159,21 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
-        image_spans = attn_metadata.image_spans if attn_metadata is not None else None
-        q_global_positions = attn_metadata.q_global_positions if attn_metadata is not None else None
+        full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
 
-        # Segmented attention flow
-        if image_spans is not None and q_global_positions is not None:
-            logger.debug("Using segmented Flash Attention for mixed causal/full mask")
+        # Try piecewise attention
+        if full_attn_spans is not None:
+            logger.debug("Using piecewise Flash Attention for mixed causal/full mask")
             attn_func = partial(
                 FlashAttentionImpl._flash_wrapper,
                 attn_func=flash_attn_func,
             )
 
-            return segmented_attn(
+            return piecewise_attn(
                 query,
                 key,
                 value,
-                image_spans,
-                q_global_positions,
+                full_attn_spans,
                 self.softmax_scale,
                 attn_func,
             )

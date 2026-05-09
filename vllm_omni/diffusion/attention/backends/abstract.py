@@ -65,11 +65,9 @@ class AttentionMetadata:
     joint_strategy: str = "front"
     # the strategy to joint the query, key, and value, can be "front" or "rear"
 
-    # Segmented attention metadata (used by HunyuanImage3-like mixed causal/full masks).
-    # image_spans: [start, end) token ranges that should attend bidirectionally.
-    image_spans: list[list[tuple[int, int]]] | None = None
-    # q_global_positions: (B, Sq) absolute positions of each query token in the full sequence.
-    q_global_positions: torch.Tensor | None = None
+    # Piecewise attention metadata (mixed causal/full masks).
+    # full_attn_spans: per-sample [start, end) spans in global coordinates using full attention.
+    full_attn_spans: list[list[tuple[int, int]]] | None = None
 
 
 T = TypeVar("T", bound=AttentionMetadata)
