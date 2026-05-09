@@ -21,8 +21,8 @@ from vllm.v1.sample.sampler import Sampler
 from dataclasses import replace
 
 from vllm_omni.quantization.component_config import (
-    ComponentQuantizationConfig,
     PRE_QUANTIZED_METHODS,
+    ComponentQuantizationConfig,
 )
 
 class Qwen2_5OmniTalkerForConditionalGeneration(

@@ -72,8 +72,8 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.collection_utils import is_list_of
 
 from vllm_omni.quantization.component_config import (
-    ComponentQuantizationConfig,
     PRE_QUANTIZED_METHODS,
+    ComponentQuantizationConfig,
 )
 
 try:
