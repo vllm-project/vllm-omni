@@ -2035,6 +2035,44 @@ class HunyuanImage3Model(nn.Module):
                     return True
             return False
 
+        def is_scalar_quant_scale(name: str, tensor: torch.Tensor) -> bool:
+            return tensor.numel() == 1 and name.endswith((".input_scale", ".weight_scale"))
+
+        def load_split_param(
+            name: str,
+            tensor: torch.Tensor,
+            den: int,
+            split_param: list[tuple[str | int, int]],
+            func: Callable[[torch.Tensor], torch.Tensor] | None,
+        ) -> None:
+            param = params_dict[name]
+            weight_loader = param.weight_loader
+            if is_scalar_quant_scale(name, tensor):
+                for shard_id, _ in split_param:
+                    weight_loader(param, tensor, shard_id)
+                return
+
+            assert tensor.shape[0] % den == 0
+            units = tensor.shape[0] // den
+            offset = 0
+            tensor = func(tensor) if func else tensor
+            for shard_id, num in split_param:
+                new_offset = offset + num * units
+                weight_loader(param, tensor[offset:new_offset], shard_id)
+                offset = new_offset
+
+        def get_loaded_weight_shard(
+            name: str,
+            tensor: torch.Tensor,
+            offset: int,
+            den: int,
+        ) -> torch.Tensor:
+            if is_scalar_quant_scale(name, tensor):
+                return tensor
+            assert tensor.shape[0] % den == 0
+            units = tensor.shape[0] // den
+            return tensor[offset * units : offset * units + units]
+
         for name, loaded_weight in weights:
             # print(f"Loading weight name: {name}, tp_rank: {tp_rank}", flush=True)
             if contains_unexpected_keyword(name, unexpected_keywords):
@@ -2112,19 +2150,7 @@ class HunyuanImage3Model(nn.Module):
                 if is_pp_missing_parameter(name, self):
                     continue
 
-                assert loaded_weight.shape[0] % den == 0
-                units = loaded_weight.shape[0] // den
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                offset = 0
-                for shard_id, num in split_param:
-                    new_offset = offset + num * units
-                    if func:
-                        weight_loader(param, func(loaded_weight)[offset:new_offset], shard_id)
-                    else:
-                        weight_loader(param, loaded_weight[offset:new_offset], shard_id)
-                    offset = new_offset
-
+                load_split_param(name, loaded_weight, den, split_param, func)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
@@ -2154,12 +2180,11 @@ class HunyuanImage3Model(nn.Module):
                         continue
                     param = params_dict[name_mapped]
                     weight_loader = cast(Callable[..., bool], param.weight_loader)
-                    assert loaded_weight.shape[0] % den == 0
-                    units = loaded_weight.shape[0] // den
+                    loaded_weight_shard = get_loaded_weight_shard(name, loaded_weight, offset, den)
 
                     success = weight_loader(
                         param,
-                        loaded_weight[offset * units : offset * units + units],
+                        loaded_weight_shard,
                         name_mapped,
                         shard_id=shard_id,
                         expert_id=expert_id,
