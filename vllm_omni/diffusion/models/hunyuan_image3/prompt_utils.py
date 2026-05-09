@@ -69,9 +69,9 @@ def resolve_stop_token_ids(
 ):
     stop_token_ids = [127957]
     if "recaption" in task:
-        stop_token_ids.append(HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"])
-    if "think" in task:
         stop_token_ids.append(HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"])
+    if "think" in task:
+        stop_token_ids.append(HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"])
     return stop_token_ids
 
 
