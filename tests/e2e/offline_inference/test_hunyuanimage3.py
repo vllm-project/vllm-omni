@@ -1,6 +1,5 @@
 # ruff: noqa: E501
 from collections.abc import Generator
-from pathlib import Path
 
 import pytest
 import torch
@@ -9,6 +8,7 @@ from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
 from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
@@ -16,8 +16,7 @@ from vllm_omni.platforms import current_omni_platform
 PROMPT = "A brown and white dog is running on the grass"
 MODEL_NAME = "tencent/HunyuanImage-3.0"
 LOCAL_CLIP_PATH = "openai/clip-vit-base-patch32"
-REPO_ROOT = Path(__file__).resolve().parents[3]
-DEPLOY_CONFIG_PATH = REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3.yaml"
+DEPLOY_CONFIG_PATH = get_deploy_config_path("hunyuan_image3.yaml")
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
 
