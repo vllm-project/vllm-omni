@@ -67,6 +67,68 @@ python text_to_image.py \
   --output coffee.png
 ```
 
+### vLLM Generate CLI
+
+For one-shot local inference without starting an HTTP server, use
+`vllm generate` with the same model and generation controls. The offline CLI is
+currently scoped to text-to-image generation.
+
+```bash
+vllm generate \
+  --model Qwen/Qwen-Image \
+  --prompt "A beautiful landscape painting" \
+  --output output.png \
+  --height 1024 \
+  --width 1024 \
+  --num-inference-steps 50 \
+  --cfg-scale 4.0 \
+  --guidance-scale 4.0 \
+  --seed 42
+```
+
+The offline CLI shares diffusion parallel and memory optimization flags with
+`vllm serve --omni` where they apply to local generation. For example:
+
+```bash
+# Tensor parallelism
+vllm generate --model Qwen/Qwen-Image \
+  --prompt "A beautiful landscape painting" \
+  --output output.png \
+  --tensor-parallel-size 2
+
+# VAE memory optimization
+vllm generate --model Qwen/Qwen-Image \
+  --prompt "A beautiful landscape painting" \
+  --output output.png \
+  --vae-use-slicing --vae-use-tiling
+```
+
+### Comparing `vllm serve` and `vllm generate`
+
+Use the same model, prompt, dimensions, step count, CFG values, seed, and
+parallel/memory flags when comparing the two entrypoints. Both paths use the
+same Omni diffusion generation stack, but latency numbers should be compared
+with a consistent measurement scope:
+
+| Item | `vllm serve` | `vllm generate` |
+| ---- | ------------ | --------------- |
+| Startup/model loading | Paid once when the server starts | Paid by each CLI invocation |
+| Warm inference latency | HTTP/API overhead plus generation | Local command overhead plus generation |
+| VRAM | Server process remains resident | Process exits after generation |
+| Output | Should be reproducible with the same seed and sampling parameters, subject to backend determinism. |
+
+For a measured comparison, start the server first and record warm request
+latency from the client side. Track peak GPU memory in another terminal with
+`nvidia-smi` while running the same prompt and generation parameters through
+both entrypoints:
+
+```bash
+watch -n 0.5 nvidia-smi
+```
+
+Compare the saved images with the same seed and sampling parameters. Exact
+pixel equality can still depend on backend determinism and hardware kernels.
+
 ## Key Arguments
 
 **Common arguments:**

@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.platforms import current_omni_platform
 
 MODEL = "riverclouds/qwen_image_random"
@@ -21,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.mark.core_model
 @pytest.mark.diffusion
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_vllm_generate_cli_writes_image(tmp_path):
     if not current_omni_platform.is_cuda():
         pytest.skip("vllm generate CLI subprocess test requires CUDA.")
