@@ -150,6 +150,19 @@ def _get_diffusion_feature_cases(model: str):
             id="single_card_layerwise_offload",
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),
+        # Hybrid Sharded Data Parallel (4 GPUs)
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--use-hsdp",
+                    "--hsdp-shard-size",
+                    "4",
+                ],
+            ),
+            id="parallel_hsdp_4",
+            marks=PARALLEL_FEATURE_MARKS,
+        ),
     ]
 
 
@@ -172,6 +185,7 @@ def test_bagel(
     - Ulysses-SP (degree=2)
     - Ring-Attention (degree=2)
     - Layerwise Offloading
+    - Hybrid Sharded Data Parallel (size=4)
 
     Validation is delegated to assert_diffusion_response in tests/helpers/assertions.py,
     which checks output dimensions and basic correctness.
