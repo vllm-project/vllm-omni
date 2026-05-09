@@ -14,7 +14,7 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 
-from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
+from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker, _make_diffusion_vllm_model_config
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
 
@@ -76,6 +76,34 @@ class TestDiffusionWorkerLoadWeights:
 
         mock_gpu_worker.model_runner.load_weights.assert_called_once_with([])
         assert result == set()
+
+
+def test_diffusion_vllm_model_config_supplies_dtype_for_quant_methods():
+    from types import SimpleNamespace
+
+    from vllm_omni.quantization import build_quant_config
+
+    od_config = SimpleNamespace(
+        model="dummy",
+        dtype=torch.bfloat16,
+        quantization_config=build_quant_config(
+            {
+                "quant_method": "modelopt",
+                "quant_algo": "FP8",
+                "ignore": [],
+            }
+        ),
+        tf_model_config=SimpleNamespace(),
+        enforce_eager=True,
+        is_moe=False,
+    )
+
+    model_config = _make_diffusion_vllm_model_config(od_config)
+
+    assert model_config.dtype is torch.bfloat16
+    assert model_config.quantization == "modelopt"
+    assert model_config.quantization_config is od_config.quantization_config
+    assert model_config.is_quantized()
 
 
 class TestDiffusionWorkerSleep:
