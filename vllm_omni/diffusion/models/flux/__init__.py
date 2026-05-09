@@ -7,6 +7,7 @@ from vllm_omni.diffusion.models.flux.flux_transformer import (
     FluxTransformer2DModel,
 )
 from vllm_omni.diffusion.models.flux.pipeline_flux import (
+    FluxDMD2Pipeline,
     FluxPipeline,
     get_flux_post_process_func,
 )
@@ -17,6 +18,7 @@ from vllm_omni.diffusion.models.flux.pipeline_flux_kontext import (
 
 __all__ = [
     "FluxPipeline",
+    "FluxDMD2Pipeline",
     "FluxKontextPipeline",
     "FluxTransformer2DModel",
     "FluxKontextTransformer2DModel",

@@ -349,10 +349,8 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         self,
         prompt: str | list[str] = "",
         num_images_per_prompt: int = 1,
-        dtype: torch.dtype | None = None,
         clip_model_index: int = 0,
     ):
-        dtype = dtype or self.text_encoder.dtype
         clip_tokenizers = [self.tokenizer, self.tokenizer_2]
         clip_text_encoders = [self.text_encoder, self.text_encoder_2]
 
@@ -379,11 +377,11 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
                 f" {self.tokenizer_max_length} tokens: {removed_text}"
             )
         prompt_embeds = text_encoder(text_input_ids.to(self.device), output_hidden_states=True)
-        pooled_prompt_embeds = prompt_embeds[0]
+        pooled_prompt_embeds = prompt_embeds[0].to(dtype=self.od_config.dtype, device=self.device)
 
         prompt_embeds = prompt_embeds.hidden_states[-2]
 
-        prompt_embeds = prompt_embeds.to(dtype=self.text_encoder.dtype, device=self.device)
+        prompt_embeds = prompt_embeds.to(dtype=self.od_config.dtype, device=self.device)
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
@@ -398,9 +396,10 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         num_images_per_prompt: int = 1,
         max_sequence_length: int = 256,
         dtype: torch.dtype | None = None,
-    ):
-        dtype = dtype or (self.text_encoder_3.dtype if self.text_encoder_3 is not None else self.od_config.dtype)
-
+    ) -> torch.Tensor:
+        embedding_dtype = dtype or (
+            self.text_encoder_3.dtype if self.text_encoder_3 is not None else self.od_config.dtype
+        )
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
 
@@ -412,7 +411,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
                     self.transformer.joint_attention_dim,
                 ),
                 device=self.device,
-                dtype=dtype,
+                dtype=embedding_dtype,
             )
 
         text_inputs = self.tokenizer_3(
@@ -435,8 +434,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
         prompt_embeds = self.text_encoder_3(text_input_ids.to(self.device))[0]
 
-        dtype = self.text_encoder_3.dtype
-        prompt_embeds = prompt_embeds.to(dtype=dtype, device=self.device)
+        prompt_embeds = prompt_embeds.to(dtype=embedding_dtype, device=self.device)
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
@@ -513,13 +511,11 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         num_channels_latents,
         height,
         width,
-        dtype,
-        device,
         generator,
         latents=None,
     ) -> torch.Tensor:
         if latents is not None:
-            return latents.to(device=device, dtype=dtype)
+            return latents.to(device=self.device, dtype=self.od_config.dtype)
 
         shape = (
             batch_size,
@@ -534,7 +530,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
                 f" size of {batch_size}. Make sure the batch size matches the length of the generators."
             )
 
-        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        latents = randn_tensor(shape, generator=generator, device=self.device, dtype=self.od_config.dtype)
 
         return latents
 
@@ -578,9 +574,9 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         latents: torch.Tensor,
         timesteps: torch.Tensor,
         prompt_embeds: torch.Tensor,
-        pooled_prompt_embeds: torch.Tensor,
-        negative_prompt_embeds: torch.Tensor,
-        negative_pooled_prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: torch.Tensor | None,
+        negative_prompt_embeds: torch.Tensor | None,
+        negative_pooled_prompt_embeds: torch.Tensor | None,
         do_true_cfg: bool,
         guidance_scale: float,
         cfg_normalize: bool = False,
@@ -610,8 +606,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             self._current_timestep = t
 
             # Broadcast timestep to match batch size
-            timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
-
+            timestep = t.expand(latents.shape[0]).to(device=self.device, dtype=self.od_config.dtype)
             positive_kwargs = {
                 "hidden_states": latents,
                 "timestep": timestep,
@@ -760,8 +755,6 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
             num_channels_latents,
             height,
             width,
-            compute_dtype,
-            self.device,
             generator,
             latents,
         )
@@ -792,6 +785,7 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         if self.output_type == "latent":
             image = latents
         else:
+            # Ensure the latents are the same dtype as the VAE for decode
             latents = latents.to(self.vae.dtype)
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
 

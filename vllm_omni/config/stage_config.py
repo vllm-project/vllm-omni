@@ -286,28 +286,23 @@ class _LazyPipelineRegistry:
 
         try:
             module = importlib.import_module(module_path)
-        except ImportError as exc:
-            logger.error(
-                "Failed to import pipeline module %r for %r: %s",
-                module_path,
-                model_type,
-                exc,
-            )
+            pipeline = getattr(module, var_name, None)
+            if pipeline is None:
+                logger.error(
+                    "Pipeline variable %r not found in module %r (registered for %r)",
+                    var_name,
+                    module_path,
+                    model_type,
+                )
+                return None
+            errors = pipeline.validate()
+            if errors:
+                logger.warning("Pipeline %s has issues: %s", pipeline.model_type, errors)
+            self._loaded[model_type] = pipeline
+            return pipeline
+        except Exception:
+            logger.exception("Failed to import pipeline module %r for %r", module_path, model_type)
             return None
-        pipeline = getattr(module, var_name, None)
-        if pipeline is None:
-            logger.error(
-                "Pipeline variable %r not found in module %r (registered for %r)",
-                var_name,
-                module_path,
-                model_type,
-            )
-            return None
-        errors = pipeline.validate()
-        if errors:
-            logger.warning("Pipeline %s has issues: %s", pipeline.model_type, errors)
-        self._loaded[model_type] = pipeline
-        return pipeline
 
     def __contains__(self, model_type: str) -> bool:
         if model_type in self._loaded:
@@ -353,14 +348,23 @@ class _LazyPipelineRegistry:
     def keys(self) -> set[str]:
         return set(self._get_lazy_map().keys()) | set(self._loaded.keys())
 
+    def _safe_get(self, key: str) -> PipelineConfig | None:
+        try:
+            return self[key]
+        except Exception:
+            logger.warning("Skipping pipeline %r because it failed to load.", key)
+        return None
+
     def values(self):
-        # Iterating values forces load of every lazy pipeline.
+        # Iterating forces a lazy import for each pipeline; failures are logged and skipped.
         for key in self.keys():
-            yield self[key]
+            if (p := self._safe_get(key)) is not None:
+                yield p
 
     def items(self):
         for key in self.keys():
-            yield key, self[key]
+            if (p := self._safe_get(key)) is not None:
+                yield key, p
 
     def __iter__(self):
         return iter(self.keys())
@@ -403,6 +407,7 @@ class StageDeployConfig:
     # Stage identity and Omni runtime placement.
     stage_id: int
     devices: str | None = None
+    num_replicas: int = 1
 
     # Inter-stage connector wiring and request defaults.
     output_connectors: dict[str, str] | None = None
@@ -472,6 +477,7 @@ _STAGE_NON_ENGINE_KEYS = frozenset(
     {
         "stage_id",
         "devices",
+        "num_replicas",
         "output_connectors",
         "input_connectors",
         "default_sampling_params",
@@ -486,13 +492,20 @@ _STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name n
 def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     """Parse a single stage entry from deploy YAML into StageDeployConfig."""
     if "engine_args" in stage_data:
+        runtime_cfg = dict(stage_data.get("runtime", {}))
         engine_args = dict(stage_data["engine_args"])
         devices = stage_data.get("runtime", {}).get("devices", stage_data.get("devices"))
+        num_replicas = runtime_cfg.get("num_replicas", stage_data.get("num_replicas", 1))
     else:
         engine_args = {k: v for k, v in stage_data.items() if k not in _STAGE_NON_ENGINE_KEYS and k != "stage_id"}
         devices = stage_data.get("devices")
+        num_replicas = stage_data.get("num_replicas", stage_data.get("runtime", {}).get("num_replicas", 1))
 
-    kwargs: dict[str, Any] = {"stage_id": stage_data["stage_id"], "devices": devices}
+    kwargs: dict[str, Any] = {
+        "stage_id": stage_data["stage_id"],
+        "devices": devices,
+        "num_replicas": int(num_replicas),
+    }
     for name, f in _STAGE_DEPLOY_FIELDS.items():
         if name in engine_args:
             kwargs[name] = engine_args.pop(name)
@@ -628,7 +641,11 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str
     the flat layout. ``devices`` is ``None`` when no override is set.
     """
     if "engine_args" in ps:
-        return dict(ps["engine_args"]), ps.get("runtime", {}).get("devices")
+        overrides = dict(ps["engine_args"])
+        runtime_cfg = ps.get("runtime", {})
+        if "num_replicas" in runtime_cfg:
+            overrides["num_replicas"] = runtime_cfg["num_replicas"]
+        return overrides, runtime_cfg.get("devices")
     overrides = {k: v for k, v in ps.items() if k not in ("stage_id", "devices")}
     return overrides, ps.get("devices")
 
@@ -660,6 +677,15 @@ def _apply_platform_overrides(
             base.devices = devices
         for key, val in overrides.items():
             if hasattr(base, key):
+                # Deep-merge dict-valued fields listed in _DEEP_MERGE_KEYS so
+                # platform overlays don't silently clobber sibling keys (e.g.
+                # setting default_sampling_params={max_tokens: 2048} must not
+                # drop temperature / top_p / top_k from the base stage).
+                if key in _DEEP_MERGE_KEYS and isinstance(val, dict):
+                    base_val = getattr(base, key, None)
+                    if isinstance(base_val, dict):
+                        setattr(base, key, {**base_val, **val})
+                        continue
                 setattr(base, key, val)
             else:
                 base.engine_extras[key] = val
@@ -833,8 +859,10 @@ def merge_pipeline_deploy(
             engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
         extras = _build_extras(ps, ds)
         runtime: dict[str, Any] = {"process": True}
-        if ds is not None and ds.devices is not None:
-            runtime["devices"] = ds.devices
+        if ds is not None:
+            if ds.devices is not None:
+                runtime["devices"] = ds.devices
+            runtime["num_replicas"] = ds.num_replicas
 
         result.append(
             StageConfig(

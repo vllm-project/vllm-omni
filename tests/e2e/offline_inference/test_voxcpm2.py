@@ -41,7 +41,8 @@ def _extract_audio(multimodal_output: dict) -> torch.Tensor:
 
 
 @pytest.mark.core_model
-@pytest.mark.omni
+@pytest.mark.advanced_model
+@pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_voxcpm2_zero_shot_001(voxcpm2_engine):
     """Test zero-shot TTS produces valid audio output."""
@@ -54,7 +55,8 @@ def test_voxcpm2_zero_shot_001(voxcpm2_engine):
 
 
 @pytest.mark.core_model
-@pytest.mark.omni
+@pytest.mark.advanced_model
+@pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_voxcpm2_voice_clone_002(voxcpm2_engine):
     """Test voice cloning with a reference audio file.
@@ -95,7 +97,8 @@ def test_voxcpm2_voice_clone_002(voxcpm2_engine):
 
 
 @pytest.mark.core_model
-@pytest.mark.omni
+@pytest.mark.advanced_model
+@pytest.mark.tts
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_voxcpm2_prefill_decode_mixed_batch_003(voxcpm2_engine):
     """Regression: prefill+decode mixed batch must not crash (PR #2903)."""

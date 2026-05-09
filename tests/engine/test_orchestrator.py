@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
 import queue
 import threading
 import time
@@ -16,8 +17,9 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.core_client import AsyncMPClient
 
-from vllm_omni.engine.orchestrator import Orchestrator
+from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
+from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -73,7 +75,7 @@ class FakeStageClient:
     def set_engine_outputs(self, outputs) -> None:
         return None
 
-    def process_engine_inputs(self, stage_list, prompt=None, streaming_context=None):
+    def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
         return list(self.next_inputs)
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
@@ -90,12 +92,33 @@ class FakeStageClient:
         self._diffusion_outputs.put_nowait(output)
 
 
+class FakeCollectiveRpcStageClient(FakeStageClient):
+    def __init__(self, *args, rpc_result: Any = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.rpc_result = rpc_result
+        self.collective_rpc_calls: list[tuple[str, float | None, tuple[Any, ...], dict[str, Any]]] = []
+
+    async def collective_rpc_async(
+        self,
+        *,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        normalized_kwargs = dict(kwargs or {})
+        self.collective_rpc_calls.append((method, timeout, args, normalized_kwargs))
+        return self.rpc_result
+
+
 class FakeOutputProcessor:
     def __init__(self, *, request_outputs: list[object] | None = None) -> None:
         self.request_outputs = list(request_outputs or [])
+        self.add_request_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.abort_calls: list[list[str]] = []
 
-    def add_request(self, *_args, **_kwargs) -> None:
+    def add_request(self, *args, **kwargs) -> None:
+        self.add_request_calls.append((args, kwargs))
         return None
 
     def process_outputs(self, *_args, **_kwargs):
@@ -185,17 +208,60 @@ def _build_request_output(
     )
 
 
+def _build_stage_pools(
+    stage_clients: list[list[FakeStageClient]],
+    *,
+    output_processors: list[FakeOutputProcessor] | None = None,
+    stage_vllm_configs: list[object] | None = None,
+) -> list[StagePool]:
+    """Build StagePool list from per-stage replica lists.
+
+    ``stage_clients[i]`` is the list of FakeStageClient replicas for stage i.
+    """
+    num_stages = len(stage_clients)
+    if output_processors is None:
+        output_processors = [FakeOutputProcessor() for _ in stage_clients]
+    if stage_vllm_configs is None:
+        stage_vllm_configs = [SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)) for _ in stage_clients]
+
+    pools: list[StagePool] = []
+    for stage_id in range(num_stages):
+        clients = stage_clients[stage_id]
+        if clients[0].stage_type == "diffusion":
+            pools.append(StagePool(stage_id, clients[0]))
+        else:
+            pools.append(
+                StagePool(
+                    stage_id,
+                    clients,
+                    output_processor=output_processors[stage_id],
+                    stage_vllm_config=stage_vllm_configs[stage_id],
+                )
+            )
+    return pools
+
+
 def _build_harness(
     stage_clients: list[object],
     *,
     output_processors: list[object] | None = None,
     stage_vllm_configs: list[object] | None = None,
     async_chunk: bool = False,
+    stage_pools: list[StagePool] | None = None,
 ) -> OrchestratorFixture:
-    if output_processors is None:
-        output_processors = [FakeOutputProcessor() for _ in stage_clients]
-    if stage_vllm_configs is None:
-        stage_vllm_configs = [SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)) for _ in stage_clients]
+    """Build an Orchestrator test harness.
+
+    Accepts either pre-built ``stage_pools`` or flat lists of single-replica
+    clients/processors.
+    """
+    if stage_pools is None:
+        # Wrap flat lists into per-stage single-replica lists.
+        nested_clients = [[c] for c in stage_clients]
+        stage_pools = _build_stage_pools(
+            nested_clients,
+            output_processors=output_processors,
+            stage_vllm_configs=stage_vllm_configs,
+        )
 
     ready_future: concurrent.futures.Future[tuple[Orchestrator, janus.Queue, janus.Queue, janus.Queue]] = (
         concurrent.futures.Future()
@@ -214,9 +280,7 @@ def _build_harness(
                 request_async_queue=request_queue.async_q,
                 output_async_queue=output_queue.async_q,
                 rpc_async_queue=rpc_queue.async_q,
-                stage_clients=stage_clients,
-                output_processors=output_processors,
-                stage_vllm_configs=stage_vllm_configs,
+                stage_pools=stage_pools,
                 async_chunk=async_chunk,
             )
             ready_future.set_result((orchestrator, request_queue, output_queue, rpc_queue))
@@ -281,6 +345,18 @@ async def _get_output_message(orchestrator_fixture: OrchestratorFixture, *, time
             continue
         if msg.get("type") == "output":
             return msg
+
+
+async def _get_rpc_message(orchestrator_fixture: OrchestratorFixture, *, timeout: float = 2.0) -> dict:
+    deadline = time.monotonic() + timeout
+    rpc_sync_q = orchestrator_fixture.queues[2].sync_q
+    while True:
+        if time.monotonic() >= deadline:
+            raise AssertionError("Timed out waiting for orchestrator rpc output")
+        try:
+            return rpc_sync_q.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.01)
 
 
 async def _enqueue_add_request(
@@ -385,6 +461,11 @@ def orchestrator_factory():
             fixture.thread.join(timeout=5)
         for q in fixture.queues:
             q.close()
+
+
+# ---------------------------------------------------------------------------
+# Existing single-replica tests (adapted to StagePool interface)
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -600,12 +681,425 @@ async def test_run_abort(orchestrator_factory) -> None:
         await _wait_for(lambda: len(stages[0].add_request_calls) == 1)
 
         await _enqueue_abort_request(orchestrator_fixture, ["req-abort"])
-        await _wait_for(lambda: all(stage.abort_calls for stage in stages))
+        await _wait_for(lambda: bool(stages[0].abort_calls))
 
-        for stage in stages:
-            assert stage.abort_calls == [["req-abort"]]
-        for proc in processors:
-            assert proc.abort_calls == [["req-abort"]]
+        assert stages[0].abort_calls == [["req-abort"]]
+        assert stages[1].abort_calls == []
         assert "req-abort" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+# ---------------------------------------------------------------------------
+# Multi-replica tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_multi_replica_round_robin_distribution(orchestrator_factory) -> None:
+    """Two replicas at stage-0, single replica at stage-1.
+
+    Send two requests — they should land on different stage-0 replicas
+    (round-robin), then both forward to the single stage-1 replica.
+    """
+    stage0_r0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_r1 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(
+        stage_type="llm",
+        final_output=True,
+        next_inputs=[{"prompt_token_ids": [7, 8]}],
+    )
+
+    proc0 = FakeOutputProcessor(request_outputs=[_build_request_output("req-0", token_ids=[3], finished=True)])
+    proc1 = FakeOutputProcessor(request_outputs=[_build_request_output("req-0", token_ids=[10], finished=True)])
+
+    default_vllm_cfg = SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))
+    stage_pools = _build_stage_pools(
+        [[stage0_r0, stage0_r1], [stage1]],
+        output_processors=[proc0, proc1],
+        stage_vllm_configs=[default_vllm_cfg, default_vllm_cfg],
+    )
+
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        # Request 0 → should land on replica 0 (RR starts at 0)
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-0",
+            prompt=SimpleNamespace(request_id="req-0", prompt_token_ids=[1, 2]),
+            original_prompt={"prompt": "hello 0"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        await _wait_for(lambda: len(stage0_r0.add_request_calls) == 1)
+        assert len(stage0_r1.add_request_calls) == 0
+
+        # Request 1 → should land on replica 1 (RR advances)
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-1",
+            prompt=SimpleNamespace(request_id="req-1", prompt_token_ids=[5, 6]),
+            original_prompt={"prompt": "hello 1"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        await _wait_for(lambda: len(stage0_r1.add_request_calls) == 1)
+        assert len(stage0_r0.add_request_calls) == 1  # unchanged
+
+        # Complete req-0 at stage-0 replica-0 → should forward to stage-1
+        stage0_r0.push_engine_core_outputs(_engine_core_outputs("s0r0-raw", 1.0))
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        assert stage1.add_request_calls[0][0].request_id == "req-0"
+
+        # Complete req-0 at stage-1 → final output
+        proc1.request_outputs = [_build_request_output("req-0", token_ids=[10], finished=True)]
+        stage1.push_engine_core_outputs(_engine_core_outputs("s1-raw", 2.0))
+        output_msg = await _get_output_message(orchestrator_fixture)
+
+        assert output_msg["request_id"] == "req-0"
+        assert output_msg["stage_id"] == 1
+        assert output_msg["finished"] is True
+        assert "req-0" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_multi_replica_abort_broadcasts_to_all_replicas(orchestrator_factory) -> None:
+    """Abort must be sent to every replica across all stages."""
+    stage0_r0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_r1 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+
+    proc0 = FakeOutputProcessor()
+    proc1 = FakeOutputProcessor()
+
+    default_vllm_cfg = SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))
+    stage_pools = _build_stage_pools(
+        [[stage0_r0, stage0_r1], [stage1]],
+        output_processors=[proc0, proc1],
+        stage_vllm_configs=[default_vllm_cfg, default_vllm_cfg],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-abort-mr",
+            prompt=SimpleNamespace(request_id="req-abort-mr", prompt_token_ids=[1]),
+            original_prompt={"prompt": "cancel"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        await _wait_for(lambda: len(stage0_r0.add_request_calls) == 1)
+
+        await _enqueue_abort_request(orchestrator_fixture, ["req-abort-mr"])
+        await _wait_for(lambda: bool(stage0_r0.abort_calls))
+
+        assert stage0_r0.abort_calls == [["req-abort-mr"]]
+        assert stage0_r1.abort_calls == []
+        assert stage1.abort_calls == []
+        assert "req-abort-mr" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_multi_replica_shutdown_all_replicas(orchestrator_factory) -> None:
+    """Shutdown must shut down every replica across all stages."""
+    stage0_r0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_r1 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(stage_type="llm", final_output=True)
+
+    default_vllm_cfg = SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))
+    stage_pools = _build_stage_pools(
+        [[stage0_r0, stage0_r1], [stage1]],
+        stage_vllm_configs=[default_vllm_cfg, default_vllm_cfg],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    await _shutdown_orchestrator(orchestrator_fixture)
+
+    assert not orchestrator_fixture.thread.is_alive()
+    for client in [stage0_r0, stage0_r1, stage1]:
+        assert client.shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_submit_update_reuses_existing_binding() -> None:
+    """A request admitted to one replica must keep using that replica on updates."""
+    stage0_r0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_r1 = FakeStageClient(stage_type="llm", final_output=False)
+    pool = StagePool(
+        0,
+        [stage0_r0, stage0_r1],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+
+    req0_state = OrchestratorRequestState(
+        request_id="req-0",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+    req1_state = OrchestratorRequestState(
+        request_id="req-1",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+
+    await pool.submit_initial("req-0", req0_state, SimpleNamespace(request_id="req-0", prompt_token_ids=[1, 2]))
+    await pool.submit_update("req-0", req0_state, SimpleNamespace(request_id="req-0", prompt_token_ids=[3]))
+    await pool.submit_initial("req-1", req1_state, SimpleNamespace(request_id="req-1", prompt_token_ids=[4, 5]))
+    await pool.submit_update("req-1", req1_state, SimpleNamespace(request_id="req-1", prompt_token_ids=[6]))
+
+    assert pool.get_bound_replica_id("req-0") == 0
+    assert pool.get_bound_replica_id("req-1") == 1
+    assert len(stage0_r0.add_request_calls) == 2
+    assert len(stage0_r1.add_request_calls) == 2
+    assert stage0_r0.add_request_calls[0][0].request_id == "req-0"
+    assert stage0_r0.add_request_calls[1][0].request_id == "req-0"
+    assert stage0_r1.add_request_calls[0][0].request_id == "req-1"
+    assert stage0_r1.add_request_calls[1][0].request_id == "req-1"
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_submit_update_refreshes_output_processor_state() -> None:
+    output_processor = FakeOutputProcessor()
+
+    class AssertingStageClient(FakeStageClient):
+        async def add_request_async(self, *args, **kwargs) -> None:
+            if len(self.add_request_calls) == 1:
+                prompts = [call_kwargs["prompt"] for _, call_kwargs in output_processor.add_request_calls]
+                assert prompts == ["seg-1", "seg-2"]
+            await super().add_request_async(*args, **kwargs)
+
+    stage0 = AssertingStageClient(stage_type="llm", final_output=False)
+    pool = StagePool(
+        0,
+        [stage0],
+        output_processor=output_processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    req_state = OrchestratorRequestState(
+        request_id="req-0",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+
+    await pool.submit_initial(
+        "req-0",
+        req_state,
+        SimpleNamespace(request_id="req-0", prompt_token_ids=[1, 2]),
+        prompt_text="seg-1",
+    )
+    await pool.submit_update(
+        "req-0",
+        req_state,
+        SimpleNamespace(request_id="req-0", prompt_token_ids=[3], resumable=True),
+        prompt_text="seg-2",
+    )
+
+    assert len(output_processor.add_request_calls) == 2
+    assert output_processor.add_request_calls[1][1]["prompt"] == "seg-2"
+
+
+@pytest.mark.asyncio
+async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> None:
+    class RecordingPool:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, Any]] = []
+
+        async def submit_update(self, request_id, req_state, request, *, prompt_text=None) -> int:
+            self.calls.append((request_id, prompt_text))
+            return 0
+
+    pool = RecordingPool()
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.request_states = {
+        "req-stream": OrchestratorRequestState(
+            request_id="req-stream",
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+        )
+    }
+    orchestrator.stage_pools = [pool]
+
+    await orchestrator._handle_streaming_update(
+        {
+            "request_id": "req-stream",
+            "prompt": SimpleNamespace(request_id="req-stream", prompt_token_ids=[1], resumable=True),
+            "sampling_params_list": [_sampling_params()],
+            "output_prompt_text": "segment-2",
+        }
+    )
+
+    assert pool.calls == [("req-stream", "segment-2")]
+    assert orchestrator.request_states["req-stream"].streaming.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_submit_initial_rolls_back_output_processor_when_client_submit_fails() -> None:
+    class FailingStageClient(FakeStageClient):
+        async def add_request_async(self, *args, **_kwargs) -> None:
+            raise RuntimeError("submit failed")
+
+    class TrackingOutputProcessor(FakeOutputProcessor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.added_request_ids: list[str] = []
+            self.removed_request_ids: list[str] = []
+
+        def add_request(self, request, *_args, **_kwargs) -> None:
+            self.added_request_ids.append(request.request_id)
+
+        def remove_request(self, request_id: str) -> None:
+            self.removed_request_ids.append(request_id)
+
+    client = FailingStageClient(stage_type="llm", final_output=False)
+    output_processor = TrackingOutputProcessor()
+    pool = StagePool(
+        0,
+        [client],
+        output_processor=output_processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    req_state = OrchestratorRequestState(
+        request_id="req-0",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+
+    with pytest.raises(RuntimeError, match="submit failed"):
+        await pool.submit_initial("req-0", req_state, SimpleNamespace(request_id="req-0", prompt_token_ids=[1, 2]))
+
+    assert output_processor.added_request_ids == ["req-0"]
+    assert output_processor.removed_request_ids == ["req-0"]
+    assert pool.get_bound_replica_id("req-0") is None
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_abort_requests_logs_when_binding_is_missing(caplog) -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    pool = StagePool(
+        0,
+        [stage0],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+
+    target_logger = logging.getLogger("vllm_omni.engine.stage_pool")
+    target_logger.addHandler(caplog.handler)
+    prev_level = target_logger.level
+    target_logger.setLevel(logging.DEBUG)
+    try:
+        await pool.abort_requests(["missing-req"])
+    finally:
+        target_logger.removeHandler(caplog.handler)
+        target_logger.setLevel(prev_level)
+
+    assert not stage0.abort_calls
+    assert "abort: no binding for req=missing-req in stage-0" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_collective_rpc_ignores_invalid_stage_ids(orchestrator_factory, caplog) -> None:
+    stage0 = FakeCollectiveRpcStageClient(stage_type="llm", final_output=True, rpc_result={"stage": 0})
+    stage1 = FakeCollectiveRpcStageClient(stage_type="llm", final_output=True, rpc_result={"stage": 1})
+    stage_pools = _build_stage_pools(
+        [[stage0], [stage1]],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        target_logger = logging.getLogger("vllm_omni.engine.orchestrator")
+        target_logger.addHandler(caplog.handler)
+        prev_level = target_logger.level
+        target_logger.setLevel(logging.WARNING)
+        try:
+            orchestrator_fixture.request_sync_q.put_nowait(
+                {
+                    "type": "collective_rpc",
+                    "rpc_id": "rpc-1",
+                    "method": "list_loras",
+                    "stage_ids": [99, 1],
+                }
+            )
+
+            msg = await _get_rpc_message(orchestrator_fixture)
+        finally:
+            target_logger.removeHandler(caplog.handler)
+            target_logger.setLevel(prev_level)
+
+        assert msg["type"] == "collective_rpc_result"
+        assert msg["rpc_id"] == "rpc-1"
+        assert msg["stage_ids"] == [1]
+        assert msg["results"] == [{"stage": 1}]
+        assert not stage0.collective_rpc_calls
+        assert len(stage1.collective_rpc_calls) == 1
+        assert "collective_rpc: ignoring invalid stage_id 99" in caplog.text
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator_factory) -> None:
+    """CFG companions should be routed to the same stage-0 replica as their parent."""
+    stage0_r0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_r1 = FakeStageClient(stage_type="llm", final_output=False)
+    default_vllm_cfg = SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))
+    stage_pools = _build_stage_pools(
+        [[stage0_r0, stage0_r1]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[default_vllm_cfg],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        # Consume replica-0 first so the parent request binds to replica-1.
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="warmup",
+            prompt=SimpleNamespace(request_id="warmup", prompt_token_ids=[0]),
+            original_prompt={"prompt": "warmup"},
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+        )
+        await _wait_for(lambda: len(stage0_r0.add_request_calls) == 1)
+
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="parent",
+            prompt=SimpleNamespace(request_id="parent", prompt_token_ids=[1, 2]),
+            original_prompt={"prompt": "parent"},
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+        )
+        await _wait_for(lambda: len(stage0_r1.add_request_calls) == 1)
+
+        orchestrator_fixture.request_sync_q.put_nowait(
+            {
+                "type": "add_companion_request",
+                "companion_id": "parent-neg",
+                "parent_id": "parent",
+                "role": "negative",
+                "prompt": SimpleNamespace(request_id="parent-neg", prompt_token_ids=[9]),
+                "companion_prompt_text": {"prompt": "negative"},
+                "sampling_params_list": [_sampling_params()],
+            }
+        )
+        await _wait_for(lambda: len(stage0_r1.add_request_calls) == 2)
+
+        assert stage_pools[0].get_bound_replica_id("parent") == 1
+        assert stage_pools[0].get_bound_replica_id("parent-neg") == 1
+        assert len(stage0_r0.add_request_calls) == 1
+        assert stage0_r1.add_request_calls[0][0].request_id == "parent"
+        assert stage0_r1.add_request_calls[1][0].request_id == "parent-neg"
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)

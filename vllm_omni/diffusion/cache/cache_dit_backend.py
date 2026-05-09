@@ -1383,6 +1383,61 @@ def enable_cache_for_ernie_image(pipeline: Any, cache_config: Any) -> Callable[[
     return refresh_cache_context
 
 
+def enable_cache_for_hunyuan_video_15(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+    """Enable cache-dit for HunyuanVideo 1.5 pipeline.
+
+    HunyuanVideo 1.5 uses a single transformer with has_separate_cfg=True
+    (separate conditional/unconditional forward passes). The _sp_plan scatter
+    is applied at the transformer input boundary (empty-string key), so CacheDiT
+    sees already-sharded hidden_states throughout transformer_blocks.
+    """
+    db_cache_config = _build_db_cache_config(cache_config)
+
+    calibrator_config = None
+    if cache_config.enable_taylorseer:
+        taylorseer_order = cache_config.taylorseer_order
+        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
+        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
+
+    logger.info(
+        f"Enabling cache-dit on HunyuanVideo15 transformer: "
+        f"Fn={db_cache_config.Fn_compute_blocks}, "
+        f"Bn={db_cache_config.Bn_compute_blocks}, "
+        f"W={db_cache_config.max_warmup_steps}, "
+    )
+
+    cache_dit.enable_cache(
+        BlockAdapter(
+            transformer=pipeline.transformer,
+            blocks=pipeline.transformer.transformer_blocks,
+            forward_pattern=ForwardPattern.Pattern_0,
+            check_forward_pattern=True,
+            has_separate_cfg=True,
+        ),
+        cache_config=db_cache_config,
+        calibrator_config=calibrator_config,
+    )
+
+    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+        if cache_config.scm_steps_mask_policy is None:
+            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+        else:
+            cache_dit.refresh_context(
+                pipeline.transformer,
+                cache_config=DBCacheConfig().reset(
+                    num_inference_steps=num_inference_steps,
+                    steps_computation_mask=cache_dit.steps_mask(
+                        mask_policy=cache_config.scm_steps_mask_policy,
+                        total_steps=num_inference_steps,
+                    ),
+                    steps_computation_policy=cache_config.scm_steps_policy,
+                ),
+                verbose=verbose,
+            )
+
+    return refresh_cache_context
+
+
 # Register custom cache-dit enablers after function definitions
 CUSTOM_DIT_ENABLERS.update(
     {
@@ -1406,6 +1461,8 @@ CUSTOM_DIT_ENABLERS.update(
         "GlmImagePipeline": enable_cache_for_glm_image,
         "Flux2Pipeline": enable_cache_for_flux2,
         "ErnieImagePipeline": enable_cache_for_ernie_image,
+        "HunyuanVideo15Pipeline": enable_cache_for_hunyuan_video_15,
+        "HunyuanVideo15I2VPipeline": enable_cache_for_hunyuan_video_15,
     }
 )
 

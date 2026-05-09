@@ -314,9 +314,7 @@ def test_compute_capture_sizes(kwargs, expected_in, not_expected):
 )
 def test_snakebeta_triton_vs_eager(batch, channels, seq_len):
     """Fused Triton SnakeBeta kernel must match eager PyTorch output."""
-    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
-        SnakeBeta,
-    )
+    from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 
     if not SnakeBeta._init_triton():
         pytest.skip("Triton not available")

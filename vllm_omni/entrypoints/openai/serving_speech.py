@@ -359,6 +359,46 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._build_fish_speech_prompt_async = make_async(self._build_fish_speech_prompt, executor=self._tts_executor)
         self._estimate_prompt_len_async = make_async(self._estimate_prompt_len, executor=self._tts_executor)
 
+    async def warmup(self) -> None:
+        """Run a synthetic speech request to trigger all first-request warmup.
+
+        Unlike qwen3-tts, whose CUDA Graph warmup targets a standalone tokenizer
+        decoder (no vLLM dependencies) and can complete entirely at model-init
+        time, VoxCPM2 needs to warm up PagedAttention scaffold/residual LLMs.
+        Their CUDA Graph capture requires a vLLM ``ForwardContext``
+        (attn_metadata, slot_mapping, etc.) that only exists during real
+        inference steps.  The same request also pays the one-time torch.compile
+        JIT tax for the LocDiT estimator, feat_encoder, AudioVAE decoder, and
+        projection helpers.
+
+        For VoxCPM2 this shifts ~15s of torch.compile + CUDA Graph capture from
+        the first user request to server startup.
+        """
+        if self._tts_model_type != "voxcpm2":
+            return
+
+        t0 = time.time()
+        logger.info("Running warmup speech request for model_type=%s", self._tts_model_type)
+        # VoxCPM2 has no predefined speaker presets — "default" means zero-shot
+        # mode (no voice cloning).  The voice field is required by the OpenAI
+        # API schema but semantically ignored by the model.
+        warmup_req = OpenAICreateSpeechRequest(
+            input="Warmup.",
+            voice="default",
+            response_format="wav",
+            speed=1.0,
+            stream=False,
+            model=self.model_name,
+        )
+        try:
+            _audio_bytes, _media_type = await self._generate_audio_bytes(warmup_req, request_id="speech-warmup")
+        except Exception as exc:
+            logger.warning("Speech warmup failed (non-fatal): %s", exc)
+            return
+
+        elapsed = time.time() - t0
+        logger.info("Speech warmup complete in %.1fs", elapsed)
+
     def _get_qwen_tts_expected_speaker_embedding_dim(self) -> int | None:
         """Return the loaded Qwen3-TTS speaker embedding dim, if known.
 
@@ -491,6 +531,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         try:
             if self._tts_model_type == "voxcpm":
                 return set()
+            if self._tts_model_type == "voxcpm2":
+                return {"default"}
             if self._tts_model_type == "voxtral_tts":
                 config = self.engine_client.model_config.hf_config.audio_config
             else:
