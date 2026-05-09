@@ -18,6 +18,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig
 
 class Qwen2_5OmniTalkerForConditionalGeneration(
     nn.Module,
@@ -41,6 +42,8 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
         super().__init__()
         config: Qwen2_5OmniTalkerConfig = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        if isinstance(quant_config, ComponentQuantizationConfig):
+            quant_config = quant_config.resolve("talker")
         self.vllm_config = vllm_config
         self.prefix = prefix
         self.quant_config = quant_config
