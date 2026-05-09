@@ -388,8 +388,9 @@ class TestErrorHandling:
         engine = _make_engine_client()
 
         async def empty_gen(*args, **kwargs):
-            for _ in []:
+            if False:
                 yield
+            return
 
         engine.generate = MagicMock(side_effect=empty_gen)
         server = _make_server(engine_client=engine)
@@ -447,7 +448,7 @@ class TestErrorHandling:
         engine = _make_engine_client()
 
         async def gen_value_error(*args, **kwargs):
-            for _ in []:
+            if False:
                 yield
             raise ValueError("bad value")
 
@@ -463,7 +464,7 @@ class TestErrorHandling:
         engine = _make_engine_client()
 
         async def gen_runtime_error(*args, **kwargs):
-            for _ in []:
+            if False:
                 yield
             raise RuntimeError("something went wrong")
 
