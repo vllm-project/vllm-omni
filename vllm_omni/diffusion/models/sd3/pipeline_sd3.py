@@ -250,8 +250,8 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         self._sd3_fp8_vram_extras = quant_config_is_fp8(od_config.quantization_config)
 
     def _sd3_fp8_maybe_empty_cuda_cache(self) -> None:
-        if self._sd3_fp8_vram_extras and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if self._sd3_fp8_vram_extras and torch.accelerator.is_available():
+            torch.accelerator.empty_cache()
 
     def _ensure_text_encoders_on_device(self) -> None:
         dev = self.device
