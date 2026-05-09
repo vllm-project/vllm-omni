@@ -312,16 +312,19 @@ def test_compute_capture_sizes(kwargs, expected_in, not_expected):
     "batch,channels,seq_len",
     [(2, 64, 1000), (1, 32, 1), (1, 32, 7), (1, 32, 128), (1, 32, 1024), (1, 32, 4096)],
 )
-def test_snakebeta_triton_vs_eager(batch, channels, seq_len):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_snakebeta_triton_vs_eager(batch, channels, seq_len, dtype):
     """Fused Triton SnakeBeta kernel must match eager PyTorch output."""
     from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 
     if not SnakeBeta._init_triton():
         pytest.skip("Triton not available")
+    if dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        pytest.skip("bf16 not supported on this CUDA device")
 
     torch.manual_seed(42)
     snake = SnakeBeta(in_features=channels).to(DEVICE).eval()
-    x = torch.randn(batch, channels, seq_len, device=DEVICE)
+    x = torch.randn(batch, channels, seq_len, device=DEVICE, dtype=dtype)
 
     with torch.no_grad():
         eager_out = snake._eager_forward(x)

@@ -58,9 +58,11 @@ class SnakeBeta(nn.Module):
             t_off = tl.program_id(2) * block_t + tl.arange(0, block_t)
             mask = t_off < t_len
 
-            x = tl.load(x_ptr + bid * stride_b + cid * stride_c + t_off, mask=mask, other=0.0)
-            ea = tl.load(exp_alpha_ptr + cid)
-            ib = tl.load(inv_beta_ptr + cid)
+            # tl.sin in Triton expects fp32/fp64 inputs. Cast explicitly so bf16
+            # activations don't fail at compile time.
+            x = tl.load(x_ptr + bid * stride_b + cid * stride_c + t_off, mask=mask, other=0.0).to(tl.float32)
+            ea = tl.load(exp_alpha_ptr + cid).to(tl.float32)
+            ib = tl.load(inv_beta_ptr + cid).to(tl.float32)
             sin_val = tl.sin(x * ea)
             result = x + ib * sin_val * sin_val
 
