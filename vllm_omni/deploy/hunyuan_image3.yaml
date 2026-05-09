@@ -5,6 +5,17 @@
 pipeline: hunyuan_image3
 async_chunk: false
 
+connectors:
+  rdma_connector:
+    name: MooncakeTransferEngineConnector
+    extra:
+      host: "auto"
+      zmq_port: 50051
+      protocol: "rdma"
+      device_name: ""
+      memory_pool_size: 4294967296
+      memory_pool_device: "cpu"
+
 stages:
   - stage_id: 0
     max_num_seqs: 1
@@ -18,6 +29,10 @@ stages:
       rope_parameters:
         mrope_section: [0, 32, 32]
         rope_type: default
+    omni_kv_config:
+      need_send_cache: true
+    output_connectors:
+      to_stage_1: rdma_connector
     default_sampling_params:
       temperature: 0.6
       top_p: 0.95
@@ -35,6 +50,8 @@ stages:
     cache_backend:
     cache_config:
     enable_cache_dit_summary: false
+    omni_kv_config:
+      need_recv_cache: true
     parallel_config:
       tensor_parallel_size: 4
       enable_expert_parallel: true
@@ -44,6 +61,8 @@ stages:
       vae_patch_parallel_size: 1
     default_sampling_params:
       seed: 42
+    input_connectors:
+      from_stage_0: rdma_connector
 
 edges:
   - from: 0
