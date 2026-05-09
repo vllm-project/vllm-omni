@@ -38,10 +38,6 @@ def clean_gpu_memory_between_tests(request):
     # after session autouse fixtures like ``default_env`` have run (RFC #2299).
     from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 
-    if request.node.get_closest_marker("cpu") is not None and request.node.get_closest_marker("cuda") is None:
-        yield
-        return
-
     print("\n=== PRE-TEST GPU CLEANUP ===")
     run_pre_test_cleanup()
     yield
