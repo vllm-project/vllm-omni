@@ -258,6 +258,22 @@ class OmniWeavingPipeline(
         # `sampling_params.extra_args['flow_shift']`. Reset in `forward` before `set_timesteps`.
         self._default_scheduler_shift = float(getattr(self.scheduler, "_shift", 1.0))
 
+        # When model_index.json is absent (Tencent-format repos), OmniDiffusionConfig falls back
+        # to the top-level config.json which lacks transformer-specific keys like `deepstack`.
+        # Patch only the missing keys from transformer/config.json into the existing tf_model_config.
+        if not getattr(od_config.tf_model_config, "deepstack", None):
+            import json as _json
+
+            _tf_cfg_path = os.path.join(od_config.model, "transformer", "config.json")
+            if os.path.isfile(_tf_cfg_path):
+                _tf_cfg = _json.loads(open(_tf_cfg_path).read())
+                if _tf_cfg.get("deepstack"):
+                    od_config.tf_model_config.params["deepstack"] = _tf_cfg["deepstack"]
+                    logger.info(
+                        "OmniWeaving: patched deepstack=%s from transformer/config.json",
+                        od_config.tf_model_config.get("deepstack"),
+                    )
+
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, HunyuanVideo15Transformer3DModel)
         self.transformer = HunyuanVideo15Transformer3DModel(od_config=od_config, **transformer_kwargs)
         self.use_meanflow = getattr(od_config.tf_model_config, "use_meanflow", False)
@@ -552,6 +568,184 @@ class OmniWeavingPipeline(
             attention_mask,
         )
 
+    def _extract_deepstack_from_outputs(
+        self,
+        outputs: Any,
+        attention_mask: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        crop_start: int,
+        deepstack_indices: list[int],
+        apply_setclip: bool,
+        setclip_token_id: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Extract and process deepstack hidden states from Qwen outputs.
+
+        Returns tensor of shape (num_deepstack_layers, B, L, D).
+        Mirrors official TextEncoder.encode deepstack path (lines 506-573).
+        """
+        # Stack selected hidden layers: (num_layers, B, full_seq, D)
+        stacked = torch.stack([outputs.hidden_states[i] for i in deepstack_indices], dim=0)
+        # Crop system/template prefix
+        stacked = stacked[:, :, crop_start:, :]
+        # Zero-out padding positions using the (already-cropped) attention_mask
+        stacked = stacked * attention_mask.unsqueeze(0).unsqueeze(-1)
+
+        if apply_setclip and input_ids is not None:
+            # Mirror official setclip path: find last occurrence of token_id per batch item,
+            # drop everything up to and including it (vision prefix removal).
+            num_layers, B, L, D = stacked.shape
+            device = stacked.device
+            all_slices: list[torch.Tensor] = []
+            for k in range(B):
+                mask = input_ids[k] == setclip_token_id
+                if mask.any():
+                    last_pos = int(mask.nonzero()[-1, 0].item())
+                    if last_pos < L - 1:
+                        all_slices.append(stacked[:, k, last_pos + 1 :])
+                    else:
+                        all_slices.append(stacked[:, k])
+                else:
+                    all_slices.append(stacked[:, k])
+            max_len = max(s.shape[1] for s in all_slices)
+            padded = torch.zeros(num_layers, B, max_len, D, device=device, dtype=stacked.dtype)
+            for i, s in enumerate(all_slices):
+                padded[:, i, : s.shape[1]] = s
+            stacked = padded
+
+        return stacked.to(dtype=dtype)
+
+    def _get_mllm_deepstack_hidden_states_text_only(
+        self,
+        prompt: list[str],
+        device: torch.device,
+        dtype: torch.dtype,
+        deepstack_indices: list[int],
+        num_hidden_layers_to_skip: int = 2,
+    ) -> torch.Tensor:
+        prompt_formatted = format_text_input(prompt, self.system_message)
+        text_inputs = self.tokenizer.apply_chat_template(
+            prompt_formatted,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            padding="max_length",
+            max_length=self.tokenizer_max_length + self.prompt_template_encode_start_idx,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_input_ids = text_inputs.input_ids.to(device=device)
+        prompt_attention_mask = text_inputs.attention_mask.to(device=device)
+        with torch.no_grad():
+            outputs = self.mllm(
+                input_ids=text_input_ids,
+                attention_mask=prompt_attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        crop_start = self.prompt_template_encode_start_idx
+        cropped_mask = prompt_attention_mask[:, crop_start:]
+        return self._extract_deepstack_from_outputs(
+            outputs,
+            cropped_mask,
+            None,
+            crop_start,
+            deepstack_indices,
+            apply_setclip=False,
+            setclip_token_id=0,
+            dtype=dtype,
+        )
+
+    def _get_mllm_deepstack_hidden_states_i2v_vision(
+        self,
+        prompt: list[str],
+        device: torch.device,
+        dtype: torch.dtype,
+        images: list[PIL.Image.Image],
+        deepstack_indices: list[int],
+        num_hidden_layers_to_skip: int = 2,
+    ) -> torch.Tensor:
+        assert self.qwen_processor is not None and self._process_vision_info is not None
+        system_block = {
+            "role": "system",
+            "content": [{"type": "text", "text": OMNIWEAVING_I2V_SYSTEM_MESSAGE}],
+        }
+        max_length = self.tokenizer_max_length + self._mllm_i2v_crop_start + self._mllm_i2v_vision_token_budget
+        batch_conversations: list[list[dict[str, Any]]] = []
+        text_for_proc: list[str] = []
+        tmax = self._mllm_i2v_qwen_thumbnail_max
+        for p, img in zip(prompt, images, strict=True):
+            txt = p if p else " "
+            vis = self._resize_pil_for_qwen_mllm(img, tmax)
+            user_block: dict[str, Any] = {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": vis},
+                    {"type": "text", "text": txt},
+                ],
+            }
+            conv = [system_block, user_block]
+            batch_conversations.append(conv)
+            text_for_proc.append(
+                self.qwen_processor.apply_chat_template(conv, tokenize=False, add_generation_prompt=True)
+            )
+        image_inputs, video_inputs = self._process_vision_info(batch_conversations)
+        proc_inputs = self.qwen_processor(
+            text=text_for_proc,
+            images=image_inputs,
+            videos=video_inputs,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=max_length,
+        )
+        model_kw = self._mllm_inputs_to_device(dict(proc_inputs), device)
+        fwd_kw = self._mllm_forward_kwargs(model_kw)
+        with torch.no_grad():
+            outputs = self.mllm(**fwd_kw, output_hidden_states=True, return_dict=True)
+        crop_start = self._mllm_i2v_crop_start
+        attention_mask = fwd_kw["attention_mask"]
+        input_ids = fwd_kw["input_ids"]
+        cropped_mask = attention_mask[:, crop_start:]
+        cropped_ids = input_ids[:, crop_start:]
+        apply_setclip = self._mllm_i2v_setclip and "pixel_values" in fwd_kw
+        return self._extract_deepstack_from_outputs(
+            outputs,
+            cropped_mask,
+            cropped_ids,
+            crop_start,
+            deepstack_indices,
+            apply_setclip=apply_setclip,
+            setclip_token_id=self._mllm_i2v_setclip_token_id,
+            dtype=dtype,
+        )
+
+    def _get_mllm_deepstack_hidden_states(
+        self,
+        prompt: list[str],
+        device: torch.device,
+        dtype: torch.dtype,
+        deepstack_indices: list[int],
+        images: list[PIL.Image.Image] | None = None,
+        num_hidden_layers_to_skip: int = 2,
+    ) -> torch.Tensor:
+        """Return deepstack tensor (num_layers, B, L, D) for the given prompts."""
+        use_i2v_vision = (
+            self._mllm_i2v_use_vision
+            and images is not None
+            and len(images) == len(prompt)
+            and all(im is not None for im in images)
+            and self.qwen_processor is not None
+            and self._process_vision_info is not None
+        )
+        if use_i2v_vision:
+            return self._get_mllm_deepstack_hidden_states_i2v_vision(
+                prompt, device, dtype, images, deepstack_indices, num_hidden_layers_to_skip
+            )
+        return self._get_mllm_deepstack_hidden_states_text_only(
+            prompt, device, dtype, deepstack_indices, num_hidden_layers_to_skip
+        )
+
     def _get_t5_2_prompt_embeds(
         self, prompt: list[str], device: torch.device, dtype: torch.dtype
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -601,6 +795,19 @@ class OmniWeavingPipeline(
         prompt_embeds_mask = prompt_embeds_mask.to(dtype=dtype)
         prompt_embeds_mask_2 = prompt_embeds_mask_2.to(dtype=dtype)
 
+        deepstack_indices: list[int] = list(getattr(self.transformer, "deep_stack", []))
+        deepstack_states: torch.Tensor | None = None
+        negative_deepstack_states: torch.Tensor | None = None
+        if deepstack_indices:
+            deepstack_states = self._get_mllm_deepstack_hidden_states(
+                prompt, device, dtype, deepstack_indices, images=mllm_images
+            )
+            logger.info(
+                "OmniWeaving deepstack: indices=%s, states_shape=%s",
+                deepstack_indices,
+                tuple(deepstack_states.shape),
+            )
+
         negative_prompt_embeds = None
         negative_prompt_embeds_mask = None
         negative_prompt_embeds_2 = None
@@ -626,6 +833,10 @@ class OmniWeavingPipeline(
             ) = self._get_t5_2_prompt_embeds(neg_p, device, dtype)
             negative_prompt_embeds_mask = negative_prompt_embeds_mask.to(dtype=dtype)
             negative_prompt_embeds_mask_2 = negative_prompt_embeds_mask_2.to(dtype=dtype)
+            if deepstack_indices:
+                negative_deepstack_states = self._get_mllm_deepstack_hidden_states(
+                    neg_p, device, dtype, deepstack_indices, images=neg_mllm_images
+                )
         return (
             prompt_embeds,
             prompt_embeds_mask,
@@ -635,6 +846,8 @@ class OmniWeavingPipeline(
             negative_prompt_embeds_mask,
             negative_prompt_embeds_2,
             negative_prompt_embeds_mask_2,
+            deepstack_states,
+            negative_deepstack_states,
         )
 
     def _get_image_embeds(self, image: PIL.Image.Image, device: torch.device) -> torch.Tensor:
@@ -790,6 +1003,7 @@ class OmniWeavingPipeline(
                     "encoder_hidden_states_2": enc_tuple[2],
                     "encoder_attention_mask_2": enc_tuple[3],
                     "image_embeds": image_embeds,
+                    "all_stack_text_states": enc_tuple[8],
                     "return_dict": False,
                 }
                 negative_kwargs = (
@@ -802,6 +1016,7 @@ class OmniWeavingPipeline(
                         "encoder_hidden_states_2": enc_tuple[6],
                         "encoder_attention_mask_2": enc_tuple[7],
                         "image_embeds": image_embeds,
+                        "all_stack_text_states": enc_tuple[9],
                         "return_dict": False,
                     }
                     if do_cfg and enc_tuple[4] is not None
@@ -987,6 +1202,12 @@ class OmniWeavingPipeline(
             map_k(f"{p}.img_mod.linear.bias", f"{t_p}.norm1.linear.bias")
             map_k(f"{p}.txt_mod.linear.weight", f"{t_p}.norm1_context.linear.weight")
             map_k(f"{p}.txt_mod.linear.bias", f"{t_p}.norm1_context.linear.bias")
+
+        # OmniWeaving deepstack projection (mm_in) — same key names on both sides
+        map_k("mm_in.linear_1.weight", "mm_in.linear_1.weight")
+        map_k("mm_in.linear_1.bias", "mm_in.linear_1.bias")
+        map_k("mm_in.linear_2.weight", "mm_in.linear_2.weight")
+        map_k("mm_in.linear_2.bias", "mm_in.linear_2.bias")
 
         # Single Blocks
         single_block_keys = set(k.split(".")[1] for k in raw_tf.keys() if k.startswith("single_blocks."))

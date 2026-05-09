@@ -279,6 +279,22 @@ class HunyuanVideo15TokenRefiner(nn.Module):
         return hidden_states
 
 
+class HunyuanVideo15TextProjection(nn.Module):
+    """Official OmniWeaving deepstack projection (`mm_in`)."""
+
+    def __init__(self, in_channels: int, hidden_size: int):
+        super().__init__()
+        self.linear_1 = nn.Linear(in_channels, hidden_size)
+        self.act_1 = nn.SiLU()
+        self.linear_2 = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, caption: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.linear_1(caption)
+        hidden_states = self.act_1(hidden_states)
+        hidden_states = self.linear_2(hidden_states)
+        return hidden_states
+
+
 class HunyuanVideo15ByT5TextProjection(nn.Module):
     def __init__(self, in_features: int, hidden_size: int, out_features: int):
         super().__init__()
@@ -314,6 +330,143 @@ class HunyuanVideo15ImageProjection(nn.Module):
         hidden_states = self.linear_2(hidden_states)
         hidden_states = self.norm_out(hidden_states)
         return hidden_states
+
+
+class HunyuanVideo15SingleAdaLayerNorm(nn.Module):
+    """Single-stream pre-norm plus official 3-way DiT modulation."""
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, 3 * hidden_size)
+        self.nonlinearity = nn.SiLU()
+
+    def forward(self, hidden_states: torch.Tensor, emb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        shift, scale, gate = self.linear(self.nonlinearity(emb)).chunk(3, dim=-1)
+        hidden_states = self.norm(hidden_states)
+        hidden_states = hidden_states * (1 + scale[:, None]) + shift[:, None]
+        return hidden_states, gate
+
+
+class HunyuanVideo15SingleAttention(nn.Module):
+    """Single-stream attention used by Tencent HunyuanVideo-1.5/OmniWeaving.
+
+    The sequence layout is ``[video_tokens, text_tokens]``. RoPE is applied only
+    to the video-token Q/K prefix, matching the official implementation.
+    """
+
+    def __init__(
+        self,
+        query_dim: int,
+        heads: int,
+        dim_head: int,
+        bias: bool = True,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.head_dim = dim_head
+        self.inner_dim = heads * dim_head
+
+        self.norm_q = RMSNorm(dim_head, eps=eps)
+        self.norm_k = RMSNorm(dim_head, eps=eps)
+        self.to_qkv = QKVParallelLinear(
+            hidden_size=query_dim,
+            head_size=self.head_dim,
+            total_num_heads=heads,
+            bias=bias,
+        )
+        self.rope = RotaryEmbedding(is_neox_style=False)
+        self.attn = Attention(
+            num_heads=self.to_qkv.num_heads,
+            head_size=self.head_dim,
+            softmax_scale=1.0 / (self.head_dim**0.5),
+            causal=False,
+            num_kv_heads=self.to_qkv.num_kv_heads,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        img_seq_len: int,
+        attention_mask: torch.Tensor | None = None,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        qkv, _ = self.to_qkv(hidden_states)
+        q_size = self.to_qkv.num_heads * self.head_dim
+        kv_size = self.to_qkv.num_kv_heads * self.head_dim
+        query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+        query = query.unflatten(-1, (self.to_qkv.num_heads, -1))
+        key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
+        value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
+
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+
+        if image_rotary_emb is not None:
+            img_query, text_query = query[:, :img_seq_len], query[:, img_seq_len:]
+            img_key, text_key = key[:, :img_seq_len], key[:, img_seq_len:]
+            cos, sin = image_rotary_emb
+            cos = cos.to(img_query.dtype)
+            sin = sin.to(img_query.dtype)
+            img_query = self.rope(img_query, cos, sin)
+            img_key = self.rope(img_key, cos, sin)
+            query = torch.cat([img_query, text_query], dim=1)
+            key = torch.cat([img_key, text_key], dim=1)
+
+        attn_metadata = None
+        if attention_mask is not None:
+            # attention_mask covers text tokens only; video tokens are always valid.
+            attention_mask = F.pad(attention_mask, (img_seq_len, 0), value=True)
+            attn_metadata = AttentionMetadata(attn_mask=attention_mask.bool())
+
+        hidden_states = self.attn(query, key, value, attn_metadata)
+        hidden_states = hidden_states.flatten(2, 3)
+        return hidden_states.to(query.dtype)
+
+
+class HunyuanVideo15SingleTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        mlp_ratio: float = 4.0,
+        qk_norm: str = "rms_norm",
+    ) -> None:
+        super().__init__()
+        hidden_size = num_attention_heads * attention_head_dim
+        mlp_hidden_size = int(hidden_size * mlp_ratio)
+
+        self.norm = HunyuanVideo15SingleAdaLayerNorm(hidden_size)
+        self.attn = HunyuanVideo15SingleAttention(
+            query_dim=hidden_size,
+            heads=num_attention_heads,
+            dim_head=attention_head_dim,
+            bias=True,
+            eps=1e-6,
+        )
+        self.proj_mlp = nn.Linear(hidden_size, mlp_hidden_size)
+        self.act_mlp = nn.GELU(approximate="tanh")
+        self.proj_out = nn.Linear(hidden_size + mlp_hidden_size, hidden_size)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        img_seq_len: int,
+        attention_mask: torch.Tensor | None = None,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
+        attn_output = self.attn(
+            norm_hidden_states,
+            img_seq_len=img_seq_len,
+            attention_mask=attention_mask,
+            image_rotary_emb=freqs_cis,
+        )
+        mlp_output = self.act_mlp(self.proj_mlp(norm_hidden_states))
+        output = self.proj_out(torch.cat([attn_output, mlp_output], dim=-1))
+        return hidden_states + gate.unsqueeze(1) * output
 
 
 class HunyuanVideo15Attention(nn.Module):
@@ -591,8 +744,8 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
     tensor-parallel layers for the 54 main transformer blocks.
     """
 
-    _repeated_blocks = ["HunyuanVideo15TransformerBlock"]
-    _layerwise_offload_blocks_attrs = ["transformer_blocks"]
+    _repeated_blocks = ["HunyuanVideo15TransformerBlock", "HunyuanVideo15SingleTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
         "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
@@ -616,6 +769,7 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         num_attention_heads: int = 16,
         attention_head_dim: int = 128,
         num_layers: int = 54,
+        num_single_layers: int = 0,
         num_refiner_layers: int = 2,
         mlp_ratio: float = 4.0,
         patch_size: int = 1,
@@ -630,12 +784,18 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         task_type: str = "i2v",
         use_meanflow: bool = False,
         quant_config: "QuantizationConfig | None" = None,
+        deepstack: list[int] | tuple[int, ...] | None = None,
     ):
         super().__init__()
 
-        # Allow tf_model_config to override num_layers
+        # Allow tf_model_config to override Tencent/Diffusers layer counts.
         model_config = od_config.tf_model_config
-        num_layers = getattr(model_config, "num_layers", num_layers)
+        num_layers = getattr(model_config, "mm_double_blocks_depth", getattr(model_config, "num_layers", num_layers))
+        num_single_layers = getattr(
+            model_config,
+            "mm_single_blocks_depth",
+            getattr(model_config, "num_single_layers", num_single_layers),
+        )
 
         self.parallel_config = od_config.parallel_config
         self.in_channels = in_channels
@@ -671,6 +831,16 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        self.single_transformer_blocks = nn.ModuleList(
+            [
+                HunyuanVideo15SingleTransformerBlock(
+                    num_attention_heads, attention_head_dim, mlp_ratio=mlp_ratio, qk_norm=qk_norm
+                )
+                for _ in range(num_single_layers)
+            ]
+        )
+        self.deep_stack = list(deepstack or [])
+        self.mm_in = HunyuanVideo15TextProjection(text_embed_dim, inner_dim) if self.deep_stack else None
 
         self.norm_out = AdaLayerNormContinuous(inner_dim, inner_dim, elementwise_affine=False, eps=1e-6)
         self.proj_out = nn.Linear(inner_dim, patch_size_t * patch_size * patch_size * self.out_channels)
@@ -686,6 +856,7 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         encoder_attention_mask_2: torch.Tensor | None = None,
         image_embeds: torch.Tensor | None = None,
         image_embeds_mask: torch.Tensor | None = None,
+        all_stack_text_states: torch.Tensor | None = None,
         attention_kwargs: dict[str, Any] | None = None,
         return_dict: bool = True,
     ) -> torch.Tensor | Transformer2DModelOutput:
@@ -819,7 +990,11 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
             if hidden_states_mask.all():
                 hidden_states_mask = None
 
-        for block in self.transformer_blocks:
+        all_stack_text_states_in = None
+        if all_stack_text_states is not None and self.mm_in is not None:
+            all_stack_text_states_in = self.mm_in(all_stack_text_states.to(dtype=encoder_hidden_states.dtype))
+
+        for index, block in enumerate(self.transformer_blocks):
             hidden_states, encoder_hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
@@ -828,6 +1003,32 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
                 image_rotary_emb,
                 hidden_states_mask=hidden_states_mask,
             )
+            # Official OmniWeaving injects selected Qwen hidden states into the tail
+            # of the text stream after double blocks.  The MLLM text tokens are the
+            # final valid/padded segment in our [image, ByT5, MLLM, padding] layout.
+            if all_stack_text_states_in is not None and index < all_stack_text_states_in.shape[0]:
+                n_slice = all_stack_text_states_in[index].shape[-2]
+                n_keep = encoder_hidden_states.shape[1] - n_slice
+                encoder_hidden_states = torch.cat(
+                    [
+                        encoder_hidden_states[:, :n_keep],
+                        encoder_hidden_states[:, n_keep:] + all_stack_text_states_in[index].detach(),
+                    ],
+                    dim=1,
+                )
+
+        img_seq_len = hidden_states.shape[1]
+        if len(self.single_transformer_blocks) > 0:
+            hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
+            for block in self.single_transformer_blocks:
+                hidden_states = block(
+                    hidden_states,
+                    temb,
+                    img_seq_len=img_seq_len,
+                    attention_mask=encoder_attention_mask,
+                    freqs_cis=image_rotary_emb,
+                )
+            hidden_states = hidden_states[:, :img_seq_len]
 
         hidden_states = self.norm_out(hidden_states, temb)
         hidden_states = self.proj_out(hidden_states)

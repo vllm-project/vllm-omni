@@ -29,7 +29,7 @@ class BenchmarkCase:
     image_path: str | None = None
     image_paths: list[str] | None = None
     flow_shift: float | None = None
-    fps: int = 8
+    fps: int = 16
     notes: str | None = None
     # If set, passed to official `generate.py --aspect_ratio` instead of inferring from width/height.
     aspect_ratio: str | None = None
@@ -163,8 +163,8 @@ def load_prompt_file(path: str | Path) -> tuple[str, str | None]:
 def extract_stage_metrics(output: Any) -> tuple[dict[str, float], float | None]:
     stage_durations = dict(getattr(output, "stage_durations", {}) or {})
     peak_memory_mb = getattr(output, "peak_memory_mb", 0.0) or 0.0
-    if peak_memory_mb <= 0 and torch.cuda.is_available():
-        peak_memory_mb = torch.cuda.max_memory_allocated() / (1024**2)
+    if peak_memory_mb <= 0 and torch.cuda.is_available() and hasattr(torch, "accelerator"):
+        peak_memory_mb = torch.accelerator.max_memory_allocated() / (1024**2)
     peak_memory_gib = peak_memory_mb / 1024 if peak_memory_mb > 0 else None
     return stage_durations, peak_memory_gib
 
@@ -206,7 +206,12 @@ def _unwrap_payload(obj: Any) -> Any:
             current = current.request_output
             continue
         if hasattr(current, "images") and current.images:
-            current = current.images[0]
+            imgs = current.images
+            if isinstance(imgs, (list, tuple)) and imgs and isinstance(imgs[0], Image.Image):
+                # Video: keep all frames — `images[0]` would truncate to one frame before numpy stacking.
+                current = imgs
+                continue
+            current = imgs[0] if isinstance(imgs, (list, tuple)) else imgs
             continue
         if hasattr(current, "outputs") and current.outputs:
             current = current.outputs[0]
@@ -246,9 +251,41 @@ def _to_numpy(payload: Any) -> np.ndarray:
     return array
 
 
+def _stack_pil_frames_if_any(candidate: Any) -> np.ndarray | None:
+    if not isinstance(candidate, (list, tuple)) or not candidate:
+        return None
+    head = candidate[0]
+    if not isinstance(head, Image.Image):
+        return None
+    return np.stack([np.asarray(f) for f in candidate], axis=0)
+
+
+def _probe_diffusion_frames(output: Any) -> np.ndarray | None:
+    """Prefer `OmniRequestOutput.images` (one PIL per decoded frame); avoids fragile unwrap to a single tensor."""
+    probe: Any = output
+    for _ in range(14):
+        if hasattr(probe, "images") and probe.images:
+            stacked = _stack_pil_frames_if_any(probe.images)
+            if stacked is not None:
+                return stacked
+        next_probe = None
+        if hasattr(probe, "request_output") and probe.request_output is not None:
+            next_probe = probe.request_output
+        elif hasattr(probe, "outputs") and probe.outputs:
+            next_probe = probe.outputs[0]
+        if next_probe is None:
+            break
+        probe = next_probe
+    return None
+
+
 def extract_video_array(output: Any) -> np.ndarray:
-    payload = _unwrap_payload(output)
-    array = _to_numpy(payload)
+    direct = _probe_diffusion_frames(output)
+    if direct is not None:
+        array = direct
+    else:
+        payload = _unwrap_payload(output)
+        array = _to_numpy(payload)
     if array.ndim == 5 and array.shape[0] == 1:
         array = np.squeeze(array, axis=0)
     if array.ndim != 4:
@@ -278,11 +315,18 @@ def video_payload_to_uint8(payload: Any) -> np.ndarray:
     if np.issubdtype(video_fhwc.dtype, np.integer):
         return np.clip(video_fhwc, 0, 255).astype(np.uint8)
 
-    if video_fhwc.max() <= 1.0 and video_fhwc.min() >= 0.0:
-        return np.clip(video_fhwc * 255.0, 0, 255).astype(np.uint8)
-
+    # Float video: prefer fixed linear maps used by Diffusers/VAE (not per-clip min–max,
+    # which stretches contrast over [T,H,W] and amplifies grain / banding).
     v_min = float(video_fhwc.min())
     v_max = float(video_fhwc.max())
+    _eps = 1e-3
+    # [0, 1] (allow tiny slack for fp noise)
+    if v_min >= -_eps and v_max <= 1.0 + _eps:
+        return np.clip(video_fhwc * 255.0, 0, 255).astype(np.uint8)
+    # [-1, 1] typical pre-`VideoProcessor.postprocess_video` RGB
+    if v_min >= -1.0 - _eps and v_max <= 1.0 + _eps and v_min < -_eps:
+        return np.clip((video_fhwc * 0.5 + 0.5) * 255.0, 0, 255).astype(np.uint8)
+
     if math.isclose(v_min, v_max):
         return np.zeros_like(video_fhwc, dtype=np.uint8)
     normalized = (video_fhwc - v_min) / (v_max - v_min)

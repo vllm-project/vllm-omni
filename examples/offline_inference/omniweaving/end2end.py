@@ -100,8 +100,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--height", type=int, default=None, help="Video height.")
     parser.add_argument("--width", type=int, default=None, help="Video width.")
     parser.add_argument("--num-frames", type=int, default=33, help="Number of frames.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--fps", type=int, default=8, help="Output video FPS.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed (official generate.py CLI default is 123).")
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=16,
+        help="Output video FPS (official generate.py uses 16 when --fps omitted and num_frames<=81).",
+    )
     parser.add_argument(
         "--video-bitrate",
         type=str,

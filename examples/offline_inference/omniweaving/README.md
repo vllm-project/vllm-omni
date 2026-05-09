@@ -6,7 +6,9 @@ This directory contains end-to-end examples of running offline inference with th
 
 - **I2V 480p** in `bench_omniweaving_*.py` uses **`assets/p1` / `p2` (.png + .txt)**; both portrait (**480×848**) and T2V-like grid (**832×480**) use **`flow_shift=7.0`** to match the official `generate.py` default `omniweaving` preset (`--assets-dir` overrides the asset folder).
 - **T2V 480p** bench rows are **`t2v_1`…`t2v_5`** (prompts in `../text_to_video/T2V_data/`), **832×480** and **flow_shift=5.0** by default.
-- **Multimodal Qwen for I2V** requires `qwen-vl-utils` (e.g. `pip install qwen-vl-utils` or `pip install vllm-omni[omniweaving]` in dev setups). The pipeline also applies **560 max-edge thumbnailing** and (by default) **setclip-style** trimming on Qwen2-VL hidden states to follow the official `hunyuan_video_pipeline` + `TextEncoder.encode` behavior; see `custom_pipeline_args` in `OMNIWEAVING_ARCHITECTURE_NOTES.md`. VAE decode defaults to **tiling on** in `end2end.py` to match the documented memory behavior.
+- **Export / mux**: default **`--mux-preset high`** (**12 Mbps** H.264) — **same tensors** as inference, clearer MP4 for side‑by‑side viewing. Use **`--mux-preset official`** when you want no explicit ffmpeg bitrate (closest to OmniWeaving ``generate.py`` ``imageio.mimwrite``). Override with **`--video-bitrate`** (e.g. `8M`).
+- **Dtype**: default **`bfloat16`** (`--dtype bfloat16`) matching official ``generate.py --dtype bf16``. Optional **`--dtype float32`** matches official **`--dtype fp32`** when you want maximum numerical precision (slower, more VRAM).
+- **Multimodal Qwen for I2V** requires `qwen-vl-utils` (e.g. `pip install qwen-vl-utils` or `pip install vllm-omni[omniweaving]` in dev setups). The pipeline also applies **560 max-edge thumbnailing** and (by default) **setclip-style** trimming on Qwen2-VL hidden states to follow the official `hunyuan_video_pipeline` + `TextEncoder.encode` behavior; see `custom_pipeline_args` in `OMNIWEAVING_ARCHITECTURE_NOTES.md`.
 
 ## Official vs vLLM-Omni performance (latency / VRAM)
 
