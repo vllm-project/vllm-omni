@@ -25,7 +25,13 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
+)
+from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 
 class Flux2SwiGLU(nn.Module):
@@ -78,6 +84,7 @@ class Flux2FeedForward(nn.Module):
 class Flux2Attention(nn.Module):
     def __init__(
         self,
+        parallel_config: DiffusionParallelConfig,
         query_dim: int,
         heads: int = 8,
         dim_head: int = 64,
@@ -91,6 +98,7 @@ class Flux2Attention(nn.Module):
         elementwise_affine: bool = True,
     ):
         super().__init__()
+        self.parallel_config = parallel_config
         self.head_dim = dim_head
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
         self.query_dim = query_dim
@@ -183,34 +191,89 @@ class Flux2Attention(nn.Module):
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
 
-            query = torch.cat([encoder_query, query], dim=1)
-            key = torch.cat([encoder_key, key], dim=1)
-            value = torch.cat([encoder_value, value], dim=1)
+            sp_size = self.parallel_config.sequence_parallel_size
+            forward_ctx = get_forward_context()
+            use_sp_joint_attention = sp_size is not None and sp_size > 1 and not forward_ctx.split_text_embed_in_sp
 
-        if image_rotary_emb is not None:
-            cos, sin = image_rotary_emb
-            cos = cos.to(query.dtype)
-            sin = sin.to(query.dtype)
-            query = self.rope(query, cos, sin)
-            key = self.rope(key, cos, sin)
+            if use_sp_joint_attention and image_rotary_emb is not None:
+                cos, sin = image_rotary_emb
+                cos = cos.to(query.dtype)
+                sin = sin.to(query.dtype)
+                txt_len = encoder_query.shape[1]
+                txt_cos, img_cos = cos[:txt_len], cos[txt_len:]
+                txt_sin, img_sin = sin[:txt_len], sin[txt_len:]
+                query = self.rope(query, img_cos, img_sin)
+                key = self.rope(key, img_cos, img_sin)
+                encoder_query = self.rope(encoder_query, txt_cos, txt_sin)
+                encoder_key = self.rope(encoder_key, txt_cos, txt_sin)
 
-        attn_metadata = None
-        if attention_mask is not None:
-            if attention_mask.dim() == 3:
-                attention_mask = attention_mask.unsqueeze(1)
-            attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+                attn_metadata = AttentionMetadata(
+                    joint_query=encoder_query,
+                    joint_key=encoder_key,
+                    joint_value=encoder_value,
+                    joint_strategy="front",
+                )
+                hidden_states_mask: torch.Tensor | None = kwargs.get("hidden_states_mask", None)
+                encoder_hidden_states_mask: torch.Tensor | None = kwargs.get("encoder_hidden_states_mask", None)
+                if hidden_states_mask is not None:
+                    attn_metadata.attn_mask = hidden_states_mask
+                if encoder_hidden_states_mask is not None:
+                    attn_metadata.joint_attn_mask = encoder_hidden_states_mask
 
-        hidden_states = self.attn(query, key, value, attn_metadata)
-        hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
+                hidden_states = self.attn(query, key, value, attn_metadata)
+                hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
 
-        if encoder_hidden_states is not None:
-            context_len = encoder_hidden_states.shape[1]
-            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
-                [context_len, hidden_states.shape[1] - context_len],
-                dim=1,
-            )
-            # Contiguous for FP8 quantization in RowParallelLinear
-            encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
+                txt_len = encoder_hidden_states.shape[1]
+                encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                    [txt_len, hidden_states.shape[1] - txt_len],
+                    dim=1,
+                )
+                # Contiguous for FP8 quantization in RowParallelLinear
+                encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
+            else:
+                query = torch.cat([encoder_query, query], dim=1)
+                key = torch.cat([encoder_key, key], dim=1)
+                value = torch.cat([encoder_value, value], dim=1)
+
+                if image_rotary_emb is not None:
+                    cos, sin = image_rotary_emb
+                    cos = cos.to(query.dtype)
+                    sin = sin.to(query.dtype)
+                    query = self.rope(query, cos, sin)
+                    key = self.rope(key, cos, sin)
+
+                attn_metadata = None
+                if attention_mask is not None:
+                    if attention_mask.dim() == 3:
+                        attention_mask = attention_mask.unsqueeze(1)
+                    attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+
+                hidden_states = self.attn(query, key, value, attn_metadata)
+                hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
+
+                context_len = encoder_hidden_states.shape[1]
+                encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                    [context_len, hidden_states.shape[1] - context_len],
+                    dim=1,
+                )
+                # Contiguous for FP8 quantization in RowParallelLinear
+                encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
+        else:
+            if image_rotary_emb is not None:
+                cos, sin = image_rotary_emb
+                cos = cos.to(query.dtype)
+                sin = sin.to(query.dtype)
+                query = self.rope(query, cos, sin)
+                key = self.rope(key, cos, sin)
+
+            attn_metadata = None
+            if attention_mask is not None:
+                if attention_mask.dim() == 3:
+                    attention_mask = attention_mask.unsqueeze(1)
+                attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+
+            hidden_states = self.attn(query, key, value, attn_metadata)
+            hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
 
         hidden_states = self.to_out[0](hidden_states.contiguous())
         hidden_states = self.to_out[1](hidden_states)
@@ -227,6 +290,7 @@ class Flux2ParallelSelfAttention(nn.Module):
 
     def __init__(
         self,
+        parallel_config: DiffusionParallelConfig,
         query_dim: int,
         heads: int = 8,
         dim_head: int = 64,
@@ -240,6 +304,7 @@ class Flux2ParallelSelfAttention(nn.Module):
         mlp_mult_factor: int = 2,
     ):
         super().__init__()
+        self.parallel_config = parallel_config
         self.head_dim = dim_head
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
         self.query_dim = query_dim
@@ -298,20 +363,56 @@ class Flux2ParallelSelfAttention(nn.Module):
         query = self.norm_q(query)
         key = self.norm_k(key)
 
-        if image_rotary_emb is not None:
+        sp_size = self.parallel_config.sequence_parallel_size
+        forward_ctx = get_forward_context()
+        text_seq_len = kwargs.get("text_seq_len", None)
+        use_sp_single_stream = (
+            sp_size is not None and sp_size > 1 and not forward_ctx.split_text_embed_in_sp and text_seq_len is not None
+        )
+
+        if use_sp_single_stream and image_rotary_emb is not None:
             cos, sin = image_rotary_emb
             cos = cos.to(query.dtype)
             sin = sin.to(query.dtype)
-            query = self.rope(query, cos, sin)
-            key = self.rope(key, cos, sin)
+            txt_cos, img_cos = cos[:text_seq_len], cos[text_seq_len:]
+            txt_sin, img_sin = sin[:text_seq_len], sin[text_seq_len:]
 
-        attn_metadata = None
-        if attention_mask is not None:
-            if attention_mask.dim() == 3:
-                attention_mask = attention_mask.unsqueeze(1)
-            attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+            img_query = query[:, text_seq_len:]
+            img_key = key[:, text_seq_len:]
+            img_value = value[:, text_seq_len:]
+            text_query = query[:, :text_seq_len]
+            text_key = key[:, :text_seq_len]
+            text_value = value[:, :text_seq_len]
 
-        attn_output = self.attn(query, key, value, attn_metadata)
+            img_query = self.rope(img_query, img_cos, img_sin)
+            img_key = self.rope(img_key, img_cos, img_sin)
+            text_query = self.rope(text_query, txt_cos, txt_sin)
+            text_key = self.rope(text_key, txt_cos, txt_sin)
+
+            attn_metadata = AttentionMetadata(
+                joint_query=text_query,
+                joint_key=text_key,
+                joint_value=text_value,
+                joint_strategy="front",
+            )
+            hidden_states_mask: torch.Tensor | None = kwargs.get("hidden_states_mask", None)
+            encoder_hidden_states_mask: torch.Tensor | None = kwargs.get("encoder_hidden_states_mask", None)
+            if hidden_states_mask is not None:
+                attn_metadata.attn_mask = hidden_states_mask
+            if encoder_hidden_states_mask is not None:
+                attn_metadata.joint_attn_mask = encoder_hidden_states_mask
+
+            attn_output = self.attn(img_query, img_key, img_value, attn_metadata)
+        else:
+            query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)
+
+            attn_metadata = None
+            if attention_mask is not None:
+                if attention_mask.dim() == 3:
+                    attention_mask = attention_mask.unsqueeze(1)
+                attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+
+            attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.flatten(2, 3).to(query.dtype)
 
         mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
@@ -323,6 +424,7 @@ class Flux2ParallelSelfAttention(nn.Module):
 class Flux2SingleTransformerBlock(nn.Module):
     def __init__(
         self,
+        parallel_config: DiffusionParallelConfig,
         dim: int,
         num_attention_heads: int,
         attention_head_dim: int,
@@ -333,6 +435,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.attn = Flux2ParallelSelfAttention(
+            parallel_config=parallel_config,
             query_dim=dim,
             dim_head=attention_head_dim,
             heads=num_attention_heads,
@@ -383,6 +486,7 @@ class Flux2SingleTransformerBlock(nn.Module):
 class Flux2TransformerBlock(nn.Module):
     def __init__(
         self,
+        parallel_config: DiffusionParallelConfig,
         dim: int,
         num_attention_heads: int,
         attention_head_dim: int,
@@ -397,6 +501,7 @@ class Flux2TransformerBlock(nn.Module):
         self.norm1_context = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
 
         self.attn = Flux2Attention(
+            parallel_config=parallel_config,
             query_dim=dim,
             added_kv_proj_dim=dim,
             dim_head=attention_head_dim,
@@ -409,10 +514,20 @@ class Flux2TransformerBlock(nn.Module):
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias)
+        self.ff = Flux2FeedForward(
+            dim=dim,
+            dim_out=dim,
+            mult=mlp_ratio,
+            bias=bias,
+        )
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.ff_context = Flux2FeedForward(dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias)
+        self.ff_context = Flux2FeedForward(
+            dim=dim,
+            dim_out=dim,
+            mult=mlp_ratio,
+            bias=bias,
+        )
 
     def forward(
         self,
@@ -492,6 +607,38 @@ class Flux2PosEmbed(nn.Module):
         return freqs_cos, freqs_sin
 
 
+class Flux2RopePrepare(nn.Module):
+    """Prepare text/image RoPE tensors for sequence parallel hooks.
+
+    This module encapsulates the RoPE computation for Flux.2
+    For dual-stream attention, text components (outputs 0, 1) are replicated
+    across SP ranks, while image components (outputs 2, 3) are sharded.
+    """
+
+    def __init__(self, pos_embed: Flux2PosEmbed):
+        super().__init__()
+        self.pos_embed = pos_embed
+
+    def forward(
+        self,
+        img_ids: torch.Tensor,
+        txt_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if is_torch_npu_available():
+            img_freqs_cos, img_freqs_sin = self.pos_embed(img_ids.cpu())
+            txt_freqs_cos, txt_freqs_sin = self.pos_embed(txt_ids.cpu())
+            img_freqs_cos = img_freqs_cos.to(img_ids.device)
+            img_freqs_sin = img_freqs_sin.to(img_ids.device)
+            txt_freqs_cos = txt_freqs_cos.to(txt_ids.device)
+            txt_freqs_sin = txt_freqs_sin.to(txt_ids.device)
+        else:
+            img_freqs_cos, img_freqs_sin = self.pos_embed(img_ids)
+            txt_freqs_cos, txt_freqs_sin = self.pos_embed(txt_ids)
+        # Output order must match _sp_plan indices:
+        # text RoPE is replicated, image RoPE is sharded.
+        return txt_freqs_cos, txt_freqs_sin, img_freqs_cos, img_freqs_sin
+
+
 class Flux2TimestepGuidanceEmbeddings(nn.Module):
     def __init__(
         self,
@@ -550,15 +697,42 @@ class Flux2Modulation(nn.Module):
 class Flux2Transformer2DModel(nn.Module):
     """
     The Transformer model introduced in Flux 2.
+
+    Supports sequence parallelism when configured via `OmniDiffusionConfig`.
     """
 
     _repeated_blocks = ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
         return ("transformer_blocks" in name or "single_transformer_blocks" in name) and name.split(".")[-1].isdigit()
 
     _hsdp_shard_conditions = [_is_transformer_block]
+    _sp_plan = {
+        "": {
+            "hidden_states": SequenceParallelInput(
+                split_dim=1,
+                expected_dims=3,
+                auto_pad=True,
+            ),
+        },
+        "rope_prepare": {
+            2: SequenceParallelInput(
+                split_dim=0,
+                expected_dims=2,
+                split_output=True,
+                auto_pad=True,
+            ),
+            3: SequenceParallelInput(
+                split_dim=0,
+                expected_dims=2,
+                split_output=True,
+                auto_pad=True,
+            ),
+        },
+        "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
 
     def __init__(
         self,
@@ -576,6 +750,7 @@ class Flux2Transformer2DModel(nn.Module):
         rope_theta: int = 2000,
         eps: float = 1e-6,
         guidance_embeds: bool = True,
+        od_config: OmniDiffusionConfig | None = None,
     ):
         super().__init__()
         self.guidance_embeds = guidance_embeds
@@ -600,7 +775,12 @@ class Flux2Transformer2DModel(nn.Module):
             guidance_embeds=guidance_embeds,
         )
 
-        self.pos_embed = Flux2PosEmbed(theta=rope_theta, axes_dim=axes_dims_rope)
+        if od_config is not None:
+            self.parallel_config = od_config.parallel_config
+        else:
+            self.parallel_config = DiffusionParallelConfig()
+
+        self.pos_embed = Flux2PosEmbed(theta=rope_theta, axes_dim=list(axes_dims_rope))
         self.time_guidance_embed = Flux2TimestepGuidanceEmbeddings(
             in_channels=timestep_guidance_channels,
             embedding_dim=self.inner_dim,
@@ -614,10 +794,12 @@ class Flux2Transformer2DModel(nn.Module):
 
         self.x_embedder = nn.Linear(in_channels, self.inner_dim, bias=False)
         self.context_embedder = nn.Linear(joint_attention_dim, self.inner_dim, bias=False)
+        self.rope_prepare = Flux2RopePrepare(self.pos_embed)
 
         self.transformer_blocks = nn.ModuleList(
             [
                 Flux2TransformerBlock(
+                    parallel_config=self.parallel_config,
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
@@ -632,6 +814,7 @@ class Flux2Transformer2DModel(nn.Module):
         self.single_transformer_blocks = nn.ModuleList(
             [
                 Flux2SingleTransformerBlock(
+                    parallel_config=self.parallel_config,
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
@@ -667,6 +850,10 @@ class Flux2Transformer2DModel(nn.Module):
 
         num_txt_tokens = encoder_hidden_states.shape[1]
 
+        sp_size = self.parallel_config.sequence_parallel_size
+        if sp_size is not None and sp_size > 1:
+            get_forward_context().split_text_embed_in_sp = False
+
         timestep = timestep.to(hidden_states.dtype) * 1000
         if guidance is not None:
             guidance = guidance.to(hidden_states.dtype) * 1000
@@ -685,18 +872,33 @@ class Flux2Transformer2DModel(nn.Module):
         if txt_ids.ndim == 3:
             txt_ids = txt_ids[0]
 
-        if is_torch_npu_available():
-            freqs_cos_image, freqs_sin_image = self.pos_embed(img_ids.cpu())
-            image_rotary_emb = (freqs_cos_image.npu(), freqs_sin_image.npu())
-            freqs_cos_text, freqs_sin_text = self.pos_embed(txt_ids.cpu())
-            text_rotary_emb = (freqs_cos_text.npu(), freqs_sin_text.npu())
-        else:
-            image_rotary_emb = self.pos_embed(img_ids)
-            text_rotary_emb = self.pos_embed(txt_ids)
+        txt_freqs_cos, txt_freqs_sin, img_freqs_cos, img_freqs_sin = self.rope_prepare(img_ids, txt_ids)
         concat_rotary_emb = (
-            torch.cat([text_rotary_emb[0], image_rotary_emb[0]], dim=0),
-            torch.cat([text_rotary_emb[1], image_rotary_emb[1]], dim=0),
+            torch.cat([txt_freqs_cos, img_freqs_cos], dim=0),
+            torch.cat([txt_freqs_sin, img_freqs_sin], dim=0),
         )
+
+        hidden_states_mask = None
+        encoder_hidden_states_mask = None
+        ctx = get_forward_context()
+        if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+            batch_size = hidden_states.shape[0]
+            img_padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+
+            hidden_states_mask = torch.ones(
+                batch_size,
+                img_padded_seq_len,
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+            if hidden_states_mask.all():
+                hidden_states_mask = None
+
+        if hidden_states_mask is not None:
+            joint_attention_kwargs["hidden_states_mask"] = hidden_states_mask
+        if encoder_hidden_states_mask is not None:
+            joint_attention_kwargs["encoder_hidden_states_mask"] = encoder_hidden_states_mask
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
@@ -717,6 +919,7 @@ class Flux2Transformer2DModel(nn.Module):
                 temb_mod_params=single_stream_mod,
                 image_rotary_emb=concat_rotary_emb,
                 joint_attention_kwargs=joint_attention_kwargs,
+                text_seq_len=num_txt_tokens,
             )
 
         hidden_states = hidden_states[:, num_txt_tokens:, ...]
