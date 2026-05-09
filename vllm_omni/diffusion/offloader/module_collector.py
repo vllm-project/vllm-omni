@@ -48,6 +48,7 @@ class ModuleDiscovery:
         "text_encoder_2",
         "text_encoder_3",
         "image_encoder",
+        "mllm",
     ]
     _FALLBACK_VAE_ATTRS = [
         "vae",
