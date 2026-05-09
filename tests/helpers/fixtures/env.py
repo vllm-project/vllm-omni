@@ -27,15 +27,12 @@ def model_prefix() -> str:
     return f"{prefix.rstrip('/')}/" if prefix else ""
 
 
-@pytest.fixture(autouse=True)
-def clean_gpu_memory_between_tests(request):
-    """Run GPU memory cleanup between tests unless the item is CPU-only (no ``cuda`` mark).
+@pytest.fixture
+def clean_gpu_memory_between_tests():
+    """Opt-in GPU pre/post hooks for a test (no environment-variable gate).
 
-    If ``@pytest.mark.cpu`` is applied (e.g. module ``pytestmark``) but a test also has
-    ``@pytest.mark.cuda``, pre/post GPU hooks still run (e.g. ``VLLM_TEST_CLEAN_GPU_MEMORY=1``).
+    Use as a test parameter or ``@pytest.mark.usefixtures("clean_gpu_memory_between_tests")``.
     """
-    # Import here so ``tests.helpers.env`` (and vLLM platform modules) load only
-    # after session autouse fixtures like ``default_env`` have run (RFC #2299).
     from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 
     print("\n=== PRE-TEST GPU CLEANUP ===")

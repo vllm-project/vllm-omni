@@ -77,7 +77,7 @@ def _run_diffusers_image_edit(
     input_images: list[Image.Image],
     output_path: Path,
 ) -> Image.Image:
-    run_pre_test_cleanup(enable_force=True)
+    run_pre_test_cleanup()
     pipe: QwenImageEditPipeline | QwenImageEditPlusPipeline | None = None
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
@@ -110,7 +110,7 @@ def _run_diffusers_image_edit(
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup(enable_force=True)
+        run_post_test_cleanup()
 
 
 def _vllm_omni_output_single_image(

@@ -172,7 +172,7 @@ def _run_diffusers_baseline(model: str, output_dir: Path) -> list[Image.Image]:
     """Generate video using stock diffusers LTX2Pipeline."""
     from diffusers import LTX2Pipeline
 
-    run_pre_test_cleanup(enable_force=True)
+    run_pre_test_cleanup()
     pipe = None
     try:
         pipe = LTX2Pipeline.from_pretrained(
@@ -200,7 +200,7 @@ def _run_diffusers_baseline(model: str, output_dir: Path) -> list[Image.Image]:
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup(enable_force=True)
+        run_post_test_cleanup()
 
 
 # ---------------------------------------------------------------------------
