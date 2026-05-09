@@ -388,9 +388,8 @@ class TestErrorHandling:
         engine = _make_engine_client()
 
         async def empty_gen(*args, **kwargs):
-            if False:
-                yield
             return
+            yield  # noqa: unreachable – makes this an async generator
 
         engine.generate = MagicMock(side_effect=empty_gen)
         server = _make_server(engine_client=engine)
@@ -448,9 +447,8 @@ class TestErrorHandling:
         engine = _make_engine_client()
 
         async def gen_value_error(*args, **kwargs):
-            if False:
-                yield
             raise ValueError("bad value")
+            yield  # noqa: unreachable
 
         engine.generate = MagicMock(side_effect=gen_value_error)
         server = _make_server(engine_client=engine)
@@ -464,9 +462,8 @@ class TestErrorHandling:
         engine = _make_engine_client()
 
         async def gen_runtime_error(*args, **kwargs):
-            if False:
-                yield
             raise RuntimeError("something went wrong")
+            yield  # noqa: unreachable
 
         engine.generate = MagicMock(side_effect=gen_runtime_error)
         server = _make_server(engine_client=engine)
