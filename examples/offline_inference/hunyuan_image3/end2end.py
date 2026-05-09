@@ -96,7 +96,7 @@ def parse_args():
         "--bot-task",
         type=str,
         default="auto",
-        choices=["auto", "think", "recaption", "vanilla"],
+        choices=["auto", "think", "recaption", "think_recaption", "vanilla"],
         help=(
             "Prompt behavior. 'auto' selects the default for the modality; "
             "'think' adds <think>; 'recaption' adds <recaption>; "

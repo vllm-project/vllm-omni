@@ -50,13 +50,12 @@ HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS: dict[str, int] = {
 _TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
     "t2t": ("en_unified", None, None),
     "i2t": ("en_unified", None, None),
-    "i2t_think": ("en_unified", "think", "<think>"),
     "it2i_think": ("en_unified", "think", "<think>"),
     "it2i_recaption": ("en_unified", "recaption", "<recaption>"),
     "t2i": ("en_unified", "image", None),
+    "t2i_vanilla": ("en_vanilla", "image", None),
     "t2i_think": ("en_unified", "think", "<think>"),
     "t2i_recaption": ("en_unified", "recaption", "<recaption>"),
-    "t2i_vanilla": ("en_vanilla", "image", None),
 }
 
 
@@ -69,12 +68,11 @@ def resolve_stop_token_ids(
     bot_task: str = "think",
     tokenizer: Any | None = None,
 ):
-    _, _, trigger_tag = _TASK_PRESETS[task]
     stop_token_ids = [127957]
-    if task in ("t2t_think", "i2t_think"):
+    if "recaption" in task:
         stop_token_ids.append(HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"])
-    elif trigger_tag:
-        stop_token_ids.append(tokenizer.convert_tokens_to_ids(trigger_tag))
+    if "think" in task:
+        stop_token_ids.append(HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"])
     return stop_token_ids
 
 

@@ -2149,6 +2149,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         lora_body = extra_body.get("lora")
         layers = extra_body.get("layers")
         resolution = extra_body.get("resolution")
+        bot_task = extra_body.get("bot_task")
 
         engine_prompt_data: dict[str, Any] | None = None
         modalities = ["image"]
