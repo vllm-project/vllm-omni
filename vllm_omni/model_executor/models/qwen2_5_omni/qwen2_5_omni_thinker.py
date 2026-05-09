@@ -515,11 +515,9 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         language_prefix = maybe_prefix(prefix, "language_model")
         if isinstance(quant_config, ComponentQuantizationConfig):
             visual_quant_config = quant_config.resolve(visual_prefix)
-            language_quant_config = quant_config.resolve(language_prefix)
         elif quant_config is not None:
             if quant_config.get_name() in PRE_QUANTIZED_METHODS:
                 visual_quant_config = None
-                language_quant_config = quant_config
             else:
                 quant_config = ComponentQuantizationConfig(
                     component_configs={language_prefix: quant_config},
@@ -527,10 +525,8 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 )
                 vllm_config = replace(vllm_config, quant_config=quant_config)
                 visual_quant_config = None
-                language_quant_config = quant_config.resolve(language_prefix)
         else:
             visual_quant_config = None
-            language_quant_config = None
 
         with self._mark_tower_model(vllm_config, "audio"):
             if multimodal_config.get_limit_per_prompt("audio"):
