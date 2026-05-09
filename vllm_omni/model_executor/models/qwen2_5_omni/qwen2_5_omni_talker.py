@@ -1,4 +1,5 @@
 from collections.abc import Iterable
+from dataclasses import replace
 from functools import cached_property
 
 import torch
@@ -18,12 +19,11 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from dataclasses import replace
-
 from vllm_omni.quantization.component_config import (
     PRE_QUANTIZED_METHODS,
     ComponentQuantizationConfig,
 )
+
 
 class Qwen2_5OmniTalkerForConditionalGeneration(
     nn.Module,
