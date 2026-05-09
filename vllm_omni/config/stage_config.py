@@ -1079,7 +1079,6 @@ class StageConfigFactory:
         if model_type and model_type in _PIPELINE_REGISTRY:
             return cls._create_from_registry(model_type, cli_overrides, deploy_config_path)
 
-
         # --- HF architecture fallback: some models report a generic
         # model_type that collides with another model. Match by the
         # hf_architectures declared on each registered PipelineConfig.

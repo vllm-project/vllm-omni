@@ -17,11 +17,9 @@ canonical mapping for both flows.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 from .system_prompt import get_system_prompt
-
 
 # HunyuanImage-3.0-Instruct special token ids from tokenizer.json.
 # Keep offline AR prompt/stop-token behavior independent of runtime
@@ -63,6 +61,7 @@ def available_tasks() -> list[str]:
     """Sorted list of task keys accepted by `build_prompt` / `build_prompt_tokens`."""
     return sorted(_TASK_PRESETS)
 
+
 def resolve_stop_token_ids(
     task: str = "it2i_think",
     bot_task: str = "think",
@@ -74,7 +73,6 @@ def resolve_stop_token_ids(
     if "think" in task:
         stop_token_ids.append(HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"])
     return stop_token_ids
-
 
 
 def build_prompt(
