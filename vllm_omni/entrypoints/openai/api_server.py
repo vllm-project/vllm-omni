@@ -586,6 +586,7 @@ async def omni_init_app_state(
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
     state.args = args
+    state.sleeping_stages = set()
 
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
@@ -632,7 +633,6 @@ async def omni_init_app_state(
 
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
-        state.sleeping_stages = set()
         logger.info("Pure diffusion API server initialized for model: %s", model_name)
         return
 
@@ -950,7 +950,6 @@ async def omni_init_app_state(
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
     state.server_load_metrics = 0
-    state.sleeping_stages = set()
 
 
 def Omnivideo(request: Request) -> OmniOpenAIServingVideo | None:
