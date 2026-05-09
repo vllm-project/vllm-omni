@@ -10,7 +10,6 @@ This test is intended for CI monitoring only:
 from __future__ import annotations
 
 import os
-import socket
 from dataclasses import dataclass
 
 import pytest
@@ -18,6 +17,7 @@ import torch
 import torch.distributed as dist
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import get_open_port
 from vllm_omni.diffusion.attention.parallel.ulysses import (
     _all_gather_int,
     _ulysses_all_to_all_any_o,
@@ -31,12 +31,6 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.platforms import current_omni_platform
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
 
 
 def _set_dist_env(*, rank: int, world_size: int, master_port: int) -> None:
@@ -77,7 +71,7 @@ def test_ulysses_advanced_uaa_comm_overhead(case: _PerfCase) -> None:
     if available_gpus < case.world_size:
         pytest.skip(f"Requires {case.world_size} GPUs, got {available_gpus}")
 
-    master_port = _find_free_port()
+    master_port = get_open_port()
     torch.multiprocessing.spawn(
         _perf_worker,
         args=(case.world_size, master_port, case.ulysses_degree, case.ring_degree),

@@ -33,6 +33,8 @@ from typing import Any, cast
 import psutil
 import pytest
 
+from tests.helpers.runtime import get_open_port
+
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -144,14 +146,6 @@ _server_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 
-def _get_open_port() -> int:
-    """Return an available TCP port on localhost."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        return s.getsockname()[1]
-
-
 def _wait_for_port(host: str, port: int, timeout: int = 1200) -> None:
     """Block until the given host:port accepts connections or timeout expires."""
     start = time.time()
@@ -233,7 +227,7 @@ class DiffusionServer:
         self.model = server_cfg["model"]
         self.serve_args = server_cfg["serve_args"]
         self.host = "127.0.0.1"
-        self.port = port if port is not None else _get_open_port()
+        self.port = port if port is not None else get_open_port()
         self.proc: subprocess.Popen | None = None
         self.test_name: str = ""
 
