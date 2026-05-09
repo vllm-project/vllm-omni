@@ -729,6 +729,7 @@ class TestPipelineDiscovery:
         assert "qwen2_5_omni" in _PIPELINE_REGISTRY
         assert "qwen3_omni_moe" in _PIPELINE_REGISTRY
         assert "qwen3_tts" in _PIPELINE_REGISTRY
+        assert "tuna" in _PIPELINE_REGISTRY
 
     def test_registry_loads_pipeline_on_getitem(self):
         """Looking up a registered model_type returns the matching PipelineConfig."""

@@ -28,6 +28,16 @@ def get_pipeline_path(model_dir: str, filename: str) -> Path:
 
 logger = init_logger(__name__)
 
+_TUNA_MODEL_TYPES = {
+    "tuna",
+    "tuna2",
+    "tuna_2",
+    "tuna_2_pixel",
+    "tuna2_pixel",
+    "tuna_2r_pixel",
+    "tuna2r_pixel",
+}
+
 
 def _warn_deprecated_kwargs(kwargs: dict[str, Any]) -> None:
     if "cli_explicit_keys" in kwargs:
@@ -1075,6 +1085,10 @@ class StageConfigFactory:
 
         # --- New path: check pipeline registry by model_type first ---
         model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
+        if model_type:
+            normalized_model_type = model_type.replace("-", "_").lower()
+            if normalized_model_type in _TUNA_MODEL_TYPES:
+                model_type = "tuna"
         if model_type and model_type in _PIPELINE_REGISTRY:
             return cls._create_from_registry(model_type, cli_overrides, deploy_config_path)
 

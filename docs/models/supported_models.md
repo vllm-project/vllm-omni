@@ -20,6 +20,7 @@ th {
 | `Qwen3OmniMoeForConditionalGeneration` | Qwen3-Omni | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Qwen2_5OmniForConditionalGeneration` | Qwen2.5-Omni | `Qwen/Qwen2.5-Omni-7B`, `Qwen/Qwen2.5-Omni-3B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `BagelForConditionalGeneration` | BAGEL (DiT-only) | `ByteDance-Seed/BAGEL-7B-MoT` | ✅︎ | ✅︎ | | ✅︎ |
+| `TunaExternalPipeline` | Tuna/Tuna-2 (recognized only; runtime integration not yet available) | [`facebookresearch/tuna-2`](https://github.com/facebookresearch/tuna-2) | | | | |
 | `InternVLAA1Pipeline` | InternVLA-A1 | `InternRobotics/InternVLA-A1-3B` | ✅︎ | ✅︎ | | |
 | `HunyuanImage3ForCausalMM` | HunyuanImage3.0 (DiT-only) | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
@@ -70,3 +71,5 @@ th {
 |`DyninOmniForConditionalGeneration` | Dynin-Omni | `snu-aidas/Dynin-Omni` | ✅︎ | | | |
 | `ErnieImagePipeline` | ERNIE-Image | `baidu/ERNIE-Image`, `baidu/ERNIE-Image-Turbo` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 ✅︎ indicates the model is supported on that backend. Empty cells mean not listed as supported on that backend.
+
+Tuna/Tuna-2 metadata is recognized by vLLM-Omni so users get an explicit integration-status error instead of an unknown-model failure. Runtime inference is not available yet because the upstream [`facebookresearch/tuna-2`](https://github.com/facebookresearch/tuna-2) project currently uses its own Hydra-based inference flow and `.pt` checkpoint format without a stable HuggingFace/diffusers loading contract.
