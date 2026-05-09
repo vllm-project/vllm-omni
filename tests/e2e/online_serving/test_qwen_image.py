@@ -27,7 +27,6 @@ from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "Qwen/Qwen-Image"
 T2I_PROMPT = "A photo of a cat sitting on a laptop keyboard, digital art style."

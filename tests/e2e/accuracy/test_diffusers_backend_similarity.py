@@ -119,7 +119,7 @@ def _run_diffusers_wan22_i2v(*, model: str, output_path: Path, conditioning_imag
     from diffusers import WanImageToVideoPipeline  # pyright: ignore[reportPrivateImportUsage]
     from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 
-    run_pre_test_cleanup(enable_force=True)
+    run_pre_test_cleanup()
     apply_ftfy_mock()
     pipe: WanImageToVideoPipeline | None = None
     try:
@@ -161,7 +161,7 @@ def _run_diffusers_wan22_i2v(*, model: str, output_path: Path, conditioning_imag
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup(enable_force=True)
+        run_post_test_cleanup()
 
 
 def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> tuple[Image.Image, float]:
@@ -206,7 +206,7 @@ def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
 
 
 def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.Image, float]:
-    run_pre_test_cleanup(enable_force=True)
+    run_pre_test_cleanup()
     pipe: DiffusionPipeline | None = None
     try:
         pipe = DiffusionPipeline.from_pretrained(
@@ -241,7 +241,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup(enable_force=True)
+        run_post_test_cleanup()
 
 
 @pytest.mark.benchmark

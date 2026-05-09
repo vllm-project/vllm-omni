@@ -12,7 +12,6 @@ from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "ByteDance-Seed/BAGEL-7B-MoT"
 MULTI_REPLICA_DEPLOY = get_deploy_config_path("ci/bagel_multi_replicas_4gpu.yaml")
