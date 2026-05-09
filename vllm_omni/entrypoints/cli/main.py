@@ -13,64 +13,65 @@ def _should_use_omni_cli(argv: list[str]) -> bool:
 
 def main():
     """Main CLI entry point that intercepts vLLM commands."""
+    # Check if --omni flag is present or the standalone generate subcommand is used.
     if not _should_use_omni_cli(sys.argv):
         from vllm.entrypoints.cli.main import main as vllm_main
 
         vllm_main()
         return
-
-    # Force colored logging even when piped (e.g. `| tee`).
-    # Must be set before any vLLM import because the logger
-    # formatter is configured at import time via _use_color().
-    import os
-
-    if "VLLM_LOGGING_COLOR" not in os.environ:
-        os.environ["VLLM_LOGGING_COLOR"] = "1"
-
-    from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
-    from vllm.utils.argparse_utils import FlexibleArgumentParser
-
-    import vllm_omni.entrypoints.cli.benchmark.main
-    import vllm_omni.entrypoints.cli.generate
-    import vllm_omni.entrypoints.cli.serve
-
-    CMD_MODULES = [
-        vllm_omni.entrypoints.cli.serve,
-        vllm_omni.entrypoints.cli.generate,
-        vllm_omni.entrypoints.cli.benchmark.main,
-    ]
-
-    cli_env_setup()
-
-    from vllm_omni.entrypoints.cli.serve import _ensure_vllm_platform
-
-    _ensure_vllm_platform()
-
-    parser = FlexibleArgumentParser(
-        description="vLLM OMNI CLI",
-        epilog=VLLM_SUBCMD_PARSER_EPILOG.format(subcmd="[subcommand]"),
-    )
-    parser.add_argument(
-        "-v",
-        "--version",
-        action="version",
-        version=importlib.metadata.version("vllm_omni"),
-    )
-    subparsers = parser.add_subparsers(required=False, dest="subparser")
-    cmds = {}
-    for cmd_module in CMD_MODULES:
-        new_cmds = cmd_module.cmd_init()
-        for cmd in new_cmds:
-            cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
-            cmds[cmd.name] = cmd
-    args = parser.parse_args()
-    if args.subparser in cmds:
-        cmds[args.subparser].validate(args)
-
-    if hasattr(args, "dispatch_function"):
-        args.dispatch_function(args)
     else:
-        parser.print_help()
+        # Force colored logging even when piped (e.g. `| tee`).
+        # Must be set before any vLLM import because the logger
+        # formatter is configured at import time via _use_color().
+        import os
+
+        if "VLLM_LOGGING_COLOR" not in os.environ:
+            os.environ["VLLM_LOGGING_COLOR"] = "1"
+
+        from vllm.entrypoints.utils import VLLM_SUBCMD_PARSER_EPILOG, cli_env_setup
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+        import vllm_omni.entrypoints.cli.benchmark.main
+        import vllm_omni.entrypoints.cli.generate
+        import vllm_omni.entrypoints.cli.serve
+
+        CMD_MODULES = [
+            vllm_omni.entrypoints.cli.serve,
+            vllm_omni.entrypoints.cli.generate,
+            vllm_omni.entrypoints.cli.benchmark.main,
+        ]
+
+        cli_env_setup()
+
+        from vllm_omni.entrypoints.cli.serve import _ensure_vllm_platform
+
+        _ensure_vllm_platform()
+
+        parser = FlexibleArgumentParser(
+            description="vLLM OMNI CLI",
+            epilog=VLLM_SUBCMD_PARSER_EPILOG.format(subcmd="[subcommand]"),
+        )
+        parser.add_argument(
+            "-v",
+            "--version",
+            action="version",
+            version=importlib.metadata.version("vllm_omni"),
+        )
+        subparsers = parser.add_subparsers(required=False, dest="subparser")
+        cmds = {}
+        for cmd_module in CMD_MODULES:
+            new_cmds = cmd_module.cmd_init()
+            for cmd in new_cmds:
+                cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
+                cmds[cmd.name] = cmd
+        args = parser.parse_args()
+        if args.subparser in cmds:
+            cmds[args.subparser].validate(args)
+
+        if hasattr(args, "dispatch_function"):
+            args.dispatch_function(args)
+        else:
+            parser.print_help()
 
 
 if __name__ == "__main__":
