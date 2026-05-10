@@ -318,7 +318,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     engine_args = stage_config.engine_args
 
     if current_omni_platform.is_rocm():
-        if engine_args.get("attention_backend") is None:
+        if stage_type != "diffusion" and engine_args.get("attention_backend") is None:
             from vllm._aiter_ops import rocm_aiter_ops
 
             if rocm_aiter_ops.is_enabled():
@@ -573,6 +573,14 @@ def build_engine_args_dict(
     engine_args_dict["stage_id"] = stage_id
     if engine_args_dict.get("async_chunk", False):
         engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
+
+    if stage_type == "diffusion":
+        from vllm_omni.diffusion.data import parse_attention_config
+
+        if engine_args_dict.get("diffusion_attention_config") is not None:
+            engine_args_dict["diffusion_attention_config"] = parse_attention_config(
+                engine_args_dict.get("diffusion_attention_config"),
+            )
 
     if stage_type != "diffusion":
         resolve_worker_cls(engine_args_dict)

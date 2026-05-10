@@ -43,11 +43,16 @@ class FlashAttentionImpl(AttentionImpl):
         causal: bool = False,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        qkv_layout: str | None = None,
+        backend_kwargs: dict | None = None,
         **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
         self.causal = causal
         self.softmax_scale = softmax_scale
+        self.qkv_layout = qkv_layout
+        if backend_kwargs:
+            logger.warning("FlashAttentionImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
     @staticmethod
     def _unwrap_flash_output(out: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -230,6 +235,7 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
+        layout = self.qkv_layout or "BNSD"
         output = attention_forward(
             query,
             key,
@@ -237,6 +243,6 @@ class FlashAttentionImpl(AttentionImpl):
             attn_mask=attention_mask,
             opt_mode="manual",
             op_type="fused_attn_score",
-            layout="BNSD",
+            layout=layout,
         )
         return output
