@@ -1879,9 +1879,9 @@ class AsyncOmniEngine:
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
             vae_patch_parallel_size = normalized_kwargs.get("vae_patch_parallel_size") or 1
             enable_expert_parallel = normalized_kwargs.get("enable_expert_parallel") or False
-            use_hsdp = normalized_kwargs.get("use_hsdp", False)
-            hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
-            hsdp_replicate_size = normalized_kwargs.get("hsdp_replicate_size", 1)
+            use_hsdp = normalized_kwargs.get("use_hsdp") or False
+            hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size") or -1
+            hsdp_replicate_size = normalized_kwargs.get("hsdp_replicate_size") or 1
             if sequence_parallel_size is None:
                 sequence_parallel_size = ulysses_degree * ring_degree
 
