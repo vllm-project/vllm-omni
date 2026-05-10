@@ -89,6 +89,8 @@ class CUDAGraphDecoderWrapper:
         dtype: torch.dtype = torch.long,
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
+        decode_chunk_size: int = 300,
+        decode_left_context: int = 25,
     ):
         if device.type != "cuda" or not self.enabled or self._warmed_up:
             return
@@ -100,6 +102,8 @@ class CUDAGraphDecoderWrapper:
             self.capture_sizes = self.compute_capture_sizes(
                 codec_chunk_frames=codec_chunk_frames,
                 codec_left_context_frames=codec_left_context_frames,
+                decode_chunk_size=decode_chunk_size,
+                decode_left_context=decode_left_context,
             )
 
         logger.info("Starting CUDA Graph warmup for %d sizes: %s", len(self.capture_sizes), self.capture_sizes)
