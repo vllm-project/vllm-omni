@@ -971,10 +971,8 @@ class TestDeployConfigLoading:
 
         expected_fields = {
             "async_chunk",
-
             # StageDeployConfig: stage placement and runtime fields.
             "devices",
-
             # StageDeployConfig: vLLM EngineArgs fields.
             "async_scheduling",
             "compilation_config",
@@ -993,7 +991,6 @@ class TestDeployConfigLoading:
             "subtalker_sampling_params",
             "tensor_parallel_size",
             "tokenizer_mode",
-
             # StageDeployConfig: diffusion parallel_config deploy override fields.
             "cfg_parallel_size",
             "enable_expert_parallel",
@@ -1005,7 +1002,6 @@ class TestDeployConfigLoading:
             "ulysses_mode",
             "use_hsdp",
             "vae_patch_parallel_size",
-
             # DeployConfig: pipeline-wide engine settings.
             "data_parallel_size",
             "distributed_executor_backend",
