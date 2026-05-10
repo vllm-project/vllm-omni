@@ -165,6 +165,147 @@ class TestStageConfig:
         for name in deploy_override_field_names() - {"devices"}:
             assert name not in engine_args
 
+    def test_to_omegaconf_diffusion_parallel_overrides_replace_nested_values(self):
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            yaml_engine_args={
+                "parallel_config": {
+                    "pipeline_parallel_size": 1,
+                    "data_parallel_size": 1,
+                    "tensor_parallel_size": 4,
+                    "enable_expert_parallel": False,
+                    "ulysses_degree": 1,
+                    "ring_degree": 1,
+                    "ulysses_mode": "strict",
+                    "sequence_parallel_size": 1,
+                    "cfg_parallel_size": 1,
+                    "vae_patch_parallel_size": 1,
+                    "use_hsdp": False,
+                    "hsdp_shard_size": -1,
+                    "hsdp_replicate_size": 1,
+                }
+            },
+            runtime_overrides={
+                "pipeline_parallel_size": 2,
+                "data_parallel_size": 3,
+                "tensor_parallel_size": 8,
+                "enable_expert_parallel": True,
+                "ulysses_degree": 2,
+                "ring_degree": 4,
+                "ulysses_mode": "advanced_uaa",
+                "sequence_parallel_size": 8,
+                "cfg_parallel_size": 2,
+                "vae_patch_parallel_size": 2,
+                "use_hsdp": True,
+                "hsdp_shard_size": 8,
+                "hsdp_replicate_size": 2,
+            },
+        )
+
+        omega_config = config.to_omegaconf()
+
+        assert omega_config.engine_args.parallel_config.pipeline_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.data_parallel_size == 3
+        assert omega_config.engine_args.parallel_config.tensor_parallel_size == 8
+        assert omega_config.engine_args.parallel_config.enable_expert_parallel is True
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 2
+        assert omega_config.engine_args.parallel_config.ring_degree == 4
+        assert omega_config.engine_args.parallel_config.ulysses_mode == "advanced_uaa"
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 8
+        assert omega_config.engine_args.parallel_config.cfg_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.vae_patch_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.use_hsdp is True
+        assert omega_config.engine_args.parallel_config.hsdp_shard_size == 8
+        assert omega_config.engine_args.parallel_config.hsdp_replicate_size == 2
+        assert "pipeline_parallel_size" not in omega_config.engine_args
+        assert "data_parallel_size" not in omega_config.engine_args
+        assert "tensor_parallel_size" not in omega_config.engine_args
+        assert "enable_expert_parallel" not in omega_config.engine_args
+        assert "ulysses_degree" not in omega_config.engine_args
+        assert "ring_degree" not in omega_config.engine_args
+        assert "ulysses_mode" not in omega_config.engine_args
+        assert "sequence_parallel_size" not in omega_config.engine_args
+        assert "cfg_parallel_size" not in omega_config.engine_args
+        assert "vae_patch_parallel_size" not in omega_config.engine_args
+        assert "use_hsdp" not in omega_config.engine_args
+        assert "hsdp_shard_size" not in omega_config.engine_args
+        assert "hsdp_replicate_size" not in omega_config.engine_args
+
+    def test_to_omegaconf_diffusion_parallel_overrides_create_parallel_config(self):
+        config = StageConfig(
+            stage_id=1,
+            model_stage="diffusion",
+            stage_type=StageType.DIFFUSION,
+            runtime_overrides={
+                "pipeline_parallel_size": 2,
+                "data_parallel_size": 3,
+                "tensor_parallel_size": 8,
+                "enable_expert_parallel": True,
+                "ulysses_degree": 2,
+                "ring_degree": 4,
+                "ulysses_mode": "advanced_uaa",
+                "sequence_parallel_size": 8,
+                "cfg_parallel_size": 2,
+                "vae_patch_parallel_size": 2,
+                "use_hsdp": True,
+                "hsdp_shard_size": 8,
+                "hsdp_replicate_size": 2,
+            },
+        )
+
+        omega_config = config.to_omegaconf()
+
+        assert omega_config.engine_args.parallel_config.pipeline_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.data_parallel_size == 3
+        assert omega_config.engine_args.parallel_config.tensor_parallel_size == 8
+        assert omega_config.engine_args.parallel_config.enable_expert_parallel is True
+        assert omega_config.engine_args.parallel_config.ulysses_degree == 2
+        assert omega_config.engine_args.parallel_config.ring_degree == 4
+        assert omega_config.engine_args.parallel_config.ulysses_mode == "advanced_uaa"
+        assert omega_config.engine_args.parallel_config.sequence_parallel_size == 8
+        assert omega_config.engine_args.parallel_config.cfg_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.vae_patch_parallel_size == 2
+        assert omega_config.engine_args.parallel_config.use_hsdp is True
+        assert omega_config.engine_args.parallel_config.hsdp_shard_size == 8
+        assert omega_config.engine_args.parallel_config.hsdp_replicate_size == 2
+        assert "pipeline_parallel_size" not in omega_config.engine_args
+        assert "data_parallel_size" not in omega_config.engine_args
+        assert "tensor_parallel_size" not in omega_config.engine_args
+        assert "enable_expert_parallel" not in omega_config.engine_args
+        assert "ulysses_degree" not in omega_config.engine_args
+        assert "ring_degree" not in omega_config.engine_args
+        assert "ulysses_mode" not in omega_config.engine_args
+        assert "sequence_parallel_size" not in omega_config.engine_args
+        assert "cfg_parallel_size" not in omega_config.engine_args
+        assert "vae_patch_parallel_size" not in omega_config.engine_args
+        assert "use_hsdp" not in omega_config.engine_args
+        assert "hsdp_shard_size" not in omega_config.engine_args
+        assert "hsdp_replicate_size" not in omega_config.engine_args
+
+    def test_to_omegaconf_llm_parallel_overrides_remain_top_level(self):
+        config = StageConfig(
+            stage_id=0,
+            model_stage="thinker",
+            stage_type=StageType.LLM,
+            runtime_overrides={
+                "pipeline_parallel_size": 2,
+                "data_parallel_size": 3,
+                "tensor_parallel_size": 8,
+            },
+        )
+
+        omega_config = config.to_omegaconf()
+
+        assert omega_config.engine_args.pipeline_parallel_size == 2
+        assert omega_config.engine_args.data_parallel_size == 3
+        assert omega_config.engine_args.tensor_parallel_size == 8
+        assert "pipeline_parallel_size" in omega_config.engine_args
+        assert "data_parallel_size" in omega_config.engine_args
+        assert "tensor_parallel_size" in omega_config.engine_args
+        assert "parallel_config" not in omega_config.engine_args
+
 
 class TestModelPipeline:
     """Tests for ModelPipeline class."""
