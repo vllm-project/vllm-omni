@@ -1399,17 +1399,24 @@ def enable_cache_for_helios(pipeline: Any, cache_config: Any) -> Callable[[int],
     """
     db_cache_config = _build_db_cache_config(cache_config)
 
+    calibrator_config = None
+    if cache_config.enable_taylorseer:
+        taylorseer_order = cache_config.taylorseer_order
+        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
+        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
+
     cache_dit.enable_cache(
         BlockAdapter(
             transformer=pipeline.transformer,
             blocks=[pipeline.transformer.blocks],
             forward_pattern=[ForwardPattern.Pattern_2],
             params_modifiers=[
-                ParamsModifier(cache_config=db_cache_config),
+                ParamsModifier(cache_config=db_cache_config, calibrator_config=calibrator_config),
             ],
             has_separate_cfg=False,
         ),
         cache_config=db_cache_config,
+        calibrator_config=calibrator_config,
     )
 
     logger.info(
