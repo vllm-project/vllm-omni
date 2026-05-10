@@ -35,7 +35,7 @@ from tests.helpers.assertions import (
     assert_diffusion_response,
     assert_omni_response,
 )
-from tests.helpers.env import run_forced_gpu_cleanup_round
+from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.media import (
     _merge_base64_audio_to_segment,
     convert_audio_bytes_to_text,
@@ -201,7 +201,8 @@ class OmniServer:
         env_dict: dict[str, str] | None = None,
         use_omni: bool = True,
     ) -> None:
-        run_forced_gpu_cleanup_round()
+        run_pre_test_cleanup()
+        run_post_test_cleanup()
         cleanup_dist_env_and_memory()
         self.model = model
         self.serve_args = serve_args
@@ -306,7 +307,8 @@ class OmniServer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.proc:
             self._kill_process_tree(self.proc.pid)
-        run_forced_gpu_cleanup_round()
+        run_pre_test_cleanup()
+        run_post_test_cleanup()
         cleanup_dist_env_and_memory()
 
 
@@ -593,7 +595,8 @@ class OmniServerStageCli(OmniServer):
             proc = self.stage_procs[stage_key]
             if proc.poll() is None:
                 self._kill_process_tree(proc.pid)
-        run_forced_gpu_cleanup_round()
+        run_pre_test_cleanup()
+        run_post_test_cleanup()
         cleanup_dist_env_and_memory()
 
 
@@ -1272,7 +1275,8 @@ class OmniRunner:
         **kwargs,
     ) -> None:
         cleanup_dist_env_and_memory()
-        run_forced_gpu_cleanup_round()
+        run_pre_test_cleanup()
+        run_post_test_cleanup()
         self.model_name = model_name
         self.seed = seed
         self._prompt_len_estimate_cache: dict[str, Any] = {}
@@ -1538,7 +1542,8 @@ class OmniRunner:
         if hasattr(self.omni, "close"):
             self.omni.close()
         self._cleanup_process()
-        run_forced_gpu_cleanup_round()
+        run_pre_test_cleanup()
+        run_post_test_cleanup()
         cleanup_dist_env_and_memory()
 
 
@@ -1876,6 +1881,5 @@ __all__ = [
     "OmniServerStageCli",
     "OpenAIClientHandler",
     "get_open_port",
-    "run_forced_gpu_cleanup_round",
     "dummy_messages_from_mix_data",
 ]

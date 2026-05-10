@@ -34,7 +34,7 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config.stage_config import strip_parent_engine_args
-from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
 from vllm_omni.diffusion.diffusion_engine import supports_audio_output
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.diffusion.stage_diffusion_proc import (
@@ -1441,6 +1441,16 @@ class AsyncOmniEngine:
         model_class_name = kwargs.get("model_class_name", None)
         final_output_type = "audio" if model_class_name and supports_audio_output(model_class_name) else "image"
 
+        attention_config = None
+        if (
+            kwargs.get("diffusion_attention_config") is not None
+            or kwargs.get("diffusion_attention_backend") is not None
+        ):
+            attention_config = parse_attention_config(
+                kwargs.get("diffusion_attention_config"),
+                attention_backend=kwargs.get("diffusion_attention_backend"),
+            )
+
         stage_engine_args = {
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
@@ -1467,6 +1477,8 @@ class AsyncOmniEngine:
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),
+            **({"diffusion_attention_config": attention_config} if attention_config is not None else {}),
+            "force_cutlass_fp8": bool(kwargs.get("force_cutlass_fp8", False)),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
             "enable_ar_profiler": kwargs.get("enable_ar_profiler", False),
             **(
@@ -1604,6 +1616,19 @@ class AsyncOmniEngine:
                 if lora_scale is not None:
                     if not hasattr(cfg.engine_args, "lora_scale") or cfg.engine_args.lora_scale is None:
                         cfg.engine_args.lora_scale = lora_scale
+                if (
+                    kwargs.get("diffusion_attention_config") is not None
+                    or kwargs.get("diffusion_attention_backend") is not None
+                ):
+                    has_stage_attention = (
+                        hasattr(cfg.engine_args, "diffusion_attention_config")
+                        and cfg.engine_args.diffusion_attention_config is not None
+                    )
+                    if not has_stage_attention:
+                        cfg.engine_args.diffusion_attention_config = parse_attention_config(
+                            kwargs.get("diffusion_attention_config"),
+                            attention_backend=kwargs.get("diffusion_attention_backend"),
+                        )
                 quantization_config = kwargs.get("quantization_config")
                 if quantization_config is not None:
                     if (

@@ -9,7 +9,6 @@ Uses GPUGenerationWorker for both stages (iterative unmasking + DAC decoder).
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import numpy as np
 import pytest

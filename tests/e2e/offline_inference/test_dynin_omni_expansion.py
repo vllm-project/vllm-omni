@@ -22,7 +22,6 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_DYNIN_CONFIG_PATH: Path | None = None

@@ -416,10 +416,8 @@ class BailingMoeV2SparseMoeBlock(nn.Module):
             dim=-1,
         )
 
-        # FusedMoE expects 2D hidden_states.
         hidden_states_2d = hidden_states.view(-1, h)
         final_hidden_states = self.experts(hidden_states_2d, packed_routing)
-
         final_hidden_states = final_hidden_states.view(bsz, seq_len, h)
 
         return final_hidden_states.squeeze(0) if input_is_2d else final_hidden_states

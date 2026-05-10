@@ -21,7 +21,6 @@ pytestmark = [pytest.mark.full_model]
 
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 
 def _get_config_file_from_argv() -> str | None:

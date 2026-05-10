@@ -27,10 +27,12 @@ def model_prefix() -> str:
     return f"{prefix.rstrip('/')}/" if prefix else ""
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def clean_gpu_memory_between_tests():
-    # Import here so ``tests.helpers.env`` (and vLLM platform modules) load only
-    # after session autouse fixtures like ``default_env`` have run (RFC #2299).
+    """Opt-in GPU pre/post hooks for a test (no environment-variable gate).
+
+    Use as a test parameter or ``@pytest.mark.usefixtures("clean_gpu_memory_between_tests")``.
+    """
     from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 
     print("\n=== PRE-TEST GPU CLEANUP ===")

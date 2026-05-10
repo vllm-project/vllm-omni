@@ -7,25 +7,9 @@ steps:
   - group: ":card_index_dividers: Simple Test"
     depends_on: upload-ready-pipeline
     steps:
-      - label: "Simple · Diffusion Test"
+      - label: "Simple · Diffusion & Model Executor Test"
         commands:
-          - "timeout 20m pytest -sv tests/diffusion -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
-        agents:
-          queue: "gpu_1_queue"
-        plugins:
-          - docker#v5.2.0:
-              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-              always-pull: true
-              propagate-environment: true
-              environment:
-                - "HF_HOME=/fsx/hf_cache"
-                - "HF_TOKEN"
-              volumes:
-                - "/fsx/hf_cache:/fsx/hf_cache"
-
-      - label: "Simple · Model Executor Test"
-        commands:
-          - "timeout 20m pytest -sv tests/model_executor -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "timeout 20m pytest -sv tests/diffusion tests/model_executor -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
         agents:
           queue: "gpu_1_queue"
         plugins:
@@ -374,7 +358,6 @@ steps:
         commands:
           - |
             timeout 40m bash -c "
-              export VLLM_TEST_CLEAN_GPU_MEMORY=1
               export VLLM_IMAGE_FETCH_TIMEOUT=60
               pytest -s -v tests/e2e/online_serving/test_bagel.py -m 'core_model' --run-level 'core_model'
             "
@@ -416,7 +399,6 @@ steps:
         commands:
           - |
             timeout 40m bash -c "
-              export VLLM_TEST_CLEAN_GPU_MEMORY=1
               export VLLM_IMAGE_FETCH_TIMEOUT=60
               pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py -m 'core_model' --run-level 'core_model'
             "
@@ -459,7 +441,6 @@ steps:
         commands:
           - |
             timeout 40m bash -c "
-              export VLLM_TEST_CLEAN_GPU_MEMORY=1
               export VLLM_IMAGE_FETCH_TIMEOUT=60
               pytest -s -v tests/e2e/online_serving/test_qwen_image.py -m 'core_model' --run-level 'core_model'
             "
@@ -501,7 +482,6 @@ steps:
         commands:
           - |
             timeout 40m bash -c "
-              export VLLM_TEST_CLEAN_GPU_MEMORY=1
               export VLLM_IMAGE_FETCH_TIMEOUT=60
               pytest -s -v tests/e2e/online_serving/test_qwen_image_layered.py -m 'core_model' --run-level 'core_model'
             "
