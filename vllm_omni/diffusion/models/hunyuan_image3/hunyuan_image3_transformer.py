@@ -2734,6 +2734,9 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             query_lens=[prefill_query_len],
             seq_lens=[prefill_seq_len],
             num_image_tokens=0,
+            full_attn_spans=model_kwargs["full_attn_spans"][batch_slice]
+            if model_kwargs.get("full_attn_spans")
+            else None,
         )
 
     # ==========================================================
