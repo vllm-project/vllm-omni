@@ -55,6 +55,7 @@ class FakeTokenizer:
         "</recaption>": 6,
         "</answer>": 7,
         "<boi>": 8,
+        "</think>": 9,
         **{f"<img_ratio_{i}>": 1000 + i for i in range(33)},
     }
 
@@ -83,14 +84,14 @@ def test_available_tasks_covers_all_modalities():
     }
 
 
-def test_resolve_stop_token_ids_uses_trigger_for_generation_tasks():
+def test_resolve_stop_token_ids_uses_end_tags_for_generation_tasks():
     tok = FakeTokenizer()
 
     eos_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|endoftext|>"]
-    assert resolve_stop_token_ids(task="t2i_think", tokenizer=tok) == [eos_id, FakeTokenizer.SPECIAL["<think>"]]
+    assert resolve_stop_token_ids(task="t2i_think", tokenizer=tok) == [eos_id, FakeTokenizer.SPECIAL["</think>"]]
     assert resolve_stop_token_ids(task="t2i_recaption", tokenizer=tok) == [
         eos_id,
-        FakeTokenizer.SPECIAL["<recaption>"],
+        FakeTokenizer.SPECIAL["</recaption>"],
     ]
 
 
