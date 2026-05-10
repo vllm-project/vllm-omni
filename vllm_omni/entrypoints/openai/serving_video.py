@@ -75,6 +75,11 @@ class OmniOpenAIServingVideo:
         if self._stage_configs is None and stage_configs is not None:
             self._stage_configs = stage_configs
 
+    def _preserves_original_reference_image(self) -> bool:
+        """Return whether the model expects to own reference-image preprocessing."""
+        model_name = (self._model_name or "").lower()
+        return "mova" in model_name
+
     @classmethod
     def for_diffusion(
         cls,
@@ -104,7 +109,12 @@ class OmniOpenAIServingVideo:
 
         input_image = None if reference_image is None else reference_image.data
         vp = request.resolve_video_params()
-        if input_image is not None and vp.width is not None and vp.height is not None:
+        if (
+            input_image is not None
+            and vp.width is not None
+            and vp.height is not None
+            and not self._preserves_original_reference_image()
+        ):
             target_size = (vp.width, vp.height)
             if input_image.size != target_size:
                 input_image = input_image.resize(target_size, Image.Resampling.LANCZOS)

@@ -236,6 +236,11 @@ _DIFFUSION_MODELS = {
         "pipeline_hunyuan_video_1_5_i2v",
         "HunyuanVideo15I2VPipeline",
     ),
+    "MOVA": (
+        "mova",
+        "pipeline_mova",
+        "MovaPipeline",
+    ),
     "MagiHumanPipeline": (
         "magi_human",
         "pipeline_magi_human",
@@ -258,6 +263,11 @@ _DIFFUSION_MODELS = {
     ),
 }
 
+_DIFFUSION_MODEL_METADATA = {
+    "DreamIDOmniPipeline": {"requires_transformer_config": False},
+    "MOVA": {"requires_transformer_config": False},
+}
+
 
 DiffusionModelRegistry = _ModelRegistry(
     {
@@ -268,6 +278,15 @@ DiffusionModelRegistry = _ModelRegistry(
         for model_arch, (mod_folder, mod_relname, cls_name) in _DIFFUSION_MODELS.items()
     }
 )
+
+
+def diffusion_model_requires_transformer_config(model_class_name: str | None) -> bool:
+    """Return whether the diffusion model expects transformer/config.json."""
+    if model_class_name is None:
+        return True
+    metadata = _DIFFUSION_MODEL_METADATA.get(model_class_name, {})
+    return metadata.get("requires_transformer_config", True)
+
 
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
@@ -472,6 +491,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "Flux2Pipeline": "get_flux2_post_process_func",
     "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
+    "MOVA": "get_mova_post_process_func",
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
