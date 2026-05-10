@@ -68,6 +68,10 @@ class AttentionMetadata:
     # Opaque backend-specific per-forward parameters (e.g. block masks, KV indices).
     # Backends MUST silently ignore unknown keys.
 
+    # Piecewise attention metadata (mixed causal/full masks).
+    # full_attn_spans: per-sample [start, end) spans in global coordinates using full attention.
+    full_attn_spans: list[list[tuple[int, int]]] | None = None
+
 
 T = TypeVar("T", bound=AttentionMetadata)
 
