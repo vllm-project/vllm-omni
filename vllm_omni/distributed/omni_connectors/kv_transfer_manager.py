@@ -995,6 +995,11 @@ class OmniKVTransferManager:
             logger.info(f"Skip receiving KV cache for {request_id} (need_recv_cache=False)")
             return None, 0
 
+        # Skip during warmup dummy run — no sender is available.
+        if request_id == "dummy_req_id":
+            logger.info("Skip receiving KV cache for dummy warmup request")
+            return None, 0
+
         timeout = self.config.recv_timeout
         start_time = time.time()
         poll_interval = 0.01
