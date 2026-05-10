@@ -452,6 +452,18 @@ class StageDeployConfig:
     disable_hybrid_kv_cache_manager: bool | None = None
     mm_processor_cache_gb: float | None = None
 
+    # Diffusion parallel_config deploy override fields.
+    enable_expert_parallel: bool | None = None
+    ulysses_degree: int | None = None
+    ulysses_mode: str | None = None
+    ring_degree: int | None = None
+    sequence_parallel_size: int | None = None
+    cfg_parallel_size: int | None = None
+    vae_patch_parallel_size: int | None = None
+    use_hsdp: bool | None = None
+    hsdp_shard_size: int | None = None
+    hsdp_replicate_size: int | None = None
+
     # Compilation, profiling, tokenizer/config parsing, and model loading.
     compilation_config: dict[str, Any] | None = None
     profiler_config: dict[str, Any] | None = None
