@@ -971,17 +971,16 @@ class TestDeployConfigLoading:
 
         expected_fields = {
             "async_chunk",
+
+            # StageDeployConfig: stage placement and runtime fields.
+            "devices",
+
+            # StageDeployConfig: vLLM EngineArgs fields.
             "async_scheduling",
             "compilation_config",
             "config_format",
-            "data_parallel_size",
-            "devices",
             "disable_hybrid_kv_cache_manager",
-            "distributed_executor_backend",
-            "dtype",
-            "enable_chunked_prefill",
             "enable_flashinfer_autotune",
-            "enable_prefix_caching",
             "enforce_eager",
             "gpu_memory_utilization",
             "load_format",
@@ -989,13 +988,32 @@ class TestDeployConfigLoading:
             "max_num_batched_tokens",
             "max_num_seqs",
             "mm_processor_cache_gb",
-            "pipeline_parallel_size",
             "profiler_config",
-            "quantization",
             "skip_mm_profiling",
             "subtalker_sampling_params",
             "tensor_parallel_size",
             "tokenizer_mode",
+
+            # StageDeployConfig: diffusion parallel_config deploy override fields.
+            "cfg_parallel_size",
+            "enable_expert_parallel",
+            "hsdp_replicate_size",
+            "hsdp_shard_size",
+            "ring_degree",
+            "sequence_parallel_size",
+            "ulysses_degree",
+            "ulysses_mode",
+            "use_hsdp",
+            "vae_patch_parallel_size",
+
+            # DeployConfig: pipeline-wide engine settings.
+            "data_parallel_size",
+            "distributed_executor_backend",
+            "dtype",
+            "enable_chunked_prefill",
+            "enable_prefix_caching",
+            "pipeline_parallel_size",
+            "quantization",
             "trust_remote_code",
         }
 
