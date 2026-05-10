@@ -52,6 +52,9 @@ def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | 
     user_token_id = 872
     assistant_token_id = 77091
     audio_token_id = 151675
+    image_token_id = 151655
+    video_token_id = 151656
+    mm_token_ids = {audio_token_id, image_token_id, video_token_id}
 
     ids = info.get("ids", {})
     thinker_sequences = torch.tensor(ids["all"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
@@ -79,7 +82,7 @@ def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | 
             # no audio tokens and would route entirely through text_projection
             # in the talker, producing garbled speech.
             section_ids = input_ids[0, s:e]
-            if not (section_ids == audio_token_id).any().item():
+            if not any((section_ids == tid).any().item() for tid in mm_token_ids):
                 continue
             sum_user_len += e - s
         elif role == assistant_token_id and i == len(im_start_indexes) - 2:

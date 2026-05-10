@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import re
 import time
 from collections.abc import AsyncGenerator
 from typing import cast
@@ -652,21 +651,12 @@ class RealtimeConnection(VllmRealtimeConnection):
                 await self.send(ResponseAudioDone())
                 done_sent = True
 
-            if append_response:
-                # Strip the tool-call block before storing as content — the
-                # detection branch above already appended an assistant entry
-                # with tool_calls=[...], so leaving the XML here would render
-                # the call twice in next-turn history. strip_special_tokens
-                # only handles <|...|> tokens.
-                tc_open = re.escape(self.model_cls.TOOL_CALL_OPEN)
-                tc_close = re.escape(self.model_cls.TOOL_CALL_CLOSE)
-                content_text = re.sub(
-                    rf"{tc_open}.*?{tc_close}",
-                    "",
-                    spoken_text,
-                    flags=re.DOTALL,
-                )
-                clean = self.model_cls.strip_special_tokens(content_text)
+            if append_response and not audio_pass_tool_call_detected:
+                # Only append when no tool call was detected — the detection
+                # branch already appended an assistant entry with tool_calls=[...].
+                # Appending again would create an assistant→assistant adjacency
+                # in history and duplicate the visible pre-tool text.
+                clean = self.model_cls.strip_special_tokens(spoken_text)
                 self.conversation_items.append(
                     {
                         "role": "assistant",
