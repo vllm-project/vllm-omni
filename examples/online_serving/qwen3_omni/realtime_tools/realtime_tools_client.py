@@ -14,12 +14,14 @@ Single-turn usage:
   python realtime_tools_client.py \\
       --url ws://localhost:8091/v1/realtime \\
       --model Qwen/Qwen3-Omni-30B-A3B-Instruct \\
+      --api-key <YOUR_API_KEY> \\
       --input-wav input_16k_mono.wav \\
       --output-wav tool_output.wav
 
 Multi-turn usage (multiple WAVs over one WebSocket session — proves
 conversation context is retained across turns):
   python realtime_tools_client.py \\
+      --api-key <YOUR_API_KEY> \\
       --input-wav greeting.wav weather_paris.wav weather_london.wav \\
       --output-wav response.wav   # writes response_turn1.wav, _turn2.wav, ...
 
@@ -38,6 +40,7 @@ understanding the query.
 
 Dependencies:
   pip install websockets
+  pip install pydub   # optional — enables auto-resampling of non-16kHz input WAVs
 """
 
 from __future__ import annotations
@@ -57,6 +60,10 @@ try:
 except ImportError:
     print("Please install websockets: pip install websockets")
     raise SystemExit(1)
+
+import importlib.util
+
+_PYDUB_AVAILABLE = importlib.util.find_spec("pydub") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -169,16 +176,36 @@ class TurnLatency:
 
 
 def _read_wav_pcm16(path: Path) -> bytes:
-    """Read a mono 16-bit 16 kHz uncompressed WAV and return its PCM frames."""
+    """Read a WAV file and return mono 16-bit 16 kHz PCM frames.
+
+    If pydub is available, any sample rate / channel count is accepted and
+    automatically resampled to 16 kHz mono (matching test_multiturn.py).
+    Without pydub the file must already be mono 16-bit 16 kHz.
+    """
+    if _PYDUB_AVAILABLE:
+        from pydub import AudioSegment
+
+        audio = AudioSegment.from_wav(str(path))
+        audio = audio.set_channels(1).set_frame_rate(16000).set_sample_width(2)
+        return audio.raw_data
+
     with wave.open(str(path), "rb") as wf:
         if wf.getnchannels() != 1:
-            raise ValueError(f"Input WAV must be mono (got {wf.getnchannels()} channels).")
+            raise ValueError(
+                f"Input WAV must be mono (got {wf.getnchannels()} channels); install pydub to auto-resample."
+            )
         if wf.getsampwidth() != 2:
-            raise ValueError(f"Input WAV must be 16-bit PCM (got sample width={wf.getsampwidth()}).")
+            raise ValueError(
+                f"Input WAV must be 16-bit PCM (got sample width={wf.getsampwidth()}); install pydub to auto-resample."
+            )
         if wf.getframerate() != 16000:
-            raise ValueError(f"Input WAV must be 16 kHz (got {wf.getframerate()} Hz).")
+            raise ValueError(
+                f"Input WAV must be 16 kHz (got {wf.getframerate()} Hz); install pydub to auto-resample."
+            )
         if wf.getcomptype() != "NONE":
-            raise ValueError(f"Input WAV must be uncompressed (got {wf.getcomptype()}).")
+            raise ValueError(
+                f"Input WAV must be uncompressed (got {wf.getcomptype()})."
+            )
         return wf.readframes(wf.getnframes())
 
 
@@ -296,7 +323,9 @@ async def _run_turn(ws, label: str, latency: TurnLatency, trap_calls: list[dict]
             await _execute_tool_and_reply(ws, name, arguments_json, call_id, latency, trap_calls)
         elif etype == "error":
             print(f"  [{label}] ERROR: {event.get('error', event)}")
-            break
+            # Don't break — a non-fatal server error (e.g. session.update
+            # validation) still produces response.audio.done. Breaking here
+            # would leave audio bytes in the buffer and corrupt subsequent turns.
 
     return b"".join(audio_chunks), sample_rate, tool_calls
 
@@ -315,14 +344,17 @@ INSTRUCTIONS = (
 )
 
 
-async def run_client(url: str, model: str, input_wavs: list[Path], output_wav: Path) -> None:
+async def run_client(
+    url: str, model: str, input_wavs: list[Path], output_wav: Path, api_key: str | None = None
+) -> None:
     """Connect once, run a turn per input WAV, and print a session summary."""
     print(f"[{_ts()}] Connecting to {url}")
 
     trap_calls: list[dict] = []
     results: dict[int, tuple[list[dict], TurnLatency, bool]] = {}
 
-    async with websockets.connect(url, max_size=64 * 1024 * 1024) as ws:
+    extra_headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    async with websockets.connect(url, max_size=64 * 1024 * 1024, additional_headers=extra_headers) as ws:
         await _wait_session_created(ws)
 
         await ws.send(
@@ -415,9 +447,14 @@ def main() -> None:
         default=Path("tool_output.wav"),
         help=("Output WAV path. With multiple input WAVs, '_turn{N}' is inserted before the suffix."),
     )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="Bearer token sent as Authorization header (required by deployments with auth enabled).",
+    )
 
     args = parser.parse_args()
-    asyncio.run(run_client(args.url, args.model, args.input_wav, args.output_wav))
+    asyncio.run(run_client(args.url, args.model, args.input_wav, args.output_wav, args.api_key))
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from typing import cast
 from uuid import uuid4
 
 import numpy as np
+from vllm.engine.protocol import StreamingInput
 from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel, UsageInfo
 from vllm.entrypoints.openai.realtime.connection import (
     RealtimeConnection as VllmRealtimeConnection,
@@ -23,7 +24,9 @@ from vllm.entrypoints.openai.realtime.protocol import (
     TranscriptionDelta,
     TranscriptionDone,
 )
+from vllm.inputs import PromptType
 from vllm.logger import init_logger
+from vllm.renderers.inputs.preprocess import parse_model_prompt
 from vllm.tokenizers import cached_tokenizer_from_config
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -197,7 +200,6 @@ class RealtimeConnection(VllmRealtimeConnection):
             self._pending_tool_context = True
             return
 
-        logger.info("Generating audio response with tool context")
         self.generation_task = asyncio.create_task(self._run_audio_from_tool_context(append_response=True))
 
     # -------------------------------------------------------------------------
@@ -250,9 +252,7 @@ class RealtimeConnection(VllmRealtimeConnection):
 
         self._pending_transcript_task = asyncio.create_task(self._transcribe_user_audio(self._current_user_item))
 
-        streaming_input_gen = self.serving.transcribe_realtime(
-            audio_stream, input_stream, conversation_context, prior_blocks
-        )
+        streaming_input_gen = self._transcribe_realtime(audio_stream, input_stream, conversation_context, prior_blocks)
         self.conversation_context = None
 
         self.generation_task = asyncio.create_task(self._run_generation(streaming_input_gen, input_stream))
@@ -370,12 +370,13 @@ class RealtimeConnection(VllmRealtimeConnection):
         self.current_tool_calls = []
 
         try:
-            if self.tools:
-                # Tools mode: skip the streaming text pass and route through
-                # the audio pass so the tool-call detection / abort path is
-                # active. Plain and instructions-only modes both flow through
-                # the streaming pass (multi-turn history is plumbed via
-                # conversation_context + prior_blocks in start_generation).
+            if self.tools or self.instructions:
+                # Tools or instructions mode: skip the streaming text pass and
+                # route through the audio pass. Tools mode needs the tool-call
+                # detection / abort path; instructions mode needs the audio pass
+                # because buffer_realtime_audio with a system-prefix yields a
+                # text-only first chunk that the streaming engine path processes
+                # as text-only, producing TranscriptionDelta but no audio.
                 self._cached_user_audio = []
                 self._audio_cached_event.clear()
                 while True:
@@ -632,12 +633,6 @@ class RealtimeConnection(VllmRealtimeConnection):
                     # chunks ⇒ stage-1 hang; neither ticking ⇒ stage-0 hang.
                     now = time.monotonic()
                     if len(spoken_text) - last_progress_len > 100 or now - last_progress_time > 5.0:
-                        logger.info(
-                            "audio-pass progress %.2fs | spoken_len=%d | audio_chunks=%d",
-                            now - t_audio_start,
-                            len(spoken_text),
-                            audio_chunk_count,
-                        )
                         last_progress_len = len(spoken_text)
                         last_progress_time = now
 
@@ -761,7 +756,6 @@ class RealtimeConnection(VllmRealtimeConnection):
             transcript = full_text.split(self.model_cls.ASSISTANT_TURN_END)[0]
             transcript = self.model_cls.strip_special_tokens(transcript)
             user_item["content"] = transcript or None
-            logger.info("[STT] transcript: %r", transcript)
         except Exception as exc:
             logger.exception("[STT] transcription failed: %s", exc)
 
@@ -810,6 +804,41 @@ class RealtimeConnection(VllmRealtimeConnection):
                 self._audio_cached_event.set()
 
         return _gen()
+
+    # -------------------------------------------------------------------------
+    # Streaming input helpers
+    # -------------------------------------------------------------------------
+
+    async def _transcribe_realtime(
+        self,
+        audio_stream: AsyncGenerator,
+        input_stream: asyncio.Queue,
+        conversation_context: str | None = None,
+        prior_blocks: str | None = None,
+    ) -> AsyncGenerator[StreamingInput, None]:
+        """Wrap buffer_realtime_audio into StreamingInput for engine.generate().
+
+        Falls back to the upstream two-arg transcribe_realtime when no
+        conversation context or prior history is present, so plain sessions
+        are unaffected by the multi-turn machinery.
+        """
+        if conversation_context is None and prior_blocks is None:
+            async for item in self.serving.transcribe_realtime(audio_stream, input_stream):
+                yield item
+            return
+
+        model_config = self.serving.model_config
+        renderer = self.serving.renderer
+        stream_input_iter = cast(
+            AsyncGenerator[PromptType, None],
+            self.model_cls.buffer_realtime_audio(
+                audio_stream, input_stream, model_config, conversation_context, prior_blocks
+            ),
+        )
+        async for prompt in stream_input_iter:
+            parsed_prompt = parse_model_prompt(model_config, prompt)
+            (engine_prompt,) = await renderer.render_cmpl_async([parsed_prompt])
+            yield StreamingInput(prompt=engine_prompt)
 
     # -------------------------------------------------------------------------
     # Text processing helpers

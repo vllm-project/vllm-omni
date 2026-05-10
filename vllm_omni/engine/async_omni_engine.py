@@ -8,6 +8,7 @@ with the Orchestrator (running in a background thread) via janus queues.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import concurrent.futures
 import copy
 import dataclasses
@@ -1102,12 +1103,14 @@ class AsyncOmniEngine:
                 # startup, the main process keeps running in a silently
                 # broken state. Send SIGTERM to ourselves so uvicorn /
                 # asyncio shutdown handlers run (GPU cleanup, log flush,
-                # in-flight request drains) instead of os._exit() bypassing
-                # them. The orchestrator process exits non-zero, which is
-                # the signal the deployment watches for.
+                # in-flight request drains). Register an atexit handler
+                # first so that after graceful shutdown completes the
+                # process still exits with code 1, which is what deployment
+                # monitors watch for to detect failure.
                 logger.error(
-                    "[AsyncOmniEngine] Orchestrator crashed post-startup; raising SIGTERM for graceful shutdown"
+                    "[AsyncOmniEngine] Orchestrator crashed post-startup; triggering graceful shutdown with failure exit code"
                 )
+                atexit.register(lambda: os._exit(1))
                 os.kill(os.getpid(), signal.SIGTERM)
             raise
         finally:

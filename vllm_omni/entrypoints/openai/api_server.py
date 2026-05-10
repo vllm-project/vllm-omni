@@ -55,6 +55,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.orca_metrics import metrics_header
+from vllm.entrypoints.openai.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
 from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.openai.speech_to_text.serving import (
@@ -115,7 +116,6 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoResponse,
 )
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
-from vllm_omni.entrypoints.openai.realtime_serving import OpenAIServingRealtime
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
@@ -404,6 +404,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
         _register_omni_exception_handlers(app)
 
         await omni_init_app_state(engine_client, app.state, args)
+        await _warmup_realtime(engine_client, app.state)
 
         # Conditionally register profiler endpoints based on stage YAML configs
         stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
@@ -540,6 +541,57 @@ async def build_async_omni_from_stage_config(
     finally:
         if async_omni:
             async_omni.shutdown()
+
+
+async def _warmup_realtime(engine_client: EngineClient, state: State) -> None:
+    """Run one thinker-only pass to warm the GPU before accepting requests.
+
+    Eliminates the cold-start latency spike on the first real /v1/realtime
+    request. Only stage 0 (thinker) is exercised — it accounts for most of
+    the cold-start cost as the largest model in the pipeline. Stages 1+2
+    (talker, code2wav) are skipped to avoid overflowing their audio buffers
+    with a synthetic silent input.
+
+    Skipped if the realtime serving object is absent (non-omni or
+    pure-diffusion deployments) or if the model class lacks realtime support.
+    """
+    from uuid import uuid4
+
+    from vllm_omni.entrypoints.utils import coerce_param_message_types
+
+    serving = getattr(state, "openai_serving_realtime", None)
+    if serving is None:
+        return
+
+    model_cls = getattr(serving, "model_cls", None)
+    if model_cls is None or not hasattr(model_cls, "build_audio_pass_prompt"):
+        return
+
+    logger.info("[warmup] Running realtime thinker warmup pass...")
+    try:
+        # 0.5 s of silence at 16 kHz — triggers a real thinker forward pass
+        # without generating audio (output_modalities=["text"] keeps stages
+        # 1+2 out of the picture, avoiding audio-buffer size constraints that
+        # vary by deploy config).
+        silence = np.zeros(8000, dtype=np.float32)
+        prompt = {
+            "prompt": model_cls.build_audio_pass_prompt(None, ""),
+            "multi_modal_data": {"audio": (silence, 16000)},
+        }
+        request_id = f"warmup-{uuid4()}"
+        generator = engine_client.generate(
+            prompt=prompt,
+            request_id=request_id,
+            output_modalities=["text"],
+            sampling_params_list=coerce_param_message_types(
+                list(engine_client.default_sampling_params_list), is_streaming=True
+            ),
+        )
+        async for _ in generator:
+            pass
+        logger.info("[warmup] Realtime thinker warmup complete.")
+    except Exception:
+        logger.warning("[warmup] Realtime warmup pass failed (non-fatal).", exc_info=True)
 
 
 async def omni_init_app_state(
@@ -935,7 +987,6 @@ async def omni_init_app_state(
         engine_client=engine_client,
         models=state.openai_serving_models,
         request_logger=request_logger,
-        speech_service=state.openai_serving_speech,
     )
 
     state.openai_serving_video = OmniOpenAIServingVideo(

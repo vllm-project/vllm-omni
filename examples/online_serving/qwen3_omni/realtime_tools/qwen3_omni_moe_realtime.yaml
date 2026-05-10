@@ -15,7 +15,7 @@
 # Use:
 #   vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
 #       --deploy-config examples/online_serving/qwen3_omni/realtime_tools/qwen3_omni_moe_realtime.yaml
-base_config: vllm_omni/deploy/qwen3_omni_moe.yaml
+base_config: ../../../../vllm_omni/deploy/qwen3_omni_moe.yaml
 
 async_chunk: false
 
@@ -24,10 +24,6 @@ stages:
     gpu_memory_utilization: 0.15
     max_num_batched_tokens: 16384
     max_model_len: 32768
-    # default_sampling_params is deep-merged with the base, so we only spell
-    # out the deltas. top_p: 1.0 (vs base 0.9) keeps tool-call JSON faithful;
-    # max_tokens: 1024 caps a single thinker turn — well above any realistic
-    # tool-call XML length.
     default_sampling_params:
       top_p: 1.0
       max_tokens: 1024
@@ -36,10 +32,6 @@ stages:
     gpu_memory_utilization: 0.35
     max_num_batched_tokens: 8192
     max_model_len: 8192
-    # Talker codec emission must be deterministic — temperature: 0.9 / top_k: 50
-    # from the production base produces high-entropy codec tokens that degrade
-    # speech quality. stop_token_ids: [2150] is the talker EOS — without it,
-    # the talker can run to max_tokens and emit trailing silence/garbage.
     default_sampling_params:
       top_k: 1
       max_tokens: 20000
