@@ -199,13 +199,9 @@ def _read_wav_pcm16(path: Path) -> bytes:
                 f"Input WAV must be 16-bit PCM (got sample width={wf.getsampwidth()}); install pydub to auto-resample."
             )
         if wf.getframerate() != 16000:
-            raise ValueError(
-                f"Input WAV must be 16 kHz (got {wf.getframerate()} Hz); install pydub to auto-resample."
-            )
+            raise ValueError(f"Input WAV must be 16 kHz (got {wf.getframerate()} Hz); install pydub to auto-resample.")
         if wf.getcomptype() != "NONE":
-            raise ValueError(
-                f"Input WAV must be uncompressed (got {wf.getcomptype()})."
-            )
+            raise ValueError(f"Input WAV must be uncompressed (got {wf.getcomptype()}).")
         return wf.readframes(wf.getnframes())
 
 

@@ -1111,9 +1111,7 @@ class AsyncOmniEngine:
                 # first so that after graceful shutdown completes the
                 # process still exits with code 1, which is what deployment
                 # monitors watch for to detect failure.
-                logger.error(
-                    "[AsyncOmniEngine] Orchestrator crashed post-startup; triggering graceful shutdown with failure exit code"
-                )
+                logger.error("[AsyncOmniEngine] Orchestrator crashed post-startup; triggering graceful shutdown")
                 atexit.register(lambda: os._exit(1))
                 os.kill(os.getpid(), signal.SIGTERM)
             raise
