@@ -130,7 +130,7 @@ def _apply_diffusion_parallel_runtime_overrides(
 
     parallel_fields = frozenset(f.name for f in fields(DiffusionParallelConfig))
     parallel_config = engine_args.get("parallel_config")
-    parallel_config_dict = to_dict(parallel_config) if parallel_config is not None else None
+    parallel_config_dict = dict(parallel_config) if parallel_config is not None else None
 
     for key in list(runtime_overrides.keys()):
         value = runtime_overrides.get(key)
