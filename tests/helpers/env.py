@@ -16,11 +16,6 @@ from contextlib import contextmanager
 import torch
 
 
-def run_forced_gpu_cleanup_round() -> None:
-    run_pre_test_cleanup(enable_force=True)
-    run_post_test_cleanup(enable_force=True)
-
-
 def get_physical_device_indices(devices):
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible_devices is None:
@@ -130,7 +125,7 @@ def wait_for_gpu_memory_to_clear(
                 )
 
             gc.collect()
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
             time.sleep(5)
 
 
@@ -232,19 +227,10 @@ def _print_gpu_processes() -> None:
     print("=" * 80)
 
 
-_SKIPPED_GPU_CLEANUP_MSG = (
-    "\nSkipping GPU memory cleanup check (typically: instance already up; no check needed between tests)\n"
-)
-
-
-def run_pre_test_cleanup(enable_force: bool = False) -> None:
-    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
-        print(_SKIPPED_GPU_CLEANUP_MSG)
-        return
-
+def run_pre_test_cleanup() -> None:
     print("Pre-test GPU status:")
 
-    num_gpus = torch.cuda.device_count()
+    num_gpus = torch.accelerator.device_count()
     if num_gpus > 0:
         try:
             wait_for_gpu_memory_to_clear(
@@ -255,14 +241,10 @@ def run_pre_test_cleanup(enable_force: bool = False) -> None:
             print(f"Pre-test cleanup note: {e}")
 
 
-def run_post_test_cleanup(enable_force: bool = False) -> None:
-    if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
-        print(_SKIPPED_GPU_CLEANUP_MSG)
-        return
-
+def run_post_test_cleanup() -> None:
     if torch.cuda.is_available():
         gc.collect()
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
 
         print("Post-test GPU status:")
         _print_gpu_processes()
@@ -318,6 +300,5 @@ __all__ = [
     "get_physical_device_indices",
     "run_post_test_cleanup",
     "run_pre_test_cleanup",
-    "run_forced_gpu_cleanup_round",
     "wait_for_gpu_memory_to_clear",
 ]

@@ -140,6 +140,7 @@ class OmniEngineArgs(EngineArgs):
     async_chunk: bool = False
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
+    force_cutlass_fp8: bool | None = None
     worker_type: str | None = None
     task_type: str | None = None
     worker_cls: str = None
@@ -438,10 +439,9 @@ class OrchestratorArgs:
     parallel_config: Any = None
 
     # === Multi-stage guards ===
-    # --tokenizer is captured here so it does not propagate to every stage
-    # uniformly (different stages often need different tokenizers, e.g.
-    # qwen3_omni thinker vs talker). Users wanting a per-stage tokenizer
-    # should set it in the deploy YAML.
+    # --tokenizer is captured by the orchestrator and forwarded to stages
+    # only when the stage does not define tokenizer/tokenizer_subdir itself.
+    # Users wanting a per-stage tokenizer should set it in the deploy YAML.
     tokenizer: str | None = None
 
 

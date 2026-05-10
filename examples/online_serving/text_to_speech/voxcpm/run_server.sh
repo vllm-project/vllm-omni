@@ -17,7 +17,7 @@ case "$MODE" in
         STAGE_CONFIG="vllm_omni/model_executor/stage_configs/voxcpm_async_chunk.yaml"
         ;;
     sync)
-        STAGE_CONFIG="vllm_omni/model_executor/stage_configs/voxcpm.yaml"
+        STAGE_CONFIG="vllm_omni/deploy/voxcpm.yaml"
         ;;
     *)
         echo "Unknown mode: $MODE"

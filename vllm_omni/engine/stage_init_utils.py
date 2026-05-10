@@ -104,6 +104,18 @@ def _resolve_model_tokenizer_paths(model: str, engine_args: dict[str, Any]) -> s
     return model
 
 
+def apply_cli_tokenizer(
+    engine_args: dict[str, Any],
+    *,
+    cli_tokenizer: str | None,
+    stage_defines_tokenizer: bool,
+) -> None:
+    """Forward CLI tokenizer unless the stage config defines its own."""
+    if cli_tokenizer is None or stage_defines_tokenizer:
+        return
+    engine_args["tokenizer"] = cli_tokenizer
+
+
 def terminate_alive_proc(proc, timeout=5):
     if proc.is_alive():
         proc.terminate()
@@ -306,7 +318,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     engine_args = stage_config.engine_args
 
     if current_omni_platform.is_rocm():
-        if engine_args.get("attention_backend") is None:
+        if stage_type != "diffusion" and engine_args.get("attention_backend") is None:
             from vllm._aiter_ops import rocm_aiter_ops
 
             if rocm_aiter_ops.is_enabled():
@@ -531,6 +543,7 @@ def build_engine_args_dict(
     stage_config: Any,
     model: str,
     stage_connector_spec: dict[str, Any] | None = None,
+    cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Build the normalized engine args dict for one stage."""
     engine_args = stage_config.engine_args
@@ -545,13 +558,29 @@ def build_engine_args_dict(
     stage_id = stage_config.stage_id
 
     engine_args_dict = _to_dict(engine_args)
+    stage_defines_tokenizer = (
+        engine_args_dict.get("tokenizer") is not None or engine_args_dict.get("tokenizer_subdir") is not None
+    )
     model = _resolve_model_tokenizer_paths(model, engine_args_dict)
+    apply_cli_tokenizer(
+        engine_args_dict,
+        cli_tokenizer=cli_tokenizer,
+        stage_defines_tokenizer=stage_defines_tokenizer,
+    )
     engine_args_dict["model"] = model
     # Stage id must come from stage config instead of inherited CLI kwargs
     # (e.g. `--stage-id` defaulting to None).
     engine_args_dict["stage_id"] = stage_id
     if engine_args_dict.get("async_chunk", False):
         engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
+
+    if stage_type == "diffusion":
+        from vllm_omni.diffusion.data import parse_attention_config
+
+        if engine_args_dict.get("diffusion_attention_config") is not None:
+            engine_args_dict["diffusion_attention_config"] = parse_attention_config(
+                engine_args_dict.get("diffusion_attention_config"),
+            )
 
     if stage_type != "diffusion":
         resolve_worker_cls(engine_args_dict)

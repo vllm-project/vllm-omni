@@ -328,7 +328,7 @@ class TestResolveModelConfigPath:
         )
         mocker.patch(
             "vllm_omni.entrypoints.utils.current_omni_platform.get_default_stage_config_path",
-            return_value="vllm_omni/model_executor/stage_configs",
+            return_value="vllm_omni/deploy",
         )
 
         original_exists = os.path.exists

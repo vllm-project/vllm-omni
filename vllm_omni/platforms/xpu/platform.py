@@ -39,10 +39,10 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
             backend = DiffusionAttentionBackendEnum[backend_upper]
-            logger.info("Using diffusion attention backend '%s'", backend_upper)
+            logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()
 
-        logger.info("Defaulting to diffusion attention backend SDPA")
+        logger.debug("Defaulting to diffusion attention backend SDPA")
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
     @classmethod

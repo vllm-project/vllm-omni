@@ -78,6 +78,7 @@ nav:
       - Online Quantization: user_guide/quantization/online.md
       - FP8 W8A8: user_guide/quantization/fp8.md
       - Int8 W8A8: user_guide/quantization/int8.md
+      - ModelOpt: user_guide/quantization/modelopt.md
       - GGUF: user_guide/quantization/gguf.md
       - AutoRound: user_guide/quantization/autoround.md
       - msModelSlim: user_guide/quantization/msmodelslim.md

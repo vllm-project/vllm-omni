@@ -4,17 +4,26 @@
 
 from __future__ import annotations
 
+import functools
+
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (  # noqa: E402
-    VoxCPM2TalkerForConditionalGeneration,
-    _RequestState,
-)
+
+@functools.lru_cache(maxsize=1)
+def _voxcpm2_talker_mod():
+    """Defer talker import (pulls vLLM model_executor) until first use."""
+    from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
+        VoxCPM2TalkerForConditionalGeneration,
+        _RequestState,
+    )
+
+    return VoxCPM2TalkerForConditionalGeneration, _RequestState
 
 
-def _make_bare_talker() -> VoxCPM2TalkerForConditionalGeneration:
+def _make_bare_talker():
+    VoxCPM2TalkerForConditionalGeneration, _ = _voxcpm2_talker_mod()
     talker = VoxCPM2TalkerForConditionalGeneration.__new__(VoxCPM2TalkerForConditionalGeneration)
     talker._active_states = {}
     talker._current_request_id = None
@@ -28,7 +37,8 @@ def _make_bare_talker() -> VoxCPM2TalkerForConditionalGeneration:
     return talker
 
 
-def _seed_cached_decode(talker, req_id: str) -> _RequestState:
+def _seed_cached_decode(talker, req_id: str):
+    _, _RequestState = _voxcpm2_talker_mod()
     state = _RequestState(request_id=req_id)
     state.prefill_completed = True
     state.decode_step_count = 5
@@ -109,8 +119,9 @@ class TestLeakWarnGuard:
         talker = _make_bare_talker()
         talker._active_state_warn_threshold = 3
 
+        _, RState = _voxcpm2_talker_mod()
         for i in range(4):
-            talker._active_states[f"seed-{i}"] = _RequestState(request_id=f"seed-{i}")
+            talker._active_states[f"seed-{i}"] = RState(request_id=f"seed-{i}")
 
         talker._get_or_create_state("new-1")
         talker._get_or_create_state("new-2")

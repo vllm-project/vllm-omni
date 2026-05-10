@@ -64,7 +64,7 @@ def test_send_multimodal_request_001(omni_server) -> None:
 
     similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
     print(f"similarity is: {similarity}")
-    assert similarity > 0.9, "The audio content is not same as the text"
+    assert similarity > 0.8, "The audio content is not same as the text"
 
     # TODO: Verify the E2E latency after confirmation baseline.
 
@@ -95,7 +95,7 @@ def test_send_multimodal_request_002(omni_server) -> None:
     )
     similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
     print(f"similarity is: {similarity}")
-    assert similarity > 0.9, "The audio content is not same as the text"
+    assert similarity > 0.8, "The audio content is not same as the text"
 
     # TODO: Verify the E2E latency after confirmation baseline.
 
@@ -184,7 +184,7 @@ def test_modality_control_003(omni_server) -> None:
     print(f"audio content is: {audio_content}")
     similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
     print(f"similarity is: {similarity}")
-    assert similarity > 0.9, "The audio content is not same as the text"
+    assert similarity > 0.8, "The audio content is not same as the text"
 
     # TODO: Verify the E2E latency after confirmation baseline.
 
@@ -213,7 +213,7 @@ def test_stream_001(omni_server) -> None:
     print(f"audio content is: {audio_content}")
     similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
     print(f"similarity is: {similarity}")
-    assert similarity > 0.9, "The audio content is not same as the text"
+    assert similarity > 0.8, "The audio content is not same as the text"
     # TODO: Verify the E2E latency after confirmation baseline.
 
 

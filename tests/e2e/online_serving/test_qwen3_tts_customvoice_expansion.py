@@ -15,10 +15,9 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
-pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+pytestmark = [pytest.mark.full_model, pytest.mark.tts]
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
