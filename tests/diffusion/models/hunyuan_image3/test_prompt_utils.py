@@ -88,10 +88,13 @@ def test_resolve_stop_token_ids_uses_end_tags_for_generation_tasks():
     tok = FakeTokenizer()
 
     eos_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|endoftext|>"]
-    assert resolve_stop_token_ids(task="t2i_think", tokenizer=tok) == [eos_id, FakeTokenizer.SPECIAL["</think>"]]
+    assert resolve_stop_token_ids(task="t2i_think", tokenizer=tok) == [
+        eos_id,
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"],
+    ]
     assert resolve_stop_token_ids(task="t2i_recaption", tokenizer=tok) == [
         eos_id,
-        FakeTokenizer.SPECIAL["</recaption>"],
+        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"],
     ]
 
 
