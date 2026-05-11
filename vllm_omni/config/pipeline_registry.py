@@ -49,7 +49,6 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.qwen3_tts.pipeline",
         "QWEN3_TTS_PIPELINE",
     ),
-<<<<<<< HEAD
     "bagel": (
         "vllm_omni.model_executor.models.bagel.pipeline",
         "BAGEL_PIPELINE",
@@ -102,7 +101,6 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.moss_tts_nano.pipeline",
         "MOSS_TTS_NANO_PIPELINE",
     ),
-=======
     "nemotron_voicechat": (
         "vllm_omni.model_executor.models.nemotron_voicechat.pipeline",
         "NEMOTRON_VOICECHAT_PIPELINE",
@@ -116,5 +114,4 @@ _DIFFUSION_PIPELINES: dict[str, tuple[str, str]] = {}
 _VLLM_OMNI_PIPELINES: dict[str, tuple[str, str]] = {
     **_OMNI_PIPELINES,
     **_DIFFUSION_PIPELINES,
->>>>>>> 78b01638 (voicechat: introduce pipeline combining nemotron duplex and eartts)
 }
