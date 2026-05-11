@@ -42,7 +42,7 @@ tts_server_params = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
-            server_args=["--trust-remote-code", "--disable-log-stats"],
+            server_args=["--trust-remote-code"],
         ),
         id="async_chunk",
     ),
@@ -53,7 +53,7 @@ tts_server_params = [
         OmniServerParams(
             model=MODEL,
             stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
-            server_args=["--trust-remote-code", "--disable-log-stats", "--no-async-chunk"],
+            server_args=["--trust-remote-code", "--no-async-chunk"],
         ),
         id="no_async_chunk",
     ),
