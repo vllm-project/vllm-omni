@@ -57,7 +57,7 @@ class Attention(nn.Module):
         self.backend_pref = None
 
         config = get_current_diffusion_config_or_none()
-        attention_config = config.attention_config if config is not None else None
+        attention_config = config.diffusion_attention_config if config is not None else None
 
         attn_backend_cls, spec = get_attn_backend_for_role(
             role=role,
