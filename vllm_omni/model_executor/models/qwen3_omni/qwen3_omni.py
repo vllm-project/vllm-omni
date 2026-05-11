@@ -21,7 +21,13 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
-from vllm.model_executor.models.interfaces import SupportsMRoPE, SupportsMultiModal, SupportsPP, SupportsRealtime
+from vllm.model_executor.models.interfaces import (
+    SupportsMRoPE,
+    SupportsMultiModal,
+    SupportsPP,
+    SupportsRealtime,
+    SupportsTranscription,
+)
 from vllm.model_executor.models.qwen3_asr_realtime import Qwen3ASRRealtimeBuffer
 from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeConditionalGenerationMixin,
@@ -85,6 +91,7 @@ class Qwen3OmniMoeForConditionalGeneration(
     CustomProcessMixin,
     SupportsMRoPE,
     SupportsRealtime,
+    SupportsTranscription,
 ):
     """
     Unified Qwen3 Omni MoE model combining thinker, talker, and code2wav.
@@ -99,6 +106,38 @@ class Qwen3OmniMoeForConditionalGeneration(
     """
 
     realtime_max_tokens = 64
+
+    # SupportsTranscription is implemented by the inner Thinker
+    # (Qwen3OmniMoeThinkerForConditionalGeneration). Delegate the protocol's
+    # classmethods so the omni wrapper — which is what the model registry
+    # resolves and what OpenAIServingTranscription instantiates — exposes the
+    # same ASR surface and `/v1/audio/transcriptions` works end-to-end on the
+    # already-loaded model (no extra VRAM, no separate process).
+    supported_languages = Qwen3OmniMoeThinkerForConditionalGeneration.supported_languages
+
+    @classmethod
+    def get_speech_to_text_config(cls, model_config: ModelConfig, task_type: str):
+        return Qwen3OmniMoeThinkerForConditionalGeneration.get_speech_to_text_config(
+            model_config, task_type
+        )
+
+    @classmethod
+    def get_generation_prompt(cls, stt_params):
+        return Qwen3OmniMoeThinkerForConditionalGeneration.get_generation_prompt(stt_params)
+
+    @classmethod
+    def validate_language(cls, language):
+        return Qwen3OmniMoeThinkerForConditionalGeneration.validate_language(language)
+
+    @classmethod
+    def get_num_audio_tokens(cls, audio_duration_s, stt_config, model_config):
+        return Qwen3OmniMoeThinkerForConditionalGeneration.get_num_audio_tokens(
+            audio_duration_s, stt_config, model_config
+        )
+
+    @classmethod
+    def post_process_output(cls, text: str) -> str:
+        return Qwen3OmniMoeThinkerForConditionalGeneration.post_process_output(text)
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
