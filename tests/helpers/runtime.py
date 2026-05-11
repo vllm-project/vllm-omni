@@ -206,6 +206,8 @@ class OmniServer:
         cleanup_dist_env_and_memory()
         self.model = model
         self.serve_args = serve_args
+        # Align with ``serve``: ``--disable-log-stats`` wins over ``--log-stats``.
+        self.log_stats = bool(serve_args) and "--disable-log-stats" not in serve_args and "--log-stats" in serve_args
         self.env_dict = env_dict
         self.use_omni = use_omni
         self.proc: subprocess.Popen | None = None
@@ -251,10 +253,11 @@ class OmniServer:
                 sock.settimeout(1)
                 if sock.connect_ex((self.host, self.port)) == 0:
                     startup_s = time.perf_counter() - startup_t0
-                    print(
-                        f"Server ready on {self.host}:{self.port} (OmniServer startup took {startup_s:.3f}s)",
-                        flush=True,
-                    )
+                    if self.log_stats:
+                        print(
+                            f"Server ready on {self.host}:{self.port} (OmniServer startup took {startup_s:.3f}s)",
+                            flush=True,
+                        )
                     return
             time.sleep(2)
         raise RuntimeError(f"Server failed to start within {max_wait} seconds")
@@ -552,11 +555,12 @@ class OmniServerStageCli(OmniServer):
                 result = sock.connect_ex((self.host, self.port))
                 if result == 0:
                     startup_s = time.perf_counter() - startup_t0
-                    print(
-                        f"OmniServerStageCli ready on {self.host}:{self.port} "
-                        f"(stage-CLI startup took {startup_s:.3f}s)",
-                        flush=True,
-                    )
+                    if self.log_stats:
+                        print(
+                            f"OmniServerStageCli ready on {self.host}:{self.port} "
+                            f"(stage-CLI startup took {startup_s:.3f}s)",
+                            flush=True,
+                        )
                     return
             time.sleep(2)
 
@@ -658,12 +662,25 @@ def _merge_diffusion_responses(parts: list[DiffusionResponse]) -> DiffusionRespo
 
 
 class OpenAIClientHandler:
-    def __init__(self, host: str = "127.0.0.1", port: int = None, api_key: str = "EMPTY", run_level: str = None):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = None,
+        api_key: str = "EMPTY",
+        run_level: str = None,
+        *,
+        log_stats: bool = True,
+    ):
         if port is None:
             port = get_open_port()
         self.base_url = f"http://{host}:{port}"
         self.client = OpenAI(base_url=f"http://{host}:{port}/v1", api_key=api_key)
         self.run_level = run_level
+        self.log_stats = log_stats
+
+    def _print_client_stat(self, message: str) -> None:
+        if self.log_stats:
+            print(message, flush=True)
 
     def _process_stream_omni_response(self, chat_completion, *, wall_start: float) -> OmniResponse:
         """Wall clock from *before* ``chat.completions.create`` through stream drain + local decode."""
@@ -805,9 +822,9 @@ class OpenAIClientHandler:
             )
             assert_omni_response(resp, request_config, run_level=self.run_level)
             if resp.e2e_latency is not None:
-                print(f"[omni] request#1 success in {resp.e2e_latency:.3f}s")
+                self._print_client_stat(f"[omni] request#1 success in {resp.e2e_latency:.3f}s")
             else:
-                print("[omni] request#1 completed")
+                self._print_client_stat("[omni] request#1 completed")
             responses.append(resp)
             return responses
 
@@ -827,9 +844,9 @@ class OpenAIClientHandler:
                 resp = future.result()
                 assert_omni_response(resp, request_config, run_level=self.run_level)
                 if resp.e2e_latency is not None:
-                    print(f"[omni] request#{request_idx} success in {resp.e2e_latency:.3f}s")
+                    self._print_client_stat(f"[omni] request#{request_idx} success in {resp.e2e_latency:.3f}s")
                 else:
-                    print(f"[omni] request#{request_idx} completed")
+                    self._print_client_stat(f"[omni] request#{request_idx} completed")
                 responses.append(resp)
         return responses
 
@@ -1062,9 +1079,9 @@ class OpenAIClientHandler:
 
             assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
             if omni_resp.e2e_latency is not None:
-                print(f"[audio.speech] request#1 success in {omni_resp.e2e_latency:.3f}s")
+                self._print_client_stat(f"[audio.speech] request#1 success in {omni_resp.e2e_latency:.3f}s")
             else:
-                print("[audio.speech] request#1 completed")
+                self._print_client_stat("[audio.speech] request#1 completed")
             responses.append(omni_resp)
             return responses
         else:
@@ -1086,9 +1103,11 @@ class OpenAIClientHandler:
                             resp, response_format=speech_fmt, wall_start=wall_start
                         )
                     if result.e2e_latency is not None:
-                        print(f"[audio.speech] request#{request_idx} success in {result.e2e_latency:.3f}s")
+                        self._print_client_stat(
+                            f"[audio.speech] request#{request_idx} success in {result.e2e_latency:.3f}s"
+                        )
                     else:
-                        print(f"[audio.speech] request#{request_idx} completed")
+                        self._print_client_stat(f"[audio.speech] request#{request_idx} completed")
                     return result
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
@@ -1121,9 +1140,11 @@ class OpenAIClientHandler:
                         r, response_format=speech_fmt, wall_start=wall_start
                     )
                     if result.e2e_latency is not None:
-                        print(f"[audio.speech] request#{request_idx} success in {result.e2e_latency:.3f}s")
+                        self._print_client_stat(
+                            f"[audio.speech] request#{request_idx} success in {result.e2e_latency:.3f}s"
+                        )
                     else:
-                        print(f"[audio.speech] request#{request_idx} completed")
+                        self._print_client_stat(f"[audio.speech] request#{request_idx} completed")
                     return result
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
@@ -1190,9 +1211,11 @@ class OpenAIClientHandler:
                     response = self._process_diffusion_response(chat_completion, wall_start=wall_start)
                     assert_diffusion_response(response, cfg, run_level=self.run_level)
                     if response.e2e_latency is not None:
-                        print(f"[diffusion] request#{request_idx} success in {response.e2e_latency:.3f}s")
+                        self._print_client_stat(
+                            f"[diffusion] request#{request_idx} success in {response.e2e_latency:.3f}s"
+                        )
                     else:
-                        print(f"[diffusion] request#{request_idx} completed")
+                        self._print_client_stat(f"[diffusion] request#{request_idx} completed")
                     responses.append(response)
             return responses
 
@@ -1211,9 +1234,9 @@ class OpenAIClientHandler:
             merged.e2e_latency = time.perf_counter() - t0
             assert_diffusion_response(merged, request_config, run_level=self.run_level)
             if merged.e2e_latency is not None:
-                print(f"[diffusion] request#1 success in {merged.e2e_latency:.3f}s")
+                self._print_client_stat(f"[diffusion] request#1 success in {merged.e2e_latency:.3f}s")
             else:
-                print("[diffusion] request#1 completed")
+                self._print_client_stat("[diffusion] request#1 completed")
             return [merged]
 
         if request_num == 1:
@@ -1222,9 +1245,9 @@ class OpenAIClientHandler:
             response = self._process_diffusion_response(chat_completion, wall_start=wall_start)
             assert_diffusion_response(response, request_config, run_level=self.run_level)
             if response.e2e_latency is not None:
-                print(f"[diffusion] request#1 success in {response.e2e_latency:.3f}s")
+                self._print_client_stat(f"[diffusion] request#1 success in {response.e2e_latency:.3f}s")
             else:
-                print("[diffusion] request#1 completed")
+                self._print_client_stat("[diffusion] request#1 completed")
             responses.append(response)
             return responses
 
@@ -1237,9 +1260,9 @@ class OpenAIClientHandler:
                 response = self._process_diffusion_response(chat_completion, wall_start=wall_start)
                 assert_diffusion_response(response, request_config, run_level=self.run_level)
                 if response.e2e_latency is not None:
-                    print(f"[diffusion] request#{request_idx} success in {response.e2e_latency:.3f}s")
+                    self._print_client_stat(f"[diffusion] request#{request_idx} success in {response.e2e_latency:.3f}s")
                 else:
-                    print(f"[diffusion] request#{request_idx} completed")
+                    self._print_client_stat(f"[diffusion] request#{request_idx} completed")
                 responses.append(response)
         return responses
 
@@ -1288,9 +1311,9 @@ class OpenAIClientHandler:
         result.e2e_latency = end_time - start_time
         assert_diffusion_response(result, request_config, run_level=self.run_level)
         if result.e2e_latency is not None:
-            print(f"[diffusion] request#1 success in {result.e2e_latency:.3f}s")
+            self._print_client_stat(f"[diffusion] request#1 success in {result.e2e_latency:.3f}s")
         else:
-            print("[diffusion] request#1 completed")
+            self._print_client_stat("[diffusion] request#1 completed")
         return [result]
 
     def _wait_until_video_completed(
@@ -1365,7 +1388,8 @@ class OmniRunner:
             **kwargs,
         )
         startup_s = time.perf_counter() - startup_t0
-        print(f"OmniRunner startup took {startup_s:.3f}s (model={model_name})", flush=True)
+        if log_stats:
+            print(f"OmniRunner startup took {startup_s:.3f}s (model={model_name})", flush=True)
 
     def get_default_sampling_params_list(self) -> list[Any]:
         if not hasattr(self.omni, "default_sampling_params_list"):
