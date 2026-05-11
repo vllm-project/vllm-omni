@@ -84,18 +84,12 @@ def test_available_tasks_covers_all_modalities():
     }
 
 
-def test_resolve_stop_token_ids_uses_end_tags_for_generation_tasks():
+def test_resolve_stop_token_ids_uses_answer_for_generation_tasks():
     tok = FakeTokenizer()
 
-    eos_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<|endoftext|>"]
-    assert resolve_stop_token_ids(task="t2i_think", tokenizer=tok) == [
-        eos_id,
-        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</think>"],
-    ]
-    assert resolve_stop_token_ids(task="t2i_recaption", tokenizer=tok) == [
-        eos_id,
-        HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"],
-    ]
+    answer_id = HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]
+    assert resolve_stop_token_ids(task="t2i_think", tokenizer=tok) == [answer_id]
+    assert resolve_stop_token_ids(task="t2i_recaption", tokenizer=tok) == [answer_id]
 
 
 @pytest.mark.parametrize(
