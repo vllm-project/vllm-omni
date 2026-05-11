@@ -31,9 +31,7 @@ try:
 except ImportError:
     _TRITON_AVAILABLE = False
 
-triton_available = pytest.mark.skipif(
-    not _TRITON_AVAILABLE, reason="Triton not available on this platform"
-)
+triton_available = pytest.mark.skipif(not _TRITON_AVAILABLE, reason="Triton not available on this platform")
 
 
 # ---------------------------------------------------------------------------

@@ -30,7 +30,7 @@ pytestmark = [
 ]
 
 DEVICE = torch.device("cuda:0")
-UPSAMPLE = 4   # synthetic acoustic decoder stride (real DAC uses 960)
+UPSAMPLE = 4  # synthetic acoustic decoder stride (real DAC uses 960)
 T_FRAMES = 25  # number of audio token frames to decode
 
 
@@ -69,9 +69,9 @@ def _build_decoder(
     config = OmniVoiceConfig()
     decoder = OmniVoiceDecoder(config)
 
-    decoder.quantizer = HiggsAudioRVQ(
-        num_quantizers=8, codebook_size=1024, codebook_dim=64, hidden_size=1024
-    ).to(DEVICE)
+    decoder.quantizer = HiggsAudioRVQ(num_quantizers=8, codebook_size=1024, codebook_dim=64, hidden_size=1024).to(
+        DEVICE
+    )
 
     decoder.fc2 = nn.Linear(1024, 256).to(DEVICE).to(fc2_dtype)
 
@@ -122,14 +122,13 @@ def test_fp16_acoustic_decoder_produces_nan_without_fix():
     # Simulate pre-fix forward: no .float() after fc2
     codes = tokens.transpose(0, 1).long()
     quantized = decoder.quantizer.decode(codes)
-    quantized_fp16 = decoder.fc2(
-        quantized.transpose(1, 2).to(decoder.fc2.weight.dtype)
-    ).transpose(1, 2)  # stays fp16, no .float()
+    quantized_fp16 = decoder.fc2(quantized.transpose(1, 2).to(decoder.fc2.weight.dtype)).transpose(
+        1, 2
+    )  # stays fp16, no .float()
     audio_broken = decoder.acoustic_decoder(quantized_fp16)
 
     assert torch.isnan(audio_broken).any() or torch.isinf(audio_broken).any(), (
-        "Expected NaN/Inf in pre-fix fp16 path with large weights — "
-        "test setup may need a higher weight_scale"
+        "Expected NaN/Inf in pre-fix fp16 path with large weights — test setup may need a higher weight_scale"
     )
 
 

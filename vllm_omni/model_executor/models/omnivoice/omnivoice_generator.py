@@ -506,7 +506,7 @@ class _OmniVoiceCUDAGraphForward:
                 static_cos,
                 static_sin,
             )
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
 
         graph = torch.cuda.CUDAGraph()
         with torch.no_grad():
