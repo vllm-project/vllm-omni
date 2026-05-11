@@ -147,7 +147,7 @@ class DiffusionEngine:
             preprocess_start_time = time.perf_counter()
             request = self.pre_process_func(request)
             preprocess_time = time.perf_counter() - preprocess_start_time
-            logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
+            logger.debug("Pre-processing completed in %.4f seconds", preprocess_time)
 
         exec_start_time = time.perf_counter()
         output = await self.async_add_req_and_wait_for_response(request)
@@ -157,7 +157,7 @@ class DiffusionEngine:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
             raise RuntimeError(output.error)
-        logger.info("Generation completed successfully.")
+        logger.debug("Generation completed successfully.")
 
         if output.output is None:
             logger.warning("Output is None, returning empty OmniRequestOutput")
@@ -204,10 +204,10 @@ class DiffusionEngine:
             model_fps = outputs.get("fps")
             outputs = outputs.get("video", outputs)
         postprocess_time = time.perf_counter() - postprocess_start_time
-        logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
+        logger.debug("Post-processing completed in %.4f seconds", postprocess_time)
 
         step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
-        logger.info(
+        logger.debug(
             "DiffusionEngine.step breakdown: preprocess=%.2f ms, "
             "add_req_and_wait=%.2f ms, postprocess=%.2f ms, total=%.2f ms",
             preprocess_time * 1000,
