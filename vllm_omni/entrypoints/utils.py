@@ -304,14 +304,14 @@ def resolve_model_config_path(model: str) -> str:
     try:
         hf_config = get_config(model, trust_remote_code=True)
         model_type = hf_config.model_type
-    except (ValueError, Exception):
+    except Exception:
         # If standard transformers format fails, try diffusers format
         if file_or_path_exists(model, "model_index.json", revision=None):
             model_type = _try_get_class_name_from_diffusers_config(model)
             if model_type is None:
                 raise ValueError(
                     f"Could not determine model_type for diffusers model: {model}. "
-                    f"Please ensure the model has 'model_type' in transformer/config.json or model_index.json"
+                    "Please ensure the model has 'model_type' in transformer/config.json or model_index.json"
                 )
         elif file_or_path_exists(model, "config.json", revision=None):
             # Try to read config.json manually for custom models like Bagel that fail get_config
@@ -331,8 +331,8 @@ def resolve_model_config_path(model: str) -> str:
         else:
             raise ValueError(
                 f"Could not determine model_type for model: {model}. "
-                f"Model is not in standard transformers format and does not have model_index.json. "
-                f"Please ensure the model has proper configuration files with 'model_type' field"
+                "Model is not in standard transformers format and does not have model_index.json. "
+                "Please ensure the model has proper configuration files with 'model_type' field"
             )
 
     default_config_path = current_omni_platform.get_default_stage_config_path()

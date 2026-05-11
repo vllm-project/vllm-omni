@@ -384,7 +384,7 @@ class TokenizerWrapper:
                     drop_last_break = True
                     break
                 if source.get("front_boi", use_front_boi_token):
-                    token_seq.append(self.boi_token_id)  # Use patched boi for Janus, otherwise useing default <boi>
+                    token_seq.append(self.boi_token_id)  # Use patched boi for Janus, otherwise using default <boi>
                     extra_token_pos["boi"].append(token_count)
                     token_count += 1
                 token_count = self._add_image_meta_info_token(
