@@ -937,7 +937,13 @@ class Orchestrator:
         stage0_request: Any,
         req_state: OrchestratorRequestState,
     ) -> None:
-        """Pre-submit downstream stages for async-chunk mode."""
+        """Pre-submit downstream stages for async-chunk mode.
+
+        A stage may override the default placeholder prompt by registering
+        ``prewarm_input_func`` on its :class:`StagePipelineConfig`; the hook
+        receives ``(stage_id, stage0_request, original_prompt)`` and returns a
+        prompt dict (or ``None`` to use the default).
+        """
         if req_state.final_stage_id <= 0:
             return
 
@@ -986,6 +992,28 @@ class Orchestrator:
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
+
+                # Stage-level override: a stage can replace the default placeholder
+                # prompt with a model-specific one (e.g. EarTTS sizes its prefill
+                # from ``speaker_latent`` rather than stage-0's prompt length).
+                prewarm_hook = getattr(next_pool.stage_client, "prewarm_input_func", None)
+                if prewarm_hook is not None:
+                    try:
+                        hook_result = prewarm_hook(
+                            stage_id=next_stage_id,
+                            stage0_request=stage0_request,
+                            original_prompt=original_prompt,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[Orchestrator] prewarm_input_func failed for req=%s stage=%s; "
+                            "falling back to default placeholder prompt",
+                            request_id,
+                            next_stage_id,
+                        )
+                        hook_result = None
+                    if isinstance(hook_result, dict) and hook_result.get("prompt_token_ids"):
+                        base_input = hook_result
 
                 request = build_engine_core_request_from_tokens(
                     request_id=request_id,

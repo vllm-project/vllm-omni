@@ -146,6 +146,7 @@ class StageEngineCoreClientBase:
             self.final_output_type = metadata.final_output_type
             self.default_sampling_params = metadata.default_sampling_params
             self.custom_process_input_func = metadata.custom_process_input_func
+            self.prewarm_input_func = metadata.prewarm_input_func
             self.model_stage = metadata.model_stage
 
         self.engine_outputs: Any = None

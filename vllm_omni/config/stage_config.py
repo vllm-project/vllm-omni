@@ -187,6 +187,7 @@ class StagePipelineConfig:
     sync_process_input_func: str | None = None
     prompt_expand_func: str | None = None
     cfg_kv_collect_func: str | None = None
+    prewarm_input_func: str | None = None
     omni_kv_config: dict[str, Any] | None = None
     # Model subdirectory indirections: for multi-component HF repos where the
     # stage's config/tokenizer lives in a subdirectory (e.g. GLM-Image's AR
@@ -811,6 +812,8 @@ def _build_extras(
         extras["prompt_expand_func"] = ps.prompt_expand_func
     if ps.cfg_kv_collect_func:
         extras["cfg_kv_collect_func"] = ps.cfg_kv_collect_func
+    if ps.prewarm_input_func:
+        extras["prewarm_input_func"] = ps.prewarm_input_func
     if ps.extras:
         extras.update(ps.extras)
     return extras

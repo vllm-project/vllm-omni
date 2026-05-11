@@ -306,6 +306,7 @@ class StageMetadata:
     runtime_cfg: Any
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
+    prewarm_input_func: Callable | None = None
     # Multi-replica: replica_id distinguishes replicas of the same stage.
     # For single-replica stages this defaults to 0.
     replica_id: int = 0
@@ -357,6 +358,12 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         _mod, _fn = _ckf_path.rsplit(".", 1)
         cfg_kv_collect_func = getattr(importlib.import_module(_mod), _fn)
 
+    prewarm_input_func: Callable | None = None
+    _pwif_path = getattr(stage_config, "prewarm_input_func", None)
+    if _pwif_path:
+        _mod, _fn = _pwif_path.rsplit(".", 1)
+        prewarm_input_func = getattr(importlib.import_module(_mod), _fn)
+
     if stage_type == "diffusion":
         return StageMetadata(
             stage_id=stage_id,
@@ -372,6 +379,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             model_stage=None,
             runtime_cfg=runtime_cfg,
             cfg_kv_collect_func=cfg_kv_collect_func,
+            prewarm_input_func=prewarm_input_func,
         )
 
     model_stage = getattr(engine_args, "model_stage", None)
@@ -393,6 +401,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
         prompt_expand_func=prompt_expand_func,
+        prewarm_input_func=prewarm_input_func,
     )
 
 
