@@ -221,6 +221,11 @@ _DIFFUSION_MODELS = {
         "pipeline_dreamid_omni",
         "DreamIDOmniPipeline",
     ),
+    "SenseNovaU1Pipeline": (
+        "sensenova_u1",
+        "pipeline_sensenova_u1",
+        "SenseNovaU1Pipeline",
+    ),
     "AudioXPipeline": (
         "audiox",
         "pipeline_audiox",
@@ -272,6 +277,7 @@ DiffusionModelRegistry = _ModelRegistry(
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
+    "SenseNovaU1Pipeline",
     "AudioXPipeline",
 }
 
@@ -475,6 +481,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
+    "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
