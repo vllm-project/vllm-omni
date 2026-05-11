@@ -459,13 +459,7 @@ class MiMoAudioLLMMultiModalProcessor(BaseMultiModalProcessor[MiMoAudioLLMProces
 
             num_features = audio_output_lengths[item_idx] // 4
             if num_features == 0:
-                try:
-                    audios = mm_items.get_items("audio", AudioProcessorItems)
-                    audio_len = audios.get_audio_length(item_idx)
-                    raise ValueError(f"The audio (len={audio_len}) is too short to be represented inside the model")
-                except (AttributeError, KeyError):
-                    # If AudioProcessorItems is not available, use default
-                    num_features = 1
+                num_features = 1
 
             audio_tokens = [audio_token_id] * num_features
 
