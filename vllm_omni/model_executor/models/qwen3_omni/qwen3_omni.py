@@ -117,9 +117,7 @@ class Qwen3OmniMoeForConditionalGeneration(
 
     @classmethod
     def get_speech_to_text_config(cls, model_config: ModelConfig, task_type: str):
-        return Qwen3OmniMoeThinkerForConditionalGeneration.get_speech_to_text_config(
-            model_config, task_type
-        )
+        return Qwen3OmniMoeThinkerForConditionalGeneration.get_speech_to_text_config(model_config, task_type)
 
     @classmethod
     def get_generation_prompt(cls, stt_params):

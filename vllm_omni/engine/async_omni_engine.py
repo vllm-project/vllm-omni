@@ -1042,9 +1042,7 @@ class AsyncOmniEngine:
 
         supported_tasks: set[str] = set()
         comprehension_pools = [
-            pool
-            for pool in self.stage_pools
-            if getattr(pool.stage_client, "is_comprehension", False)
+            pool for pool in self.stage_pools if getattr(pool.stage_client, "is_comprehension", False)
         ]
         if comprehension_pools:
             supported_tasks.add("generate")
@@ -1058,18 +1056,15 @@ class AsyncOmniEngine:
                 for pool in comprehension_pools:
                     model_config = pool.stage_vllm_config.model_config
                     arches = getattr(model_config, "architectures", None) or []
-                    for arch in arches:
-                        resolved = ModelRegistry.resolve_model_cls(arch)
-                        model_cls = resolved[0] if isinstance(resolved, tuple) else resolved
-                        if supports_transcription(model_cls):
-                            supported_tasks.add("transcription")
-                            break
-                    if "transcription" in supported_tasks:
+                    if not arches:
+                        continue
+                    resolved = ModelRegistry.resolve_model_cls(arches, model_config)
+                    model_cls = resolved[0] if isinstance(resolved, tuple) else resolved
+                    if supports_transcription(model_cls):
+                        supported_tasks.add("transcription")
                         break
             except Exception as e:
-                logger.warning(
-                    "[AsyncOmniEngine] transcription capability probe failed: %s", e
-                )
+                logger.warning("[AsyncOmniEngine] transcription capability probe failed: %s", e)
         if any(m.get("final_output_type") == "audio" for m in self.stage_metadata):
             supported_tasks.add("speech")
         self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
