@@ -10,11 +10,14 @@ A minimal extension of the upstream :class:`NemotronHForCausalLM` that:
    scheduled token). The prefill step accepts a pre-computed full
    combined embedding via
    ``additional_information["prefill_combined_embeddings"]``; on this
-   path the model's :meth:`preprocess` returns the tensor as-is. The
-   producer is expected to send
-   ``prefill_combined_embeddings=None`` on every subsequent decode
-   chunk so the runner's streaming-input merge overwrites the prefill
-   tensor with ``None`` and the decode branch is taken.
+   path the model's :meth:`preprocess` returns the tensor as-is and
+   simultaneously clears the buffer entry (by returning
+   ``{"prefill_combined_embeddings": None}`` as its update dict) so
+   that subsequent decode steps fall through to the decode branch.
+   The producer should still send
+   ``prefill_combined_embeddings=None`` on every decode chunk to make
+   the intent explicit, but the actual clearing happens consumer-side
+   because the orchestrator's serialization filters ``None`` values.
 2. Embeds an additional per-step ASR token id stream. The id is fed
    **autoregressively from the model itself** via the per-request
    ``input_asr_ids`` buffer that ``postprocess`` keeps populated after
@@ -134,10 +137,16 @@ class NemotronDuplexHForCausalLM(NemotronHForCausalLM):
           ``additional_information["prefill_combined_embeddings"]`` is
           a tensor, the caller has pre-computed the
           ``(T_prefill, hidden_size)`` combined embedding offline. We
-          return it as-is, bypassing the text+asr+acoustic sum. The
-          producer must send ``prefill_combined_embeddings=None`` on
-          every decode chunk to let the streaming-input merge in the
-          runner overwrite this slot.
+          return it as-is, bypassing the text+asr+acoustic sum, and
+          *clear* the buffer entry by returning
+          ``{"prefill_combined_embeddings": None}`` in the update
+          dict. Clearing has to happen here because the orchestrator's
+          serialization (:func:`vllm_omni.data_entry_keys.serialize_payload`)
+          silently drops ``None`` values, so the producer cannot
+          overwrite the buffer with ``None`` via the streaming-input
+          merge; the producer still sends ``prefill_combined_embeddings=None``
+          on each decode chunk as a documentation hint, but the actual
+          state transition lives on this consumer side.
 
         * **Decode (single-token step).** Builds the combined embedding
           per scheduled token from:
@@ -159,11 +168,12 @@ class NemotronDuplexHForCausalLM(NemotronHForCausalLM):
         n = int(input_ids.shape[0])
 
         # Prefill vs decode is detected directly on the value of
-        # ``prefill_combined_embeddings``. The producer sends a tensor
-        # on the prefill chunk and ``None`` on every decode chunk; the
-        # scheduler's streaming-session update propagates ``None`` to
-        # the runner, which then writes it into the per-request
-        # intermediate buffer.
+        # ``prefill_combined_embeddings``: a tensor means prefill, anything
+        # else (``None`` / missing) means decode. The buffer flips from
+        # tensor → ``None`` inside this method itself (see the update dict
+        # returned below) because serialization drops ``None`` and the
+        # producer's "send None on each decode chunk" pattern alone is not
+        # enough to clear the slot.
         prefill_combined = info_dict.get("prefill_combined_embeddings")
         if isinstance(prefill_combined, torch.Tensor):
             target_dtype = self.model.embed_tokens.weight.dtype
@@ -178,7 +188,13 @@ class NemotronDuplexHForCausalLM(NemotronHForCausalLM):
                 f"prefill_combined_embeddings length {prefill_combined.shape[0]} "
                 f"does not match scheduled token count {n}"
             )
-            return input_ids, prefill_combined, {}
+            # Clear the buffer entry: ``None`` is not serialization-safe
+            # (serialize_payload drops it), so we cannot rely on the producer
+            # to overwrite this slot from the next chunk. The runner's
+            # ``_update_intermediate_buffer`` does preserve ``None`` though,
+            # so returning it here flips the buffer to ``None`` in-process
+            # and the next preprocess call takes the decode branch.
+            return input_ids, prefill_combined, {"prefill_combined_embeddings": None}
 
         text_emb = self.model.embed_tokens(input_ids)
 
