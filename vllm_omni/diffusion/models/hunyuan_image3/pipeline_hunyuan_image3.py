@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
-import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -340,11 +339,6 @@ class HunyuanImage3Pipeline(
             )
         ]
         quant_config = od_config.quantization_config
-        os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
-        logger.info(
-            "Setting attention backend to TORCH_SDPA. "
-            "HunyuanImage3Pipeline only supports TORCH_SDPA to handle mixed causal and full attention."
-        )
         self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
         self.transformer = self.model
         self.vae = AutoencoderKLConv3D.from_config(self.hf_config.vae)
@@ -723,6 +717,26 @@ class HunyuanImage3Pipeline(
                     f"Each message should be a list of dicts or a dict, but got {type(message)}."
                 )
 
+    @staticmethod
+    def _normalize_cot_text(cot: str | None) -> str | None:
+        """
+        Ensure cot_text starts with the appropriate opening tag.
+
+        AR-generated text may omit the leading <think> or <recaption> tag
+        (since it was used as a generation trigger). This normalizes the text
+        so downstream parsing in get_cot_sections works correctly.
+        """
+        if not cot:
+            return cot
+
+        if "</think>" in cot and not cot.startswith("<think>"):
+            cot = "<think>" + cot
+            return cot
+        if "</recaption>" in cot and not cot.startswith("<recaption>"):
+            cot = "<recaption>" + cot
+            return cot
+        return cot
+
     def prepare_model_inputs(
         self,
         prompt=None,
@@ -942,10 +956,18 @@ class HunyuanImage3Pipeline(
             tokenizer_output.joint_image_slices[i] + tokenizer_output.gen_image_slices[i] for i in range(bsz)
         ]
         attention_mask = torch.ones(seq_len, seq_len, dtype=torch.bool).tril(diagonal=0).repeat(bsz, 1, 1)
+        full_attn_spans: list[list[tuple[int, int]]] = [[] for _ in range(bsz)]
         for i in range(bsz):
             for j, image_slice in enumerate(batch_image_slices[i]):
                 attention_mask[i, image_slice, image_slice] = True
+                start = image_slice.start if image_slice.start is not None else 0
+                stop = image_slice.stop if image_slice.stop is not None else seq_len
+                assert start < stop, f"Invalid image slice: {image_slice}"
+                full_attn_spans[i].append((int(start), int(stop)))
+            if full_attn_spans[i]:
+                full_attn_spans[i].sort(key=lambda x: x[0])
         attention_mask = attention_mask.unsqueeze(1)
+        model_kwargs["full_attn_spans"] = full_attn_spans
         return attention_mask
 
     def prepare_inputs_for_generation(
@@ -989,6 +1011,7 @@ class HunyuanImage3Pipeline(
                 "query_lens": kwargs.get("query_lens"),
                 "seq_lens": kwargs.get("seq_lens"),
                 "num_image_tokens": kwargs.get("num_image_tokens"),
+                "full_attn_spans": kwargs.get("full_attn_spans"),
             }
         )
         return model_inputs
@@ -1007,6 +1030,8 @@ class HunyuanImage3Pipeline(
             "custom_pos_emb": model_kwargs["custom_pos_emb"],
             "num_image_tokens": model_kwargs["num_image_tokens"],
         }
+        if "full_attn_spans" in model_kwargs:
+            updated_model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"]
 
         # update past_key_values keeping its naming used in model code
         for possible_cache_name in ALL_CACHE_NAMES:
@@ -1030,7 +1055,8 @@ class HunyuanImage3Pipeline(
                 # position ids
                 image_mask = model_kwargs["image_mask"]
                 bsz, seq_len = image_mask.shape
-                index = torch.arange(seq_len, device=image_mask.device).unsqueeze(0).repeat(bsz, 1)
+                offset = model_kwargs.get("ar_kv_reuse_offset", 0)  # should be an absolute position.
+                index = torch.arange(offset, offset + seq_len, device=image_mask.device).unsqueeze(0).repeat(bsz, 1)
                 position_ids = index.masked_select(image_mask.bool()).reshape(bsz, -1)
                 timestep_position_ids = index[
                     torch.arange(bsz), model_kwargs["gen_timestep_scatter_index"][:, -1]
@@ -1042,7 +1068,9 @@ class HunyuanImage3Pipeline(
                 for attention_mask_i, position_ids_i in zip(
                     model_kwargs["attention_mask"], updated_model_kwargs["position_ids"]
                 ):
-                    mask_list.append(torch.index_select(attention_mask_i, dim=1, index=position_ids_i.reshape(-1)))
+                    mask_list.append(
+                        torch.index_select(attention_mask_i, dim=1, index=position_ids_i.reshape(-1) - offset)
+                    )
                 attention_mask = torch.stack(mask_list, dim=0)
                 updated_model_kwargs["attention_mask"] = attention_mask
                 updated_model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"]
@@ -1133,11 +1161,13 @@ class HunyuanImage3Pipeline(
         query_lens: list[int] | None = None,
         seq_lens: list[int] | None = None,
         num_image_tokens: int | None = None,
+        uncond_cfg_prefill: bool = False,
+        full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | CausalMMOutputWithPast:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # Sanity Check of Inputs
         self._check_inputs(
-            mode == "gen_image",
+            mode == "gen_image" and not uncond_cfg_prefill,
             "in `gen_image` mode",
             [
                 ("images", images),
@@ -1146,7 +1176,7 @@ class HunyuanImage3Pipeline(
             ],
         )
         self._check_inputs(
-            mode == "gen_image" and first_step,
+            mode == "gen_image" and first_step and not uncond_cfg_prefill,
             "in `gen_image` mode at the first step",
             [
                 ("image_mask", image_mask),
@@ -1169,7 +1199,6 @@ class HunyuanImage3Pipeline(
                 ("vit_kwargs", vit_kwargs),
             ],
         )
-
         custom_pos_emb = self.get_pos_emb(custom_pos_emb, position_ids)
 
         inputs_embeds = self.model.embed_tokens(input_ids)
@@ -1180,6 +1209,8 @@ class HunyuanImage3Pipeline(
         if mode == "gen_text":
             # For gen_text, make sure gen_timestep_scatter_index is None
             gen_timestep_scatter_index = None
+            token_h, token_w = None, None
+        elif uncond_cfg_prefill:
             token_h, token_w = None, None
         else:
             if first_step:
@@ -1226,6 +1257,8 @@ class HunyuanImage3Pipeline(
                 seq_lens=seq_lens,
                 num_image_tokens=num_image_tokens,
                 gen_timestep_scatter_index=gen_timestep_scatter_index,
+                uncond_cfg_prefill=uncond_cfg_prefill,
+                full_attn_spans=full_attn_spans,
             )
         hidden_states = outputs[0]
 
@@ -1233,6 +1266,9 @@ class HunyuanImage3Pipeline(
             hidden_states = self.model.ln_f(hidden_states)
             logits = self.lm_head(hidden_states)
             logits = logits.float()
+            diffusion_prediction = None
+        elif uncond_cfg_prefill:
+            logits = None
             diffusion_prediction = None
         else:
             logits = None
@@ -1258,6 +1294,45 @@ class HunyuanImage3Pipeline(
         )
 
         return output
+
+    def inject_ar_kv_into_layers(
+        self,
+        ar_kv_data: dict[int, dict[str, torch.Tensor]],
+        positive_reuse_len: int,
+    ) -> None:
+        """Inject AR-stage KV cache into each layer's ImageKVCacheManager.
+
+        Truncates to positive_reuse_len and sets image_kv_cache_map directly.
+        """
+        for layer in self.model.layers:
+            layer_idx = layer.layer_idx
+            if layer_idx not in ar_kv_data:
+                continue
+            kv = ar_kv_data[layer_idx]
+            cache_mgr = layer.self_attn.image_attn
+            k, v = kv["key"], kv["value"]
+            cache_mgr._injected_ar_kv = [(k[:positive_reuse_len], v[:positive_reuse_len])]
+
+    def _extract_ar_kv_from_request(self, req) -> dict[str, Any]:
+        kv = getattr(getattr(req, "sampling_params", None), "past_key_values", None)
+        if kv is None:
+            return {}
+        key_cache = getattr(kv, "key_cache", None)
+        value_cache = getattr(kv, "value_cache", None)
+        if not key_cache or not value_cache:
+            return {}
+        ar_kv_data = {
+            i: {"key": k, "value": v}
+            for i, (k, v) in enumerate(zip(key_cache, value_cache))
+            if k is not None and v is not None
+        }
+        if not ar_kv_data:
+            return {}
+        logger.info(
+            f"[AR KV Reuse] Extracted {len(ar_kv_data)} layers of AR KV, "
+            f"each with length: {next(iter(ar_kv_data.values()))['key'].shape}"
+        )
+        return {"ar_kv_data": ar_kv_data}
 
     def forward(
         self,
@@ -1294,7 +1369,9 @@ class HunyuanImage3Pipeline(
         for p in req.prompts:
             extra = p.get("extra", {}) if isinstance(p, dict) else {}
             cot_text_list.append(extra.get("ar_generated_text") or None)
-        cot_text = cot_text_list if any(t is not None for t in cot_text_list) else None
+        cot_text = (
+            [self._normalize_cot_text(t) for t in cot_text_list] if any(t is not None for t in cot_text_list) else None
+        )
 
         batch_cond_image_info: list[list[JointImageInfo]] | None = None
         if any(not isinstance(p, str) for p in req.prompts):
@@ -1329,6 +1406,9 @@ class HunyuanImage3Pipeline(
             logger.info("HunyuanImage3.0 runs without classifier-free guidance when guidance_scale <= 1.0.")
         image_size = (height, width)
 
+        # ---- AR KV Reuse: extract injected KV from request ----
+        ar_kv_kwargs = self._extract_ar_kv_from_request(req)
+
         model_inputs = self.prepare_model_inputs(
             prompt=prompt,
             cot_text=cot_text,
@@ -1340,6 +1420,9 @@ class HunyuanImage3Pipeline(
             guidance_scale=guidance_scale,
             batch_cond_image_info=batch_cond_image_info,
         )
+
+        model_inputs.update(ar_kv_kwargs)
+
         outputs = self._generate(**model_inputs, **kwargs)
         return DiffusionOutput(
             output=outputs[0],

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import partial
 
 import torch
 from vllm.logger import init_logger
@@ -9,6 +10,9 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
+)
+from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
+    piecewise_attn,
 )
 
 logger = init_logger(__name__)
@@ -43,16 +47,25 @@ class FlashAttentionImpl(AttentionImpl):
         causal: bool = False,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        qkv_layout: str | None = None,
+        backend_kwargs: dict | None = None,
         **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
         self.causal = causal
         self.softmax_scale = softmax_scale
+        self.qkv_layout = qkv_layout
+        if backend_kwargs:
+            logger.warning("FlashAttentionImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
     @staticmethod
     def _unwrap_flash_output(out: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
         # FA3 may return (out, lse), FA2 returns out
         return out[0] if isinstance(out, tuple) else out
+
+    @staticmethod
+    def _flash_wrapper(q, k, v, *, attn_func, **kwargs):
+        return FlashAttentionImpl._unwrap_flash_output(attn_func(q, k, v, **kwargs))
 
     def _forward_varlen_masked(
         self,
@@ -151,6 +164,24 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
+
+        # Try piecewise attention
+        if full_attn_spans is not None:
+            logger.debug("Using piecewise Flash Attention for mixed causal/full mask")
+            attn_func = partial(
+                FlashAttentionImpl._flash_wrapper,
+                attn_func=flash_attn_func,
+            )
+
+            return piecewise_attn(
+                query,
+                key,
+                value,
+                full_attn_spans,
+                self.softmax_scale,
+                attn_func,
+            )
 
         if attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(
@@ -230,6 +261,7 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
+        layout = self.qkv_layout or "BNSD"
         output = attention_forward(
             query,
             key,
@@ -237,6 +269,6 @@ class FlashAttentionImpl(AttentionImpl):
             attn_mask=attention_mask,
             opt_mode="manual",
             op_type="fused_attn_score",
-            layout="BNSD",
+            layout=layout,
         )
         return output

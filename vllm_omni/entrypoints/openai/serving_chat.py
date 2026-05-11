@@ -2148,6 +2148,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         lora_body = extra_body.get("lora")
         layers = extra_body.get("layers")
         resolution = extra_body.get("resolution")
+        bot_task = extra_body.get("bot_task")
 
         engine_prompt_data: dict[str, Any] | None = None
         modalities = ["image"]
@@ -2157,6 +2158,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 modalities = ["img2img"]
             else:
                 engine_prompt_data = {"image": reference_images}
+
+        if bot_task:
+            from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt
+
+            prompt = build_prompt(prompt, task=bot_task)
+            if reference_images and len(reference_images) == 1:
+                engine_prompt_data = {"image": reference_images[0]}
+                modalities = ["image"]
 
         engine_prompt: OmniTextPrompt = {"prompt": prompt}
         engine_prompt["modalities"] = modalities

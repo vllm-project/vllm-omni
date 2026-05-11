@@ -16,9 +16,9 @@ import pytest
 
 from tests.helpers.mark import hardware_test
 
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
 EXAMPLE_SCRIPT = REPO_ROOT / "examples" / "offline_inference" / "internvla_a1" / "end2end.py"
 
 
@@ -33,6 +33,7 @@ def _required_env(name: str) -> str:
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+@pytest.mark.usefixtures("clean_gpu_memory_between_tests")
 def test_internvla_a1_offline_open_loop(run_level: str) -> None:
     if run_level != "advanced_model":
         pytest.skip("InternVLA-A1 offline evaluation requires real local checkpoints and dataset.")

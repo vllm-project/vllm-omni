@@ -140,6 +140,7 @@ class OmniEngineArgs(EngineArgs):
     async_chunk: bool = False
     omni_kv_config: dict | None = None
     quantization_config: Any | None = None
+    force_cutlass_fp8: bool | None = None
     worker_type: str | None = None
     task_type: str | None = None
     worker_cls: str = None

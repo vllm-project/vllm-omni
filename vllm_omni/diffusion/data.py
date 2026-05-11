@@ -1,7 +1,7 @@
 # adapted from sglang and fastvideo
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import enum
+import copy
 import os
 import random
 from collections.abc import Callable, Mapping
@@ -208,10 +208,11 @@ class TransformerConfig:
         quant_method: str | None = None
         quant_config: QuantizationConfig | None = None
         disk_qc = params.get("quantization_config")
-        if isinstance(disk_qc, dict) and "quant_method" in disk_qc:
-            quant_method = disk_qc["quant_method"]
-            kwargs = {k: v for k, v in disk_qc.items() if k != "quant_method"}
-            quant_config = build_quant_config(quant_method, **kwargs)
+        if isinstance(disk_qc, dict):
+            raw_quant_method = disk_qc.get("quant_method", disk_qc.get("method"))
+            quant_config = build_quant_config(disk_qc)
+            if quant_config is not None:
+                quant_method = raw_quant_method if raw_quant_method is not None else quant_config.get_name()
 
         return cls(params=params, quant_method=quant_method, quant_config=quant_config)
 
@@ -366,7 +367,7 @@ class OmniDiffusionConfig:
     tf_model_config: TransformerConfig = field(default_factory=TransformerConfig)
 
     # Attention
-    attention_backend: str | None = None
+    diffusion_attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE
@@ -513,6 +514,10 @@ class OmniDiffusionConfig:
     # str is resolved to {"method": <str>} internally.
     # Per-component: {"transformer": {"method": "fp8"}, "vae": None}
     quantization_config: str | QuantizationConfig | dict[str, Any] | None = None
+    # Explicit runtime override for ModelOpt FP8 diffusion checkpoints. This
+    # does not enable FP8 by itself; it only selects CUTLASS once the checkpoint
+    # has already resolved to vLLM's ModelOpt FP8 linear method.
+    force_cutlass_fp8: bool = False
 
     # Diffusion pipeline Profiling config
     enable_diffusion_pipeline_profiler: bool = False
@@ -630,14 +635,9 @@ class OmniDiffusionConfig:
 
         # Auto-detect quantization from TransformerConfig if not explicitly set.
         # This covers the case where tf_model_config is passed at construction
-        # time.  For late (post-construction) assignment, callers should use
+        # time. For late (post-construction) assignment, callers should use
         # set_tf_model_config() which propagates quant_config automatically.
-        if self.quantization_config is None and self.tf_model_config.quant_config is not None:
-            self.quantization_config = self.tf_model_config.quant_config
-            logger.info(
-                "Auto-detected quantization '%s' from model config",
-                self.tf_model_config.quant_method,
-            )
+        self._propagate_quantization_from_tf_config(self.tf_model_config)
 
         # Resolve quantization_config: str/dict -> QuantizationConfig via build_quant_config.
         if self.quantization_config is not None:
@@ -653,6 +653,10 @@ class OmniDiffusionConfig:
                     f"got {type(self.quantization_config)!r}"
                 )
 
+        # Match vLLM's config flow: parse entrypoint shorthands before the
+        # config object is built, and keep a single runtime truth source.
+        self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
+
         if self.max_cpu_loras is None:
             self.max_cpu_loras = 1
         elif self.max_cpu_loras < 1:
@@ -663,6 +667,32 @@ class OmniDiffusionConfig:
                 "diffusers_load_kwargs and diffusers_call_kwargs are only "
                 "valid together with diffusion_load_format=diffusers"
             )
+
+    def _propagate_quantization_from_tf_config(self, tf_config: "TransformerConfig") -> None:
+        if tf_config.quant_config is None:
+            return
+
+        is_checkpoint_fp8 = bool(getattr(tf_config.quant_config, "is_checkpoint_fp8_serialized", False))
+        should_use_checkpoint_config = self.quantization_config is None or (
+            is_checkpoint_fp8 and self._is_generic_fp8_quant_config(self.quantization_config)
+        )
+        if should_use_checkpoint_config:
+            self.quantization_config = tf_config.quant_config
+            logger.info(
+                "Auto-detected quantization '%s' from model config",
+                tf_config.quant_method,
+            )
+
+    @staticmethod
+    def _is_generic_fp8_quant_config(quant_config: object) -> bool:
+        if isinstance(quant_config, str):
+            return quant_config.lower() == "fp8"
+        if isinstance(quant_config, Mapping):
+            method = quant_config.get("method", quant_config.get("quant_method"))
+            return isinstance(method, str) and method.lower() == "fp8"
+        if hasattr(quant_config, "get_name"):
+            return quant_config.get_name() == "fp8"
+        return False
 
     def set_tf_model_config(self, tf_config: "TransformerConfig") -> None:
         """Assign `tf_model_config` and propagate quantization if detected.
@@ -679,12 +709,7 @@ class OmniDiffusionConfig:
                 `TransformerConfig.from_dict`.
         """
         self.tf_model_config = tf_config
-        if self.quantization_config is None and tf_config.quant_config is not None:
-            self.quantization_config = tf_config.quant_config
-            logger.info(
-                "Auto-detected quantization '%s' from model config",
-                tf_config.quant_method,
-            )
+        self._propagate_quantization_from_tf_config(tf_config)
 
     def update_multimodal_support(self) -> None:
         # Resolve serving-visible multimodal behavior from shared metadata
@@ -716,50 +741,35 @@ class OmniDiffusionConfig:
                 # Skip transformer config loading for diffusers adapter
                 # (non-DiT models don't have a separate transformer folder/config)
                 if self.diffusion_load_format == "diffusers":
-                    self.tf_model_config = TransformerConfig()
-                    try:
-                        diffusers_pipeline_cls_name = config_dict["_class_name"]
-                        self.diffusers_pipeline_cls = getattr(diffusers, diffusers_pipeline_cls_name)
-                    except (KeyError, AttributeError) as exc:
-                        logger.warning(
-                            f"Could not find valid _class_name for diffusers pipeline in model_index.json: {exc}. "
-                            "Without knowing the underlying diffusers pipeline class, the dummy run will input only "
-                            "text prompt, which may cause errors for pipelines that require additional inputs."
-                        )
+                    self.set_tf_model_config(TransformerConfig())
                 else:
                     tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model)
-                    self.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+                    self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
             else:
                 raise FileNotFoundError("model_index.json not found")
         except (AttributeError, OSError, ValueError, FileNotFoundError):
             # Skip transformer config loading for diffusers adapter
             # (non-DiT models don't have a separate transformer folder/config)
             if self.diffusion_load_format == "diffusers":
-                self.tf_model_config = TransformerConfig()
-                logger.warning(
-                    "Could not find valid model_index.json per diffusers format. "
-                    "This model is suspectedly unsupported by the diffusers backend. "
-                    "Also, without knowing the underlying diffusers pipeline class from model_index.json, "
-                    "the dummy run will input only text prompt, which may cause errors for pipelines "
-                    "that require additional inputs."
-                )
+                self.set_tf_model_config(TransformerConfig())
+                self.update_multimodal_support()
             else:
                 cfg = get_hf_file_to_dict("config.json", self.model)
                 if cfg is None:
                     raise ValueError(f"Could not find config.json or model_index.json for model {self.model}")
 
-                self.tf_model_config = TransformerConfig.from_dict(cfg)
+                self.set_tf_model_config(TransformerConfig.from_dict(cfg))
                 model_type = cfg.get("model_type")
                 architectures = cfg.get("architectures") or []
 
                 if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
                     self.model_class_name = "BagelPipeline"
-                    self.tf_model_config = TransformerConfig()
+                    self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
                 elif model_type == "nextstep":
                     if self.model_class_name is None:
                         self.model_class_name = "NextStep11Pipeline"
-                    self.tf_model_config = TransformerConfig()
+                    self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
                 elif model_type == "s2v":
                     if self.model_class_name is None:
@@ -788,29 +798,26 @@ class OmniDiffusionConfig:
         else:
             kwargs.pop("quantization", None)
 
+        # Handle "diffusion_attention_backend" shorthand: merge into
+        # diffusion_attention_config before field filtering.
+        diffusion_attn_backend = kwargs.pop("diffusion_attention_backend", None)
+        if diffusion_attn_backend is not None:
+            existing = kwargs.get("diffusion_attention_config")
+            kwargs["diffusion_attention_config"] = parse_attention_config(
+                existing,
+                attention_backend=diffusion_attn_backend,
+            )
+
         # Check environment variable as fallback for cache_backend
         # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND for backwards compatibility
         if "cache_backend" not in kwargs:
             cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
             kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
 
-        # Falsy-value check for not-None fields (convert potential None values in YAML config to empty containers)
-        if "diffusers_load_kwargs" in kwargs and kwargs["diffusers_load_kwargs"] is None:
-            kwargs["diffusers_load_kwargs"] = {}
-        if "diffusers_call_kwargs" in kwargs and kwargs["diffusers_call_kwargs"] is None:
-            kwargs["diffusers_call_kwargs"] = {}
-
-        # Forward top-level parallel knobs (e.g. --tensor-parallel-size from CLI)
-        # into parallel_config so the diffusion engine sees them.
-        par = kwargs.get("parallel_config", {})
-        if isinstance(par, Mapping):
-            par = dict(par)
-            if par.get("tensor_parallel_size") is None:
-                par.pop("tensor_parallel_size", None)
-            tensor_parallel_size = kwargs.get("tensor_parallel_size")
-            if tensor_parallel_size is not None and "tensor_parallel_size" not in par:
-                par["tensor_parallel_size"] = tensor_parallel_size
-            kwargs["parallel_config"] = par
+        # Convert optional YAML null values to empty containers.
+        for key in ("diffusers_load_kwargs", "diffusers_call_kwargs"):
+            if key in kwargs and kwargs[key] is None:
+                kwargs[key] = {}
 
         # Filter kwargs to only include valid fields
         valid_fields = {f.name for f in fields(cls)}
@@ -855,19 +862,189 @@ class DiffusionRequestAbortedError(RuntimeError):
     """Raised when a diffusion request ends via user-visible abort."""
 
 
-class AttentionBackendEnum(enum.Enum):
-    FA = enum.auto()
-    SLIDING_TILE_ATTN = enum.auto()
-    TORCH_SDPA = enum.auto()
-    SAGE_ATTN = enum.auto()
-    SAGE_ATTN_THREE = enum.auto()
-    VIDEO_SPARSE_ATTN = enum.auto()
-    VMOBA_ATTN = enum.auto()
-    AITER = enum.auto()
-    NO_ATTENTION = enum.auto()
+@dataclass
+class AttentionSpec:
+    """Specifies a backend and its backend-specific parameters for one attention role."""
 
-    def __str__(self):
-        return self.name.lower()
+    backend: str  # registry name, e.g. "FLASH_ATTN"
+    extra: dict[str, Any] = field(default_factory=dict)  # backend-specific kwargs
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.backend, str):
+            raise TypeError(f"Expected str for AttentionSpec.backend, got {type(self.backend)!r}")
+
+        if self.extra is None:
+            self.extra = {}
+        elif isinstance(self.extra, Mapping):
+            self.extra = dict(self.extra)
+        else:
+            raise TypeError(f"Expected dict for AttentionSpec.extra, got {type(self.extra)!r}")
+
+
+@dataclass
+class AttentionConfig:
+    """Per-role attention backend configuration.
+
+    Lookup precedence for a given (role, role_category):
+      1. per_role[role]         — exact match
+      2. per_role[role_category] — category fallback (e.g. "ltx2.audio_to_video" → "cross")
+      3. default                — global default
+      4. platform default       — unchanged platform logic
+    """
+
+    default: AttentionSpec | None = None
+    per_role: dict[str, AttentionSpec] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.default is not None:
+            self.default = self._coerce_spec_or_none(self.default, "default")
+
+        normalized_per_role: dict[str, AttentionSpec] = {}
+        for role_key, spec_data in self._normalize_per_role_mapping(self.per_role).items():
+            spec = self._coerce_spec_or_none(spec_data, f"per_role[{role_key!r}]")
+            if spec is not None:
+                normalized_per_role[role_key] = spec
+        self.per_role = normalized_per_role
+
+    @staticmethod
+    def _coerce_spec(spec_data: Any, field_name: str) -> AttentionSpec:
+        if isinstance(spec_data, AttentionSpec):
+            return spec_data
+        if isinstance(spec_data, str):
+            return AttentionSpec(backend=spec_data)
+        if isinstance(spec_data, Mapping):
+            return AttentionSpec(**dict(spec_data))
+        raise TypeError(f"Expected str, dict, or AttentionSpec for {field_name}, got {type(spec_data)!r}")
+
+    @classmethod
+    def _coerce_spec_or_none(cls, spec_data: Any, field_name: str) -> AttentionSpec | None:
+        spec = cls._coerce_spec(spec_data, field_name)
+        if spec.backend.lower() == "auto":
+            return None
+        return spec
+
+    @classmethod
+    def _normalize_per_role_mapping(cls, raw_per_role: Any) -> dict[str, Any]:
+        if raw_per_role is None:
+            return {}
+        if not isinstance(raw_per_role, Mapping):
+            raise TypeError(f"Expected dict for AttentionConfig.per_role, got {type(raw_per_role)!r}")
+
+        normalized: dict[str, Any] = {}
+        for role_key, spec_data in raw_per_role.items():
+            cls._flatten_per_role_entry([role_key], spec_data, normalized)
+        return normalized
+
+    @classmethod
+    def _flatten_per_role_entry(
+        cls,
+        path: list[str],
+        node: Any,
+        normalized: dict[str, Any],
+    ) -> None:
+        role = ".".join(path)
+        if not isinstance(node, Mapping):
+            normalized[role] = node
+            return
+
+        spec_keys = {"backend", "extra"}
+        node_dict = dict(node)
+        node_keys = set(node_dict)
+        if node_keys & spec_keys:
+            if not node_keys <= spec_keys:
+                raise ValueError(
+                    f"Invalid per_role entry for role {role!r}: cannot mix backend/extra with nested role keys."
+                )
+            normalized[role] = node_dict
+            return
+
+        if not node_dict:
+            raise ValueError(f"Empty per_role entry for role {role!r}")
+
+        for child_key, child_value in node_dict.items():
+            cls._flatten_per_role_entry([*path, child_key], child_value, normalized)
+
+    def resolve_with_source(
+        self,
+        role: str = "self",
+        role_category: str | None = None,
+    ) -> tuple[AttentionSpec | None, str | None]:
+        """Resolve the AttentionSpec and report which config entry matched."""
+        spec = self.per_role.get(role)
+        if spec is not None:
+            return spec, f"attention_config.per_role[{role!r}]"
+        if role_category is not None:
+            spec = self.per_role.get(role_category)
+            if spec is not None:
+                return spec, f"attention_config.per_role[{role_category!r}] (role_category fallback)"
+        if self.default is not None:
+            return self.default, "attention_config.default"
+        return None, None
+
+
+def parse_attention_config(
+    attention_config: AttentionConfig | Mapping[str, Any] | None = None,
+    *,
+    attention_backend: str | None = None,
+) -> AttentionConfig:
+    """Pure type-conversion: coerce *attention_config* to an AttentionConfig.
+
+    Optionally merges an ``attention_backend`` shorthand into the config's
+    ``default`` field.  This does **not** read environment variables —
+    use :func:`build_attention_config` for the full normalisation that
+    should happen exactly once in ``OmniDiffusionConfig.__post_init__``.
+    """
+    if attention_config is None:
+        normalized = AttentionConfig()
+    elif isinstance(attention_config, AttentionConfig):
+        normalized = copy.deepcopy(attention_config)
+    elif isinstance(attention_config, Mapping):
+        normalized = AttentionConfig(**dict(attention_config))
+    else:
+        raise TypeError(
+            f"attention_config must be an AttentionConfig, mapping, or None; got {type(attention_config)!r}"
+        )
+
+    if attention_backend is not None:
+        if normalized.default is not None:
+            raise ValueError(
+                "--diffusion-attention-backend is mutually exclusive with --diffusion-attention-config.default.backend."
+            )
+        if attention_backend.lower() != "auto":
+            normalized.default = AttentionSpec(backend=attention_backend)
+
+    return normalized
+
+
+def build_attention_config(
+    attention_config: AttentionConfig | Mapping[str, Any] | None = None,
+) -> AttentionConfig:
+    """Normalize diffusion attention config — the single authoritative entry point.
+
+    Called exactly once in ``OmniDiffusionConfig.__post_init__``.
+    Handles type-conversion **and** env-var fallback
+    (``DIFFUSION_ATTENTION_BACKEND``).
+    """
+    normalized = parse_attention_config(attention_config)
+
+    if normalized.default is not None:
+        return normalized
+
+    env_attention_backend = os.environ.get("DIFFUSION_ATTENTION_BACKEND")
+    if env_attention_backend is None:
+        return normalized
+
+    if env_attention_backend.lower() == "auto":
+        return normalized
+
+    normalized.default = AttentionSpec(backend=env_attention_backend)
+    logger.info(
+        "Parsed attention config from DIFFUSION_ATTENTION_BACKEND '%s': default=%s, per_role=%s",
+        env_attention_backend,
+        normalized.default,
+        {k: v.backend for k, v in normalized.per_role.items()},
+    )
+    return normalized
 
 
 @dataclass

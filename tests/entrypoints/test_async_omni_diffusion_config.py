@@ -5,6 +5,7 @@ import pytest
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.config.stage_config import deploy_override_field_names
+from vllm_omni.diffusion.data import AttentionConfig
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand, _create_default_diffusion_stage_cfg
 
@@ -131,6 +132,51 @@ def test_default_stage_config_includes_default_sampling_params():
     }
 
 
+def test_default_stage_config_includes_diffusion_attention_backend():
+    """Ensure diffusion attention shorthand lands in engine_args.diffusion_attention_config."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "diffusion_attention_backend": "FLASH_ATTN",
+        }
+    )[0]
+
+    diffusion_attention_config = stage_cfg["engine_args"]["diffusion_attention_config"]
+    assert isinstance(diffusion_attention_config, AttentionConfig)
+    assert diffusion_attention_config.default is not None
+    assert diffusion_attention_config.default.backend == "FLASH_ATTN"
+
+
+def test_default_stage_config_includes_diffusion_attention_config():
+    """Ensure structured diffusion attention config survives default stage creation."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "diffusion_attention_config": {
+                "default": {"backend": "FLASH_ATTN"},
+                "per_role": {"cross": {"backend": "TORCH_SDPA"}},
+            },
+        }
+    )[0]
+
+    diffusion_attention_config = stage_cfg["engine_args"]["diffusion_attention_config"]
+    assert isinstance(diffusion_attention_config, AttentionConfig)
+    assert diffusion_attention_config.default is not None
+    assert diffusion_attention_config.default.backend == "FLASH_ATTN"
+    assert diffusion_attention_config.per_role["cross"].backend == "TORCH_SDPA"
+
+
+def test_default_stage_config_rejects_conflicting_diffusion_attention_inputs():
+    """Ensure shorthand and default.backend stay mutually exclusive."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        AsyncOmniEngine._create_default_diffusion_stage_cfg(
+            {
+                "diffusion_attention_backend": "FLASH_ATTN",
+                "diffusion_attention_config": {
+                    "default": {"backend": "TORCH_SDPA"},
+                },
+            }
+        )
+
+
 def test_default_stage_config_engine_args():
     """Ensure default diffusion-stage builder sets and propagates engine_args."""
     stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
@@ -216,3 +262,28 @@ def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
 
     assert args.enable_diffusion_pipeline_profiler is True
     assert stage_cfg["engine_args"]["enable_diffusion_pipeline_profiler"] is True
+
+
+def test_serve_cli_accepts_diffusion_attention_backend():
+    """Ensure diffusion serve CLI exposes the shorthand backend flag."""
+    parser = FlexibleArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Qwen/Qwen-Image",
+            "--omni",
+            "--diffusion-attention-backend",
+            "FLASH_ATTN",
+        ]
+    )
+
+    stage_cfg = _create_default_diffusion_stage_cfg(args)[0]
+    diffusion_attention_config = stage_cfg["engine_args"]["diffusion_attention_config"]
+
+    assert args.diffusion_attention_backend == "FLASH_ATTN"
+    assert isinstance(diffusion_attention_config, AttentionConfig)
+    assert diffusion_attention_config.default is not None
+    assert diffusion_attention_config.default.backend == "FLASH_ATTN"

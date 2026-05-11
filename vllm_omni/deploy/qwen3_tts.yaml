@@ -26,6 +26,8 @@ connectors:
       # Must match the decoder sliding attention window.
       codec_chunk_frames: 25
       codec_left_context_frames: 72
+      # Emit only the first audio chunk early, then return to codec_chunk_frames.
+      initial_codec_chunk_frames: 1
 
 stages:
   - stage_id: 0

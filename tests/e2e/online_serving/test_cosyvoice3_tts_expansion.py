@@ -10,7 +10,6 @@ the CosyVoice3 model, which requires reference audio for voice cloning.
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import pytest
 

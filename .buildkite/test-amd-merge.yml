@@ -123,7 +123,6 @@ steps:
   grade: Blocking
   commands:
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - export VLLM_TEST_CLEAN_GPU_MEMORY=1
     - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni.py tests/e2e/online_serving/test_mimo_audio.py -m "advanced_model" --run-level "advanced_model"
 
 - label: "Qwen3-TTS CustomVoice E2E Test"
@@ -164,7 +163,6 @@ steps:
 #   grade: Blocking
 #   commands:
 #     - export GPU_ARCHS=gfx942
-#     - export VLLM_TEST_CLEAN_GPU_MEMORY=1
 #     - export VLLM_LOGGING_LEVEL=DEBUG
 #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
 #     - export VLLM_ROCM_USE_AITER_RMSNORM=0
@@ -177,7 +175,6 @@ steps:
 #   grade: Blocking
 #   commands:
 #     - export GPU_ARCHS=gfx942
-#     - export VLLM_TEST_CLEAN_GPU_MEMORY=1
 #     - export VLLM_LOGGING_LEVEL=DEBUG
 #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
 #     - export VLLM_ROCM_USE_AITER_RMSNORM=0
@@ -190,7 +187,6 @@ steps:
 #   grade: Blocking
 #   commands:
 #     - export GPU_ARCHS=gfx942
-#     - export VLLM_TEST_CLEAN_GPU_MEMORY=1
 #     - export VLLM_IMAGE_FETCH_TIMEOUT=60
 #     - export VLLM_LOGGING_LEVEL=DEBUG
 #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn

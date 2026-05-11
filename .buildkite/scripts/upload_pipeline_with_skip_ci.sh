@@ -21,7 +21,7 @@ is_docs_only_change() {
     if [[ "${file_path}" == *.md ]]; then
       continue
     fi
-    if [[ "${file_path}" == "mkdocs.yaml" ]]; then
+    if [[ "${file_path}" == "mkdocs.yml" ]]; then
       continue
     fi
     return 1
@@ -126,7 +126,7 @@ if skip:
 else:
     rep = "'true'"
     ready_rep = "'build.branch != \"main\" && build.pull_request.labels includes \"ready\"'"
-    merge_rep = "'(build.branch == \"main\" && build.env(\"NIGHTLY\") != \"1\") || (build.branch != \"main\" && build.pull_request.labels includes \"merge-test\")'"
+    merge_rep = "'(build.branch == \"main\" && build.env(\"NIGHTLY\") != \"1\" && build.env(\"WEEKLY\") != \"1\") || (build.branch != \"main\" && build.pull_request.labels includes \"merge-test\")'"
 rendered = (
     continuation
     .replace("__IMAGE_BUILD_IF__", rep)
