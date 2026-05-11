@@ -33,6 +33,8 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.utils import shutdown
 
+from vllm_omni.engine.arg_utils import register_omni_models_to_vllm
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.executor import Executor
@@ -58,6 +60,12 @@ class StageEngineCoreProc(EngineCoreProc):
         """Launch StageEngineCoreProc busy loop in background process."""
         signal_callback: SignalCallback | None = None
         maybe_register_config_serialize_by_value()
+
+        # Re-register omni archs: hybrid models hit
+        # ``Platform._align_hybrid_block_size`` during executor init, which
+        # calls ``ModelRegistry.resolve_model_cls`` before the model module
+        # is imported.
+        register_omni_models_to_vllm()
 
         engine_core: StageEngineCoreProc | None = None
         try:
