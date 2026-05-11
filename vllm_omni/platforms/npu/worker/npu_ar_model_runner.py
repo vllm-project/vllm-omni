@@ -108,12 +108,12 @@ class NPUARModelRunner(OmniNPUModelRunner):
         sampled_token_ids_cpu = getattr(self.input_batch, "sampled_token_ids_cpu", None)
         async_copy_ready_event = getattr(self.input_batch, "async_copy_ready_event", None)
         prev_req_id_to_index = getattr(self.input_batch, "prev_req_id_to_index", None)
-        if sampled_token_ids_cpu is None or not output_token_ids or prev_req_id_to_index is None:
+        if sampled_token_ids_cpu is None or not output_token_ids:
             return output_token_ids
 
         sampled_token_ids: list[list[int]] | None = None
         for index, req_id in enumerate(req_ids):
-            prev_index = prev_req_id_to_index.get(req_id)
+            prev_index = prev_req_id_to_index.get(req_id) if prev_req_id_to_index is not None else index
             if prev_index is None:
                 continue
             req_history = output_token_ids[index]
@@ -121,6 +121,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 assert async_copy_ready_event is not None
                 async_copy_ready_event.synchronize()
                 sampled_token_ids = sampled_token_ids_cpu.tolist()
+            if prev_index >= len(sampled_token_ids):
+                continue
             new_ids = list(sampled_token_ids[prev_index])
             if not new_ids:
                 continue
