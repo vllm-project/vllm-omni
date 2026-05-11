@@ -71,13 +71,14 @@ stages:
     gpu_memory_utilization: 0.30
     enforce_eager: false
     async_scheduling: true
+    skip_tokenizer_init: true
+    dtype: float32
     devices: "0"
     input_connectors:
       from_stage_0: connector_of_shared_memory
     # See note on stage 0: ``model_subdir`` / ``tokenizer_subdir`` must be
     # flat per-stage engine args, not nested under ``engine_extras``.
     model_subdir: eartts
-    tokenizer_subdir: eartts
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
