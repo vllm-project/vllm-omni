@@ -117,8 +117,6 @@ class NPUARModelRunner(OmniNPUModelRunner):
             if prev_index is None:
                 continue
             req_history = output_token_ids[index]
-            if not req_history or req_history[-1] != -1:
-                continue
             if sampled_token_ids is None:
                 assert async_copy_ready_event is not None
                 async_copy_ready_event.synchronize()
@@ -127,10 +125,16 @@ class NPUARModelRunner(OmniNPUModelRunner):
             if not new_ids:
                 continue
             num_sampled_ids = len(new_ids) if new_ids[-1] != -1 else new_ids.index(-1)
-            first_placeholder = req_history.index(-1)
-            num_placeholders = len(req_history) - first_placeholder
-            num_to_replace = min(num_sampled_ids, num_placeholders)
-            req_history[first_placeholder : first_placeholder + num_to_replace] = new_ids[:num_to_replace]
+            new_ids = new_ids[:num_sampled_ids]
+            if not new_ids:
+                continue
+            if req_history and req_history[-1] == -1:
+                first_placeholder = req_history.index(-1)
+                num_placeholders = len(req_history) - first_placeholder
+                num_to_replace = min(len(new_ids), num_placeholders)
+                req_history[first_placeholder : first_placeholder + num_to_replace] = new_ids[:num_to_replace]
+            elif req_history[-len(new_ids) :] != new_ids:
+                req_history.extend(new_ids)
 
         return output_token_ids
 

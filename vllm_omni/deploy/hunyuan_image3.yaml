@@ -16,9 +16,16 @@ connectors:
       device_name: ""
       memory_pool_size: 4294967296
       memory_pool_device: "cpu"
+  shared_memory_connector:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
 
 stages:
   - stage_id: 0
+    is_comprehension: false
+    final_output: true
+    final_output_type: text
     max_num_seqs: 1
     gpu_memory_utilization: 0.95
     enforce_eager: true
@@ -32,13 +39,12 @@ stages:
     omni_kv_config:
       need_send_cache: true
     output_connectors:
-      to_stage_1: rdma_connector
+      to_stage_1: shared_memory_connector
     default_sampling_params:
       temperature: 0.0
       top_p: 1
       top_k: -1
       max_tokens: 8192
-      stop_token_ids: [128025]
       detokenize: true
       skip_special_tokens: false
 
@@ -53,7 +59,7 @@ stages:
       tensor_parallel_size: 2
       enable_expert_parallel: true
     input_connectors:
-      from_stage_0: rdma_connector
+      from_stage_0: shared_memory_connector
     default_sampling_params:
       num_inference_steps: 50
       guidance_scale: 0
@@ -68,13 +74,14 @@ platforms:
   npu:
     stages:
       - stage_id: 0
-        gpu_memory_utilization: 0.75
+        gpu_memory_utilization: 0.6
         devices: "0,1,2,3,4,5,6,7"
         tensor_parallel_size: 8
+        max_num_batched_tokens: 8192
       - stage_id: 1
         gpu_memory_utilization: 0.65
         devices: "8,9,10,11"
-        max_num_batched_tokens: 32768
+        max_num_batched_tokens: 8192
         parallel_config:
           tensor_parallel_size: 4
           enable_expert_parallel: true
