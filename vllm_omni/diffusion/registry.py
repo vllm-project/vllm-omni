@@ -8,6 +8,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
+from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
@@ -280,7 +281,7 @@ def _prepare_diffusion_quant_config(
     model_class: type[nn.Module],
 ) -> None:
     """Prepare diffusion quant config using vLLM-style model bindings."""
-    quant_config = od_config.quantization_config
+    quant_config = getattr(od_config, "quantization_config", None)
     if quant_config is None:
         return
     if hasattr(quant_config, "maybe_update_config"):
@@ -314,7 +315,8 @@ def initialize_model(
     model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
     if model_class is not None:
         _prepare_diffusion_quant_config(od_config, model_class)
-        model = model_class(od_config=od_config)
+        with set_current_diffusion_config(od_config):
+            model = model_class(od_config=od_config)
 
         vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
         is_distributed_vae = hasattr(model, "vae") and isinstance(model.vae, DistributedVaeMixin)

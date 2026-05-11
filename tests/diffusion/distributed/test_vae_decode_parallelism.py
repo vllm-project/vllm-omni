@@ -21,7 +21,6 @@ import time
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.platforms import current_omni_platform
 
-# os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 all_model_configs = [

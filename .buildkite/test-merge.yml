@@ -7,25 +7,9 @@ steps:
   - group: ":card_index_dividers: Simple Test"
     depends_on: upload-merge-pipeline
     steps:
-      - label: "Simple · Diffusion Test"
+      - label: "Simple · Diffusion & Model Executor Test"
         commands:
-          - "timeout 20m pytest -sv tests/diffusion -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
-        agents:
-          queue: "gpu_1_queue"
-        plugins:
-          - docker#v5.2.0:
-              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
-              always-pull: true
-              propagate-environment: true
-              environment:
-                - "HF_HOME=/fsx/hf_cache"
-                - "HF_TOKEN"
-              volumes:
-                - "/fsx/hf_cache:/fsx/hf_cache"
-
-      - label: "Simple · Model Executor Test"
-        commands:
-          - "timeout 20m pytest -sv tests/model_executor -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
+          - "timeout 20m pytest -sv tests/diffusion tests/model_executor -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml"
         agents:
           queue: "gpu_1_queue"
         plugins:
@@ -81,7 +65,6 @@ steps:
       - |
         timeout 55m bash -c "
           set -e
-          export VLLM_TEST_CLEAN_GPU_MEMORY=1
           export VLLM_IMAGE_FETCH_TIMEOUT=60
           pytest -s -v tests/distributed -m 'advanced_model and cuda' --run-level 'advanced_model'
         "

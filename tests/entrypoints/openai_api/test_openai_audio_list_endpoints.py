@@ -9,7 +9,6 @@ Migrated from ``tests/e2e/online_serving/test_voxtral_tts.py`` to colocate with 
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import httpx
 import pytest

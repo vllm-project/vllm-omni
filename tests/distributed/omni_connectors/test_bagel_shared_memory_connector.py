@@ -26,6 +26,8 @@ from tests.helpers.stage_config import get_deploy_config_path, modify_stage_conf
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.platforms import current_omni_platform
 
+pytestmark = [pytest.mark.usefixtures("clean_gpu_memory_between_tests")]
+
 BAGEL_CI_DEPLOY = get_deploy_config_path("ci/bagel.yaml")
 
 # Reference pixel data extracted from the known-good output image
@@ -212,24 +214,6 @@ def _generate_bagel_img2img(
     generated_image = _extract_generated_image(omni_outputs)
     assert generated_image is not None, "No images generated"
     assert generated_image.size == EXPECTED_OUTPUT_SIZE, f"Expected {EXPECTED_OUTPUT_SIZE}, got {generated_image.size}"
-
-    return generated_image
-
-
-def _generate_bagel_text2img(omni: Omni, prompt: str = TEXT2IMG_DEFAULT_PROMPT) -> Image.Image:
-    """Generate an image using Bagel text2img with configured parameters."""
-    params_list = _configure_sampling_params(omni)
-
-    omni_outputs = list(
-        omni.generate(
-            prompts=[{"prompt": prompt, "modalities": ["image"]}],
-            sampling_params_list=params_list,
-        )
-    )
-
-    generated_image = _extract_generated_image(omni_outputs)
-    assert generated_image is not None, "No images generated"
-    assert generated_image.size == (1024, 1024), f"Expected 1024x1024, got {generated_image.size}"
 
     return generated_image
 

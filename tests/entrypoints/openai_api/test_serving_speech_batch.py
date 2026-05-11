@@ -9,7 +9,6 @@ Validates bulk synthesis via the batch API with actual model inference.
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import base64
 import struct

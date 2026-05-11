@@ -213,7 +213,6 @@ E2E Online tests for Qwen3-Omni model with mix input and audio+text output.
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import threading
 from pathlib import Path

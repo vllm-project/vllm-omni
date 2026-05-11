@@ -88,19 +88,19 @@ class RocmOmniPlatform(OmniPlatform, RocmPlatform):
                     "Flash Attention requires `aiter` library which is only supported "
                     "on gfx942 and gfx950. Falling back to TORCH_SDPA backend."
                 )
-                logger.info("Defaulting to diffusion attention backend SDPA")
+                logger.debug("Defaulting to diffusion attention backend SDPA")
                 return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
             backend = DiffusionAttentionBackendEnum[backend_upper]
-            logger.info("Using diffusion attention backend '%s'", backend_upper)
+            logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()
 
         # Choose to enable Flash Attention by default on ROCm
         # whenever possible as it is the fastest backend
         if aiter_supported:
-            logger.info("Defaulting to diffusion attention backend FLASH_ATTN")
+            logger.debug("Defaulting to diffusion attention backend FLASH_ATTN")
             return DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
 
-        logger.info("Defaulting to diffusion attention backend SDPA")
+        logger.debug("Defaulting to diffusion attention backend SDPA")
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
     @classmethod
