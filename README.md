@@ -12,6 +12,13 @@ Easy, fast, and cheap omni-modality model serving for everyone
 | <a href="https://vllm-omni.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> | <a href="docs/assets/WeChat.jpg"><b>WeChat</b></a> | <a href="https://arxiv.org/abs/2602.02204"><b>Paper</b></a> | <a href="https://docs.google.com/presentation/d/1XJWgv79lORl8rbaVvp2d5Sqs6ZEBgAgj/edit?slide=id.p1#slide=id.p1"><b>Slides</b></a> |
 </p>
 
+<p align="center">
+  <b>English</b> ·
+  <a href="docs/i18n/README.zh-CN.md">简体中文</a> ·
+  <a href="docs/i18n/README.fr.md">Français</a> ·
+  <a href="docs/i18n/README.ja.md">日本語</a>
+</p>
+
 
 ---
 
