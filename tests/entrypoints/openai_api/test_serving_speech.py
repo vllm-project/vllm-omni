@@ -889,6 +889,18 @@ class TestTTSMethods:
         req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=emb, x_vector_only_mode=True)
         assert speech_server._validate_tts_request(req) is None
 
+    def test_speaker_embedding_192_dims_accepted_without_warning(self, speech_server, mocker: MockerFixture):
+        """192-dim ECAPA embeddings should stay on the accepted/no-warning path."""
+        emb = [0.1] * 192
+        req = OpenAICreateSpeechRequest(input="Hello", task_type="Base", speaker_embedding=emb, x_vector_only_mode=True)
+
+        mock_warn = mocker.patch("vllm_omni.entrypoints.openai.serving_speech.logger.warning")
+
+        result = speech_server._validate_tts_request(req)
+
+        assert result is None
+        mock_warn.assert_not_called()
+
     def test_upload_voice_embedding_wrong_dims_rejected(self, speech_server):
         """Embedding uploads must match the loaded Qwen3-TTS model before being stored."""
         import json

@@ -967,7 +967,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     else:
                         # Prefix cache disabled; we still need to process the data
                         for mm_key, mm_val in mm_cpu.items():
-                            mm_payload[mm_key] = to_payload_element(
+                            element = to_payload_element(
                                 element=mm_val,
                                 idx=idx,
                                 start=start,
@@ -975,6 +975,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                                 pass_lists_through=False,
                                 seq_len=seq_len,
                             )
+                            if element is None:
+                                continue
+                            mm_payload[mm_key] = element
                     payload.update(mm_payload)
                 # Flatten nested dicts to dotted keys so pooling_output
                 # stays dict[str, torch.Tensor] for msgspec serialization.

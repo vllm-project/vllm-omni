@@ -66,6 +66,7 @@ _COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
 _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
 _VOXCPM_TTS_MODEL_STAGES = {"latent_generator", "vae"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
+_RAON_TTS_MODEL_STAGES = {"ar"}
 _MING_TTS_MODEL_STAGES = {"ming_tts"}
 _MOSS_TTS_MODEL_STAGES = {"moss_tts_nano"}
 _TTS_MODEL_STAGES: set[str] = (
@@ -76,6 +77,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _OMNIVOICE_TTS_MODEL_STAGES
     | _VOXCPM_TTS_MODEL_STAGES
     | _VOXCPM2_TTS_MODEL_STAGES
+    | _RAON_TTS_MODEL_STAGES
     | _MING_TTS_MODEL_STAGES
     | _MOSS_TTS_MODEL_STAGES
 )
@@ -496,6 +498,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 for stage in self.engine_client.stage_configs
             )
             return "voxcpm" if has_vae_stage or model_stage == "vae" else "voxcpm2"
+        if model_stage in _RAON_TTS_MODEL_STAGES:
+            return "raon"
         if model_stage in _MING_TTS_MODEL_STAGES:
             return "ming_flash_omni_tts"
         if model_stage in _MOSS_TTS_MODEL_STAGES:
@@ -1070,6 +1074,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 metadata=self._speaker_metadata_to_header(speaker_data),
             )
             speaker_data["file_size"] = file_path.stat().st_size
+            speaker_data["cache_status"] = "ready"
+            speaker_data["cache_file"] = str(file_path)
+            speaker_data["cache_generated_at"] = timestamp
 
             self.uploaded_speakers[voice_name_lower] = speaker_data
             self.supported_speakers.add(voice_name_lower)
@@ -1138,11 +1145,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
                     return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
             return None  # VoxCPM2 accepts any text input
+        if self._tts_model_type == "raon":
+            return self._validate_raon_request(request)
         if self._tts_model_type == "ming_flash_omni_tts":
             return self._validate_ming_tts_request(request)
         if self._tts_model_type == "moss_tts_nano":
             return self._validate_moss_tts_request(request)
         return self._validate_qwen_tts_request(request)
+
+    def _validate_raon_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate Raon request parameters. Returns error message or None."""
+        from vllm_omni.model_executor.models.raon.serving_utils import RaonServingHooks
+
+        return RaonServingHooks.validate_request(request)
 
     def _voxcpm2_encode(self, text: str) -> list[int]:
         """Tokenize text for VoxCPM2, splitting multichar Chinese tokens."""
@@ -1874,6 +1889,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "mm_processor_kwargs": mm_kwargs,
         }
 
+    # ---- Raon helpers ----
+
+    async def _build_raon_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Build the Raon speech prompt with serving_utils speaker policy."""
+        from vllm_omni.model_executor.models.raon.serving_utils import build_raon_speech_prompt
+
+        return await build_raon_speech_prompt(self, request)
+
     def _apply_cosyvoice3_dynamic_tokens(
         self,
         sampling_params_list: list,
@@ -2049,6 +2072,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             elif self._tts_model_type == "cosyvoice3":
                 prompt = await self._build_cosyvoice3_prompt(request)
                 tts_params = {}
+            elif self._tts_model_type == "raon":
+                prompt = await self._build_raon_prompt(request)
+                tts_params = {}
             elif self._tts_model_type == "ming_flash_omni_tts":
                 prompt = self._build_ming_prompt(request)
                 tts_params = {}
@@ -2108,6 +2134,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = "voxcpm"
         elif self._tts_model_type == "voxcpm2":
             model_type = "voxcpm2"
+        elif self._tts_model_type == "raon":
+            model_type = "raon"
         elif self._tts_model_type == "ming_flash_omni_tts":
             model_type = "ming_flash_omni_tts"
         elif self._tts_model_type == "moss_tts_nano":
@@ -2128,6 +2156,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # EOS and max_token_text_ratio to cap generation length.
         if self._tts_model_type == "cosyvoice3" and sampling_params_list:
             sampling_params_list = self._apply_cosyvoice3_dynamic_tokens(sampling_params_list, request)
+
+        # Raon: apply task-specific sampling params for TTS.
+        if self._tts_model_type == "raon" and sampling_params_list:
+            from vllm_omni.model_executor.models.raon.serving_utils import (
+                prepare_raon_tts_sampling_params,
+            )
+
+            sampling_params_list = prepare_raon_tts_sampling_params(
+                self,
+                sampling_params_list,
+                request,
+            )
 
         # Apply model-specific extra parameters
         if request.extra_params is not None and sampling_params_list:
@@ -2202,6 +2242,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         base64_encode: bool = False,
         request_id: str | None = None,
     ) -> tuple[bytes | str, str]:
+        if self._tts_model_type == "raon":
+            from vllm_omni.model_executor.models.raon.serving_utils import maybe_rolling_icl_audio_bytes
+
+            result = await maybe_rolling_icl_audio_bytes(self, request, base64_encode)
+            if result is not None:
+                return result
+
         request_id, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
 
         # MOSS-TTS-Nano emits delta chunks per yield (single-stage,

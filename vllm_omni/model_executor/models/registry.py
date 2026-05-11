@@ -207,6 +207,8 @@ _OMNI_MODELS = {
         "ming_flash_omni",
         "MingFlashOmniForConditionalGeneration",
     ),
+    "RaonModel": ("raon", "raon", "RaonModel"),
+    "RaonCode2WavModel": ("raon", "raon_code2wav", "RaonCode2WavModel"),
 }
 
 

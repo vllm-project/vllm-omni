@@ -1002,7 +1002,7 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _gather_runtime_additional_information(self) -> list[dict]:
         """Gather per-request model_intermediate_buffer in batch order."""
         per_req_runtime_info = []
-        for req_id in self.input_batch.req_ids:
+        for req_index, req_id in enumerate(self.input_batch.req_ids):
             req_state = self.requests.get(req_id)
             # MammothModa2 AR grid constraint: the model must emit a special
             # end-of-line (EOL) token at the end of each image row.  To determine
@@ -1013,15 +1013,14 @@ class OmniGPUModelRunner(GPUModelRunner):
             # and forces the EOL token when column_id == ar_width.
             generated_len = len(req_state.output_token_ids) if req_state is not None else 0
             info = self.model_intermediate_buffer.get(req_id, {})
-            if info:
-                info["generated_len"] = generated_len
-                per_req_runtime_info.append(info)
-                if "thinker_reply_part_per_request" in info:
-                    q = info["thinker_reply_part_per_request"]
-                    if hasattr(q, "shape"):
-                        logger.debug(f"[OMNI] req={req_id} has thinker_reply_part_per_request queue shape: {q.shape}")
-            else:
-                per_req_runtime_info.append({})
+            info["generated_len"] = generated_len
+            info["_omni_req_id"] = req_id
+            info["_num_tokens"] = int(self._omni_num_scheduled_tokens_np[req_index])
+            per_req_runtime_info.append(info)
+            if "thinker_reply_part_per_request" in info:
+                q = info["thinker_reply_part_per_request"]
+                if hasattr(q, "shape"):
+                    logger.debug(f"[OMNI] req={req_id} has thinker_reply_part_per_request queue shape: {q.shape}")
         return per_req_runtime_info
 
     def _compute_request_token_spans(self, num_scheduled_tokens_np) -> list[tuple[int, int]]:
