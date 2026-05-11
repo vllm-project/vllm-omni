@@ -64,7 +64,9 @@ class _MicroStepPipeline:
         self.prepare_calls += 1
         state.timesteps = [torch.tensor(float(i)) for i in range(self.num_steps)]
         state.latents = torch.zeros((1,))
-        state.scheduler = None
+        # Provide a scheduler stub so the runner can build the per-chunk
+        # batched_ts from ``chunk.scheduler.timesteps[chunk.step_index]``.
+        state.scheduler = SimpleNamespace(timesteps=list(state.timesteps))
         return state
 
     def set_pp_recv_dict_buffers(self, state, **kwargs):
@@ -124,6 +126,10 @@ def _make_micro_request(
             generator_device=None,
             num_inference_steps=num_inference_steps,
             num_chunks=num_chunks,
+            num_frames=1,
+            slo_fps=None,
+            slo_max_batch=8,
+            slo_ema_alpha=0.3,
             lora_request=None,
         ),
     )
@@ -156,7 +162,7 @@ def _make_micro_scheduler_output(
     finished_req_ids=None,
 ):
     if assignment is None:
-        assignment = [RankTask(sched_req_id=sched_req_id, chunk_idx=0)]
+        assignment = [RankTask(sched_req_id=sched_req_id, chunk_indices=[0])]
     if is_new and req is not None:
         new_reqs = [NewRequestData(sched_req_id=sched_req_id, req=req)]
         cached_reqs = CachedRequestData.make_empty()
@@ -192,18 +198,15 @@ class TestRunner:
         _patch_runtime(monkeypatch, runner)
         req = _make_micro_request(num_inference_steps=1, num_chunks=1)
 
-        # μ-step 0: admit chunk 0, denoise it, mark completed.
         out0 = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(req=req, step_id=0),
         )
         assert out0.req_id == "req-1"
-        assert out0.chunk_idx == 0
-        assert out0.chunk_completed is True
+        assert out0.chunk_completion_map == {0: True}
         assert out0.finished is False
         assert "req-1" in runner.state_cache
 
-        # μ-step 1: runner decodes chunk 0 and returns finished.
         out1 = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(sched_req_id="req-1", step_id=1, assignment=[None], is_new=False),
@@ -224,26 +227,22 @@ class TestRunner:
         _patch_runtime(monkeypatch, runner)
         req = _make_micro_request(num_inference_steps=1, num_chunks=2)
 
-        # μ-step 0: process chunk 0.
         DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(req=req, step_id=0),
         )
-        # μ-step 1: decode chunk 0, process chunk 1.
         out1 = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(
                 sched_req_id="req-1",
                 step_id=1,
-                assignment=[RankTask(sched_req_id="req-1", chunk_idx=1)],
+                assignment=[RankTask(sched_req_id="req-1", chunk_indices=[1])],
                 is_new=False,
             ),
         )
-        assert out1.chunk_idx == 1
-        assert out1.chunk_completed is True
+        assert out1.chunk_completion_map == {1: True}
         assert out1.finished is False
 
-        # μ-step 2: decode chunk 1; finished after both chunks decoded.
         out2 = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(sched_req_id="req-1", step_id=2, assignment=[None], is_new=False),
@@ -261,21 +260,18 @@ class TestRunner:
         _patch_runtime(monkeypatch, runner)
         req = _make_micro_request(num_inference_steps=2, num_chunks=1)
 
-        # μ-step 0: process chunk 0 step 1/2 (not yet completed).
         out0 = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(req=req, step_id=0),
         )
-        assert out0.chunk_completed is False
+        assert out0.chunk_completion_map == {0: False}
 
-        # μ-step 1 with assignment=[None] → no chunk processed, no decode.
         out1 = DiffusionModelRunner.execute_micro_step(
             runner,
             _make_micro_scheduler_output(sched_req_id="req-1", step_id=1, assignment=[None], is_new=False),
         )
         assert out1.req_id == "req-1"
-        assert out1.chunk_idx is None
-        assert out1.chunk_completed is False
+        assert out1.chunk_completion_map is None
         assert out1.finished is False
         assert runner.pipeline.denoise_calls == 1
 
@@ -316,6 +312,60 @@ class TestRunner:
         with pytest.raises(ValueError, match="cache_backend"):
             DiffusionModelRunner.execute_micro_step(runner, _make_micro_scheduler_output(req=req))
 
+    def test_stamps_micro_step_wall_ns_on_rank0(self, monkeypatch):
+        runner = _make_runner(pp_size=1, num_steps=1)
+        _patch_runtime(monkeypatch, runner)
+        req = _make_micro_request(num_inference_steps=1, num_chunks=1)
+
+        out = DiffusionModelRunner.execute_micro_step(
+            runner,
+            _make_micro_scheduler_output(req=req, step_id=0),
+        )
+        assert out.micro_step_wall_ns is not None
+        assert out.micro_step_wall_ns >= 0
+
+    def test_batch_two_runs_two_tasks_in_one_micro_step(self, monkeypatch):
+        runner = _make_runner(pp_size=1, num_steps=1)
+        _patch_runtime(monkeypatch, runner)
+        req = _make_micro_request(num_inference_steps=1, num_chunks=2)
+
+        # μ-step 0: rank 0 admits chunks 0 and 1 in a single chunk-batch task (B=2).
+        assignment = [RankTask(sched_req_id="req-1", chunk_indices=[0, 1])]
+        out = DiffusionModelRunner.execute_micro_step(
+            runner,
+            _make_micro_scheduler_output(req=req, step_id=0, assignment=assignment),
+        )
+
+        # Phase 4 fuses the two chunks into ONE batched denoise_step call;
+        # Phase 5 runs scheduler.step per chunk (multistep history is per-chunk).
+        assert runner.pipeline.denoise_calls == 1
+        assert runner.pipeline.scheduler_calls == 2
+        assert out.req_id == "req-1"
+        assert out.chunk_completion_map == {0: True, 1: True}
+        assert out.micro_step_wall_ns is not None
+
+    def test_batch_two_decodes_both_chunks_when_drain_completes(self, monkeypatch):
+        runner = _make_runner(pp_size=1, num_steps=1)
+        _patch_runtime(monkeypatch, runner)
+        req = _make_micro_request(num_inference_steps=1, num_chunks=2)
+
+        DiffusionModelRunner.execute_micro_step(
+            runner,
+            _make_micro_scheduler_output(
+                req=req,
+                step_id=0,
+                assignment=[RankTask(sched_req_id="req-1", chunk_indices=[0, 1])],
+            ),
+        )
+        out = DiffusionModelRunner.execute_micro_step(
+            runner,
+            _make_micro_scheduler_output(sched_req_id="req-1", step_id=1, assignment=[None], is_new=False),
+        )
+
+        assert out.finished is True
+        assert runner.pipeline.decode_calls == 2
+        assert "req-1" not in runner.state_cache
+
 
 # ---------------------------------------------------------------------------
 # Worker
@@ -327,7 +377,7 @@ class TestWorker:
 
     def test_delegates_to_model_runner(self):
         worker = object.__new__(DiffusionWorker)
-        expected = RunnerOutput(req_id="req-1", chunk_idx=0, chunk_completed=False)
+        expected = RunnerOutput(req_id="req-1", chunk_completion_map={0: False})
         scheduler_output = SimpleNamespace(
             scheduled_new_reqs=[
                 SimpleNamespace(req=SimpleNamespace(sampling_params=SimpleNamespace(lora_request=None)))
@@ -422,7 +472,7 @@ class TestExecutor:
     def test_passes_through_runner_output(self, mocker: MockerFixture):
         executor = object.__new__(MultiprocDiffusionExecutor)
         executor._ensure_open = lambda: None
-        expected = RunnerOutput(req_id="req-1", chunk_idx=0, chunk_completed=True)
+        expected = RunnerOutput(req_id="req-1", chunk_completion_map={0: True})
         rpc = mocker.Mock(return_value=expected)
         executor.collective_rpc = rpc
 

@@ -163,15 +163,6 @@ class PipelineParallelMixin:
     def _pp_send_work(self, work: list[torch.distributed.Work]) -> None:
         self._pp_send_work_list = work
 
-    @property
-    def _preposted_its(self) -> list[AsyncIntermediateTensors] | None:
-        """Pre-posted IT recvs for the next micro-step (None if not primed)."""
-        return getattr(self, "_preposted_its_list", None)
-
-    @_preposted_its.setter
-    def _preposted_its(self, value: list[AsyncIntermediateTensors] | None) -> None:
-        self._preposted_its_list = value
-
     def _sync_pp_send(self) -> None:
         """
         Wait on all pending non-blocking PP sends.
@@ -194,6 +185,8 @@ class PipelineParallelMixin:
         cfg_normalize: bool = True,
         output_slice: int | None = None,
         buf_idx: int = 0,
+        batch_size: int = 1,
+        preposted_its: list[AsyncIntermediateTensors] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
         """
         Drop-in replacement for predict_noise_maybe_with_cfg that also handles PP.
@@ -230,16 +223,15 @@ class PipelineParallelMixin:
         n = len(all_kwargs)
         its: list[AsyncIntermediateTensors | None] = [None] * n
         if not pp_group.is_first_rank:
-            # Use recvs pre-posted by the previous step's scheduler_step
-            preposted = self._preposted_its
-            if preposted is not None and len(preposted) == n:
-                its = preposted
-                self._preposted_its = None
+            # Use recvs pre-posted by the previous step's scheduler_step.
+            # Caller owns the lifecycle in state.extra; we just consume here.
+            if preposted_its is not None and len(preposted_its) == n:
+                its = list(preposted_its)
             else:
                 for i in range(n):
                     its[i] = AsyncIntermediateTensors(
                         *pp_group.pipeline_irecv_tensor_dict(
-                            name="intermediate", segment_idx=i, buf_idx=buf_idx
+                            name="intermediate", segment_idx=i, buf_idx=buf_idx, batch_size=batch_size,
                         )
                     )
 
@@ -248,7 +240,9 @@ class PipelineParallelMixin:
             for i, (kwargs, it) in enumerate(zip(all_kwargs, its)):
                 result = self.predict_noise(**kwargs, intermediate_tensors=it)
                 self._pp_send_work.extend(
-                    pp_group.pipeline_isend_tensor_dict(result.tensors, name="intermediate", segment_idx=i)
+                    pp_group.pipeline_isend_tensor_dict(
+                        result.tensors, name="intermediate", segment_idx=i, batch_size=batch_size,
+                    )
                 )
             return None
 
@@ -282,9 +276,10 @@ class PipelineParallelMixin:
         t: torch.Tensor | tuple[torch.Tensor, ...],
         latents: torch.Tensor | tuple[torch.Tensor, ...],
         do_true_cfg: bool,
-        per_request_scheduler: Any | None = None,
+        per_request_scheduler: Any | list[Any] | None = None,
         buf_idx: int = 0,
         is_last_step: bool = False,
+        batch_size: int = 1,
     ) -> torch.Tensor | tuple[torch.Tensor, ...] | AsyncLatents:
         """
         Drop-in replacement for scheduler_step_maybe_with_cfg that also handles PP.
@@ -292,35 +287,66 @@ class PipelineParallelMixin:
         Only the last rank runs the scheduler (it already has noise_pred); the result
         is sent to rank 0 which needs it for the next forward pass.
 
-        Returns a ``AsyncLatents`` on rank 0 that transparently defers
-        ``handle.wait()`` until the tensor is actually consumed (via attribute
-        access or a torch operation), keeping the rank non-blocking after the
-        ``irecv`` is posted.
+        Returns ``AsyncLatents`` on rank 0 that defers wait() until the tensor
+        is actually consumed (via attribute access or a torch op), keeping the
+        rank non-blocking after the irecv.
         """
         if get_pipeline_parallel_world_size() == 1:
-            return super().scheduler_step_maybe_with_cfg(
-                noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator
-            )
+            return self._scheduler_step_local(noise_pred, t, latents, do_true_cfg, per_request_scheduler)
 
         pp_group = get_pp_group()
         if pp_group.is_last_rank:
-            latents = super().scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg, per_request_scheduler)
-            self._pp_send_work = pp_group.pipeline_isend_tensor_dict({"latents": latents}, name="latents")
+            latents = self._scheduler_step_local(noise_pred, t, latents, do_true_cfg, per_request_scheduler)
+            self._pp_send_work = pp_group.pipeline_isend_tensor_dict(
+                {"latents": latents}, name="latents", batch_size=batch_size,
+            )
         elif pp_group.is_first_rank:
-            latents = AsyncLatents(*pp_group.pipeline_irecv_tensor_dict(name="latents", buf_idx=buf_idx))
+            latents = AsyncLatents(
+                *pp_group.pipeline_irecv_tensor_dict(name="latents", buf_idx=buf_idx, batch_size=batch_size)
+            )
         return latents
-    
-    def prefetch_its_maybe_with_pp_and_cfg(self, do_true_cfg: bool, buf_idx: int, is_last_step: bool) -> None:
-        pp_group = get_pp_group()
-        if not pp_group.is_first_rank and not is_last_step:
-            cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
-            n = 1 if cfg_parallel_ready else (2 if do_true_cfg else 1)
-            next_buf_idx = (buf_idx + 1) % 2
-            self._preposted_its = [
-                AsyncIntermediateTensors(
-                    *pp_group.pipeline_irecv_tensor_dict(
-                        name="intermediate", segment_idx=i, buf_idx=next_buf_idx
-                    )
+
+    def _scheduler_step_local(
+        self,
+        noise_pred: torch.Tensor,
+        t: torch.Tensor,
+        latents: torch.Tensor,
+        do_true_cfg: bool,
+        per_request_scheduler: Any | list[Any] | None,
+    ) -> torch.Tensor:
+        """Run scheduler.step on this rank — single call or per-chunk loop."""
+        if not isinstance(per_request_scheduler, list):
+            return super().scheduler_step_maybe_with_cfg(
+                noise_pred, t, latents, do_true_cfg, per_request_scheduler,
+            )
+        new_rows: list[torch.Tensor] = []
+        for i, sched in enumerate(per_request_scheduler):
+            t_i = t[i] if t.ndim > 0 else t
+            new_rows.append(
+                super().scheduler_step_maybe_with_cfg(
+                    noise_pred[i:i + 1], t_i, latents[i:i + 1], do_true_cfg, sched,
                 )
-                for i in range(n)
-            ]
+            )
+        return torch.cat(new_rows, dim=0)
+    
+    def prefetch_its_maybe_with_pp_and_cfg(
+        self,
+        do_true_cfg: bool,
+        buf_idx: int,
+        is_last_step: bool,
+        batch_size: int = 1,
+    ) -> list[AsyncIntermediateTensors] | None:
+        pp_group = get_pp_group()
+        if pp_group.is_first_rank or is_last_step:
+            return None
+        cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
+        n = 1 if cfg_parallel_ready else (2 if do_true_cfg else 1)
+        next_buf_idx = (buf_idx + 1) % 2
+        return [
+            AsyncIntermediateTensors(
+                *pp_group.pipeline_irecv_tensor_dict(
+                    name="intermediate", segment_idx=i, buf_idx=next_buf_idx, batch_size=batch_size,
+                )
+            )
+            for i in range(n)
+        ]

@@ -111,7 +111,23 @@ class RankTask:
     """One unit of work for a rank in a stream-batch micro-step."""
 
     sched_req_id: str
-    chunk_idx: int
+    chunk_indices: list[int]
+
+
+@dataclass
+class Rank0Layout:
+    """How rank 0 should slice the [B_prev, ...] tensor it receives from last rank.
+
+    - head [0:n_finished] are chunks completing denoising (to decode)
+    - next [n_finished : n_finished+n_circulating] are re-admitted chunks
+    - rank 0 appends n_new fresh randn rows at the tail before forwarding.
+    """
+
+    n_finished: int
+    n_circulating: int
+    n_new: int
+    finished_idxs: list[int]
+    new_idxs: list[int]
 
 
 @dataclass
@@ -124,8 +140,10 @@ class DiffusionSchedulerOutput:
     finished_req_ids: set[str]
     num_running_reqs: int
     num_waiting_reqs: int
-    # Per-rank task list. Index = PP rank id.
-    per_rank_assignment: list[list[RankTask]] | None = None
+
+    # stream-batch scheduling fields
+    per_rank_assignment: list[RankTask | None] | None = None
+    rank0_layouts: dict[str, Rank0Layout] | None = None
 
     @cached_property
     def scheduled_req_ids(self) -> list[str]:

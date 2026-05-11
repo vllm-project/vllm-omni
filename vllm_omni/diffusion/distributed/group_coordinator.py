@@ -1031,12 +1031,13 @@ class PipelineGroupCoordinator(GroupCoordinator):
         name: str,
         segment_idx: int,
         template_dict: dict[str, torch.Tensor | Any],
+        batch_size: int = 1,
     ) -> None:
         """Pre-populate schema cache + a double-buffer pair (indices 0/1) for
-        (name, segment_idx).
+        ``(name, segment_idx, batch_size)``.
         """
         metadata_list, _ = _split_tensor_dict(template_dict)
-        key = (name, segment_idx)
+        key = (name, segment_idx, batch_size)
         self.dict_schema_cache[key] = metadata_list
         buffer_pair: list[dict[str, torch.Tensor]] = []
         for _ in range(2):
@@ -1055,10 +1056,12 @@ class PipelineGroupCoordinator(GroupCoordinator):
         tensor_dict: dict[str, torch.Tensor | Any],
         name: str = "dict",
         segment_idx: int = -1,
+        batch_size: int = 1,
     ) -> list[torch.distributed.Work]:
+        """Non-blocking dict send keyed by ``(name, segment_idx, batch_size)``."""
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
 
-        key = (name, segment_idx)
+        key = (name, segment_idx, batch_size)
         handles: list[torch.distributed.Work] = []
         if key not in self.dict_schema_cache:
             schema_handles, keepalive = self._isend_dict_schema(metadata_list)
@@ -1085,14 +1088,15 @@ class PipelineGroupCoordinator(GroupCoordinator):
         name: str = "dict",
         segment_idx: int = -1,
         buf_idx: int = 0,
+        batch_size: int = 1,
     ) -> tuple[dict[str, torch.Tensor | Any], list[torch.distributed.Work], list]:
         """Async tensor-dict recv into the ``buf_idx`` slot (0 or 1) of the
-        double-buffer pair for (name, segment_idx). Caller picks the slot
-        — typically ``micro_step % 2`` — so consecutive recvs alternate and
-        the previous result stays readable until its consumer is done.
+        double-buffer pair for ``(name, segment_idx, batch_size)``. Caller picks
+        the slot — typically ``micro_step % 2`` — so consecutive recvs alternate
+        and the previous result stays readable until its consumer is done.
         Posts irecvs on ``comms_stream``.
         """
-        key = (name, segment_idx)
+        key = (name, segment_idx, batch_size)
         if key not in self.dict_schema_cache:
             metadata_list = self._recv_dict_schema()
             self.dict_schema_cache[key] = metadata_list

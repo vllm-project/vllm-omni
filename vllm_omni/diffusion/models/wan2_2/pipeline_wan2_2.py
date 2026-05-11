@@ -1321,39 +1321,55 @@ class Wan22Pipeline(
         if pp_group.world_size == 1:
             return
 
-        latents_template = {"latents": state.latents}
+        # Pre-populate buffer pairs for every B in 1..slo_max_batch
+        slo_fps = getattr(state.sampling, "slo_fps", None)
+        slo_max_batch = getattr(state.sampling, "slo_max_batch", 1)
+        b_max = max(1, slo_max_batch if slo_fps else 1)
 
-        # Intermediate tensor: [batch, seq_len, inner_dim] after patch_embed + flatten.
-        batch = state.latents.shape[0]
-        num_frames = state.latents.shape[2]
-        height = state.latents.shape[3]
-        width = state.latents.shape[4]
+        _, channels, num_frames, height, width = state.latents.shape
         p_t, p_h, p_w = self.transformer_config.patch_size
         seq_len = (num_frames // p_t) * (height // p_h) * (width // p_w)
         inner_dim = self.transformer_config.num_attention_heads * self.transformer_config.attention_head_dim
-        dtype = (self.transformer or self.transformer_2).dtype
-        it_template = {
-            "hidden_states": torch.empty(batch, seq_len, inner_dim, dtype=dtype, device=self.device)
-        }
+        it_dtype = (self.transformer or self.transformer_2).dtype
+        latents_dtype = state.latents.dtype
+        device = state.latents.device
 
         cfg_branches = 2 if state.do_true_cfg else 1
-        pp_group.set_recv_dict_buffer("latents", -1, latents_template)
-        for seg in range(cfg_branches):
-            pp_group.set_recv_dict_buffer("intermediate", seg, it_template)
+        for B in range(1, b_max + 1):
+            latents_template = {
+                "latents": torch.empty(B, channels, num_frames, height, width, dtype=latents_dtype, device=device)
+            }
+            it_template = {
+                "hidden_states": torch.empty(B, seq_len, inner_dim, dtype=it_dtype, device=self.device)
+            }
+            pp_group.set_recv_dict_buffer("latents", -1, latents_template, batch_size=B)
+            for seg in range(cfg_branches):
+                pp_group.set_recv_dict_buffer("intermediate", seg, it_template, batch_size=B)
 
         self.is_buffer_setup = True
 
     def denoise_step(
         self,
         state: DiffusionRequestState,
+        batch_size: int = 1,
         **kwargs: Any,
     ) -> torch.Tensor | None:
-        """Run one denoising iteration."""
-        t = state.current_timestep
+        """Run one denoising iteration.
+
+        When ``state.batched_timesteps`` is set (stream-batch path with
+        multiple chunks at different ``step_index`` fused along dim 0),
+        it overrides ``current_timestep`` and ``_prepare_latent_input``
+        forwards the per-row timesteps directly to the transformer.
+        Model selection uses the per-row max so a batch straddling the
+        high/low noise boundary picks the high-noise transformer (correct
+        for single-stage Wan2.1; Wan2.2 boundary-straddling is a TODO).
+        """
+        t = state.batched_timesteps if state.batched_timesteps is not None else state.current_timestep
         self._current_timestep = t
 
         boundary_timestep = state.extra.get("boundary_timestep")
-        current_model, current_guidance_scale = self._select_model_for_timestep(t, boundary_timestep)
+        t_select = t.max() if t.ndim > 0 else t
+        current_model, current_guidance_scale = self._select_model_for_timestep(t_select, boundary_timestep)
 
         latent_model_input, timestep = self._prepare_latent_input(state, t, current_model.dtype)
 
@@ -1379,6 +1395,7 @@ class Wan22Pipeline(
             if do_true_cfg
             else None
         )
+        preposted_its = state.extra.pop("preposted_its", None)
 
         return self.predict_noise_maybe_with_pp_and_cfg(
             do_true_cfg=do_true_cfg,
@@ -1386,9 +1403,11 @@ class Wan22Pipeline(
             positive_kwargs=positive_kwargs,
             negative_kwargs=negative_kwargs,
             buf_idx=state.step_index % 2,
+            batch_size=batch_size,
+            preposted_its=preposted_its,
         )
 
-    def prefetch_its(self, state: DiffusionRequestState) -> None:
+    def prefetch_its(self, state: DiffusionRequestState, batch_size: int = 1) -> None:
         """Prefetch intermediate tensors for the next step."""
         t = state.current_timestep
         boundary_timestep = state.extra.get("boundary_timestep")
@@ -1397,34 +1416,48 @@ class Wan22Pipeline(
         buf_idx = state.step_index % 2
         is_last_step = state.step_index == state.total_steps - 1
 
-        self.prefetch_its_maybe_with_pp_and_cfg(
+        preposted = self.prefetch_its_maybe_with_pp_and_cfg(
             do_true_cfg=do_true_cfg,
             buf_idx=buf_idx,
             is_last_step=is_last_step,
+            batch_size=batch_size,
         )
+        if preposted is not None:
+            state.extra["preposted_its"] = preposted
 
     def step_scheduler(
         self,
         state: DiffusionRequestState,
         noise_pred: torch.Tensor,
+        *,
+        per_request_scheduler: Any | list[Any] | None = None,
+        batch_size: int = 1,
         **kwargs: Any,
     ) -> None:
-        """Run one scheduler step: update latents and advance step_index."""
-        t = state.current_timestep
+        """Run one scheduler step: update latents and advance step_index.
+
+        ``per_request_scheduler`` may be a single scheduler (B=1) or a list of
+        per-chunk schedulers (B>1, last rank loops one ``step()`` per row).
+        ``batch_size`` keys the PP recv buffer pool on first rank.
+        """
+        t = state.batched_timesteps if state.batched_timesteps is not None else state.current_timestep
         boundary_timestep = state.extra.get("boundary_timestep")
-        _, current_guidance_scale = self._select_model_for_timestep(t, boundary_timestep)
+        t_select = t.max() if t.ndim > 0 else t
+        _, current_guidance_scale = self._select_model_for_timestep(t_select, boundary_timestep)
         do_true_cfg = current_guidance_scale > 1.0 and state.negative_prompt_embeds is not None
         buf_idx = state.step_index % 2
-        is_last_step = state.step_index == state.total_steps - 1
+
+        if per_request_scheduler is None:
+            per_request_scheduler = state.scheduler
 
         state.latents = self.scheduler_step_maybe_with_pp_and_cfg(
             noise_pred,
             t,
             state.latents,
             do_true_cfg,
-            per_request_scheduler=state.scheduler,
+            per_request_scheduler=per_request_scheduler,
             buf_idx=buf_idx,
-            is_last_step=is_last_step,
+            batch_size=batch_size,
         )
         state.step_index += 1
 

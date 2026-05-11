@@ -347,10 +347,6 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
     def execute_micro_step(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
         """Forward a temporal-PP micro-step to worker ``execute_micro_step`` RPC.
 
-        The reply is collected from the last PP rank, which owns rank N-1's ODE
-        results and any chunk-finished decodes (carried in
-        ``RunnerOutput.chunk_events``). Other ranks' replies are discarded.
-
         Assumes worker rank == PP rank (true for PP-only layouts; revisit when
         introducing TP/DP combinations).
         """

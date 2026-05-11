@@ -1,14 +1,15 @@
 """Temporal-pipeline-parallel scheduler for streaming chunked diffusion.
 
-Each ``schedule()`` call corresponds to one micro-step. At any micro-step,
-each PP rank processes the chunks at the denoising step ``r = current -
-entered_rank0_at`` from the active requests' in-flight chunks. Chunks are
-admitted to rank 0 in order, propagate through ranks under NCCL FIFO
-ordering, and exit at rank N-1 in the same order.
+Each ``schedule()`` call corresponds to one micro-step. The pipeline is modeled
+as ``pp_size`` per-rank chunk queues plus a transient ``returning`` queue.
+At each schedule(), chunks at rank N-1 drain (finished -> finished_head,
+otherwise -> returning), queues shift one rank, and rank 0 receives the
+returning chunks plus B fresh admits.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -20,6 +21,7 @@ from vllm_omni.diffusion.sched.base_scheduler import _BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
     DiffusionRequestStatus,
     DiffusionSchedulerOutput,
+    Rank0Layout,
     RankTask,
 )
 
@@ -31,22 +33,24 @@ logger = init_logger(__name__)
 
 @dataclass
 class _InFlightChunk:
-    """One chunk of an active request, tracked through the temporal pipeline."""
+    """One chunk of an active request currently in the pipeline."""
 
     chunk_idx: int
-    is_active: bool = True
-    is_completed: bool = False
-    entered_rank0_at: int = -1
+    steps_done: int = 0
 
 
 @dataclass
 class _ChunkProgress:
     """Per-request chunk-level scheduling state."""
+
     sched_req_id: str
     num_chunks: int
     num_steps: int
+    pp_size: int
     chunks_admitted: int = 0
-    in_flight: list[_InFlightChunk] = field(default_factory=list)
+    # chunks_at[r] = chunks that will be processed by rank r at the current step.
+    chunks_at: list[deque[_InFlightChunk]] = field(default_factory=list)
+    returning: deque[_InFlightChunk] = field(default_factory=deque)
 
 
 @dataclass
@@ -64,7 +68,7 @@ class _SLOReqState:
 
 
 class _SLOController:
-    """AIMD controller for the stream batch size, tracked per request.
+    """AIMD controller for the stream admission rate B, tracked per request.
 
     Driven by per-micro-step wall-clock latency observations on rank 0.
 
@@ -123,7 +127,10 @@ class _SLOController:
             if st.violation_streak >= self.VIOLATION_STREAK_TARGET:
                 new_b = max(1, st.batch_size // 2)
                 if new_b != st.batch_size:
-                    logger.info(f"SLO[{sched_req_id}]: halving batch_size {st.batch_size} -> {new_b} (ema={ema/1e6:.2}ms budget={budget/1e6:.2}ms)")
+                    logger.info(
+                        f"SLO[{sched_req_id}]: halving B {st.batch_size} -> {new_b} "
+                        f"(ema={ema/1e6:.2f}ms budget={budget/1e6:.2f}ms)"
+                    )
                 st.batch_size = new_b
                 st.violation_streak = 0
             return
@@ -134,7 +141,10 @@ class _SLOController:
             st.slack_streak += 1
             if st.slack_streak >= self.SLACK_STREAK_TARGET and st.batch_size < st.max_batch:
                 st.batch_size += 1
-                logger.info(f"SLO[{sched_req_id}]: increasing batch_size -> {st.batch_size} (ema={ema/1e6:.2}ms budget={budget/1e6:.2}ms)")
+                logger.info(
+                    f"SLO[{sched_req_id}]: B -> {st.batch_size} "
+                    f"(ema={ema/1e6:.2f}ms budget={budget/1e6:.2f}ms)"
+                )
                 st.slack_streak = 0
         else:
             st.slack_streak = 0
@@ -145,17 +155,16 @@ class StreamBatchScheduler(_BaseScheduler):
 
     Per micro-step:
       1. Promote waiting requests (handled by the base class).
-      2. Admit returning chunks to rank 0 first (FIFO across active requests),
-         then admit fresh chunks, until ``batch_size`` chunks have entered
-         rank 0 this micro-step or no admittable chunks remain.
-      3. Build the per-rank assignment table from in-pipeline chunks'
-         positions ``r = current_micro_step - entered_rank0_at``.
+      2. Drain rank N-1 of last step: finished chunks -> finished_head (decode
+         layout for rank 0), others -> returning queue.
+      3. Shift per-rank queues by one (rank r <- rank r-1).
+      4. Rank 0 = returning + B fresh admits (unconditional re-admit).
+      5. Emit per-rank assignment and the per-request Rank0Layout.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.pp_size: int = 1
-        self._global_micro_step: int = 0
         self._chunk_progress: dict[str, _ChunkProgress] = {}
         self._slo: _SLOController = _SLOController()
 
@@ -166,7 +175,6 @@ class StreamBatchScheduler(_BaseScheduler):
         self.pp_size = od_config.parallel_config.pipeline_parallel_size
 
     def _reset_scheduler_state(self) -> None:
-        self._global_micro_step = 0
         self._chunk_progress.clear()
         self._slo = _SLOController()
 
@@ -195,12 +203,14 @@ class StreamBatchScheduler(_BaseScheduler):
         for new_req in base_output.scheduled_new_reqs:
             self._init_chunk_progress(new_req.sched_req_id, new_req.req)
 
-        self._advance_chunk_pipeline()
+        rank0_layouts: dict[str, Rank0Layout] = {}
+        for progress in self._chunk_progress.values():
+            rank0_layouts[progress.sched_req_id] = self._advance_chunk_pipeline_for(progress)
 
         if self._chunk_progress:
             base_output.per_rank_assignment = self._build_assignment()
+            base_output.rank0_layouts = rank0_layouts
 
-        self._global_micro_step += 1
         return base_output
 
     def _init_chunk_progress(self, sched_req_id: str, req: OmniDiffusionRequest) -> None:
@@ -212,6 +222,8 @@ class StreamBatchScheduler(_BaseScheduler):
             sched_req_id=sched_req_id,
             num_chunks=num_chunks,
             num_steps=num_steps,
+            pp_size=self.pp_size,
+            chunks_at=[deque() for _ in range(self.pp_size)],
         )
 
         chunk_frames = max(1, sampling.num_frames)
@@ -222,60 +234,84 @@ class StreamBatchScheduler(_BaseScheduler):
             ema_alpha=sampling.slo_ema_alpha,
             chunk_frames=chunk_frames,
         )
-        
-        logger.debug(f"""StreamBatchScheduler initialized chunk progress for {sched_req_id}
-        (num_chunks={num_chunks}, num_steps={num_steps}, chunk_frames={chunk_frames}, slo_fps={sampling.slo_fps}, pp_size={self.pp_size})""")
 
-    def _advance_chunk_pipeline(self) -> None:
-        """Admit returning + new chunks to rank 0 this micro-step."""
-        if not self._chunk_progress:
-            return
+        logger.debug(
+            "StreamBatchScheduler initialized chunk progress for %s "
+            "(num_chunks=%d, num_steps=%d, chunk_frames=%d, slo_fps=%s, pp_size=%d)",
+            sched_req_id, num_chunks, num_steps, chunk_frames, sampling.slo_fps, self.pp_size,
+        )
 
-        m = self._global_micro_step
+    def _advance_chunk_pipeline_for(self, progress: _ChunkProgress) -> Rank0Layout:
+        """Advance the per-rank queues by one micro-step and return rank 0's layout."""
 
-        # 1. Re-admit every returning chunk.
+        pp = progress.pp_size
+
+        # 1. Drain last rank from previous step
+        finished_idxs: list[int] = []
+        n_finished = 0
+        n_circulating = 0
+        last = progress.chunks_at[pp - 1]
+        while last:
+            chunk = last.popleft()
+            chunk.steps_done += 1
+            if chunk.steps_done >= progress.num_steps:
+                finished_idxs.append(chunk.chunk_idx)
+                n_finished += 1
+            else:
+                progress.returning.append(chunk)
+                n_circulating += 1
+
+        # 2. Shift: rank r receives what rank r-1 had
+        for r in range(pp - 1, 0, -1):
+            progress.chunks_at[r] = progress.chunks_at[r - 1]
+        progress.chunks_at[0] = deque()
+
+        # 3. Rank 0 = returning + B fresh admits
+        while progress.returning:
+            progress.chunks_at[0].append(progress.returning.popleft())
+
+        new_idxs: list[int] = []
+        budget = self._slo.batch_size(progress.sched_req_id)
+        admitted = 0
+        while admitted < budget and progress.chunks_admitted < progress.num_chunks:
+            idx = progress.chunks_admitted
+            progress.chunks_at[0].append(_InFlightChunk(chunk_idx=idx))
+            progress.chunks_admitted += 1
+            new_idxs.append(idx)
+            admitted += 1
+
+        return Rank0Layout(
+            n_finished=n_finished,
+            n_circulating=n_circulating,
+            n_new=len(new_idxs),
+            finished_idxs=finished_idxs,
+            new_idxs=new_idxs,
+        )
+
+    def _build_assignment(self) -> list[RankTask | None]:
+        assignment: list[RankTask | None] = [None] * self.pp_size
         for progress in self._chunk_progress.values():
-            for chunk in progress.in_flight:
-                if not chunk.is_active:
-                    chunk.is_active = True
-                    chunk.entered_rank0_at = m
-
-        # 2. Admit up to ``B_req`` fresh chunks per request.
-        for progress in self._chunk_progress.values():
-            budget = self._slo.batch_size(progress.sched_req_id)
-            admitted = 0
-            while (
-                progress.chunks_admitted < progress.num_chunks
-                and admitted < budget
-            ):
-                progress.in_flight.append(_InFlightChunk(
-                    chunk_idx=progress.chunks_admitted,
-                    entered_rank0_at=m,
-                ))
-                progress.chunks_admitted += 1
-                admitted += 1
-
-    def _build_assignment(self) -> list[list[RankTask]]:
-        assignment: list[list[RankTask]] = [[] for _ in range(self.pp_size)]
-        for progress in self._chunk_progress.values():
-            for chunk in progress.in_flight:
-                if not chunk.is_active:
+            for r in range(self.pp_size):
+                queue = progress.chunks_at[r]
+                if not queue:
                     continue
-                r = self._global_micro_step - chunk.entered_rank0_at
-                if 0 <= r < self.pp_size:
-                    assignment[r].append(RankTask(
+                indices = [c.chunk_idx for c in queue]
+                if assignment[r] is None:
+                    assignment[r] = RankTask(
                         sched_req_id=progress.sched_req_id,
-                        chunk_idx=chunk.chunk_idx,
-                    ))
+                        chunk_indices=indices,
+                    )
+                else:
+                    assignment[r].chunk_indices.extend(indices)
         return assignment
 
     # ── Output processing ──────────────────────────────────────────────────
 
-    def update_from_output(self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput) -> set[str]:
-        if not self._chunk_progress or sched_output.per_rank_assignment is None:
+    def update_from_output(
+        self, sched_output: DiffusionSchedulerOutput, output: RunnerOutput
+    ) -> set[str]:
+        if not self._chunk_progress:
             return set()
-
-        per_task = [output] + list(output.extra_task_outputs or [])
 
         if output.micro_step_wall_ns is not None:
             self._slo.observe(output.req_id, output.micro_step_wall_ns)
@@ -283,41 +319,13 @@ class StreamBatchScheduler(_BaseScheduler):
         terminal: dict[str, DiffusionRequestStatus] = {}
         terminal_errors: dict[str, str | None] = {}
 
-        for task_out in per_task:
-            progress = self._chunk_progress.get(task_out.req_id)
-            if progress is None:
-                continue
-            err = task_out.result.error if task_out.result is not None else None
+        progress = self._chunk_progress.get(output.req_id)
+        if progress is not None:
+            err = output.result.error if output.result is not None else None
             if err is not None:
-                terminal[task_out.req_id] = DiffusionRequestStatus.FINISHED_ERROR
-                terminal_errors[task_out.req_id] = err
-                continue
-            chunk = self._find_chunk(progress, task_out.chunk_idx) if task_out.chunk_idx is not None else None
-            if chunk is not None:
-                chunk.is_completed = task_out.chunk_completed
-            if task_out.finished:
-                terminal[task_out.req_id] = DiffusionRequestStatus.FINISHED_COMPLETED
-
-        # Roll last-rank chunks off the pipeline / mark them inactive.
-        for last_task in (sched_output.per_rank_assignment[-1] if sched_output.per_rank_assignment else []):
-            progress = self._chunk_progress.get(last_task.sched_req_id)
-            if progress is None:
-                continue
-            last_chunk = self._find_chunk(progress, last_task.chunk_idx)
-            if last_chunk is None:
-                continue
-            if last_chunk.is_completed:
-                progress.in_flight = [
-                    c for c in progress.in_flight if c.chunk_idx != last_chunk.chunk_idx
-                ]
-            else:
-                last_chunk.is_active = False
+                terminal[output.req_id] = DiffusionRequestStatus.FINISHED_ERROR
+                terminal_errors[output.req_id] = err
+            elif output.finished:
+                terminal[output.req_id] = DiffusionRequestStatus.FINISHED_COMPLETED
 
         return self._finalize_update_from_output(sched_output, terminal, terminal_errors)
-
-    @staticmethod
-    def _find_chunk(progress: _ChunkProgress, chunk_idx: int) -> _InFlightChunk | None:
-        for chunk in progress.in_flight:
-            if chunk.chunk_idx == chunk_idx:
-                return chunk
-        return None

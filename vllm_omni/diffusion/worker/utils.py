@@ -57,6 +57,8 @@ class DiffusionRequestState:
     timesteps: torch.Tensor | list[torch.Tensor] | None = None
     step_index: int = 0
 
+    batched_timesteps: torch.Tensor | None = None
+
     # ── Per-request scheduler instance (set once by prepare_encode) ──
     scheduler: Any | None = None
 
@@ -173,8 +175,8 @@ class RunnerOutput:
     Each scheduler reads the fields it needs:
 
     - ``StepScheduler`` reads ``step_index`` / ``finished``.
-    - ``StreamBatchScheduler`` reads ``chunk_idx`` / ``step_index`` /
-      ``chunk_completed`` / ``finished``.
+    - ``StreamBatchScheduler`` reads ``finished`` / ``result`` /
+      ``micro_step_wall_ns``.
 
     Fields not relevant to an execution path are left as ``None`` / ``False``.
     """
@@ -185,10 +187,7 @@ class RunnerOutput:
     result: DiffusionOutput | None = None
 
     # ── Temporal-PP micro-step fields ──
-    chunk_idx: int | None = None
-    chunk_completed: bool = False
     micro_step_wall_ns: int | None = None
-    extra_task_outputs: list["RunnerOutput"] | None = None # for B>1 
 
     def get_req_output(self, sched_req_id: str) -> RunnerOutput | None:
         return self if self.req_id == sched_req_id else None
