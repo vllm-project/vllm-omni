@@ -205,9 +205,9 @@ class OmniServer:
         run_post_test_cleanup()
         cleanup_dist_env_and_memory()
         self.model = model
-        self.serve_args = serve_args
-        # Align with ``serve``: ``--disable-log-stats`` wins over ``--log-stats``.
-        self.log_stats = bool(serve_args) and "--disable-log-stats" not in serve_args and "--log-stats" in serve_args
+        args = list(serve_args)
+        self.serve_args = args
+        self.log_stats = "--disable-log-stats" not in args and "--log-stats" in args
         self.env_dict = env_dict
         self.use_omni = use_omni
         self.proc: subprocess.Popen | None = None
@@ -1895,6 +1895,9 @@ def iter_omni_server(
             server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
         else:
             server_args = [*server_args, "--init-timeout", "900"]
+        # ``omni_server`` / ``omni_server_function``: match ``serve`` (``--disable-log-stats`` wins).
+        if "--disable-log-stats" not in server_args and "--log-stats" not in server_args:
+            server_args = [*server_args, "--log-stats"]
         if params.use_stage_cli:
             if not params.use_omni:
                 raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")
