@@ -25,6 +25,64 @@ with vLLM-Omni using multi-card parallelism. Two configurations are provided:
 
 ## Hardware Support
 
+## GPU
+
+### 4x H100 80GB
+
+#### Environment
+
+- OS: Linux
+- Python: 3.12+
+- Driver / runtime: NVIDIA CUDA environment with an H100 80 GB GPU
+- vLLM version: Match the repository requirements for your checkout
+- vLLM-Omni version or commit: Use the commit you are deploying from
+
+#### Command
+
+**Distilled model (no CFG, recommended for distilled checkpoints):**
+
+```bash
+vllm serve \
+  --omni Wan-AI/Wan2.2-I2V-A14B-Diffusers \
+  --usp 4 \
+  --vae-patch-parallel-size 4 \
+  --vae-use-tiling
+```
+
+**Official open-source model (with CFG):**
+
+```bash
+vllm serve \
+  --omni Wan-AI/Wan2.2-I2V-A14B-Diffusers \
+  --usp 2 \
+  --cfg 2 \
+  --vae-patch-parallel-size 4 \
+  --vae-use-tiling
+```
+
+> **Why the difference?** With `--cfg 2`, two copies of the input (positive and
+> negative prompts) are processed in parallel, effectively doubling the compute
+> for the DiT backbone. USP is therefore halved from 4 to 2 so that the total
+> parallelism across the 4 cards remains balanced (`usp * cfg = 4`).
+
+#### Verification
+
+After the server is ready, see
+[`examples/online_serving/image_to_video/README.md`](../../examples/online_serving/image_to_video/README.md)
+for complete client examples and request formats.
+
+#### Notes
+
+- **Key flags:**
+  - `--omni` — enables vLLM-Omni diffusion serving.
+  - `--usp <N>` — Unified Sequence Parallelism degree.
+  - `--cfg <N>` — Classifier-Free Guidance parallelism; set to 2 for models
+    that require negative-prompt computation, omit for distilled models.
+  - `--vae-patch-parallel-size 4` — parallelizes VAE decoding across all 4
+    cards.
+  - `--vae-use-tiling` — enables tiled VAE decoding to reduce peak memory.
+
+
 ## NPU
 
 ### 8x Ascend A2 / A3
