@@ -2256,6 +2256,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 engine_prompt_data = {"image": reference_images}
 
         prompt_token_ids: list[int] | None = None
+        system_prompt_type: str | None = None
         if bot_task:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
                 build_prompt,
@@ -2263,7 +2264,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             )
 
             if tokenizer is not None:
-                prompt_token_ids = build_prompt_tokens(prompt, tokenizer, task=bot_task)
+                result = build_prompt_tokens(prompt, tokenizer, task=bot_task)
+                prompt_token_ids = result["token_ids"]
+                system_prompt_type = result["system_prompt_type"]
             else:
                 prompt = build_prompt(prompt, task=bot_task)
 
@@ -2275,6 +2278,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         engine_prompt["modalities"] = modalities
         if prompt_token_ids is not None:
             engine_prompt["prompt_token_ids"] = prompt_token_ids
+        if system_prompt_type is not None:
+            engine_prompt["use_system_prompt"] = system_prompt_type
         if negative_prompt is not None:
             engine_prompt["negative_prompt"] = negative_prompt
 
