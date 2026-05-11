@@ -388,6 +388,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.resumable = False
                     stopped = True
 
+            # Mirrors OmniGenerationScheduler.update_from_output: required for
+            # AR consumer stages without a sampler-emitted EOS, where the only
+            # finish signal is the terminal chunk's ``finished`` flag.
+            if (
+                not stopped
+                and self.chunk_transfer_adapter is not None
+                and request.request_id in self.chunk_transfer_adapter.finished_requests
+            ):
+                request.status = RequestStatus.FINISHED_STOPPED
+                stopped = True
+
             if stopped:
                 routed_experts = self._get_routed_experts(request)
 
@@ -588,6 +599,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         else:
             super()._update_request_as_session(session, update)
+            # Upstream's stage-0 streaming session update extends the
+            # prompt but does not propagate per-chunk
+            # ``additional_information``
+            new_info = getattr(update, "additional_information", None)
+            if new_info is not None:
+                session.additional_information = new_info
 
     def _free_request(self, request: Request, delay_free_blocks: bool = False) -> dict[str, Any] | None:
         # TODO(wzliu)! for offline mode, we should not end process until all data is transferred
