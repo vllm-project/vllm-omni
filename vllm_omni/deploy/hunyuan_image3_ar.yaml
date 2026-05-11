@@ -33,6 +33,7 @@ platforms:
         gpu_memory_utilization: 0.75
         devices: "0,1,2,3,4,5,6,7"
         tensor_parallel_size: 8
+        max_num_batched_tokens: 8192
 
   xpu:
     stages:
