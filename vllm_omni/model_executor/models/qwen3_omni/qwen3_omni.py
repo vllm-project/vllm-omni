@@ -358,7 +358,8 @@ class Qwen3OmniMoeForConditionalGeneration(
                     blocks.append(f"<|im_start|>assistant\n{body}<|im_end|>")
             elif role == "tool":
                 content = item.get("content", "") or ""
-                blocks.append(f"<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>")
+                safe_content = content.replace("</tool_response>", "<\\/tool_response>")
+                blocks.append(f"<|im_start|>user\n<tool_response>\n{safe_content}\n</tool_response><|im_end|>")
         return "\n".join(blocks)
 
     @classmethod
@@ -366,8 +367,8 @@ class Qwen3OmniMoeForConditionalGeneration(
         """Assemble the audio-pass prompt.
 
         Audio user block is FIRST so the talker's hidden_projection sees
-        purely acoustic states for bootstrap; system/history blocks come
-        after — causal attention shields the audio tokens from them.
+        purely acoustic hidden states for bootstrap. System and history blocks
+        follow with their tokens attending back to the audio.
         """
         parts: list[str] = [f"<|im_start|>user\n{cls.AUDIO_PLACEHOLDER}<|im_end|>"]
         if system_body:
