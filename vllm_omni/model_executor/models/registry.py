@@ -174,22 +174,20 @@ _OMNI_MODELS = {
         "VoxtralTTSAudioGenerationForConditionalGeneration",
     ),
     "VoxtralTTSAudioTokenizer": ("voxtral_tts", "voxtral_tts_audio_tokenizer", "VoxtralTTSAudioTokenizer"),
-<<<<<<< HEAD
     ## MOSS-TTS-Nano
     "MossTTSNanoForCausalLM": (
         "moss_tts_nano",
         "modeling_moss_tts_nano",
         "MossTTSNanoForGeneration",
-=======
+    ),
     ## EarTTS
     "EarTTSForCausalLM": (
         "eartts",
         "eartts",
         "EarTTSForCausalLM",
->>>>>>> 6cb8d457 (eartts: initial commit)
     ),
     ## NemotronDuplexH (NemotronH + ASR head, used as the LLM stage in the
-    ## FastConformer + Nemotron + EarTTS S2S pipeline).
+    ## Nemotron + EarTTS S2S pipeline).
     "NemotronDuplexHForCausalLM": (
         "nemotron_duplex_h",
         "nemotron_duplex_h",
