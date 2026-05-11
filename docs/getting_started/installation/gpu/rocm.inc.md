@@ -5,7 +5,7 @@
 # --8<-- [end:requirements]
 # --8<-- [start:set-up-using-python]
 
-vLLM-Omni current recommends the steps in under setup through Docker Images.
+vLLM-Omni currently recommends the setup steps using Docker Images.
 
 # --8<-- [start:pre-built-wheels]
 

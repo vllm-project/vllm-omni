@@ -5,7 +5,7 @@
 # --8<-- [end:requirements]
 # --8<-- [start:set-up-using-python]
 
-vLLM-Omni depends vLLM. So please follow instructions below mainly for vLLM.
+vLLM-Omni depends on vLLM. So please follow the instructions below mainly for vLLM.
 
 !!! note
     PyTorch installed via `conda` will statically link `NCCL` library, which can cause issues when vLLM tries to use `NCCL`. See <gh-issue:8420> for more details.
@@ -107,6 +107,6 @@ docker run --runtime nvidia --gpus 2 \
 ```
 
 !!! tip
-    You can use this docker image to serve models the same way you would with in vLLM! To do so, make sure you overwrite the default entrypoint (`vllm serve --omni`) which works only for models supported in the vLLM-Omni project.
+    You can use this docker image to serve models the same way you would in vLLM! To do so, make sure you overwrite the default entrypoint (`vllm serve --omni`) which works only for models supported in the vLLM-Omni project.
 
 # --8<-- [end:pre-built-images]
