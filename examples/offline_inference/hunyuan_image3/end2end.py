@@ -273,10 +273,17 @@ def main():
     for req_output in omni_outputs:
         # Text output (AR stage or text-only)
         ro = getattr(req_output, "request_output", None)
+        txt = ""
         if ro and getattr(ro, "outputs", None):
             txt = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
-            if txt:
-                print(f"[Output] Text:\n{txt}")
+        if not txt:
+            ar_text = getattr(req_output, "custom_output", {}).get("ar_generated_text")
+            if isinstance(ar_text, list):
+                txt = "\n".join(text for text in ar_text if text)
+            else:
+                txt = ar_text or ""
+        if txt:
+            print(f"[Output] Text:\n{txt}")
 
         # Image output (DiT stage)
         images = getattr(req_output, "images", None)

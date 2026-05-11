@@ -67,7 +67,7 @@ def resolve_stop_token_ids(
     bot_task: str = "think",
     tokenizer: Any | None = None,
 ):
-    stop_token_ids = [127957]
+    stop_token_ids = [128025]
     if "recaption" in task:
         stop_token_ids.append(HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["</recaption>"])
     if "think" in task:
