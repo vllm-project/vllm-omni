@@ -20,6 +20,7 @@
 async_chunk: true
 trust_remote_code: true
 enable_prefix_caching: false
+distributed_executor_backend: uni
 
 connectors:
   connector_of_shared_memory:
