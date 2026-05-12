@@ -34,18 +34,9 @@ from tests.helpers.media import generate_synthetic_image
 
 RELIABILITY_SCENARIOS: list[dict[str, Any]] = [
     {
-        "test_name": "wan22_t2v_reliability_default",
+        "test_name": "wan22_i2v_reliability_default",
         "server_params": {
-            "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-            "server_args": [
-                "--num-gpus",
-                "1",
-                "--boundary-ratio",
-                "0.875",
-                "--flow-shift",
-                "5.0",
-                "--disable-log-stats",
-            ],
+            "model": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
         },
     }
 ]
