@@ -2256,7 +2256,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 engine_prompt_data = {"image": reference_images}
 
         engine_prompt: OmniTextPrompt = {"prompt": prompt}
-        if bot_task:  # model-specific
+        if bot_task:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
                 build_prompt,
                 build_prompt_tokens,
