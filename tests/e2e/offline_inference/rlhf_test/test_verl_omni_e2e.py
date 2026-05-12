@@ -21,12 +21,12 @@ Usage:
 """
 
 import os
-from pathlib import Path
 from uuid import uuid4
 
 import pytest
 import ray
 import torch
+from huggingface_hub import snapshot_download
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 
@@ -38,7 +38,17 @@ from tests.e2e.offline_inference.rlhf_test.rlhf_test_utils import (
     vLLMOmniHttpServer,
 )
 
-MODEL_PATH = Path(os.path.expanduser("~/models/tiny-random/Qwen-Image"))
+# HF repo IDs (auto-downloaded on first use; cached under HF_HOME).
+MODEL = os.environ.get("VLLM_OMNI_TEST_MODEL", "tiny-random/Qwen-Image")
+TOKENIZER_MODEL = os.environ.get("VLLM_OMNI_TEST_TOKENIZER", "Qwen/Qwen2-1.5B-Instruct")
+
+
+def _resolve_model_path(repo_id: str) -> str:
+    """Resolve an HF repo ID to a local snapshot path, downloading if needed."""
+    # Allow overriding with a pre-existing local path (skips download).
+    if os.path.isdir(repo_id):
+        return repo_id
+    return snapshot_download(repo_id=repo_id)
 
 
 class vLLMOmniHttpServerForTest(vLLMOmniHttpServer):
@@ -63,7 +73,7 @@ _MIN_PROMPT_TOKENS = 35
 
 def _tokenize_prompt(text: str) -> list[int]:
     """Tokenize a text prompt into valid token IDs for the model."""
-    tokenizer = AutoTokenizer.from_pretrained(os.path.join(MODEL_PATH, "tokenizer"), trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_MODEL, trust_remote_code=True)
     messages = [{"role": "user", "content": text}]
     token_ids = normalize_token_ids(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False))
     assert len(token_ids) > _MIN_PROMPT_TOKENS, (
@@ -77,7 +87,7 @@ def _tokenize_prompt(text: str) -> list[int]:
 @pytest.fixture
 def init_server():
     """Create and launch a vLLMOmniHttpServer Ray actor with Qwen/Qwen-Image."""
-    model_path = MODEL_PATH
+    model_path = _resolve_model_path(MODEL)
 
     ray.init(
         runtime_env={
@@ -124,7 +134,7 @@ def init_server():
         {
             "_target_": "verl_omni.workers.config.diffusion.DiffusionModelConfig",
             "path": str(model_path),
-            "tokenizer_path": os.path.join(str(model_path), "tokenizer"),
+            "tokenizer_path": TOKENIZER_MODEL,
             "trust_remote_code": True,
             "load_tokenizer": True,
         }
