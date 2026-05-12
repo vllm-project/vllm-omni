@@ -80,8 +80,8 @@ def test_eof_marker_when_finished_empty():
         request=_req("r", finished=True),
         is_finished=True,
     )
-    assert p["codes"] == {"audio": []}
-    assert p["meta"]["finished"].item() is True
+    assert p.codes.audio.tolist() == []
+    assert p.meta.finished.item() is True
 
 
 def test_flush_on_finish():
@@ -94,8 +94,8 @@ def test_flush_on_finish():
         is_finished=True,
     )
     assert p is not None
-    assert p["meta"]["finished"].item() is True
-    assert len(p["codes"]["audio"]) == _Q * 24
+    assert p.meta.finished.item() is True
+    assert len(p.codes.audio) == _Q * 24
 
 
 _CASES = [
@@ -149,8 +149,8 @@ def test_streaming_phases(config, n_frames, finished, expected):
     else:
         exp_ctx, exp_window = expected
         assert payload is not None
-        assert payload["meta"]["left_context_size"] == exp_ctx
-        assert len(payload["codes"]["audio"]) == _Q * exp_window
+        assert payload.meta.left_context_size == exp_ctx
+        assert len(payload.codes.audio) == _Q * exp_window
 
 
 def test_dynamic_ic_adapts_to_load():
@@ -160,14 +160,14 @@ def test_dynamic_ic_adapts_to_load():
     # Low load (1/8) -> IC=2 -> emit at 2
     p1 = _call(tm, "r", n_frames=2)
     assert p1 is not None
-    assert len(p1["codes"]["audio"]) == _Q * 2
+    assert len(p1.codes.audio) == _Q * 2
 
     # High load on a new request: active=6/8 -> IC=8 -> emit at 8
     for i in range(4):
         tm.code_prompt_token_ids[f"other-{i}"] = [[0]]
     p2 = _call(tm, "new-high-load", n_frames=8)
     assert p2 is not None
-    assert len(p2["codes"]["audio"]) == _Q * 8
+    assert len(p2.codes.audio) == _Q * 8
 
     # Requests past initial phase still count in load factor
     tm2 = _tm(max_num_seqs=4)
@@ -176,7 +176,7 @@ def test_dynamic_ic_adapts_to_load():
     # active=4/4=1.0 -> IC=16
     p3 = _call(tm2, "new", n_frames=16)
     assert p3 is not None
-    assert len(p3["codes"]["audio"]) == _Q * 16
+    assert len(p3.codes.audio) == _Q * 16
 
 
 def test_ic_load_change_mid_request():
@@ -195,7 +195,7 @@ def test_ic_load_change_mid_request():
     assert _call(tm, "r", n_frames=25) is None
     p3 = _call(tm, "r", n_frames=27)
     assert p3 is not None
-    assert p3["meta"]["left_context_size"] == 2
+    assert p3.meta.left_context_size == 2
 
     # A *new* request under high load gets IC=16 (not IC=2).
     # Frame 2 would emit under IC=2 but must hold under IC=16.
@@ -214,13 +214,13 @@ def test_connector_initial_chunk_config_overrides_dynamic_ic():
 
     p1 = _call(tm, "r", n_frames=4)
     assert p1 is not None
-    assert len(p1["codes"]["audio"]) == _Q * 4
+    assert len(p1.codes.audio) == _Q * 4
 
     # Only the first chunk uses the small size; the next emit is 4+25.
     assert _call(tm, "r", n_frames=25) is None
     p2 = _call(tm, "r", n_frames=29)
     assert p2 is not None
-    assert p2["meta"]["left_context_size"] == 4
+    assert p2.meta.left_context_size == 4
 
 
 @pytest.mark.parametrize(
@@ -268,8 +268,8 @@ def test_first_streaming_chunk_prepends_ref_code_context():
     )
 
     assert payload is not None
-    assert payload["meta"]["left_context_size"] == 2
-    assert len(payload["codes"]["audio"]) == _Q * 12
+    assert payload.meta.left_context_size == 2
+    assert len(payload.codes.audio) == _Q * 12
 
 
 def test_ref_code_context_applies_to_all_streaming_chunks():
@@ -290,8 +290,8 @@ def test_ref_code_context_applies_to_all_streaming_chunks():
 
     assert payload is not None
     # ref_code (2 frames) prepended as left context on second chunk too
-    assert payload["meta"]["left_context_size"] == 10 + 2
-    assert len(payload["codes"]["audio"]) == _Q * (35 + 2)
+    assert payload.meta.left_context_size == 10 + 2
+    assert len(payload.codes.audio) == _Q * (35 + 2)
 
 
 def test_ref_code_context_can_be_buffered_before_first_emit():
@@ -325,8 +325,8 @@ def test_ref_code_context_can_be_buffered_before_first_emit():
 
     assert payload is not None
     # ref_code (2 frames) is kept (not popped) for subsequent chunks
-    assert payload["meta"]["left_context_size"] == 2
-    assert len(payload["codes"]["audio"]) == _Q * 12
+    assert payload.meta.left_context_size == 2
+    assert len(payload.codes.audio) == _Q * 12
     assert rid in tm.request_payload
 
 
@@ -353,7 +353,7 @@ def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
 
     assert len(prompts) == 1
     prompt = prompts[0]
-    assert prompt["additional_information"] == {"meta": {"left_context_size": [2]}}
+    assert prompt["additional_information"] == {"meta": {"left_context_size": 2}}
     assert prompt["prompt_token_ids"] == [
         9,
         8,
@@ -401,4 +401,4 @@ def test_non_async_processor_filters_out_of_range_codec_values():
     prompt = prompts[0]
     # Only ref_code (1 frame) + 2 valid frames = 3 frames * 4 quantizers = 12 codes
     assert len(prompt["prompt_token_ids"]) == 4 * 3
-    assert prompt["additional_information"] == {"meta": {"left_context_size": [1]}}
+    assert prompt["additional_information"] == {"meta": {"left_context_size": 1}}

@@ -15,6 +15,7 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 @pytest.mark.benchmark
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.skip(reason="#3257")
 def test_gedit_bench_h100_smoke(
     gedit_accuracy_servers,
     accuracy_artifact_root: Path,

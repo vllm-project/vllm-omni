@@ -17,7 +17,33 @@ canonical mapping for both flows.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 from .system_prompt import get_system_prompt
+
+# HunyuanImage-3.0-Instruct special token ids from tokenizer.json.
+# Keep offline AR prompt/stop-token behavior independent of runtime
+# tokenizer lookup for these fixed control tokens.
+HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS: dict[str, int] = {
+    "<|endoftext|>": 127957,
+    "<|startoftext|>": 127958,
+    "<boi>": 128000,
+    "<eoi>": 128001,
+    "<img>": 128006,
+    "<cfg>": 128010,
+    "<recaption>": 128018,
+    "</recaption>": 128019,
+    "<think>": 128023,
+    "</think>": 128024,
+    "<answer>": 128025,
+    "</answer>": 128026,
+    "<img_size_1024>": 128037,
+    "<img_ratio_0>": 128044,
+    "<img_ratio_32>": 128076,
+    "<img_ratio_33>": 130103,
+    "<img_ratio_36>": 130106,
+}
 
 # task -> (sys_type, bot_task, trigger_tag)
 _TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
@@ -25,15 +51,24 @@ _TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
     "i2t": ("en_unified", None, None),
     "it2i_think": ("en_unified", "think", "<think>"),
     "it2i_recaption": ("en_unified", "recaption", "<recaption>"),
+    "t2i": ("en_unified", "image", None),
+    "t2i_vanilla": ("en_vanilla", "image", None),
     "t2i_think": ("en_unified", "think", "<think>"),
     "t2i_recaption": ("en_unified", "recaption", "<recaption>"),
-    "t2i_vanilla": ("en_vanilla", "image", None),
 }
 
 
 def available_tasks() -> list[str]:
     """Sorted list of task keys accepted by `build_prompt` / `build_prompt_tokens`."""
     return sorted(_TASK_PRESETS)
+
+
+def resolve_stop_token_ids(
+    task: str = "it2i_think",
+    bot_task: str = "think",
+    tokenizer: Any | None = None,
+):
+    return [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]]
 
 
 def build_prompt(
@@ -94,13 +129,19 @@ def build_prompt(
     return "".join(parts)
 
 
+@dataclass
+class PromptTokensResult:
+    token_ids: list[int]  # The tokenized prompt
+    system_prompt_type: str  # The effective system prompt type used
+
+
 def build_prompt_tokens(
     user_prompt: str,
     tokenizer,
     task: str = "it2i_think",
     sys_type: str | None = None,
     custom_system_prompt: str | None = None,
-) -> list[int]:
+) -> PromptTokensResult:
     """Segment-by-segment tokenization that matches HF apply_chat_template.
 
     Calling tokenizer.encode(build_prompt(...)) on the full string lets BPE
@@ -110,6 +151,9 @@ def build_prompt_tokens(
     each segment independently and concatenates token_ids, so no cross-
     boundary merge happens. We replicate that here and feed the result to
     Omni via OmniTokensPrompt (prompt_token_ids).
+
+    Returns:
+        PromptTokensResult
     """
     if task not in _TASK_PRESETS:
         raise ValueError(f"Unknown task {task!r}. Choose from: {available_tasks()}")
@@ -128,7 +172,11 @@ def build_prompt_tokens(
     # protect, fall back to whole-string encode.
     if task == "t2i_vanilla":
         s = build_prompt(user_prompt, task, sys_type, custom_system_prompt)
-        return tokenizer.encode(s, add_special_tokens=False)
+        token_ids = tokenizer.encode(s, add_special_tokens=False)
+        return PromptTokensResult(
+            token_ids=token_ids,
+            system_prompt_type=effective_sys_type,
+        )
 
     system_prompt = get_system_prompt(effective_sys_type, preset_bot_task, custom_system_prompt)
     # Do NOT strip -- HF apply_chat_template keeps the system prompt's
@@ -146,7 +194,11 @@ def build_prompt_tokens(
     ids += tokenizer.encode("\n\nAssistant: ", add_special_tokens=False)
     if trig_id is not None:
         ids += [trig_id]
-    return ids
+
+    return PromptTokensResult(
+        token_ids=ids,
+        system_prompt_type=effective_sys_type,
+    )
 
 
-__all__ = ["build_prompt", "build_prompt_tokens", "available_tasks"]
+__all__ = ["build_prompt", "build_prompt_tokens", "resolve_stop_token_ids", _TASK_PRESETS]

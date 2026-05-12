@@ -1044,10 +1044,12 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         )
         host._request_ids_mapping["r1"] = "r1"
         payload = {
-            "thinker_decode_embeddings": torch.ones(1, 2),
-            "thinker_output_token_ids": [1],
-            "override_keys": ["thinker_decode_embeddings", "thinker_output_token_ids"],
-            "finished": torch.tensor(False),
+            "embed": {"decode": torch.ones(1, 2)},
+            "ids": {"output": [1]},
+            "meta": {
+                "finished": torch.tensor(False),
+                "override_keys": [["embed", "decode"], ["ids", "output"]],
+            },
         }
 
         host._accumulate_payload("r1", dict(payload))
@@ -1065,15 +1067,16 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
             model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
         )
         payload = {
-            "thinker_output_token_ids": [1, 2, 3],
-            "finished": torch.tensor(False),
-            "override_keys": [
-                "thinker_output_token_ids",
-                "thinker_decode_embeddings_token_start",
-                "thinker_decode_embeddings_token_end",
-            ],
-            "thinker_decode_embeddings_token_start": 2,
-            "thinker_decode_embeddings_token_end": 3,
+            "ids": {"output": [1, 2, 3]},
+            "embed": {"decode_token_start": 2, "decode_token_end": 3},
+            "meta": {
+                "finished": torch.tensor(False),
+                "override_keys": [
+                    ["ids", "output"],
+                    ["embed", "decode_token_start"],
+                    ["embed", "decode_token_end"],
+                ],
+            },
         }
         self.assertFalse(host._payload_is_consumable(payload))
         host.shutdown_omni_connectors()
@@ -1085,9 +1088,9 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
             model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
         )
         payload = {
-            "thinker_output_token_ids": [1, 2, 3],
-            "thinker_decode_embeddings": torch.ones(1, 2),
-            "finished": torch.tensor(False),
+            "ids": {"output": [1, 2, 3]},
+            "embed": {"decode": torch.ones(1, 2)},
+            "meta": {"finished": torch.tensor(False)},
         }
         self.assertTrue(host._payload_is_consumable(payload))
         host.shutdown_omni_connectors()
@@ -1108,15 +1111,14 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         host._omni_connector.get.side_effect = [
             (
                 {
-                    "thinker_decode_embeddings": torch.ones(1, 2),
-                    "finished": torch.tensor(False),
+                    "embed": {"decode": torch.ones(1, 2)},
+                    "meta": {"finished": torch.tensor(False)},
                 },
                 1,
             ),
             (
                 {
-                    "next_stage_prompt_len": 7,
-                    "finished": torch.tensor(False),
+                    "meta": {"next_stage_prompt_len": 7, "finished": torch.tensor(False)},
                 },
                 1,
             ),

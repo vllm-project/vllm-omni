@@ -1,0 +1,118 @@
+# HunyuanImage-3.0-Instruct deploy: AR (stage 0) + DiT (stage 1)
+# with AR-to-DiT KV reuse. The base CUDA layout uses 2 GPUs for AR
+# and 2 GPUs for DiT.
+pipeline: hunyuan_image3
+async_chunk: false
+trust_remote_code: true
+
+connectors:
+  rdma_connector:
+    name: MooncakeTransferEngineConnector
+    extra:
+      host: "auto"
+      zmq_port: 50051
+      protocol: "rdma"
+      device_name: ""
+      memory_pool_size: 4294967296
+      memory_pool_device: "cpu"
+  shared_memory_connector:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+
+stages:
+  - stage_id: 0
+    is_comprehension: false
+    final_output: true
+    final_output_type: text
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.95
+    enforce_eager: true
+    max_num_batched_tokens: 32768
+    devices: "0,1"
+    tensor_parallel_size: 2
+    hf_overrides:
+      rope_parameters:
+        mrope_section: [0, 32, 32]
+        rope_type: default
+    omni_kv_config:
+      need_send_cache: true
+    output_connectors:
+      to_stage_1: shared_memory_connector
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1
+      top_k: -1
+      max_tokens: 8192
+      detokenize: true
+      skip_special_tokens: false
+
+  - stage_id: 1
+    max_num_seqs: 1
+    enforce_eager: true
+    devices: "2,3"
+    distributed_executor_backend: "mp"
+    omni_kv_config:
+      need_recv_cache: true
+    parallel_config:
+      tensor_parallel_size: 2
+      enable_expert_parallel: true
+    input_connectors:
+      from_stage_0: shared_memory_connector
+    default_sampling_params:
+      num_inference_steps: 50
+      guidance_scale: 0
+
+edges:
+  - from: 0
+    to: 1
+    window_size: -1
+    max_inflight: 1
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        gpu_memory_utilization: 0.8
+        devices: "0,1,2,3"
+        tensor_parallel_size: 4
+        max_num_batched_tokens: 8192
+      - stage_id: 1
+        gpu_memory_utilization: 0.65
+        devices: "4,5,6,7"
+        max_num_batched_tokens: 8192
+        parallel_config:
+          tensor_parallel_size: 4
+          enable_expert_parallel: true
+
+  xpu:
+    stages:
+      - stage_id: 0
+        gpu_memory_utilization: 0.95
+        devices: "0,1,2,3,4,5,6,7"
+        tensor_parallel_size: 8
+        max_num_batched_tokens: 32784
+        quantization: fp8
+        enable_expert_parallel: true
+        worker_cls: vllm_omni.platforms.xpu.worker.xpu_ar_worker.XPUARWorker
+        default_sampling_params:
+          max_tokens: 2048
+          seed: 42
+          repetition_penalty: 1.1
+      - stage_id: 1
+        gpu_memory_utilization: 0.9
+        devices: "0,1,2,3,4,5,6,7"
+        quantization: fp8
+        parallel_config:
+          pipeline_parallel_size: 1
+          data_parallel_size: 1
+          tensor_parallel_size: 8
+          enable_expert_parallel: true
+          sequence_parallel_size: 1
+          ulysses_degree: 1
+          ring_degree: 1
+          cfg_parallel_size: 1
+          vae_patch_parallel_size: 1
+          use_hsdp: false
+          hsdp_shard_size: -1
+          hsdp_replicate_size: 1
