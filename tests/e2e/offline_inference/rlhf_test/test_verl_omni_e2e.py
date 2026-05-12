@@ -36,23 +36,22 @@ import os
 from dataclasses import asdict
 from enum import Enum
 from functools import lru_cache
-from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any
 from uuid import uuid4
 
 import pytest
 import ray
-from huggingface_hub import snapshot_download
 import torch
 import torchvision.transforms as T
+from huggingface_hub import snapshot_download
 from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict
 from transformers import AutoTokenizer
+from vllm.entrypoints.openai.api_server import build_app
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 import vllm_omni.entrypoints.cli.serve
 from tests.helpers.mark import hardware_test
-from vllm.entrypoints.openai.api_server import build_app
-from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.api_server import omni_init_app_state
@@ -62,12 +61,10 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = logging.getLogger(__name__)
 
 CUSTOM_PIPELINE_CLASS = (
-    "tests.e2e.offline_inference.custom_pipeline."
-    "qwen_image_pipeline_with_logprob.QwenImagePipelineWithLogProbForTest"
+    "tests.e2e.offline_inference.custom_pipeline.qwen_image_pipeline_with_logprob.QwenImagePipelineWithLogProbForTest"
 )
 WORKER_EXTENSION_CLASS = (
-    "tests.e2e.offline_inference.custom_pipeline."
-    "worker_extension.vLLMOmniColocateWorkerExtensionForTest"
+    "tests.e2e.offline_inference.custom_pipeline.worker_extension.vLLMOmniColocateWorkerExtensionForTest"
 )
 
 # Use your specified HF repo name/path directly here
@@ -75,12 +72,14 @@ MODEL = "tiny-random/Qwen-Image"
 
 TOKENIZER_MODEL = "Qwen/Qwen2-1.5B-Instruct"
 
+
 def _resolve_model_path(repo_id: str) -> str:
     """Resolve an HF repo ID to a local snapshot path, downloading if needed."""
     # Allow overriding with a pre-existing local path (skips download).
     if os.path.isdir(repo_id):
         return repo_id
     return snapshot_download(repo_id=repo_id)
+
 
 _MIN_PROMPT_TOKENS = 35
 
@@ -107,9 +106,9 @@ class DiffusionOutput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     diffusion_output: Any
-    log_probs: Optional[Any] = None
-    stop_reason: Optional[str] = None
-    num_preempted: Optional[int] = None
+    log_probs: Any | None = None
+    stop_reason: str | None = None
+    num_preempted: int | None = None
     extra_fields: dict[str, Any] = {}
 
 
@@ -180,9 +179,7 @@ def _get_tokenizer():
 def _tokenize_prompt(text: str) -> list[int]:
     tokenizer = _get_tokenizer()
     messages = [{"role": "user", "content": text}]
-    token_ids = normalize_token_ids(
-        tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
-    )
+    token_ids = normalize_token_ids(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False))
     assert len(token_ids) > _MIN_PROMPT_TOKENS, (
         f"Prompt too short ({len(token_ids)} tokens, need >{_MIN_PROMPT_TOKENS}). "
         "The pipeline drops the first 34 chat-template prefix tokens; "
@@ -230,9 +227,7 @@ class vLLMOmniHttpServerLocal:
         # Resolve configs. verl uses omega_conf_to_dataclass; here we keep
         # them as DictConfig — every read site below uses ``_cfg_get``.
         self.config = OmegaConf.create(config) if not isinstance(config, DictConfig) else config
-        self.model_config = (
-            OmegaConf.create(model_config) if not isinstance(model_config, DictConfig) else model_config
-        )
+        self.model_config = OmegaConf.create(model_config) if not isinstance(model_config, DictConfig) else model_config
 
         self.rollout_mode = rollout_mode
         self.workers = workers
@@ -241,7 +236,7 @@ class vLLMOmniHttpServerLocal:
         self.gpus_per_node = gpus_per_node
         self.nnodes = nnodes
         self.global_steps = 0
-        self.engine: Optional[AsyncOmni] = None
+        self.engine: AsyncOmni | None = None
 
         # Diffusion-mode parity with ``vLLMOmniHttpServer._post_init``.
         self._to_tensor = T.PILToTensor()
@@ -305,9 +300,7 @@ class vLLMOmniHttpServerLocal:
             **engine_kwargs,
         }
 
-        model_path = str(
-            _cfg_get(self.model_config, "local_path", None) or _cfg_get(self.model_config, "path")
-        )
+        model_path = str(_cfg_get(self.model_config, "local_path", None) or _cfg_get(self.model_config, "path"))
         server_args_list = ["serve", model_path] + build_cli_args_from_config(args)
 
         # Same parser pipeline as parent launch_server (with vllm-omni's
@@ -353,11 +346,11 @@ class vLLMOmniHttpServerLocal:
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         request_id: str,
-        image_data: Optional[list[Any]] = None,
-        video_data: Optional[list[Any]] = None,
-        negative_prompt_ids: Optional[list[int]] = None,
+        image_data: list[Any] | None = None,
+        video_data: list[Any] | None = None,
+        negative_prompt_ids: list[int] | None = None,
         priority: int = 0,  # noqa: ARG002 (signature parity)
-    ) -> Union[DiffusionOutput]:
+    ) -> DiffusionOutput:
         # Verbatim copy of ``vLLMOmniHttpServer._generate_diffusion`` minus
         # the LoRA branch (the test does not enable ``lora_as_adapter``).
         prompt_ids = normalize_token_ids(prompt_ids)
@@ -390,7 +383,7 @@ class vLLMOmniHttpServerLocal:
             sampling_params_list=[diffusion_sampling_params],
         )
 
-        final_res: Optional[OmniRequestOutput] = None
+        final_res: OmniRequestOutput | None = None
         async for output in generator:
             final_res = output
         assert final_res is not None
@@ -582,8 +575,7 @@ def test_generate(init_server):
         assert isinstance(output, DiffusionOutput), f"Request {i}: expected DiffusionOutput"
         img = output.diffusion_output
         assert isinstance(img, torch.Tensor) and img.ndim == 3, (
-            f"Request {i}: expected CHW torch.Tensor, got {type(img).__name__} "
-            f"ndim={getattr(img, 'ndim', None)}"
+            f"Request {i}: expected CHW torch.Tensor, got {type(img).__name__} ndim={getattr(img, 'ndim', None)}"
         )
         c, h, w = img.shape
         assert c == 3, f"Request {i}: expected 3 channels (CHW), got {c}"

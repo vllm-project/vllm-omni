@@ -29,15 +29,7 @@ import signal
 
 from msgspec import field
 
-try:
-    from vllm.lora.lora_model import LoRAModel
-except ImportError:  # vLLM versions before the rename keep it under .models
-    from vllm.lora.models import LoRAModel  # type: ignore[no-redef]
 
-from vllm.lora.peft_helper import PEFTHelper
-from vllm.lora.utils import get_adapter_absolute_path
-
-from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.worker.diffusion_worker import CustomPipelineWorkerExtension
 from vllm_omni.lora.request import LoRARequest as OmniLoRARequest
 
