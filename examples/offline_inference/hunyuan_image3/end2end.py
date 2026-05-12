@@ -190,18 +190,14 @@ def main():
         "init_timeout": args.init_timeout,
         "enforce_eager": args.enforce_eager,
     }
-<<<<<<< yukexiong/support_additional_config
-    if args.modality in ("text2img", "img2img"):
-        omni_kwargs["mode"] = "text-to-image"
+
     if additional_config is not None:
         omni_kwargs["additional_config"] = additional_config
-=======
     if deploy_config is not None:
         omni_kwargs["deploy_config"] = deploy_config
     else:
         omni_kwargs["stage_configs_path"] = stage_configs_path
     omni_kwargs["mode"] = _MODALITY_MODE[args.modality]
->>>>>>> main
 
     omni = Omni(**omni_kwargs)
 
