@@ -93,7 +93,9 @@ def _run(stage_config_path: str, output_path: Path) -> tuple[Image.Image, str, f
     from vllm_omni.platforms import current_omni_platform
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    token_ids = build_prompt_tokens(PROMPT, tokenizer, task="it2i_recaption", sys_type="en_unified")
+    result = build_prompt_tokens(PROMPT, tokenizer, task="it2i_recaption", sys_type="en_unified")
+    token_ids = result.token_ids
+    system_prompt_type = result.system_prompt_type
 
     with OmniRunner(MODEL_NAME, stage_configs_path=stage_config_path) as runner:
         params_list = list(runner.omni.default_sampling_params_list)
@@ -108,7 +110,7 @@ def _run(stage_config_path: str, output_path: Path) -> tuple[Image.Image, str, f
             {
                 "prompt_token_ids": token_ids,
                 "prompt": PROMPT,
-                "use_system_prompt": "en_unified",
+                "use_system_prompt": system_prompt_type,
                 "height": HEIGHT,
                 "width": WIDTH,
             }

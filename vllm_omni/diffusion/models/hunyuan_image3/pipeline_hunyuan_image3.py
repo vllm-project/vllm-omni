@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
-import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -340,11 +339,6 @@ class HunyuanImage3Pipeline(
             )
         ]
         quant_config = od_config.quantization_config
-        os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
-        logger.info(
-            "Setting attention backend to TORCH_SDPA. "
-            "HunyuanImage3Pipeline only supports TORCH_SDPA to handle mixed causal and full attention."
-        )
         self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
         self.transformer = self.model
         self.vae = AutoencoderKLConv3D.from_config(self.hf_config.vae)
@@ -962,10 +956,18 @@ class HunyuanImage3Pipeline(
             tokenizer_output.joint_image_slices[i] + tokenizer_output.gen_image_slices[i] for i in range(bsz)
         ]
         attention_mask = torch.ones(seq_len, seq_len, dtype=torch.bool).tril(diagonal=0).repeat(bsz, 1, 1)
+        full_attn_spans: list[list[tuple[int, int]]] = [[] for _ in range(bsz)]
         for i in range(bsz):
             for j, image_slice in enumerate(batch_image_slices[i]):
                 attention_mask[i, image_slice, image_slice] = True
+                start = image_slice.start if image_slice.start is not None else 0
+                stop = image_slice.stop if image_slice.stop is not None else seq_len
+                assert start < stop, f"Invalid image slice: {image_slice}"
+                full_attn_spans[i].append((int(start), int(stop)))
+            if full_attn_spans[i]:
+                full_attn_spans[i].sort(key=lambda x: x[0])
         attention_mask = attention_mask.unsqueeze(1)
+        model_kwargs["full_attn_spans"] = full_attn_spans
         return attention_mask
 
     def prepare_inputs_for_generation(
@@ -1009,6 +1011,7 @@ class HunyuanImage3Pipeline(
                 "query_lens": kwargs.get("query_lens"),
                 "seq_lens": kwargs.get("seq_lens"),
                 "num_image_tokens": kwargs.get("num_image_tokens"),
+                "full_attn_spans": kwargs.get("full_attn_spans"),
             }
         )
         return model_inputs
@@ -1027,6 +1030,8 @@ class HunyuanImage3Pipeline(
             "custom_pos_emb": model_kwargs["custom_pos_emb"],
             "num_image_tokens": model_kwargs["num_image_tokens"],
         }
+        if "full_attn_spans" in model_kwargs:
+            updated_model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"]
 
         # update past_key_values keeping its naming used in model code
         for possible_cache_name in ALL_CACHE_NAMES:
@@ -1057,6 +1062,7 @@ class HunyuanImage3Pipeline(
                     torch.arange(bsz), model_kwargs["gen_timestep_scatter_index"][:, -1]
                 ].unsqueeze(-1)
                 updated_model_kwargs["position_ids"] = torch.cat([timestep_position_ids, position_ids], dim=1)
+
                 # attention mask
                 mask_list = []
                 for attention_mask_i, position_ids_i in zip(
@@ -1156,6 +1162,7 @@ class HunyuanImage3Pipeline(
         seq_lens: list[int] | None = None,
         num_image_tokens: int | None = None,
         uncond_cfg_prefill: bool = False,
+        full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | CausalMMOutputWithPast:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # Sanity Check of Inputs
@@ -1251,6 +1258,7 @@ class HunyuanImage3Pipeline(
                 num_image_tokens=num_image_tokens,
                 gen_timestep_scatter_index=gen_timestep_scatter_index,
                 uncond_cfg_prefill=uncond_cfg_prefill,
+                full_attn_spans=full_attn_spans,
             )
         hidden_states = outputs[0]
 
@@ -1416,7 +1424,11 @@ class HunyuanImage3Pipeline(
         model_inputs.update(ar_kv_kwargs)
 
         outputs = self._generate(**model_inputs, **kwargs)
+        custom_output = {}
+        if any(t is not None for t in cot_text_list):
+            custom_output["ar_generated_text"] = cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list
         return DiffusionOutput(
             output=outputs[0],
+            custom_output=custom_output,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )

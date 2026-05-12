@@ -1054,9 +1054,12 @@ class ImageKVCacheManager:
 
         attention_mask = attention_mask.contiguous()
 
+        full_attn_spans = kwargs.get("full_attn_spans", None)
+
         if self.sp_size <= 1:
             attn_metadata = AttentionMetadata(
                 attn_mask=attention_mask,
+                full_attn_spans=full_attn_spans,
             )
         else:
             attn_metadata = AttentionMetadata(
@@ -1065,6 +1068,7 @@ class ImageKVCacheManager:
                 joint_value=joint_text_value,
                 joint_strategy="front",
                 attn_mask=attention_mask,
+                full_attn_spans=full_attn_spans,
             )
         attn_output = self.attn(query, key, value, attn_metadata)
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
@@ -2246,6 +2250,7 @@ class HunyuanImage3Model(nn.Module):
         num_image_tokens: int | None = None,
         gen_timestep_scatter_index: torch.Tensor | None = None,
         uncond_cfg_prefill: bool = False,
+        full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -2354,6 +2359,7 @@ class HunyuanImage3Model(nn.Module):
                 shard_image_size=shard_image_size,
                 shard_padding_size=shard_padding_size,
                 uncond_cfg_prefill=uncond_cfg_prefill,
+                full_attn_spans=full_attn_spans,
             )
 
             hidden_states = layer_outputs[0]
@@ -2594,6 +2600,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             if key in model_kwargs and model_kwargs[key] is not None:
                 model_kwargs[key] = model_kwargs[key][s]
 
+        # List[List[...]] per-sample metadata indexed along the CFG batch dim
+        if isinstance(model_kwargs.get("full_attn_spans"), list):
+            model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"][s.start : s.stop]
+
         # custom_pos_emb: tuple of (cos, sin)
         if "custom_pos_emb" in model_kwargs and model_kwargs["custom_pos_emb"] is not None:
             cos, sin = model_kwargs["custom_pos_emb"]
@@ -2724,6 +2734,9 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             query_lens=[prefill_query_len],
             seq_lens=[prefill_seq_len],
             num_image_tokens=0,
+            full_attn_spans=model_kwargs["full_attn_spans"][batch_slice]
+            if model_kwargs.get("full_attn_spans")
+            else None,
         )
 
     # ==========================================================

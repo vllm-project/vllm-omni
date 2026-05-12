@@ -21,7 +21,7 @@ is_docs_only_change() {
     if [[ "${file_path}" == *.md ]]; then
       continue
     fi
-    if [[ "${file_path}" == "mkdocs.yaml" ]]; then
+    if [[ "${file_path}" == "mkdocs.yml" ]]; then
       continue
     fi
     return 1
