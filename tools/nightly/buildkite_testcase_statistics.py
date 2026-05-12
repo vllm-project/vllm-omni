@@ -86,10 +86,10 @@ def normalize_commands(step: dict) -> list[str]:
 
 def extract_pytest_targets_from_line(line: str) -> list[str]:
     """
-    Parse pytest test targets (file path or marker expression) from a single command line.
-    Returns e.g. ['tests/xxx.py'].
-    When there is no explicit test file but only -m/--run-level, returns
-    ['-m expr'] or ['-m expr --run-level level'] with the full marker args.
+    Parse pytest test targets (file path, directory under tests/, or marker expression) from a single command line.
+    Returns e.g. ['tests/xxx.py'] or ['tests/e2e'].
+    When there is no explicit path but markers/options apply to the whole tree, returns
+    a synthetic token built from sidecar args (``--ignore``, ``-m``, ``-k``, ``--run-level``).
     """
     if "pytest" not in line:
         return []
@@ -105,17 +105,33 @@ def extract_pytest_targets_from_line(line: str) -> list[str]:
     args = parts[1].strip() if len(parts) > 1 else ""
     if not args:
         return []
-    targets = []
+    targets: list[str] = []
+    # Omit paths that only appear as --ignore / --test-config-file values when discovering roots.
+    sanitized_for_roots = _strip_test_config_file_clauses_from_args_fragment(
+        _strip_ignore_clauses_from_args_fragment(args)
+    )
     # Match tests/.../*.py
-    for m in re.finditer(r"tests/[^\s'\"#]+\.py", args):
+    for m in re.finditer(r"tests/[^\s'\"#]+\.py", sanitized_for_roots):
         path = m.group(0)
         if path not in targets:
             targets.append(path)
+    # Directory / namespace roots: tests/e2e, tests/e2e/, tests/foo/bar (no .py suffix)
+    for m in re.finditer(r"\s(tests/[a-zA-Z0-9_./\-]+)(?=\s|$|[\"'])", " " + sanitized_for_roots):
+        tok = m.group(1).rstrip("/")
+        if tok.endswith(".py"):
+            continue
+        if tok not in targets:
+            targets.append(tok)
+    for m in re.finditer(r"['\"](tests/[a-zA-Z0-9_./\-]+)['\"]", sanitized_for_roots):
+        tok = m.group(1).rstrip("/")
+        if tok.endswith(".py"):
+            continue
+        if tok not in targets:
+            targets.append(tok)
     if not targets:
-        # May be -m/--run-level only; record full marker arguments instead of a generic marker.
-        extra = _parse_extra_args_from_line(line)
+        # Marker-only / option-driven selection relative to tests/
+        extra = _pytest_collect_sidecar_args(line)
         if extra:
-            # Join into a single string, e.g. "-m core and cpu --run-level nightly"
             targets.append(" ".join(extra))
     return targets
 
@@ -124,38 +140,75 @@ def get_pytest_targets_from_step(step: dict) -> list[tuple[str, str]]:
     """
     Extract all pytest-related targets from a step.
     Returns [(target, raw_line), ...] where target is tests/xxx.py or '(marker/run-level)'.
+
+    Deduplication uses ``(target, raw_line)`` so the same script path with different options
+    (e.g. ``--test-config-file …``) stays distinct across Buildkite jobs.
     """
     lines = normalize_commands(step)
     out = []
     seen = set()
     for line in lines:
         for t in extract_pytest_targets_from_line(line):
-            if t not in seen:
-                seen.add(t)
+            key = (t, line)
+            if key not in seen:
+                seen.add(key)
                 out.append((t, line))
     return out
 
 
-def _parse_extra_args_from_line(raw_line: str) -> list[str]:
-    """Extract -m and --run-level args from a raw pytest command line. Strips extra spaces and quotes.
-    Correctly handles quoted expressions with spaces, e.g. -m 'core_model and cpu'.
+def _strip_ignore_clauses_from_args_fragment(fragment: str) -> str:
+    """Replace ``--ignore=…`` / ``--ignore …`` spans so path discovery does not treat ignores as roots."""
+    return re.sub(r"--ignore(?:=\S+|\s+\S+)", " ", fragment)
+
+
+def _strip_test_config_file_clauses_from_args_fragment(fragment: str) -> str:
+    """Replace ``--test-config-file`` spans so JSON paths under ``tests/`` are not mistaken for collection roots."""
+    return re.sub(r"--test-config-file(?:=\S+|\s+\S+)", " ", fragment)
+
+
+def _pytest_collect_sidecar_args(raw_line: str) -> list[str]:
+    """Extract pytest args that affect collection: ``--ignore``, ``--test-config-file``, ``-m``,
+    ``--run-level``, ``-k``.
+
+    Order matches typical CI lines (ignores / perf driver config, then markers / run-level / keyword).
+    Correctly handles quoted ``-m`` / ``-k`` / ``--run-level`` values with spaces.
     """
     extra: list[str] = []
 
-    # -m: match -m followed by '...', "..." or a single token (so -m expression is one argv)
-    m = re.search(r"-m\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))", raw_line)
-    if m:
-        value = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+    for m in re.finditer(r"--ignore(?:=(\S+)|\s+(\S+))", raw_line):
+        path = (m.group(1) or m.group(2) or "").strip()
+        if path:
+            extra.extend(["--ignore", path])
+
+    for m in re.finditer(r"--test-config-file(?:=(\S+)|\s+(\S+))", raw_line):
+        path = (m.group(1) or m.group(2) or "").strip()
+        if path:
+            extra.extend(["--test-config-file", path])
+
+    marker = re.search(r"-m\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))", raw_line)
+    if marker:
+        value = (marker.group(1) or marker.group(2) or marker.group(3) or "").strip()
         if value:
             extra.extend(["-m", value])
 
-    r = re.search(r"--run-level\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))", raw_line)
-    if r:
-        value = (r.group(1) or r.group(2) or r.group(3) or "").strip()
+    runlvl = re.search(r"--run-level\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))", raw_line)
+    if runlvl:
+        value = (runlvl.group(1) or runlvl.group(2) or runlvl.group(3) or "").strip()
         if value:
             extra.extend(["--run-level", value])
 
+    kw = re.search(r"-k\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))", raw_line)
+    if kw:
+        value = (kw.group(1) or kw.group(2) or kw.group(3) or "").strip()
+        if value:
+            extra.extend(["-k", value])
+
     return extra
+
+
+def _parse_extra_args_from_line(raw_line: str) -> list[str]:
+    """Backward-compatible alias for :func:`_pytest_collect_sidecar_args`."""
+    return _pytest_collect_sidecar_args(raw_line)
 
 
 def _parse_collect_only_stdout(stdout: str, *, raise_on_empty: bool = True, stderr: str = "") -> list[str]:
@@ -198,8 +251,15 @@ def _resolve_pytest_target(target: str, repo_root: Path, extra: list[str], raw_l
         if not path.exists():
             raise FileNotFoundError(f"Pytest target path does not exist: {path}")
         return [str(path)], target.replace("\\", "/"), 60
+
+    if " " not in target and not target.startswith("-") and target.startswith("tests/"):
+        rel_dir = Path(target.rstrip("/"))
+        dir_path = (repo_root / rel_dir).resolve()
+        if dir_path.exists() and dir_path.is_dir():
+            return [str(dir_path)], target.replace("\\", "/").rstrip("/"), 120
+
     if not extra:
-        raise RuntimeError(f"Failed to parse -m/--run-level from pytest line: {raw_line!r}")
+        raise RuntimeError(f"Failed to parse pytest sidecar args from line: {raw_line!r}")
     if not (repo_root / "tests").exists():
         raise FileNotFoundError("tests/ directory not found under repo root")
     return ["tests/"], "tests/", 120
@@ -208,9 +268,13 @@ def _resolve_pytest_target(target: str, repo_root: Path, extra: list[str], raw_l
 def collect_test_names(target: str, repo_root: Path, raw_line: str) -> list[str]:
     """
     Run pytest --collect-only -q for a target and return test node id list (incl. parametrized).
-    target: path like tests/foo.py or marker string (e.g. "-m expr"). raw_line used for -m/--run-level.
+
+    ``path_args`` come from ``target`` (file, dir under ``tests/``, or fallback ``tests/``). Sidecar
+    flags ``--ignore``, ``--test-config-file``, ``-m``, ``-k``, ``--run-level`` are taken from the
+    full ``raw_line`` and appended to the same invocation so collection matches CI (perf scripts
+    parametrize from ``--test-config-file`` at import time).
     """
-    extra = _parse_extra_args_from_line(raw_line)
+    extra = _pytest_collect_sidecar_args(raw_line)
     path_args, _fallback, timeout_quiet = _resolve_pytest_target(target, repo_root, extra, raw_line)
 
     cmd_quiet = [sys.executable, "-m", "pytest", *path_args, "--collect-only", "-q"]
@@ -241,6 +305,15 @@ def _extra_with_skip_marker(extra: list[str]) -> list[str]:
         elif extra[i] == "--run-level" and i + 1 < len(extra):
             out.extend(["--run-level", extra[i + 1]])
             i += 2
+        elif extra[i] == "-k" and i + 1 < len(extra):
+            out.extend(["-k", extra[i + 1]])
+            i += 2
+        elif extra[i] == "--ignore" and i + 1 < len(extra):
+            out.extend(["--ignore", extra[i + 1]])
+            i += 2
+        elif extra[i] == "--test-config-file" and i + 1 < len(extra):
+            out.extend(["--test-config-file", extra[i + 1]])
+            i += 2
         else:
             i += 1
     if not has_m:
@@ -253,7 +326,7 @@ def get_skip_status(target: str, raw_line: str, repo_root: Path) -> set[str]:
     Use pytest -m skip --collect-only -q to collect tests marked with skip; return their node ids.
     Does not run tests; only collects. Supports both pytest xxx.py and pytest -m "marker".
     """
-    extra = _parse_extra_args_from_line(raw_line)
+    extra = _pytest_collect_sidecar_args(raw_line)
     try:
         path_args, _, timeout_quiet = _resolve_pytest_target(target, repo_root, extra, raw_line)
     except (FileNotFoundError, RuntimeError):
