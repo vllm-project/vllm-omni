@@ -192,9 +192,9 @@ def main():
     # Format prompts
     formatted_prompts: list[OmniPromptType] = []
     for p in prompts:
-        token_ids = build_prompt_tokens(p, tokenizer, task=task, sys_type=args.sys_type)
-        preset_sys_type, _, _ = _TASK_PRESETS[task]
-        effective_sys_type = args.sys_type or preset_sys_type
+        result = build_prompt_tokens(p, tokenizer, task=task, sys_type=args.sys_type)
+        token_ids = result.token_ids
+        effective_sys_type = result.system_prompt_type
 
         # `prompt_token_ids` drives the AR stage (matches HF byte-for-byte).
         # `prompt` and `use_system_prompt` are forwarded by ar2diffusion to
