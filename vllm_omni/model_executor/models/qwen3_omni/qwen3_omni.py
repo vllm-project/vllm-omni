@@ -841,6 +841,10 @@ class Qwen3OmniMoeForConditionalGeneration(
                     # compatible with old shape [1,S,D]
                     rem_tail = trailing_text_hidden.squeeze(0)
                 if rem_tail.shape[0] > 0:
+                    # Prefill bootstrap already consumed the first assistant text token.
+                    # Keep decode aligned to the remaining text boundary.
+                    if rem_tail.ndim == 2 and rem_tail.shape[0] > 1:
+                        rem_tail = rem_tail[1:, :]
                     update_dict.setdefault("hidden_states", {})["trailing_text"] = rem_tail.detach()
             # Also persist projected tts_pad for decode fallback if needed
             if isinstance(tts_pad_thinker, torch.Tensor):

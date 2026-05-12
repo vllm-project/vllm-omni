@@ -1233,13 +1233,6 @@ class AsyncOmniEngine:
                 bootstrap_addr = f"http://{kv_ip}:{port}"
         except Exception as exc:
             logger.warning("[AsyncOmniEngine] Could not extract PD bootstrap address: %s", exc)
-
-        logger.info(
-            "[AsyncOmniEngine] PD disaggregation detected: prefill=stage-%d, decode=stage-%d, bootstrap=%s",
-            prefill_idx,
-            decode_idx,
-            bootstrap_addr,
-        )
         prefill_engine_id: str | None = None
         try:
             prefill_client = self.stage_clients[prefill_idx]
@@ -1247,6 +1240,13 @@ class AsyncOmniEngine:
             prefill_engine_id = getattr(kv_cfg, "engine_id", None)
         except Exception as exc:
             logger.warning("[AsyncOmniEngine] Could not extract prefill engine_id: %s", exc)
+
+        logger.info(
+            "[AsyncOmniEngine] PD disaggregation detected: prefill=stage-%d, decode=stage-%d, bootstrap=%s",
+            prefill_idx,
+            decode_idx,
+            bootstrap_addr,
+        )
 
         return {
             "pd_pair": (prefill_idx, decode_idx),

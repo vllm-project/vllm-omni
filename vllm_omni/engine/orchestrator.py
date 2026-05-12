@@ -12,6 +12,7 @@ import asyncio
 import copy
 import time as _time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 import janus
@@ -36,6 +37,74 @@ from vllm_omni.metrics.utils import count_tokens_from_outputs
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+@lru_cache(maxsize=8)
+def _load_tokenizer_eos_token_id(
+    tokenizer_name_or_path: str,
+    trust_remote_code: bool,
+    revision: str | None,
+) -> int | None:
+    try:
+        from transformers import AutoTokenizer
+    except Exception:
+        return None
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name_or_path,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+        )
+    except Exception:
+        logger.exception(
+            "[Orchestrator] failed to load tokenizer for eos lookup: %s",
+            tokenizer_name_or_path,
+        )
+        return None
+
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(eos_token_id, int):
+        return eos_token_id
+    if isinstance(eos_token_id, (list, tuple)):
+        for token_id in eos_token_id:
+            if isinstance(token_id, int):
+                return token_id
+    return None
+
+
+def _resolve_model_eos_token_id(model_config: ModelConfig | None) -> int | None:
+    if model_config is None:
+        return None
+    hf_text_cfg = getattr(model_config, "hf_text_config", None)
+    eos_token_id = getattr(hf_text_cfg, "eos_token_id", None)
+    if isinstance(eos_token_id, int):
+        return eos_token_id
+    if isinstance(eos_token_id, (list, tuple)):
+        for token_id in eos_token_id:
+            if isinstance(token_id, int):
+                return token_id
+
+    hf_cfg = getattr(model_config, "hf_config", None)
+    eos_token_id = getattr(hf_cfg, "eos_token_id", None)
+    if isinstance(eos_token_id, int):
+        return eos_token_id
+    if isinstance(eos_token_id, (list, tuple)):
+        for token_id in eos_token_id:
+            if isinstance(token_id, int):
+                return token_id
+
+    tokenizer_name_or_path = getattr(model_config, "tokenizer", None) or getattr(model_config, "model", None)
+    if isinstance(tokenizer_name_or_path, str) and tokenizer_name_or_path:
+        eos_token_id = _load_tokenizer_eos_token_id(
+            tokenizer_name_or_path=tokenizer_name_or_path,
+            trust_remote_code=bool(getattr(model_config, "trust_remote_code", False)),
+            revision=getattr(model_config, "tokenizer_revision", None),
+        )
+        if isinstance(eos_token_id, int):
+            return eos_token_id
+
+    return None
 
 
 def build_engine_core_request_from_tokens(
@@ -444,17 +513,6 @@ class Orchestrator:
             kv_params = getattr(output, "kv_transfer_params", None)
             if kv_params is not None:
                 self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
-                logger.debug(
-                    "[Orchestrator][PD] stored kv_transfer_params for req=%s (keys=%s)",
-                    req_id,
-                    list(self._pd_kv_params[req_id].keys()),
-                )
-            else:
-                logger.debug(
-                    "[Orchestrator][PD] prefill stage output for req=%s has no kv_transfer_params; "
-                    "continuing with transfer_id/bootstrap-based Mooncake routing.",
-                    req_id,
-                )
 
         if (
             (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
@@ -896,6 +954,12 @@ class Orchestrator:
             # and OutputProcessor would leak.
             self.output_processors[stage_id].abort_requests(processed.reqs_to_abort, internal=True)
             for req_id in processed.reqs_to_abort:
+                # Mirror final-stage / explicit abort cleanup for PD-specific
+                # transient state so aborted requests don't leak across tests.
+                self._pd_kv_params.pop(req_id, None)
+                self._pd_decode_prev_output_len.pop(req_id, None)
+                self._clear_pd_prefill_multimodal_output(req_id)
+                self._cfg_tracker.cleanup_parent(req_id)
                 self.request_states.pop(req_id, None)
 
         if raw_outputs.scheduler_stats is not None:
