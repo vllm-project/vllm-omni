@@ -555,13 +555,12 @@ def test_language_001(omni_server, openai_client) -> None:
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_long_text_output_001(omni_server, openai_client) -> None:
+def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
     """
     Input Modal: text only (long-form generation prompt).
-    Output Modal: text only
-    Input Setting: stream=False
+    Output Modal: text, audio (default ``modalities``);
+    Input Setting: stream=True
     Datasets: single request
-    Validates that the model can produce long text output (>= 300 words).
     """
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
