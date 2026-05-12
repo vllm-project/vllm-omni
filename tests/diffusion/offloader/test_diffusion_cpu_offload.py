@@ -12,9 +12,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
 AUDIO_MODEL = {
-    # Model-level offload only saves a small amount for this pipeline; keep the
-    # threshold below the observed L4 CI delta to avoid allocator noise flake.
-    "stabilityai/stable-audio-open-1.0": {"cuda": 64, "rocm": None},
+    "stabilityai/stable-audio-open-1.0": {"cuda": 100, "rocm": None},
 }
 
 IMAGE_VIDEO_MODELS = {
