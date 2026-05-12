@@ -28,7 +28,6 @@ import ray
 from huggingface_hub import snapshot_download
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
-from tests.helpers.mark import hardware_test
 
 from tests.e2e.offline_inference.rlhf_test.rlhf_test_utils import (
     DiffusionOutput,
@@ -37,6 +36,7 @@ from tests.e2e.offline_inference.rlhf_test.rlhf_test_utils import (
     normalize_token_ids,
     vLLMOmniHttpServer,
 )
+from tests.helpers.mark import hardware_test
 
 # HF repo IDs (auto-downloaded on first use; cached under HF_HOME).
 MODEL = os.environ.get("VLLM_OMNI_TEST_MODEL", "tiny-random/Qwen-Image")
@@ -169,8 +169,6 @@ def init_server():
     ray.shutdown()
 
 
-
-
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -216,4 +214,3 @@ def test_generate(init_server):
         assert 0.0 <= output.diffusion_output[0][0][0] <= 1.0, f"Request {i}: pixel values must be in [0, 1]"
 
     print(f"All {len(prompts)} concurrent requests returned valid DiffusionOutput")
-
