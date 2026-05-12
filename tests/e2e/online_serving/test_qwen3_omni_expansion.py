@@ -576,6 +576,4 @@ def test_long_text_output_001(omni_server, openai_client) -> None:
     responses = openai_client.send_omni_request(request_config)
     text = responses[0].text_content if responses else ""
     word_count = len(text.split())
-    assert word_count >= 300, (
-        f"Expected at least 300 words in long output, got {word_count}"
-    )
+    assert word_count >= 300, f"Expected at least 300 words in long output, got {word_count}"
