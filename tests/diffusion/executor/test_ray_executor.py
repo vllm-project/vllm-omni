@@ -1,17 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 import os
+import threading
+from types import SimpleNamespace
 
 import pytest
 from pytest_mock import MockerFixture
 
 ray = pytest.importorskip("ray")
 
+from vllm_omni.diffusion.data import DiffusionOutput  # noqa: E402
 from vllm_omni.diffusion.executor.ray_executor import (  # noqa: E402
+    EXECUTE_MODEL_TIMEOUT,
     RayDiffusionExecutor,
     RayDiffusionWorkerWrapper,
+    RayWorkerMetaData,
 )
+from vllm_omni.diffusion.worker.utils import RunnerOutput  # noqa: E402
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -67,14 +74,182 @@ class TestRayDiffusionWorkerWrapper:
         with pytest.raises(RuntimeError, match="Worker is not initialized"):
             wrapper.execute_method("any_method")
 
+    def test_execute_rpc_skips_non_output_rank(self, mocker: MockerFixture):
+        """execute_rpc should not run single-rank RPCs on other ranks."""
+        wrapper = RayDiffusionWorkerWrapper(rpc_rank=1)
+        wrapper.worker = mocker.Mock()
+        wrapper.worker.ping.return_value = "pong"
+
+        assert wrapper.execute_rpc("ping", output_rank=0, exec_all_ranks=False) is None
+
+        wrapper.worker.ping.assert_not_called()
+
+    def test_execute_rpc_executes_all_ranks_but_only_output_rank_replies(self, mocker: MockerFixture):
+        """exec_all_ranks should execute locally while suppressing non-output replies."""
+        wrapper = RayDiffusionWorkerWrapper(rpc_rank=1)
+        wrapper.worker = mocker.Mock()
+        wrapper.worker.ping.return_value = "pong"
+
+        assert wrapper.execute_rpc("ping", output_rank=0, exec_all_ranks=True) is None
+
+        wrapper.worker.ping.assert_called_once_with()
+
+    def test_execute_rpc_moves_diffusion_output_to_cpu(self, mocker: MockerFixture):
+        """Ray RPC replies should not attempt to serialize GPU tensors."""
+        wrapper = RayDiffusionWorkerWrapper(rpc_rank=0)
+        wrapper.worker = mocker.Mock()
+        output = DiffusionOutput(error="ok")
+        to_cpu = mocker.spy(output, "to_cpu")
+        wrapper.worker.generate.return_value = output
+
+        result = wrapper.execute_rpc("generate", args=("req",), output_rank=0)
+
+        assert result is output
+        wrapper.worker.generate.assert_called_once_with("req")
+        to_cpu.assert_called_once_with()
+
+
+class TestExecutorApi:
+    """Test RayDiffusionExecutor implements the current DiffusionExecutor API."""
+
+    def test_executor_is_concrete(self):
+        assert not inspect.isabstract(RayDiffusionExecutor)
+
+    def test_execute_request_dispatches_execute_model(self, mocker: MockerFixture, mock_od_config):
+        executor = object.__new__(RayDiffusionExecutor)
+        executor._closed = False
+        executor.od_config = mock_od_config
+        result = DiffusionOutput(error="ok")
+        executor.collective_rpc = mocker.Mock(return_value=result)
+        request = object()
+        scheduler_output = SimpleNamespace(
+            num_scheduled_reqs=1,
+            scheduled_new_reqs=[
+                SimpleNamespace(
+                    req=request,
+                    sched_req_id="sched-req-1",
+                )
+            ],
+        )
+
+        output = RayDiffusionExecutor.execute_request(executor, scheduler_output)
+
+        assert isinstance(output, RunnerOutput)
+        assert output.req_id == "sched-req-1"
+        assert output.finished is True
+        assert output.result is result
+        executor.collective_rpc.assert_called_once_with(
+            "execute_model",
+            args=(request, mock_od_config),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+
+    def test_execute_request_rejects_batches(self, mocker: MockerFixture, mock_od_config):
+        executor = object.__new__(RayDiffusionExecutor)
+        executor._closed = False
+        executor.od_config = mock_od_config
+        executor.collective_rpc = mocker.Mock()
+        scheduler_output = SimpleNamespace(
+            num_scheduled_reqs=2,
+            scheduled_new_reqs=[],
+        )
+
+        with pytest.raises(ValueError, match="batch_size=1"):
+            RayDiffusionExecutor.execute_request(executor, scheduler_output)
+
+        executor.collective_rpc.assert_not_called()
+
+    def test_execute_step_dispatches_execute_stepwise(self, mocker: MockerFixture):
+        executor = object.__new__(RayDiffusionExecutor)
+        executor._closed = False
+        expected = RunnerOutput(req_id="sched-step-1", step_index=1, finished=False, result=None)
+        executor.collective_rpc = mocker.Mock(return_value=expected)
+        scheduler_output = SimpleNamespace(scheduled_req_ids=["sched-step-1"])
+
+        output = RayDiffusionExecutor.execute_step(executor, scheduler_output)
+
+        assert output is expected
+        executor.collective_rpc.assert_called_once_with(
+            "execute_stepwise",
+            args=(scheduler_output,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+
+    def test_execute_step_accepts_legacy_diffusion_output(self, mocker: MockerFixture):
+        executor = object.__new__(RayDiffusionExecutor)
+        executor._closed = False
+        result = DiffusionOutput(error="legacy")
+        executor.collective_rpc = mocker.Mock(return_value=result)
+        scheduler_output = SimpleNamespace(scheduled_req_ids=["sched-step-1"])
+
+        output = RayDiffusionExecutor.execute_step(executor, scheduler_output)
+
+        assert isinstance(output, RunnerOutput)
+        assert output.req_id == "sched-step-1"
+        assert output.finished is True
+        assert output.result is result
+
+    def test_shutdown_runs_finalizer(self, mocker: MockerFixture):
+        executor = object.__new__(RayDiffusionExecutor)
+        executor._closed = False
+        executor._finalizer = mocker.Mock()
+
+        RayDiffusionExecutor.shutdown(executor)
+
+        assert executor._closed is True
+        executor._finalizer.assert_called_once_with()
+
+
+class TestAddReq:
+    """Test add_req on RayDiffusionExecutor."""
+
+    @pytest.fixture
+    def executor(self, mocker: MockerFixture):
+        ex = object.__new__(RayDiffusionExecutor)
+        ex._closed = False
+        ex.workers = [RayWorkerMetaData(worker=mocker.Mock(), rank=i) for i in range(3)]
+        return ex
+
+    def test_add_req_returns_rank0_and_waits_for_followers(self, mocker: MockerFixture, executor):
+        request = object()
+        expected = DiffusionOutput(error="rank0")
+        futures = [f"future-{i}" for i in range(3)]
+        for meta, future in zip(executor.workers, futures):
+            meta.worker.execute_model.remote.return_value = future
+        mock_ray_get = mocker.patch("ray.get", side_effect=[expected, [None, None]])
+
+        result = RayDiffusionExecutor.add_req(executor, request)
+
+        assert result is expected
+        for meta in executor.workers:
+            meta.worker.execute_model.remote.assert_called_once_with(request)
+        assert mock_ray_get.call_args_list[0].args == (futures[0],)
+        assert mock_ray_get.call_args_list[0].kwargs == {"timeout": EXECUTE_MODEL_TIMEOUT}
+        assert mock_ray_get.call_args_list[1].args == (futures[1:],)
+        assert mock_ray_get.call_args_list[1].kwargs == {"timeout": EXECUTE_MODEL_TIMEOUT}
+
+    def test_add_req_closed_executor_raises(self, executor):
+        executor._closed = True
+
+        with pytest.raises(RuntimeError, match="closed"):
+            RayDiffusionExecutor.add_req(executor, object())
+
+    def test_add_req_rejects_unexpected_rank0_result(self, mocker: MockerFixture, executor):
+        for i, meta in enumerate(executor.workers):
+            meta.worker.execute_model.remote.return_value = f"future-{i}"
+        mocker.patch("ray.get", side_effect=["not-output", [None, None]])
+
+        with pytest.raises(RuntimeError, match="Unexpected response type"):
+            RayDiffusionExecutor.add_req(executor, object())
+
 
 class TestCollectiveRpc:
     """Test collective_rpc on RayDiffusionExecutor."""
 
     @pytest.fixture
     def executor(self, mocker: MockerFixture):
-        from vllm_omni.diffusion.executor.ray_executor import RayWorkerMetaData
-
         ex = object.__new__(RayDiffusionExecutor)
         ex._closed = False
         ex.workers = [RayWorkerMetaData(worker=mocker.Mock(), rank=i) for i in range(3)]
@@ -86,12 +261,40 @@ class TestCollectiveRpc:
         mocker.patch("ray.get", return_value=expected)
         assert executor.collective_rpc("ping") == expected
         for meta in executor.workers:
-            meta.worker.execute_method.remote.assert_called_once_with("ping")
+            meta.worker.execute_rpc.remote.assert_called_once_with(
+                "ping",
+                (),
+                {},
+                None,
+                True,
+            )
 
     def test_unique_reply_rank(self, mocker, executor):
         """collective_rpc with unique_reply_rank should return single response."""
         mocker.patch("ray.get", return_value=["r0", "r1", "r2"])
         assert executor.collective_rpc("ping", unique_reply_rank=2) == "r2"
+        for meta in executor.workers:
+            meta.worker.execute_rpc.remote.assert_called_once_with(
+                "ping",
+                (),
+                {},
+                2,
+                False,
+            )
+
+    def test_unique_reply_rank_can_execute_all_ranks(self, mocker, executor):
+        """collective_rpc should propagate exec_all_ranks to Ray workers."""
+        mocker.patch("ray.get", return_value=["r0", None, None])
+
+        assert executor.collective_rpc("execute_model", unique_reply_rank=0, exec_all_ranks=True) == "r0"
+        for meta in executor.workers:
+            meta.worker.execute_rpc.remote.assert_called_once_with(
+                "execute_model",
+                (),
+                {},
+                0,
+                True,
+            )
 
     def test_timeout_raises(self, mocker, executor):
         """collective_rpc should raise TimeoutError on timeout."""
@@ -100,6 +303,38 @@ class TestCollectiveRpc:
             executor.collective_rpc("slow", timeout=1.0)
         _, call_kwargs = mock_ray_get.call_args
         assert call_kwargs.get("timeout") == 1.0
+
+    def test_concurrent_calls_keep_results_with_callers(self, mocker: MockerFixture, executor):
+        """Concurrent collective_rpc calls should not mix caller results."""
+        for meta in executor.workers:
+            meta.worker.execute_rpc.remote.side_effect = (
+                lambda method, args, kwargs, output_rank, exec_all_ranks, rank=meta.rank: {
+                    "rank": rank,
+                    "tag": args[0],
+                }
+            )
+
+        def fake_ray_get(futures, timeout=None):
+            del timeout
+            return [f"rank{future['rank']}-{future['tag']}" for future in futures]
+
+        mocker.patch("ray.get", side_effect=fake_ray_get)
+        results: dict[str, str] = {}
+
+        def call(tag: str) -> None:
+            results[tag] = executor.collective_rpc(
+                "ping",
+                args=(tag,),
+                unique_reply_rank=0,
+            )
+
+        threads = [threading.Thread(target=call, args=(f"call-{i}",)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert results == {f"call-{i}": f"rank0-call-{i}" for i in range(8)}
 
 
 class TestExecutorFactory:

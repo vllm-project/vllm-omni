@@ -7,7 +7,7 @@ import os
 import weakref
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip, get_open_port
@@ -15,6 +15,10 @@ from vllm.utils.network_utils import get_ip, get_open_port
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
+    from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -117,6 +121,45 @@ class RayDiffusionWorkerWrapper:
         if self.rpc_rank == 0:
             return output.to_cpu()
         return None
+
+    def _move_result_to_cpu(self, result: Any) -> Any:
+        if isinstance(result, DiffusionOutput):
+            return result.to_cpu()
+
+        from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
+
+        if isinstance(result, RunnerOutput):
+            if isinstance(result.result, DiffusionOutput):
+                result.result = result.result.to_cpu()
+            return result
+
+        if isinstance(result, BatchRunnerOutput):
+            for runner_output in result.runner_outputs:
+                if isinstance(runner_output.result, DiffusionOutput):
+                    runner_output.result = runner_output.result.to_cpu()
+            return result
+
+        return result
+
+    def execute_rpc(
+        self,
+        method: str,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        output_rank: int | None = None,
+        exec_all_ranks: bool = False,
+    ) -> Any:
+        kwargs = kwargs or {}
+        should_execute = exec_all_ranks or output_rank is None or output_rank == self.rpc_rank
+        should_reply = output_rank is None or output_rank == self.rpc_rank
+
+        if not should_execute:
+            return None
+
+        result = self.execute_method(method, *args, **kwargs)
+        if not should_reply:
+            return None
+        return self._move_result_to_cpu(result)
 
     def execute_method(self, method: str, *args, **kwargs) -> Any:
         if self.worker is None:
@@ -264,6 +307,8 @@ class RayDiffusionExecutor(DiffusionExecutor):
             # Wait for remaining workers to finish their side of the
             # distributed computation, but discard their None results.
             ray.get(futures[1:], timeout=EXECUTE_MODEL_TIMEOUT)
+            if not isinstance(rank0_result, DiffusionOutput):
+                raise RuntimeError(f"Unexpected response type for generate: {type(rank0_result)!r}")
             return rank0_result
         except ray.exceptions.RayTaskError as e:
             logger.error(f"Worker execution failed: {e}")
@@ -272,6 +317,63 @@ class RayDiffusionExecutor(DiffusionExecutor):
             logger.error("Worker execution timed out")
             raise TimeoutError("Diffusion generation timed out") from e
 
+    def execute_request(self, scheduler_output: "DiffusionSchedulerOutput") -> "BaseRunnerOutput":
+        """Adapt request-mode scheduler output to worker execute_model RPC."""
+        from vllm_omni.diffusion.worker.utils import RunnerOutput
+
+        if self._closed:
+            raise RuntimeError("RayDiffusionExecutor is closed.")
+        if scheduler_output.num_scheduled_reqs != 1:
+            raise ValueError(
+                f"Request mode currently supports batch_size=1, "
+                f"but got {scheduler_output.num_scheduled_reqs} scheduled requests."
+            )
+
+        new_req = scheduler_output.scheduled_new_reqs[0]
+        result = self.collective_rpc(
+            "execute_model",
+            args=(new_req.req, self.od_config),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+        if not isinstance(result, DiffusionOutput):
+            raise RuntimeError(f"Unexpected response type for execute_request: {type(result)!r}")
+
+        return RunnerOutput(
+            req_id=new_req.sched_req_id,
+            step_index=None,
+            finished=True,
+            result=result,
+        )
+
+    def execute_step(self, scheduler_output: "DiffusionSchedulerOutput") -> "BaseRunnerOutput":
+        """Forward step-mode scheduler output to worker execute_stepwise RPC."""
+        from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, RunnerOutput
+
+        if self._closed:
+            raise RuntimeError("RayDiffusionExecutor is closed.")
+        result = self.collective_rpc(
+            "execute_stepwise",
+            args=(scheduler_output,),
+            unique_reply_rank=0,
+            exec_all_ranks=True,
+        )
+
+        if isinstance(result, BaseRunnerOutput):
+            return result
+        # TODO: Remove this fallback with MultiprocDiffusionExecutor's matching
+        # compatibility path; DiffusionOutput cannot represent failed batches.
+        if isinstance(result, DiffusionOutput):
+            req_id = scheduler_output.scheduled_req_ids[0] if scheduler_output.scheduled_req_ids else ""
+            return RunnerOutput(
+                req_id=req_id,
+                step_index=None,
+                finished=True,
+                result=result,
+            )
+        else:
+            raise RuntimeError(f"Unexpected response type for execute_step: {type(result)!r}")
+
     def collective_rpc(
         self,
         method: str,
@@ -279,12 +381,23 @@ class RayDiffusionExecutor(DiffusionExecutor):
         args: tuple = (),
         kwargs: dict | None = None,
         unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any:
         if self._closed:
             raise RuntimeError("RayDiffusionExecutor is closed.")
 
         kwargs = kwargs or {}
-        futures = [meta.worker.execute_method.remote(method, *args, **kwargs) for meta in self.workers]
+        output_rank = unique_reply_rank
+        futures = [
+            meta.worker.execute_rpc.remote(
+                method,
+                args,
+                kwargs,
+                output_rank,
+                output_rank is None or exec_all_ranks,
+            )
+            for meta in self.workers
+        ]
 
         try:
             responses = ray.get(futures, timeout=timeout)
