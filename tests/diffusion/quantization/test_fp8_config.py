@@ -73,6 +73,51 @@ def test_build_quant_config_modelopt_fp8_config_json():
     assert config.is_checkpoint_fp8_serialized
 
 
+def test_build_quant_config_modelopt_nvfp4_config_json():
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config(
+        {
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+            "group_size": 16,
+            "ignore": ["proj_out"],
+            "producer": {"name": "modelopt"},
+        }
+    )
+
+    assert isinstance(config, ModelOptNvFp4Config)
+    assert config.get_name() == "modelopt_fp4"
+    assert config.is_checkpoint_nvfp4_serialized
+    assert config.group_size == 16
+
+
+def test_build_quant_config_modelopt_mixed_config_json():
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig
+
+    from vllm_omni.quantization import build_quant_config
+
+    config = build_quant_config(
+        {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "group_size": 16,
+            "quantized_layers": {
+                "transformer_blocks.0.attn.to_q": {"quant_algo": "FP8"},
+                "transformer_blocks.0.img_mlp.net.0.proj": {"quant_algo": "NVFP4", "group_size": 16},
+            },
+            "producer": {"name": "modelopt"},
+        }
+    )
+
+    assert isinstance(config, ModelOptMixedPrecisionConfig)
+    assert config.get_name() == "modelopt_mixed"
+    assert config.quantized_layers["transformer_blocks.0.attn.to_q"]["quant_algo"] == "FP8"
+    assert config.quantized_layers["transformer_blocks.0.img_mlp.net.0.proj"]["quant_algo"] == "NVFP4"
+
+
 def test_build_quant_config_per_component():
     from vllm_omni.quantization import ComponentQuantizationConfig, build_quant_config
 
@@ -233,10 +278,53 @@ def test_transformer_config_auto_detects_modelopt_fp8():
     assert config.quant_method == "modelopt"
 
 
+def test_transformer_config_auto_detects_modelopt_nvfp4():
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+
+    from vllm_omni.diffusion.data import TransformerConfig
+
+    config = TransformerConfig.from_dict(
+        {
+            "_class_name": "FluxTransformer2DModel",
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+                "ignore": ["proj_out"],
+            },
+        }
+    )
+
+    assert isinstance(config.quant_config, ModelOptNvFp4Config)
+    assert config.quant_method == "modelopt"
+
+
+def test_omni_diffusion_config_auto_propagates_modelopt_nvfp4():
+    from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+
+    tf_config = TransformerConfig.from_dict(
+        {
+            "_class_name": "FluxTransformer2DModel",
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+                "ignore": ["proj_out"],
+            },
+        }
+    )
+    config = OmniDiffusionConfig(model="test")
+
+    config.set_tf_model_config(tf_config)
+
+    assert config.quantization_config is tf_config.quant_config
+    assert config.quantization_config.get_name() == "modelopt_fp4"
+
+
 def test_supported_methods_includes_vllm():
     from vllm_omni.quantization import SUPPORTED_QUANTIZATION_METHODS
 
-    for method in ["fp8", "gguf", "awq", "gptq", "bitsandbytes", "modelopt"]:
+    for method in ["fp8", "gguf", "awq", "gptq", "bitsandbytes", "modelopt", "modelopt_fp4", "modelopt_mixed"]:
         assert method in SUPPORTED_QUANTIZATION_METHODS, f"{method} missing"
 
 

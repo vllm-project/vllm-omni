@@ -9,6 +9,9 @@ import torch.nn as nn
 
 from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
     ModelOptFp8CheckpointAdapter,
+    ModelOptMixedPrecisionCheckpointAdapter,
+    ModelOptNvFp4CheckpointAdapter,
+    get_checkpoint_adapter,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -40,6 +43,40 @@ class _QuantizedPackedModelOptModel(nn.Module):
             "input_scale",
             nn.Parameter(torch.empty(1), requires_grad=False),
         )
+
+
+class _QuantizedPackedModelOptNvFp4Model(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.transformer = nn.Module()
+        self.transformer.block = nn.Module()
+        self.transformer.block.to_qkv = nn.Module()
+        self.transformer.block.to_qkv.register_parameter(
+            "weight",
+            nn.Parameter(torch.empty(2, 1, dtype=torch.uint8), requires_grad=False),
+        )
+        self.transformer.block.to_qkv.register_parameter(
+            "weight_scale",
+            nn.Parameter(torch.empty(2, 1, dtype=torch.float8_e4m3fn), requires_grad=False),
+        )
+        self.transformer.block.to_qkv.register_parameter(
+            "weight_scale_2",
+            nn.Parameter(torch.empty(1), requires_grad=False),
+        )
+        self.transformer.block.to_qkv.register_parameter(
+            "input_scale",
+            nn.Parameter(torch.empty(1), requires_grad=False),
+        )
+
+
+class _QuantConfig:
+    def __init__(self, name: str, **attrs) -> None:
+        self.name = name
+        for attr_name, attr_value in attrs.items():
+            setattr(self, attr_name, attr_value)
+
+    def get_name(self) -> str:
+        return self.name
 
 
 def _make_source() -> SimpleNamespace:
@@ -92,3 +129,54 @@ def test_modelopt_adapter_keeps_scale_tensors_for_quantized_target():
         "transformer.block.to_q.weight_scale",
         "transformer.block.to_q.input_scale",
     ]
+
+
+def test_modelopt_nvfp4_adapter_selected_for_checkpoint_config():
+    model = _QuantizedPackedModelOptNvFp4Model()
+    quant_config = _QuantConfig(
+        "modelopt_fp4",
+        is_checkpoint_nvfp4_serialized=True,
+    )
+
+    adapter = get_checkpoint_adapter(model, _make_source(), quant_config, use_safetensors=True)
+
+    assert isinstance(adapter, ModelOptNvFp4CheckpointAdapter)
+
+
+def test_modelopt_mixed_adapter_selected_for_checkpoint_config():
+    model = _QuantizedPackedModelOptNvFp4Model()
+    quant_config = _QuantConfig("modelopt_mixed")
+
+    adapter = get_checkpoint_adapter(model, _make_source(), quant_config, use_safetensors=True)
+
+    assert isinstance(adapter, ModelOptMixedPrecisionCheckpointAdapter)
+
+
+def test_modelopt_nvfp4_adapter_keeps_quantized_tensors_for_quantized_target():
+    model = _QuantizedPackedModelOptNvFp4Model()
+    adapter = ModelOptNvFp4CheckpointAdapter(model, _make_source())
+    weight = torch.tensor([[0x12], [0x34]], dtype=torch.uint8)
+    weight_scale = torch.tensor([[1.0], [0.5]], dtype=torch.float32).to(torch.float8_e4m3fn)
+    weight_scale_2 = torch.tensor([0.25], dtype=torch.float32)
+    input_scale = torch.tensor([0.75], dtype=torch.float32)
+
+    adapted = list(
+        adapter.adapt(
+            iter(
+                [
+                    ("transformer.block.to_q.weight_scale", weight_scale),
+                    ("transformer.block.to_q.weight_scale_2", weight_scale_2),
+                    ("transformer.block.to_q.input_scale", input_scale),
+                    ("transformer.block.to_q.weight", weight),
+                ]
+            )
+        )
+    )
+
+    assert [name for name, _ in adapted] == [
+        "transformer.block.to_q.weight_scale",
+        "transformer.block.to_q.weight_scale_2",
+        "transformer.block.to_q.input_scale",
+        "transformer.block.to_q.weight",
+    ]
+    assert adapted[-1][1].dtype == torch.uint8

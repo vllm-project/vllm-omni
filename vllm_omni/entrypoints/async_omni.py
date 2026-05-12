@@ -684,6 +684,16 @@ class AsyncOmni(EngineClient, OmniBase):
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 
+    async def notify_kv_transfer_request_rejected(
+        self,
+        request_id: str,
+        kv_transfer_params: dict[str, Any],
+        *,
+        data_parallel_rank: int | None = None,
+    ) -> None:
+        """Compatibility hook for vLLM's KV-transfer cleanup path."""
+        return None
+
     async def pause_generation(
         self,
         *,
