@@ -17,7 +17,32 @@ canonical mapping for both flows.
 
 from __future__ import annotations
 
+from typing import Any
+
 from .system_prompt import get_system_prompt
+
+# HunyuanImage-3.0-Instruct special token ids from tokenizer.json.
+# Keep offline AR prompt/stop-token behavior independent of runtime
+# tokenizer lookup for these fixed control tokens.
+HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS: dict[str, int] = {
+    "<|endoftext|>": 127957,
+    "<|startoftext|>": 127958,
+    "<boi>": 128000,
+    "<eoi>": 128001,
+    "<img>": 128006,
+    "<cfg>": 128010,
+    "<recaption>": 128018,
+    "</recaption>": 128019,
+    "<think>": 128023,
+    "</think>": 128024,
+    "<answer>": 128025,
+    "</answer>": 128026,
+    "<img_size_1024>": 128037,
+    "<img_ratio_0>": 128044,
+    "<img_ratio_32>": 128076,
+    "<img_ratio_33>": 130103,
+    "<img_ratio_36>": 130106,
+}
 
 # task -> (sys_type, bot_task, trigger_tag)
 _TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
@@ -25,15 +50,24 @@ _TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
     "i2t": ("en_unified", None, None),
     "it2i_think": ("en_unified", "think", "<think>"),
     "it2i_recaption": ("en_unified", "recaption", "<recaption>"),
+    "t2i": ("en_unified", "image", None),
+    "t2i_vanilla": ("en_vanilla", "image", None),
     "t2i_think": ("en_unified", "think", "<think>"),
     "t2i_recaption": ("en_unified", "recaption", "<recaption>"),
-    "t2i_vanilla": ("en_vanilla", "image", None),
 }
 
 
 def available_tasks() -> list[str]:
     """Sorted list of task keys accepted by `build_prompt` / `build_prompt_tokens`."""
     return sorted(_TASK_PRESETS)
+
+
+def resolve_stop_token_ids(
+    task: str = "it2i_think",
+    bot_task: str = "think",
+    tokenizer: Any | None = None,
+):
+    return [HUNYUAN_IMAGE3_SPECIAL_TOKEN_IDS["<answer>"]]
 
 
 def build_prompt(
@@ -149,4 +183,4 @@ def build_prompt_tokens(
     return ids
 
 
-__all__ = ["build_prompt", "build_prompt_tokens", "available_tasks"]
+__all__ = ["build_prompt", "build_prompt_tokens", "resolve_stop_token_ids", _TASK_PRESETS]

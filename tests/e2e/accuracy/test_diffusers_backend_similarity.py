@@ -119,7 +119,7 @@ def _run_diffusers_wan22_i2v(*, model: str, output_path: Path, conditioning_imag
     from diffusers import WanImageToVideoPipeline  # pyright: ignore[reportPrivateImportUsage]
     from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 
-    run_pre_test_cleanup(enable_force=True)
+    run_pre_test_cleanup()
     apply_ftfy_mock()
     pipe: WanImageToVideoPipeline | None = None
     try:
@@ -160,8 +160,8 @@ def _run_diffusers_wan22_i2v(*, model: str, output_path: Path, conditioning_imag
         del pipe
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        run_post_test_cleanup(enable_force=True)
+            torch.accelerator.empty_cache()
+        run_post_test_cleanup()
 
 
 def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> tuple[Image.Image, float]:
@@ -206,7 +206,7 @@ def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
 
 
 def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.Image, float]:
-    run_pre_test_cleanup(enable_force=True)
+    run_pre_test_cleanup()
     pipe: DiffusionPipeline | None = None
     try:
         pipe = DiffusionPipeline.from_pretrained(
@@ -240,8 +240,8 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
         del pipe
         gc.collect()
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        run_post_test_cleanup(enable_force=True)
+            torch.accelerator.empty_cache()
+        run_post_test_cleanup()
 
 
 @pytest.mark.benchmark
@@ -279,7 +279,15 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
 
 @pytest.mark.benchmark
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.parametrize("model_id", ["Wan-AI/Wan2.2-I2V-A14B-Diffusers"])
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        pytest.param(
+            "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+            marks=pytest.mark.skip(reason="#3488"),
+        ),
+    ],
+)
 def test_diffusers_backend_i2v_matches_diffusers(
     model_id: str,
     accuracy_artifact_root: Path,

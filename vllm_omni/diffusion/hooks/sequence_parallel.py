@@ -375,7 +375,7 @@ class SequenceParallelSplitHook(ModelHook):
         2. Creates an attention mask indicating valid vs padding positions
         3. Stores the mask and padding info in ForwardContext
         """
-        from vllm_omni.diffusion.attention.selector import get_attn_backend
+        from vllm_omni.diffusion.attention.selector import get_attn_backend_for_role
         from vllm_omni.diffusion.distributed.parallel_state import (
             get_ring_parallel_world_size,
             get_sequence_parallel_rank,
@@ -395,7 +395,17 @@ class SequenceParallelSplitHook(ModelHook):
             return sp_shard(x, dim, validate=False)
 
         # Check backend compatibility
-        attn_backend = get_attn_backend(-1)
+        attention_config = None
+        if is_forward_context_available():
+            od_config = get_forward_context().omni_diffusion_config
+            if od_config is not None:
+                attention_config = od_config.diffusion_attention_config
+
+        attn_backend, _ = get_attn_backend_for_role(
+            role="self",
+            head_size=-1,
+            attention_config=attention_config,
+        )
         if not attn_backend.supports_attention_mask:
             raise ValueError(
                 f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "

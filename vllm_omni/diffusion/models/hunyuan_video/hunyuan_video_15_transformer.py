@@ -24,6 +24,10 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
+from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
+from vllm_omni.diffusion.distributed.sp_sharding import sp_shard_with_padding
+from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.flux.flux_transformer import FeedForward
 
@@ -395,7 +399,8 @@ class HunyuanVideo15Attention(nn.Module):
         encoder_hidden_states: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         qkv, _ = self.to_qkv(hidden_states)
         q_size = self.to_qkv.num_heads * self.head_dim
         kv_size = self.to_qkv.num_kv_heads * self.head_dim
@@ -430,22 +435,40 @@ class HunyuanVideo15Attention(nn.Module):
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
 
-            query = torch.cat([query, encoder_query], dim=1)
-            key = torch.cat([key, encoder_key], dim=1)
-            value = torch.cat([value, encoder_value], dim=1)
-
         attn_metadata = None
-        if attention_mask is not None:
-            seq_len = query.shape[1]
-            # Pad mask to full sequence length (video + encoder tokens)
-            # Keep mask 2D (batch_size, seq_len) — each attention backend
-            # handles reshaping internally (flash_attn uses unpadding,
-            # SDPA expands to 4D via _maybe_reshape_attn_mask).
-            attention_mask = F.pad(attention_mask, (seq_len - attention_mask.shape[1], 0), value=True)
-            attention_mask = attention_mask.bool()
-            attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+        ctx = get_forward_context()
+        if ctx.sp_active and encoder_hidden_states is not None:
+            # Under Ulysses SP, encoder tokens are passed via joint_*
+            # metadata so they can be head-sliced separately from the
+            # all-to-all'd video tokens in UlyssesParallelAttention.
+            attn_metadata = AttentionMetadata(
+                joint_query=encoder_query,
+                joint_key=encoder_key,
+                joint_value=encoder_value,
+                joint_strategy="rear",
+            )
+            if attention_mask is not None:
+                attn_metadata.joint_attn_mask = attention_mask.bool()
+            if hidden_states_mask is not None:
+                attn_metadata.attn_mask = hidden_states_mask
+            hidden_states = self.attn(query, key, value, attn_metadata)
+        else:
+            if encoder_hidden_states is not None:
+                query = torch.cat([query, encoder_query], dim=1)
+                key = torch.cat([key, encoder_key], dim=1)
+                value = torch.cat([value, encoder_value], dim=1)
 
-        hidden_states = self.attn(query, key, value, attn_metadata)
+            if attention_mask is not None:
+                seq_len = query.shape[1]
+                # Pad mask to full sequence length (video + encoder tokens)
+                # Keep mask 2D (batch_size, seq_len) - each attention backend
+                # handles reshaping internally (flash_attn uses unpadding,
+                # SDPA expands to 4D via _maybe_reshape_attn_mask).
+                attention_mask = F.pad(attention_mask, (seq_len - attention_mask.shape[1], 0), value=True)
+                attention_mask = attention_mask.bool()
+                attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+
+            hidden_states = self.attn(query, key, value, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -499,7 +522,8 @@ class HunyuanVideo15TransformerBlock(nn.Module):
         temb: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         freqs_cis: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
         norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
             encoder_hidden_states, emb=temb
@@ -510,6 +534,7 @@ class HunyuanVideo15TransformerBlock(nn.Module):
             encoder_hidden_states=norm_encoder_hidden_states,
             attention_mask=attention_mask,
             image_rotary_emb=freqs_cis,
+            hidden_states_mask=hidden_states_mask,
         )
 
         hidden_states = hidden_states + attn_output * gate_msa.unsqueeze(1)
@@ -546,6 +571,14 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
     }
 
     _hsdp_shard_conditions = [is_transformer_block_module]
+
+    _sp_plan = {
+        "rope": {
+            0: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
+            1: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
+        },
+        "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
+    }
 
     def __init__(
         self,
@@ -634,6 +667,18 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
 
         hidden_states = self.x_embedder(hidden_states)
 
+        # Scatter hidden_states along seq dim for sequence parallelism.
+        # Done here (after x_embedder, before transformer_blocks) so that
+        # CacheDiT sees already-sharded hidden_states when saving
+        # original_hidden_states at the start of CachedBlocks.forward.
+        if get_sequence_parallel_world_size() > 1:
+            hidden_states, _pad_size = sp_shard_with_padding(hidden_states, dim=1)
+            if _pad_size > 0:
+                ctx = get_forward_context()
+                if ctx.sp_original_seq_len is None:
+                    ctx.sp_padding_size = _pad_size
+                    ctx.sp_original_seq_len = hidden_states.shape[1] * get_sequence_parallel_world_size() - _pad_size
+
         encoder_hidden_states = self.context_embedder(encoder_hidden_states, timestep, encoder_attention_mask)
 
         encoder_hidden_states_cond_emb = self.cond_type_embed(
@@ -717,6 +762,23 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         encoder_hidden_states = torch.stack(new_encoder_hidden_states)
         encoder_attention_mask = torch.stack(new_encoder_attention_mask)
 
+        # Create explicit attn_mask for image tokens when SP auto_pad is active.
+        ctx = get_forward_context()
+        hidden_states_mask = None
+        if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+            padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+            hidden_states_mask = torch.ones(
+                batch_size,
+                padded_seq_len,
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+
+            # if mask is all true, set it to None
+            if hidden_states_mask.all():
+                hidden_states_mask = None
+
         for block in self.transformer_blocks:
             hidden_states, encoder_hidden_states = block(
                 hidden_states,
@@ -724,6 +786,7 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
                 temb,
                 encoder_attention_mask,
                 image_rotary_emb,
+                hidden_states_mask=hidden_states_mask,
             )
 
         hidden_states = self.norm_out(hidden_states, temb)

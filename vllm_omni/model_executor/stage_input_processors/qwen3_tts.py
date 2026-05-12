@@ -161,10 +161,11 @@ def talker2code2wav_async_chunk(
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
+    configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
 
     # Per-request override takes priority over dynamic IC.
-    per_request_override = False
-    initial_chunk_size = 0
+    fixed_initial_chunk_size = configured_initial_chunk_size > 0
+    initial_chunk_size = configured_initial_chunk_size
     additional_information = getattr(request, "additional_information", None)
 
     if (
@@ -175,10 +176,10 @@ def talker2code2wav_async_chunk(
         entry = additional_information.entries["initial_codec_chunk_frames"]
         if entry.list_data is not None and len(entry.list_data) == 1:
             initial_chunk_size = int(entry.list_data[0])
-            per_request_override = True
+            fixed_initial_chunk_size = True
 
     # Dynamic IC: cache per request so boundaries stay stable for its lifetime.
-    if not per_request_override:
+    if not fixed_initial_chunk_size:
         _ic_cache = getattr(transfer_manager, "_cached_ic", None)
         if _ic_cache is None:
             _ic_cache = {}
@@ -190,7 +191,7 @@ def talker2code2wav_async_chunk(
             _ic_cache[request_id] = compute_dynamic_initial_chunk_size(active, capacity, max_ic)
         initial_chunk_size = _ic_cache[request_id]
 
-    if chunk_size <= 0 or left_context_size_config < 0 or initial_chunk_size < 0:
+    if chunk_size <= 0 or left_context_size_config < 0 or configured_initial_chunk_size < 0 or initial_chunk_size < 0:
         raise ValueError(
             f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
             f"codec_left_context_frames={left_context_size_config}, "
@@ -214,21 +215,16 @@ def talker2code2wav_async_chunk(
             }
         return None
 
-    in_initial_phase = initial_chunk_size > 0 and initial_chunk_size < chunk_size and length <= chunk_size
+    use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
 
-    if in_initial_phase:
-        # IC phase: emit every initial_chunk_size frames with growing left context.
-        if not finished and length % initial_chunk_size != 0:
+    if use_first_chunk and length <= initial_chunk_size:
+        if not finished and length < initial_chunk_size:
             return None
-        context_length = (
-            length % initial_chunk_size if (finished and length % initial_chunk_size != 0) else initial_chunk_size
-        )
+        context_length = length if finished and length < initial_chunk_size else initial_chunk_size
     else:
-        # Normal phase: offset so the first normal emit picks up after IC phase.
-        # IC is stateless (may change with load); any mismatch is absorbed by left_context.
-        initial_coverage = (
-            (chunk_size // initial_chunk_size) * initial_chunk_size if 0 < initial_chunk_size < chunk_size else 0
-        )
+        # The initial chunk is only for TTFA. After that, return to the normal
+        # codec chunk size so Code2Wav is not flooded by repeated tiny windows.
+        initial_coverage = initial_chunk_size if use_first_chunk else 0
         adjusted = length - initial_coverage
         if not finished and adjusted % chunk_size != 0:
             return None

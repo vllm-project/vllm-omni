@@ -338,6 +338,16 @@ class OmniServeCommand(CLISubcommand):
                 'Example: \'{"method":"gguf","gguf_model":"/path/to/model.gguf"}\'.'
             ),
         )
+        omni_config_group.add_argument(
+            "--force-cutlass-fp8",
+            action="store_true",
+            default=None,
+            help=(
+                "Diffusion-only runtime override for ModelOpt FP8 checkpoints: "
+                "force CUTLASS FP8 linear kernels on CUDA SM89+ devices. "
+                "Ignored for BF16, non-ModelOpt FP8, ROCm, and older CUDA GPUs."
+            ),
+        )
 
         # HSDP (Hybrid Sharded Data Parallel) parameters
         omni_config_group.add_argument(
@@ -358,6 +368,32 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=1,
             help="Number of replica groups for HSDP. Each group holds a full sharded copy.",
+        )
+
+        # Attention backend configuration
+        omni_config_group.add_argument(
+            "--diffusion-attention-backend",
+            dest="diffusion_attention_backend",
+            type=str,
+            default=None,
+            help="Diffusion attention backend (shorthand). "
+            "Sets the default backend for all diffusion attention roles, e.g. 'FLASH_ATTN'. "
+            "May be combined with --diffusion-attention-config.per_role.* overrides, "
+            "but mutually exclusive with --diffusion-attention-config.default.backend.",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-attention-config",
+            "-dac",
+            dest="diffusion_attention_config",
+            type=json.loads,
+            default=None,
+            help="Diffusion attention config. Accepts JSON or vLLM-style dotted flags. "
+            "Examples: "
+            "--diffusion-attention-config.default.backend FLASH_ATTN, "
+            "--diffusion-attention-config.per_role.self.backend SPARSE_BLOCK, "
+            "--diffusion-attention-config.per_role.cross.backend SAGE_ATTN, "
+            '--diffusion-attention-config \'{"default": {"backend": "FLASH_ATTN"}, '
+            '"per_role": {"cross": {"backend": "SAGE_ATTN"}}}\'.',
         )
 
         # Cache optimization parameters
@@ -557,6 +593,7 @@ def run_headless(args: argparse.Namespace) -> None:
         model,
         args_dict.get("stage_configs_path"),
         args_dict,
+        deploy_config_path=args_dict.get("deploy_config"),
     )
 
     # Locate the stage config that matches stage_id.

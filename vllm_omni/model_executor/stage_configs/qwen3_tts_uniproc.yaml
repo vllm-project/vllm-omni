@@ -38,7 +38,7 @@ stage_args:
       devices: "0"
     engine_args:
       model_stage: code2wav
-      max_num_seqs: 1
+      max_num_seqs: 10
       model_arch: Qwen3TTSCode2Wav
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
@@ -87,6 +87,8 @@ runtime:
         # Match the decoder sliding attention window to avoid chunk-boundary noise.
         codec_chunk_frames: 25
         codec_left_context_frames: 72
+        # Emit only the first audio chunk early, then return to codec_chunk_frames.
+        initial_codec_chunk_frames: 1
 
   edges:
     - from: 0

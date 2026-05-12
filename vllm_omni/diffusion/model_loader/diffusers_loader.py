@@ -7,7 +7,7 @@ import re
 import time
 from collections.abc import Generator, Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import torch
 from huggingface_hub import hf_hub_download
@@ -32,12 +32,13 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig
+from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
+    get_checkpoint_adapter,
+)
 from vllm_omni.diffusion.model_loader.gguf_adapters import get_gguf_adapter
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
+from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.registry import initialize_model
-
-if TYPE_CHECKING:
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 logger = init_logger(__name__)
 
@@ -176,7 +177,11 @@ class DiffusersPipelineLoader:
 
         return hf_folder, hf_weights_files, use_safetensors
 
-    def _get_weights_iterator(self, source: "ComponentSource") -> Generator[tuple[str, torch.Tensor], None, None]:
+    def _get_weights_iterator(
+        self,
+        source: "ComponentSource",
+        model: nn.Module | None = None,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         _, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
@@ -212,7 +217,34 @@ class DiffusersPipelineLoader:
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        prefixed_weights_iterator = ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        if model is not None:
+            checkpoint_adapter = self._get_checkpoint_adapter(model, source, use_safetensors)
+            if checkpoint_adapter is not None:
+                return checkpoint_adapter.adapt(prefixed_weights_iterator)
+        return prefixed_weights_iterator
+
+    def _get_source_quant_config(self, source: "ComponentSource") -> object | None:
+        if self.od_config is None:
+            return None
+
+        quant_config = self.od_config.quantization_config
+        if hasattr(quant_config, "resolve"):
+            return quant_config.resolve(source.prefix.rstrip("."))
+        return quant_config
+
+    def _get_checkpoint_adapter(
+        self,
+        model: nn.Module,
+        source: "ComponentSource",
+        use_safetensors: bool,
+    ):
+        return get_checkpoint_adapter(
+            model=model,
+            source=source,
+            quant_config=self._get_source_quant_config(source),
+            use_safetensors=use_safetensors,
+        )
 
     def get_all_weights(
         self,
@@ -220,7 +252,7 @@ class DiffusersPipelineLoader:
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         sources = self._get_weight_sources(model)
         for source in sources:
-            yield from self._get_weights_iterator(source)
+            yield from self._get_weights_iterator(source, model=model)
 
     def _get_weight_sources(self, model: nn.Module) -> tuple["ComponentSource", ...]:
         return tuple(
@@ -268,7 +300,7 @@ class DiffusersPipelineLoader:
         """Load a model with the given configurations."""
         if load_format is None:
             load_format = "default"
-
+        self.od_config = od_config
         # CPU offload + FP8: load weights on device for FP8 quantization
         if load_device == "cpu" and od_config.quantization_config is not None:
             load_device = device.type
@@ -278,7 +310,7 @@ class DiffusersPipelineLoader:
         with set_default_torch_dtype(od_config.dtype):
             if od_config.parallel_config.use_hsdp:
                 model = self._load_model_with_hsdp(
-                    od_config, load_format=load_format, custom_pipeline_name=custom_pipeline_name
+                    od_config, target_device=device, load_format=load_format, custom_pipeline_name=custom_pipeline_name
                 )
             else:
                 with target_device:
@@ -287,16 +319,18 @@ class DiffusersPipelineLoader:
                     elif load_format == "diffusers":
                         model = DiffusersAdapterPipeline(od_config=od_config, device=target_device)
                     elif load_format == "custom_pipeline":
+                        from vllm_omni.diffusion.config import set_current_diffusion_config
+
                         model_cls = resolve_obj_by_qualname(custom_pipeline_name)
-                        model = model_cls(od_config=od_config)
+                        with set_current_diffusion_config(od_config):
+                            model = model_cls(od_config=od_config)
                     else:
-                        # 'dummy' format should not call this function at all
                         raise ValueError(f"Unknown load_format: {load_format}")
                 logger.debug("Loading weights on %s ...", load_device)
                 if load_format == "diffusers":
                     # DiffusersAdapterPipeline.load_weights() calls
-                    # DiffusionPipeline.from_pretrained() internally — it does
-                    # NOT use our native (customized) pipeline classes.
+                    # DiffusionPipeline.from_pretrained() internally; it does
+                    # not use our native customized pipeline classes.
                     cast(DiffusersAdapterPipeline, model).load_weights()
                 elif self._is_gguf_quantization(od_config):
                     self._load_weights_with_gguf(model, od_config)
@@ -448,9 +482,7 @@ class DiffusersPipelineLoader:
     def _get_model_loadable_names(self, model: nn.Module) -> set[str]:
         # Avoid model.state_dict() here because GGUF uses UninitializedParameter
         # which raises during detach(). Collect names directly.
-        names = {name for name, _ in model.named_parameters()}
-        names.update(name for name, _ in model.named_buffers())
-        return names
+        return {name for name, _ in model.named_parameters()} | {name for name, _ in model.named_buffers()}
 
     def _resolve_gguf_model_path(self, gguf_model: str, revision: str | None) -> str:
         if os.path.isfile(gguf_model):
@@ -529,6 +561,7 @@ class DiffusersPipelineLoader:
     def _load_model_with_hsdp(
         self,
         od_config: OmniDiffusionConfig,
+        target_device: torch.device,
         load_format: str = "default",
         custom_pipeline_name: str | None = None,
     ) -> nn.Module:
@@ -558,8 +591,11 @@ class DiffusersPipelineLoader:
         if load_format == "default":
             model = initialize_model(od_config)
         elif load_format == "custom_pipeline":
+            from vllm_omni.diffusion.config import set_current_diffusion_config
+
             model_cls = resolve_obj_by_qualname(custom_pipeline_name)
-            model = model_cls(od_config=od_config)
+            with set_current_diffusion_config(od_config):
+                model = model_cls(od_config=od_config)
         self.load_weights(model)
 
         # Collect all transformers to shard (some models have transformer_2 for MoE)
@@ -578,4 +614,19 @@ class DiffusersPipelineLoader:
         for name, trans in transformers_to_shard:
             logger.debug("Applying HSDP to %s", name)
             apply_hsdp_to_model(trans, hsdp_config)
+
+        # # HSDP only shards transformer modules. All other runtime modules must
+        # # be placed on the execution device explicitly after sharding.
+        discovered_modules = ModuleDiscovery.discover(model)
+        modules_to_move: list[nn.Module] = []
+        if discovered_modules.vaes is not None:
+            modules_to_move.extend(discovered_modules.vaes)
+        if discovered_modules.encoders is not None:
+            modules_to_move.extend(discovered_modules.encoders)
+        if discovered_modules.resident_modules is not None:
+            modules_to_move.extend(discovered_modules.resident_modules)
+
+        for module in modules_to_move:
+            module.to(target_device)
+
         return model

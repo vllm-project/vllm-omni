@@ -6,7 +6,10 @@ import threading
 import wave
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from tests.helpers.runtime import DiffusionResponse
 
 import numpy as np
 import soundfile as sf
@@ -30,7 +33,7 @@ _PRESET_VOICE_GENDER_MAP: dict[str, str] = {
 
 
 def assert_image_diffusion_response(
-    response,
+    response: "DiffusionResponse",
     request_config: dict[str, Any],
     run_level: str = None,
 ) -> None:
@@ -64,12 +67,24 @@ def assert_image_diffusion_response(
         height = extra_body.get("height")
 
         if width is not None or height is not None:
-            for img in response.images:
-                assert_image_valid(img, width=width, height=height)
+            if isinstance(width, (list, tuple)) and isinstance(height, (list, tuple)):
+                assert len(response.images) == len(width) == len(height), (
+                    f"Per-output size lists require one image per entry; got {len(response.images)} images, "
+                    f"len(width)={len(width)}, len(height)={len(height)}"
+                )
+                for img, w, h in zip(response.images, width, height, strict=True):
+                    assert_image_valid(img, width=int(w), height=int(h))
+            else:
+                for img in response.images:
+                    assert_image_valid(
+                        img,
+                        width=_maybe_int(width) if width is not None else None,
+                        height=_maybe_int(height) if height is not None else None,
+                    )
 
 
 def assert_video_diffusion_response(
-    response,
+    response: "DiffusionResponse",
     request_config: dict[str, Any],
     run_level: str = None,
 ) -> None:
@@ -110,7 +125,7 @@ def assert_video_diffusion_response(
 
 
 def assert_audio_diffusion_response(
-    response,
+    response: "DiffusionResponse",
     request_config: dict[str, Any],
     run_level: str = None,
 ) -> None:
@@ -422,9 +437,6 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
         AssertionError: When the response does not meet validation criteria
     """
     assert response.success, "The request failed."
-    e2e_latency = response.e2e_latency
-    if e2e_latency is not None:
-        print(f"the e2e latency is: {e2e_latency}")
 
     modalities = request_config.get("modalities", ["text", "audio"])
 
@@ -483,11 +495,72 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                 )
 
 
+def _speech_combined_error_text_for_assert(response: Any) -> str:
+    """Join ``error_message`` and UTF-8 body (e.g. HTTP 200 + JSON) for substring checks."""
+    parts: list[str] = []
+    em = getattr(response, "error_message", None)
+    if em:
+        parts.append(str(em))
+    ab = getattr(response, "audio_bytes", None)
+    if ab:
+        parts.append(ab.decode("utf-8", errors="replace"))
+    return "\n".join(parts)
+
+
+def _assert_speech_error_substrings(haystack: str, err_expected: Any) -> None:
+    if isinstance(err_expected, (list, tuple)):
+        assert any(str(s) in haystack for s in err_expected), (
+            f"Expected error text to contain one of {err_expected!r}, got: {haystack!r}"
+        )
+    else:
+        assert str(err_expected) in haystack, f"Expected error text to contain {str(err_expected)!r}, got: {haystack!r}"
+
+
 def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str) -> None:
+    """Validate speech API results.
+
+    If ``status_code`` is set: assert HTTP status, then optional ``err_message`` (4xx: ``error_message`` only;
+    HTTP 200: ``error_message`` and/or body, e.g. JSON with HTTP 200).
+
+    If only ``err_message`` is set: assert substring(s) on combined error text. Otherwise success/min_audio/etc.
+    """
+    # When present, only compare HTTP status and skip all other checks (e.g. expected 4xx).
+    # ``status_code`` may be a single int or a collection of allowed codes (e.g. ``(400, 422)``).
+    expected_status = request_config.get("status_code")
+    err_expected = request_config.get("err_message")
+    if expected_status is not None:
+        actual = getattr(response, "status_code", None)
+        assert actual is not None, (
+            "request_config has status_code but response has no .status_code "
+            "(set OmniResponse.status_code or pass a response object with status_code)"
+        )
+        if isinstance(expected_status, (list, tuple, set, frozenset)):
+            assert actual in expected_status, f"Expected HTTP status in {expected_status!r}, got {actual}"
+        else:
+            assert actual == int(expected_status), f"Expected HTTP status {int(expected_status)}, got {actual}"
+
+        if err_expected is not None:
+            if actual is not None and actual != 200:
+                msg = (getattr(response, "error_message", None) or "") + ""
+                _assert_speech_error_substrings(msg, err_expected)
+            else:
+                _assert_speech_error_substrings(_speech_combined_error_text_for_assert(response), err_expected)
+        return
+
+    if err_expected is not None:
+        _assert_speech_error_substrings(_speech_combined_error_text_for_assert(response), err_expected)
+        return
+
     assert response.success, "The request failed."
-    e2e_latency = getattr(response, "e2e_latency", None)
-    if e2e_latency is not None:
-        print(f"the avg e2e latency is: {e2e_latency}")
+
+    # Optional floor on decoded audio size (models with very short clips may use a lower value).
+    min_audio = request_config.get("min_audio_bytes")
+    if min_audio is not None:
+        n = int(min_audio)
+        if n > 0:
+            ab = response.audio_bytes
+            assert ab is not None, "Expected audio bytes when min_audio_bytes is set"
+            assert len(ab) > n, f"Audio payload too small: {len(ab)} bytes, expected more than {n} (min_audio_bytes)"
 
     req_fmt = request_config.get("response_format")
     if req_fmt == "pcm" and response.audio_bytes:
@@ -514,11 +587,8 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
         _assert_preset_voice_gender_from_audio(response.audio_bytes, request_config.get("voice"))
 
 
-def assert_diffusion_response(response: Any, request_config: dict[str, Any], run_level: str = None):
+def assert_diffusion_response(response: "DiffusionResponse", request_config: dict[str, Any], run_level: str = None):
     assert response.success, "The request failed."
-    e2e_latency = getattr(response, "e2e_latency", None)
-    if e2e_latency is not None:
-        print(f"the avg e2e is: {e2e_latency}")
     has_any_content = any(content is not None for content in (response.images, response.videos, response.audios))
     assert has_any_content, "Response contains no images, videos, or audios"
     if response.images is not None:

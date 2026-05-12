@@ -286,9 +286,11 @@ class Qwen3TTSCode2Wav(nn.Module):
         if hasattr(self.decoder, "precompute_snake_caches"):
             self.decoder.precompute_snake_caches()
 
-        # Read chunk config from stage connector and update decode params
-        chunk_frames = 0
-        left_frames = 0
+        # The connector codec chunk settings control inter-stage streaming
+        # windows. Keep decoder-internal chunking separate; using the small
+        # streaming window here causes repeated overlap decode in Code2Wav.
+        codec_chunk_frames = 0
+        codec_left_context_frames = 0
         model_cfg = getattr(self.vllm_config, "model_config", None)
         connector_cfg = getattr(model_cfg, "stage_connector_config", None)
         extra_cfg = (
@@ -296,20 +298,40 @@ class Qwen3TTSCode2Wav(nn.Module):
             if isinstance(connector_cfg, dict)
             else getattr(connector_cfg, "extra", None)
         )
+
+        def _get_int_config(name: str, default: int) -> int:
+            value = extra_cfg.get(name, default)
+            if value is None:
+                return default
+            try:
+                return int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
+
         if isinstance(extra_cfg, dict):
-            chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
-            left_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
-            if getattr(model_cfg, "async_chunk", False) and chunk_frames > 0:
-                self._decode_chunk_frames = chunk_frames
-                self._decode_left_context_frames = left_frames if left_frames > 0 else 0
+            codec_chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
+            codec_left_context_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
+            decode_chunk_frames = _get_int_config("decode_chunk_frames", self._decode_chunk_frames)
+            decode_left_context_frames = _get_int_config(
+                "decode_left_context_frames",
+                self._decode_left_context_frames,
+            )
+            if decode_chunk_frames <= 0 or decode_left_context_frames < 0:
+                raise ValueError(
+                    "Invalid Qwen3-TTS Code2Wav decode chunk config: "
+                    f"decode_chunk_frames={decode_chunk_frames}, "
+                    f"decode_left_context_frames={decode_left_context_frames}"
+                )
+            self._decode_chunk_frames = decode_chunk_frames
+            self._decode_left_context_frames = decode_left_context_frames
 
         if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
             try:
                 if (
-                    chunk_frames > 0
-                    and left_frames > 0
+                    codec_chunk_frames > 0
+                    and codec_left_context_frames > 0
                     and self._decoder_sliding_window
-                    and left_frames < self._decoder_sliding_window
+                    and codec_left_context_frames < self._decoder_sliding_window
                 ):
                     logger.warning(
                         "Qwen3-TTS streaming codec_left_context_frames=%d "
@@ -317,15 +339,17 @@ class Qwen3TTSCode2Wav(nn.Module):
                         "chunk-boundary distortion may occur. "
                         "Increase codec_left_context_frames to at least "
                         "%d for streaming.",
-                        left_frames,
+                        codec_left_context_frames,
                         self._decoder_sliding_window,
                         self._decoder_sliding_window,
                     )
 
                 self.decoder.enable_cudagraph(
                     device=device,
-                    codec_chunk_frames=chunk_frames,
-                    codec_left_context_frames=left_frames,
+                    codec_chunk_frames=codec_chunk_frames,
+                    codec_left_context_frames=codec_left_context_frames,
+                    decode_chunk_size=self._decode_chunk_frames,
+                    decode_left_context=self._decode_left_context_frames,
                 )
                 logger.info("Code2Wav decoder CUDA Graph enabled")
             except Exception:

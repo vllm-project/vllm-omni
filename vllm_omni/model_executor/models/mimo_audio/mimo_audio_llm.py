@@ -793,7 +793,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         local_embeds: torch.FloatTensor,  # [1, 1, hidden_size]
         tokens_dtype: torch.dtype = torch.int64,
         tokens_device: torch.device = torch.device(
-            f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
+            f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
         ),
         local_sampler: MiMoSampler | MiMoLocalSamplerTensor | None = None,
     ):
@@ -847,7 +847,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         local_embeds: torch.FloatTensor,  # [1, 1, hidden_size]
         tokens_dtype: torch.dtype = torch.int64,
         tokens_device: torch.device = torch.device(
-            f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
+            f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
         ),
         local_sampler: MiMoSampler | None = None,
     ):

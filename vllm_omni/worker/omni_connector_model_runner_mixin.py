@@ -120,6 +120,7 @@ class OmniConnectorModelRunnerMixin:
         # ownership lives in ``_local_stage_payload_cache``.
         self._send_side_request_payload: dict[str, dict[str, Any]] = {}
         self._code_prompt_token_ids: dict[str, list[list[int]]] = defaultdict(list)
+        self._cached_ic: dict[str, int] = {}
         self._request_ids_mapping: dict[str, str] = {}
 
         # -- async I/O state (shared by chunk + full_payload_mode) --
@@ -220,6 +221,7 @@ class OmniConnectorModelRunnerMixin:
                 self._put_req_chunk.pop(send_req_id, None)
                 self._send_side_request_payload.pop(send_req_id, None)
                 self._code_prompt_token_ids.pop(send_req_id, None)
+                self._cached_ic.pop(send_req_id, None)
             self._kv_pending_transfers.pop(req_id, None)
             self._kv_active_transfers.discard(req_id)
             self._kv_completed_transfers.discard(req_id)
@@ -239,7 +241,9 @@ class OmniConnectorModelRunnerMixin:
     def _drop_send_side_payload_state(self, req_id: str, ext_id: str | None) -> None:
         if ext_id is not None:
             self._send_side_request_payload.pop(ext_id, None)
+            self._cached_ic.pop(ext_id, None)
         self._send_side_request_payload.pop(req_id, None)
+        self._cached_ic.pop(req_id, None)
 
     def _cleanup_recv_delivery_state(self, req_id: str) -> None:
         """Clear recv-side delivery-cycle state."""
@@ -1786,6 +1790,7 @@ class OmniConnectorModelRunnerMixin:
                 self._put_req_chunk.pop(cleanup_req_id, None)
                 self._send_side_request_payload.pop(cleanup_req_id, None)
                 self._code_prompt_token_ids.pop(cleanup_req_id, None)
+                self._cached_ic.pop(cleanup_req_id, None)
 
     # ------------------------------------------------------------------ #
     #  Payload accumulation  (ported from OmniChunkTransferAdapter)
