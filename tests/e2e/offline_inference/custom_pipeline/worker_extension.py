@@ -44,11 +44,6 @@ from vllm_omni.lora.request import LoRARequest as OmniLoRARequest
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------
-#  In-memory LoRA request (mirror of verl_omni's OmniTensorLoRARequest)
-# ---------------------------------------------------------------------
-
-
 class OmniTensorLoRARequestForTest(OmniLoRARequest):
     peft_config: dict = field(default=None)
     lora_tensors: dict = field(default=None)
@@ -69,75 +64,6 @@ def set_death_signal() -> None:
 
 
 # ---------------------------------------------------------------------
-#  VLLMOmniHijackForTest — verbatim port of
-#  verl_omni.utils.vllm_omni.utils.VLLMOmniHijack (minus verl's VLLMHijack
-#  cascade, which targets the AR/text LRU LoRA manager not exercised here).
-# ---------------------------------------------------------------------
-
-
-class VLLMOmniHijackForTest:
-    """Monkey-patches vllm-omni internals to support in-memory LoRA tensors."""
-
-    _applied: bool = False
-
-    @staticmethod
-    def hijack() -> None:
-        if VLLMOmniHijackForTest._applied:
-            return
-
-        def hijack__load_adapter(self, lora_request: OmniTensorLoRARequestForTest) -> tuple[LoRAModel, PEFTHelper]:
-            if not self._expected_lora_modules:
-                raise ValueError("No supported LoRA modules found in the diffusion pipeline.")
-
-            logger.debug("Supported LoRA modules: %s", self._expected_lora_modules)
-
-            lora_tensors = None
-            if isinstance(lora_request, OmniTensorLoRARequestForTest):
-                peft_config = lora_request.peft_config
-                lora_tensors = lora_request.lora_tensors
-                peft_helper = PEFTHelper.from_dict(peft_config)
-            else:
-                lora_path = get_adapter_absolute_path(lora_request.lora_path)
-                logger.debug("Resolved LoRA path: %s", lora_path)
-                peft_helper = PEFTHelper.from_local_dir(
-                    lora_path,
-                    max_position_embeddings=None,
-                    tensorizer_config_dict=lora_request.tensorizer_config_dict,
-                )
-
-            if isinstance(lora_request, OmniTensorLoRARequestForTest):
-                lora_model = LoRAModel.from_lora_tensors(
-                    tensors=lora_tensors,
-                    peft_helper=peft_helper,
-                    lora_model_id=lora_request.lora_int_id,
-                    device="cpu",
-                    dtype=self.dtype,
-                    model_vocab_size=None,
-                    weights_mapper=None,
-                )
-            else:
-                lora_model = LoRAModel.from_local_checkpoint(
-                    lora_path,
-                    expected_lora_modules=self._expected_lora_modules,
-                    peft_helper=peft_helper,
-                    lora_model_id=lora_request.lora_int_id,
-                    device="cpu",
-                    dtype=self.dtype,
-                    model_vocab_size=None,
-                    tensorizer_config_dict=lora_request.tensorizer_config_dict,
-                    weights_mapper=None,
-                )
-
-            for lora in lora_model.loras.values():
-                lora.optimize()
-
-            return lora_model, peft_helper
-
-        DiffusionLoRAManager._load_adapter = hijack__load_adapter
-        VLLMOmniHijackForTest._applied = True
-
-
-# ---------------------------------------------------------------------
 #  The worker extension itself
 # ---------------------------------------------------------------------
 
@@ -152,7 +78,6 @@ class vLLMOmniColocateWorkerExtensionForTest(CustomPipelineWorkerExtension):
 
     def __new__(cls, **kwargs):
         set_death_signal()
-        VLLMOmniHijackForTest.hijack()
         return super().__new__(cls)
 
     @staticmethod
