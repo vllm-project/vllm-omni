@@ -29,7 +29,6 @@ import signal
 
 from msgspec import field
 
-
 from vllm_omni.diffusion.worker.diffusion_worker import CustomPipelineWorkerExtension
 from vllm_omni.lora.request import LoRARequest as OmniLoRARequest
 
