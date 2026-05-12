@@ -8,8 +8,8 @@ import pytest
 import torch
 
 from vllm_omni.model_executor.stage_input_processors.glm_image import (
-    _first_source_image,
     _extract_latent_payload,
+    _first_source_image,
     _has_source_image,
     _parse_generated_tokens,
     _upsample_token_ids,
