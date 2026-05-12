@@ -551,3 +551,31 @@ def test_language_001(omni_server, openai_client) -> None:
     }
 
     openai_client.send_omni_request(request_config)
+
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_long_text_output_001(omni_server, openai_client) -> None:
+    """
+    Input Modal: text only (long-form generation prompt).
+    Output Modal: text only
+    Input Setting: stream=False
+    Datasets: single request
+    Validates that the model can produce long text output (>= 300 words).
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text="Tell a 500-word story.",
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+    }
+
+    responses = openai_client.send_omni_request(request_config)
+    text = responses[0].text_content if responses else ""
+    word_count = len(text.split())
+    assert word_count >= 300, (
+        f"Expected at least 300 words in long output, got {word_count}"
+    )
