@@ -227,7 +227,7 @@ class Orchestrator:
             raise ValueError(f"Missing sampling params for stage 0. Got {len(sampling_params_list)} stage params.")
         final_stage_id = msg["final_stage_id"]
 
-        logger.info(
+        logger.debug(
             "[Orchestrator] _handle_add_request: stage=%s req=%s "
             "prompt_type=%s original_prompt_type=%s final_stage=%s "
             "num_sampling_params=%d",

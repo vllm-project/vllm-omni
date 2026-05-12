@@ -69,6 +69,34 @@ def supports_audio_output(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_audio_output", False))
 
 
+def get_extra_body_params(model_class_name: str) -> frozenset[str]:
+    """Return the set of extra_body keys accepted by a pipeline.
+
+    Each pipeline can declare ``EXTRA_BODY_PARAMS: ClassVar[frozenset[str]]``
+    to advertise which request-level parameters should be forwarded from
+    ``extra_body`` to ``OmniDiffusionSamplingParams.extra_args``.
+    Returns an empty frozenset when the pipeline does not declare any.
+    """
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return frozenset()
+    return frozenset(getattr(model_cls, "EXTRA_BODY_PARAMS", frozenset()))
+
+
+def get_extra_output_params(model_class_name: str) -> frozenset[str]:
+    """Return the set of custom_output keys to expose in API response metrics.
+
+    Each pipeline can declare ``EXTRA_OUTPUT_PARAMS: ClassVar[frozenset[str]]``
+    to advertise which ``DiffusionOutput.custom_output`` keys should be
+    copied into the response ``metrics`` dict.
+    Returns an empty frozenset when the pipeline does not declare any.
+    """
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return frozenset()
+    return frozenset(getattr(model_cls, "EXTRA_OUTPUT_PARAMS", frozenset()))
+
+
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
@@ -147,7 +175,7 @@ class DiffusionEngine:
             preprocess_start_time = time.perf_counter()
             request = self.pre_process_func(request)
             preprocess_time = time.perf_counter() - preprocess_start_time
-            logger.info(f"Pre-processing completed in {preprocess_time:.4f} seconds")
+            logger.debug("Pre-processing completed in %.4f seconds", preprocess_time)
 
         exec_start_time = time.perf_counter()
         output = await self.async_add_req_and_wait_for_response(request)
@@ -157,7 +185,7 @@ class DiffusionEngine:
             raise DiffusionRequestAbortedError(output.abort_message or "Diffusion request aborted.")
         if output.error:
             raise RuntimeError(output.error)
-        logger.info("Generation completed successfully.")
+        logger.debug("Generation completed successfully.")
 
         if output.output is None:
             logger.warning("Output is None, returning empty OmniRequestOutput")
@@ -204,10 +232,10 @@ class DiffusionEngine:
             model_fps = outputs.get("fps")
             outputs = outputs.get("video", outputs)
         postprocess_time = time.perf_counter() - postprocess_start_time
-        logger.info(f"Post-processing completed in {postprocess_time:.4f} seconds")
+        logger.debug("Post-processing completed in %.4f seconds", postprocess_time)
 
         step_total_ms = (time.perf_counter() - diffusion_engine_start_time) * 1000
-        logger.info(
+        logger.debug(
             "DiffusionEngine.step breakdown: preprocess=%.2f ms, "
             "add_req_and_wait=%.2f ms, postprocess=%.2f ms, total=%.2f ms",
             preprocess_time * 1000,
@@ -230,6 +258,11 @@ class DiffusionEngine:
             "postprocess_time_ms": postprocess_time * 1000,
         }
 
+        # Detect text output: when the pipeline returns a string (e.g.,
+        # SenseNova-U1 / BAGEL single-stage img2text / text2text), wrap it
+        # as a text-type response instead of an image.
+        is_text_output = isinstance(output_data, str) and custom_output.get("text_output") is not None
+
         # Handle single request or multiple requests
         is_audio_output = supports_audio_output(self.od_config.model_class_name)
         if is_audio_output and model_audio_sample_rate is None:
@@ -247,6 +280,19 @@ class DiffusionEngine:
             prompt = request.prompts[0]
             request_id = request.request_ids[0] if request.request_ids else ""
 
+            if is_text_output:
+                return [
+                    OmniRequestOutput.from_diffusion(
+                        request_id=request_id,
+                        images=[],
+                        prompt=prompt,
+                        metrics=metrics,
+                        custom_output=custom_output,
+                        final_output_type="text",
+                        stage_durations=output.stage_durations,
+                        peak_memory_mb=output.peak_memory_mb,
+                    ),
+                ]
             if is_audio_output:
                 request_audio_payload = outputs[0] if len(outputs) == 1 else outputs
                 return [
