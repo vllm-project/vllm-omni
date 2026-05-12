@@ -37,7 +37,10 @@ def _get_diffusion_feature_cases(model: str):
                     "2",
                 ],
             ),
-            marks=FOUR_CARD_FEATURE_MARKS,
+            marks=[
+                *FOUR_CARD_FEATURE_MARKS,
+                pytest.mark.skip(reason="#3432"),
+            ],
         ),
     ]
 

@@ -415,7 +415,7 @@ class OmniDiffusionConfig:
     tf_model_config: TransformerConfig = field(default_factory=TransformerConfig)
 
     # Attention
-    attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
+    diffusion_attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE
@@ -717,7 +717,7 @@ class OmniDiffusionConfig:
 
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
-        self.attention_config = build_attention_config(self.attention_config)
+        self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
         self.kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.kv_cache_skip_steps)
         self.kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.kv_cache_skip_layers)
 
@@ -830,6 +830,10 @@ class OmniDiffusionConfig:
                     self.model_class_name = "BagelPipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
+                elif model_type == "neo_chat":
+                    self.model_class_name = "SenseNovaU1Pipeline"
+                    self.tf_model_config = TransformerConfig()
+                    self.update_multimodal_support()
                 elif model_type == "nextstep":
                     if self.model_class_name is None:
                         self.model_class_name = "NextStep11Pipeline"
@@ -862,20 +866,12 @@ class OmniDiffusionConfig:
         else:
             kwargs.pop("quantization", None)
 
-        # Map "diffusion_attention_config" to "attention_config" so the
-        # engine_args key (namespaced to avoid collision with vLLM's own
-        # attention_config) is mapped to the dataclass field.
-        if "diffusion_attention_config" in kwargs and "attention_config" not in kwargs:
-            kwargs["attention_config"] = kwargs.pop("diffusion_attention_config")
-        else:
-            kwargs.pop("diffusion_attention_config", None)
-
         # Handle "diffusion_attention_backend" shorthand: merge into
-        # attention_config before field filtering.
+        # diffusion_attention_config before field filtering.
         diffusion_attn_backend = kwargs.pop("diffusion_attention_backend", None)
         if diffusion_attn_backend is not None:
-            existing = kwargs.get("attention_config")
-            kwargs["attention_config"] = parse_attention_config(
+            existing = kwargs.get("diffusion_attention_config")
+            kwargs["diffusion_attention_config"] = parse_attention_config(
                 existing,
                 attention_backend=diffusion_attn_backend,
             )

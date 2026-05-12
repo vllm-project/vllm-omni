@@ -137,13 +137,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                     break
                 meta = info.get("meta", {})
                 if "left_context_size" in meta:
-                    # left_context_size may come through serialization as an int, [int], or tensor([int]).
-                    value = meta["left_context_size"]
-                    if isinstance(value, list):
-                        value = value[0] if value else 0
-                    if isinstance(value, torch.Tensor):
-                        value = value.reshape(-1)[0].item() if value.numel() > 0 else 0
-                    left_context_size[i] = int(value)
+                    left_context_size[i] = meta["left_context_size"]
         for i, req_ids in enumerate(request_ids_list):
             if req_ids.numel() < 1:
                 parsed.append((0, 0))

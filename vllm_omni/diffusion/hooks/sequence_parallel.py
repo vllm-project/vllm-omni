@@ -399,7 +399,7 @@ class SequenceParallelSplitHook(ModelHook):
         if is_forward_context_available():
             od_config = get_forward_context().omni_diffusion_config
             if od_config is not None:
-                attention_config = od_config.attention_config
+                attention_config = od_config.diffusion_attention_config
 
         attn_backend, _ = get_attn_backend_for_role(
             role="self",

@@ -437,9 +437,6 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
         AssertionError: When the response does not meet validation criteria
     """
     assert response.success, "The request failed."
-    e2e_latency = response.e2e_latency
-    if e2e_latency is not None:
-        print(f"the e2e latency is: {e2e_latency}")
 
     modalities = request_config.get("modalities", ["text", "audio"])
 
@@ -555,9 +552,6 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
         return
 
     assert response.success, "The request failed."
-    e2e_latency = getattr(response, "e2e_latency", None)
-    if e2e_latency is not None:
-        print(f"the avg e2e latency is: {e2e_latency}")
 
     # Optional floor on decoded audio size (models with very short clips may use a lower value).
     min_audio = request_config.get("min_audio_bytes")
@@ -595,9 +589,6 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
 
 def assert_diffusion_response(response: "DiffusionResponse", request_config: dict[str, Any], run_level: str = None):
     assert response.success, "The request failed."
-    e2e_latency = getattr(response, "e2e_latency", None)
-    if e2e_latency is not None:
-        print(f"the avg e2e is: {e2e_latency}")
     has_any_content = any(content is not None for content in (response.images, response.videos, response.audios))
     assert has_any_content, "Response contains no images, videos, or audios"
     if response.images is not None:

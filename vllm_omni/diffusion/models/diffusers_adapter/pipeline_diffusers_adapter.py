@@ -210,7 +210,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
             logging.info("No transformer found in diffusers pipeline. Skipping attention backend setting.")
             return
 
-        default_spec = self.od_config.attention_config.default
+        default_spec = self.od_config.diffusion_attention_config.default
         attention_backend_config = default_spec.backend if default_spec is not None else None
         attention_backend_attempts: list[str] = []
         match attention_backend_config:

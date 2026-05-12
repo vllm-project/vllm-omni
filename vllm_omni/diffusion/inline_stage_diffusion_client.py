@@ -86,7 +86,7 @@ class InlineStageDiffusionClient:
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> None:
-        logger.info(
+        logger.debug(
             "[InlineStageDiffusionClient] stage-%s [rep-%s] add request: %s",
             self.stage_id,
             self.replica_id,
@@ -144,7 +144,7 @@ class InlineStageDiffusionClient:
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
     ) -> None:
-        logger.info(
+        logger.debug(
             "[InlineStageDiffusionClient] stage-%s [rep-%s] add batch request: %s (%d prompts)",
             self.stage_id,
             self.replica_id,

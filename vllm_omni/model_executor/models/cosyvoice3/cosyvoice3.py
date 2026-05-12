@@ -32,6 +32,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
 from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
 from vllm_omni.model_executor.models.cosyvoice3.utils import (
     concat_text_with_prompt_ids,
@@ -380,43 +381,6 @@ class CosyVoice3Model(
         return parent_config.with_hf_config(qwen_hf_config, architectures=["Qwen2Model"])
 
     @staticmethod
-    def _as_tensor(value: object) -> torch.Tensor | None:
-        """Extract tensor payload from runtime info fields."""
-        if isinstance(value, list):
-            if not value:
-                return None
-            value = value[0]
-        if isinstance(value, torch.Tensor):
-            return value
-        return None
-
-    @staticmethod
-    def _as_str(value: object) -> str | None:
-        """Extract string payload from runtime info fields."""
-        if isinstance(value, list):
-            if not value:
-                return None
-            value = value[0]
-        if value is None:
-            return None
-        return str(value)
-
-    @staticmethod
-    def _as_bool(value: object) -> bool:
-        """Extract boolean payload from runtime info fields."""
-        if isinstance(value, list):
-            if not value:
-                return False
-            value = value[0]
-        if isinstance(value, torch.Tensor):
-            if value.numel() == 0:
-                return False
-            return bool(value.reshape(-1)[0].item())
-        if value is None:
-            return False
-        return bool(value)
-
-    @staticmethod
     def _cross_fade_audio(audio: torch.Tensor, prev_tail: torch.Tensor) -> torch.Tensor:
         """Blend previous chunk tail into current chunk head using a Hamming window.
 
@@ -710,12 +674,17 @@ class CosyVoice3Model(
             multimodal_outputs = {}
 
             if "speech_token" in kwargs:
-                # Wrap in lists to pass through gpu_ar_model_runner shape filtering
-                multimodal_outputs = {
-                    "speech_token": [kwargs.get("speech_token")],
-                    "speech_feat": [kwargs.get("speech_feat")],
-                    "embedding": [kwargs.get("embedding")],
-                }
+                # Prompt conditioning tensors for code2wav: live under
+                # ``embed.*`` per OmniPayloadStruct schema.
+                multimodal_outputs = to_dict(
+                    OmniPayloadStruct(
+                        embed=EmbeddingsStruct(
+                            speech_token=kwargs.get("speech_token"),
+                            speech_feat=kwargs.get("speech_feat"),
+                            embedding=kwargs.get("embedding"),
+                        ),
+                    )
+                )
 
             return OmniOutput(text_hidden_states=hidden_states, multimodal_outputs=multimodal_outputs)
         elif self.model_stage == "cosyvoice3_code2wav":
@@ -738,23 +707,29 @@ class CosyVoice3Model(
                 runtime_info = []
 
             for idx, req_ids in enumerate(request_ids_list):
-                info = runtime_info[idx] if idx < len(runtime_info) and isinstance(runtime_info[idx], dict) else {}
-                req_id = self._as_str(info.get("req_id")) if info else None
-                stream_finished = self._as_bool(info.get("stream_finished")) if info else False
-                speech_token = self._as_tensor(info.get("speech_token")) if info else None
-                speech_feat = self._as_tensor(info.get("speech_feat")) if info else None
-                embedding = self._as_tensor(info.get("embedding")) if info else None
+                raw = runtime_info[idx] if idx < len(runtime_info) and isinstance(runtime_info[idx], dict) else {}
+                payload = to_struct(raw)
+                meta = payload.meta
+                embed = payload.embed
+
+                req_id = meta.req_id[0] if (meta and meta.req_id) else None
+                stream_finished = (
+                    bool(meta.stream_finished.item()) if (meta and meta.stream_finished is not None) else False
+                )
+                speech_token = embed.speech_token if embed else None
+                speech_feat = embed.speech_feat if embed else None
+                embedding = embed.embedding if embed else None
                 if speech_token is None or speech_feat is None or embedding is None:
                     if stream_finished and req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
                         with self._stream_audio_cache_lock:
                             self._stream_vocoder_cache_by_req.pop(req_id, None)
                     audios[idx] = self._stitch_stream_audio(req_id, empty_audio, stream_finished)
-                    if (
-                        req_ids.numel() > 0
-                        and info
-                        and ("token_offset" in info or "left_context_size" in info or "generated_len" in info)
+                    if req_ids.numel() > 0 and (
+                        (meta and meta.left_context_size is not None) or payload.generated_len is not None
                     ):
-                        info_keys = ",".join(sorted(info.keys())) if info else ""
+                        info_keys = ",".join(
+                            sorted(f for f in payload.__struct_fields__ if getattr(payload, f) is not None)
+                        )
                         logger.warning_once(
                             "CosyVoice3 code2wav missing prompt conditioning for non-empty codec tokens: "
                             "raw_len=%d info_keys=%s",
@@ -780,18 +755,11 @@ class CosyVoice3Model(
                 # `generated_len` is injected for many models by the generic
                 # runner, so only explicit chunk-routing fields should switch
                 # code2wav into the streaming path.
-                uses_streaming_decode = bool(info) and (
-                    "stream_finished" in info or "token_offset" in info or "left_context_size" in info
+                uses_streaming_decode = meta and (
+                    meta.stream_finished is not None or meta.left_context_size is not None
                 )
                 if uses_streaming_decode:
-                    token_offset = 0
-                    try:
-                        if info and "token_offset" in info:
-                            token_offset = max(0, int(info.get("token_offset", 0)))
-                        elif info:
-                            token_offset = max(0, int(info.get("left_context_size", 0)))
-                    except (TypeError, ValueError):
-                        token_offset = 0
+                    token_offset = max(0, meta.left_context_size or 0)
 
                     cache_state = None
                     if req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):

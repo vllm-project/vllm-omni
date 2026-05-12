@@ -285,14 +285,14 @@ class TestOmniDiffusionConfigAttentionParsing:
 
     def test_diffusion_attention_backend_sets_default(self):
         config = OmniDiffusionConfig.from_kwargs(diffusion_attention_backend="SAGE_ATTN")
-        assert isinstance(config.attention_config, AttentionConfig)
-        assert config.attention_config.default is not None
-        assert config.attention_config.default.backend == "SAGE_ATTN"
+        assert isinstance(config.diffusion_attention_config, AttentionConfig)
+        assert config.diffusion_attention_config.default is not None
+        assert config.diffusion_attention_config.default.backend == "SAGE_ATTN"
 
     def test_diffusion_attention_backend_auto_means_platform_default(self):
         config = OmniDiffusionConfig.from_kwargs(diffusion_attention_backend="auto")
-        assert isinstance(config.attention_config, AttentionConfig)
-        assert config.attention_config.default is None
+        assert isinstance(config.diffusion_attention_config, AttentionConfig)
+        assert config.diffusion_attention_config.default is None
 
     def test_diffusion_attention_backend_and_default_are_mutually_exclusive(self):
         with pytest.raises(ValueError):
@@ -303,27 +303,19 @@ class TestOmniDiffusionConfigAttentionParsing:
 
     def test_dict_diffusion_attention_config(self):
         config = OmniDiffusionConfig(
-            attention_config={
+            diffusion_attention_config={
                 "default": {"backend": "FLASH_ATTN"},
                 "per_role": {"self": "SPARSE_BLOCK"},
             }
         )
-        assert config.attention_config.default.backend == "FLASH_ATTN"
-        assert config.attention_config.per_role["self"].backend == "SPARSE_BLOCK"
+        assert config.diffusion_attention_config.default.backend == "FLASH_ATTN"
+        assert config.diffusion_attention_config.per_role["self"].backend == "SPARSE_BLOCK"
 
-    def test_legacy_attention_config_name_maps_in_from_kwargs(self):
-        config = OmniDiffusionConfig.from_kwargs(
-            attention_config={
-                "default": {"backend": "FLASH_ATTN"},
-            }
-        )
-        assert config.attention_config.default.backend == "FLASH_ATTN"
-
-    def test_no_attention_config_defaults_to_empty(self):
+    def test_no_diffusion_attention_config_defaults_to_empty(self):
         config = OmniDiffusionConfig()
-        assert isinstance(config.attention_config, AttentionConfig)
-        assert config.attention_config.default is None
-        assert config.attention_config.per_role == {}
+        assert isinstance(config.diffusion_attention_config, AttentionConfig)
+        assert config.diffusion_attention_config.default is None
+        assert config.diffusion_attention_config.per_role == {}
 
 
 class TestCurrentDiffusionConfig:
@@ -397,7 +389,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
         )
 
         od_config = SimpleNamespace(
-            attention_config=AttentionConfig(
+            diffusion_attention_config=AttentionConfig(
                 default=AttentionSpec(backend="FLASH_ATTN"),
                 per_role={"cross": AttentionSpec(backend="TORCH_SDPA", extra={"block_size": 128})},
             ),
@@ -418,7 +410,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
         assert captured["role"] == "cross"
         assert captured["role_category"] == "cross"
         assert captured["head_size"] == 64
-        assert captured["attention_config"] is od_config.attention_config
+        assert captured["attention_config"] is od_config.diffusion_attention_config
         assert attn.backend_pref == "TORCH_SDPA"
         assert attn.attention.kwargs["backend_kwargs"] == {"block_size": 128}
         assert attn.attention.kwargs["qkv_layout"] == "BSND"
