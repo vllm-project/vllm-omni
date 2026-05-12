@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-Parse pytest commands from Buildkite test-ready.yml, test-merge.yml, test-nightly.yml;
-collect test cases (including parametrized) via pytest --collect-only -q and produce an HTML report.
+Parse pytest commands from Buildkite test-ready.yml, test-merge.yml, test-nightly.yml,
+and test-weekly.yml; collect test cases (including parametrized) via pytest --collect-only -q
+and produce an HTML report.
+
+Leaf steps may live under ``group:`` blocks (nested ``steps``); those are flattened with the
+group title carried into the report.
 
 Usage (run from repo root):
-  python scripts/buildkite_testcase_statistics.py -o buildkite_testcase_statistics.html
+  python tools/nightly/buildkite_testcase_statistics.py -o buildkite_testcase_statistics.html
+  python tools/nightly/buildkite_testcase_statistics.py --sample-preview -o buildkite_testcase_statistics_preview.html
+
+``--sample-preview`` emits placeholder rows only (no pytest / no real counts).
 
 Requires: PyYAML (pip install pyyaml)
 """
@@ -24,12 +31,36 @@ import yaml
 # Repo root (parent of the directory containing this script)
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 BUILDKITE_DIR = REPO_ROOT / ".buildkite"
-PIPELINE_FILES = ["test-ready.yml", "test-merge.yml", "test-nightly.yml"]
+PIPELINE_FILES = ["test-ready.yml", "test-merge.yml", "test-nightly.yml", "test-weekly.yml"]
 
 
 def load_yaml(path: Path) -> dict:
     with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def iter_pytest_leaf_steps(steps: list, *, group: str | None = None) -> list[tuple[dict, str | None]]:
+    """
+    Flatten Buildkite YAML steps, expanding ``group`` blocks that contain nested ``steps``.
+
+    Returns ``(leaf_step_dict, group_title)`` for each leaf step that has non-empty ``commands``.
+    ``group_title`` is ``None`` for top-level steps outside any ``group:`` block.
+    """
+    out: list[tuple[dict, str | None]] = []
+    for raw in steps or []:
+        if not isinstance(raw, dict):
+            continue
+        nested = raw.get("steps")
+        if isinstance(nested, list) and nested:
+            next_group = group
+            if "group" in raw:
+                g = raw.get("group")
+                next_group = g if isinstance(g, str) else (str(g) if g is not None else group)
+            out.extend(iter_pytest_leaf_steps(nested, group=next_group))
+            continue
+        if raw.get("commands"):
+            out.append((raw, group))
+    return out
 
 
 PYTEST_CMD_RE = re.compile(r"(?:timeout\s+\S+\s+)?(?:python3? -m\s+)?pytest\s+[^\n&|;]*")
@@ -308,6 +339,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
         "test-ready": "ready",
         "test-merge": "merge",
         "test-nightly": "nightly",
+        "test-weekly": "weekly",
     }
 
     def esc(s: str) -> str:
@@ -318,7 +350,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
 
     pipeline_totals: dict[str, int] = {}
     for item in all_stats:
-        _, pipeline_name, _, _, _, _, count, _, _, _ = item
+        _, pipeline_name, _, _, _, _, _, count, _, _, _ = item
         pipeline_totals[pipeline_name] = pipeline_totals.get(pipeline_name, 0) + count
     pipeline_summary_rows = []
     for idx, (pipeline_name, pipeline_count) in enumerate(sorted(pipeline_totals.items())):
@@ -331,7 +363,8 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
     # Summary rows by module (item: ..., names, docstrings, skipped_ids)
     summary_rows = []
     for i, item in enumerate(all_stats):
-        _, pipeline_name, label, test_files, _, marker_targets, count, _, _, _ = item
+        _, pipeline_name, group, label, test_files, _, marker_targets, count, _, _, _ = item
+        group_cell = esc(group) if group else "—"
         if test_files:
             files_html = "<br>".join(esc(f) for f in test_files)
         elif marker_targets:
@@ -343,14 +376,15 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
         badge_span = f'<span class="badge {badge}">{esc(pipeline_name)}</span>' if badge else esc(pipeline_name)
         summary_rows.append(
             f'<tr class="{tr_class(i)}">'
-            f'<td>{badge_span}</td><td>{esc(label)}</td><td class="num">{count}</td>'
+            f'<td>{badge_span}</td><td>{group_cell}</td><td>{esc(label)}</td><td class="num">{count}</td>'
             f'<td class="files">{files_html}</td></tr>'
         )
 
-    # Detail rows grouped by Pipeline, then by Test Suite (two-level collapsible)
+    # Detail rows grouped by Pipeline -> Buildkite group -> Test Suite -> files
     case_details_thead = """
             <tr>
               <th>Pipeline</th>
+              <th>Group</th>
               <th>Test Suite</th>
               <th>Test File</th>
               <th>No.</th>
@@ -358,10 +392,11 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
               <th>Status</th>
               <th>Description</th>
             </tr>"""
-    # Per-item: (pipeline_name, label, count, badge_span, suite_rows_html)
-    pipeline_suites: dict[str, list[tuple[str, int, str, str]]] = {}  # pipeline -> [(label, count, summary, body)]
+    # pipeline -> group_title -> [(label, count, suite_summary, body)]
+    pipeline_group_suites: dict[str, dict[str | None, list[tuple[str, int, str, str]]]] = {}
     for item in all_stats:
-        _, pipeline_name, label, _, _, _, count, names, docstrings, skipped_ids = item
+        _, pipeline_name, group, label, _, _, _, count, names, docstrings, skipped_ids = item
+        group_cell = esc(group) if group else "—"
         badge = pipeline_badges.get(pipeline_name, "")
         badge_span = f'<span class="badge {badge}">{esc(pipeline_name)}</span>' if badge else esc(pipeline_name)
         suite_summary = f"{esc(label)} ({count} cases)"
@@ -369,7 +404,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
         if not names:
             suite_rows = [
                 f'<tr class="{tr_class(0)}">'
-                f"<td>{badge_span}</td><td>{esc(label)}</td>"
+                f"<td>{badge_span}</td><td>{group_cell}</td><td>{esc(label)}</td>"
                 f'<td class="files"><em>(marker-only / no collection)</em></td><td class="num">0</td>'
                 f'<td class="name"><em>No collection or only -m/--run-level</em></td>'
                 f'<td class="status"></td><td class="desc"></td></tr>'
@@ -396,7 +431,8 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
                     status_html = '<span class="badge skip">Skipped</span>' if is_skipped else "—"
                     suite_rows.append(
                         f'<tr class="{tr_class(i - 1)}">'
-                        f'<td>{badge_span}</td><td>{esc(label)}</td><td class="files">{esc(file_name)}</td>'
+                        f"<td>{badge_span}</td><td>{group_cell}</td><td>{esc(label)}</td>"
+                        f'<td class="files">{esc(file_name)}</td>'
                         f'<td class="num">{i}</td>'
                         f'<td class="name"><code>{esc(name)}</code></td>'
                         f'<td class="status">{status_html}</td><td class="desc">{desc_html}</td></tr>'
@@ -408,44 +444,40 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
                     f"<tbody>{''.join(suite_rows)}</tbody></table></div></details>"
                 )
         body = "".join(file_sections)
-        if pipeline_name not in pipeline_suites:
-            pipeline_suites[pipeline_name] = []
-        pipeline_suites[pipeline_name].append((label, count, suite_summary, body))
+        pipeline_group_suites.setdefault(pipeline_name, {}).setdefault(group, []).append(
+            (label, count, suite_summary, body)
+        )
 
-    # Build two-level HTML: Pipeline (outer) -> Test Suite (inner) -> table
-    detail_sections_html_parts = []
-    for pipeline_name in sorted(pipeline_badges.keys()):
-        if pipeline_name not in pipeline_suites:
+    def _group_sort_key(k: str | None) -> tuple[bool, str]:
+        return (k is None, (k or "").lower())
+
+    detail_sections_html_parts: list[str] = []
+    all_pipeline_keys = sorted(set(pipeline_badges.keys()) | set(pipeline_group_suites.keys()))
+    for pipeline_name in all_pipeline_keys:
+        if pipeline_name not in pipeline_group_suites:
             continue
-        suites = pipeline_suites[pipeline_name]
-        pipeline_total = sum(c for _, c, _, _ in suites)
+        groups_dict = pipeline_group_suites[pipeline_name]
+        pipeline_total = sum(c for suites in groups_dict.values() for (_, c, _, _) in suites)
         badge = pipeline_badges.get(pipeline_name, "")
         badge_span = f'<span class="badge {badge}">{esc(pipeline_name)}</span>' if badge else esc(pipeline_name)
         pipeline_summary = f"{badge_span} ({pipeline_total} cases)"
-        inner_html = "".join(
-            f'<details class="suite-details"><summary>{suite_summary}</summary>'
-            f'<div class="case-files-inner">{body}</div></details>'
-            for _, _, suite_summary, body in suites
-        )
+        group_sections: list[str] = []
+        for g_key in sorted(groups_dict.keys(), key=_group_sort_key):
+            suites = groups_dict[g_key]
+            group_total = sum(c for _, c, _, _ in suites)
+            display_g = "—" if g_key is None else g_key
+            inner_html = "".join(
+                f'<details class="suite-details"><summary>{suite_summary}</summary>'
+                f'<div class="case-files-inner">{body}</div></details>'
+                for _, _, suite_summary, body in suites
+            )
+            group_sections.append(
+                f'<details class="group-details"><summary>{esc(display_g)} ({group_total} cases)</summary>'
+                f'<div class="group-details-inner">{inner_html}</div></details>'
+            )
         detail_sections_html_parts.append(
             f'<details class="pipeline-details"><summary>{pipeline_summary}</summary>'
-            f'<div class="case-details-inner">{inner_html}</div></details>'
-        )
-    # Include pipelines that might be in all_stats but not in pipeline_badges (e.g. custom names)
-    for pipeline_name in sorted(pipeline_suites.keys()):
-        if pipeline_name in pipeline_badges:
-            continue
-        suites = pipeline_suites[pipeline_name]
-        pipeline_total = sum(c for _, c, _, _ in suites)
-        pipeline_summary = f"{esc(pipeline_name)} ({pipeline_total} cases)"
-        inner_html = "".join(
-            f'<details class="suite-details"><summary>{suite_summary}</summary>'
-            f'<div class="case-files-inner">{body}</div></details>'
-            for _, _, suite_summary, body in suites
-        )
-        detail_sections_html_parts.append(
-            f'<details class="pipeline-details"><summary>{pipeline_summary}</summary>'
-            f'<div class="case-details-inner">{inner_html}</div></details>'
+            f'<div class="case-details-inner">{"".join(group_sections)}</div></details>'
         )
     detail_sections_html = "".join(detail_sections_html_parts)
 
@@ -466,6 +498,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
       --ready: #3fb950;
       --merge: #a371f7;
       --nightly: #f0883e;
+      --weekly: #79c0ff;
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -566,6 +599,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
     .badge.ready {{ background: rgba(63, 185, 80, 0.2); color: var(--ready); }}
     .badge.merge {{ background: rgba(163, 113, 247, 0.2); color: var(--merge); }}
     .badge.nightly {{ background: rgba(240, 136, 62, 0.2); color: var(--nightly); }}
+    .badge.weekly {{ background: rgba(121, 192, 255, 0.2); color: var(--weekly); }}
     .badge.skip {{ background: rgba(139, 148, 158, 0.25); color: var(--muted); }}
     td.status {{ color: var(--muted); font-size: 0.85rem; }}
     .case-details details {{
@@ -595,6 +629,12 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
     .case-details details th {{ border-top: 0; }}
     .case-details .pipeline-details {{ margin-bottom: 0.5rem; }}
     .case-details .pipeline-details .case-details-inner {{ padding-left: 0.5rem; margin-top: 0.25rem; }}
+    .case-details .group-details {{ margin-bottom: 0.35rem; margin-left: 0.35rem; }}
+    .case-details .group-details summary::before {{
+      content: "▶ "; font-size: 0.7rem; color: var(--muted); margin-right: 0.35rem;
+    }}
+    .case-details .group-details[open] summary::before {{ content: "▼ "; }}
+    .case-details .group-details .group-details-inner {{ padding-left: 0.35rem; margin-top: 0.25rem; }}
     .case-details .suite-details {{ margin-bottom: 0.35rem; margin-left: 0.5rem; }}
     .case-details .suite-details summary::before {{
       content: "▶ "; font-size: 0.7rem; color: var(--muted); margin-right: 0.35rem;
@@ -663,7 +703,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
       <div class="table-wrap">
         <table>
           <thead>
-            <tr><th>Pipeline</th><th>Test Suite</th><th>Cases</th><th>Test Files</th></tr>
+            <tr><th>Pipeline</th><th>Group</th><th>Test Suite</th><th>Cases</th><th>Test Files</th></tr>
           </thead>
           <tbody>
             {"".join(summary_rows)}
@@ -674,7 +714,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
 
     <section class="case-details">
       <h2>Case Details</h2>
-      <p class="meta">Expand by Pipeline, then by Test Suite, then by Test File.</p>
+      <p class="meta">Expand by Pipeline, then Buildkite group, then Test Suite, then by Test File.</p>
       <div class="filter-bar">
         <label for="test-file-filter">Filter by Test File</label>
         <input
@@ -698,16 +738,21 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
         const query = input.value.trim().toLowerCase();
         document.querySelectorAll(".pipeline-details").forEach((pipeline) => {{
           let pipelineVisible = false;
-          pipeline.querySelectorAll(".suite-details").forEach((suite) => {{
-            let suiteVisible = false;
-            suite.querySelectorAll(".file-details").forEach((fileDetail) => {{
-              const fileName = (fileDetail.dataset.testFile || fileDetail.textContent || "").toLowerCase();
-              const matched = !query || fileName.includes(query);
-              fileDetail.style.display = matched ? "" : "none";
-              if (matched) suiteVisible = true;
+          pipeline.querySelectorAll(".group-details").forEach((group) => {{
+            let groupVisible = false;
+            group.querySelectorAll(".suite-details").forEach((suite) => {{
+              let suiteVisible = false;
+              suite.querySelectorAll(".file-details").forEach((fileDetail) => {{
+                const fileName = (fileDetail.dataset.testFile || fileDetail.textContent || "").toLowerCase();
+                const matched = !query || fileName.includes(query);
+                fileDetail.style.display = matched ? "" : "none";
+                if (matched) suiteVisible = true;
+              }});
+              suite.style.display = suiteVisible ? "" : "none";
+              if (suiteVisible) groupVisible = true;
             }});
-            suite.style.display = suiteVisible ? "" : "none";
-            if (suiteVisible) pipelineVisible = true;
+            group.style.display = groupVisible ? "" : "none";
+            if (groupVisible) pipelineVisible = true;
           }});
           pipeline.style.display = pipelineVisible ? "" : "none";
         }});
@@ -721,6 +766,86 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
 </html>
 """
     out_path.write_text(html_content, encoding="utf-8")
+
+
+def _sample_preview_stats() -> list[tuple]:
+    """Synthetic stats tuples matching ``main()`` layout — UI demo only."""
+    names_a = [
+        "tests/e2e/demo/test_alpha.py::test_smoke",
+        "tests/e2e/demo/test_alpha.py::test_params[x0]",
+        "tests/e2e/demo/test_beta.py::test_widgets",
+    ]
+    skipped_a = {"tests/e2e/demo/test_alpha.py::test_smoke"}
+    return [
+        (
+            "test-ready / :card_index_dividers: Simple Test / Simple · Diffusion",
+            "test-ready",
+            ":card_index_dividers: Simple Test",
+            "Simple · Diffusion & Model Executor Test",
+            ["tests/diffusion/test_dummy.py", "tests/model_executor/test_dummy.py"],
+            False,
+            [],
+            len(names_a) - len(skipped_a),
+            names_a,
+            ["Alpha smoke.", "", "Widgets."],
+            skipped_a,
+        ),
+        (
+            "test-ready / Custom Pipeline Test",
+            "test-ready",
+            None,
+            "Custom Pipeline Test",
+            ["tests/e2e/offline_inference/custom_pipeline/test_cp.py"],
+            False,
+            [],
+            1,
+            ["tests/e2e/offline_inference/custom_pipeline/test_cp.py::test_cp_one"],
+            [""],
+            set(),
+        ),
+        (
+            "test-merge / :card_index_dividers: Diffusion Test / LoRA",
+            "test-merge",
+            ":card_index_dividers: Diffusion Test",
+            "Diffusion · LoRA Test",
+            ["tests/diffusion/lora/test_lora.py"],
+            False,
+            [],
+            2,
+            [
+                "tests/diffusion/lora/test_lora.py::test_load",
+                "tests/diffusion/lora/test_lora.py::test_infer[a]",
+            ],
+            ["", ""],
+            set(),
+        ),
+        (
+            "test-nightly / Omni marker-only (sample)",
+            "test-nightly",
+            ":card_index_dividers: Omni Model Test",
+            "Omni · marker-only step (sample)",
+            [],
+            True,
+            ["-m full_model and omni and H100", "--run-level full_model"],
+            0,
+            [],
+            [],
+            set(),
+        ),
+        (
+            "test-weekly / Reliability (sample)",
+            "test-weekly",
+            None,
+            "Reliability Test - qwen3-omni",
+            ["tests/dfx/reliability/test_reliability_qwen3_omni.py"],
+            False,
+            [],
+            1,
+            ["tests/dfx/reliability/test_reliability_qwen3_omni.py::test_placeholder"],
+            ["Weekly reliability placeholder."],
+            set(),
+        ),
+    ]
 
 
 def main() -> None:
@@ -739,7 +864,22 @@ def main() -> None:
         default=default_out,
         help=f"Output HTML file path (default: {default_out})",
     )
+    parser.add_argument(
+        "--sample-preview",
+        action="store_true",
+        help="Write HTML using placeholder pipelines/groups/cases only (no pytest, no YAML-driven counts).",
+    )
     args = parser.parse_args()
+
+    if args.sample_preview:
+        all_stats = _sample_preview_stats()
+        out_path = args.output.resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        total = sum(item[7] for item in all_stats)
+        write_html(all_stats, out_path, total, REPO_ROOT)
+        print(f"Written (sample preview): {out_path}")
+        print(f"Test Suites: {len(all_stats)}, total placeholder cases: {total}")
+        return
 
     all_stats = []
 
@@ -752,11 +892,10 @@ def main() -> None:
         steps = data.get("steps") or []
         pipeline_name = filename.replace(".yml", "")
 
-        for step in steps:
+        for step, group in iter_pytest_leaf_steps(steps):
             if not isinstance(step, dict):
                 continue
             label = step.get("label") or "(no label)"
-            # Skip commented-out steps (usually no label or commands)
             if not step.get("commands"):
                 continue
             targets = get_pytest_targets_from_step(step)
@@ -764,6 +903,8 @@ def main() -> None:
                 continue
 
             module_key = f"{pipeline_name} / {label}"
+            if group:
+                module_key = f"{pipeline_name} / {group} / {label}"
             # test_files: only real .py files; marker-only steps will have an empty list.
             test_files = [t for t, _ in targets if t.endswith(".py")]
             # marker_targets: synthetic marker targets (e.g. "-m expr", "-m expr --run-level level").
@@ -785,6 +926,7 @@ def main() -> None:
                 (
                     module_key,
                     pipeline_name,
+                    group,
                     label,
                     test_files,
                     marker_only,
@@ -798,7 +940,7 @@ def main() -> None:
 
     out_path = args.output.resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    total = sum(item[6] for item in all_stats)
+    total = sum(item[7] for item in all_stats)
     write_html(all_stats, out_path, total, REPO_ROOT)
     print(f"Written: {out_path}")
     print(f"Test Suites: {len(all_stats)}, total cases (sum of steps): {total}")
