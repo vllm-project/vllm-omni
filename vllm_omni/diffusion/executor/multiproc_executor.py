@@ -226,6 +226,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     if code is not None and code < 0:
                         try:
                             import signal as _signal
+
                             sig = _signal.Signals(-code).name
                         except (ValueError, ImportError):
                             sig = f"signal {-code}"
