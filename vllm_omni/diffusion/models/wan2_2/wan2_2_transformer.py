@@ -329,6 +329,7 @@ class WanSelfAttention(nn.Module):
         head_dim: int,
         eps: float = 1e-5,
         dropout: float = 0.0,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -374,6 +375,7 @@ class WanSelfAttention(nn.Module):
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
             role="self",
+            prefix=prefix,
         )
 
     def forward(
@@ -431,6 +433,7 @@ class WanCrossAttention(nn.Module):
         eps: float = 1e-5,
         dropout: float = 0.0,
         added_kv_proj_dim: int | None = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -523,6 +526,7 @@ class WanCrossAttention(nn.Module):
             causal=False,
             role="cross",
             qkv_layout="BSND",
+            prefix=prefix,
             skip_sequence_parallel=True,
             # Wan2.2 cross-attn operates on short text-encoder sequences; per-block
             # FP8 quant offers no perf win and degrades quality. Opt out until a
@@ -602,6 +606,7 @@ class WanTransformerBlock(nn.Module):
         eps: float = 1e-6,
         added_kv_proj_dim: int | None = None,
         cross_attn_norm: bool = False,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -614,6 +619,7 @@ class WanTransformerBlock(nn.Module):
             num_heads=num_heads,
             head_dim=head_dim,
             eps=eps,
+            prefix=f"{prefix}.attn1",
         )
 
         # 2. Cross-attention
@@ -623,6 +629,7 @@ class WanTransformerBlock(nn.Module):
             head_dim=head_dim,
             eps=eps,
             added_kv_proj_dim=added_kv_proj_dim,
+            prefix=f"{prefix}.attn2",
         )
         self.norm2 = LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
 
@@ -640,8 +647,6 @@ class WanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         hidden_states_mask: torch.Tensor | None = None,
-        denoise_step_idx: int | None = None,
-        layer_idx: int | None = None,
     ) -> torch.Tensor:
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
@@ -662,26 +667,13 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = self.norm1(hidden_states, scale_msa, shift_msa).type_as(hidden_states)
-        self_attn_metadata = AttentionMetadata(
-            attn_mask=hidden_states_mask,
-            extra={
-                "denoise_step_idx": denoise_step_idx,
-                "layer_idx": layer_idx,
-            },
-        )
+        self_attn_metadata = AttentionMetadata(attn_mask=hidden_states_mask)
         attn_output = self.attn1(norm_hidden_states, rotary_emb, self_attn_metadata)
         hidden_states = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
         norm_hidden_states = self.norm2(hidden_states).type_as(hidden_states)
-        cross_attn_metadata = AttentionMetadata(
-            attn_mask=None,
-            extra={
-                "denoise_step_idx": denoise_step_idx,
-                "layer_idx": layer_idx,
-            },
-        )
-        attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, cross_attn_metadata)
+        attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, None)
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
@@ -850,8 +842,16 @@ class WanTransformer3DModel(nn.Module):
         # 3. Transformer blocks
         self.blocks = nn.ModuleList(
             [
-                WanTransformerBlock(inner_dim, ffn_dim, num_attention_heads, eps, added_kv_proj_dim, cross_attn_norm)
-                for _ in range(num_layers)
+                WanTransformerBlock(
+                    inner_dim,
+                    ffn_dim,
+                    num_attention_heads,
+                    eps,
+                    added_kv_proj_dim,
+                    cross_attn_norm,
+                    prefix=f"blocks.{layer_idx}",
+                )
+                for layer_idx in range(num_layers)
             ]
         )
 
@@ -944,17 +944,13 @@ class WanTransformer3DModel(nn.Module):
             hidden_states_mask = None
 
         # Transformer blocks
-        denoise_step_idx = attention_kwargs.get("step_idx") if attention_kwargs is not None else None
-
-        for layer_idx, block in enumerate(self.blocks):
+        for block in self.blocks:
             hidden_states = block(
                 hidden_states,
                 encoder_hidden_states,
                 timestep_proj,
                 rotary_emb,
                 hidden_states_mask,
-                denoise_step_idx,
-                layer_idx,
             )
 
         # Output norm, projection & unpatchify

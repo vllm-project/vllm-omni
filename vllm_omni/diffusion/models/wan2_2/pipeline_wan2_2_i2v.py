@@ -22,6 +22,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
@@ -295,7 +296,7 @@ class Wan22I2VPipeline(
                     current_model = self.transformer_2
                     current_guidance_scale = guidance_high
 
-                attention_kwargs["step_idx"] = step_idx
+                set_forward_context_denoise_step_idx(step_idx)
 
                 # Prepare latent input
                 if self.expand_timesteps:

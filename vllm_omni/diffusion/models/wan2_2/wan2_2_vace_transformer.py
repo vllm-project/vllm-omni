@@ -33,8 +33,17 @@ class VaceWanTransformerBlock(WanTransformerBlock):
         added_kv_proj_dim: int | None = None,
         cross_attn_norm: bool = False,
         block_id: int = 0,
+        prefix: str = "",
     ):
-        super().__init__(dim, ffn_dim, num_heads, eps, added_kv_proj_dim, cross_attn_norm)
+        super().__init__(
+            dim,
+            ffn_dim,
+            num_heads,
+            eps,
+            added_kv_proj_dim,
+            cross_attn_norm,
+            prefix=prefix,
+        )
         self.proj_in = nn.Linear(dim, dim) if block_id == 0 else None
         self.proj_out = nn.Linear(dim, dim)
 
@@ -46,8 +55,6 @@ class VaceWanTransformerBlock(WanTransformerBlock):
         temb: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         hidden_states_mask: torch.Tensor | None = None,
-        denoise_step_idx: int | None = None,
-        layer_idx: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.proj_in is not None:
             control_hidden_states = self.proj_in(control_hidden_states)
@@ -59,8 +66,6 @@ class VaceWanTransformerBlock(WanTransformerBlock):
             temb,
             rotary_emb,
             hidden_states_mask,
-            denoise_step_idx,
-            layer_idx,
         )
 
         conditioning_states = self.proj_out(control_hidden_states)
@@ -122,6 +127,7 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
                         self.config.added_kv_proj_dim,
                         self.config.cross_attn_norm,
                         block_id=i,
+                        prefix=f"vace_blocks.{i}",
                     )
                     for i in range(len(vace_layers))
                 ]
@@ -218,8 +224,6 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
             )
             hidden_states_mask[:, ctx.sp_original_seq_len :] = False
 
-        denoise_step_idx = attention_kwargs.get("step_idx") if attention_kwargs is not None else None
-
         # VACE: embed context and run conditioning blocks
         vace_hints = None
         if vace_context is not None and self.vace_blocks is not None:
@@ -234,8 +238,6 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
                     timestep_proj,
                     rotary_emb,
                     hidden_states_mask,
-                    denoise_step_idx,
-                    i,
                 )
                 vace_hints.append(conditioning_states)
 
@@ -251,8 +253,6 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
                 timestep_proj,
                 rotary_emb,
                 hidden_states_mask,
-                denoise_step_idx,
-                i,
             )
             if vace_hints is not None and self.vace_layers_mapping is not None and i in self.vace_layers_mapping:
                 vace_idx = self.vace_layers_mapping[i]

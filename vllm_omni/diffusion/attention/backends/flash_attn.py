@@ -14,22 +14,12 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
 )
-from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
 
 class FlashAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
-
-    @classmethod
-    def supports_kv_cache_dtype(cls, kv_cache_dtype: str | None) -> bool:
-        """Align with FlashAttentionImpl._supported_kv_cache_dtypes for current device."""
-        if kv_cache_dtype is None:
-            return True
-        platform_key = current_omni_platform.device_name
-        supported = FlashAttentionImpl._supported_kv_cache_dtypes.get(platform_key, set())
-        return kv_cache_dtype in supported
 
     @classmethod
     def supports_attention_mask(cls) -> bool:

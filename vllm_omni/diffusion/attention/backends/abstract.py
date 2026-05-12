@@ -6,11 +6,8 @@ from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 
 import torch
-from vllm.logger import init_logger
 
 from vllm_omni.platforms import current_omni_platform
-
-logger = init_logger(__name__)
 
 
 class AttentionBackend(ABC):
@@ -21,15 +18,6 @@ class AttentionBackend(ABC):
     @classmethod
     def supports_attention_mask(cls) -> bool:
         return False
-
-    @classmethod
-    def supports_kv_cache_dtype(cls, kv_cache_dtype: str | None) -> bool:
-        """Whether this backend supports the given KV cache quantization dtype.
-
-        Override in subclasses that support quantized KV (e.g. FP8).
-        Default: only None (no quantization) is supported.
-        """
-        return kv_cache_dtype is None
 
     @staticmethod
     @abstractmethod
@@ -82,9 +70,7 @@ class AttentionMetadata:
     #
     # Well-known optional keys (convention, not required on all forwards):
     #   "kv_cache_dtype": str | None — quantized KV dtype (e.g. "fp8"); backends
-    #     decide whether/how to apply; AttentionImpl may clear unsupported values.
-    #   "denoise_step_idx", "layer_idx": int | None — selective KV-quant gating
-    #     (see diffusion attention layer skip selectors).
+    #     decide whether/how to apply.
 
     # Piecewise attention metadata (mixed causal/full masks).
     # full_attn_spans: per-sample [start, end) spans in global coordinates using full attention.
@@ -97,8 +83,7 @@ T = TypeVar("T", bound=AttentionMetadata)
 class AttentionImpl(ABC, Generic[T]):
     # Per-platform kv_cache_dtype support. Maps OmniPlatformEnum value
     # (e.g. "cuda", "npu") to the set of quantized dtypes that platform
-    # handles. The base forward() checks this before dispatching and
-    # clears unsupported dtypes with a warning.
+    # handles.
     #
     # To add FP8 support for a new platform in a subclass:
     #   _supported_kv_cache_dtypes = {"cuda": {"fp8"}, "npu": {"fp8"}}
@@ -119,40 +104,11 @@ class AttentionImpl(ABC, Generic[T]):
     ) -> None:
         raise NotImplementedError
 
-    # Platform enum value → forward method name. To add a new platform,
-    # implement forward_{name}() and register it here.
-    _PLATFORM_DISPATCH: dict[str, str] = {
-        "cuda": "forward_cuda",
-        "rocm": "forward_hip",
-        "npu": "forward_npu",
-        "xpu": "forward_xpu",
-        "musa": "forward_musa",
-    }
-
-    def _handle_kv_cache_dtype(
-        self,
-        attn_metadata: T | None,
-        platform_key: str,
-    ) -> None:
-        """Check kv_cache_dtype compatibility for this platform.
-
-        If the requested kv_cache_dtype is not in _supported_kv_cache_dtypes
-        for the current platform, it is cleared to None with a warning.
-        """
-        if attn_metadata is None:
-            return
-        kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype")
+    @classmethod
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: str | None, platform_key: str) -> bool:
         if kv_cache_dtype is None:
-            return
-        supported = self._supported_kv_cache_dtypes.get(platform_key, set())
-        if kv_cache_dtype not in supported:
-            logger.warning_once(
-                "kv_cache_dtype='%s' requested but %s on %s does not support it. Running in native dtype.",
-                kv_cache_dtype,
-                type(self).__name__,
-                platform_key,
-            )
-            attn_metadata.extra["kv_cache_dtype"] = None
+            return True
+        return kv_cache_dtype in cls._supported_kv_cache_dtypes.get(platform_key, set())
 
     def forward(
         self,
@@ -162,16 +118,18 @@ class AttentionImpl(ABC, Generic[T]):
         attn_metadata: T | None = None,
     ) -> torch.Tensor:
         """Dispatch to platform-specific forward implementation."""
-        platform_key = current_omni_platform.device_name
-        method_name = self._PLATFORM_DISPATCH.get(platform_key)
-        if method_name is None:
-            raise NotImplementedError(
-                f"No forward implementation for platform: {platform_key}. "
-                f"Register it in AttentionImpl._PLATFORM_DISPATCH."
-            )
-        self._handle_kv_cache_dtype(attn_metadata, platform_key)
-        method = getattr(self, method_name)
-        return method(query, key, value, attn_metadata)
+        if current_omni_platform.is_rocm():
+            return self.forward_hip(query, key, value, attn_metadata)
+        elif current_omni_platform.is_cuda():
+            return self.forward_cuda(query, key, value, attn_metadata)
+        elif current_omni_platform.is_npu():
+            return self.forward_npu(query, key, value, attn_metadata)
+        elif current_omni_platform.is_xpu():
+            return self.forward_xpu(query, key, value, attn_metadata)
+        elif current_omni_platform.is_musa():
+            return self.forward_musa(query, key, value, attn_metadata)
+        else:
+            raise NotImplementedError(f"No forward implementation for platform: {current_omni_platform}")
 
     def forward_cuda(
         self,
