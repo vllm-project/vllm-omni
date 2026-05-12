@@ -2250,7 +2250,7 @@ class HunyuanImage3Model(nn.Module):
         num_image_tokens: int | None = None,
         gen_timestep_scatter_index: torch.Tensor | None = None,
         uncond_cfg_prefill: bool = False,
-        ar_kv_reuse_len: int = None,
+        ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -2735,6 +2735,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             query_lens=[prefill_query_len],
             seq_lens=[prefill_seq_len],
             num_image_tokens=0,
+            ar_kv_reuse_len=negative_reuse_len,
             full_attn_spans=model_kwargs["full_attn_spans"][batch_slice]
             if model_kwargs.get("full_attn_spans")
             else None,
