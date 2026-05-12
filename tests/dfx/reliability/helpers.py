@@ -8,6 +8,7 @@ This module keeps fault injection callable from tests directly:
 
 from __future__ import annotations
 
+import concurrent.futures
 import http.client
 import json
 import logging
@@ -484,6 +485,218 @@ def _log_server_process_tree(server: Any) -> None:
 
 FaultInjector = Callable[[Any], None]
 """Callable invoked with the live ``OmniServer`` after it is ready (see ``omni_server_after_fault``)."""
+
+
+def run_fault_injection_with_rate_load(
+    *,
+    submit_request: Callable[[], Any],
+    inject_fault: Callable[[], None],
+    num_requests: int = 10,
+    request_rate: float = 0.3,
+    submit_interval_sec: float | None = None,
+    completion_timeout_sec: float = 120.0,
+) -> None:
+    """Submit requests with a fixed rate, then inject fault once an in-flight request is observed."""
+    if num_requests <= 0:
+        raise ValueError("num_requests must be > 0")
+    if request_rate <= 0:
+        raise ValueError("request_rate must be > 0")
+
+    interval_sec = submit_interval_sec if submit_interval_sec is not None else (1.0 / request_rate)
+    if interval_sec < 0:
+        raise ValueError("submit_interval_sec must be >= 0")
+
+    max_workers = min(max(2, num_requests), 8)
+    injected = False
+    futures: list[concurrent.futures.Future[Any]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for idx in range(num_requests):
+            futures.append(executor.submit(submit_request))
+            in_flight = any(not future.done() for future in futures)
+            if in_flight and not injected:
+                inject_fault()
+                injected = True
+            if idx != num_requests - 1 and interval_sec > 0:
+                time.sleep(interval_sec)
+
+        if not injected:
+            in_flight = any(not future.done() for future in futures)
+            if in_flight:
+                inject_fault()
+                injected = True
+
+        if not injected:
+            pytest.skip(
+                "no in-flight request observed before fault injection; "
+                "increase request cost or request rate for this environment"
+            )
+
+        done, pending = concurrent.futures.wait(
+            futures,
+            timeout=completion_timeout_sec,
+            return_when=concurrent.futures.ALL_COMPLETED,
+        )
+        assert not pending, (
+            "some in-flight-load requests did not converge after fault injection: "
+            f"pending={len(pending)} done={len(done)}"
+        )
+
+
+def list_alive_pids(pids: Sequence[int]) -> list[int]:
+    """Return alive PIDs from one PID list."""
+    return [int(pid) for pid in pids if psutil.pid_exists(int(pid))]
+
+
+def query_gpu_compute_pid_used_memory_mb() -> dict[int, int] | None:
+    """Query NVIDIA compute-process memory map (pid -> used MB).
+
+    Returns ``None`` when ``nvidia-smi`` is unavailable/unreadable on current host.
+    """
+    out = subprocess.run(
+        ["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode != 0:
+        logger.warning("[reliability][gpu] nvidia-smi query failed: %s", out.stderr.strip())
+        return None
+
+    pid_to_mem_mb: dict[int, int] = {}
+    for line in out.stdout.splitlines():
+        row = line.strip()
+        if not row:
+            continue
+        pieces = [part.strip() for part in row.split(",", maxsplit=1)]
+        if len(pieces) != 2:
+            continue
+        pid_raw, mem_raw = pieces
+        if not pid_raw.isdigit():
+            continue
+        mem_digits = "".join(ch for ch in mem_raw if ch.isdigit())
+        if not mem_digits:
+            continue
+        pid_to_mem_mb[int(pid_raw)] = int(mem_digits)
+    return pid_to_mem_mb
+
+
+def assert_no_worker_residual_and_gpu_release(
+    server: Any,
+    *,
+    scenario: str,
+    timeout_sec: float = 30.0,
+    poll_interval_sec: float = 0.5,
+) -> None:
+    """Assert no residual worker process and no GPU residency on tracked workers after fault."""
+    snapshot = getattr(server, "reliability_fault_snapshot", None)
+    if not isinstance(snapshot, dict):
+        pytest.fail(f"[{scenario}] missing reliability fault snapshot on server")
+    worker_pids = [int(pid) for pid in snapshot.get("worker_pids", [])]
+    if not worker_pids:
+        pytest.skip(f"[{scenario}] no worker PIDs captured for this run")
+
+    worker_pid_set = set(worker_pids)
+    deadline = time.monotonic() + timeout_sec
+    last_alive_workers: list[int] = []
+    last_gpu_leaks: dict[int, int] = {}
+    while time.monotonic() < deadline:
+        last_alive_workers = list_alive_pids(worker_pids)
+        gpu_map = query_gpu_compute_pid_used_memory_mb()
+        if gpu_map is None:
+            pytest.skip(f"[{scenario}] nvidia-smi unavailable; skip GPU release assertion")
+        last_gpu_leaks = {pid: mem_mb for pid, mem_mb in gpu_map.items() if pid in worker_pid_set and mem_mb > 0}
+        if not last_alive_workers and not last_gpu_leaks:
+            return
+        time.sleep(poll_interval_sec)
+
+    assert not last_alive_workers, f"[{scenario}] residual worker processes remain alive: {last_alive_workers}"
+    assert not last_gpu_leaks, f"[{scenario}] worker GPU memory not released: {last_gpu_leaks}"
+
+
+def _capture_server_fault_snapshot(server: Any) -> dict[str, list[int]]:
+    """Capture current server process snapshot for post-fault assertions."""
+    tree_pids = _list_server_process_tree(server)
+    root_pid = tree_pids[0] if tree_pids else None
+    worker_pids: list[int] = []
+    for pid in tree_pids:
+        _, cmdline = _safe_proc_info(pid)
+        if "multiprocessing.spawn" in cmdline:
+            worker_pids.append(pid)
+    snapshot = {
+        "root_pids": [root_pid] if root_pid is not None else [],
+        "tree_pids": tree_pids,
+        "worker_pids": worker_pids,
+    }
+    setattr(server, "reliability_fault_snapshot", snapshot)
+    return snapshot
+
+
+def make_server_root_kill_fault_injector(
+    *,
+    signal_name: str = "SIGKILL",
+    post_kill_wait_seconds: float = 0.0,
+) -> FaultInjector:
+    """Kill only the current server root process (simulate first strike on PID1-like process)."""
+
+    def _inject(server: Any) -> None:
+        _log_server_process_tree(server)
+        snapshot = _capture_server_fault_snapshot(server)
+        root_pids = snapshot["root_pids"]
+        if not root_pids:
+            pytest.skip("no server root process found for root-kill injection")
+        root_pid = int(root_pids[0])
+        sig = getattr(signal, signal_name, None)
+        if sig is None:
+            raise ValueError(f"Unsupported signal_name: {signal_name}")
+        name, cmdline = _safe_proc_info(root_pid)
+        print(
+            f"[reliability][process-kill] root-kill pid={root_pid} name={name} signal={signal_name} cmdline={cmdline}",
+            flush=True,
+        )
+        os.kill(root_pid, sig)
+        if post_kill_wait_seconds > 0:
+            time.sleep(post_kill_wait_seconds)
+
+    return _inject
+
+
+def make_server_tree_kill_fault_injector(
+    *,
+    signal_name: str = "SIGKILL",
+    post_kill_wait_seconds: float = 0.0,
+    inter_kill_wait_seconds: float = 0.2,
+) -> FaultInjector:
+    """Kill current server root first, then kill all remaining descendants."""
+
+    def _inject(server: Any) -> None:
+        _log_server_process_tree(server)
+        snapshot = _capture_server_fault_snapshot(server)
+        tree_pids = [int(pid) for pid in snapshot["tree_pids"]]
+        if not tree_pids:
+            pytest.skip("no server process tree found for tree-kill injection")
+
+        sig = getattr(signal, signal_name, None)
+        if sig is None:
+            raise ValueError(f"Unsupported signal_name: {signal_name}")
+
+        root_pid = tree_pids[0]
+        kill_order = [root_pid, *[pid for pid in tree_pids if pid != root_pid]]
+        for pid in kill_order:
+            if not psutil.pid_exists(pid):
+                continue
+            name, cmdline = _safe_proc_info(pid)
+            print(
+                f"[reliability][process-kill] tree-kill pid={pid} name={name} signal={signal_name} cmdline={cmdline}",
+                flush=True,
+            )
+            os.kill(pid, sig)
+            if inter_kill_wait_seconds > 0:
+                time.sleep(inter_kill_wait_seconds)
+
+        if post_kill_wait_seconds > 0:
+            time.sleep(post_kill_wait_seconds)
+
+    return _inject
 
 
 def make_process_kill_fault_injector(

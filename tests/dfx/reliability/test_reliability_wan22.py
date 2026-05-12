@@ -20,9 +20,13 @@ from tests.dfx.conftest import (
     supports_video_generation,
 )
 from tests.dfx.reliability.helpers import (
+    assert_no_worker_residual_and_gpu_release,
     get_health_raw,
     inject_gpu_oom,
     make_process_kill_fault_injector,
+    make_server_root_kill_fault_injector,
+    make_server_tree_kill_fault_injector,
+    run_fault_injection_with_rate_load,
     stop_gpu_oom_hogs,
 )
 from tests.helpers.mark import hardware_test
@@ -76,6 +80,27 @@ PROCESS_KILL_ERROR_KEYWORDS = (
 
 WAN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, E2E_STAGE_CONFIGS_DIR)
 DIFFUSION_VIDEO_PARAMS = [param for param in WAN_PARAMS if supports_video_generation(param.model)]
+INFLIGHT_INJECTION_REQUEST_RATE = 0.3
+INFLIGHT_INJECTION_REQUEST_COUNT = 10
+
+
+def _video_request_config() -> dict[str, Any]:
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
+    return {
+        "form_data": {
+            "prompt": "Generate a realistic road-driving video with camera motion.",
+            "width": 512,
+            "height": 512,
+            "fps": 8,
+            "num_frames": 8,
+            "guidance_scale": 1.0,
+            "flow_shift": 5.0,
+            "num_inference_steps": 4,
+            "seed": 42,
+        },
+        "image_reference": image_data_url,
+        "stream": False,
+    }
 
 
 @pytest.mark.slow
@@ -409,3 +434,47 @@ def test_reliability_video_oom_recovers_after_fault_removed(
             "unhealthy terminal state should fail fast on /v1/videos, "
             f"got health={terminal_health}, request_status={recovery_status}, body={recovery_text_prefix!r}"
         )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
+def test_reliability_fault_process_kill_serve_root_video_no_worker_residual_and_gpu_release(
+    omni_server_function,
+    openai_client_function,
+) -> None:
+    """Black-box: during an in-flight video request, kill serve root and verify cleanup."""
+    request_config = _video_request_config()
+    injector = make_server_root_kill_fault_injector(signal_name="SIGKILL", post_kill_wait_seconds=2.0)
+    run_fault_injection_with_rate_load(
+        submit_request=lambda: openai_client_function.send_video_diffusion_request(request_config, request_num=1),
+        inject_fault=lambda: injector(omni_server_function),
+        num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
+        request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
+        completion_timeout_sec=120.0,
+    )
+    assert_no_worker_residual_and_gpu_release(omni_server_function, scenario="kill_serve_root_only")
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
+def test_reliability_fault_process_kill_tree_video_no_worker_residual_and_gpu_release(
+    omni_server_function,
+    openai_client_function,
+) -> None:
+    """Black-box: during an in-flight video request, kill server process tree and verify cleanup."""
+    request_config = _video_request_config()
+    injector = make_server_tree_kill_fault_injector(
+        signal_name="SIGKILL",
+        post_kill_wait_seconds=2.0,
+        inter_kill_wait_seconds=0.1,
+    )
+    run_fault_injection_with_rate_load(
+        submit_request=lambda: openai_client_function.send_video_diffusion_request(request_config, request_num=1),
+        inject_fault=lambda: injector(omni_server_function),
+        num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
+        request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
+        completion_timeout_sec=120.0,
+    )
+    assert_no_worker_residual_and_gpu_release(omni_server_function, scenario="kill_server_tree")
