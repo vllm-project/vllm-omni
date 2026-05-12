@@ -476,7 +476,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
         file_sections: list[str] = []
         if not names:
             suite_rows = [
-                f'<tr class="{tr_class(0)}">'
+                f'<tr class="{tr_class(0)}" data-case-skipped="0">'
                 f"<td>{badge_span}</td><td>{group_cell}</td><td>{esc(label)}</td>"
                 f'<td class="files"><em>(marker-only / no collection)</em></td><td class="num">0</td>'
                 f'<td class="name"><em>No collection or only -m/--run-level</em></td>'
@@ -502,8 +502,9 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
                 for i, (name, desc, is_skipped) in enumerate(file_groups[file_name], 1):
                     desc_html = esc(desc).replace("\n", "<br>") if desc else ""
                     status_html = '<span class="badge skip">Skipped</span>' if is_skipped else "—"
+                    skip_attr = ' data-case-skipped="1"' if is_skipped else ' data-case-skipped="0"'
                     suite_rows.append(
-                        f'<tr class="{tr_class(i - 1)}">'
+                        f'<tr class="{tr_class(i - 1)}"{skip_attr}>'
                         f"<td>{badge_span}</td><td>{group_cell}</td><td>{esc(label)}</td>"
                         f'<td class="files">{esc(file_name)}</td>'
                         f'<td class="num">{i}</td>'
@@ -627,6 +628,20 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
       outline: none;
     }}
     .filter-input:focus {{
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.18);
+    }}
+    .filter-select {{
+      min-width: 180px;
+      padding: 0.65rem 0.85rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      outline: none;
+      font-size: 0.9rem;
+    }}
+    .filter-select:focus {{
       border-color: var(--accent);
       box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.18);
     }}
@@ -796,7 +811,12 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
           type="text"
           placeholder="Type part of a test file path, e.g. tests/e2e/online_serving"
         />
-        <span class="filter-hint">Filter applies to the Test File fold sections below.</span>
+        <label for="case-status-filter">Case status</label>
+        <select id="case-status-filter" class="filter-select" aria-label="Filter by case status">
+          <option value="all" selected>All cases</option>
+          <option value="skipped">Skipped only</option>
+        </select>
+        <span class="filter-hint">Path filter applies to file sections; status hides non-matching rows.</span>
       </div>
       {detail_sections_html}
     </section>
@@ -805,10 +825,19 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
   <script>
     (() => {{
       const input = document.getElementById("test-file-filter");
-      if (!input) return;
+      const statusSel = document.getElementById("case-status-filter");
+      if (!input || !statusSel) return;
 
       const applyFilter = () => {{
         const query = input.value.trim().toLowerCase();
+        const statusFilter = statusSel.value;
+
+        document.querySelectorAll(".case-details tbody tr[data-case-skipped]").forEach((tr) => {{
+          const isSkipped = tr.dataset.caseSkipped === "1";
+          const statusOk = statusFilter === "all" || (statusFilter === "skipped" && isSkipped);
+          tr.style.display = statusOk ? "" : "none";
+        }});
+
         document.querySelectorAll(".pipeline-details").forEach((pipeline) => {{
           let pipelineVisible = false;
           pipeline.querySelectorAll(".group-details").forEach((group) => {{
@@ -817,7 +846,12 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
               let suiteVisible = false;
               suite.querySelectorAll(".file-details").forEach((fileDetail) => {{
                 const fileName = (fileDetail.dataset.testFile || fileDetail.textContent || "").toLowerCase();
-                const matched = !query || fileName.includes(query);
+                const pathOk = !query || fileName.includes(query);
+                const rows = fileDetail.querySelectorAll("tbody tr[data-case-skipped]");
+                const anyRowVisible =
+                  rows.length === 0 ||
+                  Array.from(rows).some((tr) => tr.style.display !== "none");
+                const matched = pathOk && anyRowVisible;
                 fileDetail.style.display = matched ? "" : "none";
                 if (matched) suiteVisible = true;
               }});
@@ -832,6 +866,7 @@ def write_html(all_stats: list[tuple], out_path: Path, total: int, repo_root: Pa
       }};
 
       input.addEventListener("input", applyFilter);
+      statusSel.addEventListener("change", applyFilter);
       applyFilter();
     }})();
   </script>
