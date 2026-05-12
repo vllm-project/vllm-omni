@@ -30,7 +30,7 @@ import torch
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 
-from tests.e2e.offline_inference.rlhf_test._inlined_server import (
+from tests.e2e.offline_inference.rlhf_test.rlhf_test_utils import (
     DiffusionOutput,
     RolloutMode,
     VllmOmniPipelineBase,
