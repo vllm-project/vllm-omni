@@ -2280,7 +2280,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if system_prompt_type is not None:
                 engine_prompt["use_system_prompt"] = system_prompt_type
 
-        engine_prompt: OmniTextPrompt = {"prompt": prompt}
         engine_prompt["modalities"] = modalities
         if negative_prompt is not None:
             engine_prompt["negative_prompt"] = negative_prompt
