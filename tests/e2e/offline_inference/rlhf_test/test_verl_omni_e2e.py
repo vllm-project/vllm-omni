@@ -28,6 +28,7 @@ import ray
 from huggingface_hub import snapshot_download
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
+from tests.helpers.mark import hardware_test
 
 from tests.e2e.offline_inference.rlhf_test.rlhf_test_utils import (
     DiffusionOutput,
@@ -168,6 +169,11 @@ def init_server():
     ray.shutdown()
 
 
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_generate(init_server):
     """Concurrent generate() calls covering basic output, logprobs, and multi-request correctness."""
     server = init_server
@@ -211,6 +217,3 @@ def test_generate(init_server):
 
     print(f"All {len(prompts)} concurrent requests returned valid DiffusionOutput")
 
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
