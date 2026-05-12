@@ -38,17 +38,17 @@ import socket
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from enum import Enum
 from pprint import pprint
-from typing import Any, Optional, Union
+from typing import Any
 
 import ray
 import torch
 import torchvision.transforms as T
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict
-
-import vllm_omni.entrypoints.cli.serve
 from vllm.entrypoints.openai.api_server import build_app
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+import vllm_omni.entrypoints.cli.serve
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.api_server import omni_init_app_state
@@ -67,12 +67,10 @@ logger.setLevel(logging.INFO)
 # ---------------------------------------------------------------------
 
 CUSTOM_PIPELINE_CLASS = (
-    "tests.e2e.offline_inference.custom_pipeline."
-    "qwen_image_pipeline_with_logprob.QwenImagePipelineWithLogProbForTest"
+    "tests.e2e.offline_inference.custom_pipeline.qwen_image_pipeline_with_logprob.QwenImagePipelineWithLogProbForTest"
 )
 WORKER_EXTENSION_CLASS = (
-    "tests.e2e.offline_inference.custom_pipeline."
-    "worker_extension.vLLMOmniColocateWorkerExtensionForTest"
+    "tests.e2e.offline_inference.custom_pipeline.worker_extension.vLLMOmniColocateWorkerExtensionForTest"
 )
 
 
@@ -188,9 +186,9 @@ class DiffusionOutput(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     diffusion_output: Any
-    log_probs: Optional[Any] = None
-    stop_reason: Optional[str] = None
-    num_preempted: Optional[int] = None
+    log_probs: Any | None = None
+    stop_reason: str | None = None
+    num_preempted: int | None = None
     extra_fields: dict[str, Any] = {}
 
 
@@ -200,7 +198,7 @@ class DiffusionOutput(BaseModel):
 # =====================================================================
 
 
-def omega_conf_to_dataclass(config, dataclass_type: Optional[type[Any]] = None) -> Any:
+def omega_conf_to_dataclass(config, dataclass_type: type[Any] | None = None) -> Any:
     if not config:
         return dataclass_type() if dataclass_type is not None else None
     if not isinstance(config, (DictConfig, ListConfig, dict, list)):
@@ -208,11 +206,7 @@ def omega_conf_to_dataclass(config, dataclass_type: Optional[type[Any]] = None) 
 
     assert dataclass_type is not None and is_dataclass(dataclass_type)
 
-    raw = (
-        OmegaConf.to_container(config, resolve=True)
-        if isinstance(config, (DictConfig, ListConfig))
-        else config
-    )
+    raw = OmegaConf.to_container(config, resolve=True) if isinstance(config, (DictConfig, ListConfig)) else config
 
     valid = {f.name: f for f in fields(dataclass_type)}
     kwargs: dict[str, Any] = {}
@@ -291,26 +285,26 @@ class DiffusionPipelineConfig(BaseConfig):
     num_inference_steps: int = 10
     true_cfg_scale: float = 1.0
     max_sequence_length: int = 512
-    guidance_scale: Optional[float] = None
+    guidance_scale: float | None = None
 
 
 @dataclass
 class DiffusionRolloutConfig(BaseConfig):
-    name: Optional[str] = None
+    name: str | None = None
     mode: str = "async"
     n: int = 1
     dtype: str = "bfloat16"
     gpu_memory_utilization: float = 0.5
     enforce_eager: bool = False
-    cudagraph_capture_sizes: Optional[list] = None
+    cudagraph_capture_sizes: list | None = None
     data_parallel_size: int = 1
     expert_parallel_size: int = 1
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     max_num_batched_tokens: int = 8192
-    logprobs_mode: Optional[str] = "processed_logprobs"
-    scheduling_policy: Optional[str] = "fcfs"
-    max_model_len: Optional[int] = None
+    logprobs_mode: str | None = "processed_logprobs"
+    scheduling_policy: str | None = "fcfs"
+    max_model_len: int | None = None
     max_num_seqs: int = 1024
     disable_log_stats: bool = True
     engine_kwargs: dict = field(default_factory=dict)
@@ -319,38 +313,38 @@ class DiffusionRolloutConfig(BaseConfig):
     enable_prefix_caching: bool = True
     load_format: str = "dummy"
     skip_tokenizer_init: bool = True
-    quantization: Optional[str] = None
+    quantization: str | None = None
     enable_rollout_routing_replay: bool = False
     enable_sleep_mode: bool = True
-    external_lib: Optional[str] = None
+    external_lib: str | None = None
     seed: int = 0
-    limit_images: Optional[int] = None
+    limit_images: int | None = None
     # parent vLLMHttpServer reads these; we keep them None/disabled.
-    profiler: Optional[Any] = None
-    prometheus: Optional[Any] = None
-    mtp: Optional[Any] = None
+    profiler: Any | None = None
+    prometheus: Any | None = None
+    mtp: Any | None = None
 
 
 @dataclass
 class DiffusionModelConfig(BaseConfig):
     path: str = ""
-    architecture: Optional[str] = None
-    local_path: Optional[str] = None
-    tokenizer_path: Optional[str] = None
-    local_tokenizer_path: Optional[str] = None
+    architecture: str | None = None
+    local_path: str | None = None
+    tokenizer_path: str | None = None
+    local_tokenizer_path: str | None = None
     model_type: str = "diffusion_model"
     load_tokenizer: bool = True
     trust_remote_code: bool = False
-    custom_chat_template: Optional[str] = None
-    external_lib: Optional[str] = None
+    custom_chat_template: str | None = None
+    external_lib: str | None = None
     lora_rank: int = 0
     lora_alpha: int = 64
     lora_init_weights: str = "gaussian"
-    target_modules: Optional[Any] = "all-linear"
-    target_parameters: Optional[list[str]] = None
-    exclude_modules: Optional[str] = None
+    target_modules: Any | None = "all-linear"
+    target_parameters: list[str] | None = None
+    exclude_modules: str | None = None
     lora: dict[str, Any] = field(default_factory=dict)
-    lora_adapter_path: Optional[str] = None
+    lora_adapter_path: str | None = None
 
     def __post_init__(self):
         if self.local_path is None:
@@ -390,7 +384,7 @@ class VllmOmniPipelineBase:
         return cls._registry.get(architecture)
 
     @classmethod
-    def get_pipeline_path(cls, architecture: Optional[str]) -> Optional[str]:
+    def get_pipeline_path(cls, architecture: str | None) -> str | None:
         pipeline_cls = cls._registry.get(architecture) if architecture else None
         if pipeline_cls is None:
             return None
@@ -439,7 +433,7 @@ class vLLMHttpServer:
             self.config.load_format = "auto"
 
         self._server_address = ray.util.get_node_ip_address().strip("[]")
-        self._server_port: Optional[int] = None
+        self._server_port: int | None = None
 
         # Profiler controller (test passes no profiler config -> None).
         profiler_config = self.config.profiler
@@ -448,9 +442,7 @@ class vLLMHttpServer:
             tool_config = omega_conf_to_dataclass(
                 (getattr(profiler_config, "tool_config", None) or {}).get(profiler_config.tool)
             )
-        self.profiler_controller = DistProfiler(
-            self.replica_rank, config=profiler_config, tool_config=tool_config
-        )
+        self.profiler_controller = DistProfiler(self.replica_rank, config=profiler_config, tool_config=tool_config)
 
         # Port allocation (single-node DP=1 -> none of these are consumed).
         if self.node_rank == 0:
@@ -705,7 +697,7 @@ class vLLMHttpServer:
     def _get_override_generation_config(self) -> dict:
         return {}
 
-    def _apply_quantization(self) -> tuple[Optional[str], dict]:
+    def _apply_quantization(self) -> tuple[str | None, dict]:
         # Test never enables quantization \u2014 verbatim default return path.
         quantization = self.config.get("quantization", None)
         return quantization, {}
@@ -808,11 +800,11 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         request_id: str,
-        image_data: Optional[list[Any]] = None,
-        video_data: Optional[list[Any]] = None,
-        negative_prompt_ids: Optional[list[int]] = None,
+        image_data: list[Any] | None = None,
+        video_data: list[Any] | None = None,
+        negative_prompt_ids: list[int] | None = None,
         priority: int = 0,
-    ) -> Union[DiffusionOutput]:
+    ) -> DiffusionOutput:
         return await self._generate_diffusion(
             prompt_ids, sampling_params, request_id, image_data, video_data, negative_prompt_ids, priority
         )
@@ -823,9 +815,9 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         request_id: str,
-        image_data: Optional[list[Any]] = None,
-        video_data: Optional[list[Any]] = None,
-        negative_prompt_ids: Optional[list[int]] = None,
+        image_data: list[Any] | None = None,
+        video_data: list[Any] | None = None,
+        negative_prompt_ids: list[int] | None = None,
         priority: int = 0,  # noqa: ARG002
     ) -> DiffusionOutput:
         prompt_ids = normalize_token_ids(prompt_ids)
@@ -860,7 +852,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             sampling_params_list=[diffusion_sampling_params],
         )
 
-        final_res: Optional[OmniRequestOutput] = None
+        final_res: OmniRequestOutput | None = None
         async for output in generator:
             final_res = output
         assert final_res is not None

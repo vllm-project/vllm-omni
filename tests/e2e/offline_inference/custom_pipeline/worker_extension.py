@@ -36,6 +36,7 @@ except ImportError:  # vLLM versions before the rename keep it under .models
 
 from vllm.lora.peft_helper import PEFTHelper
 from vllm.lora.utils import get_adapter_absolute_path
+
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.worker.diffusion_worker import CustomPipelineWorkerExtension
 from vllm_omni.lora.request import LoRARequest as OmniLoRARequest
@@ -84,9 +85,7 @@ class VLLMOmniHijackForTest:
         if VLLMOmniHijackForTest._applied:
             return
 
-        def hijack__load_adapter(
-            self, lora_request: OmniTensorLoRARequestForTest
-        ) -> tuple[LoRAModel, PEFTHelper]:
+        def hijack__load_adapter(self, lora_request: OmniTensorLoRARequestForTest) -> tuple[LoRAModel, PEFTHelper]:
             if not self._expected_lora_modules:
                 raise ValueError("No supported LoRA modules found in the diffusion pipeline.")
 

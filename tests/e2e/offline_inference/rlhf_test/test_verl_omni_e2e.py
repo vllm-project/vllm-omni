@@ -25,7 +25,6 @@ from uuid import uuid4
 
 import pytest
 import ray
-import torch
 from huggingface_hub import snapshot_download
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
