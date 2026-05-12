@@ -56,6 +56,12 @@ CUDA_VISIBLE_DEVICES=0,1 \
 examples/online_serving/dreamzero/run_server.sh
 ```
 
+If you have 2 GPUs with moderate VRAM (less than 80GB), you can use the following command to start the server with TP=2 configuration files:
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+examples/online_serving/dreamzero/run_server_with_tp2_config.sh
+```
+
 If you only want 1 GPU:
 
 ```bash
@@ -63,6 +69,7 @@ CUDA_VISIBLE_DEVICES=0 \
 CFG_PARALLEL_SIZE=1 \
 examples/online_serving/dreamzero/run_server.sh
 ```
+Please note DreamZero requires >=74GB VRAM for single-GPU serving.
 
 The websocket endpoint is:
 
@@ -353,3 +360,27 @@ The upstream DreamZero-dependent parity tests are kept under:
 
 Those tests require a local upstream DreamZero checkout and are not needed for
 the standard vLLM example above.
+
+
+# MolmoSpaces DreamZero Evaluation Demo
+
+This example shows how to use the vllm-host to evaluate DreamZero on molmospaces benchmarks.
+
+## Files
+
+- `molmospace_dreamzero_eval_demo.py`: evaluate DreamZero on molmospaces benchmarks
+
+## Environment requirements
+
+- Install molmospaces in your python environment by following the instructions in [molmospaces/README.md](https://github.com/allenai/molmospaces/blob/main/README.md)
+- Prepare the benchmark/assets directory by following the instructions in molmospaces.
+
+## Run the evaluation
+
+From the repository root:
+
+```bash
+python examples/online_serving/dreamzero/molmospace_dreamzero_eval_demo.py \
+  --benchmark_dir /path/to/molmospaces/assets/benchmarks/molmospaces-bench-v2/benchmarks/20260327/ithor/FrankaCloseHardBench/FrankaCloseHardBench_20260206_json_benchmark \
+  --output_dir /path/to/eval_output --max_episodes 1 --task_horizon_steps 240 --episode_idx 1
+```
