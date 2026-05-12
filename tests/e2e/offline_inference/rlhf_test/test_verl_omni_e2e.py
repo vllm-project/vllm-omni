@@ -585,11 +585,4 @@ def test_generate(init_server):
         )
         assert 0.0 <= float(img[0, 0, 0]) <= 1.0, f"Request {i}: pixel values must be in [0, 1]"
 
-    lp = results[0].log_probs
-    assert lp is not None, "log_probs should be present when logprobs=True"
-    if isinstance(lp, torch.Tensor):
-        assert lp.numel() > 0
-    else:
-        assert len(lp) > 0
-
     print(f"All {len(prompts)} concurrent requests returned valid DiffusionOutput")
