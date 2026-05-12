@@ -552,6 +552,7 @@ def test_language_001(omni_server, openai_client) -> None:
 
     openai_client.send_omni_request(request_config)
 
+
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_long_text_output_001(omni_server, openai_client) -> None:
