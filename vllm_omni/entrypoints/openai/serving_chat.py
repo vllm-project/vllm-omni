@@ -2265,8 +2265,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             if tokenizer is not None:
                 result = build_prompt_tokens(prompt, tokenizer, task=bot_task)
-                prompt_token_ids = result["token_ids"]
-                system_prompt_type = result["system_prompt_type"]
+                prompt_token_ids = result.token_ids
+                system_prompt_type = result.system_prompt_type
             else:
                 prompt = build_prompt(prompt, task=bot_task)
 

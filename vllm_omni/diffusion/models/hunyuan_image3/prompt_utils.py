@@ -17,6 +17,7 @@ canonical mapping for both flows.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from .system_prompt import get_system_prompt
@@ -128,13 +129,19 @@ def build_prompt(
     return "".join(parts)
 
 
+@dataclass
+class PromptTokensResult:
+    token_ids: list[int]  # The tokenized prompt
+    system_prompt_type: str  # The effective system prompt type used
+
+
 def build_prompt_tokens(
     user_prompt: str,
     tokenizer,
     task: str = "it2i_think",
     sys_type: str | None = None,
     custom_system_prompt: str | None = None,
-) -> dict[str, Any]:
+) -> PromptTokensResult:
     """Segment-by-segment tokenization that matches HF apply_chat_template.
 
     Calling tokenizer.encode(build_prompt(...)) on the full string lets BPE
@@ -146,9 +153,7 @@ def build_prompt_tokens(
     Omni via OmniTokensPrompt (prompt_token_ids).
 
     Returns:
-        A dictionary containing:
-        - token_ids: list[int] - The tokenized prompt
-        - system_prompt_type: str - The effective system prompt type used
+        PromptTokensResult
     """
     if task not in _TASK_PRESETS:
         raise ValueError(f"Unknown task {task!r}. Choose from: {available_tasks()}")
@@ -168,10 +173,10 @@ def build_prompt_tokens(
     if task == "t2i_vanilla":
         s = build_prompt(user_prompt, task, sys_type, custom_system_prompt)
         token_ids = tokenizer.encode(s, add_special_tokens=False)
-        return {
-            "token_ids": token_ids,
-            "system_prompt_type": effective_sys_type,
-        }
+        return PromptTokensResult(
+            token_ids=token_ids,
+            system_prompt_type=effective_sys_type,
+        )
 
     system_prompt = get_system_prompt(effective_sys_type, preset_bot_task, custom_system_prompt)
     # Do NOT strip -- HF apply_chat_template keeps the system prompt's
@@ -190,10 +195,10 @@ def build_prompt_tokens(
     if trig_id is not None:
         ids += [trig_id]
 
-    return {
-        "token_ids": ids,
-        "system_prompt_type": effective_sys_type,
-    }
+    return PromptTokensResult(
+        token_ids=ids,
+        system_prompt_type=effective_sys_type,
+    )
 
 
 __all__ = ["build_prompt", "build_prompt_tokens", "resolve_stop_token_ids", _TASK_PRESETS]

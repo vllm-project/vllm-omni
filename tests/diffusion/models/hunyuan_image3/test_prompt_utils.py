@@ -181,7 +181,7 @@ def test_build_prompt_tokens_segments_each_boundary():
 def test_build_prompt_tokens_image_placeholder_present_for_image_tasks():
     tok = FakeTokenizer()
     result = build_prompt_tokens("hi", tok, task="i2t")
-    ids = result["token_ids"]
+    ids = result.token_ids
     assert ids[0] == FakeTokenizer.SPECIAL["<|startoftext|>"], "BOS (<|startoftext|>) must be the first token"
     assert FakeTokenizer.SPECIAL["<img>"] in ids, "<img> placeholder must be present for i2t/it2i tasks"
 
@@ -189,7 +189,7 @@ def test_build_prompt_tokens_image_placeholder_present_for_image_tasks():
 def test_build_prompt_tokens_no_image_for_text_only_tasks():
     tok = FakeTokenizer()
     result = build_prompt_tokens("hi", tok, task="t2t")
-    ids = result["token_ids"]
+    ids = result.token_ids
     assert FakeTokenizer.SPECIAL["<img>"] not in ids, "<img> must NOT appear for text-only tasks"
 
 
@@ -206,7 +206,7 @@ def test_build_prompt_tokens_trigger_is_last_token(task: str, trigger_id: int):
     """Trigger tag id must be the LAST token (after `Assistant: ` segment)."""
     tok = FakeTokenizer()
     result = build_prompt_tokens("hi", tok, task=task)
-    ids = result["token_ids"]
+    ids = result.token_ids
     assert ids[-1] == trigger_id
 
 
@@ -214,7 +214,7 @@ def test_build_prompt_tokens_no_trigger_for_plain_tasks():
     """Tasks without trigger_tag (t2t / i2t) must NOT append a trigger id."""
     tok = FakeTokenizer()
     result = build_prompt_tokens("hi", tok, task="t2t")
-    ids = result["token_ids"]
+    ids = result.token_ids
     assert ids[-1] not in {
         FakeTokenizer.SPECIAL["<think>"],
         FakeTokenizer.SPECIAL["<recaption>"],
@@ -310,7 +310,7 @@ def test_segment_tokenize_diverges_from_full_string_encode():
 
     user_prompt = "写一首关于夜的诗。"
     result = build_prompt_tokens(user_prompt, tok, task="i2t")
-    seg_ids = result["token_ids"]
+    seg_ids = result.token_ids
     full_ids = tok.encode(build_prompt(user_prompt, task="i2t"), add_special_tokens=False)
 
     assert seg_ids != full_ids, (
