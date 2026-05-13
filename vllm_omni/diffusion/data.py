@@ -766,6 +766,10 @@ class OmniDiffusionConfig:
                     self.model_class_name = "BagelPipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
+                elif model_type == "neo_chat":
+                    self.model_class_name = "SenseNovaU1Pipeline"
+                    self.tf_model_config = TransformerConfig()
+                    self.update_multimodal_support()
                 elif model_type == "nextstep":
                     if self.model_class_name is None:
                         self.model_class_name = "NextStep11Pipeline"

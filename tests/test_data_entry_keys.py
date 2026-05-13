@@ -1,41 +1,175 @@
-"""Tests for data_entry_keys: TypedDict payload structure, flatten/unflatten, serialize/deserialize."""
+"""Tests for data_entry_keys."""
 
+import msgspec
+import pytest
 import torch
 
 from vllm_omni.data_entry_keys import (
+    CodesStruct,
+    EmbeddingsStruct,
+    HiddenStatesStruct,
+    IdsStruct,
+    MetaStruct,
     OmniPayload,
+    OmniPayloadStruct,
     deserialize_payload,
     flatten_payload,
     serialize_payload,
+    to_dict,
+    to_struct,
     unflatten_payload,
 )
 from vllm_omni.engine import AdditionalInformationPayload
 
 
-class TestOmniPayload:
-    def test_nested_payload_structure(self):
-        """Verify OmniPayload can be constructed with nested dicts."""
-        payload: OmniPayload = {
-            "hidden_states": {"output": torch.tensor([1.0])},
-            "embed": {"prefill": torch.tensor([2.0])},
-            "codes": {"audio": torch.tensor([3.0])},
-            "ids": {"all": [1, 2, 3]},
-            "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+class TestOmniPayloadStruct:
+    """Runtime-validated mirror of OmniPayload (msgspec.Struct)."""
+
+    def test_to_struct_validates_dict(self):
+        d = {"meta": {"left_context_size": 25, "finished": torch.tensor(False)}}
+        s = to_struct(d)
+        assert s.meta.left_context_size == 25
+
+    def test_to_struct_rejects_legacy_flat_top_level(self):
+        with pytest.raises(msgspec.ValidationError, match="unknown field"):
+            to_struct({"code_predictor_codes": torch.zeros(3, 8)})
+
+    def test_to_struct_rejects_legacy_flat_meta_field(self):
+        # `left_context_size` at top level (legacy) instead of under `meta`
+        with pytest.raises(msgspec.ValidationError, match="unknown field"):
+            to_struct({"left_context_size": 25})
+
+    def test_to_struct_rejects_typo_in_subkey(self):
+        with pytest.raises(msgspec.ValidationError, match="unknown field"):
+            to_struct({"meta": {"finisheed": True}})
+
+    def test_to_struct_rejects_wrong_type(self):
+        with pytest.raises(msgspec.ValidationError, match="Expected"):
+            to_struct({"meta": {"left_context_size": "not_an_int"}})
+
+    def test_round_trip_dict_struct_dict(self):
+        original = {
+            "meta": {"left_context_size": 7, "finished": torch.tensor(True)},
+            "codes": {"audio": torch.zeros(2, 8)},
+            "hidden_states": {"output": torch.zeros(4, 16)},
         }
-        assert torch.equal(payload["hidden_states"]["output"], torch.tensor([1.0]))
-        assert torch.equal(payload["embed"]["prefill"], torch.tensor([2.0]))
-        assert torch.equal(payload["codes"]["audio"], torch.tensor([3.0]))
-        assert payload["ids"]["all"] == [1, 2, 3]
-        assert payload["meta"]["finished"].item() is True
+        s = to_struct(original)
+        d = to_dict(s)
+        assert sorted(d.keys()) == sorted(original.keys())
+        for top, sub in original.items():
+            assert sorted(d[top].keys()) == sorted(sub.keys())
 
-    def test_partial_payload(self):
-        """OmniPayload fields are all optional (total=False)."""
-        payload: OmniPayload = {"meta": {"finished": torch.tensor(False, dtype=torch.bool)}}
-        assert payload["meta"]["finished"].item() is False
+    def test_to_dict_drops_unset_fields(self):
+        s = OmniPayloadStruct(meta=MetaStruct(left_context_size=10))
+        d = to_dict(s)
+        assert d == {"meta": {"left_context_size": 10}}
 
-    def test_empty_payload(self):
-        payload: OmniPayload = {}
-        assert len(payload) == 0
+    def test_struct_with_all_categories(self):
+        d = {
+            "hidden_states": {"output": torch.zeros(1)},
+            "embed": {"prefill": torch.zeros(1), "tts_bos": torch.zeros(1)},
+            "ids": {"all": [1, 2], "prompt": [1]},
+            "codes": {"audio": torch.zeros(1)},
+            "meta": {"left_context_size": 3, "num_processed_tokens": 7},
+        }
+        s = to_struct(d)
+        assert isinstance(s.hidden_states, HiddenStatesStruct)
+        assert isinstance(s.embed, EmbeddingsStruct)
+        assert isinstance(s.ids, IdsStruct)
+        assert isinstance(s.codes, CodesStruct)
+        assert isinstance(s.meta, MetaStruct)
+        assert s.ids.all == [1, 2]
+        assert s.meta.num_processed_tokens == 7
+
+
+class TestValidatePayload:
+    def test_raises_on_unknown_top_level(self):
+        from vllm_omni.data_entry_keys import validate_payload
+
+        with pytest.raises(msgspec.ValidationError, match="unknown field"):
+            validate_payload({"code_predictor_codes": torch.zeros(3, 8)}, context="test_boundary")
+
+    def test_raises_on_unknown_sub_key(self):
+        from vllm_omni.data_entry_keys import validate_payload
+
+        with pytest.raises(msgspec.ValidationError, match="unknown field"):
+            validate_payload({"meta": {"finisheed": True}})
+
+    def test_none_is_ok(self):
+        from vllm_omni.data_entry_keys import validate_payload
+
+        validate_payload(None)  # should not raise
+
+    def test_valid_payload_passes(self):
+        from vllm_omni.data_entry_keys import validate_payload
+
+        validate_payload({"meta": {"left_context_size": 5}})
+
+    def test_context_in_error_message(self):
+        from vllm_omni.data_entry_keys import validate_payload
+
+        with pytest.raises(msgspec.ValidationError, match="my_call_site"):
+            validate_payload({"bad": 1}, context="my_call_site")
+
+
+class TestWireEquivalenceStructVsDict:
+    """Producer return-side migration invariant: encoding an ``OmniPayloadStruct``
+    via the connector serializer must decode to the same payload as encoding
+    the equivalent ``to_dict(struct)``.
+
+    Guards against regressions where the wire format diverges between the two
+    paths (e.g. msgspec adds a struct tag, or ``to_dict`` drops a non-default
+    sub-field that ``omit_defaults`` retains).
+    """
+
+    @staticmethod
+    def _round_trip(obj):
+        from vllm_omni.distributed.omni_connectors.utils.serialization import (
+            OmniMsgpackDecoder,
+            OmniMsgpackEncoder,
+        )
+
+        return OmniMsgpackDecoder().decode(OmniMsgpackEncoder().encode(obj))
+
+    @staticmethod
+    def _assert_decoded_equal(a, b):
+        if isinstance(a, dict):
+            assert isinstance(b, dict)
+            assert sorted(a.keys()) == sorted(b.keys())
+            for k in a:
+                TestWireEquivalenceStructVsDict._assert_decoded_equal(a[k], b[k])
+        elif isinstance(a, torch.Tensor):
+            assert isinstance(b, torch.Tensor)
+            assert a.dtype == b.dtype
+            assert a.shape == b.shape
+            assert torch.equal(a, b)
+        elif isinstance(a, list):
+            assert isinstance(b, list) and len(a) == len(b)
+            for x, y in zip(a, b, strict=True):
+                TestWireEquivalenceStructVsDict._assert_decoded_equal(x, y)
+        else:
+            assert a == b
+
+    def test_basic_payload(self):
+        struct = OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor([1, 2, 3], dtype=torch.long)),
+            meta=MetaStruct(left_context_size=10, finished=torch.tensor(True, dtype=torch.bool)),
+        )
+        self._assert_decoded_equal(self._round_trip(struct), self._round_trip(to_dict(struct)))
+
+    def test_nested_sub_structs(self):
+        # Exercises depth-2 sub-struct encoding (embed.*) which was the case that
+        # exposed schema drift in the #1829 migration.
+        struct = OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor([5, 6], dtype=torch.long)),
+            meta=MetaStruct(finished=torch.tensor(False, dtype=torch.bool)),
+            embed=EmbeddingsStruct(
+                speech_token=torch.tensor([[1, 2, 3]]),
+                speech_feat=torch.tensor([[[0.1, 0.2], [0.3, 0.4]]]),
+                embedding=torch.tensor([[0.5, 0.6]]),
+            ),
+        )
+        self._assert_decoded_equal(self._round_trip(struct), self._round_trip(to_dict(struct)))
 
 
 class TestFlattenPayload:
@@ -76,9 +210,6 @@ class TestFlattenPayload:
         assert torch.equal(flat["hidden_states.layer_24"], torch.tensor([3.0]))
         assert "hidden_states.layers" not in flat
 
-    def test_empty_payload(self):
-        assert flatten_payload({}) == {}
-
     def test_mixed_nested_and_top_level(self):
         nested: OmniPayload = {
             "codes": {"audio": torch.tensor([1.0])},
@@ -117,9 +248,6 @@ class TestUnflattenPayload:
         assert torch.equal(nested["hidden_states"]["output"], torch.tensor([1.0]))
         assert torch.equal(nested["hidden_states"]["layers"][0], torch.tensor([2.0]))
         assert torch.equal(nested["hidden_states"]["layers"][24], torch.tensor([3.0]))
-
-    def test_empty_payload(self):
-        assert unflatten_payload({}) == {}
 
 
 class TestFlattenUnflattenRoundTrip:
