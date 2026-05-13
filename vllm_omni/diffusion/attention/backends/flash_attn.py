@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import partial
 
 import torch
 from vllm.logger import init_logger
@@ -9,6 +10,9 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
+)
+from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
+    piecewise_attn,
 )
 
 logger = init_logger(__name__)
@@ -35,6 +39,20 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 class FlashAttentionImpl(AttentionImpl):
+    # Per-platform FP8 KV quantization support.
+    # To enable FP8 on a new platform, add its OmniPlatformEnum value here
+    # and handle kv_cache_dtype in the corresponding forward_{platform}().
+    #
+    # TODO(quant-backend): The FP8 quant path currently lives inside
+    # FlashAttentionImpl gated by ``attn_metadata.extra["kv_cache_dtype"]``.
+    # Eventually extract it into a dedicated FlashAttentionQuantBackend so
+    # backend selection (not metadata) decides quant. Until then, model
+    # authors can opt a specific Attention layer out via
+    # ``Attention(disable_kv_quant=True)``.
+    _supported_kv_cache_dtypes = {
+        "npu": {"fp8"},
+    }
+
     def __init__(
         self,
         num_heads: int,
@@ -43,16 +61,25 @@ class FlashAttentionImpl(AttentionImpl):
         causal: bool = False,
         num_kv_heads: int | None = None,
         prefix: str = "",
+        qkv_layout: str | None = None,
+        backend_kwargs: dict | None = None,
         **extra_impl_args,
     ) -> None:
         self.num_heads = num_heads
         self.causal = causal
         self.softmax_scale = softmax_scale
+        self.qkv_layout = qkv_layout
+        if backend_kwargs:
+            logger.warning("FlashAttentionImpl ignoring backend_kwargs: %s", list(backend_kwargs.keys()))
 
     @staticmethod
     def _unwrap_flash_output(out: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
         # FA3 may return (out, lse), FA2 returns out
         return out[0] if isinstance(out, tuple) else out
+
+    @staticmethod
+    def _flash_wrapper(q, k, v, *, attn_func, **kwargs):
+        return FlashAttentionImpl._unwrap_flash_output(attn_func(q, k, v, **kwargs))
 
     def _forward_varlen_masked(
         self,
@@ -151,6 +178,24 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        full_attn_spans = attn_metadata.full_attn_spans if attn_metadata is not None else None
+
+        # Try piecewise attention
+        if full_attn_spans is not None:
+            logger.debug("Using piecewise Flash Attention for mixed causal/full mask")
+            attn_func = partial(
+                FlashAttentionImpl._flash_wrapper,
+                attn_func=flash_attn_func,
+            )
+
+            return piecewise_attn(
+                query,
+                key,
+                value,
+                full_attn_spans,
+                self.softmax_scale,
+                attn_func,
+            )
 
         if attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(
@@ -219,6 +264,39 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
         """NPU attention implementation using mindiesd."""
+
+        kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata else None
+        if kv_cache_dtype is not None:
+            return self.forward_fa_quant_npu(query, key, value, attn_metadata)
+        return self.forward_fa_npu(query, key, value, attn_metadata)
+
+    def forward_fa_quant_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata = None,
+    ) -> torch.Tensor:
+        from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_rotate_quant_fa
+
+        layout = self.qkv_layout or "BNSD"
+        # Models pass (B, S, H, D); NPU fused op expects (B, N, S, D).
+        out = fp8_rotate_quant_fa(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            layout=layout,
+            softmax_scale=self.softmax_scale,
+        )
+        return out.transpose(1, 2)
+
+    def forward_fa_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata = None,
+    ) -> torch.Tensor:
         try:
             from mindiesd import attention_forward
         except ImportError:
@@ -228,15 +306,14 @@ class FlashAttentionImpl(AttentionImpl):
                 "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
             )
-
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
-        output = attention_forward(
+        layout = self.qkv_layout or "BNSD"
+        return attention_forward(
             query,
             key,
             value,
             attn_mask=attention_mask,
             opt_mode="manual",
             op_type="fused_attn_score",
-            layout="BNSD",
+            layout=layout,
         )
-        return output

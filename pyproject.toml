@@ -55,11 +55,16 @@ dev = [
     "opencc>=1.2.0",
     "mistune>=3.2.0", # for example tests
     "torchmetrics>=1.4.0", # for accuracy similarity metrics
+    "ray[default]", # for RL test
     "jiwer>=3.0.0",
     "zhon>=2.0.0",
     "zhconv>=1.4.2",
     "scipy>=1.10.0",
     "funasr>=1.0.0",
+    "lpips>=0.1.4", # for quantization fp8
+    "orjson>=3.11.7", # to make v1/embeddings API fast
+    "voxcpm>=2.0.2", # for voxcpm model Test
+    "torchdiffeq>=0.2.5" # for covo_audio Test
 ]
 
 demo = [
@@ -142,6 +147,12 @@ ignore = [
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"
+"torch.cuda.max_memory_allocated".msg = "Use torch.accelerator.max_memory_allocated"
+"torch.cuda.reset_peak_memory_stats".msg = "Use torch.accelerator.reset_peak_memory_stats"
+"torch.cuda.device_count".msg = "Use torch.accelerator.device_count"
+"torch.cuda.current_device".msg = "Use torch.accelerator.current_device_index"
+"torch.cuda.empty_cache".msg  = "Use torch.accelerator.empty_cache"
+"torch.cuda.synchronize".msg = "Use torch.accelerator.synchronize"
 
 [tool.mypy]
 python_version = "3.12, 3.13"
@@ -176,6 +187,7 @@ markers = [
     # function module markers
     "diffusion: Diffusion model tests",
     "omni: Omni model tests",
+    "tts: TTS model tests",
     "cache: Cache backend tests",
     "parallel: Parallelism/distributed tests",
     "example: Doc example code tests",

@@ -875,6 +875,7 @@ def merge_pipeline_deploy(
             runtime["num_replicas"] = ds.num_replicas
             if ds.env is not None:
                 runtime["env"] = ds.env
+        runtime["requires_multimodal_data"] = ps.requires_multimodal_data
 
         result.append(
             StageConfig(

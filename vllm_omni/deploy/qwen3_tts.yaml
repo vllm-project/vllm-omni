@@ -26,6 +26,8 @@ connectors:
       # Must match the decoder sliding attention window.
       codec_chunk_frames: 25
       codec_left_context_frames: 72
+      # Emit only the first audio chunk early, then return to codec_chunk_frames.
+      initial_codec_chunk_frames: 1
 
 stages:
   - stage_id: 0
@@ -52,7 +54,7 @@ stages:
       top_p: 1.0
 
   - stage_id: 1
-    max_num_seqs: 1
+    max_num_seqs: 10
     gpu_memory_utilization: 0.3
     enforce_eager: true
     trust_remote_code: true

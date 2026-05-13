@@ -212,7 +212,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         peak_allocated_gb = peak_allocated_bytes / (1024**3)
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
 
-        logger.info(
+        logger.debug(
             "Peak GPU memory (this request): %.2f GB reserved, %.2f GB allocated, %.2f GB pool overhead (%.1f%%)",
             peak_reserved_gb,
             peak_allocated_gb,

@@ -132,7 +132,7 @@ class HunyuanModel(HunYuanModel):
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)
             fused_moe_expert_mapping = fused_moe_make_expert_params_mapping(
-                self,
+                model=self,
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
@@ -1517,14 +1517,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         # For comprehension mode, block image generation tokens but allow
         # text structure tokens (<think>, <answer>, etc.) so the model can
-        # follow its natural generation pattern. The yaml stop_token_ids
-        # for i2t/t2t now includes </think> (128024) so the AR-only output
-        # terminates after the analysis section, matching HF's
-        # `bot_task="think"` behavior. Without that stop, the model
-        # continues into a recaption section even in comprehension mode
-        # (the stage-transition processor only fires in generation mode,
-        # but the instruct-tuned model writes recaption on its own from
-        # internal habit).
+        # follow its natural generation pattern. Runtime sampling params
+        # decide stop tokens from the active bot_task, matching the official
+        # HunyuanImage3 generation path without hard-coded YAML token ids.
         self._blocked_token_ids: set[int] = set()
         if self._is_comprehension:
             self._blocked_token_ids.update(
@@ -1603,7 +1598,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 layer.mlp = None
                 del mlp
                 gc.collect()
-                torch.cuda.empty_cache()
+                torch.accelerator.empty_cache()
 
                 layer.mlp = HunyuanImage3SparseMoeBlock(
                     config=self.config,

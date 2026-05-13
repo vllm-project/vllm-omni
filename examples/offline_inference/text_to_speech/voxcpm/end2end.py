@@ -11,11 +11,11 @@ import soundfile as sf
 import torch
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni import AsyncOmni, Omni
 from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
-DEFAULT_SYNC_STAGE_CONFIG = REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "voxcpm.yaml"
+DEFAULT_SYNC_STAGE_CONFIG = get_deploy_config_path("voxcpm.yaml")
 
 
 def _build_prompt(args) -> dict[str, Any]:
@@ -167,7 +167,7 @@ def parse_args():
     parser.add_argument(
         "--stage-configs-path",
         type=str,
-        default=str(DEFAULT_SYNC_STAGE_CONFIG),
+        default=DEFAULT_SYNC_STAGE_CONFIG,
         help=("Stage config path. Use voxcpm.yaml for non-streaming or voxcpm_async_chunk.yaml for streaming."),
     )
     parser.add_argument("--text", type=str, required=True, help="Input text for synthesis.")

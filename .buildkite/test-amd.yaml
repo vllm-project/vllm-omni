@@ -8,7 +8,7 @@ steps:
   grade: Blocking
   commands:
     - export GPU_ARCHS=gfx942
-    - pytest -s -v tests/e2e/offline_inference/test_t2i_model.py
+    - pytest -s -v tests/e2e/offline_inference/test_z_image.py
 
 - label: "Diffusion Images API LoRA E2E"
   timeout_in_minutes: 30
@@ -20,7 +20,7 @@ steps:
     - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/e2e/online_serving/test_images_generations_lora.py
+    - pytest -s -v tests/diffusion/lora/test_images_generations_lora.py
 
 - label: "Diffusion Model CPU offloading Test"
   timeout_in_minutes: 20
@@ -32,8 +32,8 @@ steps:
     - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/e2e/offline_inference/test_diffusion_cpu_offload.py
-    - pytest -s -v tests/e2e/offline_inference/test_diffusion_layerwise_offload.py
+    - pytest -s -v tests/diffusion/offloader/test_diffusion_cpu_offload.py
+    - pytest -s -v tests/diffusion/offloader/test_diffusion_layerwise_offload.py
 
 - label: "Diffusion Cache Backend Test"
   timeout_in_minutes: 15
@@ -57,7 +57,7 @@ steps:
     - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/e2e/offline_inference/test_sequence_parallel.py -m core_model
+    - pytest -s -v tests/diffusion/distributed/test_sequence_parallel.py -m core_model
 
 - label: "Diffusion Tensor Parallelism Test"
   timeout_in_minutes: 20
@@ -67,7 +67,7 @@ steps:
     - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/e2e/offline_inference/test_zimage_parallelism.py
+    - pytest -s -v tests/diffusion/distributed/test_zimage_parallelism.py
 
 - label: "Diffusion GPU Worker Test"
   timeout_in_minutes: 20
@@ -100,23 +100,9 @@ steps:
   commands:
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - export VLLM_TEST_CLEAN_GPU_MEMORY="1"
     - export VLLM_ROCM_USE_AITER=0
     - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py
     - pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py
-
-
-- label: "Diffusion Image Edit Test"
-  timeout_in_minutes: 15
-  agent_pool: mi325_1
-  depends_on: amd-build
-  mirror_hardwares: [amdproduction]
-  grade: Blocking
-  commands:
-    - export GPU_ARCHS=gfx942
-    - export VLLM_LOGGING_LEVEL=DEBUG
-    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - pytest -s -v tests/e2e/online_serving/test_image_gen_edit.py
 
 
 - label: "Omni Sleep Mode Test"
@@ -129,5 +115,4 @@ steps:
     - export GPU_ARCHS=gfx942
     - export VLLM_LOGGING_LEVEL=DEBUG
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-    - export VLLM_TEST_CLEAN_GPU_MEMORY="1"
-    - pytest -s -v tests/e2e/offline_inference/test_omni_sleep_mode.py -m "advanced_model and omni and MI325" --run-level "advanced_model"
+    - pytest -s -v tests/entrypoints/test_omni_sleep_mode.py -m "advanced_model and omni and MI325" --run-level "advanced_model"

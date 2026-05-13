@@ -31,7 +31,7 @@ from vllm import SamplingParams
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 MODEL = "mistralai/Voxtral-4B-TTS-2603"
@@ -41,6 +41,14 @@ SAMPLE_RATE = 24000
 MIN_AUDIO_SAMPLES = 1000
 VOICE = "casual_female"
 TEST_TEXT = "Hello, how are you?"
+
+# (model, stage_config_path, extra_omni_kwargs) for indirect parametrize on
+# ``omni_runner_function`` (function-scoped: must exit before ``AsyncOmni`` test).
+_OMNI_RUNNER_PARAM = (
+    MODEL,
+    STAGE_CONFIG,
+    {"enforce_eager": True},
+)
 
 
 def _compose_request(model_name: str, text: str, voice: str) -> dict:
@@ -58,83 +66,60 @@ def _compose_request(model_name: str, text: str, voice: str) -> dict:
     }
 
 
-def _resolve_stage_config(run_level: str) -> str:
-    """Resolve stage config: strip load_format for advanced_model (real weights)."""
-    if run_level == "advanced_model":
-        return modify_stage_config(
-            STAGE_CONFIG,
-            deletes={
-                "stages": {
-                    0: ["load_format"],
-                    1: ["load_format"],
-                }
-            },
-        )
-    return STAGE_CONFIG
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@pytest.mark.parametrize("omni_runner_function", [_OMNI_RUNNER_PARAM], indirect=True)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+def test_voxtral_tts_offline_basic(omni_runner_function: OmniRunner) -> None:
+    """Offline sync path; function-scoped runner so AsyncOmni test does not overlap a live Omni."""
+    omni = omni_runner_function.omni
+    inputs = _compose_request(MODEL, TEST_TEXT, VOICE)
+
+    sampling_params = SamplingParams(max_tokens=2500)
+    sampling_params_list = [sampling_params, sampling_params]
+
+    outputs = list(omni.generate([inputs], sampling_params_list))
+
+    assert len(outputs) > 0, "No outputs generated"
+
+    # Find audio output from the final stage
+    audio_data = None
+    for o in outputs:
+        mm = getattr(o, "multimodal_output", None)
+        if mm and "audio" in mm:
+            audio_data = mm["audio"]
+            break
+
+    assert audio_data is not None, "No audio output found in any stage output"
+
+    # Concatenate audio chunks if returned as a list of tensors
+    if isinstance(audio_data, list):
+        audio_tensor = torch.cat(audio_data)
+    elif isinstance(audio_data, torch.Tensor):
+        audio_tensor = audio_data
+    else:
+        audio_tensor = torch.tensor(audio_data)
+
+    audio_array = audio_tensor.float().cpu().numpy()
+
+    assert len(audio_array) > MIN_AUDIO_SAMPLES, (
+        f"Audio too short: {len(audio_array)} samples, expected > {MIN_AUDIO_SAMPLES}"
+    )
+
+    # Verify audio isn't all zeros / silence
+    assert np.max(np.abs(audio_array)) > 0.01, "Audio appears to be silence"
 
 
 @pytest.mark.advanced_model
-@pytest.mark.omni
+@pytest.mark.tts
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-def test_voxtral_tts_offline_basic(run_level):
-    """Test basic Voxtral TTS offline inference with a voice preset."""
-    stage_config = _resolve_stage_config(run_level)
-
-    with OmniRunner(
-        MODEL,
-        stage_configs_path=stage_config,
-        enforce_eager=True,
-    ) as runner:
-        omni = runner.omni
-        inputs = _compose_request(MODEL, TEST_TEXT, VOICE)
-
-        sampling_params = SamplingParams(max_tokens=2500)
-        sampling_params_list = [sampling_params, sampling_params]
-
-        outputs = list(omni.generate([inputs], sampling_params_list))
-
-        assert len(outputs) > 0, "No outputs generated"
-
-        # Find audio output from the final stage
-        audio_data = None
-        for o in outputs:
-            mm = getattr(o, "multimodal_output", None)
-            if mm and "audio" in mm:
-                audio_data = mm["audio"]
-                break
-
-        assert audio_data is not None, "No audio output found in any stage output"
-
-        # Concatenate audio chunks if returned as a list of tensors
-        if isinstance(audio_data, list):
-            audio_tensor = torch.cat(audio_data)
-        elif isinstance(audio_data, torch.Tensor):
-            audio_tensor = audio_data
-        else:
-            audio_tensor = torch.tensor(audio_data)
-
-        audio_array = audio_tensor.float().cpu().numpy()
-
-        assert len(audio_array) > MIN_AUDIO_SAMPLES, (
-            f"Audio too short: {len(audio_array)} samples, expected > {MIN_AUDIO_SAMPLES}"
-        )
-
-        # Verify audio isn't all zeros / silence
-        assert np.max(np.abs(audio_array)) > 0.01, "Audio appears to be silence"
-
-
-@pytest.mark.advanced_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
-def test_voxtral_tts_offline_streaming(run_level):
+def test_voxtral_tts_offline_streaming():
     """Test AsyncOmni streaming inference for Voxtral TTS."""
 
     async def _run():
-        stage_config = _resolve_stage_config(run_level)
-
         async_omni = AsyncOmni(
             model=MODEL,
-            stage_configs_path=stage_config,
+            stage_configs_path=STAGE_CONFIG,
             stage_init_timeout=300,
             enforce_eager=True,
         )

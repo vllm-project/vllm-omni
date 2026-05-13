@@ -450,11 +450,12 @@ class OmniBase(PDDisaggregationMixin):
         except Exception:
             logger.exception("[%s] Finalize request handling error", self.__class__.__name__)
 
-        images = getattr(engine_outputs, "images", []) if stage_meta["final_output_type"] == "image" else []
+        output_type = getattr(engine_outputs, "final_output_type", stage_meta["final_output_type"])
+        images = getattr(engine_outputs, "images", []) if output_type == "image" else []
         return OmniRequestOutput(
             request_id=req_id or "",
             stage_id=stage_id,
-            final_output_type=stage_meta["final_output_type"],
+            final_output_type=output_type,
             request_output=engine_outputs,
             images=images,
             trajectory_latents=getattr(engine_outputs, "trajectory_latents", None),

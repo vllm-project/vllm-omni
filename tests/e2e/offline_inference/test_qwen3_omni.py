@@ -5,7 +5,6 @@ E2E offline tests for Omni model with video input and audio output.
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import pytest
 
@@ -61,4 +60,4 @@ def test_video_to_audio(omni_runner, omni_runner_handler) -> None:
     request_config = {"prompts": get_question(), "videos": video, "modalities": ["audio"]}
 
     # Test single completion
-    omni_runner_handler.send_request(request_config)
+    omni_runner_handler.send_omni_request(request_config)

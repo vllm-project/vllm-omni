@@ -5,6 +5,13 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.data_entry_keys import (
+    CodesStruct,
+    MetaStruct,
+    OmniPayload,
+    OmniPayloadStruct,
+    to_dict,
+)
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     compute_dynamic_initial_chunk_size,
     max_ic_for_chunk_size,
@@ -95,18 +102,13 @@ def talker2code2wav(
             ref_code_len = 0
         # Code2Wav expects codebook-major flat: [Q*num_frames]
         codec_codes = audio_codes.transpose(0, 1).cpu().reshape(-1).tolist()
-        additional_information: dict[str, Any] = {}
-        if ref_code_len > 0:
-            additional_information["meta"] = {"left_context_size": [ref_code_len]}
-        # Propagate speaker and language from the original prompt so they are
-        # available as runtime_additional_information in later pipeline stages,
-        # consistent with qwen3-omni and qwen2.5-omni stage input processors.
-        speaker = extract_speaker_from_prompt(prompt, index=i)
-        if speaker is not None:
-            additional_information["speaker"] = speaker
-        language = extract_language_from_prompt(prompt, index=i)
-        if language is not None:
-            additional_information["language"] = language
+        additional_information = to_dict(
+            OmniPayloadStruct(
+                meta=MetaStruct(left_context_size=ref_code_len) if ref_code_len > 0 else None,
+                speaker=extract_speaker_from_prompt(prompt, index=i),
+                language=extract_language_from_prompt(prompt, index=i),
+            )
+        )
         code2wav_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=codec_codes,
@@ -118,7 +120,7 @@ def talker2code2wav(
     return code2wav_inputs
 
 
-def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
+def _extract_last_frame(pooling_output: OmniPayload) -> torch.Tensor | None:
     audio_codes = pooling_output.get("codes", {}).get("audio")
     if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
         return None
@@ -134,10 +136,10 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
 
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any] | None,
+    pooling_output: OmniPayload | None,
     request: Any,
     is_finished: bool = False,
-) -> dict[str, Any] | None:
+) -> OmniPayloadStruct | None:
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
     request_payload = getattr(transfer_manager, "request_payload", None)
@@ -161,10 +163,11 @@ def talker2code2wav_async_chunk(
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
+    configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
 
     # Per-request override takes priority over dynamic IC.
-    per_request_override = False
-    initial_chunk_size = 0
+    fixed_initial_chunk_size = configured_initial_chunk_size > 0
+    initial_chunk_size = configured_initial_chunk_size
     additional_information = getattr(request, "additional_information", None)
 
     if (
@@ -175,10 +178,10 @@ def talker2code2wav_async_chunk(
         entry = additional_information.entries["initial_codec_chunk_frames"]
         if entry.list_data is not None and len(entry.list_data) == 1:
             initial_chunk_size = int(entry.list_data[0])
-            per_request_override = True
+            fixed_initial_chunk_size = True
 
     # Dynamic IC: cache per request so boundaries stay stable for its lifetime.
-    if not per_request_override:
+    if not fixed_initial_chunk_size:
         _ic_cache = getattr(transfer_manager, "_cached_ic", None)
         if _ic_cache is None:
             _ic_cache = {}
@@ -190,7 +193,7 @@ def talker2code2wav_async_chunk(
             _ic_cache[request_id] = compute_dynamic_initial_chunk_size(active, capacity, max_ic)
         initial_chunk_size = _ic_cache[request_id]
 
-    if chunk_size <= 0 or left_context_size_config < 0 or initial_chunk_size < 0:
+    if chunk_size <= 0 or left_context_size_config < 0 or configured_initial_chunk_size < 0 or initial_chunk_size < 0:
         raise ValueError(
             f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
             f"codec_left_context_frames={left_context_size_config}, "
@@ -208,27 +211,22 @@ def talker2code2wav_async_chunk(
 
     if length <= 0:
         if finished:
-            return {
-                "codes": {"audio": []},
-                "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
-            }
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+            )
         return None
 
-    in_initial_phase = initial_chunk_size > 0 and initial_chunk_size < chunk_size and length <= chunk_size
+    use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
 
-    if in_initial_phase:
-        # IC phase: emit every initial_chunk_size frames with growing left context.
-        if not finished and length % initial_chunk_size != 0:
+    if use_first_chunk and length <= initial_chunk_size:
+        if not finished and length < initial_chunk_size:
             return None
-        context_length = (
-            length % initial_chunk_size if (finished and length % initial_chunk_size != 0) else initial_chunk_size
-        )
+        context_length = length if finished and length < initial_chunk_size else initial_chunk_size
     else:
-        # Normal phase: offset so the first normal emit picks up after IC phase.
-        # IC is stateless (may change with load); any mismatch is absorbed by left_context.
-        initial_coverage = (
-            (chunk_size // initial_chunk_size) * initial_chunk_size if 0 < initial_chunk_size < chunk_size else 0
-        )
+        # The initial chunk is only for TTFA. After that, return to the normal
+        # codec chunk size so Code2Wav is not flooded by repeated tiny windows.
+        initial_coverage = initial_chunk_size if use_first_chunk else 0
         adjusted = length - initial_coverage
         if not finished and adjusted % chunk_size != 0:
             return None
@@ -253,19 +251,17 @@ def talker2code2wav_async_chunk(
 
     num_quantizers = len(window_frames[0])
     num_frames = len(window_frames)
-    code_predictor_codes = [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)]
+    code_predictor_codes = torch.tensor(
+        [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)],
+        dtype=torch.long,
+    )
 
-    info: dict[str, Any] = {
-        "codes": {"audio": code_predictor_codes},
-        "meta": {"left_context_size": left_context_size, "finished": torch.tensor(finished, dtype=torch.bool)},
-    }
-    # Propagate speaker and language from the request so they are available
-    # as runtime_additional_information in subsequent pipeline stages, consistent
-    # with qwen3-omni and qwen2.5-omni stage input processors.
-    speaker = extract_speaker_from_request(request)
-    if speaker is not None:
-        info["speaker"] = speaker
-    language = extract_language_from_request(request)
-    if language is not None:
-        info["language"] = language
-    return info
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=code_predictor_codes),
+        meta=MetaStruct(
+            left_context_size=left_context_size,
+            finished=torch.tensor(finished, dtype=torch.bool),
+        ),
+        speaker=extract_speaker_from_request(request),
+        language=extract_language_from_request(request),
+    )

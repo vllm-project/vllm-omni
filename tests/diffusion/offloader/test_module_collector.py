@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Unit tests for ModuleDiscovery and SupportsModuleOffload."""
+"""Unit tests for ModuleDiscovery and SupportsComponentDiscovery."""
 
 from typing import ClassVar
 
 import pytest
 from torch import nn
 
-from vllm_omni.diffusion.models.interface import SupportsModuleOffload
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
@@ -57,7 +57,7 @@ class DuplicateAttrPipeline(nn.Module):
         self.vae = nn.Linear(10, 10)
 
 
-class ProtocolPipeline(nn.Module, SupportsModuleOffload):
+class ProtocolPipeline(nn.Module, SupportsComponentDiscovery):
     """Pipeline with non-standard names, using the protocol."""
 
     _dit_modules: ClassVar[list[str]] = ["gen_transformer"]
@@ -74,7 +74,7 @@ class ProtocolPipeline(nn.Module, SupportsModuleOffload):
         self.transformer = nn.Linear(10, 10)
 
 
-class MissingAttrPipeline(nn.Module, SupportsModuleOffload):
+class MissingAttrPipeline(nn.Module, SupportsComponentDiscovery):
     """Pipeline that declares a non-existent attribute."""
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
@@ -87,7 +87,7 @@ class MissingAttrPipeline(nn.Module, SupportsModuleOffload):
         self.vae = nn.Linear(10, 10)
 
 
-class MissingIntermediatePipeline(nn.Module, SupportsModuleOffload):
+class MissingIntermediatePipeline(nn.Module, SupportsComponentDiscovery):
     """Pipeline with dotted path referencing non-existent intermediate."""
 
     _dit_modules: ClassVar[list[str]] = ["nonexistent.transformer"]
@@ -98,7 +98,7 @@ class MissingIntermediatePipeline(nn.Module, SupportsModuleOffload):
         super().__init__()
 
 
-class NestedPipeline(nn.Module, SupportsModuleOffload):
+class NestedPipeline(nn.Module, SupportsComponentDiscovery):
     """Pipeline with nested modules accessed via dotted paths."""
 
     _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]
@@ -113,7 +113,7 @@ class NestedPipeline(nn.Module, SupportsModuleOffload):
         self.vae = nn.Linear(10, 10)
 
 
-class ResidentPipeline(nn.Module, SupportsModuleOffload):
+class ResidentPipeline(nn.Module, SupportsComponentDiscovery):
     """Pipeline with resident modules that must stay on GPU."""
 
     _dit_modules: ClassVar[list[str]] = ["language_model.model"]
@@ -134,7 +134,7 @@ class ResidentPipeline(nn.Module, SupportsModuleOffload):
         self.vae = nn.Linear(10, 10)
 
 
-class MultiVaePipeline(nn.Module, SupportsModuleOffload):
+class MultiVaePipeline(nn.Module, SupportsComponentDiscovery):
     """Pipeline with multiple VAEs."""
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
@@ -155,13 +155,13 @@ class MultiVaePipeline(nn.Module, SupportsModuleOffload):
 
 
 class TestFallbackDiscovery:
-    """Test the fallback attribute scan (no SupportsModuleOffload)."""
+    """Test the fallback attribute scan (no SupportsComponentDiscovery)."""
 
     def test_discovers_standard_attrs(self):
         pipeline = FallbackPipeline()
         result = ModuleDiscovery.discover(pipeline)
 
-        assert not isinstance(pipeline, SupportsModuleOffload)
+        assert not isinstance(pipeline, SupportsComponentDiscovery)
         assert result.dit_names == ["transformer"]
         assert result.dits[0] is pipeline.transformer
         assert result.encoder_names == ["text_encoder", "text_encoder_2"]
@@ -183,13 +183,13 @@ class TestFallbackDiscovery:
 
 
 class TestProtocolDiscovery:
-    """Test discovery via SupportsModuleOffload protocol."""
+    """Test discovery via SupportsComponentDiscovery protocol."""
 
     def test_discovers_declared_attrs_and_ignores_undeclared(self):
         pipeline = ProtocolPipeline()
         result = ModuleDiscovery.discover(pipeline)
 
-        assert isinstance(pipeline, SupportsModuleOffload)
+        assert isinstance(pipeline, SupportsComponentDiscovery)
         assert result.dit_names == ["gen_transformer"]
         assert result.encoder_names == ["mllm", "vision_model"]
         assert len(result.vaes) == 1

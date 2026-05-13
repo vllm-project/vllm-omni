@@ -195,6 +195,25 @@ stages:
     devices: "0,1"
 ```
 
+#### Hybrid Sharded Data Parallel (HSDP)
+
+For larger Bagel deployments on multiple GPUs, you can enable HSDP (Hybrid Sharded Data Parallel) by modifying the stage configuration (for example, [`bagel.yaml`](../../../vllm_omni/deploy/bagel.yaml)). HSDP shards transformer weights across GPUs to reduce per-GPU memory usage.
+
+1. **Enable HSDP**: Set `use_hsdp: true`.
+2. **Set shard size**: Set `hsdp_shard_size` to the number of GPUs used for sharding (for example, `4`).
+3. **Set replicate size**: Usually keep `hsdp_replicate_size: 1` unless you want replicated HSDP groups.
+4. **Set devices**: Specify the comma-separated GPU IDs used by the diffusion stage (for example, `"0,1,2,3"`).
+
+Example configuration for HSDP across 4 GPUs:
+```yaml
+  - stage_id: 1
+    devices: "0,1,2,3"
+    parallel_config:
+      use_hsdp: true
+      hsdp_shard_size: 4
+      hsdp_replicate_size: 1
+```
+
 Then pass the custom deploy YAML:
 
 ```bash

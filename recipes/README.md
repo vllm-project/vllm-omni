@@ -29,6 +29,10 @@ recipes/
   Qwen-Image on `1x A100 80GB`, including optional step-wise continuous batching replay
 - [`Qwen/Qwen3-Omni.md`](./Qwen/Qwen3-Omni.md): online serving recipe for
   multimodal chat on `1x A100 80GB`
+- [`Tencent/Covo-Audio-Chat.md`](./Tencent/Covo-Audio-Chat.md): online
+  serving recipe for audio chat on `1x A100 80GB`
+- [`Qwen/Qwen3-TTS.md`](./Qwen/Qwen3-TTS.md): text-to-speech serving recipe
+  for Qwen3-TTS (CustomVoice / VoiceDesign / Base) on `1x H100/A100 80GB`
 - [`LTX/LTX-2.md`](./LTX/LTX-2.md): text-to-video and image-to-video serving
   recipe for LTX-2 on `1x H200 141GB`
 - [`Wan-AI/Wan2.2-I2V.md`](./Wan-AI/Wan2.2-I2V.md): image-to-video serving

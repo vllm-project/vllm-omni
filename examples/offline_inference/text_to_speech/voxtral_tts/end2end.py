@@ -42,6 +42,7 @@ async def run_streaming(inputs, sampling_params_list, model_name, args, output_d
         model=model_name,
         deploy_config=args.deploy_config,
         log_stats=args.log_stats,
+        quantization=args.quantization,
     )
 
     # Normalize to a list so batch and single-input share the same code path
@@ -184,7 +185,7 @@ async def run_streaming(inputs, sampling_params_list, model_name, args, output_d
     )
 
     async_omni.shutdown()
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     gc.collect()
 
 
@@ -194,6 +195,7 @@ def run_non_streaming(inputs, sampling_params_list, model_name, args, output_dir
         model=model_name,
         log_stats=args.log_stats,
         deploy_config=args.deploy_config,
+        quantization=args.quantization,
     )
 
     if args.profiling_mode:
@@ -223,7 +225,7 @@ def run_non_streaming(inputs, sampling_params_list, model_name, args, output_dir
     print(f"RTF: {output_audio_dur / vllm_elapsed:.4f}")
 
     del llm
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     gc.collect()
 
 
@@ -305,6 +307,12 @@ def parse_args() -> Namespace:
         default=None,
         help="CFG alpha for flow-matching guidance (default: use value from stage config, typically 1.2).",
     )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        help="Quantization method (e.g. 'fp8'). Applied to the language model only.",
+    )
     nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
@@ -379,7 +387,7 @@ def main(args: Any) -> None:
             f"--num-prompts ({args.num_prompts}) must be divisible by --concurrency ({args.concurrency})"
         )
 
-    torch.cuda.empty_cache()
+    torch.accelerator.empty_cache()
     gc.collect()
 
     if args.streaming:

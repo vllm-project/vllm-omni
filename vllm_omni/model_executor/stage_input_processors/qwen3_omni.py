@@ -11,7 +11,16 @@ import torch
 from vllm.inputs import TextPrompt
 from vllm.platforms import current_platform
 
-from vllm_omni.data_entry_keys import OmniPayload
+from vllm_omni.data_entry_keys import (
+    CodesStruct,
+    EmbeddingsStruct,
+    HiddenStatesStruct,
+    IdsStruct,
+    MetaStruct,
+    OmniPayload,
+    OmniPayloadStruct,
+    to_dict,
+)
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
@@ -275,10 +284,10 @@ def _get_streaming_codec_delta_len(
 
 def thinker2talker_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any],
+    pooling_output: OmniPayload,
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
-) -> list[dict[str, Any]]:
+) -> OmniPayloadStruct | None:
     """
     Process thinker outputs to create talker inputs.
     1. thinker's text generation outputs (token IDs + hidden states)
@@ -294,7 +303,8 @@ def thinker2talker_async_chunk(
 
     thinker_hs = pooling_output.get("hidden_states", {})
     thinker_layers = thinker_hs.get("layers", {}) if isinstance(thinker_hs, dict) else {}
-    thinker_embed = pooling_output.get("embed", {}) if isinstance(pooling_output.get("embed", {}), dict) else {}
+    thinker_embed_raw = pooling_output.get("embed", {})
+    thinker_embed = thinker_embed_raw if isinstance(thinker_embed_raw, dict) else {}
     thinker_emb = _layer_tensor(thinker_layers, _EMBED_LAYER_KEY)
     thinker_hid = _layer_tensor(thinker_layers, _HIDDEN_LAYER_KEY)
     if thinker_emb is None or thinker_hid is None:
@@ -305,82 +315,62 @@ def thinker2talker_async_chunk(
             thinker_hid is not None,
         )
         return None
+    speaker = extract_speaker_from_request(request)
+    language = extract_language_from_request(request)
+
+    def _maybe_cpu(t: Any) -> torch.Tensor | None:
+        return t.detach().cpu() if isinstance(t, torch.Tensor) else None
 
     if chunk_id == 0:
-        all_token_ids = request.all_token_ids  # prefill + decode
-        prompt_token_ids = request.prompt_token_ids
-        # Convert ConstantList to regular list for OmniSerializer serialization
-        all_token_ids = _ensure_list(all_token_ids)
-        prompt_token_ids = _ensure_list(prompt_token_ids)
-        payload: OmniPayload = {
-            "embed": {
-                "prefill": thinker_emb.detach().cpu(),
-                # Provide thinker-side TTS token embeddings for talker projection
-                "tts_bos": thinker_embed.get("tts_bos").detach().cpu()
-                if isinstance(thinker_embed.get("tts_bos"), torch.Tensor)
-                else None,
-                "tts_eos": thinker_embed.get("tts_eos").detach().cpu()
-                if isinstance(thinker_embed.get("tts_eos"), torch.Tensor)
-                else None,
-                "tts_pad": thinker_embed.get("tts_pad").detach().cpu()
-                if isinstance(thinker_embed.get("tts_pad"), torch.Tensor)
-                else None,
-            },
-            "hidden_states": {"output": thinker_hid.detach().cpu()},
-            "ids": {"all": all_token_ids, "prompt": prompt_token_ids},
-            "meta": {"finished": torch.tensor(is_finished, dtype=torch.bool)},
-        }
-        talker_additional_info = payload
-        speaker = extract_speaker_from_request(request)
-        if speaker is not None:
-            talker_additional_info["speaker"] = speaker
-        language = extract_language_from_request(request)
-        if language is not None:
-            talker_additional_info["language"] = language
+        all_token_ids = _ensure_list(request.all_token_ids)
+        prompt_token_ids = _ensure_list(request.prompt_token_ids)
+        payload = OmniPayloadStruct(
+            embed=EmbeddingsStruct(
+                prefill=thinker_emb.detach().cpu(),
+                tts_bos=_maybe_cpu(thinker_embed.get("tts_bos")),
+                tts_eos=_maybe_cpu(thinker_embed.get("tts_eos")),
+                tts_pad=_maybe_cpu(thinker_embed.get("tts_pad")),
+            ),
+            hidden_states=HiddenStatesStruct(output=thinker_hid.detach().cpu()),
+            ids=IdsStruct(all=all_token_ids, prompt=prompt_token_ids),
+            meta=MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool)),
+            speaker=speaker,
+            language=language,
+        )
         if transfer_manager.request_payload.get(request_id) is None:
             if not is_finished:
-                transfer_manager.request_payload[request_id] = talker_additional_info
+                transfer_manager.request_payload[request_id] = to_dict(payload)
                 return None
         else:
             save_payload = transfer_manager.request_payload.pop(request_id)
-            talker_additional_info["embed"]["prefill"] = torch.cat(
-                (
-                    save_payload.get("embed", {}).get("prefill"),
-                    talker_additional_info.get("embed", {}).get("prefill"),
-                ),
-                dim=0,
+            payload.embed.prefill = torch.cat(
+                (save_payload.get("embed", {}).get("prefill"), payload.embed.prefill), dim=0
             )
-            talker_additional_info["hidden_states"]["output"] = torch.cat(
-                (
-                    save_payload.get("hidden_states", {}).get("output"),
-                    talker_additional_info.get("hidden_states", {}).get("output"),
-                ),
-                dim=0,
+            payload.hidden_states.output = torch.cat(
+                (save_payload.get("hidden_states", {}).get("output"), payload.hidden_states.output), dim=0
             )
     else:
-        output_token_ids = request.output_token_ids
-        # Convert ConstantList to regular list for OmniSerializer serialization
-        output_token_ids = _ensure_list(output_token_ids)
-
-        talker_additional_info: OmniPayload = {
-            "meta": {"finished": torch.tensor(is_finished, dtype=torch.bool)},
-        }
-        speaker = extract_speaker_from_request(request)
-        if speaker is not None:
-            talker_additional_info["speaker"] = speaker
-        language = extract_language_from_request(request)
-        if language is not None:
-            talker_additional_info["language"] = language
-
+        output_token_ids = _ensure_list(request.output_token_ids)
+        meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
         if output_token_ids:
-            talker_additional_info["meta"]["override_keys"] = [("embed", "decode"), ("ids", "output")]
-            talker_additional_info["embed"] = {"decode": thinker_emb.detach().cpu()}
-            talker_additional_info["ids"] = {"output": output_token_ids}
+            meta.override_keys = [("embed", "decode"), ("ids", "output")]
+            payload = OmniPayloadStruct(
+                meta=meta,
+                embed=EmbeddingsStruct(decode=thinker_emb.detach().cpu()),
+                ids=IdsStruct(output=output_token_ids),
+                speaker=speaker,
+                language=language,
+            )
         else:
             # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
-            talker_additional_info["embed"] = {"prefill": thinker_emb.detach().cpu()}
-            talker_additional_info["hidden_states"] = {"output": thinker_hid.detach().cpu()}
-    return talker_additional_info
+            payload = OmniPayloadStruct(
+                meta=meta,
+                embed=EmbeddingsStruct(prefill=thinker_emb.detach().cpu()),
+                hidden_states=HiddenStatesStruct(output=thinker_hid.detach().cpu()),
+                speaker=speaker,
+                language=language,
+            )
+    return payload
 
 
 def thinker2talker(
@@ -459,36 +449,26 @@ def thinker2talker(
             except Exception as exc:
                 logger.warning("[PD] Could not merge prefill embeddings: %s", exc)
 
-        payload: OmniPayload = {
-            "embed": {
-                "prefill": thinker_emb,
-                "tts_bos": _resolve_tts_token_embedding(
+        payload = OmniPayloadStruct(
+            embed=EmbeddingsStruct(
+                prefill=thinker_emb,
+                tts_bos=_resolve_tts_token_embedding(
                     "tts_bos", thinker_mm=thinker_mm, prefill_mm=prefill_mm, device=device
                 ),
-                "tts_eos": _resolve_tts_token_embedding(
+                tts_eos=_resolve_tts_token_embedding(
                     "tts_eos", thinker_mm=thinker_mm, prefill_mm=prefill_mm, device=device
                 ),
-                "tts_pad": _resolve_tts_token_embedding(
+                tts_pad=_resolve_tts_token_embedding(
                     "tts_pad", thinker_mm=thinker_mm, prefill_mm=prefill_mm, device=device
                 ),
-            },
-            "hidden_states": {
-                "output": thinker_hid,
-            },
-            "ids": {
-                "all": thinker_sequences,
-                "prompt": thinker_input_ids,
-            },
-        }
-        info = payload
-        speaker = extract_speaker_from_prompt(prompt, index=i)
-        if speaker is not None:
-            info["speaker"] = speaker
-        language = extract_language_from_prompt(prompt, index=i)
-        if language is not None:
-            info["language"] = language
-
-        prompt_len = _compute_talker_prompt_ids_length(payload, device=device)
+            ),
+            hidden_states=HiddenStatesStruct(output=thinker_hid),
+            ids=IdsStruct(all=thinker_sequences, prompt=thinker_input_ids),
+            speaker=extract_speaker_from_prompt(prompt, index=i),
+            language=extract_language_from_prompt(prompt, index=i),
+        )
+        info = to_dict(payload)
+        prompt_len = _compute_talker_prompt_ids_length(info, device=device)
 
         talker_inputs.append(
             OmniTokensPrompt(
@@ -509,10 +489,10 @@ def thinker2talker(
 
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any],
+    pooling_output: OmniPayload,
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
-):
+) -> OmniPayloadStruct | None:
     """
     Pooling version.
     """
@@ -565,17 +545,15 @@ def talker2code2wav_async_chunk(
     left_context_size = max(0, min(length - context_length, left_context_size_config))
     end_index = min(length, left_context_size + context_length)
 
-    codes = (
-        torch.tensor(transfer_manager.code_prompt_token_ids[request_id][-end_index:])
-        .transpose(0, 1)
-        .reshape(-1)
-        .tolist()
-    )
+    codes = torch.tensor(transfer_manager.code_prompt_token_ids[request_id][-end_index:]).transpose(0, 1).reshape(-1)
 
-    return {
-        "codes": {"audio": codes},
-        "meta": {"left_context_size": left_context_size, "finished": torch.tensor(is_finished, dtype=torch.bool)},
-    }
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=codes),
+        meta=MetaStruct(
+            left_context_size=left_context_size,
+            finished=torch.tensor(is_finished, dtype=torch.bool),
+        ),
+    )
 
 
 def talker2code2wav(
