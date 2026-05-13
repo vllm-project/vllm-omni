@@ -37,15 +37,12 @@ _waiting_family = Gauge(
     "Number of requests waiting to be scheduled.",
     labelnames=_labelnames,
 )
-_success_family = Counter(
-    defs.NUM_REQUESTS_SUCCESS,
-    "Number of requests that completed without error.",
-    labelnames=_labelnames,
-)
-_fail_family = Counter(
-    defs.NUM_REQUESTS_FAIL,
-    "Number of requests that returned an error.",
-    labelnames=_labelnames,
+_completion_family = Counter(
+    defs.REQUESTS_SUCCESS,
+    "Total requests by completion reason "
+    "(stop / length / abort / ...). Aborts include the 'fail' path "
+    "that previously had its own num_requests_fail counter (G6).",
+    labelnames=list(defs.SUCCESS_LABELS),
 )
 _e2e_latency_family = Histogram(
     defs.E2E_REQUEST_LATENCY_SECONDS,
@@ -75,8 +72,6 @@ class OmniPrometheusMetrics:
         self._model_name = model_name
         self._running = _running_family.labels(model_name=model_name)
         self._waiting = _waiting_family.labels(model_name=model_name)
-        self._success = _success_family.labels(model_name=model_name)
-        self._fail = _fail_family.labels(model_name=model_name)
         self._e2e_latency = _e2e_latency_family.labels(model_name=model_name)
         self._queue_time = _queue_time_family.labels(model_name=model_name)
         self._diffusion_by_stage: dict[tuple[str, int], Histogram] = {}
@@ -87,14 +82,27 @@ class OmniPrometheusMetrics:
     def set_waiting(self, n: int) -> None:
         self._waiting.set(n)
 
-    def request_succeeded(self, e2e_seconds: float, queue_seconds: float | None = None) -> None:
-        self._success.inc()
+    def request_succeeded(
+        self,
+        e2e_seconds: float,
+        queue_seconds: float | None = None,
+        finished_reason: str = "stop",
+    ) -> None:
+        _completion_family.labels(
+            model_name=self._model_name,
+            finished_reason=finished_reason,
+        ).inc()
         self._e2e_latency.observe(e2e_seconds)
         if queue_seconds is not None:
             self._queue_time.observe(queue_seconds)
 
     def request_failed(self) -> None:
-        self._fail.inc()
+        # Pipeline-level "fail" maps to the upstream FinishReason.ABORT bucket;
+        # a single counter family now covers both normal stops and aborts.
+        _completion_family.labels(
+            model_name=self._model_name,
+            finished_reason="abort",
+        ).inc()
 
     def observe_diffusion_metrics(self, stage_id: int, metrics: dict[str, float]) -> None:
         for key, parent in _diffusion_families.items():

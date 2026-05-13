@@ -33,13 +33,15 @@ VIDEO_GENERATION_TIME = "video_generation_time"
 # ============================================================================
 NUM_REQUESTS_RUNNING = METRIC_PREFIX + "num_requests_running"
 NUM_REQUESTS_WAITING = METRIC_PREFIX + "num_requests_waiting"
-NUM_REQUESTS_SUCCESS = METRIC_PREFIX + "num_requests_success"
-NUM_REQUESTS_FAIL = METRIC_PREFIX + "num_requests_fail"
 E2E_REQUEST_LATENCY_SECONDS = METRIC_PREFIX + "e2e_request_latency_seconds"
 REQUEST_QUEUE_TIME_SECONDS = METRIC_PREFIX + "request_queue_time_seconds"
 
-# G6: requests_success_total{finished_reason} — Pipeline 全局 Counter
-REQUESTS_SUCCESS_TOTAL = METRIC_PREFIX + "requests_success_total"
+# G6: per-finished_reason Counter that replaces the original
+# num_requests_success / num_requests_fail pair from PR #3362. Single source
+# of completion-state counting with finished_reason ∈ {stop, length, abort, ...}
+# (aborts include the "fail" path that previously used a separate counter).
+# Counter auto-suffixes _total at exposition time; pass without _total here.
+REQUESTS_SUCCESS = METRIC_PREFIX + "requests_success"
 
 
 # ============================================================================

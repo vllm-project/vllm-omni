@@ -462,7 +462,17 @@ class OmniBase(PDDisaggregationMixin):
                 _pt = getattr(_fin_m, "pipeline_timings", None) or {}
                 queue_ms = _pt.get("queue_wait_ms")
                 queue_seconds = queue_ms / 1000.0 if queue_ms is not None else None
-                self.prom_metrics.request_succeeded(e2e_seconds, queue_seconds=queue_seconds)
+                # G6: extract finished_reason from upstream CompletionOutput
+                # so the per-reason completion Counter is labelled correctly.
+                completion_outputs = getattr(engine_outputs, "outputs", None) or []
+                fr = (
+                    getattr(completion_outputs[0], "finish_reason", None)
+                    if completion_outputs
+                    else None
+                ) or "stop"
+                self.prom_metrics.request_succeeded(
+                    e2e_seconds, queue_seconds=queue_seconds, finished_reason=fr,
+                )
 
                 # Modality observe (Phase 3.2). Inside the same finalize guard so
                 # it fires once per request and inherits the try/except isolation.

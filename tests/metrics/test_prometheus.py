@@ -14,8 +14,7 @@ _MODEL = "test-model"
 _PIPELINE_METRICS = [
     "vllm:omni_num_requests_running",
     "vllm:omni_num_requests_waiting",
-    "vllm:omni_num_requests_success",
-    "vllm:omni_num_requests_fail",
+    "vllm:omni_requests_success",
     "vllm:omni_e2e_request_latency_seconds",
     "vllm:omni_request_queue_time_seconds",
 ]
@@ -40,9 +39,12 @@ def prom() -> OmniPrometheusMetrics:
 
 @pytest.fixture(scope="module")
 def scrape_output(prom: OmniPrometheusMetrics, registry: CollectorRegistry) -> str:
-    prom.request_succeeded(e2e_seconds=1.5, queue_seconds=0.3)
-    prom.request_succeeded(e2e_seconds=2.0, queue_seconds=0.5)
-    prom.request_failed()
+    # Two natural completions (stop) + one length-cap + one failure (abort)
+    # exercise three distinct finished_reason buckets in the merged Counter.
+    prom.request_succeeded(e2e_seconds=1.5, queue_seconds=0.3, finished_reason="stop")
+    prom.request_succeeded(e2e_seconds=2.0, queue_seconds=0.5, finished_reason="stop")
+    prom.request_succeeded(e2e_seconds=3.0, queue_seconds=0.4, finished_reason="length")
+    prom.request_failed()  # → finished_reason="abort"
     prom.set_running(5)
     prom.set_waiting(2)
     prom.observe_diffusion_metrics(
@@ -70,17 +72,24 @@ class TestMetricObservation:
             assert f"# HELP {name}" in scrape_output, f"missing metric family: {name}"
 
     def test_counter_values(self, scrape_output: str) -> None:
-        success = _sample_value(
+        # Per-reason buckets sourced from the merged completion Counter (G6).
+        stop = _sample_value(
             scrape_output,
-            f'vllm:omni_num_requests_success_total{{model_name="{_MODEL}"}}',
+            f'vllm:omni_requests_success_total{{finished_reason="stop",model_name="{_MODEL}"}}',
         )
-        assert success == 2.0
+        assert stop == 2.0
 
-        fail = _sample_value(
+        length = _sample_value(
             scrape_output,
-            f'vllm:omni_num_requests_fail_total{{model_name="{_MODEL}"}}',
+            f'vllm:omni_requests_success_total{{finished_reason="length",model_name="{_MODEL}"}}',
         )
-        assert fail == 1.0
+        assert length == 1.0
+
+        abort = _sample_value(
+            scrape_output,
+            f'vllm:omni_requests_success_total{{finished_reason="abort",model_name="{_MODEL}"}}',
+        )
+        assert abort == 1.0
 
     def test_gauge_values(self, scrape_output: str) -> None:
         running = _sample_value(
@@ -96,17 +105,20 @@ class TestMetricObservation:
         assert waiting == 2.0
 
     def test_histogram_counts(self, scrape_output: str) -> None:
+        # 3 successful completions (stop x2 + length x1) all observe e2e/queue;
+        # the 1 failed completion only increments the Counter without observing
+        # the latency histogram, so the count stays at 3.
         e2e_count = _sample_value(
             scrape_output,
             f'vllm:omni_e2e_request_latency_seconds_count{{model_name="{_MODEL}"}}',
         )
-        assert e2e_count == 2.0
+        assert e2e_count == 3.0
 
         queue_count = _sample_value(
             scrape_output,
             f'vllm:omni_request_queue_time_seconds_count{{model_name="{_MODEL}"}}',
         )
-        assert queue_count == 2.0
+        assert queue_count == 3.0
 
     def test_diffusion_histogram_counts(self, scrape_output: str) -> None:
         for name in _DIFFUSION_METRICS:
