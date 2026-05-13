@@ -1032,14 +1032,14 @@ class ImageKVCacheManager:
             self.image_kv_cache_map = None  # reset first
             key, value = self._cache_prompt_kv(key, value, seq_len, shard_image_size)
             if self.sp_size > 1:
-                local_prompt_len = q_len - shard_image_size
-                joint_text_query = query[:, :local_prompt_len, :, :]
+                local_prompt_len = seq_len - shard_image_size
+                join_query_len = query.shape[1] - shard_image_size
+                joint_text_query = query[:, :join_query_len, :, :]
                 joint_text_key = key[:, :local_prompt_len, :, :]
                 joint_text_value = value[:, :local_prompt_len, :, :]
-                query = query[:, local_prompt_len:, :, :]
+                query = query[:, join_query_len:, :, :]
                 key = key[:, local_prompt_len:, :, :]
                 value = value[:, local_prompt_len:, :, :]
-        else:
             if self.sp_size <= 1:
                 key, value = self._reuse_prompt_kv(key, value, seq_len, bs)
             else:
