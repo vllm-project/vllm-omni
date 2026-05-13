@@ -51,7 +51,7 @@ stages:
     max_num_seqs: 1
     enforce_eager: true
     async_scheduling: false
-    max_num_batched_tokens: 51200
+    max_num_batched_tokens: 65536
     enable_chunked_prefill: false
     devices: "1,2"
     num_replicas: 2
