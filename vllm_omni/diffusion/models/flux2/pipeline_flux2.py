@@ -365,18 +365,28 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
         # Check if model is a local path
         local_files_only = os.path.exists(model)
 
+        # When CPU offload is on, keep text_encoder/VAE on CPU at init; the offloader
+        # moves them per-forward. Materializing Mistral3 on GPU OOMs on ≤30 GiB cards.
+        placement_device = torch.device("cpu") if od_config.enable_cpu_offload else self._execution_device
+
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
         self.text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
-            model, subfolder="text_encoder", local_files_only=local_files_only
-        ).to(self._execution_device)
+            model,
+            subfolder="text_encoder",
+            local_files_only=local_files_only,
+            torch_dtype=od_config.dtype,
+        ).to(placement_device)
         self.tokenizer = PixtralProcessor.from_pretrained(
             model, subfolder="tokenizer", local_files_only=local_files_only
         )
-        self.vae = AutoencoderKLFlux2.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self._execution_device
-        )
+        self.vae = AutoencoderKLFlux2.from_pretrained(
+            model,
+            subfolder="vae",
+            local_files_only=local_files_only,
+            torch_dtype=od_config.dtype,
+        ).to(placement_device)
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, Flux2Transformer2DModel)
         self.transformer = Flux2Transformer2DModel(quant_config=od_config.quantization_config, **transformer_kwargs)
 
