@@ -21,7 +21,6 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
-from vllm.v1.metrics.loggers import PrometheusStatLogger
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -29,6 +28,7 @@ from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
+from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -151,10 +151,23 @@ class Orchestrator:
             (p.stage_vllm_config for p in stage_pools if p.stage_vllm_config is not None),
             None,
         )
+        # Build flat engine_idx ↔ (stage_id, replica_id) maps so that the wrap
+        # exposes the ~37 vllm:* families with per-(stage, replica) labels.
+        # The reverse map is consulted at record() time to find the engine_idx
+        # to update from the orchestrator's (stage_id, replica_id) loop.
+        stage_replica_map: dict[int, tuple[str, str]] = {}
+        self._stage_replica_to_engine_idx: dict[tuple[int, int], int] = {}
+        flat_idx = 0
+        for stage_id, pool in enumerate(stage_pools):
+            for replica_id in range(pool.num_replicas):
+                stage_replica_map[flat_idx] = (str(stage_id), str(replica_id))
+                self._stage_replica_to_engine_idx[(stage_id, replica_id)] = flat_idx
+                flat_idx += 1
+
         if vllm_config_for_stats is not None:
-            self._stat_logger: PrometheusStatLogger | None = PrometheusStatLogger(
+            self._stat_logger: OmniPrometheusStatLogger | None = OmniPrometheusStatLogger(
                 vllm_config=vllm_config_for_stats,
-                engine_indexes=list(range(self.num_stages)),
+                stage_replica_map=stage_replica_map,
             )
         else:
             self._stat_logger = None
@@ -483,7 +496,7 @@ class Orchestrator:
                                 self._stat_logger.record(
                                     raw_outputs.scheduler_stats,
                                     iteration_stats,
-                                    engine_idx=stage_id,
+                                    engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
                                 )
                         except asyncio.CancelledError:
                             raise
