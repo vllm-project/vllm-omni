@@ -31,6 +31,8 @@ class SupportAudioInput(Protocol):
 @runtime_checkable
 class SupportAudioOutput(Protocol):
     support_audio_output: ClassVar[bool] = True
+    sample_rate: ClassVar[int] = 24000
+    audio_channel_first: ClassVar[bool] = False
 
 
 @runtime_checkable

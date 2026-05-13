@@ -548,6 +548,11 @@ class OmniDiffusionConfig:
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
 
+    # Audio output support
+    supports_audio_output: bool = False
+    audio_sample_rate: int = 24000
+    audio_channel_first: bool = False
+
     log_level: str = "info"
 
     # Omni configuration (injected from stage config)
@@ -783,13 +788,6 @@ class OmniDiffusionConfig:
         self.tf_model_config = tf_config
         self._propagate_quantization_from_tf_config(tf_config)
 
-    def update_multimodal_support(self) -> None:
-        # Resolve serving-visible multimodal behavior from shared metadata
-        # instead of importing concrete pipeline modules into the config layer.
-        metadata = get_diffusion_model_metadata(self.model_class_name)
-        self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
-        self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
-
     def enrich_config(self) -> None:
         """Load model metadata from HuggingFace and populate config fields.
 
@@ -852,10 +850,38 @@ class OmniDiffusionConfig:
                         self.model_class_name = "WanS2VPipeline"
                     self.tf_model_config = TransformerConfig()
                     self.update_multimodal_support()
+                elif model_type == "audiodit":
+                    if self.model_class_name is None:
+                        self.model_class_name = "LongCatAudioDiTPipeline"
+                    self.update_multimodal_support()
                 elif architectures and len(architectures) == 1:
                     self.model_class_name = architectures[0]
                 else:
-                    raise
+                    raise ValueError(
+                        f"Unsupported diffusion model config for model {self.model}: "
+                        f"model_type={model_type!r}, architectures={architectures!r}"
+                    )
+
+        self.populate_audio_output_metadata()
+
+    def populate_audio_output_metadata(self) -> None:
+        """Populate audio output metadata from the registered pipeline class."""
+        if self.model_class_name is None:
+            return
+
+        from vllm_omni.diffusion.registry import DiffusionModelRegistry
+
+        model_cls = DiffusionModelRegistry._try_load_model_cls(self.model_class_name)
+        self.supports_audio_output = bool(getattr(model_cls, "support_audio_output", False))
+        self.audio_sample_rate = int(getattr(model_cls, "sample_rate", 24000))
+        self.audio_channel_first = bool(getattr(model_cls, "audio_channel_first", False))
+
+    def update_multimodal_support(self) -> None:
+        # Resolve serving-visible multimodal behavior from shared metadata
+        # instead of importing concrete pipeline modules into the config layer.
+        metadata = get_diffusion_model_metadata(self.model_class_name)
+        self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
+        self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":

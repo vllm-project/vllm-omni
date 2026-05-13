@@ -77,10 +77,19 @@ class StageDiffusionClient:
         stage_init_timeout: int,
         batch_size: int = 1,
     ) -> None:
+        self.od_config = od_config
+        self.od_config.enrich_config()
         # Spawn StageDiffusionProc subprocess and wait for READY.
-        proc, handshake_address, request_address, response_address = spawn_diffusion_proc(model, od_config)
+        proc, handshake_address, request_address, response_address = spawn_diffusion_proc(model, self.od_config)
         complete_diffusion_handshake(proc, handshake_address, stage_init_timeout)
-        self._initialize_client(metadata, request_address, response_address, proc=proc, batch_size=batch_size)
+        self._initialize_client(
+            metadata,
+            request_address,
+            response_address,
+            proc=proc,
+            batch_size=batch_size,
+            od_config=self.od_config,
+        )
 
     @classmethod
     def from_addresses(
@@ -91,6 +100,7 @@ class StageDiffusionClient:
         *,
         proc: Any = None,
         batch_size: int = 1,
+        od_config: OmniDiffusionConfig | None = None,
     ) -> StageDiffusionClient:
         """Create a client for an already-running diffusion subprocess."""
         client = cls.__new__(cls)
@@ -100,6 +110,7 @@ class StageDiffusionClient:
             response_address,
             proc=proc,
             batch_size=batch_size,
+            od_config=od_config,
         )
         return client
 
@@ -111,6 +122,7 @@ class StageDiffusionClient:
         *,
         proc: Any,
         batch_size: int,
+        od_config: OmniDiffusionConfig | None = None,
     ) -> None:
         self.stage_id = metadata.stage_id
         self.replica_id = metadata.replica_id
@@ -120,6 +132,7 @@ class StageDiffusionClient:
         self.requires_multimodal_data = getattr(metadata, "requires_multimodal_data", False)
         self.custom_process_input_func = getattr(metadata, "custom_process_input_func", None)
         self.engine_input_source = getattr(metadata, "engine_input_source", [])
+        self.od_config = od_config
         self._proc = proc
         self._owns_process = proc is not None
 

@@ -82,6 +82,8 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
     # contract introduced for AudioX in #2077).
     support_audio_output: ClassVar[bool] = True
     audio_sample_rate: ClassVar[int] = 44100
+    sample_rate = 44100
+    audio_channel_first = True
 
     def __init__(
         self,

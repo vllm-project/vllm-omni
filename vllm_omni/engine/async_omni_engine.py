@@ -778,6 +778,7 @@ class AsyncOmniEngine:
                     request_address=addresses.inputs[0],
                     response_address=addresses.outputs[0],
                     batch_size=self.diffusion_batch_size,
+                    od_config=build_diffusion_config(self.model, remote_stage_cfg, remote_metadata),
                 )
             else:
                 device_control_env = current_omni_platform.device_control_env_var
@@ -827,6 +828,7 @@ class AsyncOmniEngine:
                                 response_address=response_address,
                                 proc=proc,
                                 batch_size=self.diffusion_batch_size,
+                                od_config=od_config,
                             )
                         else:
                             client = initialize_diffusion_stage(

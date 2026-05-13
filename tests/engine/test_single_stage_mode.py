@@ -958,6 +958,7 @@ class TestSingleStageReplicaInitialization:
             response_address="tcp://resp",
             proc=proc,
             batch_size=4,
+            od_config="diffusion-config",
         )
 
     def test_initialize_diffusion_replica_local_failure_terminates_proc(self, mocker: MockerFixture):
