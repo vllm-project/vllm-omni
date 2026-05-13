@@ -1040,6 +1040,7 @@ class ImageKVCacheManager:
                 query = query[:, join_query_len:, :, :]
                 key = key[:, local_prompt_len:, :, :]
                 value = value[:, local_prompt_len:, :, :]
+        else:
             if self.sp_size <= 1:
                 key, value = self._reuse_prompt_kv(key, value, seq_len, bs)
             else:
