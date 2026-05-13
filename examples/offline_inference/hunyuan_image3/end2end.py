@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -116,6 +117,17 @@ def parse_args():
     parser.add_argument("--log-stats", action="store_true", default=False)
     parser.add_argument("--init-timeout", type=int, default=300, help="Initialization timeout in seconds.")
     parser.add_argument("--enforce-eager", action="store_true", help="Disable torch.compile.")
+    parser.add_argument(
+        "--additional-config",
+        type=str,
+        default=None,
+        help=(
+            "JSON object forwarded to Omni/additional_config, for example "
+            '\'{"torchair_graph_config":{"enabled":true}}\'. Different platforms may support different '
+            "configs. Make sure the configs are valid for the platform you are using. "
+            "Contents must be hashable."
+        ),
+    )
 
     from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
@@ -123,9 +135,27 @@ def parse_args():
     return parser.parse_args()
 
 
+def parse_additional_config(raw_value: str | None) -> dict | None:
+    """Parse a JSON string into an additional_config mapping."""
+    if raw_value is None:
+        return None
+
+    try:
+        additional_config = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid --additional-config JSON: {exc}") from exc
+
+    if additional_config is None:
+        return None
+    if not isinstance(additional_config, dict):
+        raise ValueError(f"--additional-config must decode to a JSON object, got {type(additional_config).__name__}")
+    return additional_config
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
+    additional_config = parse_additional_config(args.additional_config)
 
     # Determine task for prompt formatting from modality + bot behavior.
     task = _MODALITY_TASK_MAP[args.modality]
@@ -160,6 +190,9 @@ def main():
         "init_timeout": args.init_timeout,
         "enforce_eager": args.enforce_eager,
     }
+
+    if additional_config is not None:
+        omni_kwargs["additional_config"] = additional_config
     if deploy_config is not None:
         omni_kwargs["deploy_config"] = deploy_config
     else:
@@ -262,6 +295,8 @@ def main():
         print(f"  Output size: {args.width}x{args.height}")
     if args.image_path:
         print(f"  Input image: {args.image_path}")
+    if additional_config is not None:
+        print(f"  Additional config: {additional_config}")
     print(f"  Prompts: {prompts}")
     print(f"{'=' * 60}\n")
 

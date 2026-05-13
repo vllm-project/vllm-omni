@@ -552,6 +552,7 @@ class OmniDiffusionConfig:
 
     # Omni configuration (injected from stage config)
     omni_kv_config: dict[str, Any] = field(default_factory=dict)
+    additional_config: dict[str, Any] = field(default_factory=dict)
 
     profiler_config: "ProfilerConfig | dict[str, Any] | None" = None
 
@@ -649,6 +650,13 @@ class OmniDiffusionConfig:
             from vllm.config import ProfilerConfig
 
             self.profiler_config = ProfilerConfig(**self.profiler_config)
+
+        if self.additional_config is None:
+            self.additional_config = {}
+        elif isinstance(self.additional_config, Mapping):
+            self.additional_config = dict(self.additional_config)
+        else:
+            raise TypeError(f"additional_config must be a mapping or None, got {type(self.additional_config)!r}")
 
         # Convert parallel_config dict/DictConfig to DiffusionParallelConfig
         # Use Mapping to handle both plain dicts and OmegaConf DictConfig
