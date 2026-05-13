@@ -1032,11 +1032,12 @@ class ImageKVCacheManager:
             self.image_kv_cache_map = None  # reset first
             key, value = self._cache_prompt_kv(key, value, seq_len, shard_image_size)
             if self.sp_size > 1:
-                local_prompt_len = q_len - shard_image_size
-                joint_text_query = query[:, :local_prompt_len, :, :]
+                local_prompt_len = seq_len - shard_image_size
+                join_query_len = query.shape[1] - shard_image_size
+                joint_text_query = query[:, :join_query_len, :, :]
                 joint_text_key = key[:, :local_prompt_len, :, :]
                 joint_text_value = value[:, :local_prompt_len, :, :]
-                query = query[:, local_prompt_len:, :, :]
+                query = query[:, join_query_len:, :, :]
                 key = key[:, local_prompt_len:, :, :]
                 value = value[:, local_prompt_len:, :, :]
         else:
@@ -2250,6 +2251,7 @@ class HunyuanImage3Model(nn.Module):
         num_image_tokens: int | None = None,
         gen_timestep_scatter_index: torch.Tensor | None = None,
         uncond_cfg_prefill: bool = False,
+        ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -2305,7 +2307,7 @@ class HunyuanImage3Model(nn.Module):
             else:  # [image tokens, last token]
                 shard_padding_size = shard_image_size * sp_world_size - num_image_tokens
             if first_step:
-                seq_lens = [prompt_size + shard_image_size for _ in seq_lens]
+                seq_lens = [prompt_size + shard_image_size + ar_kv_reuse_len for _ in seq_lens]
             else:
                 seq_lens = [x - y for x, y in zip(seq_lens, query_lens)]
                 seq_lens = [seq_len + shard_image_size - 1 for seq_len in seq_lens]
@@ -2734,6 +2736,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             query_lens=[prefill_query_len],
             seq_lens=[prefill_seq_len],
             num_image_tokens=0,
+            ar_kv_reuse_len=negative_reuse_len,
             full_attn_spans=model_kwargs["full_attn_spans"][batch_slice]
             if model_kwargs.get("full_attn_spans")
             else None,
@@ -2787,7 +2790,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
     ):
         ar_kv_data = model_kwargs.pop("ar_kv_data", None)
         if ar_kv_data is None:
-            return input_ids
+            return input_ids, 0
 
         # 1. positive prefix len
         positive_reuse_len, negative_reuse_len = self._get_kv_reuse_len(model_kwargs, batch_size)
@@ -2796,7 +2799,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             f"negative_reuse_len={negative_reuse_len}"
         )
         if positive_reuse_len <= 0:
-            return input_ids
+            return input_ids, 0
 
         # 2. inject positive kv
         self.model.inject_ar_kv_into_layers(ar_kv_data, positive_reuse_len)
@@ -2821,7 +2824,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             positive_reuse_len=positive_reuse_len,
         )
 
-        return input_ids
+        return input_ids, positive_reuse_len
 
     @torch.no_grad()
     def __call__(
@@ -2975,9 +2978,12 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         # Attempt to reuse KV cache from the AR stage.
         # Note: the reusable KV length may differ between positive and negative prompts.
-        input_ids = self._maybe_handle_ar_kv_reuse(
+        input_ids, ar_kv_reuse_len = self._maybe_handle_ar_kv_reuse(
             input_ids, model_kwargs, batch_size, cfg_parallel_ready, cfg_rank, device
         )
+
+        # Store ar_kv_reuse_len in model_kwargs for use in forward method (SP mode)
+        model_kwargs["ar_kv_reuse_len"] = ar_kv_reuse_len
 
         # Sampling loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order

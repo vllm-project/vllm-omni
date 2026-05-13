@@ -51,6 +51,7 @@ _TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
     "i2t": ("en_unified", None, None),
     "it2i_think": ("en_unified", "think", "<think>"),
     "it2i_recaption": ("en_unified", "recaption", "<recaption>"),
+    "it2i_think_recaption": ("en_unified", "think_recaption", "<think>"),
     "t2i": ("en_unified", "image", None),
     "t2i_vanilla": ("en_vanilla", "image", None),
     "t2i_think": ("en_unified", "think", "<think>"),
