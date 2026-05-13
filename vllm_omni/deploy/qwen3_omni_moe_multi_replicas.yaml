@@ -55,6 +55,7 @@ stages:
     enforce_eager: true
     async_scheduling: false
     max_num_batched_tokens: 1048576
+    enable_chunked_prefill: false
     devices: "1,2"
     num_replicas: 2
     input_connectors:

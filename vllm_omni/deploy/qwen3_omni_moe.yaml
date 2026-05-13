@@ -62,6 +62,7 @@ stages:
     enforce_eager: true
     trust_remote_code: true
     enable_prefix_caching: false
+    enable_chunked_prefill: false
     async_scheduling: false
     devices: "1"
     input_connectors:
