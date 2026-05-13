@@ -22,6 +22,7 @@ class ForwardContext:
     omni_diffusion_config: OmniDiffusionConfig | None = None
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None
     split_text_embed_in_sp: bool = False
+    denoise_step_idx: int | None = None
     # whether to split the text embed in sequence parallel, if True, the text embed will be split in sequence parallel
 
     # Sequence Parallel padding support
@@ -103,12 +104,14 @@ def create_forward_context(
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     split_text_embed_in_sp: bool = False,
+    denoise_step_idx: int | None = None,
 ):
     return ForwardContext(
         vllm_config=vllm_config,
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
+        denoise_step_idx=denoise_step_idx,
     )
 
 
@@ -133,6 +136,7 @@ def set_forward_context(
     omni_diffusion_config: OmniDiffusionConfig | None = None,
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]] | None = None,
     split_text_embed_in_sp: bool = False,
+    denoise_step_idx: int | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, split_text_embed_in_sp, etc.
@@ -143,6 +147,7 @@ def set_forward_context(
         omni_diffusion_config=omni_diffusion_config,
         attn_metadata=attn_metadata,
         split_text_embed_in_sp=split_text_embed_in_sp,
+        denoise_step_idx=denoise_step_idx,
     )
     # vLLM CustomOp dispatch (e.g. QKVParallelLinear) requires a global
     # vLLM config set via set_current_vllm_config().
@@ -160,3 +165,9 @@ def set_forward_context(
                 vllm.ir.enable_torch_wrap(vllm_config.compilation_config.ir_enable_torch_wrap),
             ):
                 yield
+
+
+def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
+    """Set the current diffusion denoise step on the active ForwardContext."""
+    if _forward_context is not None:
+        _forward_context.denoise_step_idx = step_idx

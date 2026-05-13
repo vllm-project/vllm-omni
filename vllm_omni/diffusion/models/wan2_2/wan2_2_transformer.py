@@ -329,6 +329,7 @@ class WanSelfAttention(nn.Module):
         head_dim: int,
         eps: float = 1e-5,
         dropout: float = 0.0,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -374,13 +375,14 @@ class WanSelfAttention(nn.Module):
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
             role="self",
+            prefix=prefix,
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
-        attn_mask: torch.Tensor | None = None,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         # Fused QKV projection
         qkv, _ = self.to_qkv(hidden_states)
@@ -404,11 +406,6 @@ class WanSelfAttention(nn.Module):
             freqs_cos, freqs_sin = rotary_emb
             query = self.rotary_embedding(query, freqs_cos, freqs_sin)
             key = self.rotary_embedding(key, freqs_cos, freqs_sin)
-
-        # Create attention metadata if mask is provided
-        attn_metadata = None
-        if attn_mask is not None:
-            attn_metadata = AttentionMetadata(attn_mask=attn_mask)
 
         # Compute attention using unified attention layer
         hidden_states = self.attn(query, key, value, attn_metadata)
@@ -436,6 +433,7 @@ class WanCrossAttention(nn.Module):
         eps: float = 1e-5,
         dropout: float = 0.0,
         added_kv_proj_dim: int | None = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -528,13 +526,19 @@ class WanCrossAttention(nn.Module):
             causal=False,
             role="cross",
             qkv_layout="BSND",
+            prefix=prefix,
             skip_sequence_parallel=True,
+            # Wan2.2 cross-attn operates on short text-encoder sequences; per-block
+            # FP8 quant offers no perf win and degrades quality. Opt out until a
+            # dedicated quant backend handles this case.
+            disable_kv_quant=True,
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         # Handle I2V case where encoder_hidden_states contains both image and text
         encoder_hidden_states_img = None
@@ -568,12 +572,12 @@ class WanCrossAttention(nn.Module):
             key_img = key_img.unflatten(2, (self.num_heads, self.head_dim))
             value_img = value_img.unflatten(2, (self.num_heads, self.head_dim))
 
-            hidden_states_img = self.attn(query, key_img, value_img)
+            hidden_states_img = self.attn(query, key_img, value_img, attn_metadata)
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
 
         # Main cross-attention using unified attention layer
-        hidden_states = self.attn(query, key, value)
+        hidden_states = self.attn(query, key, value, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 
@@ -602,6 +606,7 @@ class WanTransformerBlock(nn.Module):
         eps: float = 1e-6,
         added_kv_proj_dim: int | None = None,
         cross_attn_norm: bool = False,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -614,6 +619,7 @@ class WanTransformerBlock(nn.Module):
             num_heads=num_heads,
             head_dim=head_dim,
             eps=eps,
+            prefix=f"{prefix}.attn1",
         )
 
         # 2. Cross-attention
@@ -623,6 +629,7 @@ class WanTransformerBlock(nn.Module):
             head_dim=head_dim,
             eps=eps,
             added_kv_proj_dim=added_kv_proj_dim,
+            prefix=f"{prefix}.attn2",
         )
         self.norm2 = LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
 
@@ -660,12 +667,13 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = self.norm1(hidden_states, scale_msa, shift_msa).type_as(hidden_states)
-        attn_output = self.attn1(norm_hidden_states, rotary_emb, hidden_states_mask)
+        self_attn_metadata = AttentionMetadata(attn_mask=hidden_states_mask)
+        attn_output = self.attn1(norm_hidden_states, rotary_emb, self_attn_metadata)
         hidden_states = (hidden_states + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
         norm_hidden_states = self.norm2(hidden_states).type_as(hidden_states)
-        attn_output = self.attn2(norm_hidden_states, encoder_hidden_states)
+        attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, None)
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
@@ -834,8 +842,16 @@ class WanTransformer3DModel(nn.Module):
         # 3. Transformer blocks
         self.blocks = nn.ModuleList(
             [
-                WanTransformerBlock(inner_dim, ffn_dim, num_attention_heads, eps, added_kv_proj_dim, cross_attn_norm)
-                for _ in range(num_layers)
+                WanTransformerBlock(
+                    inner_dim,
+                    ffn_dim,
+                    num_attention_heads,
+                    eps,
+                    added_kv_proj_dim,
+                    cross_attn_norm,
+                    prefix=f"blocks.{layer_idx}",
+                )
+                for layer_idx in range(num_layers)
             ]
         )
 
@@ -929,7 +945,13 @@ class WanTransformer3DModel(nn.Module):
 
         # Transformer blocks
         for block in self.blocks:
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask)
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states,
+                timestep_proj,
+                rotary_emb,
+                hidden_states_mask,
+            )
 
         # Output norm, projection & unpatchify
         shift, scale = self.output_scale_shift_prepare(temb)

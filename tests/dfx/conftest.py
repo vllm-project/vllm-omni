@@ -2,6 +2,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -377,11 +378,23 @@ def run_benchmark(
         command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, universal_newlines=True
     )
 
-    for line in iter(process.stdout.readline, ""):
-        print(line, end=" ")
+    if process.stdout is None or process.stderr is None:
+        raise RuntimeError("Failed to capture benchmark process output streams")
 
-    for line in iter(process.stderr.readline, ""):
-        print(line, end=" ")
+    def _forward_stream(stream) -> None:
+        try:
+            for line in iter(stream.readline, ""):
+                print(line, end="")
+        finally:
+            stream.close()
+
+    stdout_thread = threading.Thread(target=_forward_stream, args=(process.stdout,))
+    stderr_thread = threading.Thread(target=_forward_stream, args=(process.stderr,))
+    stdout_thread.start()
+    stderr_thread.start()
+    stdout_thread.join()
+    stderr_thread.join()
+    process.wait()
 
     if "--result-dir" in command:
         index = command.index("--result-dir")

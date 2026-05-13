@@ -33,8 +33,17 @@ class VaceWanTransformerBlock(WanTransformerBlock):
         added_kv_proj_dim: int | None = None,
         cross_attn_norm: bool = False,
         block_id: int = 0,
+        prefix: str = "",
     ):
-        super().__init__(dim, ffn_dim, num_heads, eps, added_kv_proj_dim, cross_attn_norm)
+        super().__init__(
+            dim,
+            ffn_dim,
+            num_heads,
+            eps,
+            added_kv_proj_dim,
+            cross_attn_norm,
+            prefix=prefix,
+        )
         self.proj_in = nn.Linear(dim, dim) if block_id == 0 else None
         self.proj_out = nn.Linear(dim, dim)
 
@@ -118,6 +127,7 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
                         self.config.added_kv_proj_dim,
                         self.config.cross_attn_norm,
                         block_id=i,
+                        prefix=f"vace_blocks.{i}",
                     )
                     for i in range(len(vace_layers))
                 ]
@@ -220,7 +230,7 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
             full_seq_len = hidden_states.shape[1] * sp_size
             control_hidden_states = self.embed_vace_context(vace_context.to(hidden_states.dtype), full_seq_len, sp_size)
             vace_hints = []
-            for block in self.vace_blocks:
+            for i, block in enumerate(self.vace_blocks):
                 conditioning_states, control_hidden_states = block(
                     hidden_states,
                     encoder_hidden_states,
@@ -237,7 +247,13 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
 
         # Transformer blocks with VACE hint application
         for i, block in enumerate(self.blocks):
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask)
+            hidden_states = block(
+                hidden_states,
+                encoder_hidden_states,
+                timestep_proj,
+                rotary_emb,
+                hidden_states_mask,
+            )
             if vace_hints is not None and self.vace_layers_mapping is not None and i in self.vace_layers_mapping:
                 vace_idx = self.vace_layers_mapping[i]
                 hidden_states = hidden_states + vace_hints[vace_idx] * vace_context_scale[vace_idx]

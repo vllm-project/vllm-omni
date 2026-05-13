@@ -1,4 +1,4 @@
-﻿# Quantization
+# Quantization
 
 vLLM-Omni exposes quantization through the unified `quantization_config`
 path. The same configuration entrypoint is used across diffusion-only models,
@@ -10,6 +10,7 @@ type has a different quantization scope.
 | Mode | Guide | Description | Methods |
 |------|-------|-------------|---------|
 | Online quantization | [Online Quantization](online.md) | vLLM-Omni computes quantized weights and scales while loading the model. | FP8 W8A8, Int8 W8A8 |
+| Runtime attention quantization | [Quantized KV Cache](quantized_kvcache.md) | vLLM-Omni dynamically quantizes eligible diffusion Flash Attention tensors during inference. | FP8 FA |
 | Pre-quantized checkpoints | Method-specific guides | The checkpoint or an offline quantizer provides quantized weights and scales before serving. | ModelOpt, GGUF, AutoRound, msModelSlim, serialized Int8 |
 
 ## Hardware Support
