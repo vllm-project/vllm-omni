@@ -39,6 +39,20 @@ class FlashAttentionBackend(AttentionBackend):
 
 
 class FlashAttentionImpl(AttentionImpl):
+    # Per-platform FP8 KV quantization support.
+    # To enable FP8 on a new platform, add its OmniPlatformEnum value here
+    # and handle kv_cache_dtype in the corresponding forward_{platform}().
+    #
+    # TODO(quant-backend): The FP8 quant path currently lives inside
+    # FlashAttentionImpl gated by ``attn_metadata.extra["kv_cache_dtype"]``.
+    # Eventually extract it into a dedicated FlashAttentionQuantBackend so
+    # backend selection (not metadata) decides quant. Until then, model
+    # authors can opt a specific Attention layer out via
+    # ``Attention(disable_kv_quant=True)``.
+    _supported_kv_cache_dtypes = {
+        "npu": {"fp8"},
+    }
+
     def __init__(
         self,
         num_heads: int,
@@ -250,6 +264,39 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata = None,
     ) -> torch.Tensor:
         """NPU attention implementation using mindiesd."""
+
+        kv_cache_dtype = attn_metadata.extra.get("kv_cache_dtype") if attn_metadata else None
+        if kv_cache_dtype is not None:
+            return self.forward_fa_quant_npu(query, key, value, attn_metadata)
+        return self.forward_fa_npu(query, key, value, attn_metadata)
+
+    def forward_fa_quant_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata = None,
+    ) -> torch.Tensor:
+        from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_rotate_quant_fa
+
+        layout = self.qkv_layout or "BNSD"
+        # Models pass (B, S, H, D); NPU fused op expects (B, N, S, D).
+        out = fp8_rotate_quant_fa(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            layout=layout,
+            softmax_scale=self.softmax_scale,
+        )
+        return out.transpose(1, 2)
+
+    def forward_fa_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata = None,
+    ) -> torch.Tensor:
         try:
             from mindiesd import attention_forward
         except ImportError:
@@ -259,10 +306,9 @@ class FlashAttentionImpl(AttentionImpl):
                 "For installation details, see https://gitcode.com/Ascend/MindIE-SD"
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
             )
-
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
         layout = self.qkv_layout or "BNSD"
-        output = attention_forward(
+        return attention_forward(
             query,
             key,
             value,
@@ -271,4 +317,3 @@ class FlashAttentionImpl(AttentionImpl):
             op_type="fused_attn_score",
             layout=layout,
         )
-        return output
