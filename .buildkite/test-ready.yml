@@ -217,6 +217,26 @@ steps:
   - group: ":card_index_dividers: E2E Test"
     depends_on: upload-ready-pipeline
     steps:
+      - label: "RLHF · VeRL-Omni E2E Test"
+        commands:
+          - |
+            timeout 20m bash -c "
+              pytest -s -v tests/e2e/offline_inference/rlhf_test/test_verl_omni_e2e.py
+            "
+        agents:
+          queue: "gpu_1_queue"
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              shm-size: "8gb"
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"
+
       - label: "Omni · Qwen3-Omni Test"
         commands:
           - |
