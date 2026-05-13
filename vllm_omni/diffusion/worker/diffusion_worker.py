@@ -206,14 +206,7 @@ class DiffusionWorker:
         world_size = self.od_config.num_gpus
         rank = self.rank
 
-        # Respect existing MASTER_ADDR/PORT (e.g., set by Ray executor)
-        if "MASTER_ADDR" not in os.environ:
-            os.environ["MASTER_ADDR"] = "localhost"
-        if "MASTER_PORT" not in os.environ:
-            os.environ["MASTER_PORT"] = str(self.od_config.master_port)
-        os.environ["LOCAL_RANK"] = str(self.local_rank)
-        os.environ["RANK"] = str(rank)
-        os.environ["WORLD_SIZE"] = str(world_size)
+        self._setup_distributed_env_vars(world_size=world_size, rank=rank)
 
         # Use local_rank (not rank) for device selection to support
         # Ray's per-actor CUDA_VISIBLE_DEVICES remapping
@@ -259,6 +252,21 @@ class DiffusionWorker:
                 enable_expert_parallel=parallel_config.enable_expert_parallel,
             )
             init_workspace_manager(self.device)
+
+    def _setup_distributed_env_vars(self, world_size: int, rank: int) -> None:
+        if getattr(self.od_config, "distributed_executor_backend", "mp") == "ray":
+            # Ray sets rendezvous details from the executor because rank 0 may
+            # live on a different host from the driver.
+            os.environ.setdefault("MASTER_ADDR", "localhost")
+            os.environ.setdefault("MASTER_PORT", str(self.od_config.master_port))
+        else:
+            # Multiprocessing workers inherit the parent environment, so avoid
+            # accidentally reusing unrelated distributed settings.
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = str(self.od_config.master_port)
+        os.environ["LOCAL_RANK"] = str(self.local_rank)
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
 
     def _create_profiler(self) -> WorkerProfiler | None:
         profiler_config = self.od_config.profiler_config

@@ -74,6 +74,13 @@ class TestRayDiffusionWorkerWrapper:
         with pytest.raises(RuntimeError, match="Worker is not initialized"):
             wrapper.execute_method("any_method")
 
+    def test_get_open_port_returns_actor_local_port(self, mocker: MockerFixture):
+        mock_get_open_port = mocker.patch("vllm_omni.diffusion.executor.ray_executor.get_open_port", return_value=23456)
+
+        assert RayDiffusionWorkerWrapper(rpc_rank=0).get_open_port() == "23456"
+
+        mock_get_open_port.assert_called_once_with()
+
     def test_execute_rpc_skips_non_output_rank(self, mocker: MockerFixture):
         """execute_rpc should not run single-rank RPCs on other ranks."""
         wrapper = RayDiffusionWorkerWrapper(rpc_rank=1)
@@ -200,6 +207,55 @@ class TestExecutorApi:
 
         assert executor._closed is True
         executor._finalizer.assert_called_once_with()
+
+    def test_init_workers_uses_rank0_actor_port(self, mocker: MockerFixture, mock_od_config):
+        executor = object.__new__(RayDiffusionExecutor)
+        executor.od_config = mock_od_config
+        executor.workers = []
+        executor._resources = SimpleNamespace(workers=None)
+        mock_od_config.num_gpus = 2
+
+        actors = []
+
+        class RemoteWorkerClass:
+            def remote(self, rpc_rank: int):
+                actor = mocker.Mock()
+                actor.get_node_ip.remote.return_value = f"ip-future-{rpc_rank}"
+                actor.get_open_port.remote.return_value = f"port-future-{rpc_rank}"
+                actor.update_environment_variables.remote.return_value = f"env-future-{rpc_rank}"
+                actor.init_worker.remote.return_value = f"init-future-{rpc_rank}"
+                actors.append(actor)
+                return actor
+
+        mocker.patch(
+            "vllm_omni.diffusion.executor.ray_executor.ray.remote",
+            side_effect=lambda **_: lambda _: RemoteWorkerClass(),
+        )
+        mocker.patch("vllm_omni.diffusion.executor.ray_executor.get_ip", return_value="10.0.0.driver")
+
+        def fake_ray_get(refs, timeout=None):
+            del timeout
+            if refs == ["ip-future-0", "ip-future-1"]:
+                # Neither actor is on the driver. Sorting by IP makes actor 1 rank 0.
+                return ["10.0.0.2", "10.0.0.1"]
+            if refs == "port-future-1":
+                return "23456"
+            if isinstance(refs, list):
+                return [None for _ in refs]
+            raise AssertionError(f"unexpected ray.get input: {refs!r}")
+
+        mocker.patch("vllm_omni.diffusion.executor.ray_executor.ray.get", side_effect=fake_ray_get)
+
+        RayDiffusionExecutor._init_workers_ray(executor, placement_group=mocker.Mock())
+
+        rank0_env = actors[1].update_environment_variables.remote.call_args.args[0]
+        rank1_env = actors[0].update_environment_variables.remote.call_args.args[0]
+        assert rank0_env["MASTER_ADDR"] == "10.0.0.1"
+        assert rank0_env["MASTER_PORT"] == "23456"
+        assert rank0_env["RANK"] == "0"
+        assert rank1_env["MASTER_ADDR"] == "10.0.0.1"
+        assert rank1_env["MASTER_PORT"] == "23456"
+        assert rank1_env["RANK"] == "1"
 
 
 class TestAddReq:

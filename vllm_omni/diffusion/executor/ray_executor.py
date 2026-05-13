@@ -89,6 +89,9 @@ class RayDiffusionWorkerWrapper:
     def get_node_ip(self) -> str:
         return get_ip()
 
+    def get_open_port(self) -> str:
+        return str(get_open_port())
+
     def update_environment_variables(self, env_vars: dict[str, str]) -> None:
         for k, v in env_vars.items():
             if k in os.environ and os.environ[k] != v:
@@ -266,7 +269,7 @@ class RayDiffusionExecutor(DiffusionExecutor):
 
         unique_ips = set(meta.ip for meta in self.workers)
         master_addr = "127.0.0.1" if len(unique_ips) == 1 else self.workers[0].ip
-        master_port = str(get_open_port())
+        master_port = ray.get(self.workers[0].worker.get_open_port.remote())
 
         env_futures = []
         for meta in self.workers:
