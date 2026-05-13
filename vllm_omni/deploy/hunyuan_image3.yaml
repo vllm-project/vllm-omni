@@ -1,7 +1,7 @@
 # HunyuanImage-3.0-Instruct deploy: AR (stage 0) + DiT (stage 1)
 # with AR-to-DiT KV reuse. The base CUDA layout uses 2 GPUs for AR
 # and 2 GPUs for DiT.
-pipeline: hunyuan_image3
+pipeline: hunyuan_image_3_moe
 async_chunk: false
 trust_remote_code: true
 
