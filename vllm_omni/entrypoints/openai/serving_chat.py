@@ -67,11 +67,13 @@ from vllm.entrypoints.openai.utils import maybe_filter_parallel_tool_calls
 from vllm.entrypoints.utils import should_include_usage
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import supports_transcription
+from vllm.model_executor.models.registry import ModelRegistry
 from vllm.outputs import RequestOutput
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs import TokPrompt
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers import TokenizerLike as AnyTokenizer
 from vllm.tokenizers.mistral import (
@@ -82,6 +84,7 @@ from vllm.tokenizers.mistral import (
 )
 from vllm.tool_parsers import ToolParser
 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
+from vllm.utils.async_utils import merge_async_iterators
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -896,6 +899,134 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             lora_request=lora_request,
         )
 
+    @staticmethod
+    def _extract_last_user_audio(request: ChatCompletionRequest) -> bytes | None:
+        """Pull base64 WAV bytes out of the most recent user message's
+        `input_audio` content part, if any. Used to drive parallel input
+        transcription so the SSE stream can emit the user's transcript inline."""
+        messages = getattr(request, "messages", None) or []
+        for msg in reversed(messages):
+            role = getattr(msg, "role", None) if not isinstance(msg, dict) else msg.get("role")
+            if role != "user":
+                continue
+            content = getattr(msg, "content", None) if not isinstance(msg, dict) else msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                part_d = (
+                    part if isinstance(part, dict) else (part.model_dump() if hasattr(part, "model_dump") else None)
+                )
+                if not isinstance(part_d, dict):
+                    continue
+                if part_d.get("type") != "input_audio":
+                    continue
+                audio = part_d.get("input_audio") or {}
+                data = audio.get("data") if isinstance(audio, dict) else None
+                if isinstance(data, str):
+                    try:
+                        return base64.b64decode(data)
+                    except (ValueError, TypeError):
+                        return None
+            # Only inspect the most recent user message
+            break
+        return None
+
+    def _transcription_model_cls(self):
+        """Resolve the model class for the comprehension stage and return it
+        only if it implements SupportsTranscription, else None."""
+        try:
+            arches = getattr(self.model_config, "architectures", None) or []
+            if not arches:
+                return None
+            resolved = ModelRegistry.resolve_model_cls(arches, self.model_config)
+            model_cls = resolved[0] if isinstance(resolved, tuple) else resolved
+            if supports_transcription(model_cls):
+                return model_cls
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("transcription model resolution failed: %s", e)
+        return None
+
+    async def _stream_user_transcription(
+        self,
+        audio_bytes: bytes,
+        request_id: str,
+    ) -> AsyncGenerator[RequestOutput, None]:
+        """Run user-side ASR on the captured audio bytes against the same
+        loaded Qwen3-Omni weights and stream the resulting text deltas.
+
+        Yields RequestOutput-shaped chunks identical to what the regular chat
+        completion generator yields, so the caller can interleave them through
+        `merge_async_iterators` into the same SSE stream.
+        """
+        if soundfile is None:
+            return
+        model_cls = self._transcription_model_cls()
+        if model_cls is None:
+            return
+
+        try:
+            from vllm.config.speech_to_text import SpeechToTextParams
+        except Exception as e:
+            logger.warning("SpeechToTextParams import failed: %s", e)
+            return
+
+        # 1) decode WAV bytes → float32 PCM at the model's expected sample rate
+        try:
+            stt_config = model_cls.get_speech_to_text_config(self.model_config, "transcribe")
+            with BytesIO(audio_bytes) as buf:
+                pcm, sr = soundfile.read(buf, dtype="float32", always_2d=False)
+            if pcm.ndim > 1:  # downmix
+                pcm = pcm.mean(axis=1)
+            if sr != stt_config.sample_rate:
+                # cheap linear resample to model SR — input is short
+                import numpy as np
+
+                ratio = stt_config.sample_rate / float(sr)
+                new_len = int(round(len(pcm) * ratio))
+                pcm = np.interp(
+                    np.linspace(0, len(pcm), new_len, endpoint=False),
+                    np.arange(len(pcm)),
+                    pcm,
+                ).astype("float32")
+        except Exception as e:
+            logger.warning("input ASR audio decode failed: %s", e)
+            return
+
+        # 2) build the ASR prompt via the model's own template
+        try:
+            stt_params = SpeechToTextParams(
+                audio=pcm,
+                stt_config=stt_config,
+                model_config=self.model_config,
+                task_type="transcribe",
+            )
+            prompt = model_cls.get_generation_prompt(stt_params)
+        except Exception as e:
+            logger.warning("input ASR prompt build failed: %s", e)
+            return
+
+        # 3) submit to the engine as a text-only generation; the comprehension
+        # stage will run ASR. RequestOutputKind.DELTA gives us token-by-token
+        # deltas so we can stream the transcript live alongside the chat reply.
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=512,
+            output_kind=RequestOutputKind.DELTA,
+        )
+
+        asr_request_id = f"asr-{request_id}"
+        try:
+            async for output in self.engine_client.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=asr_request_id,
+                output_modalities=["text"],
+            ):
+                yield output
+        except Exception as e:
+            logger.warning("input ASR generation aborted: %s", e)
+            return
+
     async def chat_completion_stream_generator(
         self,
         request: ChatCompletionRequest,
@@ -973,8 +1104,61 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         include_usage, include_continuous_usage = should_include_usage(stream_options, self.enable_force_include_usage)
 
         last_metrics: dict[str, Any] | None = None
+
+        # If the user message includes audio AND the model supports
+        # transcription, spawn a parallel ASR pass and merge its text deltas
+        # into the same SSE stream tagged with modality="transcription". This
+        # lets the client display the heard user-side transcript inline,
+        # without a second HTTP round-trip to /v1/audio/transcriptions.
+        asr_gen: AsyncGenerator[RequestOutput, None] | None = None
         try:
-            async for omni_res in result_generator:
+            audio_bytes = self._extract_last_user_audio(request)
+            if audio_bytes is not None:
+                asr_gen = self._stream_user_transcription(audio_bytes, request_id)
+        except Exception as _asr_e:  # pragma: no cover - defensive
+            logger.warning("user transcription setup failed: %s", _asr_e)
+            asr_gen = None
+
+        async def _wrapped_results():
+            """Yield ("chat", omni_res) or ("asr_text", delta_str)."""
+            if asr_gen is None:
+                async for omni_res in result_generator:
+                    yield ("chat", omni_res)
+                return
+            async for src_idx, item in merge_async_iterators(result_generator, asr_gen):
+                if src_idx == 0:
+                    yield ("chat", item)
+                else:
+                    # ASR RequestOutput with output_kind=DELTA — outputs[0].text
+                    # is the delta token string
+                    try:
+                        delta_text = item.outputs[0].text if item.outputs else ""
+                    except Exception:
+                        delta_text = ""
+                    if delta_text:
+                        yield ("asr_text", delta_text)
+
+        try:
+            async for _src_kind, _src_item in _wrapped_results():
+                if _src_kind == "asr_text":
+                    asr_chunk = OmniChatCompletionStreamResponse(
+                        id=request_id,
+                        object=chunk_object_type,
+                        created=created_time,
+                        choices=[
+                            ChatCompletionResponseStreamChoice(
+                                index=0,
+                                delta=DeltaMessage(content=_src_item),
+                                logprobs=None,
+                                finish_reason=None,
+                            )
+                        ],
+                        model=model_name,
+                        modality="transcription",
+                    )
+                    yield f"data: {asr_chunk.model_dump_json(exclude_unset=True)}\n\n"
+                    continue
+                omni_res = _src_item
                 final_output_type = omni_res.final_output_type
                 res = omni_res.request_output
                 if final_output_type not in first_iteration_dict:

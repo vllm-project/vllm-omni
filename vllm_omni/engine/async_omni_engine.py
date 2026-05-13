@@ -1075,10 +1075,31 @@ class AsyncOmniEngine:
         self.stage_vllm_configs = [pool.stage_vllm_config for pool in self.stage_pools]
         self.output_processors = [pool.output_processor for pool in self.stage_pools]
 
-        # TODO(Peiqi): Hack here
         supported_tasks: set[str] = set()
-        if any(getattr(pool.stage_client, "is_comprehension", False) for pool in self.stage_pools):
+        comprehension_pools = [
+            pool for pool in self.stage_pools if getattr(pool.stage_client, "is_comprehension", False)
+        ]
+        if comprehension_pools:
             supported_tasks.add("generate")
+            # If the comprehension stage's model class also implements
+            # SupportsTranscription, expose `/v1/audio/transcriptions` against
+            # the already-loaded model (no extra VRAM, no separate process).
+            try:
+                from vllm.model_executor.models.interfaces import supports_transcription
+                from vllm.model_executor.models.registry import ModelRegistry
+
+                for pool in comprehension_pools:
+                    model_config = pool.stage_vllm_config.model_config
+                    arches = getattr(model_config, "architectures", None) or []
+                    if not arches:
+                        continue
+                    resolved = ModelRegistry.resolve_model_cls(arches, model_config)
+                    model_cls = resolved[0] if isinstance(resolved, tuple) else resolved
+                    if supports_transcription(model_cls):
+                        supported_tasks.add("transcription")
+                        break
+            except Exception as e:
+                logger.warning("[AsyncOmniEngine] transcription capability probe failed: %s", e)
         if any(m.get("final_output_type") == "audio" for m in self.stage_metadata):
             supported_tasks.add("speech")
         self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
