@@ -11,9 +11,6 @@
 #     is cudagraph-incompatible.
 #   * Platform sections flip enforce_eager per-stage where platform
 #     cudagraph support differs.
-#   * Stage 2 (code2wav) max_num_batched_tokens is set to 1,048,576 because
-#     when async_chunk is False, it needs to be at least
-#     65536(talker max_position_embeddings) * 16 = 1,048,576 to avoid dropping tokens.
 async_chunk: true
 
 connectors:
@@ -56,7 +53,7 @@ stages:
       repetition_penalty: 1.05
 
   - stage_id: 2
-    max_num_batched_tokens: 1048576
+    max_num_batched_tokens: 51200
     max_num_seqs: 64
     gpu_memory_utilization: 0.1
     enforce_eager: true

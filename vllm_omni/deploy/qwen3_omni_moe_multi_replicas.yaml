@@ -12,9 +12,6 @@
 #     loop is cudagraph-incompatible.
 #   * Stages 1/2 use num_replicas=2 and share devices "1,2". Replica
 #     routing is handled by StagePool with request-level affinity.
-#   * Stage 2 (code2wav) max_num_batched_tokens is set to 1,048,576 because
-#     when async_chunk is False, it needs to be at least
-#     65536(talker max_position_embeddings) * 16 = 1,048,576 to avoid dropping tokens.
 async_chunk: true
 
 connectors:
@@ -54,7 +51,7 @@ stages:
     max_num_seqs: 1
     enforce_eager: true
     async_scheduling: false
-    max_num_batched_tokens: 1048576
+    max_num_batched_tokens: 51200
     enable_chunked_prefill: false
     devices: "1,2"
     num_replicas: 2
