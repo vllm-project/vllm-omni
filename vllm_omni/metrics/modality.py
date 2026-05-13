@@ -18,6 +18,8 @@ scope for this iteration.
 
 from __future__ import annotations
 
+from typing import Any
+
 from prometheus_client import Counter, Histogram
 
 from vllm_omni.metrics import definitions as defs
@@ -153,3 +155,60 @@ class OmniModalityMetrics:
         _video_generation_time_family.labels(
             model_name=self._model_name, stage=stage, replica=replica
         ).observe(gen_time_seconds)
+
+
+def observe_modality_at_finalize(
+    mod_metrics: OmniModalityMetrics,
+    *,
+    output_type: str | None,
+    stage_id: int,
+    replica_id: int | None,
+    stage_metrics: Any,
+    engine_outputs: Any,
+    request_arrival_ts: float,
+    finalize_ts: float,
+) -> None:
+    """Route per-modality observations for a finalized request.
+
+    Used by ``omni_base._process_single_result`` inside the e2e_done finalize
+    guard so it fires once per request. Skips text path (covered by upstream
+    ``vllm:*{stage="thinker", ...}``) and any case where required inputs are
+    missing — caller should not need to pre-validate.
+
+    audio_ttfp is intentionally NOT observed here; it's emitted by the
+    streaming hook (Phase 3.3) at first-packet time, not at finalize.
+    """
+    if replica_id is None or stage_metrics is None or output_type is None:
+        return
+    if output_type not in ("audio", "image", "video"):
+        return
+
+    stage_label = str(stage_id)
+    replica_label = str(replica_id)
+    gen_time_s = float(getattr(stage_metrics, "stage_gen_time_ms", 0.0)) / 1000.0
+
+    if output_type == "audio":
+        mm_out = getattr(engine_outputs, "multimodal_output", None) or {}
+        sample_rate = defs.resolve_audio_sample_rate(mm_out)
+        n_frames = int(getattr(stage_metrics, "audio_generated_frames", 0) or 0)
+        mod_metrics.inc_audio_frames(stage_label, replica_label, n_frames)
+        duration_s = n_frames / sample_rate if sample_rate > 0 else 0.0
+        if duration_s > 0:
+            mod_metrics.observe_audio_duration(stage_label, replica_label, duration_s)
+            mod_metrics.observe_audio_rtf(
+                stage_label,
+                replica_label,
+                defs.compute_audio_rtf(gen_time_s, duration_s),
+            )
+    elif output_type == "image":
+        n_images = len(getattr(engine_outputs, "images", []) or [])
+        mod_metrics.inc_image_num(stage_label, replica_label, n_images)
+        mod_metrics.observe_image_generation_time(
+            stage_label, replica_label, gen_time_s
+        )
+        image_ttfp_s = max(finalize_ts - request_arrival_ts, 0.0)
+        mod_metrics.observe_image_ttfp(stage_label, replica_label, image_ttfp_s)
+    else:  # video
+        mod_metrics.observe_video_generation_time(
+            stage_label, replica_label, gen_time_s
+        )

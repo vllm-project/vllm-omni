@@ -141,3 +141,38 @@ def compute_video_rtf(stage_gen_time_s: float, video_duration_s: float) -> float
     if video_duration_s <= 0:
         return 0.0
     return stage_gen_time_s / video_duration_s
+
+
+# ============================================================================
+# Audio sample-rate resolution
+# ============================================================================
+# Most common across vllm-omni talker variants (cosyvoice3, omnivoice,
+# qwen3_tts, mimo_audio, voxcpm). voxcpm2 uses 48000, stable_audio 44100,
+# ming_flash 16000 — these models populate multimodal_output["audio_sample_rate"]
+# at runtime so this default only kicks in when the field is missing.
+DEFAULT_AUDIO_SAMPLE_RATE = 24000
+
+_SAMPLE_RATE_KEYS = ("audio_sample_rate", "sample_rate", "sampling_rate", "sr")
+
+
+def resolve_audio_sample_rate(multimodal_output: dict | None) -> int:
+    """Extract audio sample_rate from a multimodal_output dict, with fallbacks.
+
+    Tries the same key chain as serving_chat.py's audio response path so
+    /metrics audio_duration_seconds = audio_frames / sample_rate stays
+    consistent with what the OpenAI streaming endpoint reports back to clients.
+    Returns DEFAULT_AUDIO_SAMPLE_RATE when no usable value is present.
+    """
+    if not multimodal_output:
+        return DEFAULT_AUDIO_SAMPLE_RATE
+    for key in _SAMPLE_RATE_KEYS:
+        raw = multimodal_output.get(key)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return DEFAULT_AUDIO_SAMPLE_RATE

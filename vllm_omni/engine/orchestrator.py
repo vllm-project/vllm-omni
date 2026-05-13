@@ -576,7 +576,7 @@ class Orchestrator:
                 )
                 stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
-            await self._route_output(stage_id, output, req_state, stage_metrics)
+            await self._route_output(stage_id, replica_id, output, req_state, stage_metrics)
 
     async def _handle_stage_error(self, stage_id: int, output: Any) -> None:
         """Emit a frontend-visible error and clean up request state."""
@@ -632,6 +632,7 @@ class Orchestrator:
     async def _route_output(
         self,
         stage_id: int,
+        replica_id: int,
         output: Any,
         req_state: OrchestratorRequestState,
         stage_metrics: Any,
@@ -652,6 +653,7 @@ class Orchestrator:
                     "type": "output",
                     "request_id": req_id,
                     "stage_id": stage_id,
+                    "replica_id": replica_id,
                     "engine_outputs": output,
                     "metrics": stage_metrics,
                     "finished": finished and stage_id == req_state.final_stage_id,
@@ -664,6 +666,7 @@ class Orchestrator:
                     "type": "stage_metrics",
                     "request_id": req_id,
                     "stage_id": stage_id,
+                    "replica_id": replica_id,
                     "metrics": stage_metrics,
                     "stage_submit_ts": submit_ts,
                 }

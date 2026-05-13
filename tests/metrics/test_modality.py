@@ -4,7 +4,7 @@ import pytest
 from prometheus_client import REGISTRY, generate_latest
 
 from vllm_omni.metrics import definitions as defs
-from vllm_omni.metrics.modality import OmniModalityMetrics
+from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_finalize
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -162,6 +162,183 @@ class TestVideo:
 # ---------------------------------------------------------------------------
 # Bucket selection (RTF uses RTF_BUCKETS, others use SECONDS_BUCKETS)
 # ---------------------------------------------------------------------------
+
+
+class _StubModMetrics:
+    """Records every observe/inc call so the routing logic can be asserted."""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    def inc_audio_frames(self, s, r, n):
+        self.calls.append(("inc_audio_frames", s, r, n))
+
+    def observe_audio_duration(self, s, r, d):
+        self.calls.append(("observe_audio_duration", s, r, d))
+
+    def observe_audio_rtf(self, s, r, rtf):
+        self.calls.append(("observe_audio_rtf", s, r, rtf))
+
+    def inc_image_num(self, s, r, n):
+        self.calls.append(("inc_image_num", s, r, n))
+
+    def observe_image_generation_time(self, s, r, t):
+        self.calls.append(("observe_image_generation_time", s, r, t))
+
+    def observe_image_ttfp(self, s, r, t):
+        self.calls.append(("observe_image_ttfp", s, r, t))
+
+    def observe_video_generation_time(self, s, r, t):
+        self.calls.append(("observe_video_generation_time", s, r, t))
+
+
+class _Bag:
+    """Tiny attribute bag for stage_metrics / engine_outputs stubs."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class TestObserveModalityAtFinalize:
+    def test_audio_path_full(self):
+        stub = _StubModMetrics()
+        stage_metrics = _Bag(stage_gen_time_ms=500.0, audio_generated_frames=24000)
+        engine_outputs = _Bag(multimodal_output={"audio_sample_rate": 24000})
+
+        observe_modality_at_finalize(
+            stub,
+            output_type="audio",
+            stage_id=1,
+            replica_id=0,
+            stage_metrics=stage_metrics,
+            engine_outputs=engine_outputs,
+            request_arrival_ts=100.0,
+            finalize_ts=100.5,
+        )
+        # 24000 frames / 24000 Hz = 1.0s duration; gen 0.5s → rtf 0.5
+        assert ("inc_audio_frames", "1", "0", 24000) in stub.calls
+        assert ("observe_audio_duration", "1", "0", 1.0) in stub.calls
+        assert ("observe_audio_rtf", "1", "0", 0.5) in stub.calls
+
+    def test_audio_path_zero_frames_skips_duration_and_rtf(self):
+        stub = _StubModMetrics()
+        observe_modality_at_finalize(
+            stub,
+            output_type="audio",
+            stage_id=1,
+            replica_id=0,
+            stage_metrics=_Bag(stage_gen_time_ms=300.0, audio_generated_frames=0),
+            engine_outputs=_Bag(multimodal_output={}),
+            request_arrival_ts=100.0,
+            finalize_ts=100.3,
+        )
+        # inc with 0 still called (Counter side gates internally to no-op)
+        assert ("inc_audio_frames", "1", "0", 0) in stub.calls
+        # but no duration / rtf because duration_s == 0
+        assert not any(c[0] == "observe_audio_duration" for c in stub.calls)
+        assert not any(c[0] == "observe_audio_rtf" for c in stub.calls)
+
+    def test_audio_uses_resolved_sample_rate_from_multimodal_output(self):
+        stub = _StubModMetrics()
+        # Non-default 16 kHz from talker config
+        observe_modality_at_finalize(
+            stub,
+            output_type="audio",
+            stage_id=1,
+            replica_id=0,
+            stage_metrics=_Bag(stage_gen_time_ms=1000.0, audio_generated_frames=16000),
+            engine_outputs=_Bag(multimodal_output={"sample_rate": 16000}),
+            request_arrival_ts=0.0,
+            finalize_ts=1.0,
+        )
+        # 16000 / 16000 = 1.0s
+        assert ("observe_audio_duration", "1", "0", 1.0) in stub.calls
+
+    def test_image_path_uses_finalize_minus_arrival_for_ttfp(self):
+        stub = _StubModMetrics()
+        observe_modality_at_finalize(
+            stub,
+            output_type="image",
+            stage_id=2,
+            replica_id=1,
+            stage_metrics=_Bag(stage_gen_time_ms=2000.0),
+            engine_outputs=_Bag(images=["img1", "img2", "img3"]),
+            request_arrival_ts=10.0,
+            finalize_ts=12.5,
+        )
+        assert ("inc_image_num", "2", "1", 3) in stub.calls
+        assert ("observe_image_generation_time", "2", "1", 2.0) in stub.calls
+        assert ("observe_image_ttfp", "2", "1", 2.5) in stub.calls
+
+    def test_image_ttfp_clamped_to_zero_on_clock_skew(self):
+        stub = _StubModMetrics()
+        observe_modality_at_finalize(
+            stub,
+            output_type="image",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=_Bag(stage_gen_time_ms=1000.0),
+            engine_outputs=_Bag(images=["img"]),
+            request_arrival_ts=100.0,
+            finalize_ts=99.5,  # finalize earlier than arrival (impossible but defensive)
+        )
+        assert ("observe_image_ttfp", "2", "0", 0.0) in stub.calls
+
+    def test_video_path_only_emits_generation_time(self):
+        stub = _StubModMetrics()
+        observe_modality_at_finalize(
+            stub,
+            output_type="video",
+            stage_id=2,
+            replica_id=0,
+            stage_metrics=_Bag(stage_gen_time_ms=5200.0),
+            engine_outputs=_Bag(),
+            request_arrival_ts=0.0,
+            finalize_ts=5.3,
+        )
+        assert stub.calls == [("observe_video_generation_time", "2", "0", 5.2)]
+
+    def test_text_path_no_calls(self):
+        stub = _StubModMetrics()
+        observe_modality_at_finalize(
+            stub,
+            output_type="text",
+            stage_id=0,
+            replica_id=0,
+            stage_metrics=_Bag(stage_gen_time_ms=100.0),
+            engine_outputs=_Bag(),
+            request_arrival_ts=0.0,
+            finalize_ts=0.1,
+        )
+        assert stub.calls == []
+
+    def test_replica_id_none_skipped(self):
+        stub = _StubModMetrics()
+        observe_modality_at_finalize(
+            stub,
+            output_type="audio",
+            stage_id=1,
+            replica_id=None,  # error path: orchestrator emitted without replica_id
+            stage_metrics=_Bag(stage_gen_time_ms=500.0, audio_generated_frames=240),
+            engine_outputs=_Bag(multimodal_output={}),
+            request_arrival_ts=0.0,
+            finalize_ts=0.5,
+        )
+        assert stub.calls == []
+
+    def test_stage_metrics_none_skipped(self):
+        stub = _StubModMetrics()
+        observe_modality_at_finalize(
+            stub,
+            output_type="audio",
+            stage_id=1,
+            replica_id=0,
+            stage_metrics=None,
+            engine_outputs=_Bag(multimodal_output={}),
+            request_arrival_ts=0.0,
+            finalize_ts=0.5,
+        )
+        assert stub.calls == []
 
 
 class TestBucketSelection:

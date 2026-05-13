@@ -18,6 +18,7 @@ from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_stage_id_for_e2e
+from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_finalize
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -187,6 +188,7 @@ class OmniBase(PDDisaggregationMixin):
 
         self.request_states: dict[str, ClientRequestState] = {}
         self.prom_metrics = OmniPrometheusMetrics(model_name=model)
+        self.mod_metrics = OmniModalityMetrics(model_name=model)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
         if not self.output_modalities:
@@ -443,6 +445,8 @@ class OmniBase(PDDisaggregationMixin):
         if not stage_meta["final_output"]:
             return None
 
+        output_type = getattr(engine_outputs, "final_output_type", stage_meta["final_output_type"])
+
         try:
             rid_key = str(req_id)
             if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done and finished:
@@ -457,6 +461,19 @@ class OmniBase(PDDisaggregationMixin):
                 queue_ms = _pt.get("queue_wait_ms")
                 queue_seconds = queue_ms / 1000.0 if queue_ms is not None else None
                 self.prom_metrics.request_succeeded(e2e_seconds, queue_seconds=queue_seconds)
+
+                # Modality observe (Phase 3.2). Inside the same finalize guard so
+                # it fires once per request and inherits the try/except isolation.
+                observe_modality_at_finalize(
+                    self.mod_metrics,
+                    output_type=output_type,
+                    stage_id=stage_id,
+                    replica_id=result.get("replica_id"),
+                    stage_metrics=_m,
+                    engine_outputs=engine_outputs,
+                    request_arrival_ts=req_start_ts.get(req_id, wall_start_ts),
+                    finalize_ts=now,
+                )
         except Exception:
             logger.exception("[%s] Finalize request handling error", self.__class__.__name__)
 
@@ -469,7 +486,6 @@ class OmniBase(PDDisaggregationMixin):
         if finished and isinstance(diffusion_metrics, dict) and diffusion_metrics:
             self.prom_metrics.observe_diffusion_metrics(stage_id, diffusion_metrics)
 
-        output_type = getattr(engine_outputs, "final_output_type", stage_meta["final_output_type"])
         images = getattr(engine_outputs, "images", []) if output_type == "image" else []
         return OmniRequestOutput(
             request_id=req_id or "",
