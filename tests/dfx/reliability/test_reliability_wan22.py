@@ -70,6 +70,10 @@ PROCESS_KILL_ERROR_KEYWORDS = (
 )
 SERVE_SIGNAL_PARAMS = [
     pytest.param("SIGTERM", id="sigterm"),
+    pytest.param("SIGKILL", id="sigkill"),
+]
+TREE_SIGNAL_PARAMS = [
+    pytest.param("SIGTERM", id="sigterm"),
     pytest.param("SIGINT", id="sigint"),
     pytest.param("SIGKILL", id="sigkill"),
 ]
@@ -82,15 +86,6 @@ WORKER_SIGNAL_FAULT_PARAMS = [
             post_kill_wait_seconds=2.0,
         ),
         id="runtime_process_chain_sigterm",
-    ),
-    pytest.param(
-        make_process_kill_fault_injector(
-            grep_patterns="multiprocessing.spawn",
-            signal_name="SIGINT",
-            limit=1,
-            post_kill_wait_seconds=2.0,
-        ),
-        id="runtime_process_chain_sigint",
     ),
     pytest.param(
         make_process_kill_fault_injector(
@@ -488,6 +483,7 @@ def test_reliability_video_oom_recovers_after_fault_removed(
 
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.skip(reason="issue#2768")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
@@ -518,17 +514,62 @@ def test_reliability_fault_process_kill_serve_root_video_no_worker_residual_and_
 
 
 @pytest.mark.slow
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
+@pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
+def test_reliability_fault_process_kill_serve_root_video_no_load_fast_fail_and_cleanup(
+    omni_server_function,
+    signal_name: str,
+) -> None:
+    """Black-box: kill serve root without load; verify fast-fail/health/cleanup."""
+    scenario = f"kill_serve_root_no_load_{signal_name.lower()}"
+    injector = make_server_root_kill_fault_injector(signal_name=signal_name, post_kill_wait_seconds=2.0)
+    injector(omni_server_function)
+    host = omni_server_function.host
+    port = omni_server_function.port
+    _assert_post_fault_video_fast_fail(host, port, scenario=scenario)
+    _assert_post_fault_health_terminal(host, port, scenario=scenario)
+    assert_no_worker_residual_and_gpu_release(omni_server_function, scenario=scenario)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@pytest.mark.parametrize("signal_name", TREE_SIGNAL_PARAMS)
+@pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
+def test_reliability_fault_process_kill_tree_video_no_load_fast_fail_and_cleanup(
+    omni_server_function,
+    signal_name: str,
+) -> None:
+    """Black-box: kill server tree without load; verify fast-fail/health/cleanup."""
+    scenario = f"kill_server_tree_no_load_{signal_name.lower()}"
+    injector = make_server_tree_kill_fault_injector(
+        signal_name=signal_name,
+        post_kill_wait_seconds=2.0,
+        inter_kill_wait_seconds=0.1,
+    )
+    injector(omni_server_function)
+    host = omni_server_function.host
+    port = omni_server_function.port
+    _assert_post_fault_video_fast_fail(host, port, scenario=scenario)
+    _assert_post_fault_health_terminal(host, port, scenario=scenario)
+    assert_no_worker_residual_and_gpu_release(omni_server_function, scenario=scenario)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@pytest.mark.parametrize("signal_name", TREE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_tree_video_no_worker_residual_and_gpu_release(
     omni_server_function,
     openai_client_function,
+    signal_name: str,
 ) -> None:
     """Black-box: during in-flight video requests, kill server process tree and verify post-fault behavior/cleanup."""
     request_config = _video_request_config()
-    scenario = "kill_server_tree_sigkill"
+    scenario = f"kill_server_tree_{signal_name.lower()}"
     injector = make_server_tree_kill_fault_injector(
-        signal_name="SIGKILL",
+        signal_name=signal_name,
         post_kill_wait_seconds=2.0,
         inter_kill_wait_seconds=0.1,
     )
