@@ -100,8 +100,7 @@ python examples/offline_inference/hunyuan_image3/end2end.py \
   --prompts "A cute cat"
 ```
 
-<<<<<<< yukexiong/support_additional_config
-### Additional Config
+## Additional Config
 
 You can pass diffusion worker `additional_config` from the offline example as a JSON object.
 This maps to the upstream vLLM `VllmConfig.additional_config` platform extension field:
@@ -113,57 +112,13 @@ python end2end.py --modality text2img \
                   --additional-config '{"torchair_graph_config":{"enabled":true}}'
 ```
 
-### Key Arguments
-
-#### 📌 Command Line Arguments (end2end.py)
-
-| Argument               | Type   | Default                              | Description                                                  |
-| :--------------------- | :----- | :----------------------------------- | :----------------------------------------------------------- |
-| `--model`              | string | `tencent/HunyuanImage-3.0-Instruct` | Model path or name                                           |
-| `--modality`           | choice | `text2img`                           | Modality: `text2img`, `img2img`, `img2text`, `text2text`     |
-| `--prompts`            | list   | `None`                               | Input text prompts                                           |
-| `--image-path`         | string | `None`                               | Input image path (for `img2img`/`img2text`)                  |
-| `--output`             | string | `.`                                  | Output directory for saved images                            |
-| `--steps`              | int    | `50`                                 | Number of inference steps                                    |
-| `--guidance-scale`     | float  | `5.0`                                | Classifier-free guidance scale                               |
-| `--seed`               | int    | `42`                                 | Random seed                                                  |
-| `--height`             | int    | `1024`                               | Output image height                                          |
-| `--width`              | int    | `1024`                               | Output image width                                           |
-| `--bot-task`           | string | auto                                 | Override prompt task (e.g. `it2i_think`, `t2i_recaption`)    |
-| `--sys-type`           | string | auto                                 | Override system prompt type (e.g. `en_unified`, `en_vanilla`) |
-| `--stage-configs-path` | string | auto                                 | Custom stage config YAML path                                |
-| `--additional-config`  | string | `None`                               | JSON object forwarded to diffusion `additional_config`       |
-| `--enforce-eager`      | flag   | `False`                              | Disable torch.compile                                        |
-| `--init-timeout`       | int    | `300`                                | Initialization timeout (seconds)                             |
-| `--vae-use-tiling`     | flag   | `False`                              | Enable VAE tiling for memory optimization (required to avoid OOM on A100) |
-
-------
-
-#### ⚙️ Stage Configurations
-
-| Config YAML                         | Modality  | Stages | GPUs   | Description                           |
-| :---------------------------------- | :-------- | :----- | :----- | :------------------------------------ |
-| `hunyuan_image3_t2i.yaml`           | text2img  | 2      | 8      | T2I with AR→DiT, 4 GPU each          |
-| `hunyuan_image3_it2i.yaml`          | img2img   | 2      | 8      | IT2I with AR→DiT, 4 GPU each         |
-| `hunyuan_image3_i2t.yaml`           | img2text  | 1      | 4      | I2T (AR only)                         |
-| `hunyuan_image3_t2t.yaml`           | text2text | 1      | 4      | T2T (AR only)                         |
-| `hunyuan_image3_t2i_2gpu.yaml`      | text2img  | 2      | 2      | T2I for 2-GPU setups                  |
-| `hunyuan_image3_moe.yaml`           | text2img  | 2      | 8      | T2I with MoE AR→DiT KV reuse          |
-| `hunyuan_image3_moe_dit_2gpu_fp8.yaml` | text2img | 2   | 2      | T2I with FP8 quantization             |
-
-------
-
-## Using MoE Config
-
-The `hunyuan_image3_moe.yaml` config enables AR→DiT KV cache reuse with 8 GPUs (4 for AR + 4 for DiT).
-=======
 ## Key Arguments
->>>>>>> main
 
 | Argument | Description |
 | :--- | :--- |
 | `--deploy-config` | Preferred config path for unified deploy YAMLs. |
 | `--stage-configs-path` | Legacy stage config path, kept only for compatibility. Prefer `--deploy-config`. |
+| `--additional-config` | JSON object forwarded to diffusion worker `additional_config`. |
 | `--modality` | Offline-only convenience flag. One of `text2img`, `img2img`, `img2text`, `text2text`. It selects prompt formatting, internal `mode`, and default deploy config for this script. Online serving uses `--deploy-config` plus the endpoint and, for chat completions, request `modalities` instead. |
 | `--steps` | Number of diffusion inference steps for image generation. |
 | `--guidance-scale` | Classifier-free guidance scale for image generation. |
