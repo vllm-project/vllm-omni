@@ -16,6 +16,7 @@ from pydantic import TypeAdapter
 
 from vllm_omni.diffusion.diffusion_engine import get_extra_body_params, get_extra_output_params
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.metrics.modality import observe_audio_first_packet
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -1542,6 +1543,26 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         yield f"data: {data}\n\n"
 
                 elif final_output_type == "audio":
+                    # Phase 3.3: observe audio_ttfp_seconds on first audio packet
+                    # for this request_id (once-per-request guard via first_audio_ts).
+                    req_state = self.engine_client.request_states.get(request_id)
+                    if req_state is not None and req_state.first_audio_ts is None:
+                        now_ts = time.time()
+                        req_state.first_audio_ts = now_ts
+                        stage_pools = getattr(self.engine_client.engine, "stage_pools", None)
+                        replica_id = (
+                            stage_pools[omni_res.stage_id].get_bound_replica_id(request_id)
+                            if stage_pools is not None and 0 <= omni_res.stage_id < len(stage_pools)
+                            else None
+                        )
+                        observe_audio_first_packet(
+                            self.engine_client.mod_metrics,
+                            stage_id=omni_res.stage_id,
+                            replica_id=replica_id,
+                            arrival_ts=req_state.request_arrival_ts,
+                            now_ts=now_ts,
+                        )
+
                     role = self.get_chat_request_role(request)
                     choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
                     chunk = OmniChatCompletionStreamResponse(

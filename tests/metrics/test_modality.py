@@ -4,7 +4,11 @@ import pytest
 from prometheus_client import REGISTRY, generate_latest
 
 from vllm_omni.metrics import definitions as defs
-from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_finalize
+from vllm_omni.metrics.modality import (
+    OmniModalityMetrics,
+    observe_audio_first_packet,
+    observe_modality_at_finalize,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -339,6 +343,49 @@ class TestObserveModalityAtFinalize:
             finalize_ts=0.5,
         )
         assert stub.calls == []
+
+
+class TestObserveAudioFirstPacket:
+    def test_observes_with_valid_inputs(self):
+        stub = _StubModMetrics()
+        # Patch in audio_ttfp to the stub for routing assertion.
+        stub.observe_audio_ttfp = lambda s, r, t: stub.calls.append(("observe_audio_ttfp", s, r, t))
+
+        observe_audio_first_packet(
+            stub,
+            stage_id=1,
+            replica_id=0,
+            arrival_ts=100.0,
+            now_ts=100.42,
+        )
+        assert stub.calls == [("observe_audio_ttfp", "1", "0", pytest.approx(0.42))]
+
+    def test_replica_none_skipped(self):
+        stub = _StubModMetrics()
+        stub.observe_audio_ttfp = lambda s, r, t: stub.calls.append(("observe_audio_ttfp", s, r, t))
+        observe_audio_first_packet(
+            stub, stage_id=1, replica_id=None, arrival_ts=100.0, now_ts=100.5
+        )
+        assert stub.calls == []
+
+    def test_arrival_ts_zero_skipped(self):
+        # Defensive: req_state.request_arrival_ts == 0.0 means async_omni
+        # never populated it (e.g. some fast path). Skip rather than emit
+        # garbage TTFP measured against epoch.
+        stub = _StubModMetrics()
+        stub.observe_audio_ttfp = lambda s, r, t: stub.calls.append(("observe_audio_ttfp", s, r, t))
+        observe_audio_first_packet(
+            stub, stage_id=1, replica_id=0, arrival_ts=0.0, now_ts=100.5
+        )
+        assert stub.calls == []
+
+    def test_clock_skew_clamped_to_zero(self):
+        stub = _StubModMetrics()
+        stub.observe_audio_ttfp = lambda s, r, t: stub.calls.append(("observe_audio_ttfp", s, r, t))
+        observe_audio_first_packet(
+            stub, stage_id=1, replica_id=0, arrival_ts=100.5, now_ts=100.0
+        )
+        assert stub.calls == [("observe_audio_ttfp", "1", "0", 0.0)]
 
 
 class TestBucketSelection:

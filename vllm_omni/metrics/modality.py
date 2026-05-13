@@ -212,3 +212,28 @@ def observe_modality_at_finalize(
         mod_metrics.observe_video_generation_time(
             stage_label, replica_label, gen_time_s
         )
+
+
+def observe_audio_first_packet(
+    mod_metrics: OmniModalityMetrics,
+    *,
+    stage_id: int,
+    replica_id: int | None,
+    arrival_ts: float,
+    now_ts: float,
+) -> None:
+    """Observe audio_ttfp_seconds on a request's first audio packet.
+
+    Caller is responsible for the once-per-request guard (e.g. checking
+    ``ClientRequestState.first_audio_ts is None``) so this function fires at
+    most once per request_id. Defensive-skips when ``replica_id`` or
+    ``arrival_ts`` is insufficient — both can legitimately be missing in error
+    paths and we'd rather drop the sample than emit a wrong (stage, replica).
+
+    Phase 3.3 — companion to ``observe_modality_at_finalize`` which handles the
+    other 7 modality families at finalize time.
+    """
+    if replica_id is None or arrival_ts <= 0:
+        return
+    ttfp = max(now_ts - arrival_ts, 0.0)
+    mod_metrics.observe_audio_ttfp(str(stage_id), str(replica_id), ttfp)

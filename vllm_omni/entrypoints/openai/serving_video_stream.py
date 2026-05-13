@@ -45,6 +45,7 @@ from vllm_omni.entrypoints.openai.video_frame_filter import FrameSimilarityFilte
 from vllm_omni.entrypoints.openai.video_stream_context import (
     text_only_message,
 )
+from vllm_omni.metrics.modality import observe_audio_first_packet
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -573,6 +574,31 @@ class OmniStreamingVideoHandler:
 
                     if t_first_audio is None:
                         t_first_audio = _time.monotonic()
+                        # Phase 3.3: observe audio_ttfp_seconds. Hook here rather
+                        # than at the OpenAI SSE path because this WebSocket route
+                        # is the canonical real-time entrypoint for video+audio.
+                        req_state = (
+                            self._engine_client.request_states.get(request_id)
+                            if self._engine_client is not None
+                            else None
+                        )
+                        if req_state is not None and req_state.first_audio_ts is None:
+                            now_ts = _time.time()
+                            req_state.first_audio_ts = now_ts
+                            stage_pools = getattr(self._engine_client.engine, "stage_pools", None)
+                            stage_id = getattr(output, "stage_id", 0)
+                            replica_id = (
+                                stage_pools[stage_id].get_bound_replica_id(request_id)
+                                if stage_pools is not None and 0 <= stage_id < len(stage_pools)
+                                else None
+                            )
+                            observe_audio_first_packet(
+                                self._engine_client.mod_metrics,
+                                stage_id=stage_id,
+                                replica_id=replica_id,
+                                arrival_ts=req_state.request_arrival_ts,
+                                now_ts=now_ts,
+                            )
                     audio_chunk_count += 1
                     if streaming:
                         b64, audio_chunks_drained = self._extract_audio_delta_b64(

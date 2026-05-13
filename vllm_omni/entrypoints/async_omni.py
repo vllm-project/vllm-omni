@@ -302,6 +302,7 @@ class AsyncOmni(EngineClient, OmniBase):
             )
             req_state = ClientRequestState(request_id)
             req_state.metrics = metrics
+            req_state.request_arrival_ts = wall_start_ts
             self.request_states[request_id] = req_state
 
             # PD disaggregation: modify prefill-stage sampling params per request
