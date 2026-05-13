@@ -15,12 +15,14 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
@@ -117,9 +119,12 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     return {}
 
 
-def create_transformer_from_config(config: dict) -> WanTransformer3DModel:
+def create_transformer_from_config(
+    config: dict,
+    quant_config: QuantizationConfig | None = None,
+) -> WanTransformer3DModel:
     """Create WanTransformer3DModel from config dict."""
-    kwargs = {}
+    kwargs: dict = {}
 
     if "patch_size" in config:
         kwargs["patch_size"] = tuple(config["patch_size"])
@@ -151,6 +156,58 @@ def create_transformer_from_config(config: dict) -> WanTransformer3DModel:
         kwargs["rope_max_seq_len"] = config["rope_max_seq_len"]
     if "pos_embed_seq_len" in config:
         kwargs["pos_embed_seq_len"] = config["pos_embed_seq_len"]
+
+    # Auto-detect quantization from transformer's config.json when not explicitly provided.
+    # merge_mxfp8_checkpoint.py injects quantization_config into config.json so that
+    # offline quantized checkpoints are recognized here without a CLI flag.
+    if "quantization_config" in config:
+        from vllm_omni.quantization.factory import build_quant_config
+
+        disk_qc = config["quantization_config"]
+        if isinstance(disk_qc, dict) and "quant_method" in disk_qc:
+            qc_method = disk_qc["quant_method"]
+            qc_kwargs = {k: v for k, v in disk_qc.items() if k != "quant_method"}
+            if quant_config is None:
+                # No CLI flag: full auto-detection.
+                quant_config = build_quant_config(qc_method, **qc_kwargs)
+                logger.info(
+                    "Auto-detected quantization from transformer config.json: method=%s kwargs=%s",
+                    qc_method,
+                    qc_kwargs,
+                )
+            elif quant_config.get_name() != qc_method:
+                # The caller supplied a quant_config of a different method than
+                # what the checkpoint was built with. Loading serialized tensors
+                # (e.g. MXFP8 weight scales) with the wrong linear method would
+                # produce corrupt output or a shape mismatch crash.  Reject early
+                # so the user gets a clear message instead of a silent failure.
+                raise ValueError(
+                    f"Checkpoint config.json declares quant_method={qc_method!r} but the "
+                    f"active quantization config is {quant_config.get_name()!r}. "
+                    "Pass a matching --quantization flag or omit it for auto-detection."
+                )
+            elif (
+                qc_kwargs.get("is_checkpoint_mxfp8_serialized", False)
+                and hasattr(quant_config, "is_checkpoint_mxfp8_serialized")
+                and not quant_config.is_checkpoint_mxfp8_serialized
+            ):
+                # Same method: CLI provided online mode but config.json marks this
+                # as a pre-quantized offline checkpoint.  Switch to offline mode so
+                # users can pass --quantization mxfp8 without knowing the
+                # online/offline distinction.
+                quant_config = build_quant_config(qc_method, **qc_kwargs)
+                logger.info(
+                    "config.json marks checkpoint as serialized; switching from online to offline MXFP8 mode.",
+                )
+        elif isinstance(disk_qc, str) and quant_config is None:
+            quant_config = build_quant_config(disk_qc)
+            logger.info(
+                "Auto-detected quantization from transformer config.json: method=%s",
+                disk_qc,
+            )
+
+    if quant_config is not None:
+        kwargs["quant_config"] = quant_config
 
     return WanTransformer3DModel(**kwargs)
 
@@ -370,8 +427,9 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         )
 
     def _create_transformer(self, config: dict) -> WanTransformer3DModel:
-        """Create a transformer from a config dict. Subclasses may override."""
-        return create_transformer_from_config(config)
+        """Create a transformer from a config dict. Respects od_config.quantization_config."""
+        quant_config = getattr(self.od_config, "quantization_config", None)
+        return create_transformer_from_config(config, quant_config=quant_config)
 
     @property
     def guidance_scale(self):
@@ -403,9 +461,12 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         latent_condition: torch.Tensor | None = None,
         first_frame_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if attention_kwargs is None:
+            attention_kwargs = {}
         with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
+            for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
+                set_forward_context_denoise_step_idx(step_idx)
 
                 # Select model based on timestep and boundary_ratio
                 # High noise stage (t >= boundary_timestep): use transformer

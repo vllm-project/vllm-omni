@@ -126,6 +126,37 @@ def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[No
     yield
 
 
+def _is_unexpected_additional_config_type_error(exc: TypeError) -> bool:
+    """Return True only for constructor rejections of the additional_config kwarg."""
+    message = str(exc)
+    return "unexpected keyword argument" in message and "additional_config" in message
+
+
+def _create_diffusion_worker_vllm_config(device: torch.device, od_config: OmniDiffusionConfig) -> VllmConfig:
+    """Create a worker-local VllmConfig while preserving additional_config when supported."""
+    config_kwargs: dict[str, Any] = {
+        "compilation_config": CompilationConfig(),
+        "device_config": DeviceConfig(device=device),
+    }
+    if od_config.additional_config:
+        config_kwargs["additional_config"] = od_config.additional_config
+
+    try:
+        return VllmConfig(**config_kwargs)
+    except TypeError as exc:
+        if not _is_unexpected_additional_config_type_error(exc):
+            raise
+
+        logger.debug("Worker-local VllmConfig does not accept additional_config in constructor: %s", exc)
+        config_kwargs.pop("additional_config", None)
+        vllm_config = VllmConfig(**config_kwargs)
+        try:
+            setattr(vllm_config, "additional_config", dict(od_config.additional_config))
+        except Exception as set_exc:  # pragma: no cover - defensive for older vLLM builds
+            logger.warning("Failed to attach additional_config to worker VllmConfig: %s", set_exc)
+        return vllm_config
+
+
 class DiffusionWorker:
     """
     A worker that manages GPU infrastructure and delegates to the model runner.
@@ -188,10 +219,7 @@ class DiffusionWorker:
 
         # Create vllm_config for parallel configuration. Pass explicit device_config
         # so DeviceConfig does not rely on current_platform in worker subprocesses.
-        vllm_config = VllmConfig(
-            compilation_config=CompilationConfig(),
-            device_config=DeviceConfig(device=self.device),
-        )
+        vllm_config = _create_diffusion_worker_vllm_config(self.device, self.od_config)
         vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         vllm_config.parallel_config.enable_expert_parallel = self.od_config.parallel_config.enable_expert_parallel

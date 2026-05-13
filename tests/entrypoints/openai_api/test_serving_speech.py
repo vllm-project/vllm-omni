@@ -643,6 +643,45 @@ class TestSpeechAPI:
         assert response.status_code == 400
         assert "finite" in response.json()["detail"]
 
+    @pytest.mark.asyncio
+    async def test_create_diffusion_speech_extra_params(self, mocker: MockerFixture):
+        """Test that extra_params are correctly applied to sampling_params_list in diffusion mode."""
+        # Mock the engine client
+        mock_engine = mocker.MagicMock()
+
+        # Mock default sampling params
+        mock_sampling_param = mocker.MagicMock()
+        mock_sampling_param.extra_args = {"existing_arg": "value"}
+        mock_engine.default_sampling_params_list = [mock_sampling_param]
+
+        # Mock generate to yield a valid OmniRequestOutput
+        async def mock_generate(*args, **kwargs):
+            yield create_mock_audio_output_for_test()
+
+        mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
+
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+
+        # Mock create_audio to avoid actual audio processing/saving
+        mocker.patch.object(
+            server, "create_audio", return_value=mocker.MagicMock(audio_data=b"dummy", media_type="audio/wav")
+        )
+
+        req = OpenAICreateSpeechRequest(input="Hello", extra_params={"new_arg": 123, "existing_arg": "new_value"})
+
+        await server._create_diffusion_speech(req)
+
+        # Verify generate was called
+        mock_engine.generate.assert_called_once()
+
+        # Get the sampling_params_list passed to generate
+        kwargs = mock_engine.generate.call_args.kwargs
+        passed_params = kwargs["sampling_params_list"]
+
+        # Verify it was deepcopied and updated
+        assert passed_params is not mock_engine.default_sampling_params_list
+        assert passed_params[0].extra_args == {"existing_arg": "new_value", "new_arg": 123}
+
 
 class TestTTSMethods:
     """Unit tests for TTS validation and parameter building."""

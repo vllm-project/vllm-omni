@@ -8,6 +8,7 @@ import ssl
 import sys
 import time
 import traceback
+import wave
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -374,6 +375,14 @@ async def async_request_openai_chat_omni_completions(
         # outputs or metrics from previous attempts.
         generated_text = ""
         generated_audio = None
+        # For wav responses, accumulate decoded PCM bytes per chunk
+        # to avoid repeated AudioSegment decode/concat.
+        wav_pcm_buffer = bytearray()
+        wav_audio_params: tuple[int, int, int] | None = None
+        wav_inconsistent_chunk_count = 0
+        first_inconsistent_wav_params: tuple[int, int, int] | None = None
+        # For non-wav responses, accumulate encoded bytes then decode once.
+        audio_bytes_buffer = bytearray()
         ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
@@ -440,12 +449,28 @@ async def async_request_openai_chat_omni_completions(
                                         audio_generate_time = timestamp - st
                                         if content:
                                             audio_bytes = base64.b64decode(content)
-                                            seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
-                                            if seg is not None:
-                                                if generated_audio is None:
-                                                    generated_audio = seg
-                                                else:
-                                                    generated_audio = generated_audio + seg
+                                            if response_format == "wav":
+                                                try:
+                                                    with wave.open(io.BytesIO(audio_bytes), "rb") as wav_reader:
+                                                        params = (
+                                                            wav_reader.getnchannels(),
+                                                            wav_reader.getsampwidth(),
+                                                            wav_reader.getframerate(),
+                                                        )
+                                                        if wav_audio_params is None:
+                                                            wav_audio_params = params
+                                                        elif wav_audio_params != params:
+                                                            wav_inconsistent_chunk_count += 1
+                                                            if first_inconsistent_wav_params is None:
+                                                                first_inconsistent_wav_params = params
+                                                            continue
+                                                        wav_pcm_buffer.extend(
+                                                            wav_reader.readframes(wav_reader.getnframes())
+                                                        )
+                                                except Exception as ex:
+                                                    logger.warning("Failed to parse wav audio chunk: %s", ex)
+                                            else:
+                                                audio_bytes_buffer.extend(audio_bytes)
 
                                 if metrics := data.get("metrics"):
                                     output.output_tokens = metrics.get("num_tokens_out", 0)
@@ -454,8 +479,34 @@ async def async_request_openai_chat_omni_completions(
                                     if (pt := usage.get("prompt_tokens")) is not None:
                                         output.prompt_len = pt
 
+                    if wav_inconsistent_chunk_count > 0:
+                        logger.warning(
+                            "Dropped %d wav chunks with inconsistent params during benchmark "
+                            "(expected=%s, first_inconsistent=%s). "
+                            "Audio frames/duration may be undercounted.",
+                            wav_inconsistent_chunk_count,
+                            wav_audio_params,
+                            first_inconsistent_wav_params,
+                        )
+
                     output.latency = timestamp - st
                     output.generated_text = generated_text
+                    if response_format == "wav" and wav_pcm_buffer and wav_audio_params is not None:
+                        channels, sample_width, frame_rate = wav_audio_params
+                        generated_audio = AudioSegment(
+                            data=bytes(wav_pcm_buffer),
+                            sample_width=sample_width,
+                            frame_rate=frame_rate,
+                            channels=channels,
+                        )
+                    elif audio_bytes_buffer:
+                        try:
+                            generated_audio = AudioSegment.from_file(
+                                io.BytesIO(bytes(audio_bytes_buffer)),
+                                format=response_format,
+                            )
+                        except Exception as ex:
+                            logger.warning("Failed to decode accumulated audio bytes: %s", ex)
                     if generated_audio is not None:
                         output.audio_duration = len(generated_audio) / 1000.0
                         frame_width = generated_audio.frame_width

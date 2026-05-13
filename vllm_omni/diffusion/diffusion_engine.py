@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import inspect
 import queue
 import threading
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -36,6 +38,18 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _RpcTask:
+    """A pending collective_rpc invocation queued for the busy loop."""
+
+    method: str
+    args: tuple
+    kwargs: dict | None
+    deadline: float | None
+    unique_reply_rank: int | None
+    future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
 
 
 def supports_multimodal_input(od_config: OmniDiffusionConfig) -> tuple[bool, bool]:
@@ -136,10 +150,15 @@ class DiffusionEngine:
         self.stop_event: threading.Event | None = None
         self._loop_started = False
         self._init_lock = asyncio.Lock()
+        # _rpc_lock is retained solely as the underlying lock for self._cv,
+        # which is used to signal the busy loop. Worker-call serialization is
+        # now handled structurally by routing all executor calls through the
+        # busy loop rather than via mutual exclusion.
         self._rpc_lock = threading.RLock()
         self._cv = threading.Condition(self._rpc_lock)
         self._out_queue: dict[str, asyncio.Future] = {}
         self.abort_queue: queue.Queue[str] = queue.Queue()
+        self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
         self.execute_fn = self.executor.execute_step if self.step_execution else self.executor.execute_request
 
         try:
@@ -413,13 +432,23 @@ class DiffusionEngine:
     def _busy_loop(self):
         while not self.stop_event.is_set():
             self._process_aborts_queue()
+            self._process_rpc_queue()
 
             with self._cv:
-                while not self.scheduler.has_requests() and not self.stop_event.is_set():
+                while (
+                    not self.scheduler.has_requests()
+                    and self._rpc_queue.empty()
+                    and self.abort_queue.empty()
+                    and not self.stop_event.is_set()
+                ):
                     self._cv.wait(timeout=1.0)
 
                 if self.stop_event.is_set():
                     break
+
+                if not self.scheduler.has_requests():
+                    # Only RPC / abort work pending; loop back to drain it.
+                    continue
 
                 sched_output = self.scheduler.schedule()
 
@@ -446,8 +475,64 @@ class DiffusionEngine:
                 )
 
             self._process_aborts_queue()
+            self._process_rpc_queue()
             finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
             self._handle_finished_requests(finished_req_ids, runner_output)
+
+        # Engine is stopping: fail any RPCs still queued so callers don't hang.
+        self._fail_pending_rpcs(RuntimeError("DiffusionEngine is shutting down."))
+
+    def _process_rpc_queue(self) -> None:
+        """Execute pending collective_rpc tasks from the busy-loop thread.
+
+        Running these here means executor calls are naturally serialized
+        against execute_fn() without any mutual-exclusion locking.
+        """
+        while True:
+            try:
+                task = self._rpc_queue.get_nowait()
+            except queue.Empty:
+                return
+
+            fut = task.future
+            if fut.cancelled() or fut.done():
+                continue
+
+            remaining: float | None = None
+            if task.deadline is not None:
+                remaining = task.deadline - time.monotonic()
+                if remaining <= 0:
+                    if not fut.done():
+                        fut.set_exception(TimeoutError(f"RPC call to {task.method} timed out before execution."))
+                    continue
+
+            try:
+                result = self.executor.collective_rpc(
+                    method=task.method,
+                    timeout=remaining,
+                    args=task.args,
+                    kwargs=task.kwargs,
+                    unique_reply_rank=task.unique_reply_rank,
+                )
+            except BaseException as exc:  # noqa: BLE001 - propagate to caller
+                # The future may have been cancelled (e.g. by a sync timeout
+                # or asyncio cancellation) while the executor call was
+                # running. Setting state on a cancelled/done future raises
+                # InvalidStateError, which would kill the busy loop.
+                if not fut.done():
+                    fut.set_exception(exc)
+            else:
+                if not fut.done():
+                    fut.set_result(result)
+
+    def _fail_pending_rpcs(self, exc: BaseException) -> None:
+        while True:
+            try:
+                task = self._rpc_queue.get_nowait()
+            except queue.Empty:
+                return
+            if not task.future.done():
+                task.future.set_exception(exc)
 
     def _handle_finished_requests(
         self,
@@ -502,6 +587,8 @@ class DiffusionEngine:
             raise
 
     async def async_add_req_and_wait_for_response(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        # No lock needed: add_request is already protected by self._cv, and
+        # all executor calls are serialized inside the busy loop.
         sched_req_id = self.add_request(request)
         return await self.get_result(sched_req_id)
 
@@ -615,6 +702,28 @@ class DiffusionEngine:
         if output.error:
             raise RuntimeError(f"Dummy run failed: {output.error}")
 
+    def _submit_rpc(
+        self,
+        method: str,
+        timeout: float | None,
+        args: tuple,
+        kwargs: dict | None,
+        unique_reply_rank: int | None,
+    ) -> _RpcTask:
+        assert isinstance(method, str), "Only string method names are supported for now"
+        deadline = None if timeout is None else time.monotonic() + timeout
+        task = _RpcTask(
+            method=method,
+            args=args,
+            kwargs=kwargs,
+            deadline=deadline,
+            unique_reply_rank=unique_reply_rank,
+        )
+        with self._cv:
+            self._rpc_queue.put(task)
+            self._cv.notify_all()
+        return task
+
     def collective_rpc(
         self,
         method: str,
@@ -624,6 +733,10 @@ class DiffusionEngine:
         unique_reply_rank: int | None = None,
     ) -> Any:
         """Call a method on worker processes and get results immediately.
+
+        The call is enqueued and executed by the engine's busy loop between
+        scheduler steps, so it is naturally serialized against per-request
+        execute_fn() invocations without any explicit mutual-exclusion lock.
 
         Args:
             method: The method name (str) to execute on workers
@@ -637,32 +750,56 @@ class DiffusionEngine:
         """
         assert isinstance(method, str), "Only string method names are supported for now"
 
-        deadline = None if timeout is None else time.monotonic() + timeout
-        acquired = False
+        # If the busy loop hasn't started yet (e.g. during _dummy_run in
+        # __init__, or before the first async request after construction),
+        # there is no busy-loop thread to drain the RPC queue. Fall back to
+        # calling the executor directly, but serialize concurrent callers
+        # via self._cv's underlying lock so multiple threads in this window
+        # cannot race on the shared broadcast_mq / result_mq transport.
+        if not self._loop_started:
+            with self._cv:
+                # Re-check under the lock: the busy loop may have started
+                # between the outer check and acquiring the lock, in which
+                # case we should use the queued path for proper ordering.
+                if not self._loop_started:
+                    return self.executor.collective_rpc(
+                        method=method,
+                        timeout=timeout,
+                        args=args,
+                        kwargs=kwargs,
+                        unique_reply_rank=unique_reply_rank,
+                    )
+
+        task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank)
         try:
-            if deadline is None:
-                self._rpc_lock.acquire()
-                acquired = True
-            else:
-                lock_timeout = max(0, deadline - time.monotonic())
-                acquired = self._rpc_lock.acquire(timeout=lock_timeout)
-            if not acquired:
-                raise TimeoutError(f"RPC call to {method} timed out waiting for engine lock.")
+            return task.future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as exc:
+            task.future.cancel()
+            raise TimeoutError(f"RPC call to {method} timed out.") from exc
 
-            rpc_timeout = None if deadline is None else max(0, deadline - time.monotonic())
-            if deadline is not None and rpc_timeout <= 0:
-                raise TimeoutError(f"RPC call to {method} timed out.")
+    async def async_collective_rpc(
+        self,
+        method: str,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        unique_reply_rank: int | None = None,
+    ) -> Any:
+        """Async variant of :meth:`collective_rpc` for event-loop callers.
 
-            return self.executor.collective_rpc(
-                method=method,
-                timeout=rpc_timeout,
-                args=args,
-                kwargs=kwargs,
-                unique_reply_rank=unique_reply_rank,
-            )
-        finally:
-            if acquired:
-                self._rpc_lock.release()
+        Mirrors :meth:`async_add_req_and_wait_for_response`: enqueue a task
+        keyed by a future and ``await`` the result without blocking the loop.
+        """
+        await self._check_and_start_background_loop()
+        task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank)
+        aio_fut = asyncio.wrap_future(task.future)
+        try:
+            if timeout is None:
+                return await aio_fut
+            return await asyncio.wait_for(aio_fut, timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            task.future.cancel()
+            raise TimeoutError(f"RPC call to {method} timed out.") from exc
 
     def close(self) -> None:
         if hasattr(self, "scheduler"):
