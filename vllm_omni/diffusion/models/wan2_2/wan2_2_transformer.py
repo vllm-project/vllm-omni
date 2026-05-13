@@ -908,7 +908,14 @@ class WanTransformer3DModel(nn.Module):
         self.start_layer, self.end_layer, self.blocks = make_layers(
             num_layers,
             lambda prefix: WanTransformerBlock(
-                inner_dim, ffn_dim, num_attention_heads, eps, added_kv_proj_dim, cross_attn_norm, quant_config=quant_config
+                inner_dim,
+                ffn_dim,
+                num_attention_heads,
+                eps,
+                added_kv_proj_dim,
+                cross_attn_norm,
+                quant_config=quant_config,
+                prefix=prefix,
             ),
             prefix="blocks",
         )
