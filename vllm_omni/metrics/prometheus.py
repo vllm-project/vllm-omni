@@ -1,54 +1,59 @@
 from prometheus_client import Counter, Gauge, Histogram
 
-_labelnames = ["model_name"]
+from vllm_omni.metrics import definitions as defs
+
+_labelnames = list(defs.PIPELINE_LABELS)
 _diffusion_labelnames = ["model_name", "engine"]
 
+# Mapping from stage-emitted metric key (engine internal name) to the
+# (prometheus family name, help text) we expose. Keys must match what the
+# diffusion engine puts into its per-request metrics dict.
 _DIFFUSION_METRIC_DEFS: dict[str, tuple[str, str]] = {
     "preprocess_time_ms": (
-        "vllm:omni_diffusion_preprocess_time_ms",
+        defs.DIFFUSION_PREPROCESS_TIME_MS,
         "Diffusion preprocess time per request in milliseconds.",
     ),
     "diffusion_engine_exec_time_ms": (
-        "vllm:omni_diffusion_exec_time_ms",
+        defs.DIFFUSION_EXEC_TIME_MS,
         "Diffusion model execution time per request in milliseconds.",
     ),
     "postprocess_time_ms": (
-        "vllm:omni_diffusion_postprocess_time_ms",
+        defs.DIFFUSION_POSTPROCESS_TIME_MS,
         "Diffusion postprocess time per request in milliseconds.",
     ),
     "diffusion_engine_total_time_ms": (
-        "vllm:omni_diffusion_step_time_ms",
+        defs.DIFFUSION_STEP_TIME_MS,
         "Total diffusion step time per request in milliseconds.",
     ),
 }
 
 _running_family = Gauge(
-    "vllm:omni_num_requests_running",
+    defs.NUM_REQUESTS_RUNNING,
     "Number of requests currently running across all pipeline stages.",
     labelnames=_labelnames,
 )
 _waiting_family = Gauge(
-    "vllm:omni_num_requests_waiting",
+    defs.NUM_REQUESTS_WAITING,
     "Number of requests waiting to be scheduled.",
     labelnames=_labelnames,
 )
 _success_family = Counter(
-    "vllm:omni_num_requests_success",
+    defs.NUM_REQUESTS_SUCCESS,
     "Number of requests that completed without error.",
     labelnames=_labelnames,
 )
 _fail_family = Counter(
-    "vllm:omni_num_requests_fail",
+    defs.NUM_REQUESTS_FAIL,
     "Number of requests that returned an error.",
     labelnames=_labelnames,
 )
 _e2e_latency_family = Histogram(
-    "vllm:omni_e2e_request_latency_seconds",
+    defs.E2E_REQUEST_LATENCY_SECONDS,
     "Histogram of end-to-end request latency in seconds.",
     labelnames=_labelnames,
 )
 _queue_time_family = Histogram(
-    "vllm:omni_request_queue_time_seconds",
+    defs.REQUEST_QUEUE_TIME_SECONDS,
     "Histogram of request queue wait time in seconds.",
     labelnames=_labelnames,
 )
