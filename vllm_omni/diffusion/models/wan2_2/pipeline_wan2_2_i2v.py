@@ -290,7 +290,7 @@ class Wan22I2VPipeline(
         attention_kwargs: dict[str, Any],
         condition: torch.Tensor,
         first_frame_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
         with self.progress_bar(total=len(timesteps)) as pbar:
@@ -345,7 +345,7 @@ class Wan22I2VPipeline(
                     negative_kwargs = None
 
                 # Predict noise with automatic CFG parallel handling
-                noise_pred = self.predict_noise_maybe_with_pp_and_cfg(
+                noise_pred = self.predict_noise_maybe_with_cfg(
                     do_true_cfg=do_true_cfg,
                     true_cfg_scale=current_guidance_scale,
                     positive_kwargs=positive_kwargs,
@@ -354,11 +354,8 @@ class Wan22I2VPipeline(
                 )
 
                 # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-                latents = self.scheduler_step_maybe_with_pp_and_cfg(noise_pred, t, latents, do_true_cfg)
+                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
                 pbar.update()
-
-        # Sync any pending non-blocking PP sends from the last denoising step.
-        self.sync_pp_send()
 
         return latents
 
@@ -681,7 +678,6 @@ class Wan22I2VPipeline(
     def predict_noise(
         self,
         current_model: nn.Module | None = None,
-        intermediate_tensors: IntermediateTensors | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | IntermediateTensors:
         """
@@ -689,18 +685,15 @@ class Wan22I2VPipeline(
 
         Args:
             current_model: The transformer model to use (transformer or transformer_2)
-            intermediate_tensors: states and residuals received from the previous stage.
             **kwargs: Arguments to pass to the transformer
 
         Returns:
-            Predicted noise tensor or IntermediateTensors for PP
+            Predicted noise tensor or IntermediateTensors on non-last PP stages.
         """
         if current_model is None:
             current_model = self.transformer
-        result = current_model(**kwargs, intermediate_tensors=intermediate_tensors)
-        if isinstance(result, IntermediateTensors):
-            return result
-        return result[0]
+        result = current_model(**kwargs)
+        return result[0] if isinstance(result, tuple) else result
 
     def encode_prompt(
         self,

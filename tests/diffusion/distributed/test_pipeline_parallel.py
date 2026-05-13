@@ -21,6 +21,8 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.platforms import current_omni_platform
 
+pytestmark = [pytest.mark.parallel]
+
 
 def _find_free_port() -> str:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -126,6 +128,8 @@ class MockPipelineParallel(PipelineParallelMixin, CFGParallelMixin):
 class TestAsyncLatents:
     """Verifies the lazy-resolution behaviour of AsyncLatents without a real process group."""
 
+    pytestmark = [pytest.mark.cpu]
+
     def _make(self, tensor: torch.Tensor, handles: list | None = None, postproc: list | None = None) -> AsyncLatents:
         return AsyncLatents({"latents": tensor}, handles or [], postproc or [])
 
@@ -188,17 +192,19 @@ class TestAsyncLatents:
 
 
 # ---------------------------------------------------------------------------
-# 2.  sync_pp_send – unit tests (no distributed env required)
+# 2.  _sync_pp_send / diffuse wrapper – unit tests (no distributed env required)
 # ---------------------------------------------------------------------------
 
 
 class TestSyncPPSend:
-    """Verifies PipelineParallelMixin.sync_pp_send without a real process group."""
+    """Verifies PipelineParallelMixin's internal PP-send flush."""
+
+    pytestmark = [pytest.mark.cpu]
 
     @staticmethod
     def _make_pipeline() -> PipelineParallelMixin:
         # Instantiate a bare mixin — no layers, no distributed env needed.
-        # sync_pp_send only touches _pp_send_work, so this is sufficient.
+        # _sync_pp_send only touches _pp_send_work, so this is sufficient.
         class _BarePP(PipelineParallelMixin, CFGParallelMixin):
             pass
 
@@ -206,21 +212,81 @@ class TestSyncPPSend:
 
     def test_noop_when_work_list_empty(self):
         pipeline = self._make_pipeline()
-        pipeline.sync_pp_send()
+        pipeline._sync_pp_send()
         assert pipeline._pp_send_work == []
 
     def test_waits_all_pending_handles(self):
         pipeline = self._make_pipeline()
         works = [FakeWork(), FakeWork(), FakeWork()]
         pipeline._pp_send_work = works
-        pipeline.sync_pp_send()
+        pipeline._sync_pp_send()
         assert all(w.waited for w in works), "Some handles were not waited on"
 
     def test_clears_work_list_after_sync(self):
         pipeline = self._make_pipeline()
         pipeline._pp_send_work = [FakeWork()]
-        pipeline.sync_pp_send()
+        pipeline._sync_pp_send()
         assert pipeline._pp_send_work == []
+
+
+class TestDiffuseWrapper:
+    """Verifies that PipelineParallelMixin flushes pending sends when diffuse() exits."""
+
+    pytestmark = [pytest.mark.cpu]
+
+    def test_diffuse_flushes_pending_sends_on_success(self):
+        work = FakeWork()
+
+        class _DiffusePP(PipelineParallelMixin, CFGParallelMixin):
+            def diffuse(self):
+                self._pp_send_work = [work]
+                return "done"
+
+        pipeline = _DiffusePP()
+
+        assert pipeline.diffuse() == "done"
+        assert work.waited
+        assert pipeline._pp_send_work == []
+
+    def test_diffuse_flushes_pending_sends_on_exception(self):
+        work = FakeWork()
+
+        class _DiffusePP(PipelineParallelMixin, CFGParallelMixin):
+            def diffuse(self):
+                self._pp_send_work = [work]
+                raise RuntimeError("boom")
+
+        pipeline = _DiffusePP()
+
+        with pytest.raises(RuntimeError, match="boom"):
+            pipeline.diffuse()
+        assert work.waited
+        assert pipeline._pp_send_work == []
+
+    def test_diffuse_wrapper_preserves_metadata(self):
+        class _DiffusePP(PipelineParallelMixin, CFGParallelMixin):
+            def diffuse(self):
+                """Original diffuse docstring."""
+                return "done"
+
+        assert _DiffusePP.diffuse.__name__ == "diffuse"
+        assert _DiffusePP.diffuse.__doc__ == "Original diffuse docstring."
+
+
+@pytest.mark.cpu
+def test_pipeline_parallel_requires_cfg_mixin():
+    with pytest.raises(TypeError, match="inherits PipelineParallelMixin but not CFGParallelMixin"):
+
+        class _MissingCFG(PipelineParallelMixin):
+            pass
+
+
+@pytest.mark.cpu
+def test_pipeline_parallel_requires_mro_before_cfg_mixin():
+    with pytest.raises(TypeError, match="must inherit PipelineParallelMixin before CFGParallelMixin"):
+
+        class _WrongOrder(CFGParallelMixin, PipelineParallelMixin):
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +374,7 @@ def isend_irecv_worker(local_rank: int, world_size: int, master_port: str, resul
     destroy_distributed_env()
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(current_omni_platform.get_device_count() < 2, reason="Need at least 2 GPUs")
 @pytest.mark.parametrize("pp_size", [2])
 def test_isend_irecv_tensor_dict(pp_size: int):
@@ -326,7 +393,7 @@ def test_isend_irecv_tensor_dict(pp_size: int):
 
 
 # ---------------------------------------------------------------------------
-# 4.  predict_noise_maybe_with_pp_and_cfg
+# 4.  predict_noise_maybe_with_cfg
 # ---------------------------------------------------------------------------
 
 _baseline_cache: dict[tuple, torch.Tensor] = {}
@@ -359,7 +426,7 @@ def compute_single_gpu_baseline(test_config: dict, dtype: torch.dtype, do_true_c
     )
 
     with torch.inference_mode():
-        noise_pred = pipeline.predict_noise_maybe_with_pp_and_cfg(
+        noise_pred = pipeline.predict_noise_maybe_with_cfg(
             do_true_cfg=do_true_cfg,
             true_cfg_scale=test_config["cfg_scale"],
             positive_kwargs=positive_kwargs,
@@ -396,14 +463,16 @@ def predict_noise_worker(
     )
 
     with torch.inference_mode():
-        noise_pred = pipeline.predict_noise_maybe_with_pp_and_cfg(
+        noise_pred = pipeline.predict_noise_maybe_with_cfg(
             do_true_cfg=do_true_cfg,
             true_cfg_scale=test_config["cfg_scale"],
             positive_kwargs=positive_kwargs,
             negative_kwargs=negative_kwargs,
             cfg_normalize=False,
         )
-    pipeline.sync_pp_send()
+    # This worker exercises predict_noise_maybe_with_cfg directly, bypassing diffuse().
+    # Flush the non-last PP rank's async send before barrier / process teardown.
+    pipeline._sync_pp_send()
 
     if pp_group.is_last_rank:
         assert noise_pred is not None
@@ -417,6 +486,7 @@ def predict_noise_worker(
     destroy_distributed_env()
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize(
     "pp_size, cfg_size, do_true_cfg, dtype, num_layers, input_seed, rtol, atol",
     [
@@ -483,7 +553,7 @@ def predict_noise_worker(
     ],
 )
 def test_predict_noise(pp_size, cfg_size, do_true_cfg, dtype, num_layers, input_seed, rtol, atol):
-    """predict_noise_maybe_with_pp_and_cfg output matches the single-GPU baseline across PP / CFG topologies."""
+    """predict_noise_maybe_with_cfg output matches the single-GPU baseline across PP / CFG topologies."""
     test_config = {
         "num_layers": num_layers,
         "dim": 64,
@@ -520,7 +590,7 @@ def test_predict_noise(pp_size, cfg_size, do_true_cfg, dtype, num_layers, input_
 
 
 # ---------------------------------------------------------------------------
-# 5.  scheduler_step_maybe_with_pp_and_cfg
+# 5.  scheduler_step_maybe_with_cfg
 # ---------------------------------------------------------------------------
 
 
@@ -536,14 +606,14 @@ def compute_scheduler_step_baseline(test_config: dict, do_true_cfg: bool) -> tor
     t = torch.tensor(500, device=device)
 
     with torch.inference_mode():
-        noise_pred = pipeline.predict_noise_maybe_with_pp_and_cfg(
+        noise_pred = pipeline.predict_noise_maybe_with_cfg(
             do_true_cfg=do_true_cfg,
             true_cfg_scale=test_config["cfg_scale"],
             positive_kwargs=positive_kwargs,
             negative_kwargs=negative_kwargs,
             cfg_normalize=False,
         )
-        result = pipeline.scheduler_step_maybe_with_pp_and_cfg(
+        result = pipeline.scheduler_step_maybe_with_cfg(
             noise_pred=noise_pred, t=t, latents=latents, do_true_cfg=do_true_cfg
         )
 
@@ -574,17 +644,19 @@ def scheduler_step_worker(
     t = torch.tensor(500, device=device)
 
     with torch.inference_mode():
-        noise_pred = pipeline.predict_noise_maybe_with_pp_and_cfg(
+        noise_pred = pipeline.predict_noise_maybe_with_cfg(
             do_true_cfg=do_true_cfg,
             true_cfg_scale=test_config["cfg_scale"],
             positive_kwargs=positive_kwargs,
             negative_kwargs=negative_kwargs,
             cfg_normalize=False,
         )
-        latents = pipeline.scheduler_step_maybe_with_pp_and_cfg(
+        latents = pipeline.scheduler_step_maybe_with_cfg(
             noise_pred=noise_pred, t=t, latents=latents, do_true_cfg=do_true_cfg
         )
-    pipeline.sync_pp_send()
+    # This worker exercises scheduler_step_maybe_with_cfg directly, bypassing diffuse().
+    # Flush the last PP rank's async latent send before barrier / process teardown.
+    pipeline._sync_pp_send()
 
     if pp_group.is_first_rank and cfg_rank == 0:
         resolved = latents.contiguous()
@@ -595,6 +667,7 @@ def scheduler_step_worker(
     destroy_distributed_env()
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize(
     "pp_size, cfg_size, do_true_cfg, input_seed",
     [

@@ -1,6 +1,5 @@
 # Pipeline Parallelism Guide
 
-
 ## Table of Content
 
 - [Overview](#overview)
@@ -15,9 +14,12 @@
 
 ## Overview
 
-Pipeline Parallelism splits the denoising transformer block-wise into sequential stages across GPUs. Each rank owns only part of the transformer, which reduces per-GPU model memory and enables larger diffusion models to run across multiple devices.
+Pipeline Parallelism splits the denoising transformer block-wise into sequential stages across GPUs. Each rank owns only
+part of the transformer, which reduces per-GPU model memory and enables larger diffusion models to run across multiple
+devices.
 
-It can also be combined with other distributed methods such as CFG-Parallel, Tensor Parallelism, and Sequence Parallelism.
+It can also be combined with other distributed methods such as CFG-Parallel, Tensor Parallelism, and Sequence
+Parallelism.
 
 See supported models list in [Supported Models](../../diffusion_features.md#supported-models).
 
@@ -114,9 +116,9 @@ In `DiffusionParallelConfig`
 |--------------------------|------|---------|------------------------------------------------------------------------------------------------------------------|
 | `pipeline_parallel_size` | int  | 1       | Number of pipeline-parallel stages. Set to a value greater than 1 to split the denoising transformer across GPUs |
 
-
 > [!NOTE]
-> Total GPU count is the product of all enabled distributed dimensions, for example `pipeline_parallel_size * cfg_parallel_size * tensor_parallel_size * ulysses_degree * ring_degree`.
+> Total GPU count is the product of all enabled distributed dimensions, for example
+`pipeline_parallel_size * cfg_parallel_size * tensor_parallel_size * ulysses_degree * ring_degree`.
 
 
 ---
@@ -134,12 +136,15 @@ In `DiffusionParallelConfig`
 **Not for:**
 
 - Single GPU setups
-- Models that do not support Pipeline Parallelism (check [supported models](../../diffusion_features.md#supported-models))
+- Models that do not support Pipeline Parallelism
+  (check [supported models](../../diffusion_features.md#supported-models))
 - Very small models where inter-stage communication overhead may outweigh the benefit
 
 ### Expected Behavior
 
-Pipeline Parallelism primarily reduces per-GPU memory usage by splitting the transformer into stage-local blocks. Depending on the model, topology, and resolution, it may also help execution fit into available hardware, but it is not primarily a latency optimization.
+Pipeline Parallelism primarily reduces per-GPU memory usage by splitting the transformer into stage-local blocks.
+Depending on the model, topology, and resolution, it may also help execution fit into available hardware, but it is not
+primarily a latency optimization.
 
 ---
 
@@ -152,33 +157,35 @@ Pipeline Parallelism primarily reduces per-GPU memory usage by splitting the tra
 **Solutions**:
 
 1. **Check your goal:**
+
 ```python
 # PP is mainly for memory scaling, not guaranteed latency speedup
 parallel_config = DiffusionParallelConfig(pipeline_parallel_size=2)
 ```
 
 2. **Check model support:**
-   - Verify your model in [supported models](../../diffusion_features.md#supported-models)
-   - PP is currently validated only on selected pipelines
+    - Verify your model in [supported models](../../diffusion_features.md#supported-models)
+    - PP is currently validated only on selected pipelines
 
 3. **Combine with other methods when appropriate:**
-   - PP can be combined with CFG-Parallel, Tensor Parallelism, or Sequence Parallelism on supported models
+    - PP can be combined with CFG-Parallel, Tensor Parallelism, or Sequence Parallelism on supported models
 
-### Common Issue 2: PP run hangs or fails after denoising
+### Common Issue 2: PP pipeline fails at import
 
-**Symptoms**: Generation reaches the end of the denoising loop and then hangs or fails during later stages.
+**Symptoms**: Importing a custom pipeline raises a `TypeError` about `CFGParallelMixin` or mixin order.
 
 **Solutions**:
 
-1. Ensure the model implementation flushes pending PP sends after the denoising loop.
-2. Use a validated PP-enabled pipeline as the integration reference.
-3. Compare against the Wan2.2 implementation if adding PP to a new model.
+1. Inherit both mixins.
+2. Put `PipelineParallelMixin` before `CFGParallelMixin` in the class base list.
+3. Use `class YourPipeline(nn.Module, PipelineParallelMixin, CFGParallelMixin): ...` as the reference pattern.
 
 ---
 
 ## Summary
 
 1. ✅ **Enable Pipeline Parallelism** - Set `pipeline_parallel_size > 1` in `DiffusionParallelConfig`
-2. ✅ **Use Supported Models** - Verify your model supports PP in [supported models](../../diffusion_features.md#supported-models)
+2. ✅ **Use Supported Models** - Verify your model supports PP in
+   [supported models](../../diffusion_features.md#supported-models)
 3. ✅ **Combine When Needed** - PP can be combined with CFG-Parallel and other distributed methods on supported pipelines
 4. ✅ **Scale for Memory** - Use PP primarily to reduce per-GPU model memory and fit larger transformers

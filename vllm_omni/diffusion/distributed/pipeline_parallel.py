@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import wraps
 from typing import Any
 
 import torch
@@ -75,8 +76,7 @@ class PipelineParallelMixin:
     Mixin providing Pipeline Parallelism for diffusion pipelines.
 
     All PP ranks run the full denoising loop in `forward()`.
-    `predict_noise_maybe_with_pp_and_cfg` and `scheduler_step_maybe_with_pp_and_cfg` encapsulate
-    all inter-rank communication.
+    `predict_noise_maybe_with_cfg` and `scheduler_step_maybe_with_cfg` encapsulate all inter-rank communication.
 
     Communication pattern per denoising step:
       Forward chain : rank 0 → 1 → … → N-1  via async isend/irecv (AsyncIntermediateTensors)
@@ -101,6 +101,24 @@ class PipelineParallelMixin:
                 "predict_noise_maybe_with_cfg(), scheduler_step_maybe_with_cfg(), and combine_cfg_noise(). "
                 "Add CFGParallelMixin to the base classes of your pipeline."
             )
+        mro = cls.mro()
+        if mro.index(PipelineParallelMixin) > mro.index(CFGParallelMixin):
+            raise TypeError(
+                f"{cls.__name__} must inherit PipelineParallelMixin before CFGParallelMixin so MRO selects "
+                f"PP-aware predict/scheduler wrappers and their `super()` calls delegate to CFGParallelMixin."
+            )
+
+        diffuse = cls.__dict__.get("diffuse")
+        if callable(diffuse):
+
+            @wraps(diffuse)
+            def wrapped_diffuse(self, *args: Any, **kwargs: Any) -> Any:
+                try:
+                    return diffuse(self, *args, **kwargs)
+                finally:
+                    self._sync_pp_send()
+
+            cls.diffuse = wrapped_diffuse
 
     @property
     def _pp_send_work(self) -> list[torch.distributed.Work]:
@@ -112,7 +130,7 @@ class PipelineParallelMixin:
     def _pp_send_work(self, work: list[torch.distributed.Work]) -> None:
         self._pp_send_work_list = work
 
-    def sync_pp_send(self) -> None:
+    def _sync_pp_send(self) -> None:
         """
         Wait on all pending non-blocking PP sends.
 
@@ -125,15 +143,15 @@ class PipelineParallelMixin:
                 handle.wait()
             self._pp_send_work = []
 
-    def predict_noise_maybe_with_pp_and_cfg(
+    def predict_noise_maybe_with_cfg(
         self,
         do_true_cfg: bool,
         true_cfg_scale: float,
         positive_kwargs: dict[str, Any],
         negative_kwargs: dict[str, Any] | None,
-        cfg_normalize: bool = False,
+        cfg_normalize: bool = True,
         output_slice: int | None = None,
-    ) -> torch.Tensor | None:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
         """
         Drop-in replacement for predict_noise_maybe_with_cfg that also handles PP.
 
@@ -149,11 +167,11 @@ class PipelineParallelMixin:
             None on all other ranks.
         """
         if get_pipeline_parallel_world_size() == 1:
-            return self.predict_noise_maybe_with_cfg(
+            return super().predict_noise_maybe_with_cfg(
                 do_true_cfg, true_cfg_scale, positive_kwargs, negative_kwargs, cfg_normalize, output_slice
             )
 
-        self.sync_pp_send()
+        self._sync_pp_send()
 
         pp_group = get_pp_group()
 
@@ -203,14 +221,15 @@ class PipelineParallelMixin:
             pred = pred[:, :output_slice]
         return pred
 
-    def scheduler_step_maybe_with_pp_and_cfg(
+    def scheduler_step_maybe_with_cfg(
         self,
-        noise_pred: torch.Tensor | None,
-        t: torch.Tensor,
-        latents: torch.Tensor,
+        noise_pred: torch.Tensor | tuple[torch.Tensor, ...] | None,
+        t: torch.Tensor | tuple[torch.Tensor, ...],
+        latents: torch.Tensor | tuple[torch.Tensor, ...],
         do_true_cfg: bool,
         per_request_scheduler: Any | None = None,
-    ) -> torch.Tensor:
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...] | AsyncLatents:
         """
         Drop-in replacement for scheduler_step_maybe_with_cfg that also handles PP.
 
@@ -223,11 +242,15 @@ class PipelineParallelMixin:
         ``irecv`` is posted.
         """
         if get_pipeline_parallel_world_size() == 1:
-            return self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg, per_request_scheduler)
+            return super().scheduler_step_maybe_with_cfg(
+                noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator
+            )
 
         pp_group = get_pp_group()
         if pp_group.is_last_rank:
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg, per_request_scheduler)
+            latents = super().scheduler_step_maybe_with_cfg(
+                noise_pred, t, latents, do_true_cfg, per_request_scheduler, generator
+            )
             self._pp_send_work = pp_group.isend_tensor_dict({"latents": latents}, dst=0)
         elif pp_group.is_first_rank:
             latents = AsyncLatents(*pp_group.irecv_tensor_dict(src=pp_group.world_size - 1))
