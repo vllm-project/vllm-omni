@@ -45,37 +45,62 @@ def _rewrite_labelnames(labelnames):
     return type(labelnames)(out) if not isinstance(labelnames, list) else out
 
 
-def _rewrite_label_kwargs(kwargs: dict) -> dict:
-    """Translate ``.labels(engine=idx, ...)`` kwargs into ``stage``/``replica``.
+def _engine_to_stage_replica(engine_value) -> tuple[str, str]:
+    """Look up (stage, replica) for an engine_idx, accepting int or str input.
 
-    Raises ``KeyError`` when ``engine_idx`` is missing from the map — fail-fast
-    is preferable to silently emitting series under a wrong (stage, replica).
+    Upstream emits engine values in two flavors:
+    - int form, e.g. ``gauge_engine_sleep_state.labels(engine=idx, ...)`` (loggers.py:510)
+    - str form, e.g. ``info_gauge.labels(**metrics_info)`` where ``metrics_info["engine"] = str(idx)`` (loggers.py:1055)
+
+    Raises ``KeyError`` when the value is missing from the map — fail-fast is
+    preferable to silently emitting series under a wrong (stage, replica).
     """
-    if "engine" not in kwargs:
-        return kwargs
-    engine_idx = kwargs.pop("engine")
-    stage, replica = _ENGINE_INDEX_MAP[engine_idx]
-    kwargs["stage"] = stage
-    kwargs["replica"] = replica
-    return kwargs
+    key = int(engine_value) if isinstance(engine_value, str) else engine_value
+    return _ENGINE_INDEX_MAP[key]
 
 
 class _RelabelMixin:
-    """Mixin: rewrite ``labelnames`` at family creation and ``.labels()`` kwargs.
+    """Mixin: rewrite ``labelnames`` at family creation and ``.labels()`` calls.
 
-    Used to derive ``_RelabelGauge`` / ``_RelabelCounter`` / ``_RelabelHistogram``
-    that drop into upstream ``PrometheusStatLogger._gauge_cls`` / ``_counter_cls`` /
-    ``_histogram_cls`` slots.
+    Handles all four upstream forms encountered in
+    ``vllm.v1.metrics.loggers.PrometheusStatLogger``:
+
+    1. ``.labels(engine=idx, ...)`` kwarg with int engine (loggers.py:510)
+    2. ``.labels(model_name, str(idx), source)`` positional with str engine
+       (loggers.py:646, 679)
+    3. ``.labels(**metrics_info)`` kwarg with str engine (loggers.py:1056)
+    4. Families without an ``engine`` label — passthrough (e.g. lora_info)
+
+    Drops into upstream's ``_gauge_cls`` / ``_counter_cls`` / ``_histogram_cls``
+    class slots.
     """
 
     def __init__(self, *args, **kwargs):
-        if "labelnames" in kwargs:
-            kwargs["labelnames"] = _rewrite_labelnames(kwargs["labelnames"])
+        # Remember where `engine` sat in the original labelnames so positional
+        # `.labels()` calls can splice (stage, replica) at the right offset.
+        labelnames = kwargs.get("labelnames")
+        if labelnames is not None:
+            original = list(labelnames)
+            self._engine_label_index = (
+                original.index("engine") if "engine" in original else -1
+            )
+            kwargs["labelnames"] = _rewrite_labelnames(labelnames)
+        else:
+            self._engine_label_index = -1
         super().__init__(*args, **kwargs)
 
     def labels(self, *args, **kwargs):
-        if kwargs:
-            kwargs = _rewrite_label_kwargs(kwargs)
+        if self._engine_label_index >= 0:
+            if args:
+                # Positional form: replace args[engine_idx] with (stage, replica).
+                idx = self._engine_label_index
+                if idx < len(args):
+                    stage, replica = _engine_to_stage_replica(args[idx])
+                    args = (*args[:idx], stage, replica, *args[idx + 1 :])
+            elif "engine" in kwargs:
+                stage, replica = _engine_to_stage_replica(kwargs.pop("engine"))
+                kwargs["stage"] = stage
+                kwargs["replica"] = replica
         return super().labels(*args, **kwargs)
 
 

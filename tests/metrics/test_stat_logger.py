@@ -8,7 +8,7 @@ from vllm_omni.metrics.stat_logger import (
     _RelabelCounter,
     _RelabelGauge,
     _RelabelHistogram,
-    _rewrite_label_kwargs,
+    _engine_to_stage_replica,
     _rewrite_labelnames,
 )
 
@@ -64,37 +64,25 @@ class TestRewriteLabelnames:
 
 
 # ---------------------------------------------------------------------------
-# _rewrite_label_kwargs
+# _engine_to_stage_replica
 # ---------------------------------------------------------------------------
 
 
-class TestRewriteLabelKwargs:
-    def test_engine_kwarg_translated(self):
+class TestEngineToStageReplica:
+    def test_int_engine_value(self):
+        # Mirrors upstream `.labels(engine=idx, ...)` with int (loggers.py:510).
         _ENGINE_INDEX_MAP[7] = ("talker", "1")
-        out = _rewrite_label_kwargs({"engine": 7, "model_name": "m"})
-        assert out == {"stage": "talker", "replica": "1", "model_name": "m"}
+        assert _engine_to_stage_replica(7) == ("talker", "1")
 
-    def test_engine_with_extra_kwargs(self):
-        # Mirrors upstream's `.labels(engine=idx, model_name=m, sleep_state=s)`.
-        _ENGINE_INDEX_MAP[3] = ("thinker", "0")
-        out = _rewrite_label_kwargs(
-            {"engine": 3, "model_name": "m", "sleep_state": "awake"}
-        )
-        assert out == {
-            "stage": "thinker",
-            "replica": "0",
-            "model_name": "m",
-            "sleep_state": "awake",
-        }
-
-    def test_no_engine_kwarg_passthrough(self):
-        out = _rewrite_label_kwargs({"model_name": "m", "stage": "talker"})
-        assert out == {"model_name": "m", "stage": "talker"}
+    def test_str_engine_value(self):
+        # Mirrors upstream `metrics_info["engine"] = str(idx)` (loggers.py:1055).
+        _ENGINE_INDEX_MAP[2] = ("thinker", "0")
+        assert _engine_to_stage_replica("2") == ("thinker", "0")
 
     def test_missing_engine_idx_raises(self):
         # Empty map → fail-fast rather than emit a wrong (stage, replica).
         with pytest.raises(KeyError):
-            _rewrite_label_kwargs({"engine": 999, "model_name": "m"})
+            _engine_to_stage_replica(999)
 
 
 # ---------------------------------------------------------------------------
@@ -226,3 +214,101 @@ class TestRelabelHistogram:
         )
         assert h._labelnames == ("model_name",)
         h.labels(model_name="m").observe(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Positional .labels() with engine value (loggers.py:646, 679)
+# ---------------------------------------------------------------------------
+
+
+class TestPositionalEngine:
+    def test_positional_engine_at_middle_index(self, registry):
+        # Mirrors `counter_prompt_tokens_by_source.labels(model_name, str(idx), source)`.
+        # Family original labelnames = ["model_name", "engine", "source"].
+        _ENGINE_INDEX_MAP[5] = ("talker", "0")
+        c = _RelabelCounter(
+            name="omni_test_pos_mid",
+            documentation="test",
+            labelnames=["model_name", "engine", "source"],
+            registry=registry,
+        )
+        c.labels("m", "5", "decoder").inc(2)
+
+        out = generate_latest(registry).decode()
+        assert (
+            'omni_test_pos_mid_total{model_name="m",replica="0",source="decoder",stage="talker"} 2.0'
+            in out
+        )
+
+    def test_positional_engine_with_int_value(self, registry):
+        # Defensive: positional form may also receive an int (we accept both).
+        _ENGINE_INDEX_MAP[3] = ("thinker", "1")
+        c = _RelabelCounter(
+            name="omni_test_pos_int",
+            documentation="test",
+            labelnames=["model_name", "engine", "reason"],
+            registry=registry,
+        )
+        c.labels("m", 3, "stop").inc()
+
+        out = generate_latest(registry).decode()
+        assert (
+            'omni_test_pos_int_total{model_name="m",reason="stop",replica="1",stage="thinker"} 1.0'
+            in out
+        )
+
+
+# ---------------------------------------------------------------------------
+# String-form engine kwarg (loggers.py:1056 info_gauge)
+# ---------------------------------------------------------------------------
+
+
+class TestStrEngineKwarg:
+    def test_engine_kwarg_str_form(self, registry):
+        # Mirrors `info_gauge.labels(**metrics_info)` where metrics_info["engine"]="0".
+        _ENGINE_INDEX_MAP[0] = ("thinker", "0")
+        g = _RelabelGauge(
+            name="omni_test_info",
+            documentation="test",
+            labelnames=["cache_size", "engine"],
+            multiprocess_mode="mostrecent",
+            registry=registry,
+        )
+        # Upstream pattern: pass everything as kwargs from the metrics_info dict.
+        g.labels(cache_size="big", engine="0").set(1)
+
+        out = generate_latest(registry).decode()
+        assert (
+            'omni_test_info{cache_size="big",replica="0",stage="thinker"} 1.0'
+            in out
+        )
+
+
+# ---------------------------------------------------------------------------
+# Child metric does not re-trigger relabel logic
+# ---------------------------------------------------------------------------
+
+
+class TestChildNoRecursion:
+    def test_child_set_does_not_relookup(self, registry):
+        # Once .labels() returns a child, subsequent .set()/.inc() must not
+        # consult _ENGINE_INDEX_MAP again. We verify by clearing the map
+        # AFTER labels() and proving .set() still works.
+        _ENGINE_INDEX_MAP[4] = ("diffusion", "0")
+        g = _RelabelGauge(
+            name="omni_test_child",
+            documentation="test",
+            labelnames=["model_name", "engine"],
+            registry=registry,
+        )
+        child = g.labels(engine=4, model_name="m")
+        _ENGINE_INDEX_MAP.clear()  # would break a second .labels() lookup
+        child.set(99.0)  # but set() is on the bound child — no map needed
+
+        # Re-populate so generate_latest doesn't trip on anything else.
+        _ENGINE_INDEX_MAP[4] = ("diffusion", "0")
+        out = generate_latest(registry).decode()
+        assert (
+            'omni_test_child{model_name="m",replica="0",stage="diffusion"} 99.0'
+            in out
+        )
