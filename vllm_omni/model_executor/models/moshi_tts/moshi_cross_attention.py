@@ -104,10 +104,23 @@ class MoshiTransformerLayer(nn.Module):
         sa_out = self.self_attn(positions=positions, hidden_states=normed, **kwargs)
         combined = combined + sa_out
 
+        import os as _os
+
+        _dbg = _os.environ.get("MOSHI_TTS_DBG") == "1"
         if self.cross_attention_src is not None:
             normed_cross = self.cross_attn_layernorm(combined)
             cross_out = self.cross_attn(normed_cross, self.cross_attention_src)
+            if _dbg:
+                print(
+                    f"[MOSHI:cross_out] ctx_shape={tuple(self.cross_attention_src.shape)}"
+                    f" ctx_norm={self.cross_attention_src.float().norm():.4f}"
+                    f" cross_out_norm={cross_out.float().norm():.4f}"
+                    f" cross_out[:4]={cross_out.reshape(-1)[:4].tolist()}",
+                    flush=True,
+                )
             combined = combined + cross_out
+        elif _dbg:
+            print("[MOSHI:cross_out] SKIPPED (cross_attention_src is None)", flush=True)
 
         normed_mlp = self.post_attention_layernorm(combined)
         hidden_states = self.mlp(normed_mlp)

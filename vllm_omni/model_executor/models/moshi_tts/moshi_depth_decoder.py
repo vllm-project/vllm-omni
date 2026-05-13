@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import logging
+import os as _os
 from collections.abc import Iterable
 
 import torch
+
+# Set MOSHI_TTS_DBG=1 to emit depth-decoder per-step traces aligned with
+# the moshi/ depformer traces for side-by-side diffing.
+_DEPTH_DBG = _os.environ.get("MOSHI_TTS_DBG", "0") == "1"
 import torch._dynamo
 import torch.nn as nn
 import torch.nn.functional as F
@@ -526,11 +531,16 @@ class MoshiDepthDecoder(nn.Module):
         wi = self._weight_indices
         seq_len = step + 1
         weight_pos = self._map_step_to_weight_idx(wi[:seq_len])
+        _do_dep_dbg = _DEPTH_DBG and step == 0 and getattr(self, "_depth_dbg_step", -1) == 16
 
         if step == 0:
             text_embed = self._text_embed(text_token_id)
             proj = self.input_projections(main_hidden.unsqueeze(1), weight_pos[0:1])
             embed_buf[:bsz, 0, :] = text_embed + proj.squeeze(1)
+            if _do_dep_dbg:
+                print(f"[MOSHI:dep_in_proj]  step=16 cb=0 proj={proj.squeeze(1)}", flush=True)
+                print(f"[MOSHI:dep_text_emb] step=16 cb=0 text_emb={text_embed}", flush=True)
+                print(f"[MOSHI:dep_combined] step=16 cb=0 combined={embed_buf[:bsz, 0, :]}", flush=True)
         else:
             audio_embed = self.embed_tokens[step - 1](prev_code)
             proj = self.input_projections(main_hidden.unsqueeze(1), weight_pos[step : step + 1])
@@ -538,7 +548,36 @@ class MoshiDepthDecoder(nn.Module):
 
         step_input = embed_buf[:bsz, :seq_len, :]
 
+        if _do_dep_dbg:
+            _dep_handles = []
+            for _li, _layer in enumerate(self.layers):
+
+                def _dep_attn_hook(m, inp, out, li=_li):
+                    _h = out[0] if isinstance(out, (tuple, list)) else out
+                    print(f"[MOSHI:dep_attn_out] step=16 cb=0 layer={li} attn={_h}", flush=True)
+
+                def _dep_norm2_hook(m, inp, out, li=_li):
+                    print(f"[MOSHI:dep_norm2]    step=16 cb=0 layer={li} norm2={out}", flush=True)
+
+                def _dep_ff_hook(m, inp, out, li=_li):
+                    _h = out[0] if isinstance(out, (tuple, list)) else out
+                    print(f"[MOSHI:dep_ff]       step=16 cb=0 layer={li} ff={_h}", flush=True)
+
+                def _dep_layer_hook(m, inp, out, li=_li):
+                    _h = out[0] if isinstance(out, (tuple, list)) else out
+                    print(f"[MOSHI:dep_layer]    step=16 cb=0 layer={li} h={_h}", flush=True)
+
+                _dep_handles.append(_layer.self_attn.register_forward_hook(_dep_attn_hook))
+                _dep_handles.append(_layer.post_attention_layernorm.register_forward_hook(_dep_norm2_hook))
+                _dep_handles.append(_layer.mlp.register_forward_hook(_dep_ff_hook))
+                _dep_handles.append(_layer.register_forward_hook(_dep_layer_hook))
+
         hidden_out = self._run_layers(step_input, weight_pos)
+
+        if _do_dep_dbg:
+            for _h in _dep_handles:
+                _h.remove()
+            print(f"[MOSHI:dep_output]   step=16 cb=0 output={hidden_out[:, 0:1, :]}", flush=True)
 
         last_hidden = hidden_out[:, -1:, :]
         if self.output_norms is not None:
@@ -568,17 +607,25 @@ class MoshiDepthDecoder(nn.Module):
     ) -> torch.Tensor:
         """Run one AR step with KV cache + F.linear fast path."""
         wi = self._get_weight_idx_int(step)
+        _do_dep_dbg = _DEPTH_DBG and step == 0 and getattr(self, "_depth_dbg_step", -1) == 16
 
         # Embed single position via F.linear
         proj = self.input_projections.forward_single(main_hidden, wi)  # [B, H]
         if step == 0:
             text_embed_val = self._text_embed(text_token_id)
             embed = text_embed_val + proj
+            if _do_dep_dbg:
+                print(f"[MOSHI:dep_in_proj]  step=16 cb=0 proj={proj}", flush=True)
+                print(f"[MOSHI:dep_text_emb] step=16 cb=0 text_emb={text_embed_val}", flush=True)
+                print(f"[MOSHI:dep_combined] step=16 cb=0 combined={embed}", flush=True)
         else:
             embed = self.embed_tokens[step - 1](prev_code) + proj
 
         # Forward through layers with KV cache — [B, 1, H]
         hidden_out = self._run_layers_cached(embed.unsqueeze(1), wi, step)
+
+        if _do_dep_dbg:
+            print(f"[MOSHI:dep_output]   step=16 cb=0 output={hidden_out}", flush=True)
 
         # Extract logits via F.linear
         last_h = hidden_out.squeeze(1)  # [B, H]

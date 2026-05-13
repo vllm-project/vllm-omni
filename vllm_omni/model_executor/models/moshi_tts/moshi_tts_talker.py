@@ -48,6 +48,72 @@ from .weight_remapping import filter_depth_decoder_weights, remap_moshi_weights
 
 logger = init_logger(__name__)
 
+import os as _os
+
+# Set MOSHI_TTS_DBG=1 to emit per-step traces aligned with the moshi/
+# reference implementation for side-by-side diffing.
+_TTS_DBG = _os.environ.get("MOSHI_TTS_DBG", "0") == "1"
+_TTS_DBG_FWD_STEP = 0  # global step counter for _tts_dbg_print_input (matches lm.py)
+
+
+def _tts_dbg_print_state(tag: str, step: int, sampled: int, forced: int, state: Any) -> None:
+    if not _TTS_DBG:
+        return
+    print(
+        f"[TTS-DBG/{tag} step={step:4d} batch=0] "
+        f"sampled={sampled:5d} forced={forced:5d} "
+        f"q={len(state.queued):2d} fp={state.forced_padding} rp={state.remaining_padding} "
+        f"end={state.end_step} entries={len(state.entries):2d}",
+        flush=True,
+    )
+
+
+def _tts_dbg_print_consume(
+    tag: str,
+    step: int,
+    *,
+    sampled: int,
+    rp_before: int,
+    fp_before: int,
+    queued_before: int,
+    entries_before: int,
+    new_word_id: int,
+    end_step_set: bool,
+) -> None:
+    if not _TTS_DBG:
+        return
+    sampled_new_word = sampled == new_word_id and queued_before == 0 and fp_before == 0 and rp_before > 0
+    cause = "sampled-new_word" if sampled_new_word else "remaining-padding-exhausted"
+    drained = "drained" if end_step_set else "word"
+    print(
+        f"[TTS-DBG/{tag} CONSUME step={step:4d} batch=0] "
+        f"cause={cause:28s} kind={drained} "
+        f"sampled={sampled:5d} rp_before={rp_before} fp_before={fp_before} "
+        f"queued_before={queued_before} entries_before={entries_before}",
+        flush=True,
+    )
+
+
+def _tts_dbg_print_codes(tag: str, step: int, codes: list | torch.Tensor) -> None:
+    if not _TTS_DBG:
+        return
+    if isinstance(codes, torch.Tensor):
+        codes = codes.reshape(-1).tolist()
+    print(f"[TTS-DBG/{tag} step={step:4d} batch=0] codes[:8]={codes[:8]}", flush=True)
+
+
+def _tts_dbg_print_input(tag: str, t: torch.Tensor, *, has_cross: bool) -> None:
+    global _TTS_DBG_FWD_STEP
+    if not _TTS_DBG:
+        return
+    print(
+        f"[TTS-DBG/{tag} input_] step={_TTS_DBG_FWD_STEP:4d} "
+        f"shape={tuple(t.shape)} dtype={t.dtype} "
+        f"cross={'yes' if has_cross else 'no '}\n{t}",
+        flush=True,
+    )
+    _TTS_DBG_FWD_STEP += 1
+
 
 def _sin_embedding(ctx: torch.Tensor, max_period: float = 10000.0) -> torch.Tensor:
     """Sinusoidal positional embedding matching moshi/modules/transformer.py:create_sin_embedding.
@@ -317,9 +383,72 @@ class MoshiTTSTalkerForConditionalGeneration(nn.Module):
     ) -> torch.Tensor | IntermediateTensors:
         if self._cross_attn_wrappers:
             ctx = self._cross_attn_ctx.get(self._active_req_id)
+            if _TTS_DBG:
+                _step_dbg = getattr(self, "_dbg_step_idx", "?")
+                if ctx is None:
+                    print(f"[MOSHI:cross_ctx] step={_step_dbg} ctx=None (cross-attn DISABLED)", flush=True)
+                else:
+                    print(
+                        f"[MOSHI:cross_ctx] step={_step_dbg} shape={tuple(ctx.shape)} norm={ctx.float().norm().item():.4f}",
+                        flush=True,
+                    )
             for wrapper in self._cross_attn_wrappers:
                 wrapper.cross_attention_src = ctx
-        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        if not (_TTS_DBG and inputs_embeds is not None and hasattr(self.model, "layers")):
+            return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        _step = getattr(self, "_dbg_step_idx", "?")
+        _handles = []
+        for _li, _layer in enumerate(self.model.layers):
+
+            def _norm1_hook(m, inp, out, li=_li, s=_step):
+                print(f"[MOSHI:norm1_out]    step={s} layer={li} norm1={out}", flush=True)
+                if isinstance(out, torch.Tensor):
+                    print(f"[MOSHI:norm1_max]    step={s} layer={li} max={out.abs().max().item():.6f}", flush=True)
+
+            _handles.append(_layer.input_layernorm.register_forward_hook(_norm1_hook))
+            _qkv = getattr(_layer.self_attn, "qkv_proj", None)
+            if _qkv is not None:
+
+                def _in_proj_hook(m, inp, out, li=_li, s=_step):
+                    print(f"[MOSHI:in_proj_out]  step={s} layer={li} projected={out}", flush=True)
+
+                _handles.append(_qkv.register_forward_hook(_in_proj_hook))
+            _rope = getattr(_layer.self_attn, "rotary_emb", None)
+            if _rope is not None:
+
+                def _rope_hook(m, inp, out, li=_li, s=_step):
+                    if isinstance(out, (tuple, list)) and len(out) >= 2:
+                        print(f"[MOSHI:rope_q]       step={s} layer={li} q={out[0]}", flush=True)
+                        print(f"[MOSHI:rope_k]       step={s} layer={li} k={out[1]}", flush=True)
+
+                _handles.append(_rope.register_forward_hook(_rope_hook))
+
+            def _attn_hook(m, inp, out, li=_li, s=_step):
+                _h = out[0] if isinstance(out, (tuple, list)) else out
+                print(f"[MOSHI:attn_out]     step={s} layer={li} attn={_h}", flush=True)
+
+            _handles.append(_layer.self_attn.register_forward_hook(_attn_hook))
+
+            def _norm2_hook(m, inp, out, li=_li, s=_step):
+                print(f"[MOSHI:norm2_out]    step={s} layer={li} norm2={out}", flush=True)
+
+            _handles.append(_layer.post_attention_layernorm.register_forward_hook(_norm2_hook))
+
+            def _ff_hook(m, inp, out, li=_li, s=_step):
+                _h = out[0] if isinstance(out, (tuple, list)) else out
+                print(f"[MOSHI:ff_update]    step={s} layer={li} ff={_h}", flush=True)
+
+            _handles.append(_layer.mlp.register_forward_hook(_ff_hook))
+
+            def _layer_hook(m, inp, out, li=_li, s=_step):
+                _h = out[0] if isinstance(out, (tuple, list)) else out
+                print(f"[MOSHI:layer_hidden] step={s} layer={li} h={_h}", flush=True)
+
+            _handles.append(_layer.register_forward_hook(_layer_hook))
+        result = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        for _h in _handles:
+            _h.remove()
+        return result
 
     def compute_logits(
         self,
@@ -330,9 +459,14 @@ class MoshiTTSTalkerForConditionalGeneration(nn.Module):
             hidden_states = hidden_states.text_hidden_states
         if hidden_states is None:
             return None
+        if _TTS_DBG and isinstance(hidden_states, torch.Tensor):
+            _tts_dbg_print_input("dst_out", hidden_states, has_cross=bool(self._cross_attn_wrappers))
         logits = self.logits_processor(self.lm_head, hidden_states)
         if logits is None:
             return None
+        if _TTS_DBG:
+            _step = getattr(self, "_dbg_step_idx", "?")
+            print(f"[MOSHI:txt_logits] step={_step} logits={logits}", flush=True)
 
         # TTS sampling is constrained to {new_word, pad}. When the state
         # machine is done + audio_delay has elapsed, ``preprocess`` flips
@@ -801,6 +935,24 @@ class MoshiTTSTalkerForConditionalGeneration(nn.Module):
         tts_step = int((info_dict.get("meta") or {}).get("tts_step", 0) or 0)
         self._current_model_step[req_id] = tts_step + 1
 
+        if _TTS_DBG:
+            self._dbg_step_idx = tts_step
+            if tts_step == 0:
+                print(
+                    f"[MOSHI:delays] delay_steps={self._audio_delay_steps} "
+                    f"delays={list(self.delay_pattern.delays[:8])}",
+                    flush=True,
+                )
+                if hasattr(self.model, "layers") and self.model.layers:
+                    _attn0 = self.model.layers[0].self_attn
+                    _qkv = getattr(_attn0, "qkv_proj", None)
+                    if _qkv is not None and hasattr(_qkv, "weight"):
+                        _w = _qkv.weight
+                        print(
+                            f"[MOSHI:in_proj_w] shape={tuple(_w.shape)} w[:2,:4]={_w[:2, :4].tolist()}",
+                            flush=True,
+                        )
+
         T_frames = self._prefix_num_frames.get(req_id, 0)
         in_prefix = T_frames > 0 and tts_step < T_frames
 
@@ -819,9 +971,30 @@ class MoshiTTSTalkerForConditionalGeneration(nn.Module):
                 # state machine so it isn't double-advanced.
                 forced_input = self._token_ids.pad
             else:
+                if _TTS_DBG:
+                    _rp_before = state.remaining_padding
+                    _fp_before = state.forced_padding
+                    _queued_before = len(state.queued)
+                    _entries_before = len(state.entries)
+                    _end_step_before = state.end_step
                 forced_input = self._machine.process(tts_step, state, sampled)
                 self._last_machine_step[req_id] = tts_step
                 self._last_forced_token[req_id] = forced_input
+                if _TTS_DBG and _entries_before > len(state.entries):
+                    _tts_dbg_print_consume(
+                        "dst ",
+                        tts_step,
+                        sampled=sampled,
+                        rp_before=_rp_before,
+                        fp_before=_fp_before,
+                        queued_before=_queued_before,
+                        entries_before=_entries_before,
+                        new_word_id=self._token_ids.new_word,
+                        end_step_set=(_end_step_before is None and state.end_step is not None),
+                    )
+            if _TTS_DBG:
+                _forced_main = forced_input % self._token_ids.card if self._second_stream_ahead > 0 else forced_input
+                _tts_dbg_print_state("dst ", tts_step, sampled, _forced_main, state)
 
             if state.end_step is not None and tts_step >= state.end_step + self._audio_delay_steps:
                 forced_input = self._token_ids.pad
@@ -851,6 +1024,27 @@ class MoshiTTSTalkerForConditionalGeneration(nn.Module):
         if cond_sum is not None:
             embed = embed + cond_sum
 
+        if _TTS_DBG:
+            _step_dbg = tts_step
+            _audio_ids_debug = prev_codes_pp.tolist() if prev_codes_pp is not None else None
+            print(f"[MOSHI:audio_ids]    step={_step_dbg} ids={_audio_ids_debug}", flush=True)
+            for _cb in range(min(4, self._num_codebooks)):
+                _per_cb_delay = int(delays_pp[_cb])
+                if current_model_step <= _per_cb_delay:
+                    _cb_code = self._audio_vocab_size
+                    _cb_emb = self.audio_embed_tokens[_cb](sos_code_pp).to(dtype=dtype)
+                elif current_model_step > _per_cb_delay + self._audio_delay_steps and prev_codes_pp is not None:
+                    _cb_code = int(prev_codes_pp[0, _cb].item())
+                    _cb_emb = self.audio_embed_tokens[_cb](prev_codes_pp[:, _cb]).to(dtype=dtype)
+                else:
+                    _cb_code = 0
+                    _cb_emb = torch.zeros(1, self.main_config.hidden_size, device=dev, dtype=dtype)
+                print(f"[MOSHI:cb_embed]     step={_step_dbg} cb={_cb} code={_cb_code} emb={_cb_emb}", flush=True)
+            print(f"[MOSHI:text_embed]   step={_step_dbg} text_emb={text_embed}", flush=True)
+            print(f"[MOSHI:audio_embed]  step={_step_dbg} audio_emb_sum={audio_embed_sum}", flush=True)
+            print(f"[MOSHI:input_embeds] step={_step_dbg} input_={embed}", flush=True)
+            _tts_dbg_print_input("dst ", embed.reshape(1, -1), has_cross=bool(self._cross_attn_wrappers))
+
         H = self.main_config.hidden_size
         text_step = torch.zeros(1, H, device=dev, dtype=dtype)
         text_step[0, 0] = float(tts_step)
@@ -876,6 +1070,10 @@ class MoshiTTSTalkerForConditionalGeneration(nn.Module):
         current_model_step = self._current_model_step.get(req_id, 0)
         in_audio_delay = current_model_step < self._audio_delay_steps
 
+        if _TTS_DBG:
+            _step = getattr(self, "_dbg_step_idx", "?")
+            print(f"[MOSHI:depth_used] step={_step} in_audio_delay={in_audio_delay}", flush=True)
+
         if in_audio_delay:
             audio_codes = torch.zeros((bsz, K), dtype=torch.long, device=dev)
         else:
@@ -887,6 +1085,13 @@ class MoshiTTSTalkerForConditionalGeneration(nn.Module):
             else:
                 text_token_id = torch.zeros((bsz,), dtype=torch.long, device=dev)
 
+            if _TTS_DBG and getattr(self, "_dbg_step_idx", -1) == 16:
+                print(f"[MOSHI:hidden_at_depformer] step=16 main_hidden={last.reshape(bsz, -1)}", flush=True)
+                print(f"[MOSHI:text_tok_at_depformer] step=16 text_token={text_token_id}", flush=True)
+                print(f"[MOSHI:forced_at_depformer]  step=16 text_token_after_hook={text_token_id}", flush=True)
+            if _TTS_DBG:
+                self.depth_decoder._depth_dbg_step = getattr(self, "_dbg_step_idx", -1)
+
             audio_codes = self.depth_decoder(
                 main_hidden=last.reshape(bsz, -1).to(dtype=torch.bfloat16),
                 text_token_id=text_token_id,
@@ -895,12 +1100,19 @@ class MoshiTTSTalkerForConditionalGeneration(nn.Module):
                 top_k=250,
             )
 
+            if _TTS_DBG:
+                self.depth_decoder._depth_dbg_step = -1
+
             prefix = self._prefixes.get(req_id)
             decode_step = current_model_step - 1
             if prefix is not None and 0 <= decode_step < int(prefix.shape[0]):
                 prefix_row = prefix[decode_step].to(device=dev)
                 override_mask = (prefix_row != -2).unsqueeze(0).expand(bsz, -1)
                 audio_codes = torch.where(override_mask, prefix_row.unsqueeze(0).expand(bsz, -1), audio_codes)
+
+        if _TTS_DBG and not in_audio_delay:
+            _step = getattr(self, "_dbg_step_idx", 0)
+            _tts_dbg_print_codes("dst ", _step if isinstance(_step, int) else 0, audio_codes[0])
 
         self._last_audio_codes[req_id] = audio_codes.detach()
         return {"hidden_states": {"last": last}}
