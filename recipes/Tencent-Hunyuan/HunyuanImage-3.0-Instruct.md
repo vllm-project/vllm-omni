@@ -186,9 +186,9 @@ Validated score summary:
 
 The CI assertion threshold is `overall_mean >= 0.45`, so the smoke result is
 comfortably above the gate. The generate server and judge server run
-sequentially through the `OmniServer` fixture, and
-`VLLM_TEST_CLEAN_GPU_MEMORY=1` is used to wait for memory cleanup between
-server lifetimes.
+sequentially through the `OmniServer` fixture, with GPU memory cleanup
+between server lifetimes (for example via the `clean_gpu_memory_between_tests`
+pytest fixture in the smoke path).
 
 The lower-cost 2-GPU Instruct setup was tried for this smoke path but did not
 fit in memory. A previous 2-GPU experiment used the base HunyuanImage-3.0

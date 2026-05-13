@@ -149,6 +149,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 dtype=torch.long,
             )
         elif self.model_stage == "talker":
+            multimodal_config.skip_mm_profiling = True
             self.has_preprocess = True
             self.has_postprocess = True
             self.set_custom_preprocess(self.talker_preprocess)
@@ -166,7 +167,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                 hf_config=talker_config,
                 architectures=["Qwen3OmniMoeTalkerForConditionalGeneration"],
             )
-            self.talker.init_multi_modal(thinker_config)
             self.model = self.talker
             self.code2wav = None
 
@@ -188,6 +188,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             }
 
         elif self.model_stage == "code2wav":
+            multimodal_config.skip_mm_profiling = True
             self.enable_update_additional_information = True
             self.thinker = None
             self.talker = None
@@ -280,6 +281,8 @@ class Qwen3OmniMoeForConditionalGeneration(
     ) -> torch.Tensor:
         if self.model_stage == "code2wav":
             return torch.zeros_like(input_ids).reshape(-1, 1).repeat(1, self.vllm_config.model_config.get_hidden_size())
+        if self.model_stage == "talker":
+            return self.model.embed_input_ids(input_ids)
         return self.model.embed_input_ids(
             input_ids=input_ids, multimodal_embeddings=multimodal_embeddings, is_multimodal=is_multimodal
         )
@@ -986,9 +989,11 @@ class Qwen3OmniMoeForConditionalGeneration(
         start_index = meta.get("num_processed_tokens", 0)
         thinker_output_token_ids = ids.get("output", [])
         if start_index >= len(thinker_output_token_ids) - 1:
-            if meta.get("finished"):
+            # When the tokens output by the thinker are exhausted, an EOS token needs to be appended.
+            # Use the finished_flag to mark that all tokens output by thinker have been consumed.
+            if meta.get("eos_emitted", False):
                 return self.tts_pad_embed.to(device)
-            update_dict.setdefault("meta", {})["finished"] = True
+            update_dict.setdefault("meta", {})["eos_emitted"] = True
             return self.tts_eos_embed.to(device)
 
         if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
@@ -1257,6 +1262,18 @@ class Qwen3OmniMoeForConditionalGeneration(
 
     # ==================== Weight Loading ====================
 
+    def _get_codec_frame_config(self) -> tuple[int, int]:
+        """Extract codec_chunk_frames and codec_left_context_frames from stage connector config."""
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        if isinstance(connector_cfg, dict):
+            extra = connector_cfg.get("extra", {})
+        else:
+            extra = getattr(connector_cfg, "extra", None) or {}
+        chunk_frames = int(extra.get("codec_chunk_frames", 0) or 0)
+        left_frames = int(extra.get("codec_left_context_frames", 0) or 0)
+        return chunk_frames, left_frames
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for all components of the omni model."""
         loaded_weights = set()
@@ -1292,6 +1309,21 @@ class Qwen3OmniMoeForConditionalGeneration(
             code2wav_loaded = self.code2wav.load_weights(code2wav_weights)
             code2wav_loaded = add_prefix_to_loaded_weights(code2wav_loaded, "code2wav")
             loaded_weights.update(code2wav_loaded)
+
+            # Precompute SnakeBeta caches and enable CUDA graph for Code2Wav decoder
+            try:
+                self.code2wav.precompute_snake_caches()
+                if hasattr(self.code2wav, "enable_cudagraph"):
+                    chunk_frames, left_frames = self._get_codec_frame_config()
+                    self.code2wav.enable_cudagraph(
+                        codec_chunk_frames=chunk_frames,
+                        codec_left_context_frames=left_frames,
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to enable CUDA Graph for Code2Wav; falling back to eager.",
+                    exc_info=True,
+                )
 
         # Log summary
         logger.info(

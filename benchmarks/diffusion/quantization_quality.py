@@ -151,7 +151,7 @@ def _generate_image(omni, args, prompt, seed):
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
-    torch.cuda.reset_peak_memory_stats()
+    torch.accelerator.reset_peak_memory_stats()
     start = time.perf_counter()
     outputs = omni.generate(
         {"prompt": prompt},
@@ -163,7 +163,7 @@ def _generate_image(omni, args, prompt, seed):
         ),
     )
     elapsed = time.perf_counter() - start
-    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+    peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
     first = outputs[0]
     req_out = first.request_output[0] if hasattr(first, "request_output") else first
@@ -178,7 +178,7 @@ def _generate_video(omni, args, prompt, seed):
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
-    torch.cuda.reset_peak_memory_stats()
+    torch.accelerator.reset_peak_memory_stats()
     start = time.perf_counter()
     outputs = omni.generate(
         {"prompt": prompt, "negative_prompt": ""},
@@ -192,7 +192,7 @@ def _generate_video(omni, args, prompt, seed):
         ),
     )
     elapsed = time.perf_counter() - start
-    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+    peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
     first = outputs[0]
     if hasattr(first, "request_output") and isinstance(first.request_output, list):
@@ -228,8 +228,8 @@ def _unload_omni(omni):
     del omni
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.accelerator.empty_cache()
+        torch.accelerator.synchronize()
 
 
 def run_benchmark(args):

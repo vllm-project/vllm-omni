@@ -18,6 +18,7 @@ from vllm_omni.entrypoints.utils import (
     _filter_dict_like_object,
     coerce_param_message_types,
     filter_dataclass_kwargs,
+    filter_stages,
     load_and_resolve_stage_configs,
     load_stage_configs_from_yaml,
     resolve_model_config_path,
@@ -328,7 +329,7 @@ class TestResolveModelConfigPath:
         )
         mocker.patch(
             "vllm_omni.entrypoints.utils.current_omni_platform.get_default_stage_config_path",
-            return_value="vllm_omni/model_executor/stage_configs",
+            return_value="vllm_omni/deploy",
         )
 
         original_exists = os.path.exists
@@ -359,6 +360,85 @@ class TestLoadAndResolveStageConfigs:
         assert config_path is None
         assert len(stage_configs) == 1
         assert "dtype" in stage_configs[0]["engine_args"]
+
+    def test_stage_configs_path_promotes_new_deploy_yaml_without_expanding_replicas(
+        self, tmp_path, mocker: MockerFixture
+    ):
+        deploy_path = tmp_path / "qwen3_multi.yaml"
+        deploy_path.write_text(
+            'stages:\n  - stage_id: 0\n    devices: "0"\n  - stage_id: 1\n    devices: "1,2,3"\n    num_replicas: 3\n',
+            encoding="utf-8",
+        )
+
+        returned_stage_configs = [
+            create_config({"stage_id": 0, "runtime": {"devices": "0"}, "engine_args": {"model": "dummy"}}),
+            create_config(
+                {
+                    "stage_id": 1,
+                    "runtime": {"devices": "1,2,3", "num_replicas": 3},
+                    "engine_args": {"model": "dummy"},
+                }
+            ),
+        ]
+        load_stage_configs = mocker.patch(
+            "vllm_omni.entrypoints.utils.load_stage_configs_from_model",
+            return_value=returned_stage_configs,
+        )
+
+        config_path, stage_configs = load_and_resolve_stage_configs(
+            model="dummy-model",
+            stage_configs_path=str(deploy_path),
+            kwargs={},
+        )
+
+        load_stage_configs.assert_called_once_with(
+            "dummy-model",
+            base_engine_args={},
+            deploy_config_path=str(deploy_path),
+            stage_overrides=None,
+        )
+        assert config_path == str(deploy_path)
+        assert len(stage_configs) == 2
+        assert stage_configs[1].runtime.num_replicas == 3
+        assert stage_configs[1].runtime.devices == "1,2,3"
+
+    def test_filter_stages_selects_mode_stages_without_mutating_stage_config(self, tmp_path):
+        config_path = tmp_path / "deploy.yaml"
+        config_path.write_text(
+            """modes:
+  - mode: text-to-text
+    stages: [0]
+  - mode: text-to-image
+    stages: [0, 1]
+""",
+            encoding="utf-8",
+        )
+        stages = [
+            create_config(
+                {
+                    "stage_id": 0,
+                    "runtime": {"requires_multimodal_data": True},
+                    "final_output": False,
+                    "final_output_type": None,
+                }
+            ),
+            create_config(
+                {
+                    "stage_id": 1,
+                    "runtime": {"requires_multimodal_data": True},
+                    "final_output": True,
+                    "final_output_type": "image",
+                }
+            ),
+        ]
+
+        filtered = filter_stages(str(config_path), stages, {"mode": "text-to-text"})
+
+        assert len(filtered) == 1
+        assert filtered[0].stage_id == 0
+        assert filtered[0].runtime.requires_multimodal_data is True
+        assert filtered[0].final_output is False
+        assert filtered[0].final_output_type is None
 
 
 class TestLoadStageConfigsFromYaml:

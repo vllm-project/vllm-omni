@@ -12,7 +12,12 @@ Coverage:
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+from tests.helpers.runtime import (
+    OmniServer,
+    OmniServerParams,
+    OpenAIClientHandler,
+    dummy_messages_from_mix_data,
+)
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
@@ -96,9 +101,10 @@ def _get_diffusion_feature_cases(model: str):
     indirect=True,
 )
 def test_flux2_klein(omni_server: OmniServer, openai_client: OpenAIClientHandler):
+    messages = dummy_messages_from_mix_data(content_text=POSITIVE_PROMPT)
     request_config = {
         "model": omni_server.model,
-        "messages": [{"role": "user", "content": POSITIVE_PROMPT}],
+        "messages": messages,
         "extra_body": {
             "height": 512,
             "width": 512,

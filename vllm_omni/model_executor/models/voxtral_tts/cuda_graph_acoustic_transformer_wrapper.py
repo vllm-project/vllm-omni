@@ -85,7 +85,7 @@ class CUDAGraphAcousticTransformerWrapper:
             with torch.no_grad():
                 self._forward_cudagraph_compatible(dummy, cfg_alpha=dummy_cfg_alpha, noise=dummy_noise)
 
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
 
         # Phase 2: Capture graphs
         for size in self.capture_sizes:
@@ -199,7 +199,7 @@ class CUDAGraphAcousticTransformerWrapper:
         with torch.no_grad():
             _ = self._forward_cudagraph_compatible(static_input, cfg_alpha=static_cfg_alpha, noise=static_noise)
 
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
 
         graph = CUDAGraph()
         with torch.no_grad():

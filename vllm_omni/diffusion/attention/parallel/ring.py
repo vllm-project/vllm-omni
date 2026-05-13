@@ -18,11 +18,10 @@ from vllm_omni.diffusion.attention.parallel.base import (
 )
 from vllm_omni.diffusion.distributed.group_coordinator import SequenceParallelGroupCoordinator
 
-# from vllm_omni.diffusion.attention.backends.ring_selector import AttnType # Already imported above
-from vllm_omni.diffusion.forward_context import get_forward_context
-
 if TYPE_CHECKING:
     from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,13 +107,8 @@ class RingParallelAttention:
             softmax_scale = query.shape[-1] ** -0.5
 
         backend_pref = self.attn_backend_pref
-        if backend_pref is None:
-            try:
-                config = get_forward_context().omni_diffusion_config
-                # config might not have attention_backend attribute if not updated
-                backend_pref = getattr(config, "attention_backend", None)
-            except Exception:
-                backend_pref = None
+        if backend_pref is not None:
+            backend_pref = backend_pref.lower()
 
         # Determine attention type with fallback chain: FA3 -> FA2 -> SDPA
         # FP32 is not supported by Flash Attention, force SDPA
@@ -122,7 +116,6 @@ class RingParallelAttention:
             backend_pref = "sdpa"
         elif not HAS_FA3 and not HAS_FLASH_ATTN:
             if backend_pref != "sdpa":
-                logger = init_logger(__name__)
                 logger.warning_once("Flash Attention (FA2/FA3) is not available! Force enabling SDPA.")
             backend_pref = "sdpa"
 
@@ -135,7 +128,7 @@ class RingParallelAttention:
             if attn_metadata.joint_strategy is not None:
                 joint_strategy = attn_metadata.joint_strategy
 
-        if backend_pref == "sdpa" or backend_pref == "torch":
+        if backend_pref in {"sdpa", "torch", "torch_sdpa"}:
             from vllm_omni.diffusion.attention.backends.ring_pytorch_attn import ring_pytorch_attn_func
 
             return ring_pytorch_attn_func(

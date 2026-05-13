@@ -506,7 +506,7 @@ _AUDIO_MIME_BY_SUFFIX = {
 }
 
 
-def test_asset_path(relative_path: str | os.PathLike) -> Path:
+def get_asset_path(relative_path: str | os.PathLike) -> Path:
     """Resolve a path under ``tests/assets/`` to its absolute on-disk location."""
     return _TEST_ASSETS_ROOT / Path(relative_path)
 
@@ -517,7 +517,7 @@ def load_test_audio_data_url(relative_path: str | os.PathLike) -> str:
     Used by tests that need real reference audio (e.g. voice cloning) without
     relying on the server's ability to fetch external URLs at request time.
     """
-    path = test_asset_path(relative_path)
+    path = get_asset_path(relative_path)
     mime = _AUDIO_MIME_BY_SUFFIX.get(path.suffix.lower(), "application/octet-stream")
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:{mime};base64,{encoded}"
@@ -680,7 +680,7 @@ __all__ = [
     "generate_synthetic_audio",
     "generate_synthetic_image",
     "generate_synthetic_video",
+    "get_asset_path",
     "load_test_audio_data_url",
     "preprocess_text",
-    "test_asset_path",
 ]

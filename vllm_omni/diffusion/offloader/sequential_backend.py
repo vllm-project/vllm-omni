@@ -76,10 +76,14 @@ class SequentialOffloadHook(ModelHook):
         if param.device.type == "cpu":
             return
 
+        # XPU's allocator doesn't respect stream dependencies in empty_cache,
+        # so non-blocking copies can race with cache eviction. Use blocking
+        # copies on XPU to avoid NULL pointer errors during DMA.
+        non_blocking = not self.use_hsdp and not current_omni_platform.is_xpu()
         self._move_params(
             module,
             torch.device("cpu"),
-            non_blocking=not self.use_hsdp,
+            non_blocking=non_blocking,
             pin_memory=self.pin_memory,
         )
         current_omni_platform.empty_cache()
@@ -218,6 +222,13 @@ class ModelLevelOffloadBackend(OffloadBackend):
             except Exception as exc:
                 logger.debug("Failed to move VAE to GPU: %s", exc)
 
+        # Pin resident modules on GPU (small hot submodules called inside the DiT loop).
+        for res, name in zip(modules.resident_modules, modules.resident_names):
+            try:
+                res.to(self.device)
+            except Exception as exc:
+                logger.warning("Failed to move resident module '%s' to GPU: %s", name, exc)
+
         # Apply sequential offloading hooks
         apply_sequential_offload(
             dit_modules=modules.dits,
@@ -233,9 +244,10 @@ class ModelLevelOffloadBackend(OffloadBackend):
         self.enabled = True
 
         logger.info(
-            "Model-level offloading enabled: %s <-> %s (mutual exclusion)",
+            "Model-level offloading enabled: %s <-> %s (mutual exclusion)%s",
             ", ".join(modules.dit_names),
             ", ".join(modules.encoder_names),
+            f"; resident on GPU: {', '.join(modules.resident_names)}" if modules.resident_names else "",
         )
 
     def disable(self) -> None:

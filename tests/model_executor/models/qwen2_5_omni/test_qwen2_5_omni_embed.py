@@ -10,15 +10,22 @@ Regression test for: https://github.com/vllm-project/vllm/issues/34506
   - Interleaved (use_audio_in_video) should also work correctly.
 """
 
+import functools
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
-from vllm.model_executor.models.qwen2_5_omni_thinker import (
-    check_interleaved_audio_video,
-    merge_interleaved_embeddings,
-)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@functools.lru_cache(maxsize=1)
+def _qwen2_5_omni_thinker_mod():
+    """Load vLLM thinker only at first use so collection does not import model_executor too early."""
+    import vllm.model_executor.models.qwen2_5_omni_thinker as m
+
+    return m
+
 
 # Fake token IDs
 AUDIO_TOKEN_ID = 1001
@@ -74,31 +81,35 @@ def make_interleaved_seq(video_chunks: list[int], audio_chunks: list[int], text_
 class TestCheckInterleavedAudioVideo:
     def test_non_interleaved_audio_then_video(self):
         """Audio entirely before video -> not interleaved."""
+        m = _qwen2_5_omni_thinker_mod()
         input_ids, is_multimodal = make_token_seq(5, 0, 4)
         is_video = is_multimodal & (input_ids == VIDEO_TOKEN_ID)
         is_audio = is_multimodal & (input_ids == AUDIO_TOKEN_ID)
-        assert not check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
+        assert not m.check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
 
     def test_non_interleaved_with_image(self):
         """Audio + image + video (the mixed_modalities case) -> not interleaved."""
+        m = _qwen2_5_omni_thinker_mod()
         input_ids, is_multimodal = make_token_seq(5, 4, 6)
         is_video = is_multimodal & (input_ids == VIDEO_TOKEN_ID)
         is_audio = is_multimodal & (input_ids == AUDIO_TOKEN_ID)
-        assert not check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
+        assert not m.check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
 
     def test_no_audio(self):
         """Video only -> not interleaved."""
+        m = _qwen2_5_omni_thinker_mod()
         input_ids, is_multimodal = make_token_seq(0, 0, 6)
         is_video = is_multimodal & (input_ids == VIDEO_TOKEN_ID)
         is_audio = is_multimodal & (input_ids == AUDIO_TOKEN_ID)
-        assert not check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
+        assert not m.check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
 
     def test_interleaved(self):
         """V A V A interleaved -> True."""
+        m = _qwen2_5_omni_thinker_mod()
         input_ids, is_multimodal = make_interleaved_seq([4, 4], [3, 3])
         is_video = is_multimodal & (input_ids == VIDEO_TOKEN_ID)
         is_audio = is_multimodal & (input_ids == AUDIO_TOKEN_ID)
-        assert check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
+        assert m.check_interleaved_audio_video(is_video, is_audio, is_video.sum().item(), is_audio.sum().item())
 
 
 # ---------------------------------------------------------------------------
@@ -111,9 +122,8 @@ def make_mock_model(mocker: MockerFixture, hidden: int = 8):
     Return a minimal mock of Qwen2_5OmniThinkerForConditionalGeneration
     that has enough structure to run embed_input_ids.
     """
-    from vllm.model_executor.models.qwen2_5_omni_thinker import (
-        Qwen2_5OmniThinkerForConditionalGeneration,
-    )
+    m = _qwen2_5_omni_thinker_mod()
+    Qwen2_5OmniThinkerForConditionalGeneration = m.Qwen2_5OmniThinkerForConditionalGeneration
 
     model = mocker.Mock(spec=Qwen2_5OmniThinkerForConditionalGeneration)
 
@@ -145,7 +155,9 @@ def make_mock_model(mocker: MockerFixture, hidden: int = 8):
             is_multimodal=is_multimodal,
         )
 
-    model.embed_input_ids = lambda *a, **kw: Qwen2_5OmniThinkerForConditionalGeneration.embed_input_ids(model, *a, **kw)
+    model.embed_input_ids = lambda *a, **kw: m.Qwen2_5OmniThinkerForConditionalGeneration.embed_input_ids(  # noqa: E501
+        model, *a, **kw
+    )
 
     model._super_embed_input_ids = fake_super_embed
 
@@ -285,6 +297,7 @@ class TestEmbedInputIds:
 class TestMergeInterleavedEmbeddings:
     def test_basic_interleaved(self):
         """Video chunks + audio chunks scattered to correct positions."""
+        m = _qwen2_5_omni_thinker_mod()
         hidden = 4
         input_ids, is_multimodal = make_interleaved_seq([3, 3], [2, 2])
 
@@ -299,7 +312,7 @@ class TestMergeInterleavedEmbeddings:
             torch.full((num_audio, hidden), 10.0),
         ]
 
-        result = merge_interleaved_embeddings(
+        result = m.merge_interleaved_embeddings(
             inputs_embeds,
             mm_embeds,
             is_video,

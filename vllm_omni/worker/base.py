@@ -110,7 +110,7 @@ class OmniGPUWorkerBase(GPUWorker):
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             self.model_runner.profile_run()
             if current_omni_platform.is_rocm():
-                torch.cuda.synchronize()
+                torch.accelerator.synchronize()
             return kv_cache_memory_bytes
 
         with memory_profiling(

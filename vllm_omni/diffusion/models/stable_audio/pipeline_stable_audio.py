@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
+from typing import ClassVar
 
 import torch
 from diffusers import AutoencoderOobleck
@@ -74,6 +75,13 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         od_config: OmniDiffusion configuration object
         prefix: Weight prefix for loading (default: "")
     """
+
+    # Picked up by ``supports_audio_output`` in the diffusion engine so the
+    # default stage metadata reports ``final_output_type="audio"`` and the
+    # ``multimodal_output`` payload includes the sample rate (mirrors the
+    # contract introduced for AudioX in #2077).
+    support_audio_output: ClassVar[bool] = True
+    audio_sample_rate: ClassVar[int] = 44100
 
     def __init__(
         self,

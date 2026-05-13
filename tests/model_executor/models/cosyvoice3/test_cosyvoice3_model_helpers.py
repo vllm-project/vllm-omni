@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
+import functools
 from threading import Lock
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
@@ -11,10 +15,19 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.logits_processor.state import LogitsProcessors
 from vllm.v1.sample.metadata import SamplingMetadata
 
-from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
-from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+if TYPE_CHECKING:
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
+
+
+@functools.lru_cache(maxsize=1)
+def _cosyvoice3_model_and_runner():
+    """Defer heavy Omni/vLLM imports until a test runs (avoids duplicate CustomOp init)."""
+    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
+    return CosyVoice3Model, GPUARModelRunner
 
 
 class _DummyCode2Wav:
@@ -59,6 +72,7 @@ def _make_code2wav_model(
     num_samples: int = 32,
     outputs: list[tuple[torch.Tensor, dict[str, object] | None]] | None = None,
 ) -> CosyVoice3Model:
+    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
     model.model_stage = "cosyvoice3_code2wav"
@@ -79,6 +93,7 @@ def _make_code2wav_model(
 
 
 def _make_talker_model() -> CosyVoice3Model:
+    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
     model.model_stage = "cosyvoice3_talker"
@@ -124,12 +139,14 @@ def _make_sampling_metadata(
 
 
 def test_split_request_ids_uses_seq_token_counts():
+    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
     ids = torch.tensor([10, 11, 12, 13, 14], dtype=torch.long)
     chunks = CosyVoice3Model._split_request_ids(ids, [2, 2, 2])
     assert [c.tolist() for c in chunks] == [[10, 11], [12, 13], [14]]
 
 
 def test_split_request_ids_honors_single_request_seq_token_counts():
+    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
     ids = torch.tensor([10, 11, 12, 13, 14], dtype=torch.long)
     chunks = CosyVoice3Model._split_request_ids(ids, [3])
     assert [c.tolist() for c in chunks] == [[10, 11, 12]]
@@ -147,11 +164,12 @@ def test_forward_prefers_token_offset_when_present():
 
     runtime_info = [
         {
-            "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
-            "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
-            "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
-            "token_offset": 2,
-            "left_context_size": 1,
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+                "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
+            },
+            "meta": {"left_context_size": 2},
         }
     ]
 
@@ -176,10 +194,12 @@ def test_forward_falls_back_to_left_context_size_for_backward_compat():
 
     runtime_info = [
         {
-            "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
-            "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
-            "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
-            "left_context_size": 2,
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+                "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
+            },
+            "meta": {"left_context_size": 2},
         }
     ]
 
@@ -197,10 +217,12 @@ def test_forward_ignores_single_request_padded_tail_tokens():
     model = _make_code2wav_model(with_stride_cfg=True)
     runtime_info = [
         {
-            "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
-            "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
-            "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
-            "token_offset": 0,
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+                "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
+            },
+            "meta": {"left_context_size": 0},
         }
     ]
 
@@ -221,10 +243,12 @@ def test_forward_uses_non_stream_decode_without_chunk_metadata():
 
     runtime_info = [
         {
-            "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
-            "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
-            "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
-            "prefix_ids": [101, 102],
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+                "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
+            },
+            "ids": {"prompt": [101, 102]},
             "generated_len": 3,
         }
     ]
@@ -258,12 +282,16 @@ def test_forward_reuses_streaming_cache_state_between_chunks():
     )
     runtime_info = [
         {
-            "req_id": ["rid-stream"],
-            "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
-            "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
-            "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
-            "token_offset": 0,
-            "stream_finished": torch.tensor(False),
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+                "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
+            },
+            "meta": {
+                "req_id": ["rid-stream"],
+                "stream_finished": torch.tensor(False),
+                "left_context_size": 0,
+            },
         }
     ]
 
@@ -304,12 +332,16 @@ def test_forward_clears_streaming_cache_on_terminal_chunk():
     )
     runtime_info = [
         {
-            "req_id": ["rid-stream"],
-            "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
-            "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
-            "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
-            "token_offset": 0,
-            "stream_finished": torch.tensor(False),
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+                "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
+            },
+            "meta": {
+                "req_id": ["rid-stream"],
+                "stream_finished": torch.tensor(False),
+                "left_context_size": 0,
+            },
         }
     ]
 
@@ -321,7 +353,7 @@ def test_forward_clears_streaming_cache_on_terminal_chunk():
     )
     assert "rid-stream" in model._stream_vocoder_cache_by_req
 
-    runtime_info[0]["stream_finished"] = torch.tensor(True)
+    runtime_info[0]["meta"]["stream_finished"] = torch.tensor(True)
     out = model.forward(
         input_ids=torch.tensor([0, 1, 2], dtype=torch.long),
         positions=torch.tensor([0, 1, 2], dtype=torch.long),
@@ -376,6 +408,7 @@ def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
         def update_async_output_token_ids(self):
             self.updated = True
 
+    _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
     runner.model = SimpleNamespace(
@@ -407,6 +440,7 @@ def test_gpu_ar_model_runner_supplies_req_output_history_to_model_sampler():
         def update_async_output_token_ids(self):
             raise AssertionError("fallback async repair should not run for model sampler path")
 
+    _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
     runner.model = SimpleNamespace(
@@ -446,6 +480,7 @@ def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
         def update_async_output_token_ids(self):
             raise AssertionError("fallback async repair should not run for model sampler path")
 
+    _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
     runner.model = SimpleNamespace(

@@ -77,8 +77,14 @@ def test_stable_audio_quantization_and_teacache() -> None:
 
     CI should provide ``HF_TOKEN`` if the checkpoint is gated.
     """
+    # ``model_class_name`` must be passed explicitly: the default-stage-cfg
+    # factory in ``async_omni_engine.py`` reads it out of ``kwargs`` when
+    # deciding ``final_output_type`` (#2077), and at construction time the
+    # auto-resolution from ``model_index.json`` has not run yet. AudioX's
+    # offline test follows the same pattern.
     m = Omni(
         model="stabilityai/stable-audio-open-1.0",
+        model_class_name="StableAudioPipeline",
         quantization="fp8",
         cache_backend="tea_cache",
         cache_config={"rel_l1_thresh": 0.2},

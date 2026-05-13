@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -94,3 +95,24 @@ def test_inline_shutdown(client, mock_engine):
 
     assert client._shutting_down
     mock_engine.close.assert_called_once()
+
+
+def test_inline_client_requires_replica_id(mock_engine):
+    metadata = SimpleNamespace(
+        stage_id=0,
+        final_output=True,
+        final_output_type="image",
+        default_sampling_params={},
+        requires_multimodal_data=False,
+        custom_process_input_func=None,
+        engine_input_source=[],
+    )
+    with patch.object(InlineStageDiffusionClient, "_enrich_config"):
+        od_config = MagicMock(spec=OmniDiffusionConfig)
+        with pytest.raises(AttributeError, match="replica_id"):
+            InlineStageDiffusionClient(
+                model="test_model",
+                od_config=od_config,
+                metadata=metadata,
+                batch_size=1,
+            )

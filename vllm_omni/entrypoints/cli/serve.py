@@ -188,6 +188,12 @@ class OmniServeCommand(CLISubcommand):
             help="Select and launch a single stage by stage_id.",
         )
         omni_config_group.add_argument(
+            "--replica-id",
+            type=int,
+            default=0,
+            help="Replica id to register when launching a single headless stage.",
+        )
+        omni_config_group.add_argument(
             "--stage-init-timeout",
             type=int,
             default=300,
@@ -332,6 +338,16 @@ class OmniServeCommand(CLISubcommand):
                 'Example: \'{"method":"gguf","gguf_model":"/path/to/model.gguf"}\'.'
             ),
         )
+        omni_config_group.add_argument(
+            "--force-cutlass-fp8",
+            action="store_true",
+            default=None,
+            help=(
+                "Diffusion-only runtime override for ModelOpt FP8 checkpoints: "
+                "force CUTLASS FP8 linear kernels on CUDA SM89+ devices. "
+                "Ignored for BF16, non-ModelOpt FP8, ROCm, and older CUDA GPUs."
+            ),
+        )
 
         # HSDP (Hybrid Sharded Data Parallel) parameters
         omni_config_group.add_argument(
@@ -352,6 +368,32 @@ class OmniServeCommand(CLISubcommand):
             type=int,
             default=1,
             help="Number of replica groups for HSDP. Each group holds a full sharded copy.",
+        )
+
+        # Attention backend configuration
+        omni_config_group.add_argument(
+            "--diffusion-attention-backend",
+            dest="diffusion_attention_backend",
+            type=str,
+            default=None,
+            help="Diffusion attention backend (shorthand). "
+            "Sets the default backend for all diffusion attention roles, e.g. 'FLASH_ATTN'. "
+            "May be combined with --diffusion-attention-config.per_role.* overrides, "
+            "but mutually exclusive with --diffusion-attention-config.default.backend.",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-attention-config",
+            "-dac",
+            dest="diffusion_attention_config",
+            type=json.loads,
+            default=None,
+            help="Diffusion attention config. Accepts JSON or vLLM-style dotted flags. "
+            "Examples: "
+            "--diffusion-attention-config.default.backend FLASH_ATTN, "
+            "--diffusion-attention-config.per_role.self.backend SPARSE_BLOCK, "
+            "--diffusion-attention-config.per_role.cross.backend SAGE_ATTN, "
+            '--diffusion-attention-config \'{"default": {"backend": "FLASH_ATTN"}, '
+            '"per_role": {"cross": {"backend": "SAGE_ATTN"}}}\'.',
         )
 
         # Cache optimization parameters
@@ -429,6 +471,27 @@ class OmniServeCommand(CLISubcommand):
             type=float,
             default=None,
             help="Scheduler flow_shift for video models (e.g., 5.0 for 720p, 12.0 for 480p).",
+        )
+        # vLLM already registers --kv-cache-dtype for the serve parser. Keep
+        # this fallback only for older vLLM versions where the option is absent.
+        if "--kv-cache-dtype" not in serve_parser._option_string_actions:
+            omni_config_group.add_argument(
+                "--kv-cache-dtype",
+                type=str,
+                default=None,
+                help="Config-level KV cache dtype (e.g. fp8).",
+            )
+        omni_config_group.add_argument(
+            "--kv-cache-skip-steps",
+            type=str,
+            default=None,
+            help="Config-level KV-cache quantization skip-step selector, e.g. '0-9,20,25-30'.",
+        )
+        omni_config_group.add_argument(
+            "--kv-cache-skip-layers",
+            type=str,
+            default=None,
+            help="Config-level KV-cache quantization skip-layer selector, e.g. '0,1,4-8'.",
         )
         omni_config_group.add_argument(
             "--cfg-parallel-size",
@@ -529,14 +592,18 @@ def run_headless(args: argparse.Namespace) -> None:
 
     model = args.model
     stage_id: int | None = args.stage_id
+    replica_id: int = args.replica_id
     omni_master_address: str | None = args.omni_master_address
     omni_master_port: int | None = args.omni_master_port
 
     if stage_id is None:
         raise ValueError("--stage-id is required in headless mode")
+    if replica_id < 0:
+        raise ValueError("--replica-id must be >= 0 in headless mode")
     if omni_master_address is None or omni_master_port is None:
         raise ValueError("--omni-master-address and --omni-master-port are required in headless mode")
-    if getattr(args, "api_server_count", 0) and args.api_server_count > 1:
+    api_server_count = args.api_server_count or 0
+    if api_server_count > 1:
         raise ValueError("api_server_count can't be set in headless mode")
     if args.worker_backend != "multi_process":
         raise ValueError("headless mode requires worker_backend=multi_process")
@@ -547,25 +614,25 @@ def run_headless(args: argparse.Namespace) -> None:
         model,
         args_dict.get("stage_configs_path"),
         args_dict,
+        deploy_config_path=args_dict.get("deploy_config"),
     )
 
     # Locate the stage config that matches stage_id.
     stage_cfg = None
     for cfg in stage_configs:
-        if getattr(cfg, "stage_id", None) == stage_id:
+        if cfg.stage_id == stage_id:
             stage_cfg = cfg
             break
     if stage_cfg is None:
         raise ValueError(
-            f"No stage config found for stage_id={stage_id}. "
-            f"Available stage ids: {[getattr(c, 'stage_id', None) for c in stage_configs]}"
+            f"No stage config found for stage_id={stage_id}. Available stage ids: {[c.stage_id for c in stage_configs]}"
         )
 
     prepare_engine_environment()
     omni_transfer_config = load_omni_transfer_config_for_model(model, config_path)
     omni_conn_cfg, omni_from, omni_to = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
 
-    if getattr(stage_cfg, "stage_type", "llm") == "diffusion":
+    if stage_cfg.stage_type == "diffusion":
         metadata = extract_stage_metadata(stage_cfg)
         if omni_conn_cfg:
             inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
@@ -573,8 +640,9 @@ def run_headless(args: argparse.Namespace) -> None:
         od_config = build_diffusion_config(model, stage_cfg, metadata)
 
         logger.info(
-            "[Headless] Launching diffusion stage %d via OmniMasterServer at %s:%d",
+            "[Headless] Launching diffusion stage %d replica %d via OmniMasterServer at %s:%d",
             stage_id,
+            replica_id,
             omni_master_address,
             omni_master_port,
         )
@@ -587,6 +655,7 @@ def run_headless(args: argparse.Namespace) -> None:
                 omni_stage_id=stage_id,
                 omni_stage_config=stage_cfg,
                 return_addresses=True,
+                replica_id=replica_id,
             )
             proc, _, _, _ = spawn_diffusion_proc(
                 model,
@@ -595,13 +664,13 @@ def run_headless(args: argparse.Namespace) -> None:
                 request_address=request_address,
                 response_address=response_address,
             )
-            complete_diffusion_handshake(proc, handshake_address)
+            complete_diffusion_handshake(proc, handshake_address, args.stage_init_timeout)
             proc.join()
             if proc.exitcode not in (None, 0):
-                raise RuntimeError(f"Diffusion stage {stage_id} exited with code {proc.exitcode}")
+                raise RuntimeError(f"Diffusion stage {stage_id} replica {replica_id} exited with code {proc.exitcode}")
             return
         finally:
-            logger.info("[Headless] Shutting down stage %d.", stage_id)
+            logger.info("[Headless] Shutting down stage %d replica %d.", stage_id, replica_id)
             if proc is not None and proc.is_alive():
                 terminate_alive_proc(proc)
 
@@ -617,6 +686,7 @@ def run_headless(args: argparse.Namespace) -> None:
         stage_cfg,
         model,
         stage_connector_spec=stage_connector_spec,
+        cli_tokenizer=getattr(args, "tokenizer", None),
     )
 
     # Inject omni KV connector config so the engine runner can initialize the
@@ -677,15 +747,17 @@ def run_headless(args: argparse.Namespace) -> None:
             enable_wave_coordination=vllm_config.model_config.is_moe,
         )
         logger.info(
-            "[Headless] Started DP Coordinator process for stage %d (PID: %d)",
+            "[Headless] Started DP Coordinator process for stage %d replica %d (PID: %d)",
             stage_id,
+            replica_id,
             coordinator.proc.pid,
         )
 
     logger.info(
-        "[Headless] Launching %d engine core(s) for stage %d via OmniMasterServer at %s:%d",
+        "[Headless] Launching %d engine core(s) for stage %d replica %d via OmniMasterServer at %s:%d",
         local_engine_count,
         stage_id,
+        replica_id,
         omni_master_address,
         omni_master_port,
     )
@@ -700,11 +772,12 @@ def run_headless(args: argparse.Namespace) -> None:
         omni_stage_id=stage_id,
         omni_stage_config=stage_cfg,
         coordinator=coordinator,
+        replica_id=replica_id,
     )
 
     engine_manager = None
-    log_stats = bool(getattr(args, "log_stats", False))
-    if getattr(args, "disable_log_stats", False):
+    log_stats = bool(args.log_stats)
+    if args.disable_log_stats:
         log_stats = False
 
     try:

@@ -15,9 +15,9 @@ import torch
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni import Omni
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-DEFAULT_STAGE_CONFIGS_PATH = str(REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "voxcpm2.yaml")
 SAMPLE_RATE = 48_000
 
 
@@ -42,10 +42,11 @@ def parse_args():
         help="Directory for output WAV files.",
     )
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         type=str,
-        default=DEFAULT_STAGE_CONFIGS_PATH,
-        help="Path to the stage config YAML file.",
+        default=None,
+        help="Override the deploy config path. If unset, auto-loads "
+        "vllm_omni/deploy/voxcpm2.yaml based on the HF model_type.",
     )
     parser.add_argument(
         "--ref-audio",
@@ -59,6 +60,7 @@ def parse_args():
         default=None,
         help="Optional transcript of --ref-audio (enables continuation mode).",
     )
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 
@@ -94,7 +96,7 @@ def main():
 
     engine = Omni(
         model=args.model,
-        stage_configs_path=args.stage_configs_path,
+        deploy_config=args.deploy_config,
     )
 
     from transformers import AutoTokenizer

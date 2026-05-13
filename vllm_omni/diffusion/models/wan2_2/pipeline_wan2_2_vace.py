@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
@@ -188,9 +189,13 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         vace_context: torch.Tensor | None,
         vace_context_scale: float,
     ) -> torch.Tensor:
+        if attention_kwargs is None:
+            attention_kwargs = {}
         with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
+            for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
+                set_forward_context_denoise_step_idx(step_idx)
+
                 latent_model_input = latents.to(dtype)
                 timestep = t.expand(latents.shape[0])
 
