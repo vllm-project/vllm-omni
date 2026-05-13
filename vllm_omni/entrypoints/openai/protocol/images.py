@@ -135,7 +135,7 @@ class ImageGenerationRequest(BaseModel):
         ),
     )
     
-     # vllm-omni extension for model-specific parameters
+    # vllm-omni extension for model-specific parameters
     extra_args: dict[str, Any] | None = Field(
         default=None,
         description=(
