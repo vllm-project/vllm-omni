@@ -495,7 +495,7 @@ def run_fault_injection_with_rate_load(
     request_rate: float = 0.3,
     submit_interval_sec: float | None = None,
     completion_timeout_sec: float = 120.0,
-) -> None:
+) -> dict[str, Any]:
     """Submit requests with a fixed rate, then inject fault once an in-flight request is observed."""
     if num_requests <= 0:
         raise ValueError("num_requests must be > 0")
@@ -540,6 +540,26 @@ def run_fault_injection_with_rate_load(
             "some in-flight-load requests did not converge after fault injection: "
             f"pending={len(pending)} done={len(done)}"
         )
+    failure_observed = False
+    completed = 0
+    success = 0
+    exceptions = 0
+    for future in futures:
+        completed += 1
+        try:
+            future.result()
+            success += 1
+        except Exception:  # noqa: BLE001
+            exceptions += 1
+            failure_observed = True
+    return {
+        "num_submitted": num_requests,
+        "completed": completed,
+        "success": success,
+        "exceptions": exceptions,
+        "failure_observed": failure_observed,
+        "inflight_observed": True,
+    }
 
 
 def list_alive_pids(pids: Sequence[int]) -> list[int]:

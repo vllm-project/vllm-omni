@@ -68,6 +68,40 @@ PROCESS_KILL_ERROR_KEYWORDS = (
     "500",
     "503",
 )
+SERVE_SIGNAL_PARAMS = [
+    pytest.param("SIGTERM", id="sigterm"),
+    pytest.param("SIGINT", id="sigint"),
+    pytest.param("SIGKILL", id="sigkill"),
+]
+WORKER_SIGNAL_FAULT_PARAMS = [
+    pytest.param(
+        make_process_kill_fault_injector(
+            grep_patterns="multiprocessing.spawn",
+            signal_name="SIGTERM",
+            limit=1,
+            post_kill_wait_seconds=2.0,
+        ),
+        id="runtime_process_chain_sigterm",
+    ),
+    pytest.param(
+        make_process_kill_fault_injector(
+            grep_patterns="multiprocessing.spawn",
+            signal_name="SIGINT",
+            limit=1,
+            post_kill_wait_seconds=2.0,
+        ),
+        id="runtime_process_chain_sigint",
+    ),
+    pytest.param(
+        make_process_kill_fault_injector(
+            grep_patterns="multiprocessing.spawn",
+            signal_name="SIGKILL",
+            limit=1,
+            post_kill_wait_seconds=2.0,
+        ),
+        id="runtime_process_chain_sigkill",
+    ),
+]
 
 WAN_PARAMS = create_reliability_omni_server_params(RELIABILITY_SCENARIOS, E2E_STAGE_CONFIGS_DIR)
 DIFFUSION_VIDEO_PARAMS = [param for param in WAN_PARAMS if supports_video_generation(param.model)]
@@ -92,6 +126,51 @@ def _video_request_config() -> dict[str, Any]:
         "image_reference": image_data_url,
         "stream": False,
     }
+
+
+def _assert_post_fault_video_fast_fail(host: str, port: int, *, scenario: str) -> None:
+    url = f"http://{host}:{port}/v1/videos"
+    payload = {
+        "prompt": "post-fault fast-fail check",
+        "width": "512",
+        "height": "512",
+        "fps": "8",
+        "num_frames": "8",
+        "num_inference_steps": "4",
+    }
+    start = time.monotonic()
+    try:
+        response = requests.post(
+            url,
+            data=payload,
+            headers={"Accept": "application/json"},
+            timeout=20,
+        )
+        elapsed = time.monotonic() - start
+        assert elapsed < 15, f"[{scenario} fast_fail] /v1/videos did not fail fast: {elapsed:.2f}s"
+        assert response.status_code >= 500, (
+            f"[{scenario} fast_fail] expected server-side error after fault, "
+            f"got status={response.status_code}, body={response.text[:200]!r}"
+        )
+    except Exception:  # noqa: BLE001
+        elapsed = time.monotonic() - start
+        assert elapsed < 15, f"[{scenario} fast_fail] exception was too slow after fault: {elapsed:.2f}s"
+
+
+def _assert_post_fault_health_terminal(host: str, port: int, *, scenario: str) -> None:
+    deadline = time.monotonic() + 20.0
+    last_observation = ""
+    while time.monotonic() < deadline:
+        try:
+            status, body = get_health_raw(host, port, timeout_sec=5)
+            last_observation = f"http={status}, body={body[:200]!r}"
+            if status == 503:
+                return
+        except Exception as exc:  # noqa: BLE001
+            last_observation = f"exception={exc!r}"
+            return
+        time.sleep(0.5)
+    pytest.fail(f"[{scenario} health] no terminal post-fault health observed: {last_observation}")
 
 
 @pytest.mark.slow
@@ -138,17 +217,7 @@ def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server_funct
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize(
     "fault_injector",
-    [
-        pytest.param(
-            make_process_kill_fault_injector(
-                grep_patterns="multiprocessing.spawn",
-                signal_name="SIGKILL",
-                limit=1,
-                post_kill_wait_seconds=2.0,
-            ),
-            id="runtime_process_chain",
-        ),
-    ],
+    WORKER_SIGNAL_FAULT_PARAMS,
     indirect=True,
 )
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
@@ -184,17 +253,7 @@ def test_reliability_fault_process_kill_video_request_failure(
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize(
     "fault_injector",
-    [
-        pytest.param(
-            make_process_kill_fault_injector(
-                grep_patterns="multiprocessing.spawn",
-                signal_name="SIGKILL",
-                limit=1,
-                post_kill_wait_seconds=2.0,
-            ),
-            id="runtime_process_chain",
-        ),
-    ],
+    WORKER_SIGNAL_FAULT_PARAMS,
     indirect=True,
 )
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
@@ -428,23 +487,34 @@ def test_reliability_video_oom_recovers_after_fault_removed(
 
 
 @pytest.mark.slow
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_serve_root_video_no_worker_residual_and_gpu_release(
     omni_server_function,
     openai_client_function,
+    signal_name: str,
 ) -> None:
-    """Black-box: during an in-flight video request, kill serve root and verify cleanup."""
+    """Black-box: during in-flight video requests, kill serve root and verify post-fault behavior/cleanup."""
     request_config = _video_request_config()
-    injector = make_server_root_kill_fault_injector(signal_name="SIGKILL", post_kill_wait_seconds=2.0)
-    run_fault_injection_with_rate_load(
+    scenario = f"kill_serve_root_{signal_name.lower()}"
+    injector = make_server_root_kill_fault_injector(signal_name=signal_name, post_kill_wait_seconds=2.0)
+    load_result = run_fault_injection_with_rate_load(
         submit_request=lambda: openai_client_function.send_video_diffusion_request(request_config, request_num=1),
         inject_fault=lambda: injector(omni_server_function),
         num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
         request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
         completion_timeout_sec=120.0,
     )
-    assert_no_worker_residual_and_gpu_release(omni_server_function, scenario="kill_serve_root_only")
+    assert load_result["failure_observed"], (
+        f"[{scenario}] expected at least one load request failure after fault; load_result={load_result}"
+    )
+    host = omni_server_function.host
+    port = omni_server_function.port
+    _assert_post_fault_video_fast_fail(host, port, scenario=scenario)
+    _assert_post_fault_health_terminal(host, port, scenario=scenario)
+    assert_no_worker_residual_and_gpu_release(omni_server_function, scenario=scenario)
 
 
 @pytest.mark.slow
@@ -454,18 +524,26 @@ def test_reliability_fault_process_kill_tree_video_no_worker_residual_and_gpu_re
     omni_server_function,
     openai_client_function,
 ) -> None:
-    """Black-box: during an in-flight video request, kill server process tree and verify cleanup."""
+    """Black-box: during in-flight video requests, kill server process tree and verify post-fault behavior/cleanup."""
     request_config = _video_request_config()
+    scenario = "kill_server_tree_sigkill"
     injector = make_server_tree_kill_fault_injector(
         signal_name="SIGKILL",
         post_kill_wait_seconds=2.0,
         inter_kill_wait_seconds=0.1,
     )
-    run_fault_injection_with_rate_load(
+    load_result = run_fault_injection_with_rate_load(
         submit_request=lambda: openai_client_function.send_video_diffusion_request(request_config, request_num=1),
         inject_fault=lambda: injector(omni_server_function),
         num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
         request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
         completion_timeout_sec=120.0,
     )
-    assert_no_worker_residual_and_gpu_release(omni_server_function, scenario="kill_server_tree")
+    assert load_result["failure_observed"], (
+        f"[{scenario}] expected at least one load request failure after fault; load_result={load_result}"
+    )
+    host = omni_server_function.host
+    port = omni_server_function.port
+    _assert_post_fault_video_fast_fail(host, port, scenario=scenario)
+    _assert_post_fault_health_terminal(host, port, scenario=scenario)
+    assert_no_worker_residual_and_gpu_release(omni_server_function, scenario=scenario)
