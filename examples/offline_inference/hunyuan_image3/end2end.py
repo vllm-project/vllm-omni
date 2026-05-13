@@ -136,7 +136,7 @@ def main():
     if task not in _TASK_PRESETS:
         valid_bot_tasks = {
             "text2img": ["think", "recaption", "vanilla"],
-            "img2img": ["think", "recaption"],
+            "img2img": ["think", "recaption", "think_recaption"],
             "img2text": ["auto"],
             "text2text": ["auto"],
         }[args.modality]

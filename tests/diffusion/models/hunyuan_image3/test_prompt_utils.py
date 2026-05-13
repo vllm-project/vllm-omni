@@ -78,6 +78,7 @@ def test_available_tasks_covers_all_modalities():
         "i2t",
         "it2i_think",
         "it2i_recaption",
+        "it2i_think_recaption",
         "t2i_think",
         "t2i_recaption",
         "t2i_vanilla",
@@ -99,6 +100,7 @@ def test_resolve_stop_token_ids_uses_answer_for_generation_tasks():
         "i2t",
         "it2i_think",
         "it2i_recaption",
+        "it2i_think_recaption",
         "t2i_think",
         "t2i_recaption",
     ],
@@ -125,7 +127,7 @@ def test_build_prompt_string_structure_chat_template(task: str):
     # documentation, so substring index() catches the wrong occurrence -- use
     # endswith() which directly captures "trigger is at the tail" (the Part A
     # fix: trigger goes AFTER `Assistant: `, not before user_prompt).
-    if task in ("it2i_think", "t2i_think"):
+    if task in ("it2i_think", "t2i_think", "it2i_think_recaption"):
         assert s.endswith("Assistant: <think>"), (
             f"Trigger <think> must be appended right after `Assistant: ` (Part A fix). Got tail: ...{s[-40:]!r}"
         )
