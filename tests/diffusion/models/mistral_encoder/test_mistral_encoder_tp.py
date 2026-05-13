@@ -87,6 +87,7 @@ def setup_tp_group(monkeypatch, mocker):
         f"{_MODULE}.tensor_model_parallel_all_gather",
         _identity,
     )
+    mocker.patch("torch.distributed.broadcast")
 
     with set_current_vllm_config(VllmConfig(device_config=device_config)):
         yield
@@ -153,10 +154,11 @@ class TestRoPEInitialization:
     def test_cos_sin_shape_and_identity(self):
         rope = MistralRotaryEmbedding(head_dim=8, max_position_embeddings=512, rope_theta=1000000.0)
         seq_len = 16
-        cos, sin = rope(seq_len, device=torch.device("cpu"), dtype=torch.float32)
+        position_ids = torch.arange(seq_len).unsqueeze(0)
+        cos, sin = rope(position_ids, torch.float32)
 
-        assert cos.shape == (seq_len, 8)
-        assert sin.shape == (seq_len, 8)
+        assert cos.shape == (1, seq_len, 8)
+        assert sin.shape == (1, seq_len, 8)
         assert torch.allclose(cos**2 + sin**2, torch.ones_like(cos), atol=1e-6)
 
     def test_model_rope_uses_config_theta(self):
@@ -218,18 +220,20 @@ class TestWeightLoading:
         expected_dim = 2 * (intermediate_size // 2)
         assert mlp.gate_up_proj.weight.shape == (expected_dim, hidden_size)
 
-    def test_skips_lm_head_and_vision(self):
+    def test_skips_vision_but_loads_lm_head(self):
         config = _make_config(num_hidden_layers=1)
         model = MistralEncoderModel(config, prefix="text_encoder")
 
         weights = [
-            ("lm_head.weight", torch.randn(256, 64)),
+            ("language_model.lm_head.weight", torch.randn(256, 64)),
             ("vision_tower.encoder.weight", torch.randn(64, 64)),
             ("multi_modal_projector.linear.weight", torch.randn(64, 64)),
         ]
 
         loaded = model.load_weights(weights)
-        assert len(loaded) == 0
+        assert any("lm_head" in p for p in loaded)
+        assert not any("vision_tower" in p for p in loaded)
+        assert not any("multi_modal_projector" in p for p in loaded)
 
     def test_unknown_weights_ignored(self):
         config = _make_config(num_hidden_layers=1)
@@ -282,8 +286,8 @@ class TestKVCache:
             prefix="test",
         )
         hidden = torch.randn(1, 4, 64)
-        cos = torch.ones(4, 8)
-        sin = torch.zeros(4, 8)
+        cos = torch.ones(1, 4, 8)
+        sin = torch.zeros(1, 4, 8)
         out, kv = attn(hidden, cos, sin, use_cache=False)
         assert kv is None
         assert out.shape == (1, 4, 64)
@@ -301,8 +305,8 @@ class TestKVCache:
             prefix="test",
         )
         hidden = torch.randn(1, 4, 64)
-        cos = torch.ones(4, 8)
-        sin = torch.zeros(4, 8)
+        cos = torch.ones(1, 4, 8)
+        sin = torch.zeros(1, 4, 8)
         out, kv = attn(hidden, cos, sin, use_cache=True)
         assert kv is not None
         k, v = kv
@@ -324,14 +328,14 @@ class TestKVCache:
         )
         # Simulate a prefill with 4 tokens
         hidden = torch.randn(1, 4, 64)
-        cos = torch.ones(4, 8)
-        sin = torch.zeros(4, 8)
+        cos = torch.ones(1, 4, 8)
+        sin = torch.zeros(1, 4, 8)
         _, kv = attn(hidden, cos, sin, use_cache=True)
 
         # Simulate a decode step with 1 token
         hidden_new = torch.randn(1, 1, 64)
-        cos_new = torch.ones(1, 8)
-        sin_new = torch.zeros(1, 8)
+        cos_new = torch.ones(1, 1, 8)
+        sin_new = torch.zeros(1, 1, 8)
         out, kv2 = attn(hidden_new, cos_new, sin_new, past_key_value=kv, use_cache=True)
         k2, v2 = kv2
         assert k2.shape == (1, 2, 5, 8), "should be past(4) + new(1)"
@@ -381,19 +385,22 @@ class TestRoPEOffset:
 
     def test_offset_zero_matches_original(self):
         rope = MistralRotaryEmbedding(head_dim=8, max_position_embeddings=512, rope_theta=1000000.0)
-        cos_a, sin_a = rope(4, device=torch.device("cpu"), dtype=torch.float32)
-        cos_b, sin_b = rope(4, device=torch.device("cpu"), dtype=torch.float32, offset=0)
+        position_ids = torch.arange(4).unsqueeze(0)
+        cos_a, sin_a = rope(position_ids, torch.float32)
+        cos_b, sin_b = rope(position_ids, torch.float32)
         assert torch.allclose(cos_a, cos_b)
         assert torch.allclose(sin_a, sin_b)
 
     def test_offset_produces_shifted_positions(self):
         rope = MistralRotaryEmbedding(head_dim=8, max_position_embeddings=512, rope_theta=1000000.0)
         # Full sequence of 5 positions
-        cos_full, sin_full = rope(5, device=torch.device("cpu"), dtype=torch.float32)
-        # Position 4 only (offset=4, seq_len=1)
-        cos_off, sin_off = rope(1, device=torch.device("cpu"), dtype=torch.float32, offset=4)
-        assert torch.allclose(cos_full[4:5], cos_off)
-        assert torch.allclose(sin_full[4:5], sin_off)
+        full_ids = torch.arange(5).unsqueeze(0)
+        cos_full, sin_full = rope(full_ids, torch.float32)
+        # Position 4 only
+        offset_ids = torch.tensor([[4]])
+        cos_off, sin_off = rope(offset_ids, torch.float32)
+        assert torch.allclose(cos_full[:, 4:5], cos_off)
+        assert torch.allclose(sin_full[:, 4:5], sin_off)
 
 
 class TestGenerate:
@@ -461,7 +468,7 @@ class TestGenerate:
 
 
 class TestComputeLogits:
-    """Verify logits computation via tied embed_tokens weight."""
+    """Verify logits computation via lm_head weight."""
 
     def test_logits_shape(self):
         config = _make_config(num_hidden_layers=1, vocab_size=256)
