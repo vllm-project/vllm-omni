@@ -1074,17 +1074,6 @@ class StageConfigFactory:
         if trust_remote_code is None:
             trust_remote_code = False
 
-        # Explicit deploy YAMLs are authoritative for pipeline selection.
-        # This keeps online serving from falling back to a default single
-        # diffusion stage when HF model_type auto-detection fails or reports a
-        # model_type that is not the vLLM-Omni pipeline key.
-        if deploy_config_path is not None:
-            deploy_path = Path(deploy_config_path)
-            if deploy_path.exists():
-                deploy_cfg = load_deploy_config(deploy_path)
-                if deploy_cfg.pipeline is not None:
-                    return cls._create_from_registry(deploy_cfg.pipeline, cli_overrides, deploy_config_path)
-
         # --- New path: check pipeline registry by model_type first ---
         model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
         if model_type and model_type in _PIPELINE_REGISTRY:
