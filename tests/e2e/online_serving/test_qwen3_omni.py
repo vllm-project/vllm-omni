@@ -230,3 +230,34 @@ def test_thinker_prefix_caching(omni_server, openai_client, run_level) -> None:
             greedy_token = uncached_response.logprobs[idx].token
             cached_top_k = {lp.token for lp in cached_response.logprobs[idx].top_logprobs}
             assert greedy_token in cached_top_k
+
+
+@pytest.mark.advanced_model
+@pytest.mark.core_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", prefix_test_params, indirect=True)
+def test_thinker_prefix_caching_audio_output(omni_server, openai_client) -> None:
+    """
+    Verify that thinker prefix caching does not hang when the request
+    produces audio output (text + audio modalities).  This exercises the
+    pooler_output path with prefix-cached multimodal tensors flowing through
+    the full thinker -> talker -> code2wav pipeline.
+
+    Regression test for https://github.com/vllm-project/vllm-omni/issues/3510
+    """
+    messages = dummy_messages_from_mix_data(
+        system_prompt=get_system_prompt(),
+        content_text=get_prompt(),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": True,
+        "key_words": {
+            "audio": ["test"],
+        },
+    }
+
+    openai_client.send_omni_request(request_config, request_num=1)
