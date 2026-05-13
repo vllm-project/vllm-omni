@@ -2016,28 +2016,13 @@ def _get_diffusion_od_config(raw_request: Request, engine_client: Any) -> Any:
 def _get_max_edit_input_images(raw_request: Request, engine_client: Any) -> int | None:
     od_config = _get_diffusion_od_config(raw_request, engine_client)
     if od_config is None:
-        # Preserve the existing compatibility behavior when the diffusion
-        # config is not exposed on the serving surface.
         return None
-
-    supports_multimodal_inputs = getattr(od_config, "supports_multimodal_inputs", None)
-    if not isinstance(supports_multimodal_inputs, bool):
-        # Older serving surfaces and mocked engines may expose a placeholder
-        # object instead of a real diffusion config. Treat that as "unknown"
-        # so existing single-image flows keep working.
-        return None
-
-    if not supports_multimodal_inputs:
-        return 1
 
     max_input_images = getattr(od_config, "max_multimodal_image_inputs", None)
-    if max_input_images is None:
-        return None
-    if isinstance(max_input_images, bool) or not isinstance(max_input_images, Integral):
-        return None
-    if max_input_images < 1:
-        return None
-    return int(max_input_images)
+    if isinstance(max_input_images, Integral) and not isinstance(max_input_images, bool) and max_input_images >= 1:
+        return int(max_input_images)
+
+    return None
 
 
 def _get_lora_from_json_str(lora_body):

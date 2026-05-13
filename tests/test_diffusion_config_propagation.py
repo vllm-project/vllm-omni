@@ -117,5 +117,5 @@ def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
 
     od_config.update_multimodal_support()
 
-    assert od_config.supports_multimodal_inputs is True
     assert od_config.max_multimodal_image_inputs == QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
+    assert od_config.max_multimodal_image_inputs > 1

@@ -229,7 +229,7 @@ def async_omni_test_client():
             self.captured_sampling_params_list = None
             self.captured_prompt = None
             self._images = [Image.new("RGB", (64, 64), color="green")]
-            self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
+            self.od_config = SimpleNamespace(max_multimodal_image_inputs=4)
 
         async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
             if sampling_params_list is not None:
@@ -293,7 +293,7 @@ def async_omni_rgba_test_client():
             self.captured_sampling_params_list = None
             self.captured_prompt = None
             self._images = [Image.new("RGBA", (64, 64), color=(0, 255, 0, 128))]
-            self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
+            self.od_config = SimpleNamespace(max_multimodal_image_inputs=4)
 
         async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
             if sampling_params_list is not None:
@@ -357,7 +357,7 @@ def async_omni_stage_configs_only_client():
             self.captured_sampling_params_list = None
             self.captured_prompt = None
             self._images = [Image.new("RGB", (64, 64), color="green")]
-            self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
+            self.od_config = SimpleNamespace(max_multimodal_image_inputs=4)
 
         async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
             if sampling_params_list is not None:
@@ -604,7 +604,7 @@ def test_generate_images_async_omni_glm_image_sets_stage0_max_tokens():
             self.captured_sampling_params_list = None
             self.captured_prompt = None
             self._images = [Image.new("RGB", (64, 64), color="green")]
-            self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
+            self.od_config = SimpleNamespace(max_multimodal_image_inputs=4)
 
         async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
             self.captured_sampling_params_list = (
@@ -1065,7 +1065,7 @@ def test_image_edit_rejects_multiple_images_when_model_does_not_support_them(asy
     img_bytes_2 = make_test_image_bytes((32, 32))
 
     engine = async_omni_test_client.app.state.engine_client
-    engine.get_diffusion_od_config = lambda: SimpleNamespace(supports_multimodal_inputs=False)
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(max_multimodal_image_inputs=1)
 
     response = async_omni_test_client.post(
         "/v1/images/edits",
@@ -1100,7 +1100,6 @@ def test_image_edit_rejects_model_mismatch(test_client):
 def test_image_edit_rejects_too_many_images_for_qwen_image_edit_2511(async_omni_test_client):
     engine = async_omni_test_client.app.state.engine_client
     engine.get_diffusion_od_config = lambda: SimpleNamespace(
-        supports_multimodal_inputs=True,
         max_multimodal_image_inputs=4,
     )
 
@@ -1128,7 +1127,6 @@ def test_image_edit_rejects_too_many_images_for_qwen_image_edit_2511_before_load
 
     engine = async_omni_test_client.app.state.engine_client
     engine.get_diffusion_od_config = lambda: SimpleNamespace(
-        supports_multimodal_inputs=True,
         max_multimodal_image_inputs=4,
     )
 
@@ -1157,8 +1155,7 @@ def test_image_edit_rejects_too_many_images_for_qwen_image_edit_2511_before_load
 def test_image_edit_ignores_mock_like_multimodal_limit(async_omni_test_client):
     engine = async_omni_test_client.app.state.engine_client
     engine.get_diffusion_od_config = lambda: SimpleNamespace(
-        supports_multimodal_inputs=SimpleNamespace(),
-        max_multimodal_image_inputs=SimpleNamespace(),
+        max_multimodal_image_inputs=None,
     )
 
     response = async_omni_test_client.post(

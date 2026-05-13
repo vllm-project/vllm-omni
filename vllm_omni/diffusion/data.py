@@ -545,7 +545,7 @@ class OmniDiffusionConfig:
 
     # Support multi-image inputs and expose any model-specific request limit
     # through a generic config field so serving code stays model-agnostic.
-    supports_multimodal_inputs: bool = False
+    # None = unknown, no restriction; 1 = single image only; N>1 = max N images.
     max_multimodal_image_inputs: int | None = None
 
     log_level: str = "info"
@@ -776,10 +776,7 @@ class OmniDiffusionConfig:
         self._propagate_quantization_from_tf_config(tf_config)
 
     def update_multimodal_support(self) -> None:
-        # Resolve serving-visible multimodal behavior from shared metadata
-        # instead of importing concrete pipeline modules into the config layer.
         metadata = get_diffusion_model_metadata(self.model_class_name)
-        self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
         self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
 
     def enrich_config(self) -> None:
