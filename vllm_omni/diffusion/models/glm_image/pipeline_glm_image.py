@@ -154,7 +154,9 @@ def get_glm_image_post_process_func(od_config: OmniDiffusionConfig):
 
     image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
 
-    def post_process_func(images: torch.Tensor) -> list[PIL.Image.Image]:
+    def post_process_func(images: torch.Tensor | dict) -> list[PIL.Image.Image] | dict:
+        if isinstance(images, dict):
+            return images
         return image_processor.postprocess(images, output_type="pil")
 
     return post_process_func
@@ -255,6 +257,20 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
     4. VAE decodes final latents to image
     """
 
+    _GLM_IMAGE_PROFILER_TARGETS = [
+        "forward",
+        "forward_full_or_denoise",
+        "forward_vae_decode",
+        "encode_prompt",
+        "prepare_latents",
+        "diffuse",
+        "decode_latents",
+        "vae.encode",
+        "vae.decode",
+        "text_encoder.forward",
+        "tokenizer.forward",
+    ]
+
     def __init__(
         self,
         *,
@@ -274,59 +290,130 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         else:
             model_path = download_weights_from_hf_specific(model, od_config.revision, ["*"])
 
-        # Load scheduler
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model_path, subfolder="scheduler", local_files_only=True
-        )
+        self.model_stage = str(getattr(od_config, "model_stage", "dit") or "dit").lower()
+        self.is_full = self.model_stage in {"dit", "diffusion", "full"}
+        self.is_denoise_only = self.model_stage == "dit_denoise"
+        self.is_vae_decode_only = self.model_stage == "vae_decode"
 
-        # Load text encoder (T5 for glyph embeddings)
-        logger.info("Loading T5EncoderModel (glyph encoder)...")
-        self.text_encoder = T5EncoderModel.from_pretrained(
-            model_path,
-            subfolder="text_encoder",
-            local_files_only=True,
-            torch_dtype=torch.bfloat16,
-        ).to(self.device)
-        self.text_encoder.eval()
-
-        # Load tokenizer for glyph encoding
-        self.tokenizer = ByT5Tokenizer.from_pretrained(model_path, subfolder="tokenizer", local_files_only=True)
-
-        # Load VAE
-        logger.info("Loading AutoencoderKL (VAE)...")
-        self.vae = AutoencoderKL.from_pretrained(
-            model_path, subfolder="vae", local_files_only=True, torch_dtype=torch.bfloat16
-        ).to(self.device)
-        self.vae.eval()
-
-        # Load transformer (DiT)
-        logger.info("Loading GlmImageTransformer2DModel (DiT)...")
-        self.transformer = GlmImageTransformer2DModel(
-            od_config=od_config,
-            quant_config=od_config.quantization_config,
-        )
-
-        # Weight sources for DiT loading
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="transformer",
-                revision=od_config.revision,
-                prefix="transformer.",
-                fall_back_to_pt=True,
-            )
-        ]
-
-        # Configure scale factors
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.vae_config = self._load_vae_config(model_path)
+        block_out_channels = self.vae_config.get("block_out_channels", [128, 256, 512, 512])
+        self.vae_scale_factor = 2 ** (len(block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.default_sample_size = 128
 
-        # Get transformer config for patch size
-        self._patch_size = getattr(self.transformer, "patch_size", 2)
-        self.setup_diffusion_pipeline_profiler(
-            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        load_scheduler = self.is_full or self.is_denoise_only
+        load_text_encoder = self.is_full or self.is_denoise_only
+        load_transformer = self.is_full or self.is_denoise_only
+        load_vae = self.is_full or self.is_vae_decode_only
+
+        self.scheduler = None
+        if load_scheduler:
+            self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+                model_path, subfolder="scheduler", local_files_only=True
+            )
+
+        self.text_encoder = None
+        self.tokenizer = None
+        if load_text_encoder:
+            logger.info("Loading T5EncoderModel (glyph encoder)...")
+            self.text_encoder = T5EncoderModel.from_pretrained(
+                model_path,
+                subfolder="text_encoder",
+                local_files_only=True,
+                torch_dtype=torch.bfloat16,
+            ).to(self.device)
+            self.text_encoder.eval()
+
+            self.tokenizer = ByT5Tokenizer.from_pretrained(model_path, subfolder="tokenizer", local_files_only=True)
+
+        self.vae = None
+        if load_vae:
+            logger.info("Loading AutoencoderKL (VAE)...")
+            self.vae = AutoencoderKL.from_pretrained(
+                model_path, subfolder="vae", local_files_only=True, torch_dtype=torch.bfloat16
+            ).to(self.device)
+            self.vae.eval()
+
+        self.transformer = None
+        if load_transformer:
+            logger.info("Loading GlmImageTransformer2DModel (DiT)...")
+            self.transformer = GlmImageTransformer2DModel(
+                od_config=od_config,
+                quant_config=od_config.quantization_config,
+            )
+
+            # Weight sources for DiT loading
+            self.weights_sources = [
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=od_config.model,
+                    subfolder="transformer",
+                    revision=od_config.revision,
+                    prefix="transformer.",
+                    fall_back_to_pt=True,
+                )
+            ]
+            self._patch_size = getattr(self.transformer, "patch_size", 2)
+        else:
+            self.weights_sources = []
+            self._patch_size = 2
+
+        logger.info(
+            "Initialized GLM-Image stage '%s' on %s (full=%s denoise_only=%s vae_decode_only=%s)",
+            self.model_stage,
+            self.device,
+            self.is_full,
+            self.is_denoise_only,
+            self.is_vae_decode_only,
         )
+
+        self.setup_diffusion_pipeline_profiler(
+            profiler_targets=self._GLM_IMAGE_PROFILER_TARGETS,
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler,
+        )
+
+    def _load_vae_config(self, model_path: str) -> dict[str, object]:
+        vae_config_path = os.path.join(model_path, "vae", "config.json")
+        with open(vae_config_path) as f:
+            return json.load(f)
+
+    def _latent_channels(self) -> int:
+        return int(self.vae_config.get("latent_channels", 16))
+
+    @staticmethod
+    def _is_warmup_request(req: OmniDiffusionRequest) -> bool:
+        request_ids = getattr(req, "request_ids", None) or ()
+        return len(request_ids) == 1 and request_ids[0] == "dummy_req_id"
+
+    def _make_dummy_latents(
+        self,
+        *,
+        height: int,
+        width: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        latent_height = max(1, height // self.vae_scale_factor)
+        latent_width = max(1, width // self.vae_scale_factor)
+        vae_dtype = next(self.vae.parameters()).dtype if self.vae is not None else torch.float32
+        return torch.zeros(
+            (1, self._latent_channels(), latent_height, latent_width),
+            device=device,
+            dtype=vae_dtype,
+        )
+
+    def _latents_mean_std(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        latent_channels = self._latent_channels()
+        latents_mean = (
+            torch.tensor(self.vae_config["latents_mean"]).view(1, latent_channels, 1, 1).to(device=device, dtype=dtype)
+        )
+        latents_std = (
+            torch.tensor(self.vae_config["latents_std"]).view(1, latent_channels, 1, 1).to(device=device, dtype=dtype)
+        )
+        return latents_mean, latents_std
 
     # ==================== Input Validation ====================
 
@@ -384,6 +471,8 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """Get glyph embeddings from T5 encoder for text rendering."""
+        if self.text_encoder is None or self.tokenizer is None:
+            raise RuntimeError("GLM-Image glyph encoder is not loaded in this stage")
         device = device or self.device
         dtype = dtype or self.text_encoder.dtype
 
@@ -504,6 +593,8 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         Returns:
             Denoised latents ready for VAE decode
         """
+        if self.scheduler is None or self.transformer is None:
+            raise RuntimeError("GLM-Image denoise stage requires scheduler and transformer")
         # Prepare conditional/unconditional drop flags
         prior_token_drop_cond = torch.full_like(prior_token_id, False, dtype=torch.bool)
         prior_token_drop_uncond = torch.full_like(prior_token_id, True, dtype=torch.bool)
@@ -624,20 +715,13 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         Returns:
             GlmImageKVCache with cached KV states from condition images
         """
+        if self.vae is None or self.transformer is None:
+            raise RuntimeError("Image-edit KV-cache preparation requires both VAE and transformer")
         kv_caches = self.transformer.create_kv_cache()
         kv_caches.set_mode("write")
 
         # Prepare VAE normalization parameters
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.latent_channels, 1, 1)
-            .to(device=self.device, dtype=prompt_embeds.dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std)
-            .view(1, self.vae.config.latent_channels, 1, 1)
-            .to(device=self.device, dtype=prompt_embeds.dtype)
-        )
+        latents_mean, latents_std = self._latents_mean_std(device=self.device, dtype=prompt_embeds.dtype)
 
         # Process each condition image through transformer to populate KV cache
         for condition_image, condition_prior_token_id in zip(condition_images, prior_token_image_ids):
@@ -669,17 +753,35 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         return kv_caches
 
+    def decode_latents(
+        self,
+        latents: torch.Tensor,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        if self.vae is None:
+            raise RuntimeError("VAE is not loaded in this GLM-Image stage")
+
+        latents = latents.to(device=self.device, dtype=self.vae.dtype)
+        latents_mean, latents_std = self._latents_mean_std(device=latents.device, dtype=latents.dtype)
+        latents = latents * latents_std + latents_mean
+        return self.vae.decode(latents, return_dict=False, generator=generator)[0]
+
+    def _build_generator(self, seed: int | None) -> torch.Generator | None:
+        if seed is None:
+            return None
+        return torch.Generator(device=self.device).manual_seed(seed)
+
     @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
-        """
-        Main generation forward pass.
+        """Main generation forward pass."""
+        if self.is_vae_decode_only:
+            return self.forward_vae_decode(req)
+        return self.forward_full_or_denoise(req)
 
-        Args:
-            req: OmniDiffusionRequest with generation parameters
-
-        Returns:
-            DiffusionOutput containing generated image
-        """
+    @torch.inference_mode()
+    def forward_full_or_denoise(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        """Run the default full path or denoise-only split path."""
         if len(req.prompts) > 1:
             logger.warning(
                 """This model only supports a single prompt, not a batched request.""",
@@ -748,9 +850,7 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         batch_size = 1
         do_classifier_free_guidance = guidance_scale > 1.0
 
-        generator = None
-        if req.sampling_params.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
+        generator = self._build_generator(req.sampling_params.seed)
 
         # 1. Get prior tokens - either from external source (multistage) or generate internally
         # Check if prior_token_ids are provided externally (from AR stage in multistage mode)
@@ -833,6 +933,8 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             raise ValueError(
                 "Image edit (i2i) requires req.extra['prior_token_image_ids'] from the AR stage to build KV cache."
             )
+        if is_image_edit and self.is_denoise_only:
+            raise ValueError("GLM-Image VAE split MVP currently supports text-to-image only")
         if is_image_edit and prior_token_image_ids is not None:
             kv_caches = self._prepare_condition_image_kv_cache(
                 condition_images=preprocessed_images,
@@ -888,27 +990,73 @@ class GlmImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             kv_caches=kv_caches,
         )
 
-        # 8. VAE decode
-        latents = latents.to(self.vae.dtype)
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean)
-            .view(1, self.vae.config.latent_channels, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std)
-            .view(1, self.vae.config.latent_channels, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents = latents * latents_std + latents_mean
-        image = self.vae.decode(latents, return_dict=False, generator=generator)[0]
+        if self.is_denoise_only:
+            latent_payload = {
+                "latents": latents.detach().cpu(),
+                "height": height,
+                "width": width,
+                "seed": req.sampling_params.seed,
+            }
+            return DiffusionOutput(
+                output={"video": [], "custom_output": latent_payload},
+                custom_output=latent_payload,
+                stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+            )
+
+        image = self.decode_latents(latents, generator=generator)
 
         return DiffusionOutput(
             output=image, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
         )
 
+    @torch.inference_mode()
+    def forward_vae_decode(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        """Decode final latents produced by the denoise-only split stage."""
+        if len(req.prompts) > 1:
+            logger.warning("GLM-Image VAE decode stage only supports a single prompt; taking the first request.")
+
+        first_prompt = req.prompts[0]
+        extra = req.sampling_params.extra_args
+        if isinstance(first_prompt, dict):
+            extra = first_prompt.get("extra", {}) or extra
+
+        latents = extra.get("latents")
+        if latents is None:
+            if self._is_warmup_request(req):
+                height = int(extra.get("height") or req.sampling_params.height or 512)
+                width = int(extra.get("width") or req.sampling_params.width or 512)
+                logger.info(
+                    "Synthesizing dummy latents for GLM-Image VAE decode warmup: %sx%s",
+                    height,
+                    width,
+                )
+                latents = self._make_dummy_latents(height=height, width=width, device=self.device)
+            else:
+                raise ValueError("GLM-Image VAE decode stage expects 'latents' from the denoise stage")
+
+        if not isinstance(latents, torch.Tensor):
+            latents = torch.as_tensor(latents)
+
+        seed = extra.get("seed", req.sampling_params.seed)
+        generator = self._build_generator(seed)
+        image = self.decode_latents(latents, generator=generator)
+        return DiffusionOutput(
+            output=image,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load transformer weights."""
+        """Report checkpoint-backed weights for the active split path.
+
+        GLM-Image loads some components directly via ``from_pretrained()``
+        during pipeline construction. For split VAE-decode stages we still
+        need to report those parameters as checkpoint-initialized so the
+        strict loader validation does not treat them as missing.
+        """
+        if self.transformer is None:
+            if self.vae is not None:
+                return {f"vae.{name}" for name, _ in self.vae.named_parameters()}
+            return set()
         transformer_weights = (
             (name.replace("transformer.", "", 1), weight) for name, weight in weights if name.startswith("transformer.")
         )

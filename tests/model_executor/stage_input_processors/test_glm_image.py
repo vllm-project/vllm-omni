@@ -8,12 +8,14 @@ import pytest
 import torch
 
 from vllm_omni.model_executor.stage_input_processors.glm_image import (
+    _extract_latent_payload,
     _first_source_image,
     _has_source_image,
     _parse_generated_tokens,
     _upsample_token_ids,
     ar2diffusion,
     compute_max_tokens,
+    latent2vae,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -387,3 +389,31 @@ class TestAr2Diffusion:
         assert len(result) == 2
         assert result[0]["prompt"] == "first"
         assert result[1]["prompt"] == "second"
+
+
+class TestLatent2Vae:
+    def test_extract_latent_payload_from_custom_output(self):
+        payload = {"latents": torch.zeros((1, 16, 64, 64)), "height": 1024, "width": 1024, "seed": 42}
+        source_output = SimpleNamespace(custom_output=payload)
+        assert _extract_latent_payload(source_output) is payload
+
+    def test_latent2vae_from_custom_output(self):
+        latents = torch.zeros((1, 16, 64, 64))
+        source_output = SimpleNamespace(
+            request_id="req-1",
+            custom_output={"latents": latents, "height": 1024, "width": 1024, "seed": 42},
+        )
+
+        outputs = latent2vae([source_output])
+
+        assert len(outputs) == 1
+        assert outputs[0]["prompt"] == "vae decode"
+        assert outputs[0]["height"] == 1024
+        assert outputs[0]["width"] == 1024
+        assert torch.equal(outputs[0]["extra"]["latents"], latents)
+        assert outputs[0]["extra"]["seed"] == 42
+
+    def test_latent2vae_missing_latents_raises(self):
+        source_output = SimpleNamespace(request_id="req-2", custom_output={"height": 1024})
+        with pytest.raises(ValueError, match="expects denoise stage output"):
+            latent2vae([source_output])
