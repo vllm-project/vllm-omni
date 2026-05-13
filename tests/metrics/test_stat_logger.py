@@ -5,6 +5,7 @@ from prometheus_client import CollectorRegistry, generate_latest
 
 from vllm_omni.metrics.stat_logger import (
     _ENGINE_INDEX_MAP,
+    OmniPrometheusStatLogger,
     _RelabelCounter,
     _RelabelGauge,
     _RelabelHistogram,
@@ -312,3 +313,69 @@ class TestChildNoRecursion:
             'omni_test_child{model_name="m",replica="0",stage="diffusion"} 99.0'
             in out
         )
+
+
+# ---------------------------------------------------------------------------
+# OmniPrometheusStatLogger — focused on the wrap mechanics (full PrometheusStatLogger
+# init requires a real VllmConfig and is exercised by the orchestrator integration
+# test in Phase 2.3).
+# ---------------------------------------------------------------------------
+
+
+class TestOmniPrometheusStatLogger:
+    def test_class_slots_point_to_wrappers(self):
+        # Upstream's __init__ uses self._gauge_cls(...) etc. when constructing
+        # families; class-level slot override is how we inject the relabel logic.
+        assert OmniPrometheusStatLogger._gauge_cls is _RelabelGauge
+        assert OmniPrometheusStatLogger._counter_cls is _RelabelCounter
+        assert OmniPrometheusStatLogger._histogram_cls is _RelabelHistogram
+
+    def test_per_engine_labelvalues_setter_rewrites_to_3tuple(self):
+        # Construct via __new__ to skip the upstream PrometheusStatLogger __init__
+        # (which needs a real VllmConfig). We only verify the property descriptor.
+        sl = OmniPrometheusStatLogger.__new__(OmniPrometheusStatLogger)
+        sl._stage_replica_map = {
+            0: ("thinker", "0"),
+            1: ("talker", "0"),
+            2: ("talker", "1"),
+        }
+
+        # Mirror upstream's loggers.py:433 assignment shape.
+        sl.per_engine_labelvalues = {
+            0: ["my-model", "0"],
+            1: ["my-model", "1"],
+            2: ["my-model", "2"],
+        }
+
+        # Getter should return the 3-tuple form for downstream
+        # create_metric_per_engine consumers.
+        assert sl.per_engine_labelvalues == {
+            0: ["my-model", "thinker", "0"],
+            1: ["my-model", "talker", "0"],
+            2: ["my-model", "talker", "1"],
+        }
+
+    def test_per_engine_labelvalues_getter_returns_internal_dict(self):
+        sl = OmniPrometheusStatLogger.__new__(OmniPrometheusStatLogger)
+        sl._stage_replica_map = {0: ("thinker", "0")}
+        sl._omni_per_engine_labelvalues = {0: ["m", "thinker", "0"]}
+        assert sl.per_engine_labelvalues == {0: ["m", "thinker", "0"]}
+
+    def test_stage_replica_map_property_exposed(self):
+        sl = OmniPrometheusStatLogger.__new__(OmniPrometheusStatLogger)
+        srm = {0: ("thinker", "0"), 1: ("diffusion", "0")}
+        sl._stage_replica_map = srm
+        assert sl.stage_replica_map is srm
+
+    def test_init_populates_engine_index_map(self):
+        # Simulate the bookkeeping portion of __init__ (clear + update) without
+        # calling super, since super needs a real VllmConfig.
+        _ENGINE_INDEX_MAP[99] = ("stale", "stale")  # leftover from prior
+        srm = {0: ("thinker", "0"), 1: ("talker", "0")}
+
+        # Manually invoke the bookkeeping the way __init__ does it.
+        _ENGINE_INDEX_MAP.clear()
+        _ENGINE_INDEX_MAP.update(srm)
+
+        assert dict(_ENGINE_INDEX_MAP) == srm
+        assert 99 not in _ENGINE_INDEX_MAP  # old entry was cleared

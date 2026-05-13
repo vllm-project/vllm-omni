@@ -12,6 +12,8 @@ everything together lands in Phase 2.2.
 from __future__ import annotations
 
 from prometheus_client import Counter, Gauge, Histogram
+from vllm.config import VllmConfig
+from vllm.v1.metrics.loggers import PrometheusStatLogger
 
 # Process-wide translation table written by OmniPrometheusStatLogger at init.
 # Keys are flat engine_idx values (as upstream PrometheusStatLogger sees them);
@@ -114,3 +116,60 @@ class _RelabelCounter(_RelabelMixin, Counter):
 
 class _RelabelHistogram(_RelabelMixin, Histogram):
     pass
+
+
+class OmniPrometheusStatLogger(PrometheusStatLogger):
+    """Wrap upstream PrometheusStatLogger to expose per-(stage, replica) labels.
+
+    Replaces the upstream single ``engine`` label with two labels ``stage`` and
+    ``replica`` so that the ~37 ``vllm:*`` metric families gain per-replica
+    visibility for multi-replica deployments. See RFC §3.2.7.
+
+    The orchestrator builds ``stage_replica_map`` from the static stage_pools
+    config; flat engine_idx values map 1:1 to (stage_name, replica_id) tuples.
+    Dynamic add/remove of replicas at runtime is intentionally not supported
+    in this iteration — see RFC §3.4 risks.
+    """
+
+    # Inject our wrapper metric classes into upstream's class-level slots so
+    # every ~37 family is created with `engine` rewritten to `stage`+`replica`.
+    _gauge_cls = _RelabelGauge
+    _counter_cls = _RelabelCounter
+    _histogram_cls = _RelabelHistogram
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        stage_replica_map: dict[int, tuple[str, str]],
+    ) -> None:
+        self._stage_replica_map = stage_replica_map
+        # Populate the process-level translation table that wrapper metric
+        # classes consult on every `.labels()` call. Cleared first so a
+        # second OmniPrometheusStatLogger in the same process (e.g. tests,
+        # orchestrator restart) starts from a clean slate.
+        _ENGINE_INDEX_MAP.clear()
+        _ENGINE_INDEX_MAP.update(stage_replica_map)
+        super().__init__(
+            vllm_config=vllm_config,
+            engine_indexes=list(stage_replica_map.keys()),
+        )
+
+    @property
+    def stage_replica_map(self) -> dict[int, tuple[str, str]]:
+        return self._stage_replica_map
+
+    @property
+    def per_engine_labelvalues(self) -> dict[int, list[object]]:
+        return self._omni_per_engine_labelvalues
+
+    @per_engine_labelvalues.setter
+    def per_engine_labelvalues(self, value: dict[int, list[object]]) -> None:
+        # Upstream sets {idx: [model_name, str(idx)]} (loggers.py:433); we drop
+        # the engine str and append (stage, replica) so labelvalues match the
+        # 3-element labelnames our wrapper classes produce.
+        rewritten: dict[int, list[object]] = {}
+        for idx, vals in value.items():
+            model_name = vals[0]
+            stage, replica = self._stage_replica_map[idx]
+            rewritten[idx] = [model_name, stage, replica]
+        self._omni_per_engine_labelvalues = rewritten
