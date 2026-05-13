@@ -22,27 +22,22 @@ connectors:
 
 stages:
   - stage_id: 0
-    devices: "0,1,2,3"
+    final_output: true
+    final_output_type: text
     max_num_seqs: 1
-    requires_multimodal_data: true  # AR needs the original image
-    gpu_memory_utilization: 0.8
+    gpu_memory_utilization: 0.95
     enforce_eager: true
-    engine_output_type: latent  # AR outputs latent for DiT
-    enable_prefix_caching: false
-    max_num_batched_tokens: 8192
-    tensor_parallel_size: 4
-    pipeline_parallel_size: 1
-    omni_kv_config:
-      need_send_cache: true
+    max_num_batched_tokens: 32768
+    devices: "0,1"
+    tensor_parallel_size: 2
     hf_overrides:
       rope_parameters:
         mrope_section: [0, 32, 32]
         rope_type: default
-    is_comprehension: false  # Generation task, not comprehension
-    final_output: true
-    final_output_type: text
+    omni_kv_config:
+      need_send_cache: true
     output_connectors:
-      to_stage_1: shared_memory_connector
+      to_stage_1: rdma_connector
     default_sampling_params:
       temperature: 0.0
       top_p: 1
@@ -51,28 +46,21 @@ stages:
       detokenize: true
       skip_special_tokens: false
 
-  # Stage 1: Diffusion (DiT + VAE)
-  # Receives latents from AR stage, performs denoising + VAE decode
   - stage_id: 1
-    devices: "4,5,6,7"
     max_num_seqs: 1
-    requires_multimodal_data: true  # May need condition images
     enforce_eager: true
+    devices: "2,3"
     distributed_executor_backend: "mp"
     omni_kv_config:
-      need_recv_cache: true  # Receive AR KV cache from stage 0
+      need_recv_cache: true
     parallel_config:
-      tensor_parallel_size: 4
+      tensor_parallel_size: 2
       enable_expert_parallel: true
-    engine_input_source: [0]  # Input from AR stage
-    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.hunyuan_image3.ar2diffusion
-    final_output: true
-    final_output_type: image
+    input_connectors:
+      from_stage_0: rdma_connector
     default_sampling_params:
       num_inference_steps: 50
       guidance_scale: 0
-    input_connectors:
-      from_stage_0: shared_memory_connector
 
 edges:
   - from: 0
@@ -94,7 +82,9 @@ platforms:
         max_num_batched_tokens: 8192
         parallel_config:
           tensor_parallel_size: 4
-          enable_expert_parallel: true
+          enable_expert_parallel: false
+          sequence_parallel_size: 1
+          ulysses_degree: 1
 
   xpu:
     stages:
