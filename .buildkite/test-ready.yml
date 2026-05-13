@@ -217,7 +217,7 @@ steps:
   - group: ":card_index_dividers: E2E Test"
     depends_on: upload-ready-pipeline
     steps:
-      - label: "RLHF · VERL-Omni E2E Test"
+      - label: "RLHF · VeRL-Omni E2E Test"
         commands:
           - |
             timeout 20m bash -c "
