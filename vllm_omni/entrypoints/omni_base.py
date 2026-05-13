@@ -21,6 +21,7 @@ from vllm_omni.entrypoints.utils import coerce_param_message_types, get_final_st
 from vllm_omni.metrics.modality import OmniModalityMetrics, observe_modality_at_finalize
 from vllm_omni.metrics.prometheus import OmniPrometheusMetrics
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
+from vllm_omni.metrics.transfer import OmniTransferMetrics
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -189,6 +190,7 @@ class OmniBase(PDDisaggregationMixin):
         self.request_states: dict[str, ClientRequestState] = {}
         self.prom_metrics = OmniPrometheusMetrics(model_name=model)
         self.mod_metrics = OmniModalityMetrics(model_name=model)
+        self.transfer_metrics = OmniTransferMetrics(model_name=model)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
         if not self.output_modalities:

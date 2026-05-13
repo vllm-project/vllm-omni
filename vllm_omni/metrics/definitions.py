@@ -93,7 +93,11 @@ SUCCESS_LABELS = ("model_name", "finished_reason")
 STAGE_LABELS = ("model_name", "stage", "replica")
 
 # Cross-stage transfer label set (G3). Field names match TransferEdgeStats.
-TRANSFER_LABELS = ("from_stage", "from_replica", "to_stage", "to_replica")
+# model_name is included (deviating from RFC §3.2.6 which lists only the four
+# stage/replica labels) so transfer aligns with the rest of the omni_* family
+# naming and PromQL joins on model_name work uniformly across audio/image/
+# video/transfer.
+TRANSFER_LABELS = ("model_name", "from_stage", "from_replica", "to_stage", "to_replica")
 
 
 # ============================================================================

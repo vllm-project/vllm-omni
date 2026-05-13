@@ -5,11 +5,14 @@ from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
 from vllm_omni.metrics.utils import _build_field_defs, _build_row, _format_table
+
+if TYPE_CHECKING:
+    from vllm_omni.metrics.transfer import OmniTransferMetrics
 
 logger = init_logger(__name__)
 
@@ -121,6 +124,9 @@ class OrchestratorAggregator:
         log_stats: bool,
         wall_start_ts: float,
         final_stage_id_for_e2e: dict[str, int] | int,
+        *,
+        transfer_emitter: OmniTransferMetrics | None = None,
+        replica_resolver: Callable[[int, str], int | None] | None = None,
     ) -> None:
         self.num_stages = int(num_stages)
         self.log_stats = bool(log_stats)
@@ -131,6 +137,12 @@ class OrchestratorAggregator:
             tuple[int, int, str], TransferEdgeStats
         ] = {}  # Key: (from_stage, to_stage, request_id)
         self.e2e_events: list[RequestE2EStats] = []
+        # Phase 4 G3: emit per-physical-transfer Histogram observations to
+        # Prometheus alongside the existing TransferEdgeStats accumulation.
+        # Both deps are optional so OrchestratorAggregator stays usable in
+        # contexts that don't have a Prometheus registry (e.g. unit tests).
+        self._transfer_emitter = transfer_emitter
+        self._replica_resolver = replica_resolver
 
     def init_run_state(self, wall_start_ts: float) -> None:
         # Per-run aggregates and timing state
@@ -191,6 +203,14 @@ class OrchestratorAggregator:
             evt.size_bytes += int(size_bytes)
             evt.tx_time_ms += float(tx_time_ms)
             evt.used_shm = evt.used_shm or bool(used_shm)
+            # Phase 4 G3: emit per-physical-transfer Histogram observations.
+            self._emit_transfer_tx(
+                from_stage=int(from_stage),
+                to_stage=int(to_stage),
+                request_id=str(request_id),
+                size_bytes=int(size_bytes),
+                tx_time_ms=float(tx_time_ms),
+            )
             return evt
         except Exception:
             return None
@@ -212,9 +232,76 @@ class OrchestratorAggregator:
                 evt.size_bytes = int(stats.rx_transfer_bytes)
             evt.rx_decode_time_ms += float(stats.rx_decode_time_ms)
             evt.in_flight_time_ms += float(stats.rx_in_flight_time_ms)
+            # Phase 4 G3: emit per-physical-receive Histogram observations.
+            self._emit_transfer_rx(
+                from_stage=from_stage,
+                to_stage=to_stage,
+                request_id=rid_key,
+                rx_decode_time_ms=float(stats.rx_decode_time_ms),
+                in_flight_time_ms=float(stats.rx_in_flight_time_ms),
+            )
             return evt
         except Exception:
             return None
+
+    # ------------------------------------------------------------------
+    # Prometheus emit hooks (Phase 4 G3). Both helpers are no-ops when
+    # transfer_emitter or replica_resolver is None, or when the resolver
+    # cannot find a (stage_id, request_id) -> replica_id mapping. We
+    # deliberately fail-safe (skip) rather than emit a series with a wrong
+    # or invented replica label.
+    # ------------------------------------------------------------------
+
+    def _resolve_edge_replicas(
+        self, from_stage: int, to_stage: int, request_id: str
+    ) -> tuple[int, int] | None:
+        if self._replica_resolver is None:
+            return None
+        from_r = self._replica_resolver(from_stage, request_id)
+        to_r = self._replica_resolver(to_stage, request_id)
+        if from_r is None or to_r is None:
+            return None
+        return from_r, to_r
+
+    def _emit_transfer_tx(
+        self,
+        *,
+        from_stage: int,
+        to_stage: int,
+        request_id: str,
+        size_bytes: int,
+        tx_time_ms: float,
+    ) -> None:
+        if self._transfer_emitter is None:
+            return
+        replicas = self._resolve_edge_replicas(from_stage, to_stage, request_id)
+        if replicas is None:
+            return
+        from_r, to_r = replicas
+        self._transfer_emitter.observe_size(from_stage, from_r, to_stage, to_r, size_bytes)
+        self._transfer_emitter.observe_tx_time(from_stage, from_r, to_stage, to_r, tx_time_ms)
+
+    def _emit_transfer_rx(
+        self,
+        *,
+        from_stage: int,
+        to_stage: int,
+        request_id: str,
+        rx_decode_time_ms: float,
+        in_flight_time_ms: float,
+    ) -> None:
+        if self._transfer_emitter is None:
+            return
+        replicas = self._resolve_edge_replicas(from_stage, to_stage, request_id)
+        if replicas is None:
+            return
+        from_r, to_r = replicas
+        self._transfer_emitter.observe_rx_decode_time(
+            from_stage, from_r, to_stage, to_r, rx_decode_time_ms
+        )
+        self._transfer_emitter.observe_in_flight_time(
+            from_stage, from_r, to_stage, to_r, in_flight_time_ms
+        )
 
     def record_audio_generated_frames(
         self,
