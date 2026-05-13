@@ -167,7 +167,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
 
             self.omni_prefix_cache.update_omni_tensor_prefix_cache(
                 hidden_states=hidden_states,
-                multimodal_outputs=multimodal_outputs,
+                multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
                 slot_mapping=self.input_batch.block_table[0].slot_mapping.cpu,
                 num_tokens_padded=num_tokens_padded,
@@ -190,7 +190,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
                 query_start_loc=self.query_start_loc.cpu,
                 input_batch=self.input_batch,
-                multimodal_outputs=multimodal_outputs,
+                multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
                 num_scheduled_tokens=num_scheduled_tokens,
             )
         return combined_hidden_states, combined_multimodal_outputs
