@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import copy
 import gc
+import json
+import os
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -28,7 +31,11 @@ HEIGHT, WIDTH = 1024, 1024
 PSNR_THRESHOLD = 0.0
 SSIM_THRESHOLD = 0.0
 CLIP_SCORE_THRESHOLD = 20.0
+QUANT_CLIP_SCORE_DROP_THRESHOLD = float(os.environ.get("HUNYUAN_IMAGE3_QUANT_CLIP_SCORE_DROP_THRESHOLD", "5.0"))
 PROMPT = "A brown and white dog is running on the grass."
+QUANT_BF16_ENV = "HUNYUAN_IMAGE3_BF16_MODEL"
+QUANT_FP8_ENV = "HUNYUAN_IMAGE3_FP8_MODEL"
+QUANT_NVFP4_ENV = "HUNYUAN_IMAGE3_NVFP4_MODEL"
 
 # fmt: off
 _BASE_CONFIG = {
@@ -78,11 +85,78 @@ _BASE_CONFIG = {
 }
 # fmt: on
 
+_QUANT_DIT_CONFIG = {
+    "stage_args": [
+        {
+            "stage_id": 0,
+            "stage_type": "diffusion",
+            "runtime": {
+                "devices": "0,1",
+                "max_batch_size": 1,
+            },
+            "engine_args": {
+                "model_stage": "dit",
+                "enforce_eager": True,
+                "trust_remote_code": True,
+                "distributed_executor_backend": "mp",
+                "force_cutlass_fp8": True,
+                "moe_backend": "cutlass",
+                "parallel_config": {
+                    "tensor_parallel_size": 2,
+                    "enable_expert_parallel": True,
+                },
+                "omni_kv_config": {"need_recv_cache": True},
+            },
+            "final_output": True,
+            "final_output_type": "image",
+            "is_comprehension": False,
+            "default_sampling_params": {"seed": SEED},
+        }
+    ],
+    "runtime": {"enabled": True},
+}
+
+
+@dataclass(frozen=True)
+class _QuantAccuracyCase:
+    name: str
+    model_env: str
+    nvfp4_backend: str | None = None
+
+
+def _quant_accuracy_cases() -> list[pytest.ParameterSet]:
+    cases = [
+        _QuantAccuracyCase(name="fp8", model_env=QUANT_FP8_ENV),
+        _QuantAccuracyCase(name="mixed_nvfp4", model_env=QUANT_NVFP4_ENV, nvfp4_backend="cutlass"),
+    ]
+    params: list[pytest.ParameterSet] = []
+    for case in cases:
+        marks = []
+        if not os.environ.get(case.model_env):
+            marks.append(pytest.mark.skip(reason=f"Set {case.model_env} to run this quant accuracy case."))
+        params.append(pytest.param(case, id=case.name, marks=marks))
+    return params
+
 
 def _make_config(enable_kv_reuse: bool, path: Path) -> None:
     config = copy.deepcopy(_BASE_CONFIG)
     config["stage_args"][0]["engine_args"]["omni_kv_config"] = {"need_send_cache": enable_kv_reuse}
     config["stage_args"][1]["engine_args"]["omni_kv_config"] = {"need_recv_cache": enable_kv_reuse}
+    path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+
+
+def _quant_devices() -> str:
+    return os.environ.get("HUNYUAN_IMAGE3_QUANT_DEVICES", "0,1")
+
+
+def _quant_tensor_parallel_size() -> int:
+    return int(os.environ.get("HUNYUAN_IMAGE3_QUANT_TP", str(len(_quant_devices().split(",")))))
+
+
+def _make_quant_dit_config(path: Path) -> None:
+    config = copy.deepcopy(_QUANT_DIT_CONFIG)
+    config["stage_args"][0]["runtime"]["devices"] = _quant_devices()
+    config["stage_args"][0]["engine_args"]["parallel_config"]["tensor_parallel_size"] = _quant_tensor_parallel_size()
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
 
 
@@ -143,6 +217,63 @@ def _run(stage_config_path: str, output_path: Path) -> tuple[Image.Image, str, f
     if torch.accelerator.is_available():
         torch.accelerator.empty_cache()
     return image, cot_text, elapsed
+
+
+def _extract_image(outputs) -> Image.Image:
+    assert outputs, "Pipeline produced no outputs"
+    for output in outputs:
+        images = getattr(output, "images", None)
+        request_output = getattr(output, "request_output", None)
+        if not images and request_output is not None:
+            images = getattr(request_output, "images", None)
+        if images:
+            image = images[0].convert("RGB")
+            image.load()
+            return image
+    raise AssertionError("Pipeline output had no images")
+
+
+def _run_dit_model(
+    model: str,
+    stage_config_path: str,
+    output_path: Path,
+    *,
+    nvfp4_backend: str | None = None,
+) -> tuple[Image.Image, float]:
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.platforms import current_omni_platform
+
+    old_backend = os.environ.get("VLLM_NVFP4_GEMM_BACKEND")
+    if nvfp4_backend is not None:
+        os.environ["VLLM_NVFP4_GEMM_BACKEND"] = nvfp4_backend
+
+    try:
+        with OmniRunner(model, stage_configs_path=stage_config_path, mode="text-to-image") as runner:
+            generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
+            params = OmniDiffusionSamplingParams(
+                height=HEIGHT,
+                width=WIDTH,
+                seed=SEED,
+                generator=generator,
+                num_inference_steps=20,
+                guidance_scale=4.0,
+                guidance_scale_provided=True,
+            )
+            t0 = time.perf_counter()
+            outputs = runner.omni.generate({"prompt": PROMPT}, params)
+            elapsed = time.perf_counter() - t0
+            image = _extract_image(outputs)
+            image.save(output_path)
+            return image, elapsed
+    finally:
+        if nvfp4_backend is not None:
+            if old_backend is None:
+                os.environ.pop("VLLM_NVFP4_GEMM_BACKEND", None)
+            else:
+                os.environ["VLLM_NVFP4_GEMM_BACKEND"] = old_backend
+        gc.collect()
+        if torch.accelerator.is_available():
+            torch.accelerator.empty_cache()
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="Needs 4+ GPUs (2 AR + 2 DiT)")
@@ -213,4 +344,82 @@ def test_text_to_image_alignment(accuracy_artifact_root: Path) -> None:
         psnr_threshold=PSNR_THRESHOLD,
         width=WIDTH,
         height=HEIGHT,
+    )
+
+
+@pytest.mark.parametrize("case", _quant_accuracy_cases())
+@pytest.mark.skipif(torch.accelerator.device_count() < 2, reason="Needs 2+ GPUs for HunyuanImage3 DiT")
+def test_quantized_dit_matches_bf16_accuracy(
+    case: _QuantAccuracyCase,
+    accuracy_artifact_root: Path,
+) -> None:
+    """Quantized DiT checkpoints should preserve prompt-aligned image quality."""
+    output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-quant")
+    bf16_model = os.environ.get(QUANT_BF16_ENV, MODEL_NAME)
+    quant_model = os.environ[case.model_env]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        stage_config_path = Path(tmpdir) / "hunyuan_image3_quant_dit.yaml"
+        _make_quant_dit_config(stage_config_path)
+
+        bf16_image, bf16_time = _run_dit_model(
+            bf16_model,
+            str(stage_config_path),
+            output_dir / "bf16.png",
+        )
+        quant_image, quant_time = _run_dit_model(
+            quant_model,
+            str(stage_config_path),
+            output_dir / f"{case.name}.png",
+            nvfp4_backend=case.nvfp4_backend,
+        )
+
+    assert_similarity(
+        model_name=f"{MODEL_NAME} {case.name} vs bf16",
+        vllm_image=quant_image,
+        diffusers_image=bf16_image,
+        ssim_threshold=SSIM_THRESHOLD,
+        psnr_threshold=PSNR_THRESHOLD,
+        width=WIDTH,
+        height=HEIGHT,
+    )
+
+    clip_scorer = CLIPScorer()
+    bf16_clip_score = clip_scorer.score(bf16_image, PROMPT)
+    quant_clip_score = clip_scorer.score(quant_image, PROMPT)
+    clip_score_drop = bf16_clip_score - quant_clip_score
+
+    metrics = {
+        "case": case.name,
+        "bf16_model": bf16_model,
+        "quant_model": quant_model,
+        "prompt": PROMPT,
+        "seed": SEED,
+        "height": HEIGHT,
+        "width": WIDTH,
+        "num_inference_steps": 20,
+        "guidance_scale": 4.0,
+        "bf16_elapsed_s": bf16_time,
+        "quant_elapsed_s": quant_time,
+        "bf16_clip_score": bf16_clip_score,
+        "quant_clip_score": quant_clip_score,
+        "clip_score_drop": clip_score_drop,
+    }
+    metrics_path = output_dir / f"{case.name}_metrics.json"
+    metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+
+    print(f"\nHunyuanImage3 quant accuracy ({case.name})")
+    print(f"  bf16 model:       {bf16_model}")
+    print(f"  quant model:      {quant_model}")
+    print(f"  BF16 CLIP score:  {bf16_clip_score:.4f}")
+    print(f"  quant CLIP score: {quant_clip_score:.4f} threshold>={CLIP_SCORE_THRESHOLD:.4f}")
+    print(f"  CLIP score drop:  {clip_score_drop:.4f} threshold<={QUANT_CLIP_SCORE_DROP_THRESHOLD:.4f}")
+    print(f"  metrics:          {metrics_path}")
+
+    assert quant_clip_score >= CLIP_SCORE_THRESHOLD, (
+        f"{case.name} CLIP score below threshold: got {quant_clip_score:.4f}, expected >= {CLIP_SCORE_THRESHOLD:.4f}"
+    )
+    assert clip_score_drop <= QUANT_CLIP_SCORE_DROP_THRESHOLD, (
+        f"{case.name} CLIP score drop too large: got {clip_score_drop:.4f}, "
+        f"expected <= {QUANT_CLIP_SCORE_DROP_THRESHOLD:.4f}"
     )
