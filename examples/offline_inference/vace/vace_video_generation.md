@@ -55,7 +55,7 @@ if __name__ == "__main__":
     video = outputs[0].images
 
     from diffusers.utils import export_to_video
-    export_to_video(list(video[0].cpu().numpy()), "t2v_output.mp4", fps=16)
+    export_to_video(list(video[0]), "t2v_output.mp4", fps=16)
     omni.close()
 ```
 
