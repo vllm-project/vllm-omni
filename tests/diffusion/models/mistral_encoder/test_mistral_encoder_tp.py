@@ -89,6 +89,13 @@ def setup_tp_group(monkeypatch, mocker):
     )
     mocker.patch("torch.distributed.broadcast")
 
+    from vllm.model_executor.layers.utils import default_unquantized_gemm
+
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
+        lambda: default_unquantized_gemm,
+    )
+
     with set_current_vllm_config(VllmConfig(device_config=device_config)):
         yield
 
