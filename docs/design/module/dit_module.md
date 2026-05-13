@@ -201,7 +201,7 @@ class _BaseScheduler(SchedulerInterface):
 
 - **Shared cleanup logic**: Request-id registration, finish handling, and state removal are centralized instead of duplicated in each policy.
 
-- **Current constraint**: `max_num_running_reqs` remains `1` because the current engine path is still synchronous request-mode execution.
+- **Current constraint boundary**: `_BaseScheduler` derives `max_num_running_reqs` from `max_num_seqs`, but request-mode diffusion is still clamped back to `1` by the engine. The step-wise path can keep this above `1` for compatible-request batching.
 
 #### 2.4 Current `RequestScheduler` Policy
 
@@ -217,7 +217,7 @@ class RequestScheduler(_BaseScheduler):
 
 - **FIFO request scheduling**: Waiting requests are promoted in queue order.
 
-- **Single-request admission**: The current policy only admits one active request at a time.
+- **Single-request admission**: `RequestScheduler` still admits one active request at a time because request-mode execution completes a whole request per dispatch.
 
 - **Executor result feedback**: `update_from_output()` converts executor output into `FINISHED_COMPLETED` or `FINISHED_ERROR` and returns finished scheduler ids.
 
@@ -237,7 +237,7 @@ while True:
 
 - **No scheduler-owned IPC**: Scheduler no longer talks to workers directly.
 
-- **Conservative concurrency**: The current request-mode implementation still allows only one active request at a time.
+- **Split concurrency model**: Request-mode diffusion remains single-active-request, while the step-wise path can keep multiple compatible requests running and advance them independently between denoise steps.
 
 ---
 
@@ -455,7 +455,7 @@ To learn more about the diffusion pipeline and how to add a new diffusion pipeli
 
 #### Architecture
 
-The attention system uses a **backend selector pattern** that automatically chooses the optimal attention implementation based on hardware and model configuration.
+The attention system uses a **role-aware backend selector pattern**. Each `Attention` site declares a semantic `role` (`"self"`, `"cross"`, or a model-specific string). The selector consults the user's `AttentionConfig` to pick a backend per role and falls back to the platform default when nothing is configured.
 
 #### Backend Selection
 
@@ -463,91 +463,89 @@ The attention system uses a **backend selector pattern** that automatically choo
 
 ```python
 class Attention(nn.Module):
-    def __init__(self, num_heads, head_size, causal, softmax_scale, ...):
-        # Auto-select backend
-        self.attn_backend = get_attn_backend(-1)
-        self.attn_impl_cls = self.attn_backend.get_impl_cls()
-        self.attention = self.attn_impl_cls(...)
+    def __init__(self, num_heads, head_size, causal, softmax_scale, *,
+                 role="self", role_category=None, ...):
+        # Resolve backend for this role from the active OmniDiffusionConfig
+        config = get_current_diffusion_config_or_none()
+        attention_config = config.attention_config if config is not None else None
+        attn_backend_cls, spec = get_attn_backend_for_role(
+            role=role,
+            head_size=head_size,
+            attention_config=attention_config,
+            role_category=role_category,
+        )
+        self.attn_impl_cls = attn_backend_cls.get_impl_cls()
+        self.attention = self.attn_impl_cls(..., backend_kwargs=spec.extra if spec else None)
 ```
 
 **Available Backends**:
 
-- **FlashAttention**: Optimized CUDA kernel (FA2/FA3) - memory efficient via tiling
+- **FlashAttention** (`FLASH_ATTN`): Memory-efficient kernel that dispatches to FA2/FA3 on CUDA, AITER on ROCm, and `mindiesd` on Ascend NPU.
 
-- **SDPA**: PyTorch's scaled dot-product attention - default, cross-platform
+- **SDPA** (`TORCH_SDPA`): PyTorch's scaled dot-product attention — cross-platform fallback.
 
-- **SageAttention**: Sparse attention implementation from SageAttention library
-
-- **AscendAttention**: NPU-optimized attention for Ascend hardware
+- **SageAttention** (`SAGE_ATTN`): Quantized attention implementation from the SageAttention library.
 
 These backends provide the **kernel implementations** for attention computation. For attention-level sequence parallelism strategies (Ring Attention, Ulysses), see [Parallel Attention](#52-parallel-attention).
 
 #### Backend Selection Mechanism
 
+Selection is driven by `AttentionConfig` on `OmniDiffusionConfig`, which carries a global `default` plus a `per_role` map of `AttentionSpec` entries. A role string is resolved in this order:
+
 ```python
-def get_attn_backend(head_size: int) -> type[AttentionBackend]:
-    # Check environment variable
-    backend_name = os.environ.get("DIFFUSION_ATTENTION_BACKEND")
-
-    if backend_name:
-        return load_backend(backend_name.upper())
-
-    # Default to SDPA
-    return SDPABackend
+def get_attn_backend_for_role(role, head_size, attention_config=None, role_category=None):
+    # 1. attention_config.per_role[role]            — exact match
+    # 2. attention_config.per_role[role_category]   — category fallback
+    # 3. attention_config.default                   — global default
+    # 4. Platform default                           — hardware-specific
+    if attention_config is not None:
+        spec, source = attention_config.resolve_with_source(
+            role=role, role_category=role_category,
+        )
+        if spec is not None:
+            return load_backend(spec.backend), spec
+    return current_omni_platform.get_diffusion_attn_backend_cls(...), None
 ```
 
 **Selection Priority**:
 
-1. **Environment Variable**: `DIFFUSION_ATTENTION_BACKEND` for manual override
+1. **Per-role override** (`--diffusion-attention-config.per_role.<role>.backend`) — finest control; matched on the layer's exact `role` string.
 
-    - Valid values: `FLASH_ATTN`, `TORCH_SDPA`, `SAGE_ATTN`, `ASCEND`
+2. **Role category fallback** (`--diffusion-attention-config.per_role.<category>.backend`) — used when an exact match is missing and the layer declared `role_category` (e.g. a `"mymodel.audio_to_video"` site can fall back to `"cross"`).
 
-    - Example: `export DIFFUSION_ATTENTION_BACKEND=SAGE_ATTN`
+3. **Global default** (`--diffusion-attention-backend FLASH_ATTN`, or `--diffusion-attention-config.default.backend`, or `DIFFUSION_ATTENTION_BACKEND` env var).
 
-2. **Automatic Fallback**: Falls back to SDPA if selected backend unavailable
+4. **Platform default** — `current_omni_platform.get_diffusion_attn_backend_cls(...)` picks the best-available kernel for the hardware.
 
-3. **Hardware Detection**: Can select based on device type (NPU, CUDA, etc.)
+`AttentionSpec.extra` is forwarded to the backend constructor as `backend_kwargs`, so backend-specific parameters (e.g. SparseBlock `block_size`) can be set without changing model code.
+
+For the user-facing CLI surface, see [Diffusion Attention Backends](../../user_guide/diffusion/attention_backends.md). For the role declaration contract on the model side, see [Adding a Diffusion Model](../../contributing/model/adding_diffusion_model.md).
 
 **Backend Availability**:
 
 - **SDPA**: Always available (PyTorch built-in)
 
-- **FlashAttention**: Requires `flash-attn` package installed
+- **FlashAttention**: Requires `flash-attn` on CUDA, `aiter` on ROCm, or `mindiesd` on Ascend NPU
 
 - **SageAttention**: Requires `sage-attention` package (from THU-ML GitHub)
 
-- **AscendAttention**: Only available on Ascend NPU hardware
-
 #### Attention Backend Registry
 
-**Location**: `vllm_omni/diffusion/attention/selector.py`
+**Location**: `vllm_omni/diffusion/attention/selector.py` + `vllm_omni/platforms/<device>/platform.py`
 
-The attention system uses a **registry pattern** to manage and dynamically load attention backends. This allows for easy extension and runtime selection of backends.
-
-
-**Registry Structure**:
+Backend resolution is delegated to the active platform: `current_omni_platform.get_diffusion_attn_backend_cls(selected_backend, head_size)` returns a fully-qualified class path that `_load_backend_cls` imports lazily, with the result cached by `(backend_name, head_size)`.
 
 ```python
-# Registry mapping backend names to their module paths and class names
-_BACKEND_CONFIG = {
-    "FLASH_ATTN": {
-        "module": "vllm_omni.diffusion.attention.backends.flash_attn",
-        "class": "FlashAttentionBackend",
-    },
-    "TORCH_SDPA": {
-        "module": "vllm_omni.diffusion.attention.backends.sdpa",
-        "class": "SDPABackend",
-    },
-    "SAGE_ATTN": {
-        "module": "vllm_omni.diffusion.attention.backends.sage_attn",
-        "class": "SageAttentionBackend",
-    },
-    "ASCEND": {
-        "module": "vllm_omni.diffusion.attention.backends.ascend_attn",
-        "class": "AscendAttentionBackend",
-    },
-}
+@cache
+def _cached_get_backend_cls(backend_name: str | None, head_size: int) -> type[AttentionBackend]:
+    backend_cls_path = current_omni_platform.get_diffusion_attn_backend_cls(
+        selected_backend=backend_name,
+        head_size=head_size,
+    )
+    return _load_backend_cls(backend_cls_path)
 ```
+
+Each platform (`cuda`, `rocm`, `xpu`, `musa`, `npu`) maps backend names like `"FLASH_ATTN"`, `"TORCH_SDPA"`, `"SAGE_ATTN"` to the right backend class path for that hardware, including head-size compatibility checks. Passing `selected_backend=None` lets the platform pick its own default.
 
 #### Attention Backend Integration
 

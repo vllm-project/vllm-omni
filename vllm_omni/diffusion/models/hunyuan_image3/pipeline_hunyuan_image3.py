@@ -2,16 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
-import os
 from collections.abc import Iterable
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
-from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
+)
+from PIL import Image as PILImage
 from transformers.generation.configuration_utils import GenerationConfig
 from transformers.generation.utils import ALL_CACHE_NAMES, GenerationMixin
-from transformers.models.siglip2 import Siglip2VisionConfig, Siglip2VisionModel
 from transformers.utils.generic import ModelOutput
 from vllm.config.vllm import get_current_vllm_config
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
@@ -20,8 +22,13 @@ from vllm.transformers_utils.config import get_config
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
+    DiffusionPipelineProfilerMixin,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniTextPrompt
+from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import Siglip2VisionTransformer
 
 from .autoencoder import AutoencoderKLConv3D
 from .hunyuan_image3_tokenizer import TokenizerWrapper
@@ -63,7 +70,239 @@ def to_device(data, device):
         return data
 
 
-class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, DiffusionPipelineProfilerMixin):
+def _to_pil_image(image: Any) -> PILImage.Image:
+    if isinstance(image, PILImage.Image):
+        return image
+    if isinstance(image, str):
+        return PILImage.open(image)
+    if isinstance(image, np.ndarray):
+        array = image
+        if array.dtype != np.uint8:
+            if np.issubdtype(array.dtype, np.floating):
+                if float(np.min(array)) < 0.0:
+                    array = (np.clip(array, -1.0, 1.0) + 1.0) / 2.0
+                if float(np.max(array)) <= 1.0:
+                    array = array * 255.0
+            array = np.clip(array, 0, 255).astype(np.uint8)
+        if array.ndim == 3 and array.shape[0] in (1, 3, 4):
+            array = np.transpose(array, (1, 2, 0))
+        return PILImage.fromarray(array)
+    if isinstance(image, torch.Tensor):
+        tensor = image.detach().cpu()
+        if tensor.ndim == 4:
+            if tensor.shape[0] != 1:
+                raise ValueError(f"Only a single image tensor is supported, but got shape {tuple(tensor.shape)}.")
+            tensor = tensor.squeeze(0)
+        if tensor.ndim == 3 and tensor.shape[0] in (1, 3, 4):
+            tensor = tensor.permute(1, 2, 0)
+        if tensor.dtype.is_floating_point:
+            if float(tensor.min()) < 0.0:
+                tensor = (tensor.clamp(-1.0, 1.0) + 1.0) / 2.0
+            if float(tensor.max()) > 1.0:
+                tensor = tensor / 255.0
+            tensor = (tensor.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+        else:
+            tensor = tensor.to(torch.uint8)
+        return PILImage.fromarray(tensor.numpy())
+    raise TypeError(f"Unsupported image input type: {type(image)}")
+
+
+def _resize_and_crop_center(image: PILImage.Image, target_width: int, target_height: int) -> PILImage.Image:
+    # Mirrors HunyuanImage3Processor._resize_and_crop in
+    # vllm_omni.model_executor.models.hunyuan_image3.hunyuan_image3 so the AR
+    # and DiT stages preprocess condition images identically.
+    tw, th = target_width, target_height
+    w, h = image.size
+    tr = th / tw
+    r = h / w
+    if r < tr:
+        resize_height = th
+        resize_width = int(round(th / h * w))
+    else:
+        resize_width = tw
+        resize_height = int(round(tw / w * h))
+    resized = image.resize((resize_width, resize_height), PILImage.Resampling.LANCZOS)
+    crop_top = int(round((resize_height - th) / 2.0))
+    crop_left = int(round((resize_width - tw) / 2.0))
+    return resized.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
+
+
+def _to_python_scalar(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _image_info_to_payload(image_info: ImageInfo) -> dict[str, Any]:
+    return {
+        "image_type": image_info.image_type,
+        "image_tensor": image_info.image_tensor,
+        "image_width": _to_python_scalar(image_info.image_width),
+        "image_height": _to_python_scalar(image_info.image_height),
+        "token_width": _to_python_scalar(image_info.token_width),
+        "token_height": _to_python_scalar(image_info.token_height),
+        "image_token_length": _to_python_scalar(image_info.image_token_length),
+        "base_size": _to_python_scalar(image_info.base_size),
+        "ratio_index": _to_python_scalar(image_info.ratio_index),
+        "add_timestep_token": image_info.add_timestep_token,
+        "add_guidance_token": image_info.add_guidance_token,
+        "use_front_boi_token": image_info.use_front_boi_token,
+        "add_image_shape_token": image_info.add_image_shape_token,
+    }
+
+
+def _to_tensor_if_needed(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, list):
+        return torch.tensor(value)
+    return value
+
+
+def _image_info_from_payload(payload: dict[str, Any]) -> ImageInfo:
+    return ImageInfo(
+        image_type=payload.get("image_type"),
+        image_tensor=_to_tensor_if_needed(payload.get("image_tensor")),
+        image_width=payload.get("image_width"),
+        image_height=payload.get("image_height"),
+        token_width=payload.get("token_width"),
+        token_height=payload.get("token_height"),
+        image_token_length=payload.get("image_token_length"),
+        base_size=payload.get("base_size"),
+        ratio_index=payload.get("ratio_index"),
+        add_timestep_token=payload.get("add_timestep_token", True),
+        add_guidance_token=payload.get("add_guidance_token", False),
+        use_front_boi_token=payload.get("use_front_boi_token", True),
+        add_image_shape_token=payload.get("add_image_shape_token", True),
+    )
+
+
+def _joint_image_info_to_payload(joint_image_info: JointImageInfo) -> dict[str, Any]:
+    return {
+        "type": "joint_image_info",
+        "vae_image_info": _image_info_to_payload(joint_image_info.vae_image_info),
+        "vision_image_info": _image_info_to_payload(joint_image_info.vision_image_info),
+        "vision_encoder_kwargs": joint_image_info.vision_encoder_kwargs,
+    }
+
+
+def _joint_image_info_from_payload(payload: Any) -> JointImageInfo:
+    if isinstance(payload, JointImageInfo):
+        return payload
+    if not isinstance(payload, dict):
+        raise TypeError(f"Expected dict or JointImageInfo for conditional image payload, got {type(payload)}.")
+
+    vae_image_info = _image_info_from_payload(payload["vae_image_info"])
+    vision_image_info = _image_info_from_payload(payload["vision_image_info"])
+    vision_encoder_kwargs = payload.get("vision_encoder_kwargs") or {}
+    if isinstance(vision_encoder_kwargs, dict):
+        vision_encoder_kwargs = {key: _to_tensor_if_needed(value) for key, value in vision_encoder_kwargs.items()}
+    return JointImageInfo(
+        vae_image_info=vae_image_info,
+        vision_image_info=vision_image_info,
+        vision_encoder_kwargs=vision_encoder_kwargs,
+    )
+
+
+def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
+    hf_config = get_config(od_config.model, trust_remote_code=True)
+    image_processor = HunyuanImage3ImageProcessor(hf_config)
+    vae_h_factor = hf_config.vae_downsample_factor[0] * hf_config.patch_size
+    vae_w_factor = hf_config.vae_downsample_factor[1] * hf_config.patch_size
+    vit_patch_size = getattr(image_processor.vision_encoder_processor, "patch_size", 1)
+    if isinstance(vit_patch_size, tuple | list):
+        vit_patch_size = int(vit_patch_size[0])
+
+    def _build_cond_joint_image(raw_image: Any) -> dict[str, Any]:
+        pil_image = _to_pil_image(raw_image).convert("RGB")
+        orig_width, orig_height = pil_image.size
+
+        target_width, target_height = image_processor.reso_group.get_target_size(orig_width, orig_height)
+        target_width = int(target_width)
+        target_height = int(target_height)
+        vae_input = _resize_and_crop_center(pil_image, target_width, target_height)
+        vae_tensor = image_processor.vae_processor(vae_input)
+        base_size, ratio_idx = image_processor.reso_group.get_base_size_and_ratio_index(orig_width, orig_height)
+        base_size = int(base_size)
+        ratio_idx = int(ratio_idx)
+
+        vae_info = ImageInfo(
+            image_type="vae",
+            image_tensor=vae_tensor,
+            image_width=target_width,
+            image_height=target_height,
+            token_width=target_width // vae_w_factor,
+            token_height=target_height // vae_h_factor,
+            base_size=base_size,
+            ratio_index=ratio_idx,
+        )
+
+        vit_inputs = image_processor.vision_encoder_processor(pil_image, return_tensors="pt")
+        vit_tensor = vit_inputs["pixel_values"]
+        spatial_shapes = vit_inputs["spatial_shapes"].squeeze(0)
+        pixel_attention_mask = vit_inputs["pixel_attention_mask"].squeeze(0)
+        vit_token_h = int(spatial_shapes[0].item())
+        vit_token_w = int(spatial_shapes[1].item())
+
+        vit_info = ImageInfo(
+            image_type="siglip2",
+            image_tensor=vit_tensor,
+            image_width=vit_token_w * vit_patch_size,
+            image_height=vit_token_h * vit_patch_size,
+            token_width=vit_token_w,
+            token_height=vit_token_h,
+            image_token_length=int(vit_tensor.shape[1]),
+        )
+
+        return _joint_image_info_to_payload(
+            JointImageInfo(
+                vae_image_info=vae_info,
+                vision_image_info=vit_info,
+                vision_encoder_kwargs={
+                    "spatial_shapes": spatial_shapes,
+                    "pixel_attention_mask": pixel_attention_mask,
+                },
+            )
+        )
+
+    def pre_process_func(request: OmniDiffusionRequest):
+        for i, prompt in enumerate(request.prompts):
+            if isinstance(prompt, str):
+                prompt = OmniTextPrompt(prompt=prompt)
+
+            if "additional_information" not in prompt:
+                prompt["additional_information"] = {}
+
+            multi_modal_data = prompt.get("multi_modal_data") or {}
+            raw_images = multi_modal_data.get("image")
+            if raw_images is None:
+                raw_images = prompt.get("pil_image")
+            has_images = raw_images is not None and (not isinstance(raw_images, list) or len(raw_images) > 0)
+            if has_images:
+                image_list = raw_images if isinstance(raw_images, list) else [raw_images]
+                cond_image_infos = [_build_cond_joint_image(image) for image in image_list]
+                prompt["additional_information"]["batch_cond_image_info"] = cond_image_infos
+
+                first_image_w, first_image_h = _to_pil_image(image_list[0]).size
+                if request.sampling_params.width is None:
+                    request.sampling_params.width = int(first_image_w)
+                if request.sampling_params.height is None:
+                    request.sampling_params.height = int(first_image_h)
+
+            request.prompts[i] = prompt
+
+        return request
+
+    return pre_process_func
+
+
+class HunyuanImage3Pipeline(
+    HunyuanImage3PreTrainedModel,
+    GenerationMixin,
+    SupportImageInput,
+    DiffusionPipelineProfilerMixin,
+):
+    support_image_input = True
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "model.": "",
@@ -80,6 +319,8 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
         "model.layers[0].mlp.forward",
         "vae.encode",
         "vae.decode",
+        "patch_embed.forward",
+        "final_layer.forward",
     ]
 
     def __init__(self, od_config: OmniDiffusionConfig) -> None:
@@ -98,20 +339,14 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
             )
         ]
         quant_config = od_config.quantization_config
-        os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
-        logger.info(
-            "Setting attention backend to TORCH_SDPA. "
-            "HunyuanImage3Pipeline only supports TORCH_SDPA to handle mixed causal and full attention."
-        )
         self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
         self.transformer = self.model
         self.vae = AutoencoderKLConv3D.from_config(self.hf_config.vae)
+        self.vae.use_spatial_tiling = self.od_config.vae_use_tiling
         self._pipeline = None
         self._tkwrapper = TokenizerWrapper(od_config.model)
         self.image_processor = HunyuanImage3ImageProcessor(self.hf_config)
-        self.hf_config.vit.pop("use_return_dict", None)
-        vision_config = Siglip2VisionConfig(**self.hf_config.vit)
-        self.vision_model = Siglip2VisionModel(vision_config).vision_model
+        self.vision_model = Siglip2VisionTransformer(self.hf_config.vit)
         # self.vision_model = vision_model.vision_model
         self.vision_aligner = LightProjector(self.hf_config.vit_aligner)
         self.timestep_emb = TimestepEmbedder(hidden_size=self.hf_config.hidden_size)
@@ -380,6 +615,13 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
     def vae_encode(self, image, cfg_factor=1):
         config = self.vae.config
 
+        if image.ndim == 3:
+            image = image.unsqueeze(0)
+        if image.ndim == 4:
+            image = image.unsqueeze(2)
+        if image.ndim != 5:
+            raise ValueError(f"Expected image tensor with 3/4/5 dims, got shape {tuple(image.shape)}.")
+
         with torch.autocast(device_type=self.model.device.type, dtype=torch.float16, enabled=True):
             vae_encode_result = self.vae.encode(image)
             if isinstance(vae_encode_result, torch.Tensor):
@@ -475,6 +717,26 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
                     f"Each message should be a list of dicts or a dict, but got {type(message)}."
                 )
 
+    @staticmethod
+    def _normalize_cot_text(cot: str | None) -> str | None:
+        """
+        Ensure cot_text starts with the appropriate opening tag.
+
+        AR-generated text may omit the leading <think> or <recaption> tag
+        (since it was used as a generation trigger). This normalizes the text
+        so downstream parsing in get_cot_sections works correctly.
+        """
+        if not cot:
+            return cot
+
+        if "</think>" in cot and not cot.startswith("<think>"):
+            cot = "<think>" + cot
+            return cot
+        if "</recaption>" in cot and not cot.startswith("<recaption>"):
+            cot = "<recaption>" + cot
+            return cot
+        return cot
+
     def prepare_model_inputs(
         self,
         prompt=None,
@@ -499,8 +761,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
         batch_cot_text = cot_text
         batch_system_prompt = system_prompt
         batch_gen_image_info = None
-        # TODO: construct with user input images
-        batch_cond_image_info = None
+        batch_cond_image_info = kwargs.pop("batch_cond_image_info", None)
 
         #   -- 2.1 message_list
         if batch_message_list is not None:
@@ -545,6 +806,12 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
             if mode == "gen_image":
                 batch_gen_image_info = [self.image_processor.build_image_info(image_size) for _ in range(batch_size)]
 
+            if batch_cond_image_info is not None:
+                assert isinstance(batch_cond_image_info, list) and len(batch_cond_image_info) == batch_size, (
+                    "`batch_cond_image_info` should be a list with the same batch size as `prompt`."
+                )
+                batch_cond_image_info = [cond if isinstance(cond, list) else [cond] for cond in batch_cond_image_info]
+
         #   -- 2.3 seed
         generator = kwargs.get("generator", None)
         if generator is None:
@@ -556,6 +823,11 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
         bot_task = kwargs.pop("bot_task", "auto")
         # If `drop_think` enabled, always drop <think> parts in the context.
         drop_think = kwargs.get("drop_think", self.generation_config.drop_think)
+        # Pull sequence_template from the model's generation_config so the DiT
+        # text prefix matches how the model was trained (Instruct for the
+        # HunyuanImage-3.0-Instruct checkpoint).  Falling back to "pretrain"
+        # only if the config does not specify it.
+        sequence_template = getattr(self.generation_config, "sequence_template", "pretrain")
         # Apply batched prompt or batched message_list to build input sequence with associated info.
         out = self._tkwrapper.apply_chat_template(
             batch_prompt=batch_prompt,
@@ -568,7 +840,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
             max_length=kwargs.get("max_length"),
             bot_task=bot_task,
             image_base_size=self.config.image_base_size,
-            sequence_template="pretrain",
+            sequence_template=sequence_template,
             cfg_factor=cfg_factor[mode],
             drop_think=drop_think,
         )
@@ -579,7 +851,6 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
             cond_vae_images, cond_timestep, cond_vit_images = self._encode_cond_image(
                 batch_cond_image_info, cfg_factor[mode]
             )
-            # Pack vit kwargs. Siglip2-so requires spatial_shapes and attention_mask for inference.
             vit_kwargs = {"spatial_shapes": [], "attention_mask": []}
             for cond_image_info in batch_cond_image_info:
                 vit_kwargs["spatial_shapes"].append(
@@ -627,8 +898,16 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
         stop_token_id = dict(
             auto=[tkw.eos_token_id] + extra_auto_stops,
             image=[tkw.eos_token_id],
-            recaption=[tkw.end_recaption_token_id, tkw.end_answer_token_id, tkw.eos_token_id],
-            think=[tkw.end_recaption_token_id, tkw.end_answer_token_id, tkw.eos_token_id],
+            recaption=[
+                tkw.end_recaption_token_id,
+                tkw.end_answer_token_id,
+                tkw.eos_token_id,
+            ],
+            think=[
+                tkw.end_recaption_token_id,
+                tkw.end_answer_token_id,
+                tkw.eos_token_id,
+            ],
             img_ratio=extra_auto_stops,
         )
         model_input_kwargs = dict(
@@ -677,10 +956,18 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
             tokenizer_output.joint_image_slices[i] + tokenizer_output.gen_image_slices[i] for i in range(bsz)
         ]
         attention_mask = torch.ones(seq_len, seq_len, dtype=torch.bool).tril(diagonal=0).repeat(bsz, 1, 1)
+        full_attn_spans: list[list[tuple[int, int]]] = [[] for _ in range(bsz)]
         for i in range(bsz):
             for j, image_slice in enumerate(batch_image_slices[i]):
                 attention_mask[i, image_slice, image_slice] = True
+                start = image_slice.start if image_slice.start is not None else 0
+                stop = image_slice.stop if image_slice.stop is not None else seq_len
+                assert start < stop, f"Invalid image slice: {image_slice}"
+                full_attn_spans[i].append((int(start), int(stop)))
+            if full_attn_spans[i]:
+                full_attn_spans[i].sort(key=lambda x: x[0])
         attention_mask = attention_mask.unsqueeze(1)
+        model_kwargs["full_attn_spans"] = full_attn_spans
         return attention_mask
 
     def prepare_inputs_for_generation(
@@ -724,6 +1011,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
                 "query_lens": kwargs.get("query_lens"),
                 "seq_lens": kwargs.get("seq_lens"),
                 "num_image_tokens": kwargs.get("num_image_tokens"),
+                "full_attn_spans": kwargs.get("full_attn_spans"),
             }
         )
         return model_inputs
@@ -742,6 +1030,8 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
             "custom_pos_emb": model_kwargs["custom_pos_emb"],
             "num_image_tokens": model_kwargs["num_image_tokens"],
         }
+        if "full_attn_spans" in model_kwargs:
+            updated_model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"]
 
         # update past_key_values keeping its naming used in model code
         for possible_cache_name in ALL_CACHE_NAMES:
@@ -765,7 +1055,8 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
                 # position ids
                 image_mask = model_kwargs["image_mask"]
                 bsz, seq_len = image_mask.shape
-                index = torch.arange(seq_len, device=image_mask.device).unsqueeze(0).repeat(bsz, 1)
+                offset = model_kwargs.get("ar_kv_reuse_offset", 0)  # should be an absolute position.
+                index = torch.arange(offset, offset + seq_len, device=image_mask.device).unsqueeze(0).repeat(bsz, 1)
                 position_ids = index.masked_select(image_mask.bool()).reshape(bsz, -1)
                 timestep_position_ids = index[
                     torch.arange(bsz), model_kwargs["gen_timestep_scatter_index"][:, -1]
@@ -777,7 +1068,9 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
                 for attention_mask_i, position_ids_i in zip(
                     model_kwargs["attention_mask"], updated_model_kwargs["position_ids"]
                 ):
-                    mask_list.append(torch.index_select(attention_mask_i, dim=1, index=position_ids_i.reshape(-1)))
+                    mask_list.append(
+                        torch.index_select(attention_mask_i, dim=1, index=position_ids_i.reshape(-1) - offset)
+                    )
                 attention_mask = torch.stack(mask_list, dim=0)
                 updated_model_kwargs["attention_mask"] = attention_mask
                 updated_model_kwargs["gen_timestep_scatter_index"] = model_kwargs["gen_timestep_scatter_index"]
@@ -818,7 +1111,10 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
             # 50 and 5.0 hard code
             results = self.pipeline(
                 batch_size=len(batch_gen_image_info),
-                image_size=[batch_gen_image_info[0].image_height, batch_gen_image_info[0].image_width],
+                image_size=[
+                    batch_gen_image_info[0].image_height,
+                    batch_gen_image_info[0].image_width,
+                ],
                 num_inference_steps=kwargs.get("num_inference_steps", 50),
                 guidance_scale=kwargs.get("guidance_scale", 5.0),
                 generator=generator,
@@ -865,11 +1161,13 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
         query_lens: list[int] | None = None,
         seq_lens: list[int] | None = None,
         num_image_tokens: int | None = None,
+        uncond_cfg_prefill: bool = False,
+        full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | CausalMMOutputWithPast:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # Sanity Check of Inputs
         self._check_inputs(
-            mode == "gen_image",
+            mode == "gen_image" and not uncond_cfg_prefill,
             "in `gen_image` mode",
             [
                 ("images", images),
@@ -878,7 +1176,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
             ],
         )
         self._check_inputs(
-            mode == "gen_image" and first_step,
+            mode == "gen_image" and first_step and not uncond_cfg_prefill,
             "in `gen_image` mode at the first step",
             [
                 ("image_mask", image_mask),
@@ -901,7 +1199,6 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
                 ("vit_kwargs", vit_kwargs),
             ],
         )
-
         custom_pos_emb = self.get_pos_emb(custom_pos_emb, position_ids)
 
         inputs_embeds = self.model.embed_tokens(input_ids)
@@ -912,6 +1209,8 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
         if mode == "gen_text":
             # For gen_text, make sure gen_timestep_scatter_index is None
             gen_timestep_scatter_index = None
+            token_h, token_w = None, None
+        elif uncond_cfg_prefill:
             token_h, token_w = None, None
         else:
             if first_step:
@@ -958,6 +1257,8 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
                 seq_lens=seq_lens,
                 num_image_tokens=num_image_tokens,
                 gen_timestep_scatter_index=gen_timestep_scatter_index,
+                uncond_cfg_prefill=uncond_cfg_prefill,
+                full_attn_spans=full_attn_spans,
             )
         hidden_states = outputs[0]
 
@@ -965,6 +1266,9 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
             hidden_states = self.model.ln_f(hidden_states)
             logits = self.lm_head(hidden_states)
             logits = logits.float()
+            diffusion_prediction = None
+        elif uncond_cfg_prefill:
+            logits = None
             diffusion_prediction = None
         else:
             logits = None
@@ -991,6 +1295,45 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
 
         return output
 
+    def inject_ar_kv_into_layers(
+        self,
+        ar_kv_data: dict[int, dict[str, torch.Tensor]],
+        positive_reuse_len: int,
+    ) -> None:
+        """Inject AR-stage KV cache into each layer's ImageKVCacheManager.
+
+        Truncates to positive_reuse_len and sets image_kv_cache_map directly.
+        """
+        for layer in self.model.layers:
+            layer_idx = layer.layer_idx
+            if layer_idx not in ar_kv_data:
+                continue
+            kv = ar_kv_data[layer_idx]
+            cache_mgr = layer.self_attn.image_attn
+            k, v = kv["key"], kv["value"]
+            cache_mgr._injected_ar_kv = [(k[:positive_reuse_len], v[:positive_reuse_len])]
+
+    def _extract_ar_kv_from_request(self, req) -> dict[str, Any]:
+        kv = getattr(getattr(req, "sampling_params", None), "past_key_values", None)
+        if kv is None:
+            return {}
+        key_cache = getattr(kv, "key_cache", None)
+        value_cache = getattr(kv, "value_cache", None)
+        if not key_cache or not value_cache:
+            return {}
+        ar_kv_data = {
+            i: {"key": k, "value": v}
+            for i, (k, v) in enumerate(zip(key_cache, value_cache))
+            if k is not None and v is not None
+        }
+        if not ar_kv_data:
+            return {}
+        logger.info(
+            f"[AR KV Reuse] Extracted {len(ar_kv_data)} layers of AR KV, "
+            f"each with length: {next(iter(ar_kv_data.values()))['key'].shape}"
+        )
+        return {"ar_kv_data": ar_kv_data}
+
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -1006,10 +1349,53 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
         extra_args = getattr(getattr(req, "sampling_params", None), "extra_args", {}) or {}
         use_system_prompt = extra_args.get("use_system_prompt")
         system_prompt = extra_args.get("system_prompt")
+        # Fall back to per-prompt use_system_prompt forwarded by ar2diffusion
+        if use_system_prompt is None and req.prompts:
+            first_prompt = req.prompts[0]
+            if isinstance(first_prompt, dict):
+                use_system_prompt = first_prompt.get("use_system_prompt")
         if use_system_prompt is not None:
             system_prompt = get_system_prompt(use_system_prompt, "image", system_prompt)
             system_prompt = system_prompt.strip() if system_prompt is not None else ""
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
+
+        # Extract AR-generated CoT/recaption text from each prompt's extra dict.
+        # The AR-side stage input processor (``ar2diffusion``) already prepends
+        # the trigger tag (e.g. ``<think>``) when the AR used the KV-reuse
+        # pretrain format, so ``ar_generated_text`` is a self-contained string
+        # and ``get_cot_sections()`` can parse the think/recaption structure
+        # directly.
+        cot_text_list = []
+        for p in req.prompts:
+            extra = p.get("extra", {}) if isinstance(p, dict) else {}
+            cot_text_list.append(extra.get("ar_generated_text") or None)
+        cot_text = (
+            [self._normalize_cot_text(t) for t in cot_text_list] if any(t is not None for t in cot_text_list) else None
+        )
+
+        batch_cond_image_info: list[list[JointImageInfo]] | None = None
+        if any(not isinstance(p, str) for p in req.prompts):
+            batch_cond_image_info = []
+            for prompt_item in req.prompts:
+                if isinstance(prompt_item, str):
+                    batch_cond_image_info.append([])
+                    continue
+                prompt_additional_information = prompt_item.get("additional_information") or {}
+                prompt_cond_infos = prompt_additional_information.get("batch_cond_image_info", [])
+                if isinstance(prompt_cond_infos, JointImageInfo | dict):
+                    prompt_cond_infos = [prompt_cond_infos]
+                if prompt_cond_infos is None:
+                    prompt_cond_infos = []
+                batch_cond_image_info.append([_joint_image_info_from_payload(item) for item in prompt_cond_infos])
+
+            has_cond_image = [len(cond_infos) > 0 for cond_infos in batch_cond_image_info]
+            if any(has_cond_image) and not all(has_cond_image):
+                raise ValueError(
+                    "When batching Hunyuan image editing requests, every prompt must include input image(s)."
+                )
+            if not any(has_cond_image):
+                batch_cond_image_info = None
+
         generator = req.sampling_params.generator or generator
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
@@ -1019,17 +1405,30 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
         if guidance_scale <= 1.0:
             logger.info("HunyuanImage3.0 runs without classifier-free guidance when guidance_scale <= 1.0.")
         image_size = (height, width)
+
+        # ---- AR KV Reuse: extract injected KV from request ----
+        ar_kv_kwargs = self._extract_ar_kv_from_request(req)
+
         model_inputs = self.prepare_model_inputs(
             prompt=prompt,
-            cot_text=None,
+            cot_text=cot_text,
             system_prompt=system_prompt,
             mode="gen_image",
             generator=generator,
             image_size=image_size,
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
+            batch_cond_image_info=batch_cond_image_info,
         )
+
+        model_inputs.update(ar_kv_kwargs)
+
         outputs = self._generate(**model_inputs, **kwargs)
+        custom_output = {}
+        if any(t is not None for t in cot_text_list):
+            custom_output["ar_generated_text"] = cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list
         return DiffusionOutput(
-            output=outputs[0], stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+            output=outputs[0],
+            custom_output=custom_output,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )

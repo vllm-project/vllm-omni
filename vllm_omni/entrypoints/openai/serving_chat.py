@@ -14,6 +14,7 @@ from fastapi import Request
 from PIL import Image
 from pydantic import TypeAdapter
 
+from vllm_omni.diffusion.diffusion_engine import get_extra_body_params, get_extra_output_params
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
 from vllm_omni.entrypoints.utils import coerce_param_message_types
@@ -95,7 +96,9 @@ from vllm_omni.entrypoints.openai.stage_params import (
 from vllm_omni.entrypoints.openai.utils import (
     get_stage_type,
     get_supported_speakers_from_hf_config,
+    is_single_stage_diffusion,
     parse_lora_request,
+    resolve_diffusion_od_config,
     validate_requested_speaker,
 )
 from vllm_omni.lora.request import LoRARequest
@@ -119,6 +122,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     _diffusion_engine: AsyncOmni | None = None
     _diffusion_model_name: str = ""
     _supported_speakers: set[str] | None = None
+    _diffusion_extra_body_params: frozenset[str] | None = None
+    _diffusion_extra_output_params: frozenset[str] | None = None
 
     @classmethod
     def for_diffusion(
@@ -144,6 +149,45 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
         return instance
+
+    def _get_diffusion_extra_body_params(self) -> frozenset[str]:
+        """Return the pipeline-declared ``EXTRA_BODY_PARAMS`` (cached)."""
+        if self._diffusion_extra_body_params is not None:
+            return self._diffusion_extra_body_params
+
+        params: frozenset[str] = frozenset()
+        try:
+            od_config = resolve_diffusion_od_config(self.engine_client, self._diffusion_engine)
+            if od_config is not None and getattr(od_config, "model_class_name", None):
+                params = get_extra_body_params(od_config.model_class_name)
+        except Exception as e:
+            logger.warning("Failed to read EXTRA_BODY_PARAMS from pipeline: %s", e)
+
+        self._diffusion_extra_body_params = params
+        return params
+
+    def _get_diffusion_extra_output_params(
+        self,
+        custom_output: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Pick pipeline-declared ``EXTRA_OUTPUT_PARAMS`` keys from *custom_output*."""
+        if not custom_output:
+            return None
+
+        if self._diffusion_extra_output_params is None:
+            params: frozenset[str] = frozenset()
+            try:
+                od_config = resolve_diffusion_od_config(self.engine_client, self._diffusion_engine)
+                if od_config is not None and getattr(od_config, "model_class_name", None):
+                    params = get_extra_output_params(od_config.model_class_name)
+            except Exception as e:
+                logger.warning("Failed to read EXTRA_OUTPUT_PARAMS from pipeline: %s", e)
+            self._diffusion_extra_output_params = params
+
+        if not self._diffusion_extra_output_params:
+            return None
+        out = {k: custom_output[k] for k in self._diffusion_extra_output_params if k in custom_output}
+        return out or None
 
     def _get_supported_speakers(self) -> set[str]:
         """Load supported speakers from model config (cached)."""
@@ -356,14 +400,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     tprompt["modalities"] = ["image"]
                 if negative_prompt is not None:
                     tprompt["negative_prompt"] = negative_prompt
-                # GLM-Image's _call_hf_processor expects target_h/target_w in mm_processor_kwargs
+                # Always attach mm_processor_kwargs (possibly empty) so
+                # OmniInputPreprocessor._process_text routes through the
+                # multimodal processor path. Without it, the preprocessor
+                # falls back to plain _tokenize_prompt and AR-based image-gen
+                # models like GLM-Image never see their image-generation
+                # scaffold.
                 mm_processor_kwargs: dict[str, Any] = {}
                 if height is not None:
                     mm_processor_kwargs["target_h"] = height
                 if width is not None:
                     mm_processor_kwargs["target_w"] = width
-                if mm_processor_kwargs:
-                    tprompt["mm_processor_kwargs"] = mm_processor_kwargs
+                tprompt["mm_processor_kwargs"] = mm_processor_kwargs
                 if engine_prompt_image is not None:
                     tprompt["multi_modal_data"] = engine_prompt_image
                     # Provide multi_modal_uuids so that newer vLLM versions
@@ -382,6 +430,34 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 logger.warning("Failed to build image-generation prompt for omni multistage: %s", e)
                 _image_gen_height = None
                 _image_gen_width = None
+        elif request.modalities and ("text" in request.modalities) and is_single_stage_diffusion(self.engine_client):
+            # Single-stage diffusion text output (img2text / text2text).
+            # Build a diffusion-style prompt with modalities=["text"] so the
+            # pipeline routes to its text generation path.
+            try:
+                extracted_prompt, reference_images = self._extract_diffusion_prompt_and_images_from_messages(
+                    request.messages
+                )
+                if not extracted_prompt:
+                    return self.create_error_response("No text prompt found in messages")
+
+                tprompt: OmniTextPrompt = {"prompt": extracted_prompt}
+                tprompt["modalities"] = ["text"]
+
+                if reference_images:
+                    try:
+                        img_bytes = base64.b64decode(reference_images[0])
+                        img = Image.open(BytesIO(img_bytes))
+                        tprompt["multi_modal_data"] = {"image": img}
+                        tprompt["multi_modal_uuids"] = {"image": [f"{request_id}-image-0"]}
+                    except Exception:
+                        pass
+
+                engine_prompts = [tprompt]
+            except Exception as e:
+                logger.warning("Failed to build text-output prompt for single-stage diffusion: %s", e)
+            _image_gen_height = None
+            _image_gen_width = None
         else:
             _image_gen_height = None
             _image_gen_width = None
@@ -414,6 +490,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             sp.extra_args["cfg_text_scale"] = cfg_text_scale
                         if cfg_img_scale is not None:
                             sp.extra_args["cfg_img_scale"] = cfg_img_scale
+                        for _key in self._get_diffusion_extra_body_params():
+                            _val = extra_body.get(_key)
+                            if _val is not None:
+                                sp.extra_args[_key] = _val
 
                 self._log_inputs(
                     request_id,
@@ -556,7 +636,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if hasattr(request, "cache_salt") and request.cache_salt is not None:
             engine_prompt["cache_salt"] = request.cache_salt
 
-        speaker = getattr(request, "speaker", None)
+        speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())
         if normalized is not None:
             if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
@@ -1606,21 +1686,37 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 continue
 
             if omni_outputs.final_output_type == "text":
-                (
-                    choices_data,
-                    usage,
-                    prompt_logprobs,
-                    prompt_token_ids,
-                    kv_transfer_params,
-                ) = self._create_text_choice(
-                    request,
-                    omni_outputs,
-                    tokenizer,
-                    conversation,
-                    role,
-                    reasoning_parser,
-                )
-                final_res = omni_outputs.request_output
+                if omni_outputs.request_output is not None:
+                    (
+                        choices_data,
+                        usage,
+                        prompt_logprobs,
+                        prompt_token_ids,
+                        kv_transfer_params,
+                    ) = self._create_text_choice(
+                        request,
+                        omni_outputs,
+                        tokenizer,
+                        conversation,
+                        role,
+                        reasoning_parser,
+                    )
+                    final_res = omni_outputs.request_output
+                else:
+                    # Diffusion pipeline text output (e.g. single-stage
+                    # img2text / text2text) — no AR request_output, so build
+                    # a simple text choice from custom_output.
+                    text_body = (omni_outputs.custom_output or {}).get("text_output", "")
+                    message = ChatMessage(role=role, content=text_body)
+                    choices_data = [
+                        ChatCompletionResponseChoice(
+                            index=0,
+                            message=message,
+                            logprobs=None,
+                            finish_reason="stop",
+                            stop_reason=None,
+                        )
+                    ]
             elif omni_outputs.final_output_type == "audio":
                 choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
             elif omni_outputs.final_output_type == "image":
@@ -1636,6 +1732,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     response_metrics = {}
                 response_metrics.setdefault("stage_durations", omni_outputs.stage_durations or {})
                 response_metrics.setdefault("peak_memory_mb", float(omni_outputs.peak_memory_mb or 0.0))
+                extra = self._get_diffusion_extra_output_params(omni_outputs.custom_output)
+                if extra:
+                    response_metrics.update(extra)
             choices.extend(choices_data)
 
         response = OmniChatCompletionResponse(
@@ -2125,6 +2224,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         extra_body: dict[str, Any],
         reference_images: list[Image.Image],
         gen_params: OmniDiffusionSamplingParams,
+        tokenizer: Any = None,
     ) -> tuple[OmniTextPrompt, list[Any]]:
         """Build the shared multistage generation prompt and stage params."""
         stage_configs = getattr(engine, "stage_configs", None) or []
@@ -2144,6 +2244,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         lora_body = extra_body.get("lora")
         layers = extra_body.get("layers")
         resolution = extra_body.get("resolution")
+        bot_task = extra_body.get("bot_task")
 
         engine_prompt_data: dict[str, Any] | None = None
         modalities = ["image"]
@@ -2155,6 +2256,30 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 engine_prompt_data = {"image": reference_images}
 
         engine_prompt: OmniTextPrompt = {"prompt": prompt}
+        if bot_task:
+            from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+                build_prompt,
+                build_prompt_tokens,
+            )
+
+            prompt_token_ids: list[int] | None = None
+            system_prompt_type: str | None = None
+            if tokenizer is not None:
+                result = build_prompt_tokens(prompt, tokenizer, task=bot_task)
+                prompt_token_ids = result.token_ids
+                system_prompt_type = result.system_prompt_type
+            else:
+                prompt = build_prompt(prompt, task=bot_task)
+                engine_prompt["prompt"] = prompt
+
+            if reference_images and len(reference_images) == 1:
+                engine_prompt_data = {"image": reference_images[0]}
+                modalities = ["image"]
+            if prompt_token_ids is not None:
+                engine_prompt["prompt_token_ids"] = prompt_token_ids
+            if system_prompt_type is not None:
+                engine_prompt["use_system_prompt"] = system_prompt_type
+
         engine_prompt["modalities"] = modalities
         if negative_prompt is not None:
             engine_prompt["negative_prompt"] = negative_prompt
@@ -2324,12 +2449,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             diffusion_engine = cast(AsyncOmni, engine)
             stage_configs = getattr(diffusion_engine, "stage_configs", None) or []
             if len(stage_configs) > 1:
+                tokenizer = None
+                get_tok = getattr(diffusion_engine, "get_tokenizer", None)
+                if get_tok is not None:
+                    try:
+                        tokenizer = await get_tok()
+                    except Exception as exc:
+                        logger.warning("get_tokenizer failed: %s", exc)
                 engine_prompt, sampling_params_list = self._build_multistage_generation_inputs(
                     engine=diffusion_engine,
                     prompt=prompt,
                     extra_body=extra_body,
                     reference_images=pil_images,
                     gen_params=gen_params,
+                    tokenizer=tokenizer,
                 )
             else:
                 engine_prompt = gen_prompt
@@ -2392,8 +2525,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 else:
                     messages.append({"role": getattr(msg, "role", "user"), "content": getattr(msg, "content", "")})
 
-            # Extract prompt and images from messages
-            prompt, reference_images = self._extract_diffusion_prompt_and_images(messages)
+            # Extract prompt and multimodal inputs from messages
+            prompt, reference_images, reference_videos, reference_audios = self._extract_diffusion_prompt_and_media(
+                messages
+            )
 
             # Extract generation parameters from extra_body (preferred)
             # Reference: text_to_image.py and text_to_video.py for supported parameters
@@ -2418,6 +2553,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             cfg_text_scale = extra_body.get("cfg_text_scale")
             cfg_img_scale = extra_body.get("cfg_img_scale")
             seed = extra_body.get("seed")
+            if seed is None:
+                seed = getattr(request, "seed", None)
             negative_prompt = extra_body.get("negative_prompt")
             num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
 
@@ -2475,6 +2612,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 gen_params.extra_args["cfg_text_scale"] = cfg_text_scale
             if cfg_img_scale is not None:
                 gen_params.extra_args["cfg_img_scale"] = cfg_img_scale
+            for _key in self._get_diffusion_extra_body_params():
+                _val = extra_body.get(_key)
+                if _val is not None:
+                    gen_params.extra_args[_key] = _val
             if num_frames is not None:
                 gen_params.num_frames = num_frames
             if guidance_scale_2 is not None:
@@ -2483,6 +2624,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 gen_params.layers = layers
             if resolution is not None:
                 gen_params.resolution = resolution
+
+            # Pipeline-agnostic escape hatch (mirrors ``extra_params`` on the /v1/videos
+            # endpoint in ``serving_video.py``): a single reserved ``extra_args`` dict in
+            # ``extra_body`` flows straight into ``gen_params.extra_args``, with no keys
+            # hardcoded here.
+            extra_args_body = extra_body.get("extra_args")
+            if isinstance(extra_args_body, dict):
+                gen_params.extra_args.update(extra_args_body)
 
             # Parse per-request LoRA.
             if lora_body and isinstance(lora_body, dict):
@@ -2494,6 +2643,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             gen_params.lora_scale = lora_scale
                 except Exception as e:  # pragma: no cover - safeguard
                     logger.warning("Failed to parse LoRA request: %s", e)
+
+            # Route text modality for single-stage diffusion (img2text / text2text)
+            requested_modalities = extra_body.get("modalities") or []
+            is_text_request = "text" in requested_modalities
+
+            if is_text_request:
+                gen_prompt["modalities"] = ["text"]
 
             # Add reference image if provided (from messages content)
             if pil_images:
@@ -2517,7 +2673,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             status_code=400,
                         )
 
-            # Generate image
+            if reference_videos:
+                gen_params.extra_args["video_path"] = reference_videos[0]
+            if reference_audios:
+                gen_params.extra_args["audio_path"] = reference_audios[0]
+
+            # Generate image or audio (e.g. AudioX) via AsyncOmni
             diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
             stage_configs = list(getattr(diffusion_engine, "stage_configs", []) or [])
             sampling_params_list = build_stage_sampling_params_list(
@@ -2539,54 +2700,144 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 result = output
             if result is None:
                 return self._create_error_response("No output generated from AsyncOmni")
-            # Extract images from result
+
+            # Text output path (img2text / text2text)
+            if is_text_request and result.final_output_type == "text":
+                text_body = (result.custom_output or {}).get("text_output", "")
+                message = ChatMessage(role="assistant", content=text_body)
+                choice = ChatCompletionResponseChoice(
+                    index=0,
+                    message=message,
+                    finish_reason="stop",
+                    logprobs=None,
+                    stop_reason=None,
+                )
+                response = OmniChatCompletionResponse(
+                    id=request_id,
+                    created=created_time,
+                    model=self._diffusion_model_name,
+                    choices=[choice],
+                    usage=UsageInfo(
+                        prompt_tokens=len(prompt.split()),
+                        completion_tokens=len(text_body.split()),
+                        total_tokens=len(prompt.split()) + len(text_body.split()),
+                    ),
+                    metrics=self._get_diffusion_extra_output_params(result.custom_output),
+                )
+                logger.info(
+                    "Diffusion chat completed for request %s: text output (%d chars)",
+                    request_id,
+                    len(text_body),
+                )
+                return response
+
+            # Image output path (text2img / img2img)
+            final_output_type = getattr(result, "final_output_type", "image")
             # Handle nested OmniRequestOutput structure where images might be in request_output
             images = getattr(result.request_output, "images", [])
+            multimodal_output = getattr(result, "multimodal_output", {}) or {}
             stage_durations = result.stage_durations
             peak_memory_mb = result.peak_memory_mb
 
-            # Convert images to base64 content
-            image_contents: list[dict[str, Any]] = []
-            flat_images = []
-            for item in images:
-                if isinstance(item, list):
-                    flat_images.extend(item)
+            if final_output_type == "audio":
+                sample_rate = 48000
+                for key in ("audio_sample_rate", "sample_rate", "sampling_rate", "sr"):
+                    raw_rate = multimodal_output.get(key)
+                    try:
+                        if raw_rate is not None:
+                            sample_rate = int(raw_rate)
+                            break
+                    except (TypeError, ValueError):
+                        pass
+
+                audio_payload = multimodal_output.get("audio")
+                if isinstance(audio_payload, list):
+                    if len(audio_payload) == 0:
+                        audio_payload = None
+                    elif len(audio_payload) == 1:
+                        audio_payload = audio_payload[0]
+                if audio_payload is None:
+                    return self._create_error_response("Audio generation completed but no audio was produced.")
+
+                if isinstance(audio_payload, torch.Tensor):
+                    audio_tensor = audio_payload.detach().cpu().float()
                 else:
-                    flat_images.append(item)
+                    audio_tensor = torch.as_tensor(audio_payload).detach().cpu().float()
+                # Pipelines deliver audio as (C, T), (T,), or (B, C, T) in channels-first
+                # convention (torch default). Drop a leading batch dim, then transpose to
+                # (T, C) for soundfile / CreateAudio. Flattening here would corrupt stereo.
+                if audio_tensor.ndim == 3:
+                    audio_tensor = audio_tensor[0]
+                if audio_tensor.ndim == 2:
+                    audio_tensor = audio_tensor.transpose(0, 1).contiguous()
+                elif audio_tensor.ndim > 3:
+                    raise ValueError(f"Unexpected audio tensor rank {audio_tensor.ndim}; expected 1-3 dims.")
+                audio_array = audio_tensor.numpy()
 
-            for img in flat_images:
-                with BytesIO() as buffer:
-                    img.save(buffer, format="PNG")
-                    img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                image_contents.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{img_base64}",
-                        },
-                        "stage_durations": stage_durations,
-                        "peak_memory_mb": peak_memory_mb,
-                    }
+                audio_obj = CreateAudio(
+                    audio_tensor=audio_array,
+                    sample_rate=sample_rate,
+                    response_format="wav",
+                    speed=1.0,
+                    stream_format="audio",
+                    base64_encode=True,
                 )
-
-            # Build response
-            if not image_contents:
-                content = "Image generation completed but no images were produced."
+                audio_response: AudioResponse = self.create_audio(audio_obj)
+                audio_base64 = audio_response.audio_data
+                audio_id = f"audio-{uuid.uuid4().hex[:16]}"
+                expires_at = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
+                message = ChatMessage(
+                    role="assistant",
+                    audio=OpenAIChatCompletionAudio(
+                        id=audio_id,
+                        data=audio_base64,
+                        expires_at=expires_at,
+                        transcript="",
+                    ),
+                )
             else:
-                content = image_contents
+                # Convert images to base64 content
+                image_contents: list[dict[str, Any]] = []
+                flat_images = []
+                for item in images:
+                    if isinstance(item, list):
+                        flat_images.extend(item)
+                    else:
+                        flat_images.append(item)
 
-            # Use model_construct to bypass validation for multimodal content
-            # (ChatMessage.content only accepts str, but we need list for images)
-            # Then use object.__setattr__ to directly set the field, bypassing Pydantic's type checking
-            import warnings as warnings_module
+                for img in flat_images:
+                    with BytesIO() as buffer:
+                        img.save(buffer, format="PNG")
+                        img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                    image_contents.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{img_base64}",
+                            },
+                            "stage_durations": stage_durations,
+                            "peak_memory_mb": peak_memory_mb,
+                        }
+                    )
 
-            with warnings_module.catch_warnings():
-                warnings_module.filterwarnings("ignore", category=UserWarning, module="pydantic")
-                message = ChatMessage.model_construct(role="assistant")
-                object.__setattr__(message, "content", content)
-                # Mark content as set in fields_set to ensure proper serialization
-                if hasattr(message, "__pydantic_fields_set__"):
-                    message.__pydantic_fields_set__.add("content")
+                # Build response
+                if not image_contents:
+                    content = "Image generation completed but no images were produced."
+                else:
+                    content = image_contents
+
+                # Use model_construct to bypass validation for multimodal content
+                # (ChatMessage.content only accepts str, but we need list for images)
+                # Then use object.__setattr__ to directly set the field, bypassing Pydantic's type checking
+                import warnings as warnings_module
+
+                with warnings_module.catch_warnings():
+                    warnings_module.filterwarnings("ignore", category=UserWarning, module="pydantic")
+                    message = ChatMessage.model_construct(role="assistant")
+                    object.__setattr__(message, "content", content)
+                    # Mark content as set in fields_set to ensure proper serialization
+                    if hasattr(message, "__pydantic_fields_set__"):
+                        message.__pydantic_fields_set__.add("content")
             choice = ChatCompletionResponseChoice.model_construct(
                 index=0,
                 message=message,
@@ -2595,7 +2846,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 stop_reason=None,
             )
 
-            response = ChatCompletionResponse(
+            response = OmniChatCompletionResponse(
                 id=request_id,
                 created=created_time,
                 model=self._diffusion_model_name,
@@ -2605,11 +2856,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     completion_tokens=1,
                     total_tokens=len(prompt.split()) + 1,
                 ),
+                metrics=self._get_diffusion_extra_output_params(result.custom_output),
             )
 
             logger.info(
-                "Diffusion chat completed for request %s: %d images",
+                "Diffusion chat completed for request %s: output_type=%s, image_count=%d",
                 request_id,
+                final_output_type,
                 len(images),
             )
 
@@ -2622,20 +2875,22 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 status_code=500,
             )
 
-    def _extract_diffusion_prompt_and_images(
+    def _extract_diffusion_prompt_and_media(
         self,
         messages: list[dict[str, Any]],
-    ) -> tuple[str, list[str]]:
-        """Extract text prompt and base64 images from chat messages.
+    ) -> tuple[str, list[str], list[str], list[str]]:
+        """Extract text prompt and multimodal inputs from chat messages.
 
         Args:
             messages: List of chat messages
 
         Returns:
-            Tuple of (prompt_text, list_of_base64_images)
+            Tuple of (prompt_text, list_of_base64_images, list_of_video_urls, list_of_audio_urls)
         """
         prompt_parts: list[str] = []
         images: list[str] = []
+        videos: list[str] = []
+        audios: list[str] = []
 
         for message in messages:
             role = message.get("role", "")
@@ -2670,19 +2925,32 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                     images.append(b64_data)
                                 except ValueError:
                                     logger.warning("Invalid data URL format")
+                        elif item.get("type") == "video_url":
+                            url = item.get("video_url", {}).get("url", "")
+                            if isinstance(url, str) and url:
+                                videos.append(url)
+                        elif item.get("type") == "audio_url":
+                            url = item.get("audio_url", {}).get("url", "")
+                            if isinstance(url, str) and url:
+                                audios.append(url)
                         # Handle {"image": "base64..."} format
                         elif "image" in item:
                             images.append(item["image"])
+                        elif "video" in item and isinstance(item["video"], str):
+                            videos.append(item["video"])
+                        elif "audio" in item and isinstance(item["audio"], str):
+                            audios.append(item["audio"])
 
         prompt = " ".join(prompt_parts).strip()
-        return prompt, images
+        return prompt, images, videos, audios
 
     def _extract_diffusion_prompt_and_images_from_messages(
         self,
         messages: list[Any],
     ) -> tuple[str, list[str]]:
         """Normalize mixed message types and extract prompt + reference images once."""
-        return self._extract_diffusion_prompt_and_images(self._messages_to_dicts(messages))
+        prompt, images, _videos, _audios = self._extract_diffusion_prompt_and_media(self._messages_to_dicts(messages))
+        return prompt, images
 
     @staticmethod
     def _messages_to_dicts(messages: list[Any]) -> list[dict[str, Any]]:

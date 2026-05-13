@@ -1,10 +1,43 @@
+import os
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 import torch
 from PIL import Image
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+
+FTFY_SITECUSTOMIZE_MOCK_DIR = Path(__file__).with_name("ftfy_mock")
+
+
+class IdentityFtfy:
+    @staticmethod
+    def fix_text(text: str) -> str:
+        return text
+
+
+def apply_ftfy_mock(*, wan_i2v_module: Any | None = None) -> None:
+    """Mock ftfy library for test cases in the main process"""
+    if wan_i2v_module is None:
+        from diffusers.pipelines.wan import pipeline_wan_i2v as wan_i2v_module
+
+    if not hasattr(wan_i2v_module, "ftfy"):
+        wan_i2v_module.ftfy = IdentityFtfy()
+        print("ftfy (text encoding sanitizer) is not installed. Using mock ftfy implementation (identity function)")
+    else:
+        print("ftfy (text encoding sanitizer) is installed. Using actual ftfy implementation.")
+
+
+def env_to_apply_ftfy_mock_in_subproc(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Mock ftfy library for test cases in subprocesses, by prepending the sitecustomize.py directory to PYTHONPATH"""
+    env_dict = dict(env or {})
+    pythonpath = env_dict.get("PYTHONPATH", os.environ.get("PYTHONPATH", ""))
+    path_entries = [str(FTFY_SITECUSTOMIZE_MOCK_DIR)]
+    if pythonpath:
+        path_entries.append(pythonpath)
+    env_dict["PYTHONPATH"] = os.pathsep.join(path_entries)
+    return env_dict
 
 
 def reset_artifact_dir(path: Path) -> Path:
@@ -107,6 +140,40 @@ def compute_image_ssim_psnr(
     ssim_value = float(ssim_metric(pred_tensor, ref_tensor).item())
     psnr_value = float(psnr_metric(pred_tensor, ref_tensor).item())
     return ssim_value, psnr_value
+
+
+class CLIPScorer:
+    def __init__(self, model_name_or_path: str = "openai/clip-vit-base-patch16"):
+        from transformers import CLIPModel, CLIPProcessor
+
+        self._model = CLIPModel.from_pretrained(model_name_or_path)
+        self._processor = CLIPProcessor.from_pretrained(model_name_or_path)
+        self._model.eval()
+
+    def score(self, image: Image.Image, text: str) -> float:
+        inputs = self._processor(text=[text], images=[image], return_tensors="pt", padding=True)
+        with torch.no_grad():
+            outputs = self._model(**inputs)
+        img_emb = outputs.image_embeds
+        txt_emb = outputs.text_embeds
+        img_emb = img_emb / img_emb.norm(p=2, dim=-1, keepdim=True)
+        txt_emb = txt_emb / txt_emb.norm(p=2, dim=-1, keepdim=True)
+        similarity = (img_emb * txt_emb).sum(dim=-1)
+        return float(similarity.item() * 100)
+
+    def assert_score(self, *, model_name: str, image: Image.Image, text: str, threshold: float) -> None:
+        value = self.score(image, text)
+        print(f"{model_name} CLIP score:")
+        print(f"  CLIPScore: value={value:.4f}, threshold>={threshold:.4f}, higher_is_better=True")
+        assert value >= threshold, (
+            f"CLIP score below threshold for {model_name}: got {value:.4f}, expected >= {threshold:.4f}."
+        )
+
+
+def _pil_to_clip_tensor(image: Image.Image) -> torch.Tensor:
+    array = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
+    return tensor
 
 
 def _pil_to_batched_tensor(image: Image.Image, *, compare_mode: str) -> torch.Tensor:

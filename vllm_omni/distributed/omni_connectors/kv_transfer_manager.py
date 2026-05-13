@@ -981,6 +981,11 @@ class OmniKVTransferManager:
         Returns:
             Tuple of (data dict, size) if successful, (None, 0) otherwise
         """
+        # Check if we should receive KV cache based on config
+        if not self.config.need_recv_cache:
+            logger.debug("Skip receiving KV cache for %s (need_recv_cache=False)", request_id)
+            return None, 0
+
         if not self.connector:
             logger.warning("No connector available for receiving KV cache")
             return None, 0
@@ -990,9 +995,9 @@ class OmniKVTransferManager:
             logger.warning("Receive stages not configured")
             return None, 0
 
-        # Check if we should receive KV cache based on config
-        if not self.config.need_recv_cache:
-            logger.info(f"Skip receiving KV cache for {request_id} (need_recv_cache=False)")
+        # Skip during warmup dummy run — no sender is available.
+        if request_id == "dummy_req_id":
+            logger.info("Skip receiving KV cache for dummy warmup request")
             return None, 0
 
         timeout = self.config.recv_timeout

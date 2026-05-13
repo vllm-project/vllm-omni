@@ -26,11 +26,15 @@ connectors:
       # Must match the decoder sliding attention window.
       codec_chunk_frames: 25
       codec_left_context_frames: 72
+      # Emit only the first audio chunk early, then return to codec_chunk_frames.
+      initial_codec_chunk_frames: 1
 
 stages:
   - stage_id: 0
     max_num_seqs: 10
     gpu_memory_utilization: 0.3
+    trust_remote_code: true
+    enable_prefix_caching: false
     async_scheduling: true
     max_num_batched_tokens: 512
     max_model_len: 4096
@@ -50,9 +54,11 @@ stages:
       top_p: 1.0
 
   - stage_id: 1
-    max_num_seqs: 1
+    max_num_seqs: 10
     gpu_memory_utilization: 0.3
     enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
     async_scheduling: true
     # Must be divisible by num_code_groups and cover (left_context + chunk).
     # Prefill length is Q * num_frames (e.g. 16 * 2148 = 34368); keep
@@ -71,3 +77,9 @@ stages:
       max_tokens: 65536
       seed: 42
       repetition_penalty: 1.0
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        enforce_eager: true

@@ -13,9 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from vllm.logger import init_logger
+from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
-from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 
 _MODELS_DIR = Path(__file__).resolve().parent.parent / "model_executor" / "models"
@@ -136,18 +137,27 @@ class StageExecutionType(str, Enum):
     DIFFUSION = "diffusion"
 
 
-# Mapping class refs (not dotted-path strings) so module/class renames fail
-# at import time instead of lazily at scheduler resolution. YAML overrides
-# and downstream serialization still use the dotted-path string form; the
-# conversion happens at the map lookup site via _scheduler_path().
-_EXECUTION_TYPE_TO_SCHEDULER: dict[StageExecutionType, type | None] = {
-    StageExecutionType.LLM_AR: OmniARScheduler,
-    StageExecutionType.LLM_GENERATION: OmniGenerationScheduler,
-    StageExecutionType.DIFFUSION: None,
-}
+def _resolve_scheduler(
+    execution_type: StageExecutionType,
+    async_scheduling: bool = True,
+) -> type[VLLMScheduler] | None:
+    """Return the scheduler class for the given execution_type.
+
+    NOTE: For AutoRegressive stages, we have two schedulers for sync / async
+    respectively, and decide which to used based on the value of async_scheduling.
+    For other execution types, async_scheduling is not used.
+    """
+    if execution_type == StageExecutionType.LLM_AR:
+        if not async_scheduling:
+            return OmniARScheduler
+        return OmniARAsyncScheduler
+    if execution_type == StageExecutionType.LLM_GENERATION:
+        return OmniGenerationScheduler
+    # Diffusion currently returns None here.
+    return None
 
 
-def _scheduler_path(cls: type | None) -> str | None:
+def _scheduler_path(cls: type[VLLMScheduler] | None) -> str | None:
     """Return the dotted import path for a scheduler class (``None`` passes through)."""
     if cls is None:
         return None
@@ -213,18 +223,6 @@ class PipelineConfig:
                 return stage
         return None
 
-    def get_scheduler_cls(self, stage_id: int) -> str | None:
-        """Return the inferred scheduler class path for a stage.
-
-        Returns ``None`` for DIFFUSION stages (no vLLM scheduler). Raises
-        ``ValueError`` if ``stage_id`` doesn't exist in this pipeline, and
-        ``KeyError`` if ``execution_type`` isn't in the scheduler map.
-        """
-        stage = self.get_stage(stage_id)
-        if stage is None:
-            raise ValueError(f"Pipeline {self.model_type!r} has no stage with id {stage_id}")
-        return _scheduler_path(_EXECUTION_TYPE_TO_SCHEDULER[stage.execution_type])
-
     def validate(self) -> list[str]:
         """Return list of topology errors (empty if valid)."""
         errors: list[str] = []
@@ -288,28 +286,23 @@ class _LazyPipelineRegistry:
 
         try:
             module = importlib.import_module(module_path)
-        except ImportError as exc:
-            logger.error(
-                "Failed to import pipeline module %r for %r: %s",
-                module_path,
-                model_type,
-                exc,
-            )
+            pipeline = getattr(module, var_name, None)
+            if pipeline is None:
+                logger.error(
+                    "Pipeline variable %r not found in module %r (registered for %r)",
+                    var_name,
+                    module_path,
+                    model_type,
+                )
+                return None
+            errors = pipeline.validate()
+            if errors:
+                logger.warning("Pipeline %s has issues: %s", pipeline.model_type, errors)
+            self._loaded[model_type] = pipeline
+            return pipeline
+        except Exception:
+            logger.exception("Failed to import pipeline module %r for %r", module_path, model_type)
             return None
-        pipeline = getattr(module, var_name, None)
-        if pipeline is None:
-            logger.error(
-                "Pipeline variable %r not found in module %r (registered for %r)",
-                var_name,
-                module_path,
-                model_type,
-            )
-            return None
-        errors = pipeline.validate()
-        if errors:
-            logger.warning("Pipeline %s has issues: %s", pipeline.model_type, errors)
-        self._loaded[model_type] = pipeline
-        return pipeline
 
     def __contains__(self, model_type: str) -> bool:
         if model_type in self._loaded:
@@ -355,14 +348,23 @@ class _LazyPipelineRegistry:
     def keys(self) -> set[str]:
         return set(self._get_lazy_map().keys()) | set(self._loaded.keys())
 
+    def _safe_get(self, key: str) -> PipelineConfig | None:
+        try:
+            return self[key]
+        except Exception:
+            logger.warning("Skipping pipeline %r because it failed to load.", key)
+        return None
+
     def values(self):
-        # Iterating values forces load of every lazy pipeline.
+        # Iterating forces a lazy import for each pipeline; failures are logged and skipped.
         for key in self.keys():
-            yield self[key]
+            if (p := self._safe_get(key)) is not None:
+                yield p
 
     def items(self):
         for key in self.keys():
-            yield key, self[key]
+            if (p := self._safe_get(key)) is not None:
+                yield key, p
 
     def __iter__(self):
         return iter(self.keys())
@@ -401,19 +403,42 @@ class StageDeployConfig:
     the top level of ``DeployConfig`` and propagated to every stage.
     """
 
+    # === Omni fields ===
+    # Stage identity and Omni runtime placement.
     stage_id: int
-    max_num_seqs: int = 64
-    gpu_memory_utilization: float = 0.9
-    tensor_parallel_size: int = 1
-    enforce_eager: bool = False
-    max_num_batched_tokens: int = 32768
-    max_model_len: int | None = None
-    async_scheduling: bool | None = None
-    devices: str = "0"
+    devices: str | None = None
+    num_replicas: int = 1
+
+    # Inter-stage connector wiring and request defaults.
     output_connectors: dict[str, str] | None = None
     input_connectors: dict[str, str] | None = None
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
+
+    # === vLLM EngineArgs fields ===
+    # Parallelism and scheduler/memory capacity.
+    tensor_parallel_size: int | None = None
+    gpu_memory_utilization: float | None = None
+    max_num_seqs: int | None = None
+    max_num_batched_tokens: int | None = None
+    max_model_len: int | None = None
+
+    # Execution, scheduling, and KV/cache behavior.
+    enforce_eager: bool | None = None
+    async_scheduling: bool | None = None
+    disable_hybrid_kv_cache_manager: bool | None = None
+    mm_processor_cache_gb: float | None = None
+
+    # Compilation, profiling, tokenizer/config parsing, and model loading.
+    compilation_config: dict[str, Any] | None = None
+    profiler_config: dict[str, Any] | None = None
+    skip_mm_profiling: bool | None = None
+    enable_flashinfer_autotune: bool | None = None
+    config_format: str | None = None
+    load_format: str | None = None
+    tokenizer_mode: str | None = None
+
+    # Pass-through vLLM EngineArgs fields that are not represented above.
     engine_extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -438,20 +463,21 @@ class DeployConfig:
     pipeline: str | None = None
 
     # === Pipeline-wide engine settings (applied uniformly to every stage) ===
-    trust_remote_code: bool = True
+    trust_remote_code: bool | None = None
     distributed_executor_backend: str | None = None
     dtype: str | None = None
     quantization: str | None = None
-    enable_prefix_caching: bool = False
+    enable_prefix_caching: bool | None = None
     enable_chunked_prefill: bool | None = None
-    data_parallel_size: int = 1
-    pipeline_parallel_size: int = 1
+    data_parallel_size: int | None = None
+    pipeline_parallel_size: int | None = None
 
 
 _STAGE_NON_ENGINE_KEYS = frozenset(
     {
         "stage_id",
         "devices",
+        "num_replicas",
         "output_connectors",
         "input_connectors",
         "default_sampling_params",
@@ -466,13 +492,20 @@ _STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name n
 def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     """Parse a single stage entry from deploy YAML into StageDeployConfig."""
     if "engine_args" in stage_data:
+        runtime_cfg = dict(stage_data.get("runtime", {}))
         engine_args = dict(stage_data["engine_args"])
-        devices = stage_data.get("runtime", {}).get("devices", stage_data.get("devices", "0"))
+        devices = stage_data.get("runtime", {}).get("devices", stage_data.get("devices"))
+        num_replicas = runtime_cfg.get("num_replicas", stage_data.get("num_replicas", 1))
     else:
         engine_args = {k: v for k, v in stage_data.items() if k not in _STAGE_NON_ENGINE_KEYS and k != "stage_id"}
-        devices = stage_data.get("devices", "0")
+        devices = stage_data.get("devices")
+        num_replicas = stage_data.get("num_replicas", stage_data.get("runtime", {}).get("num_replicas", 1))
 
-    kwargs: dict[str, Any] = {"stage_id": stage_data["stage_id"], "devices": devices}
+    kwargs: dict[str, Any] = {
+        "stage_id": stage_data["stage_id"],
+        "devices": devices,
+        "num_replicas": int(num_replicas),
+    }
     for name, f in _STAGE_DEPLOY_FIELDS.items():
         if name in engine_args:
             kwargs[name] = engine_args.pop(name)
@@ -608,7 +641,11 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str
     the flat layout. ``devices`` is ``None`` when no override is set.
     """
     if "engine_args" in ps:
-        return dict(ps["engine_args"]), ps.get("runtime", {}).get("devices")
+        overrides = dict(ps["engine_args"])
+        runtime_cfg = ps.get("runtime", {})
+        if "num_replicas" in runtime_cfg:
+            overrides["num_replicas"] = runtime_cfg["num_replicas"]
+        return overrides, runtime_cfg.get("devices")
     overrides = {k: v for k, v in ps.items() if k not in ("stage_id", "devices")}
     return overrides, ps.get("devices")
 
@@ -640,6 +677,15 @@ def _apply_platform_overrides(
             base.devices = devices
         for key, val in overrides.items():
             if hasattr(base, key):
+                # Deep-merge dict-valued fields listed in _DEEP_MERGE_KEYS so
+                # platform overlays don't silently clobber sibling keys (e.g.
+                # setting default_sampling_params={max_tokens: 2048} must not
+                # drop temperature / top_p / top_k from the base stage).
+                if key in _DEEP_MERGE_KEYS and isinstance(val, dict):
+                    base_val = getattr(base, key, None)
+                    if isinstance(base_val, dict):
+                        setattr(base, key, {**base_val, **val})
+                        continue
                 setattr(base, key, val)
             else:
                 base.engine_extras[key] = val
@@ -687,6 +733,15 @@ _PIPELINE_WIDE_ENGINE_FIELDS: tuple[str, ...] = (
     "data_parallel_size",
     "pipeline_parallel_size",
 )
+
+
+def deploy_override_field_names() -> frozenset[str]:
+    """Return deploy-schema fields whose CLI defaults must not override YAML."""
+    return (
+        frozenset(_STAGE_DEPLOY_FIELDS)
+        | frozenset(_PIPELINE_WIDE_ENGINE_FIELDS)
+        | frozenset({"async_chunk", "devices"})
+    )
 
 
 def _build_engine_args(
@@ -796,10 +851,19 @@ def merge_pipeline_deploy(
         stage_type, worker_type = _resolve_execution_mode(ps.execution_type)
         input_proc, next_stage_proc = _select_processor_funcs(ps, deploy.async_chunk)
         engine_args = _build_engine_args(ps, ds, pipeline, deploy, next_stage_proc)
+        sched_cls = _resolve_scheduler(
+            ps.execution_type,
+            engine_args.get("async_scheduling", True),
+        )
+        if ps.execution_type == StageExecutionType.LLM_AR:
+            engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
         extras = _build_extras(ps, ds)
         runtime: dict[str, Any] = {"process": True}
         if ds is not None:
-            runtime["devices"] = ds.devices
+            if ds.devices is not None:
+                runtime["devices"] = ds.devices
+            runtime["num_replicas"] = ds.num_replicas
+        runtime["requires_multimodal_data"] = ps.requires_multimodal_data
 
         result.append(
             StageConfig(
@@ -811,7 +875,7 @@ def merge_pipeline_deploy(
                 final_output=ps.final_output,
                 final_output_type=ps.final_output_type,
                 worker_type=worker_type,
-                scheduler_cls=_scheduler_path(_EXECUTION_TYPE_TO_SCHEDULER.get(ps.execution_type)),
+                scheduler_cls=_scheduler_path(sched_cls),
                 hf_config_name=ps.hf_config_name,
                 is_comprehension=ps.owns_tokenizer,
                 yaml_engine_args=engine_args,
@@ -861,13 +925,13 @@ class StageConfig:
 
         # CLI overrides take precedence over YAML defaults
         for key, value in self.runtime_overrides.items():
-            if key not in ("devices", "max_batch_size"):
+            if value is not None and key not in ("devices", "max_batch_size"):
                 engine_args[key] = value
 
         # Build runtime config from YAML defaults + CLI overrides
         runtime: dict[str, Any] = dict(self.yaml_runtime)
         runtime.setdefault("process", True)
-        if "devices" in self.runtime_overrides:
+        if self.runtime_overrides.get("devices") is not None:
             runtime["devices"] = self.runtime_overrides["devices"]
 
         # Legacy compat: migrate runtime.max_batch_size → engine_args.max_num_seqs
@@ -882,8 +946,6 @@ class StageConfig:
             )
             effective_mbs = int(cli_mbs or legacy_mbs or 1)
             engine_args.setdefault("max_num_seqs", effective_mbs)
-
-        engine_args.setdefault("max_num_seqs", 1)
 
         # Build full config dict
         config_dict: dict[str, Any] = {
@@ -1009,6 +1071,8 @@ class StageConfigFactory:
             cli_overrides = {}
 
         trust_remote_code = cli_overrides.get("trust_remote_code", True)
+        if trust_remote_code is None:
+            trust_remote_code = False
 
         # --- New path: check pipeline registry by model_type first ---
         model_type, hf_config = cls._auto_detect_model_type(model, trust_remote_code=trust_remote_code)
@@ -1278,6 +1342,23 @@ class StageConfigFactory:
             # YAMLs (worker_type, scheduler_cls, etc.) — read from both places.
             worker_type = stage_data.get("worker_type", None) or yaml_engine_args.pop("worker_type", None)
             scheduler_cls = stage_data.get("scheduler_cls", None) or yaml_engine_args.pop("scheduler_cls", None)
+            if scheduler_cls:
+                async_sched = yaml_engine_args.get("async_scheduling")
+                if async_sched is not None:
+                    logger.warning(
+                        "Stage %s: async_scheduling=%r and scheduler_cls=%r "
+                        "should not be set together. scheduler_cls will take "
+                        "precedence for which scheduler is used.",
+                        stage_data.stage_id,
+                        async_sched,
+                        scheduler_cls,
+                    )
+                else:
+                    logger.warning(
+                        "Stage %s: scheduler_cls=%r is deprecated. Use async_scheduling instead.",
+                        stage_data.stage_id,
+                        scheduler_cls,
+                    )
             hf_config_name = stage_data.get("hf_config_name", None) or yaml_engine_args.pop("hf_config_name", None)
             model_stage = getattr(stage_data, "model_stage", None) or yaml_engine_args.pop("model_stage", None)
 
@@ -1352,8 +1433,8 @@ class StageConfigFactory:
 
             hf_config = get_config(model, trust_remote_code=trust_remote_code)
             return hf_config.model_type, hf_config
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"`get_config` failed for {e}; Falling back to raw config.json path")
 
         # Fallback: read config.json directly for custom model types that
         # are not registered with transformers (e.g. qwen3_tts).
@@ -1390,8 +1471,8 @@ class StageConfigFactory:
                             class_name,
                         )
                         return pipeline_cfg.model_type, None
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Failed to detect model type for diffusers-style models: {e}")
 
         # Final fallback: some models (e.g. CosyVoice3) ship an empty
         # config.json and rely on naming conventions. Match the model path

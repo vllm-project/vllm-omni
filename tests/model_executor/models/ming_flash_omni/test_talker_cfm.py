@@ -46,7 +46,7 @@ def _warmup_pipeline(cfm: CFM, aggregator: Aggregator, stop_head: torch.nn.Linea
         gen_lat = cfm.sample(llm_cond, lat_cond, y0, t, sde_args, sde_rnd)
         aggregator(gen_lat)
         stop_head(llm_cond[:, -1, :]).softmax(dim=-1)
-    torch.cuda.synchronize(device)
+    torch.accelerator.synchronize(device)
 
 
 def _build_pipeline():
@@ -95,7 +95,7 @@ class TestCFMGraphExecutor:
         his_lat = torch.randn(bsz, _HIS_PATCH_SIZE, _LATENT_DIM, device=device, dtype=_DTYPE)
 
         gen_lat, inputs_embeds, stop_out = executor.execute(input_tensor, his_lat)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
         assert gen_lat.shape == (bsz, _PATCH_SIZE, _LATENT_DIM)
         assert inputs_embeds.shape == (bsz, 1, _LLM_HIDDEN)
@@ -109,7 +109,7 @@ class TestCFMGraphExecutor:
         new_input = torch.randn_like(input_tensor)
         new_his = torch.randn_like(his_lat)
         gen_lat2, inputs_embeds2, stop_out2 = executor.execute(new_input, new_his)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         assert gen_lat2.shape == gen_lat.shape
         assert inputs_embeds2.shape == inputs_embeds.shape
         assert stop_out2.shape == stop_out.shape
@@ -125,7 +125,7 @@ class TestCFMGraphExecutor:
         snapshot_his = his_lat.clone()
 
         executor.execute(input_tensor, his_lat)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         assert torch.equal(input_tensor, snapshot_input)
         assert torch.equal(his_lat, snapshot_his)
 
@@ -139,7 +139,7 @@ class TestCFMGraphExecutorPool:
         his_lat = torch.randn(1, _HIS_PATCH_SIZE, _LATENT_DIM, device=device, dtype=_DTYPE)
 
         gen_lat, inputs_embeds, stop_out = pool.execute(input_tensor, his_lat)
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         assert gen_lat.shape == (1, _PATCH_SIZE, _LATENT_DIM)
         assert inputs_embeds.shape == (1, 1, _LLM_HIDDEN)
         assert stop_out.shape == (1, 2)

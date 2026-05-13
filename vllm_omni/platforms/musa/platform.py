@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Any
 
 import torch
 from vllm.logger import init_logger
+from vllm.platforms.interface import DeviceCapability
 from vllm_musa.platform import MUSAPlatformBase
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
@@ -33,18 +33,6 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
     @classmethod
     def get_default_stage_config_path(cls) -> str:
         return "vllm_omni/model_executor/stage_configs"
-
-    @classmethod
-    def get_diffusion_model_impl_qualname(cls, op_name: str) -> str:
-        # MUSA uses default implementations for diffusion ops
-        if op_name == "hunyuan_fused_moe":
-            return "vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe.HunyuanFusedMoEDefault"
-        return super().get_diffusion_model_impl_qualname(op_name)
-
-    @classmethod
-    def prepare_diffusion_op_runtime(cls, op_name: str, **kwargs: Any) -> None:
-        # MUSA uses default runtime preparation
-        return None
 
     @classmethod
     def has_flash_attn_package(cls) -> bool:
@@ -98,17 +86,17 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
                     )
                 elif not packages_available:
                     logger.warning("Flash Attention (mate package) not available. Falling back to TORCH_SDPA backend.")
-                logger.info("Defaulting to diffusion attention backend SDPA")
+                logger.debug("Defaulting to diffusion attention backend SDPA")
                 return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
             backend = DiffusionAttentionBackendEnum[backend_upper]
-            logger.info("Using diffusion attention backend '%s'", backend_upper)
+            logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()
 
         if flash_attn_supported:
-            logger.info("Defaulting to diffusion attention backend FLASH_ATTN")
+            logger.debug("Defaulting to diffusion attention backend FLASH_ATTN")
             return DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
 
-        logger.info("Defaulting to diffusion attention backend SDPA")
+        logger.debug("Defaulting to diffusion attention backend SDPA")
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
     @classmethod
@@ -136,9 +124,20 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
         return torch.device("musa", local_rank)
 
     @classmethod
+    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
+        """Get the compute capability of the MUSA device."""
+        major, minor = torch.cuda.get_device_capability(device_id)
+        return DeviceCapability(major=major, minor=minor)
+
+    @classmethod
     def get_device_count(cls) -> int:
         """Get the number of available MUSA devices."""
         return torch.musa.device_count()
+
+    @classmethod
+    def get_device_version(cls) -> str | None:
+        """Get the MUSA runtime version."""
+        return torch.version.musa
 
     @classmethod
     def synchronize(cls) -> None:

@@ -39,6 +39,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
 )
@@ -208,6 +209,15 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
         self._execution_device = get_local_device()
         model = od_config.model
         local_files_only = os.path.exists(model)
+
+        # Avoid the transformers v5 multi-worker subfolder race (see
+        # ``vllm_omni/diffusion/model_loader/hub_prefetch.py`` for the full
+        # analysis; L4 build #1043 hit this on FLUX.2-klein-4B's text_encoder).
+        prefetch_subfolders(
+            model,
+            ["scheduler", "text_encoder", "tokenizer", "vae"],
+            local_files_only=local_files_only,
+        )
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model,

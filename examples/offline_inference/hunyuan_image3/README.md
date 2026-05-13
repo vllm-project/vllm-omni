@@ -1,161 +1,156 @@
 # HunyuanImage-3.0-Instruct
 
-## Set up
+This example runs HunyuanImage-3.0-Instruct offline with the unified deploy
+YAMLs under `vllm_omni/deploy/`.
 
-Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
+## Deploy Configs
 
-## Run examples
+| File | Topology | Default use |
+| :--- | :--- | :--- |
+| `vllm_omni/deploy/hunyuan_image3.yaml` | AR + DiT | Default for `text2img` and `img2img`. |
+| `vllm_omni/deploy/hunyuan_image3_ar.yaml` | AR only | Default for `img2text` and `text2text`. |
+| `vllm_omni/deploy/hunyuan_image3_dit.yaml` | DiT only | Standalone diffusion stage. Pass it explicitly with `--deploy-config`. |
 
-**Note**: These examples work with the default configuration on **8x NVIDIA L40S (48GB)**. For different GPU setups, modify the stage configuration to adjust device allocation and memory utilization.
+The example chooses a deploy config automatically when `--deploy-config` and
+`--stage-configs-path` are both omitted:
 
-Get into the hunyuan_image3 folder:
+| `--modality` | `mode` passed to Omni | Default deploy |
+| :--- | :--- | :--- |
+| `text2img` | `text-to-image` | `hunyuan_image3.yaml` |
+| `img2img` | `image-editing` | `hunyuan_image3.yaml` |
+| `img2text` | `image-to-text` | `hunyuan_image3_ar.yaml` |
+| `text2text` | `text-to-text` | `hunyuan_image3_ar.yaml` |
 
-```bash
-cd examples/offline_inference/hunyuan_image3
-```
+`--modality` is an offline example convenience flag. It maps to the internal
+`mode` argument passed to `Omni(...)` by this script. HunyuanImage3 uses
+separate deploy YAMLs for AR + DiT, AR-only, and DiT-only topologies, so the
+stage topology is selected by the deploy file rather than by YAML mode
+overrides.
 
-### Modality Control
+Online serving does not expose a `--modality` flag or accept `mode` as an API
+request field. Choose the deploy topology when starting the server with
+`--deploy-config`, then use the OpenAI-compatible endpoint and request shape for
+the scenario. The `modalities` request field is used by the chat completions
+path; the image endpoints infer the image task from the endpoint and payload.
 
-HunyuanImage-3.0-Instruct supports multiple modality modes. You can control the mode using the `--modality` argument:
+| Online scenario | Server deploy | Request |
+| :--- | :--- | :--- |
+| Text to image | `--deploy-config vllm_omni/deploy/hunyuan_image3.yaml` | `POST /v1/images/generations`, or `POST /v1/chat/completions` with `"modalities": ["image"]`. |
+| Image editing | `--deploy-config vllm_omni/deploy/hunyuan_image3.yaml` | `POST /v1/images/edits`. |
+| Image/text to text | `--deploy-config vllm_omni/deploy/hunyuan_image3_ar.yaml` | `POST /v1/chat/completions` for text output, for example with `"modalities": ["text"]`. |
+| DiT-only image generation | `--deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml` | `POST /v1/images/generations`. |
 
-#### Text to Image (text2img)
+## Run Examples
 
-- **Pipeline**: Text → AR (CoT + latent tokens) → DiT (denoise) → VAE Decode → Image
-- **Stages Used**: Stage 0 (AR) + Stage 1 (DiT)
-- **KV Transfer**: AR sends KV cache to DiT for conditioned generation
-- **Default Config**: `hunyuan_image3_t2i.yaml`
-
-```bash
-python end2end.py --model tencent/HunyuanImage-3.0-Instruct \
-                  --modality text2img \
-                  --prompts "A cute cat sitting on a windowsill watching the sunset"
-```
-
-#### Image to Image (img2img)
-
-- **Pipeline**: Image + Text → AR (CoT + recaption + latent) → DiT → Edited Image
-- **Stages Used**: Stage 0 (AR) + Stage 1 (DiT)
-- **KV Transfer**: AR sends KV cache to DiT
-- **Default Config**: `hunyuan_image3_it2i.yaml`
-
-```bash
-python end2end.py --model tencent/HunyuanImage-3.0-Instruct \
-                  --modality img2img \
-                  --image-path /path/to/image.png \
-                  --prompts "Make the petals neon pink"
-```
-
-#### Image to Text (img2text)
-
-- **Pipeline**: Image + Question → AR → Text description
-- **Stages Used**: Stage 0 (AR) only
-- **Default Config**: `hunyuan_image3_i2t.yaml`
+Text to image, using the default AR + DiT deploy:
 
 ```bash
-python end2end.py --model tencent/HunyuanImage-3.0-Instruct \
-                  --modality img2text \
-                  --image-path /path/to/image.jpg \
-                  --prompts "Describe the content of the picture."
+python examples/offline_inference/hunyuan_image3/end2end.py \
+  --model tencent/HunyuanImage-3.0-Instruct \
+  --modality text2img \
+  --prompts "A cute cat sitting on a windowsill watching the sunset"
 ```
 
-#### Text to Text (text2text)
-
-- **Pipeline**: Text → AR → Text
-- **Stages Used**: Stage 0 (AR) only
-- **Default Config**: `hunyuan_image3_t2t.yaml`
+Image editing, using the default AR + DiT deploy:
 
 ```bash
-python end2end.py --model tencent/HunyuanImage-3.0-Instruct \
-                  --modality text2text \
-                  --prompts "What is the capital of France?"
+python examples/offline_inference/hunyuan_image3/end2end.py \
+  --model tencent/HunyuanImage-3.0-Instruct \
+  --modality img2img \
+  --image-path /path/to/image.png \
+  --prompts "Make the petals neon pink"
 ```
 
-### Inference Steps & Guidance
-
-Control generation quality for image modalities:
+Image to text, using the AR-only deploy:
 
 ```bash
-python end2end.py --modality text2img \
-                  --steps 50 \
-                  --guidance-scale 5.0 \
-                  --height 1024 --width 1024 \
-                  --prompts "A photo-realistic sunset over the ocean"
+python examples/offline_inference/hunyuan_image3/end2end.py \
+  --model tencent/HunyuanImage-3.0-Instruct \
+  --modality img2text \
+  --image-path /path/to/image.jpg \
+  --prompts "Describe the content of the picture."
 ```
 
-### Key Arguments
-
-#### 📌 Command Line Arguments (end2end.py)
-
-| Argument               | Type   | Default                              | Description                                                  |
-| :--------------------- | :----- | :----------------------------------- | :----------------------------------------------------------- |
-| `--model`              | string | `tencent/HunyuanImage-3.0-Instruct` | Model path or name                                           |
-| `--modality`           | choice | `text2img`                           | Modality: `text2img`, `img2img`, `img2text`, `text2text`     |
-| `--prompts`            | list   | `None`                               | Input text prompts                                           |
-| `--image-path`         | string | `None`                               | Input image path (for `img2img`/`img2text`)                  |
-| `--output`             | string | `.`                                  | Output directory for saved images                            |
-| `--steps`              | int    | `50`                                 | Number of inference steps                                    |
-| `--guidance-scale`     | float  | `5.0`                                | Classifier-free guidance scale                               |
-| `--seed`               | int    | `42`                                 | Random seed                                                  |
-| `--height`             | int    | `1024`                               | Output image height                                          |
-| `--width`              | int    | `1024`                               | Output image width                                           |
-| `--bot-task`           | string | auto                                 | Override prompt task (e.g. `it2i_think`, `t2i_recaption`)    |
-| `--sys-type`           | string | auto                                 | Override system prompt type (e.g. `en_unified`, `en_vanilla`) |
-| `--stage-configs-path` | string | auto                                 | Custom stage config YAML path                                |
-| `--enforce-eager`      | flag   | `False`                              | Disable torch.compile                                        |
-| `--init-timeout`       | int    | `300`                                | Initialization timeout (seconds)                             |
-
-------
-
-#### ⚙️ Stage Configurations
-
-| Config YAML                         | Modality  | Stages | GPUs   | Description                           |
-| :---------------------------------- | :-------- | :----- | :----- | :------------------------------------ |
-| `hunyuan_image3_t2i.yaml`           | text2img  | 2      | 8      | T2I with AR→DiT, 4 GPU each          |
-| `hunyuan_image3_it2i.yaml`          | img2img   | 2      | 8      | IT2I with AR→DiT, 4 GPU each         |
-| `hunyuan_image3_i2t.yaml`           | img2text  | 1      | 4      | I2T (AR only)                         |
-| `hunyuan_image3_t2t.yaml`           | text2text | 1      | 4      | T2T (AR only)                         |
-| `hunyuan_image3_t2i_2gpu.yaml`      | text2img  | 2      | 2      | T2I for 2-GPU setups                  |
-| `hunyuan_image3_moe.yaml`           | text2img  | 2      | 8      | T2I with MoE AR→DiT KV reuse          |
-| `hunyuan_image3_moe_dit_2gpu_fp8.yaml` | text2img | 2   | 2      | T2I with FP8 quantization             |
-
-------
-
-## Using MoE Config
-
-The `hunyuan_image3_moe.yaml` config enables AR→DiT KV cache reuse with 8 GPUs (4 for AR + 4 for DiT).
+Text to text, using the AR-only deploy:
 
 ```bash
-python end2end.py --model tencent/HunyuanImage-3.0-Instruct \
-                  --modality text2img \
-                  --stage-configs-path hunyuan_image3_moe.yaml \
-                  --prompts "A cute cat"
+python examples/offline_inference/hunyuan_image3/end2end.py \
+  --model tencent/HunyuanImage-3.0-Instruct \
+  --modality text2text \
+  --prompts "What is the capital of France?"
 ```
 
-------
+Standalone DiT, using the DiT-only deploy explicitly:
+
+```bash
+python examples/offline_inference/hunyuan_image3/end2end.py \
+  --model tencent/HunyuanImage-3.0-Instruct \
+  --modality text2img \
+  --deploy-config vllm_omni/deploy/hunyuan_image3_dit.yaml \
+  --prompts "A cinematic portrait of an astronaut in a greenhouse"
+```
+
+Override the default full AR + DiT deploy explicitly:
+
+```bash
+python examples/offline_inference/hunyuan_image3/end2end.py \
+  --model tencent/HunyuanImage-3.0-Instruct \
+  --modality text2img \
+  --deploy-config vllm_omni/deploy/hunyuan_image3.yaml \
+  --prompts "A cute cat"
+```
+
+## Key Arguments
+
+| Argument | Description |
+| :--- | :--- |
+| `--deploy-config` | Preferred config path for unified deploy YAMLs. |
+| `--stage-configs-path` | Legacy stage config path, kept only for compatibility. Prefer `--deploy-config`. |
+| `--modality` | Offline-only convenience flag. One of `text2img`, `img2img`, `img2text`, `text2text`. It selects prompt formatting, internal `mode`, and default deploy config for this script. Online serving uses `--deploy-config` plus the endpoint and, for chat completions, request `modalities` instead. |
+| `--steps` | Number of diffusion inference steps for image generation. |
+| `--guidance-scale` | Classifier-free guidance scale for image generation. |
+| `--height`, `--width` | Output image size for `text2img`. |
+| `--bot-task` | Prompt behavior. `auto` selects the default from `--modality`; `think` adds `<think>`; `recaption` adds `<recaption>`; `vanilla` uses the text-to-image pretrain template. |
+| `--sys-type` | Override the system prompt type, for example `en_unified` or `en_vanilla`. |
+| `--vae-use-tiling` | Enable VAE tiling for memory reduction. |
+
+## Notes
+
+- `hunyuan_image3_ar.yaml` is a 4-card AR-only text/comprehension deploy. It sets `engine_output_type: text`, `final_output_type: text`, and text sampling defaults.
+- `hunyuan_image3_dit.yaml` is a single-stage DiT deploy with `stage_id: 0`; it does not require stage 1 or a running AR stage.
+- The old HunyuanImage3 YAMLs under `model_executor/stage_configs/` and `platforms/*/stage_configs/` have been folded into the deploy YAMLs.
+- This PR does not keep the HunyuanImage3 AR-to-DiT KV reuse wiring. The deploy YAMLs describe the topology and platform settings only.
 
 ## Prompt Format
 
-HunyuanImage-3.0 uses a pretrain template format:
+HunyuanImage-3.0-Instruct uses an instruct chat template:
 
+```text
+<|startoftext|>{system_prompt}
+
+User: {<img>?}{user_prompt}
+
+Assistant: {trigger_tag?}
 ```
-<|startoftext|>{system_prompt}{<img>}{trigger_tag}{user_prompt}
-```
 
-- `<img>`: Placeholder for each input image (auto-inserted by `prompt_utils.py`)
-- Trigger tags: `<think>` (CoT), `<recaption>` (recaptioning)
-- System prompt: Auto-selected based on task
+- `<img>`: Placeholder for each input image (single token; expanded by the multimodal pipeline).
+- Trigger tags: `<think>` for CoT and `<recaption>` for recaptioning, placed after `Assistant: `.
+- System prompt: Auto-selected based on task.
+- `t2i_vanilla` is the only task that uses the bare pretrain template without chat structure.
+- The example composes the internal prompt task from `--modality` and `--bot-task`
+  before calling `prompt_utils`; for example, `img2text + think` becomes
+  `i2t_think` for prompt and stop-token lookup.
 
-The `prompt_utils.build_prompt()` handles this formatting automatically.
-
-------
+The shared `vllm_omni.diffusion.models.hunyuan_image3.prompt_utils.build_prompt_tokens()`
+helper handles segment-by-segment tokenization and matches HF `apply_chat_template`.
 
 ## FAQ
 
-- **OOM errors**: Decrease `gpu_memory_utilization` in the YAML stage config, or use a smaller `max_num_batched_tokens`.
+- **OOM errors**: Decrease `gpu_memory_utilization` in the deploy YAML, use a smaller `max_num_batched_tokens`, or enable VAE tiling with `--vae-use-tiling`.
 - **Custom image sizes**: Use `--height` and `--width` flags (multiples of 16 recommended).
 
-| Stage             | VRAM (approx)        |
-| :---------------- | :------------------- |
-| Stage 0 (AR)      | ~15 GiB + KV Cache   |
-| Stage 1 (DiT)     | ~30 GiB              |
-| Total (8-GPU)     | ~45 GiB + KV Cache   |
+| Stage | VRAM (approx) |
+| :--- | :--- |
+| Stage 0 (AR) | ~15 GiB + KV Cache |
+| Stage 1 (DiT) | ~30 GiB |
+| Total (8-GPU) | ~45 GiB + KV Cache |

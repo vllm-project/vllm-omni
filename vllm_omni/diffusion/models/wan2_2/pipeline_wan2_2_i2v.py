@@ -22,7 +22,9 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
@@ -196,6 +198,12 @@ class Wan22I2VPipeline(
         # Image encoder (CLIP) - optional, for Wan2.1-style I2V
         self.has_image_encoder = "image_encoder" in model_index and model_index["image_encoder"][0] is not None
 
+        # See ``hub_prefetch.py`` for the transformers v5 subfolder race.
+        subfolders = ["tokenizer", "text_encoder", "vae"]
+        if self.has_image_encoder:
+            subfolders.extend(["image_processor", "image_encoder"])
+        prefetch_subfolders(model, subfolders, local_files_only=local_files_only)
+
         if self.has_image_encoder:
             self.image_processor = CLIPImageProcessor.from_pretrained(
                 model, subfolder="image_processor", local_files_only=local_files_only
@@ -275,8 +283,10 @@ class Wan22I2VPipeline(
         condition: torch.Tensor,
         first_frame_mask: torch.Tensor,
     ) -> torch.Tensor:
+        if attention_kwargs is None:
+            attention_kwargs = {}
         with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
+            for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
 
                 # Select model and guidance scale based on timestep
@@ -285,6 +295,8 @@ class Wan22I2VPipeline(
                 if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
                     current_model = self.transformer_2
                     current_guidance_scale = guidance_high
+
+                set_forward_context_denoise_step_idx(step_idx)
 
                 # Prepare latent input
                 if self.expand_timesteps:
@@ -301,6 +313,7 @@ class Wan22I2VPipeline(
                     timestep = t.expand(latents.shape[0])
 
                 do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
+                # Prepare kwargs for positive and negative predictions
                 positive_kwargs = {
                     "hidden_states": latent_model_input,
                     "timestep": timestep,
@@ -323,6 +336,7 @@ class Wan22I2VPipeline(
                 else:
                     negative_kwargs = None
 
+                # Predict noise with automatic CFG parallel handling
                 noise_pred = self.predict_noise_maybe_with_cfg(
                     do_true_cfg=do_true_cfg,
                     true_cfg_scale=current_guidance_scale,
@@ -331,7 +345,9 @@ class Wan22I2VPipeline(
                     cfg_normalize=False,
                 )
 
+                # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+
                 pbar.update()
 
         return latents

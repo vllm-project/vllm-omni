@@ -34,7 +34,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
-from vllm_omni.diffusion.models.interface import SupportsModuleOffload
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.lora.request import LoRARequest
@@ -1153,7 +1153,7 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         return loader.load_weights(weights)
 
 
-class LTX2TwoStagesPipeline(nn.Module, SupportsModuleOffload):
+class LTX2TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
     """LTX2TwoStagesPipeline is for two stages image to video generation"""
 
     _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]

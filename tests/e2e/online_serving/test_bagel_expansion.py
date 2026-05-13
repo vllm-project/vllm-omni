@@ -6,7 +6,6 @@ Coverage:
 - TeaCache
 - Cache-DiT
 - CFG-Parallel
-- Tensor-Parallel
 - Ulysses-SP
 - Ring-Attention
 - Layerwise Offloading
@@ -31,7 +30,7 @@ PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 def _get_diffusion_feature_cases(model: str):
     """Return L4 diffusion feature cases for Bagel.
-    TeaCache, Cache-DiT, CFG-Parallel, Tensor-Parallel,
+    TeaCache, Cache-DiT, CFG-Parallel,
     Ulysses-SP, Ring-Attention, Layerwise Offloading.
     """
 
@@ -74,20 +73,6 @@ def _get_diffusion_feature_cases(model: str):
             id="parallel_cfg_2",
             marks=PARALLEL_FEATURE_MARKS,
         ),
-        # Tensor-Parallel size 2 (2 GPUs, Cache-DiT backend)
-        pytest.param(
-            OmniServerParams(
-                model=model,
-                server_args=[
-                    "--cache-backend",
-                    "cache_dit",
-                    "--tensor-parallel-size",
-                    "2",
-                ],
-            ),
-            id="parallel_tp_2",
-            marks=[*PARALLEL_FEATURE_MARKS, pytest.mark.skip(reason="issue: #2862")],
-        ),
         # Ulysses-SP degree=2 (2 GPUs)
         pytest.param(
             OmniServerParams(
@@ -121,6 +106,19 @@ def _get_diffusion_feature_cases(model: str):
             id="single_card_layerwise_offload",
             marks=SINGLE_CARD_FEATURE_MARKS,
         ),
+        # Hybrid Sharded Data Parallel (4 GPUs)
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--use-hsdp",
+                    "--hsdp-shard-size",
+                    "4",
+                ],
+            ),
+            id="parallel_hsdp_4",
+            marks=PARALLEL_FEATURE_MARKS,
+        ),
     ]
 
 
@@ -139,10 +137,10 @@ def test_bagel(
     - TeaCache
     - Cache-DiT
     - CFG-Parallel (size=2)
-    - Tensor-Parallel (size=2)
     - Ulysses-SP (degree=2)
     - Ring-Attention (degree=2)
     - Layerwise Offloading
+    - Hybrid Sharded Data Parallel (size=4)
 
     Validation is delegated to assert_diffusion_response in tests/helpers/assertions.py,
     which checks output dimensions and basic correctness.

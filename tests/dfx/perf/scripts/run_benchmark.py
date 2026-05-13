@@ -17,11 +17,10 @@ from tests.dfx.conftest import (
 )
 from tests.helpers.runtime import OmniServer
 
-pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+pytestmark = [pytest.mark.full_model]
 
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 
 def _get_config_file_from_argv() -> str | None:
@@ -65,11 +64,13 @@ def omni_server(request):
     Multi-stage initialization can take 10-20+ minutes.
     """
     with _omni_server_lock:
-        test_name, model, stage_config_path, stage_overrides, extra_cli_args = request.param
+        test_name, model, stage_config_path, stage_overrides, extra_cli_args, use_omni = request.param
 
         print(f"Starting OmniServer with test: {test_name}, model: {model}")
 
-        server_args = ["--stage-init-timeout", "600", "--init-timeout", "900"]
+        server_args: list[str] = []
+        if use_omni:
+            server_args += ["--stage-init-timeout", "600", "--init-timeout", "900"]
         # --deploy-config and --stage-overrides compose at the CLI (see vllm_omni/entrypoints/utils.py):
         # deploy-config sets the base; stage-overrides are applied on top. Both can be set.
         if stage_config_path:
@@ -78,7 +79,7 @@ def omni_server(request):
             server_args = ["--stage-overrides", stage_overrides] + server_args
         if extra_cli_args:
             server_args = list(extra_cli_args) + server_args
-        with OmniServer(model, server_args) as server:
+        with OmniServer(model, server_args, use_omni=use_omni) as server:
             server.test_name = test_name
             print("OmniServer started successfully")
             yield server

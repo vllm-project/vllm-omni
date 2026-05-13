@@ -30,6 +30,41 @@ def _get_hf_token() -> str | None:
     return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
 
 
+def _ensure_transformers_tied_weights_compat() -> None:
+    """Provide the transformers>=5 tied-weight attr expected during loading.
+
+    The DYNIN audio detokenizer uses Hugging Face remote code that still only
+    defines the older ``_tied_weights_keys`` attribute. transformers 5.x now
+    reads ``all_tied_weights_keys`` inside ``from_pretrained`` before the model
+    instance is returned, so patching the loaded object is too late.
+    """
+    try:
+        from transformers import PreTrainedModel
+    except Exception:
+        return
+
+    if hasattr(PreTrainedModel, "all_tied_weights_keys"):
+        return
+
+    def all_tied_weights_keys(self: Any) -> dict[str, Any]:
+        keys: dict[str, Any] = {}
+        for attr_name in ("_tied_weights_keys", "_dynamic_tied_weights_keys"):
+            raw_keys = getattr(self, attr_name, None)
+            if raw_keys is None:
+                continue
+            if isinstance(raw_keys, dict):
+                keys.update({str(k): v for k, v in raw_keys.items()})
+                continue
+            if isinstance(raw_keys, str):
+                keys[raw_keys] = None
+                continue
+            for key in raw_keys:
+                keys[str(key)] = None
+        return keys
+
+    PreTrainedModel.all_tied_weights_keys = property(all_tied_weights_keys)  # type: ignore[attr-defined]
+
+
 def _ensure_remote_s2u_vendor_root(
     *,
     repo_id: str,
@@ -232,6 +267,7 @@ class DyninOmniToken2Audio(DyninOmniStageBase):
                     "transformers is required to load EMOVASpeechTokenizer remote code from Hugging Face."
                 ) from e
 
+            _ensure_transformers_tied_weights_compat()
             try:
                 self._vq_audio = AutoModel.from_pretrained(
                     model_path,

@@ -11,9 +11,9 @@ to DiffusionModelRunner.
 import gc
 import multiprocessing as mp
 import os
-from collections.abc import Iterable
-from contextlib import AbstractContextManager, nullcontext
-from types import SimpleNamespace
+from collections.abc import Iterable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -22,7 +22,7 @@ from vllm.config import CompilationConfig, DeviceConfig, VllmConfig, set_current
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.logger import init_logger
 from vllm.profiler.wrapper import CudaProfilerWrapper, WorkerProfiler
-from vllm.transformers_utils.config import get_config, get_hf_text_config
+from vllm.transformers_utils.config import get_hf_text_config
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import GiB_bytes
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -45,13 +45,85 @@ from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
-from vllm_omni.diffusion.worker.utils import RunnerOutput
+from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
 from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _DiffusionVllmModelConfig:
+    model: str
+    dtype: torch.dtype
+    quantization: str | None = None
+    quantization_config: Any | None = None
+    hf_config: Any | None = None
+    hf_text_config: Any | None = None
+    multimodal_config: Any | None = None
+    enforce_eager: bool = False
+    disable_cascade_attn: bool = False
+    enable_return_routed_experts: bool = False
+    is_moe: bool = False
+
+    def is_quantized(self) -> bool:
+        return self.quantization is not None
+
+    def is_model_moe(self) -> bool:
+        return self.is_moe
+
+    def is_nvfp4_quantized(self) -> bool:
+        return self.quantization == "modelopt_fp4"
+
+
+def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _DiffusionVllmModelConfig:
+    quant_config = getattr(od_config, "quantization_config", None)
+    quantization = quant_config.get_name() if quant_config is not None and hasattr(quant_config, "get_name") else None
+    hf_config = getattr(od_config, "tf_model_config", None)
+    hf_text_config = get_hf_text_config(hf_config) if hasattr(hf_config, "get_text_config") else hf_config
+    return _DiffusionVllmModelConfig(
+        model=od_config.model,
+        dtype=od_config.dtype,
+        quantization=quantization,
+        quantization_config=quant_config,
+        hf_config=hf_config,
+        hf_text_config=hf_text_config,
+        enforce_eager=getattr(od_config, "enforce_eager", False),
+        is_moe=bool(getattr(od_config, "is_moe", False)),
+    )
+
+
+@contextmanager
+def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[None]:
+    from vllm.model_executor.layers.quantization import modelopt as vllm_modelopt
+
+    linear_method_cls = getattr(quant_config, "LinearMethodCls", None)
+    if linear_method_cls in {
+        vllm_modelopt.ModelOptFp8LinearMethod,
+        vllm_modelopt.ModelOptFp8PcPtLinearMethod,
+    }:
+        from vllm.platforms import current_platform
+
+        if current_platform.is_cuda() and current_platform.has_device_capability(89):
+            from vllm.model_executor.kernels.linear import CutlassFP8ScaledMMLinearKernel
+
+            original_init_fp8_linear_kernel = vllm_modelopt.init_fp8_linear_kernel
+
+            def init_fp8_linear_kernel_with_cutlass(*args: Any, **kwargs: Any) -> Any:
+                kwargs.setdefault("force_kernel", CutlassFP8ScaledMMLinearKernel)
+                return original_init_fp8_linear_kernel(*args, **kwargs)
+
+            vllm_modelopt.init_fp8_linear_kernel = init_fp8_linear_kernel_with_cutlass
+            logger.info("Using CUTLASS FP8 linear kernels for this ModelOpt FP8 diffusion stage.")
+            try:
+                yield
+            finally:
+                vllm_modelopt.init_fp8_linear_kernel = original_init_fp8_linear_kernel
+            return
+
+    yield
 
 
 class DiffusionWorker:
@@ -84,8 +156,10 @@ class DiffusionWorker:
         self.lora_manager: DiffusionLoRAManager | None = None
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
-        # Create model runner
-        self.model_runner = DiffusionModelRunner(
+        # Create model runner using the platform-specified class
+        model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
+        model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
+        self.model_runner = model_runner_cls(
             vllm_config=self.vllm_config,
             od_config=self.od_config,
             device=self.device,
@@ -122,20 +196,14 @@ class DiffusionWorker:
         vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
         vllm_config.parallel_config.enable_expert_parallel = self.od_config.parallel_config.enable_expert_parallel
         vllm_config.profiler_config = self.od_config.profiler_config
-        try:
-            hf_config = get_config(self.od_config.model, trust_remote_code=self.od_config.trust_remote_code)
-        except ValueError:
-            hf_config = None
-            logger.info("Skipping hf_config loading for diffusion model %r", self.od_config.model_class_name)
-        hf_text_config = get_hf_text_config(hf_config) if hf_config is not None else None
-        vllm_config.model_config = SimpleNamespace(
-            hf_config=hf_config,
-            hf_text_config=hf_text_config,
-            enforce_eager=self.od_config.enforce_eager,
-            dtype=self.od_config.dtype,
-            enable_return_routed_experts=False,
-        )
+        vllm_config.model_config = _make_diffusion_vllm_model_config(self.od_config)  # type: ignore[assignment]
         vllm_config.quant_config = self.od_config.quantization_config
+        # Since vLLM v0.20.0, IR wraps GPU ops. Set IR op priority preference to enforce GPU op fusion during wrapping.
+        # Also need to log, because vLLM internally logs another line in VllmConfig.__post_init__. Avoid confusion.
+        vllm_config.kernel_config.ir_op_priority = current_omni_platform.get_default_ir_op_priority(vllm_config)
+        logger.info(
+            "Final IR op priority after setting vLLM-Omni overrides: %s", vllm_config.kernel_config.ir_op_priority
+        )
         self.vllm_config = vllm_config
 
         # Initialize distributed environment
@@ -183,9 +251,15 @@ class DiffusionWorker:
         """Load the diffusion model using DiffusionModelRunner."""
         load_format = kwargs.get("load_format", load_format)
         custom_pipeline_name = kwargs.get("custom_pipeline_name", custom_pipeline_name)
+        cutlass_fp8_context = (
+            _force_cutlass_fp8_linear_kernel(self.od_config.quantization_config)
+            if getattr(self.od_config, "force_cutlass_fp8", False)
+            else nullcontext()
+        )
         with (
             set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),
             set_current_vllm_config(self.vllm_config),
+            cutlass_fp8_context,
         ):
             self.model_runner.load_model(
                 memory_pool_context_fn=self._maybe_get_memory_pool_context,
@@ -262,7 +336,7 @@ class DiffusionWorker:
             profiler.step()
         return output
 
-    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
         if self.lora_manager is not None:
@@ -497,7 +571,7 @@ class CustomPipelineWorkerExtension:
         if self.model_runner.pipeline is not None:
             del self.model_runner.pipeline
             gc.collect()
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
 
         # Get custom pipeline class name
         custom_pipeline_name = custom_pipeline_args["pipeline_class"]
@@ -561,11 +635,14 @@ class WorkerProc:
         custom_pipeline_args: dict[str, Any] | None = None,
     ) -> DiffusionWorker:
         """Create a worker instance. Override in subclasses for different worker types."""
+        worker_cls_path = current_omni_platform.get_diffusion_worker_cls()
+        base_worker_class = resolve_obj_by_qualname(worker_cls_path)
         wrapper = WorkerWrapperBase(
             gpu_id=gpu_id,
             od_config=od_config,
             worker_extension_cls=worker_extension_cls,
             custom_pipeline_args=custom_pipeline_args,
+            base_worker_class=base_worker_class,
         )
         return wrapper
 
@@ -834,7 +911,7 @@ class WorkerWrapperBase:
         """
         return self.worker.execute_model(reqs, od_config)
 
-    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+    def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""
         return self.worker.execute_stepwise(scheduler_output)
 

@@ -15,69 +15,40 @@ Usage:
 
 import argparse
 import os
+from pathlib import Path
 
-from vllm_omni.diffusion.models.hunyuan_image3.system_prompt import (
-    get_system_prompt,
+from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
+    _TASK_PRESETS,
+    build_prompt_tokens,
+    resolve_stop_token_ids,
 )
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniPromptType
 
-# task → (sys_type, bot_task, trigger_tag)
-_TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
-    "t2t": ("en_unified", None, None),
-    "i2t": ("en_unified", None, None),
-    "it2i_think": ("en_unified", "think", "<think>"),
-    "it2i_recaption": ("en_unified", "recaption", "<recaption>"),
-    "t2i_think": ("en_unified", "think", "<think>"),
-    "t2i_recaption": ("en_unified", "recaption", "<recaption>"),
-    "t2i_vanilla": ("en_vanilla", "image", None),
+# Default deploy configs are absolute so this example works from any cwd.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_DEFAULT_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3.yaml")
+_DEFAULT_AR_DEPLOY_CONFIG = str(_REPO_ROOT / "vllm_omni" / "deploy" / "hunyuan_image3_ar.yaml")
+
+_MODALITY_DEFAULT_DEPLOY_CONFIG = {
+    "text2img": _DEFAULT_DEPLOY_CONFIG,
+    "img2img": _DEFAULT_DEPLOY_CONFIG,
+    "img2text": _DEFAULT_AR_DEPLOY_CONFIG,
+    "text2text": _DEFAULT_AR_DEPLOY_CONFIG,
 }
 
-# Modality → prompt_utils task mapping
+_MODALITY_MODE = {
+    "text2img": "text-to-image",
+    "img2img": "image-editing",
+    "img2text": "image-to-text",
+    "text2text": "text-to-text",
+}
+
 _MODALITY_TASK_MAP = {
-    "text2img": "t2i_think",
-    "img2img": "it2i_think",
+    "text2img": "t2i",
+    "img2img": "it2i",
     "img2text": "i2t",
     "text2text": "t2t",
-}
-
-
-def build_prompt(
-    user_prompt: str,
-    task: str = "it2i_think",
-    sys_type: str | None = None,
-    custom_system_prompt: str | None = None,
-) -> str:
-    """Build a HunyuanImage-3.0 prompt using pretrain template format."""
-    if task not in _TASK_PRESETS:
-        raise ValueError(f"Unknown task {task!r}. Choose from: {sorted(_TASK_PRESETS)}")
-
-    preset_sys_type, preset_bot_task, trigger_tag = _TASK_PRESETS[task]
-    effective_sys_type = sys_type or preset_sys_type
-
-    system_prompt = get_system_prompt(effective_sys_type, preset_bot_task, custom_system_prompt)
-    sys_text = system_prompt.strip() if system_prompt else ""
-
-    has_image_input = task.startswith("i2t") or task.startswith("it2i")
-
-    parts = ["<|startoftext|>"]
-    if sys_text:
-        parts.append(sys_text)
-    if has_image_input:
-        parts.append("<img>")
-    if trigger_tag:
-        parts.append(trigger_tag)
-    parts.append(user_prompt)
-
-    return "".join(parts)
-
-
-# Modality → default stage config
-_MODALITY_DEFAULT_CONFIG = {
-    "text2img": "hunyuan_image3_t2i.yaml",
-    "img2img": "hunyuan_image3_it2i.yaml",
-    "img2text": "hunyuan_image3_i2t.yaml",
-    "text2text": "hunyuan_image3_t2t.yaml",
 }
 
 
@@ -114,13 +85,23 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--height", type=int, default=1024, help="Output image height.")
     parser.add_argument("--width", type=int, default=1024, help="Output image width.")
+    parser.add_argument(
+        "--vae-use-tiling",
+        action="store_true",
+        help="Enable VAE tiling for memory optimization.",
+    )
 
     # Prompt configuration
     parser.add_argument(
         "--bot-task",
         type=str,
-        default=None,
-        help="Override prompt task (e.g. it2i_think, t2i_recaption). Default: auto from modality.",
+        default="auto",
+        choices=["auto", "think", "recaption", "think_recaption", "vanilla"],
+        help=(
+            "Prompt behavior. 'auto' selects the default for the modality; "
+            "'think' adds <think>; 'recaption' adds <recaption>; "
+            "'vanilla' uses the t2i pretrain template."
+        ),
     )
     parser.add_argument(
         "--sys-type",
@@ -130,7 +111,8 @@ def parse_args():
     )
 
     # Omni init args
-    parser.add_argument("--stage-configs-path", type=str, default=None, help="Custom stage config YAML path.")
+    parser.add_argument("--deploy-config", type=str, default=None, help="Custom deploy YAML path.")
+    parser.add_argument("--stage-configs-path", type=str, default=None, help="Custom legacy stage config YAML path.")
     parser.add_argument("--log-stats", action="store_true", default=False)
     parser.add_argument("--init-timeout", type=int, default=300, help="Initialization timeout in seconds.")
     parser.add_argument("--enforce-eager", action="store_true", help="Disable torch.compile.")
@@ -145,22 +127,44 @@ def main():
     args = parse_args()
     os.makedirs(args.output, exist_ok=True)
 
-    # Determine task for prompt formatting
-    task = args.bot_task or _MODALITY_TASK_MAP[args.modality]
+    # Determine task for prompt formatting from modality + bot behavior.
+    task = _MODALITY_TASK_MAP[args.modality]
+    assert task is not None
+    bot_task = args.bot_task
+    if bot_task != "auto":
+        task = task + "_" + bot_task
+    if task not in _TASK_PRESETS:
+        valid_bot_tasks = {
+            "text2img": ["think", "recaption", "vanilla"],
+            "img2img": ["think", "recaption"],
+            "img2text": ["auto"],
+            "text2text": ["auto"],
+        }[args.modality]
+        raise ValueError(
+            f"--bot-task {bot_task!r} is not supported for {args.modality}. Choose from: {valid_bot_tasks}"
+        )
 
-    # Determine stage config
-    stage_configs_path = args.stage_configs_path or _MODALITY_DEFAULT_CONFIG[args.modality]
+    if args.deploy_config is not None and args.stage_configs_path is not None:
+        raise ValueError("--deploy-config and --stage-configs-path are mutually exclusive.")
+
+    deploy_config = args.deploy_config
+    stage_configs_path = args.stage_configs_path
+    if deploy_config is None and stage_configs_path is None:
+        deploy_config = _MODALITY_DEFAULT_DEPLOY_CONFIG[args.modality]
 
     # Build Omni
     omni_kwargs = {
         "model": args.model,
-        "stage_configs_path": stage_configs_path,
+        "vae_use_tiling": args.vae_use_tiling,
         "log_stats": args.log_stats,
         "init_timeout": args.init_timeout,
         "enforce_eager": args.enforce_eager,
     }
-    if args.modality in ("text2img", "img2img"):
-        omni_kwargs["mode"] = "text-to-image"
+    if deploy_config is not None:
+        omni_kwargs["deploy_config"] = deploy_config
+    else:
+        omni_kwargs["stage_configs_path"] = stage_configs_path
+    omni_kwargs["mode"] = _MODALITY_MODE[args.modality]
 
     omni = Omni(**omni_kwargs)
 
@@ -179,12 +183,28 @@ def main():
 
         input_image = Image.open(args.image_path).convert("RGB")
 
+    # Load tokenizer for segment-wise prompt tokenization (matches HF
+    # apply_chat_template byte-for-byte; see build_prompt_tokens docstring).
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+
     # Format prompts
     formatted_prompts: list[OmniPromptType] = []
     for p in prompts:
-        formatted_text = build_prompt(p, task=task, sys_type=args.sys_type)
+        result = build_prompt_tokens(p, tokenizer, task=task, sys_type=args.sys_type)
+        token_ids = result.token_ids
+        effective_sys_type = result.system_prompt_type
 
-        prompt_dict: dict = {"prompt": formatted_text}
+        # `prompt_token_ids` drives the AR stage (matches HF byte-for-byte).
+        # `prompt` and `use_system_prompt` are forwarded by ar2diffusion to
+        # the DiT stage so the diffusion pipeline can rebuild the same
+        # system prefix when constructing its model inputs.
+        prompt_dict: dict = {
+            "prompt_token_ids": token_ids,
+            "prompt": p,
+            "use_system_prompt": effective_sys_type,
+        }
 
         if args.modality == "text2img":
             prompt_dict["modalities"] = ["image"]
@@ -207,22 +227,32 @@ def main():
     # Override diffusion params if applicable
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    for i, sp in enumerate(params_list):
+    ar_stop_token_ids = resolve_stop_token_ids(task=task, bot_task=bot_task, tokenizer=tokenizer)
+    assert ar_stop_token_ids is not None
+    for sp in params_list:
         if isinstance(sp, OmniDiffusionSamplingParams):
             sp.num_inference_steps = args.steps
             sp.guidance_scale = args.guidance_scale
+            sp.guidance_scale_provided = True
             if args.seed is not None:
                 sp.seed = args.seed
             if args.modality in ("text2img",):
                 sp.height = args.height
                 sp.width = args.width
+        elif hasattr(sp, "stop_token_ids"):
+            sp.stop_token_ids = ar_stop_token_ids
 
     # Print configuration
     print(f"\n{'=' * 60}")
     print("HunyuanImage-3.0 Generation Configuration:")
     print(f"  Model: {args.model}")
     print(f"  Modality: {args.modality}")
-    print(f"  Stage config: {stage_configs_path}")
+    print(f"  Prompt task: {task}")
+    print(f"  Bot task: {bot_task}")
+    if deploy_config is not None:
+        print(f"  Deploy config: {deploy_config}")
+    else:
+        print(f"  Stage config: {stage_configs_path}")
     print(f"  Num stages: {omni.num_stages}")
     if args.modality in ("text2img", "img2img"):
         print(f"  Inference steps: {args.steps}")
@@ -243,10 +273,17 @@ def main():
     for req_output in omni_outputs:
         # Text output (AR stage or text-only)
         ro = getattr(req_output, "request_output", None)
+        txt = ""
         if ro and getattr(ro, "outputs", None):
             txt = "".join(getattr(o, "text", "") or "" for o in ro.outputs)
-            if txt:
-                print(f"[Output] Text:\n{txt}")
+        if not txt:
+            ar_text = getattr(req_output, "custom_output", {}).get("ar_generated_text")
+            if isinstance(ar_text, list):
+                txt = "\n".join(text for text in ar_text if text)
+            else:
+                txt = ar_text or ""
+        if txt:
+            print(f"[Output] Text:\n{txt}")
 
         # Image output (DiT stage)
         images = getattr(req_output, "images", None)

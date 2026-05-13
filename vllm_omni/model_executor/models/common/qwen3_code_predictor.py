@@ -345,12 +345,23 @@ class CodePredictorBaseModel(nn.Module):
         inputs_embeds: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
+        # Run the transformer body in float32 when the model is in fp16.
+        # fp16 lacks the dynamic range for stable attention scores and
+        # SiLU-gated MLP intermediates, producing NaN on GPUs without
+        # native bf16 support (Turing, Volta).  The RMSNorm and RoPE
+        # layers already upcast internally; this extends the same
+        # treatment to attention and MLP.
+        input_dtype = inputs_embeds.dtype
+        use_fp32 = input_dtype == torch.float16
+        if use_fp32:
+            inputs_embeds = inputs_embeds.float()
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, position_embeddings)
-        hidden_states = self.norm(hidden_states)
-        return hidden_states
+        with torch.amp.autocast(inputs_embeds.device.type, enabled=use_fp32, dtype=torch.float32):
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+            for layer in self.layers:
+                hidden_states = layer(hidden_states, position_embeddings)
+            hidden_states = self.norm(hidden_states)
+        return hidden_states.to(input_dtype)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters(remove_duplicate=False))
@@ -608,6 +619,7 @@ class CodePredictorWrapper(nn.Module):
         temperature: float = 0.9,
         top_k: int = 50,
         top_p: float = 1.0,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Predict residual codebooks 1..G-1 autoregressively via re-prefill."""
         bsz = int(layer0_code.shape[0])
@@ -686,13 +698,13 @@ class CodePredictorWrapper(nn.Module):
                     logits = logits.masked_fill(logits < topk_vals[:, -1:], float("-inf"))
                 if s_top_p < 1.0:
                     sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
-                    sorted_probs = F.softmax(sorted_logits, dim=-1)
+                    sorted_probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
                     cumulative_probs = sorted_probs.cumsum(dim=-1)
                     remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
                     sorted_logits[remove_mask] = float("-inf")
                     logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
-                probs = F.softmax(logits, dim=-1)
-                code = torch.multinomial(probs, num_samples=1)
+                probs = F.softmax(logits, dim=-1, dtype=torch.float32)
+                code = torch.multinomial(probs, num_samples=1, generator=generator)
             else:
                 # "per_call" mode: temperature-scaled + top-k
                 if use_sampling:
@@ -700,8 +712,8 @@ class CodePredictorWrapper(nn.Module):
                     if top_k > 0:
                         topk_vals, _ = scaled.topk(top_k, dim=-1)
                         scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
-                    probs = F.softmax(scaled, dim=-1)
-                    code = torch.multinomial(probs, num_samples=1)
+                    probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
+                    code = torch.multinomial(probs, num_samples=1, generator=generator)
                 else:
                     code = logits.argmax(dim=-1, keepdim=True)
 
