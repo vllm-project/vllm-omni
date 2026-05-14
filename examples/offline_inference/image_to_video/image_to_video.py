@@ -219,6 +219,13 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["fp8", "mxfp8", "int8", "gguf"],
+        help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 online quant (NPU). fp8: online FP8 (GPU).",
+    )
+    parser.add_argument(
         "--enable-diffusion-pipeline-profiler",
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
@@ -320,7 +327,7 @@ def main():
         hsdp_shard_size=args.hsdp_shard_size,
         hsdp_replicate_size=args.hsdp_replicate_size,
     )
-    omni = Omni(
+    omni_kwargs = dict(
         model=args.model,
         enable_layerwise_offload=args.enable_layerwise_offload,
         vae_use_slicing=args.vae_use_slicing,
@@ -339,6 +346,9 @@ def main():
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
     )
+    if args.quantization is not None:
+        omni_kwargs["quantization"] = args.quantization
+    omni = Omni(**omni_kwargs)
 
     if profiler_enabled:
         print("[Profiler] Starting profiling...")

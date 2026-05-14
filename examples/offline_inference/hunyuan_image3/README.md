@@ -100,12 +100,25 @@ python examples/offline_inference/hunyuan_image3/end2end.py \
   --prompts "A cute cat"
 ```
 
+## Additional Config
+
+You can pass diffusion worker `additional_config` from the offline example as a JSON object.
+This maps to the upstream vLLM `VllmConfig.additional_config` platform extension field:
+https://docs.vllm.ai/en/stable/api/vllm/config/#vllm.config.VllmConfig.additional_config
+
+```bash
+python end2end.py --modality text2img \
+                  --prompts "A cute cat" \
+                  --additional-config '{"torchair_graph_config":{"enabled":true}}'
+```
+
 ## Key Arguments
 
 | Argument | Description |
 | :--- | :--- |
 | `--deploy-config` | Preferred config path for unified deploy YAMLs. |
 | `--stage-configs-path` | Legacy stage config path, kept only for compatibility. Prefer `--deploy-config`. |
+| `--additional-config` | JSON object forwarded to diffusion worker `additional_config`. |
 | `--modality` | Offline-only convenience flag. One of `text2img`, `img2img`, `img2text`, `text2text`. It selects prompt formatting, internal `mode`, and default deploy config for this script. Online serving uses `--deploy-config` plus the endpoint and, for chat completions, request `modalities` instead. |
 | `--steps` | Number of diffusion inference steps for image generation. |
 | `--guidance-scale` | Classifier-free guidance scale for image generation. |

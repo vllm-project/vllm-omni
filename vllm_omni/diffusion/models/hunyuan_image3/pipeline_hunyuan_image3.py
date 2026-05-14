@@ -1011,6 +1011,7 @@ class HunyuanImage3Pipeline(
                 "query_lens": kwargs.get("query_lens"),
                 "seq_lens": kwargs.get("seq_lens"),
                 "num_image_tokens": kwargs.get("num_image_tokens"),
+                "ar_kv_reuse_len": kwargs.get("ar_kv_reuse_len", 0),
                 "full_attn_spans": kwargs.get("full_attn_spans"),
             }
         )
@@ -1162,6 +1163,7 @@ class HunyuanImage3Pipeline(
         seq_lens: list[int] | None = None,
         num_image_tokens: int | None = None,
         uncond_cfg_prefill: bool = False,
+        ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | CausalMMOutputWithPast:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -1258,6 +1260,7 @@ class HunyuanImage3Pipeline(
                 num_image_tokens=num_image_tokens,
                 gen_timestep_scatter_index=gen_timestep_scatter_index,
                 uncond_cfg_prefill=uncond_cfg_prefill,
+                ar_kv_reuse_len=ar_kv_reuse_len,
                 full_attn_spans=full_attn_spans,
             )
         hidden_states = outputs[0]
