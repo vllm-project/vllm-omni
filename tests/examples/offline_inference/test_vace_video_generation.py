@@ -2,6 +2,7 @@
 Offline inference tests: vace video generation.
 See examples/offline_inference/vace/vace_video_generation.md
 """
+
 from pathlib import Path
 import pytest
 from tests.examples.helpers import EXAMPLES, ExampleRunner, ReadmeSnippet
