@@ -5,6 +5,11 @@ from typing import Any
 import torch
 from vllm.inputs import TextPrompt
 
+from vllm_omni.data_entry_keys import (
+    CodesStruct,
+    MetaStruct,
+    OmniPayloadStruct,
+)
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 _VOXCPM_LATENT_MAGIC = 131071
@@ -74,12 +79,19 @@ def latent2vae(
     return vae_inputs
 
 
+def _eof_payload() -> OmniPayloadStruct:
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+        meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+    )
+
+
 def latent2vae_async_chunk(
     transfer_manager: Any,
     pooling_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
-) -> dict[str, Any] | None:
+) -> OmniPayloadStruct | None:
     """Stage-0 latent → stage-1 VAE under ``async_chunk`` (connector payload)."""
     # Kept for callback signature compatibility with OmniChunkTransferAdapter.
     _ = transfer_manager
@@ -87,28 +99,17 @@ def latent2vae_async_chunk(
     if callable(getattr(request, "is_finished", None)):
         finished_request = finished_request or _coerce_finished_flag(request.is_finished())
     if not isinstance(pooling_output, dict):
-        if finished_request:
-            return {
-                "code_predictor_codes": [],
-                "finished": torch.tensor(True, dtype=torch.bool),
-            }
-        return None
+        return _eof_payload() if finished_request else None
 
     latent = pooling_output.get("latent_audio_feat")
     if isinstance(latent, torch.Tensor) and latent.numel() == 0:
         latent = None
 
     if latent is None:
-        if finished_request:
-            return {
-                "code_predictor_codes": [],
-                "finished": torch.tensor(True, dtype=torch.bool),
-            }
-        return None
+        return _eof_payload() if finished_request else None
 
     serialized_codes = _serialize_latent_to_codes(latent)
-    out: dict[str, Any] = {
-        "code_predictor_codes": serialized_codes,
-        "finished": torch.tensor(finished_request, dtype=torch.bool),
-    }
-    return out
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.tensor(serialized_codes, dtype=torch.long)),
+        meta=MetaStruct(finished=torch.tensor(finished_request, dtype=torch.bool)),
+    )

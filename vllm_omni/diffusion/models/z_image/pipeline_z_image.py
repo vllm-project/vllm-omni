@@ -536,8 +536,10 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
                         image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else raw_image
 
         # strength is currently only applicable for Z-Image I2I; other pipelines ignore this parameter
-        strength = req.sampling_params.strength if req.sampling_params.strength is not None else strength
-        if strength is not None and image is None:
+        explicit_strength = req.sampling_params.strength is not None
+        if explicit_strength:
+            strength = req.sampling_params.strength
+        if explicit_strength and image is None:
             logger.warning(
                 "strength parameter (%.2f) is only applicable for image-to-image (I2I) generation. "
                 "It will be ignored for text-to-image (T2I) generation.",

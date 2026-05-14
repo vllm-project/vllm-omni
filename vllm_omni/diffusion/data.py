@@ -32,6 +32,54 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def parse_kv_cache_skip_selector(
+    selector: str | list[int] | tuple[int, ...] | set[int] | None,
+) -> set[int] | None:
+    """Parse a non-negative index selector such as "0-9,20,25-30"."""
+    if selector is None:
+        return None
+    if isinstance(selector, set):
+        values = selector
+    elif isinstance(selector, (list, tuple)):
+        values = set(selector)
+    elif isinstance(selector, str):
+        text = selector.strip()
+        if not text:
+            return None
+        values: set[int] = set()
+        for chunk in text.split(","):
+            token = chunk.strip()
+            if not token:
+                continue
+            if "-" in token:
+                start_str, end_str = token.split("-", 1)
+                try:
+                    start = int(start_str.strip())
+                    end = int(end_str.strip())
+                except ValueError as exc:
+                    raise ValueError(f"Invalid range token '{token}' in selector '{selector}'.") from exc
+                if start < 0 or end < 0 or start > end:
+                    raise ValueError(f"Invalid range token '{token}' in selector '{selector}'.")
+                values.update(range(start, end + 1))
+            else:
+                try:
+                    index = int(token)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid index token '{token}' in selector '{selector}'.") from exc
+                if index < 0:
+                    raise ValueError(f"Negative index '{index}' is not allowed in selector '{selector}'.")
+                values.add(index)
+    else:
+        raise TypeError(f"Unsupported selector type: {type(selector)!r}")
+
+    for idx in values:
+        if not isinstance(idx, int):
+            raise TypeError(f"Selector index must be int, got {type(idx)!r}")
+        if idx < 0:
+            raise ValueError("Selector indices must be non-negative.")
+    return values
+
+
 @config
 @dataclass
 class DiffusionParallelConfig:
@@ -367,7 +415,7 @@ class OmniDiffusionConfig:
     tf_model_config: TransformerConfig = field(default_factory=TransformerConfig)
 
     # Attention
-    attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
+    diffusion_attention_config: "AttentionConfig" = field(default_factory=lambda: AttentionConfig())
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE
@@ -504,6 +552,7 @@ class OmniDiffusionConfig:
 
     # Omni configuration (injected from stage config)
     omni_kv_config: dict[str, Any] = field(default_factory=dict)
+    additional_config: dict[str, Any] = field(default_factory=dict)
 
     profiler_config: "ProfilerConfig | dict[str, Any] | None" = None
 
@@ -519,6 +568,19 @@ class OmniDiffusionConfig:
     # has already resolved to vLLM's ModelOpt FP8 linear method.
     force_cutlass_fp8: bool = False
 
+    # KV cache dtype for attention. Aligned with upstream vLLM's --kv-cache-dtype.
+    # None = native dtype (no quantization).
+    # "fp8" = dynamic FP8 (float8_e4m3fn) quantization per forward pass.
+    # On Hopper+FA3: native FP8 attention (memory + compute savings).
+    # On other backends: no benefit, backends skip quantization.
+    kv_cache_dtype: str | None = None
+    # Optional skip selectors for KV-cache quantization. Format: "0-9,20,25-30".
+    # Listed steps/layers skip quantization; others keep quantized execution.
+    kv_cache_skip_steps: str | None = None
+    kv_cache_skip_layers: str | None = None
+    kv_cache_skip_step_indices: set[int] | None = None
+    kv_cache_skip_layer_indices: set[int] | None = None
+
     # Diffusion pipeline Profiling config
     enable_diffusion_pipeline_profiler: bool = False
 
@@ -527,6 +589,7 @@ class OmniDiffusionConfig:
 
     # sleep mode
     enable_sleep_mode: bool = False
+
     # Maximum number of sequences to generate in a batch
     max_num_seqs: int = 1
 
@@ -587,6 +650,13 @@ class OmniDiffusionConfig:
             from vllm.config import ProfilerConfig
 
             self.profiler_config = ProfilerConfig(**self.profiler_config)
+
+        if self.additional_config is None:
+            self.additional_config = {}
+        elif isinstance(self.additional_config, Mapping):
+            self.additional_config = dict(self.additional_config)
+        else:
+            raise TypeError(f"additional_config must be a mapping or None, got {type(self.additional_config)!r}")
 
         # Convert parallel_config dict/DictConfig to DiffusionParallelConfig
         # Use Mapping to handle both plain dicts and OmegaConf DictConfig
@@ -655,7 +725,9 @@ class OmniDiffusionConfig:
 
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
-        self.attention_config = build_attention_config(self.attention_config)
+        self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
+        self.kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.kv_cache_skip_steps)
+        self.kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.kv_cache_skip_layers)
 
         if self.max_cpu_loras is None:
             self.max_cpu_loras = 1
@@ -766,6 +838,10 @@ class OmniDiffusionConfig:
                     self.model_class_name = "BagelPipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
+                elif model_type == "neo_chat":
+                    self.model_class_name = "SenseNovaU1Pipeline"
+                    self.tf_model_config = TransformerConfig()
+                    self.update_multimodal_support()
                 elif model_type == "nextstep":
                     if self.model_class_name is None:
                         self.model_class_name = "NextStep11Pipeline"
@@ -798,20 +874,12 @@ class OmniDiffusionConfig:
         else:
             kwargs.pop("quantization", None)
 
-        # Map "diffusion_attention_config" to "attention_config" so the
-        # engine_args key (namespaced to avoid collision with vLLM's own
-        # attention_config) is mapped to the dataclass field.
-        if "diffusion_attention_config" in kwargs and "attention_config" not in kwargs:
-            kwargs["attention_config"] = kwargs.pop("diffusion_attention_config")
-        else:
-            kwargs.pop("diffusion_attention_config", None)
-
         # Handle "diffusion_attention_backend" shorthand: merge into
-        # attention_config before field filtering.
+        # diffusion_attention_config before field filtering.
         diffusion_attn_backend = kwargs.pop("diffusion_attention_backend", None)
         if diffusion_attn_backend is not None:
-            existing = kwargs.get("attention_config")
-            kwargs["attention_config"] = parse_attention_config(
+            existing = kwargs.get("diffusion_attention_config")
+            kwargs["diffusion_attention_config"] = parse_attention_config(
                 existing,
                 attention_backend=diffusion_attn_backend,
             )

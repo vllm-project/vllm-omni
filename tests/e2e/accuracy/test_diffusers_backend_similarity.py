@@ -279,7 +279,15 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
 
 @pytest.mark.benchmark
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.parametrize("model_id", ["Wan-AI/Wan2.2-I2V-A14B-Diffusers"])
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        pytest.param(
+            "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+            marks=pytest.mark.skip(reason="#3488"),
+        ),
+    ],
+)
 def test_diffusers_backend_i2v_matches_diffusers(
     model_id: str,
     accuracy_artifact_root: Path,

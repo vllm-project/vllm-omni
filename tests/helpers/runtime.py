@@ -4,6 +4,7 @@ import base64
 import concurrent.futures
 import copy
 import errno
+import gc
 import io
 import json
 import os
@@ -26,8 +27,11 @@ import torch
 import yaml
 from openai import APIError, OpenAI, omit
 from PIL import Image
-from vllm import TextPrompt
-from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+from vllm import TextPrompt, envs
+from vllm.distributed.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+)
 from vllm.logger import init_logger
 
 from tests.helpers.assertions import (
@@ -47,6 +51,39 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
+    # Reset environment variable cache
+    envs.disable_envs_cache()
+
+    # Reset rocm_aiter_ops class variables to match current os.environ.
+    # These are class-level attributes that persist across tests and are
+    # NOT restored by monkeypatch (which only restores os.environ).
+    from vllm_omni.platforms import current_omni_platform
+
+    if current_omni_platform.is_rocm():
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        rocm_aiter_ops.refresh_env_variables()
+
+    # Ensure all objects are not frozen before cleanup
+    gc.unfreeze()
+
+    destroy_model_parallel()
+    destroy_distributed_environment()
+    if shutdown_ray:
+        import ray  # Lazy import Ray
+
+        ray.shutdown()
+    gc.collect()
+
+    if not current_omni_platform.is_cpu():
+        current_omni_platform.empty_cache()
+        try:
+            torch._C._host_emptyCache()
+        except AttributeError:
+            logger.warning("torch._C._host_emptyCache() only available in Pytorch >=2.5")
 
 
 def _split_request_config_by_per_output_sizes(cfg: dict[str, Any]) -> list[dict[str, Any]] | None:
@@ -87,13 +124,6 @@ def _split_request_config_by_per_output_sizes(cfg: dict[str, Any]) -> list[dict[
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
 PromptVideoInput = list[Any] | Any | None
-
-try:
-    from vllm.distributed.parallel_state import cleanup_dist_env_and_memory  # type: ignore
-except Exception:  # pragma: no cover
-
-    def cleanup_dist_env_and_memory() -> None:
-        return None
 
 
 def get_open_port(host: str = "127.0.0.1", *, max_attempts: int = 128) -> int:
@@ -205,7 +235,9 @@ class OmniServer:
         run_post_test_cleanup()
         cleanup_dist_env_and_memory()
         self.model = model
-        self.serve_args = serve_args
+        args = list(serve_args)
+        self.serve_args = args
+        self.log_stats = "--disable-log-stats" not in args and "--log-stats" in args
         self.env_dict = env_dict
         self.use_omni = use_omni
         self.proc: subprocess.Popen | None = None
@@ -234,6 +266,7 @@ class OmniServer:
         cmd += self.serve_args
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
+        startup_t0 = time.perf_counter()
         self.proc = subprocess.Popen(
             cmd,
             env=env,
@@ -249,7 +282,12 @@ class OmniServer:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1)
                 if sock.connect_ex((self.host, self.port)) == 0:
-                    print(f"Server ready on {self.host}:{self.port}")
+                    startup_s = time.perf_counter() - startup_t0
+                    if self.log_stats:
+                        print(
+                            f"Server ready on {self.host}:{self.port} (OmniServer startup took {startup_s:.3f}s)",
+                            flush=True,
+                        )
                     return
             time.sleep(2)
         raise RuntimeError(f"Server failed to start within {max_wait} seconds")
@@ -527,6 +565,7 @@ class OmniServerStageCli(OmniServer):
                 )
 
     def _start_server(self) -> None:
+        startup_t0 = time.perf_counter()
         ordered_stage_ids = [0, *[stage_id for stage_id in self.stage_ids if stage_id != 0]]
 
         self._launch_stage(0, headless=False, replica_id=0)
@@ -545,7 +584,13 @@ class OmniServerStageCli(OmniServer):
                 sock.settimeout(1)
                 result = sock.connect_ex((self.host, self.port))
                 if result == 0:
-                    print(f"OmniServerStageCli ready on {self.host}:{self.port}")
+                    startup_s = time.perf_counter() - startup_t0
+                    if self.log_stats:
+                        print(
+                            f"OmniServerStageCli ready on {self.host}:{self.port} "
+                            f"(stage-CLI startup took {startup_s:.3f}s)",
+                            flush=True,
+                        )
                     return
             time.sleep(2)
 
@@ -607,6 +652,8 @@ class OmniResponse:
     audio_content: str | None = None
     audio_format: str | None = None
     audio_bytes: bytes | None = None
+    #: End-to-end wall time in **seconds** (``perf_counter`` delta), from just before the
+    #: OpenAI client call through response parsing and local post-process (e.g. audio decode).
     e2e_latency: float | None = None
     success: bool = False
     error_message: str | None = None
@@ -622,7 +669,9 @@ class DiffusionResponse:
     text_content: str | None = None
     images: list[Image.Image] | None = None
     audios: list[Any] | None = None
-    videos: list[bytes] | None = None
+    videos: list[Any] | None = None
+    #: End-to-end wall time in **seconds** (``perf_counter`` delta), from just before
+    #: ``chat.completions.create`` through local image / audio decode.
     e2e_latency: float | None = None
     success: bool = False
     error_message: str | None = None
@@ -643,16 +692,29 @@ def _merge_diffusion_responses(parts: list[DiffusionResponse]) -> DiffusionRespo
 
 
 class OpenAIClientHandler:
-    def __init__(self, host: str = "127.0.0.1", port: int = None, api_key: str = "EMPTY", run_level: str = None):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = None,
+        api_key: str = "EMPTY",
+        run_level: str = None,
+        *,
+        log_stats: bool = True,
+    ):
         if port is None:
             port = get_open_port()
         self.base_url = f"http://{host}:{port}"
         self.client = OpenAI(base_url=f"http://{host}:{port}/v1", api_key=api_key)
         self.run_level = run_level
+        self.log_stats = log_stats
 
-    def _process_stream_omni_response(self, chat_completion) -> OmniResponse:
+    def _print_client_stat(self, message: str) -> None:
+        if self.log_stats:
+            print(message, flush=True)
+
+    def _process_stream_omni_response(self, chat_completion, *, wall_start: float) -> OmniResponse:
+        """Wall clock from *before* ``chat.completions.create`` through stream drain + local decode."""
         result = OmniResponse()
-        start_time = time.perf_counter()
         try:
             text_content = ""
             audio_data = []
@@ -664,7 +726,6 @@ class OpenAIClientHandler:
                         audio_data.append(content)
                     elif modality == "text" and content:
                         text_content += content
-            result.e2e_latency = time.perf_counter() - start_time
             audio_content = None
             if audio_data:
                 merged_seg = _merge_base64_audio_to_segment(audio_data)
@@ -675,15 +736,16 @@ class OpenAIClientHandler:
             result.text_content = text_content
             result.audio_data = audio_data
             result.audio_content = audio_content
+            result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
         except Exception as e:
             result.error_message = f"Stream processing error: {str(e)}"
             print(f"Error: {result.error_message}")
         return result
 
-    def _process_non_stream_omni_response(self, chat_completion) -> OmniResponse:
+    def _process_non_stream_omni_response(self, chat_completion, *, wall_start: float) -> OmniResponse:
+        """Wall clock from *before* ``chat.completions.create`` through response parse + local decode."""
         result = OmniResponse()
-        start_time = time.perf_counter()
         try:
             audio_data = None
             text_content = None
@@ -698,13 +760,13 @@ class OpenAIClientHandler:
                 result.prompt_tokens = usage.prompt_tokens
                 if details := getattr(usage, "prompt_tokens_details", None):
                     result.cached_tokens = details.cached_tokens
-            result.e2e_latency = time.perf_counter() - start_time
             audio_content = None
             if audio_data:
                 result.audio_bytes = base64.b64decode(audio_data)
                 audio_content = convert_audio_bytes_to_text(result.audio_bytes)
             result.text_content = text_content
             result.audio_content = audio_content
+            result.e2e_latency = time.perf_counter() - wall_start
             if chat_completion.choices and chat_completion.choices[0].logprobs is not None:
                 result.logprobs = chat_completion.choices[0].logprobs.content
             result.success = True
@@ -713,9 +775,9 @@ class OpenAIClientHandler:
             print(f"Error: {result.error_message}")
         return result
 
-    def _process_diffusion_response(self, chat_completion) -> DiffusionResponse:
+    def _process_diffusion_response(self, chat_completion, *, wall_start: float) -> DiffusionResponse:
+        """Wall clock from *before* ``chat.completions.create`` through image decode."""
         result = DiffusionResponse()
-        start_time = time.perf_counter()
         try:
             images = []
             audios = []
@@ -744,9 +806,9 @@ class OpenAIClientHandler:
                             "expires_at": getattr(audio_obj, "expires_at", None),
                         }
                     )
-            result.e2e_latency = time.perf_counter() - start_time
             result.images = images if images else None
             result.audios = audios if audios else None
+            result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
         except Exception as e:
             result.error_message = f"Diffusion response processing error: {str(e)}"
@@ -781,33 +843,46 @@ class OpenAIClientHandler:
             create_kwargs["extra_body"] = extra_body
 
         if request_num == 1:
+            wall_start = time.perf_counter()
             chat_completion = self.client.chat.completions.create(**create_kwargs)
             resp = (
-                self._process_stream_omni_response(chat_completion)
+                self._process_stream_omni_response(chat_completion, wall_start=wall_start)
                 if stream
-                else self._process_non_stream_omni_response(chat_completion)
+                else self._process_non_stream_omni_response(chat_completion, wall_start=wall_start)
             )
             assert_omni_response(resp, request_config, run_level=self.run_level)
+            if resp.e2e_latency is not None:
+                self._print_client_stat(f"[omni] request#1 success in {resp.e2e_latency:.3f}s")
+            else:
+                self._print_client_stat("[omni] request#1 completed")
             responses.append(resp)
             return responses
 
         def _one():
+            wall_start = time.perf_counter()
             chat_completion = self.client.chat.completions.create(**create_kwargs)
             return (
-                self._process_stream_omni_response(chat_completion)
+                self._process_stream_omni_response(chat_completion, wall_start=wall_start)
                 if stream
-                else self._process_non_stream_omni_response(chat_completion)
+                else self._process_non_stream_omni_response(chat_completion, wall_start=wall_start)
             )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
-            futures = [executor.submit(_one) for _ in range(request_num)]
+            futures = {executor.submit(_one): i + 1 for i in range(request_num)}
             for future in concurrent.futures.as_completed(futures):
+                request_idx = futures[future]
                 resp = future.result()
                 assert_omni_response(resp, request_config, run_level=self.run_level)
+                if resp.e2e_latency is not None:
+                    self._print_client_stat(f"[omni] request#{request_idx} success in {resp.e2e_latency:.3f}s")
+                else:
+                    self._print_client_stat(f"[omni] request#{request_idx} completed")
                 responses.append(resp)
         return responses
 
-    def _process_stream_audio_speech_response(self, response, *, response_format: str | None = None) -> OmniResponse:
+    def _process_stream_audio_speech_response(
+        self, response, *, response_format: str | None = None, wall_start: float
+    ) -> OmniResponse:
         """
         Process streaming /v1/audio/speech responses into an OmniResponse.
 
@@ -816,7 +891,6 @@ class OpenAIClientHandler:
         from Whisper transcription.
         """
         result = OmniResponse()
-        start_time = time.perf_counter()
 
         try:
             # Aggregate all audio bytes from the streaming response.
@@ -858,7 +932,7 @@ class OpenAIClientHandler:
             # Populate OmniResponse.
             result.audio_bytes = raw_bytes
             result.audio_content = transcript
-            result.e2e_latency = time.perf_counter() - start_time
+            result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
             result.audio_format = getattr(response, "response", None)
             if result.audio_format is not None:
@@ -871,7 +945,7 @@ class OpenAIClientHandler:
         return result
 
     def _process_non_stream_audio_speech_response(
-        self, response, *, response_format: str | None = None
+        self, response, *, response_format: str | None = None, wall_start: float
     ) -> OmniResponse:
         """
         Process non-streaming /v1/audio/speech responses into an OmniResponse.
@@ -880,7 +954,6 @@ class OpenAIClientHandler:
         audio payload returned by audio.speech.create.
         """
         result = OmniResponse()
-        start_time = time.perf_counter()
 
         try:
             # OpenAI non-streaming audio.speech.create returns HttpxBinaryResponseContent (.read() or .content)
@@ -898,7 +971,7 @@ class OpenAIClientHandler:
 
             result.audio_bytes = raw_bytes
             result.audio_content = transcript
-            result.e2e_latency = time.perf_counter() - start_time
+            result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
             result.audio_format = getattr(response, "response", None)
             if result.audio_format is not None:
@@ -963,12 +1036,12 @@ class OpenAIClientHandler:
             )
 
         if request_num == 1:
-            req_start = time.perf_counter()
             if expect_error_handling:
                 # ``status`` and/or ``err_message`` requested: catch APIError (4xx) and (optionally) assert body text;
                 # HTTP 200 with JSON error body is handled in ``assert_audio_speech_response``.
                 try:
                     if stream:
+                        wall_start = time.perf_counter()
                         with self.client.audio.speech.with_streaming_response.create(
                             model=model,
                             input=text_input,
@@ -977,8 +1050,11 @@ class OpenAIClientHandler:
                             timeout=timeout,
                             voice=voice,
                         ) as resp:
-                            omni_resp = self._process_stream_audio_speech_response(resp, response_format=speech_fmt)
+                            omni_resp = self._process_stream_audio_speech_response(
+                                resp, response_format=speech_fmt, wall_start=wall_start
+                            )
                     else:
+                        wall_start = time.perf_counter()
                         resp = self.client.audio.speech.create(
                             model=model,
                             input=text_input,
@@ -987,7 +1063,9 @@ class OpenAIClientHandler:
                             timeout=timeout,
                             voice=voice,
                         )
-                        omni_resp = self._process_non_stream_audio_speech_response(resp, response_format=speech_fmt)
+                        omni_resp = self._process_non_stream_audio_speech_response(
+                            resp, response_format=speech_fmt, wall_start=wall_start
+                        )
                 except APIError as e:
                     sc = getattr(e, "status_code", None)
                     if sc is None:
@@ -1002,6 +1080,7 @@ class OpenAIClientHandler:
                         omni_resp.status_code = 200
             elif stream:
                 # Use streaming response helper.
+                wall_start = time.perf_counter()
                 with self.client.audio.speech.with_streaming_response.create(
                     model=model,
                     input=text_input,
@@ -1010,9 +1089,12 @@ class OpenAIClientHandler:
                     timeout=timeout,
                     voice=voice,
                 ) as resp:
-                    omni_resp = self._process_stream_audio_speech_response(resp, response_format=speech_fmt)
+                    omni_resp = self._process_stream_audio_speech_response(
+                        resp, response_format=speech_fmt, wall_start=wall_start
+                    )
             else:
                 # Non-streaming response.
+                wall_start = time.perf_counter()
                 resp = self.client.audio.speech.create(
                     model=model,
                     input=text_input,
@@ -1021,11 +1103,15 @@ class OpenAIClientHandler:
                     timeout=timeout,
                     voice=voice,
                 )
-                omni_resp = self._process_non_stream_audio_speech_response(resp, response_format=speech_fmt)
+                omni_resp = self._process_non_stream_audio_speech_response(
+                    resp, response_format=speech_fmt, wall_start=wall_start
+                )
 
             assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
-            elapsed = time.perf_counter() - req_start
-            print(f"[audio.speech] request#1 success in {elapsed:.3f}s")
+            if omni_resp.e2e_latency is not None:
+                self._print_client_stat(f"[audio.speech] request#1 success in {omni_resp.e2e_latency:.3f}s")
+            else:
+                self._print_client_stat("[audio.speech] request#1 completed")
             responses.append(omni_resp)
             return responses
         else:
@@ -1034,7 +1120,7 @@ class OpenAIClientHandler:
             if stream:
 
                 def _stream_task(request_idx: int):
-                    task_start = time.perf_counter()
+                    wall_start = time.perf_counter()
                     with self.client.audio.speech.with_streaming_response.create(
                         model=model,
                         input=text_input,
@@ -1043,9 +1129,15 @@ class OpenAIClientHandler:
                         timeout=timeout,
                         voice=voice,
                     ) as resp:
-                        result = self._process_stream_audio_speech_response(resp, response_format=speech_fmt)
-                    elapsed = time.perf_counter() - task_start
-                    print(f"[audio.speech] request#{request_idx} success in {elapsed:.3f}s")
+                        result = self._process_stream_audio_speech_response(
+                            resp, response_format=speech_fmt, wall_start=wall_start
+                        )
+                    if result.e2e_latency is not None:
+                        self._print_client_stat(
+                            f"[audio.speech] request#{request_idx} success in {result.e2e_latency:.3f}s"
+                        )
+                    else:
+                        self._print_client_stat(f"[audio.speech] request#{request_idx} completed")
                     return result
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
@@ -1065,8 +1157,8 @@ class OpenAIClientHandler:
             else:
 
                 def _non_stream_task(request_idx: int):
-                    task_start = time.perf_counter()
-                    resp = self.client.audio.speech.create(
+                    wall_start = time.perf_counter()
+                    r = self.client.audio.speech.create(
                         model=model,
                         input=text_input,
                         response_format=response_format,
@@ -1074,24 +1166,29 @@ class OpenAIClientHandler:
                         timeout=timeout,
                         voice=voice,
                     )
-                    elapsed = time.perf_counter() - task_start
-                    print(f"[audio.speech] request#{request_idx} success in {elapsed:.3f}s")
-                    return resp
+                    result = self._process_non_stream_audio_speech_response(
+                        r, response_format=speech_fmt, wall_start=wall_start
+                    )
+                    if result.e2e_latency is not None:
+                        self._print_client_stat(
+                            f"[audio.speech] request#{request_idx} success in {result.e2e_latency:.3f}s"
+                        )
+                    else:
+                        self._print_client_stat(f"[audio.speech] request#{request_idx} completed")
+                    return result
 
                 with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
                     futures = {executor.submit(_non_stream_task, i + 1): i + 1 for i in range(request_num)}
-
                     for future in concurrent.futures.as_completed(futures):
                         request_idx = futures[future]
                         try:
-                            resp = future.result()
+                            omni_resp = future.result()
                         except Exception as e:
                             print(
                                 f"[audio.speech] request#{request_idx} failed "
                                 f"(stream={stream}, timeout={timeout:.1f}s): {e!r}"
                             )
                             raise
-                        omni_resp = self._process_non_stream_audio_speech_response(resp, response_format=speech_fmt)
                         assert_audio_speech_response(omni_resp, request_config, run_level=self.run_level)
                         responses.append(omni_resp)
 
@@ -1113,19 +1210,21 @@ class OpenAIClientHandler:
         """
         responses: list[DiffusionResponse] = []
 
-        def _create_from_config(cfg: dict[str, Any]):
+        def _create_from_config(cfg: dict[str, Any]) -> tuple[Any, float]:
             stream = cfg.get("stream", False)
             if stream:
                 raise NotImplementedError("Streaming is not currently implemented for diffusion model e2e test")
             modalities = cfg.get("modalities", omit)  # Most diffusion models don't require modalities param
             eb = cfg.get("extra_body")
             extra = copy.deepcopy(eb) if eb else None
-            return self.client.chat.completions.create(
+            wall_start = time.perf_counter()
+            chat_completion = self.client.chat.completions.create(
                 model=cfg.get("model"),
                 messages=cfg.get("messages"),
                 extra_body=extra,
                 modalities=modalities,
             )
+            return chat_completion, wall_start
 
         if isinstance(request_config, list):
             if not request_config:
@@ -1133,12 +1232,20 @@ class OpenAIClientHandler:
             if request_num != 1:
                 raise ValueError("request_num is not supported when request_config is a list")
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(request_config)) as executor:
-                futures = {executor.submit(_create_from_config, cfg): cfg for cfg in request_config}
+                futures = {
+                    executor.submit(_create_from_config, cfg): (i + 1, cfg) for i, cfg in enumerate(request_config)
+                }
                 for future in concurrent.futures.as_completed(futures):
-                    cfg = futures[future]
-                    chat_completion = future.result()
-                    response = self._process_diffusion_response(chat_completion)
+                    request_idx, cfg = futures[future]
+                    chat_completion, wall_start = future.result()
+                    response = self._process_diffusion_response(chat_completion, wall_start=wall_start)
                     assert_diffusion_response(response, cfg, run_level=self.run_level)
+                    if response.e2e_latency is not None:
+                        self._print_client_stat(
+                            f"[diffusion] request#{request_idx} success in {response.e2e_latency:.3f}s"
+                        )
+                    else:
+                        self._print_client_stat(f"[diffusion] request#{request_idx} completed")
                     responses.append(response)
             return responses
 
@@ -1152,27 +1259,40 @@ class OpenAIClientHandler:
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(size_splits)) as executor:
                 futures = [executor.submit(_create_from_config, sub) for sub in size_splits]
                 chat_completions = [f.result() for f in futures]
-            parts = [self._process_diffusion_response(cc) for cc in chat_completions]
+            parts = [self._process_diffusion_response(cc, wall_start=ws) for cc, ws in chat_completions]
             merged = _merge_diffusion_responses(parts)
             merged.e2e_latency = time.perf_counter() - t0
             assert_diffusion_response(merged, request_config, run_level=self.run_level)
+            if merged.e2e_latency is not None:
+                self._print_client_stat(f"[diffusion] request#1 success in {merged.e2e_latency:.3f}s")
+            else:
+                self._print_client_stat("[diffusion] request#1 completed")
             return [merged]
 
         if request_num == 1:
             # Send single request
-            chat_completion = _create_from_config(request_config)
-            response = self._process_diffusion_response(chat_completion)
+            chat_completion, wall_start = _create_from_config(request_config)
+            response = self._process_diffusion_response(chat_completion, wall_start=wall_start)
             assert_diffusion_response(response, request_config, run_level=self.run_level)
+            if response.e2e_latency is not None:
+                self._print_client_stat(f"[diffusion] request#1 success in {response.e2e_latency:.3f}s")
+            else:
+                self._print_client_stat("[diffusion] request#1 completed")
             responses.append(response)
             return responses
 
         # Send concurrent requests for the same request_config
         with concurrent.futures.ThreadPoolExecutor(max_workers=request_num) as executor:
-            futures = [executor.submit(_create_from_config, request_config) for _ in range(request_num)]
+            futures = {executor.submit(_create_from_config, request_config): i + 1 for i in range(request_num)}
             for future in concurrent.futures.as_completed(futures):
-                chat_completion = future.result()
-                response = self._process_diffusion_response(chat_completion)
+                request_idx = futures[future]
+                chat_completion, wall_start = future.result()
+                response = self._process_diffusion_response(chat_completion, wall_start=wall_start)
                 assert_diffusion_response(response, request_config, run_level=self.run_level)
+                if response.e2e_latency is not None:
+                    self._print_client_stat(f"[diffusion] request#{request_idx} success in {response.e2e_latency:.3f}s")
+                else:
+                    self._print_client_stat(f"[diffusion] request#{request_idx} completed")
                 responses.append(response)
         return responses
 
@@ -1220,6 +1340,10 @@ class OpenAIClientHandler:
         result.videos = [video_content]
         result.e2e_latency = end_time - start_time
         assert_diffusion_response(result, request_config, run_level=self.run_level)
+        if result.e2e_latency is not None:
+            self._print_client_stat(f"[diffusion] request#1 success in {result.e2e_latency:.3f}s")
+        else:
+            self._print_client_stat("[diffusion] request#1 completed")
         return [result]
 
     def _wait_until_video_completed(
@@ -1274,6 +1398,7 @@ class OmniRunner:
         stage_configs_path: str | None = None,
         **kwargs,
     ) -> None:
+        startup_t0 = time.perf_counter()
         cleanup_dist_env_and_memory()
         run_pre_test_cleanup()
         run_post_test_cleanup()
@@ -1292,6 +1417,9 @@ class OmniRunner:
             stage_configs_path=stage_configs_path,
             **kwargs,
         )
+        startup_s = time.perf_counter() - startup_t0
+        if log_stats:
+            print(f"OmniRunner startup took {startup_s:.3f}s (model={model_name})", flush=True)
 
     def get_default_sampling_params_list(self) -> list[Any]:
         if not hasattr(self.omni, "default_sampling_params_list"):
@@ -1797,6 +1925,9 @@ def iter_omni_server(
             server_args = [*server_args, "--init-timeout", str(params.init_timeout)]
         else:
             server_args = [*server_args, "--init-timeout", "900"]
+        # ``omni_server`` / ``omni_server_function``: match ``serve`` (``--disable-log-stats`` wins).
+        if "--disable-log-stats" not in server_args and "--log-stats" not in server_args:
+            server_args = [*server_args, "--log-stats"]
         if params.use_stage_cli:
             if not params.use_omni:
                 raise ValueError("omni_server with use_stage_cli=True requires use_omni=True")

@@ -17,6 +17,15 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.core_client import AsyncMPClient
 
+from vllm_omni.engine.messages import (
+    AbortRequestMessage,
+    AddCompanionRequestMessage,
+    CollectiveRPCRequestMessage,
+    CollectiveRPCResultMessage,
+    OutputMessage,
+    ShutdownRequestMessage,
+    StageSubmissionMessage,
+)
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 from vllm_omni.engine.stage_pool import StagePool
@@ -44,14 +53,27 @@ class FakeStageClient:
         final_output: bool = False,
         final_output_type: str = "text",
         next_inputs: list[dict] | None = None,
+        engine_input_source: list[int] | None = None,
+        is_comprehension: bool = False,
+        model_stage: str | None = None,
+        kv_sender_info: dict[str, Any] | None = None,
     ) -> None:
+        self.stage_id = 0
+        self.replica_id = 0
         self.stage_type = stage_type
         self.final_output = final_output
         self.final_output_type = final_output_type
+        self.default_sampling_params = SamplingParams(max_tokens=1)
+        self.requires_multimodal_data = False
+        self.engine_input_source = list(engine_input_source or [0])
+        self.is_comprehension = is_comprehension
+        self.model_stage = model_stage
         self.next_inputs = list(next_inputs or [])
         self.custom_process_input_func = None
+        self._kv_sender_info = dict(kv_sender_info) if kv_sender_info is not None else None
         self.add_request_calls: list[tuple] = []
         self.abort_calls: list[list[str]] = []
+        self.collective_rpc_calls: list[tuple[str, float | None, tuple[Any, ...], dict[str, Any]]] = []
         self.shutdown_calls = 0
         self._engine_core_outputs = queue.Queue()
         self._diffusion_outputs = queue.Queue()
@@ -81,6 +103,30 @@ class FakeStageClient:
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         self.abort_calls.append(list(request_ids))
 
+    async def collective_rpc_async(
+        self,
+        *,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        normalized_kwargs = dict(kwargs or {})
+        self.collective_rpc_calls.append((method, timeout, args, normalized_kwargs))
+        return {
+            "supported": False,
+            "todo": True,
+            "reason": f"{self.__class__.__name__}.collective_rpc_async is not implemented yet",
+        }
+
+    def get_kv_sender_info(self) -> dict[str, Any] | None:
+        if self._kv_sender_info is None:
+            return None
+        return dict(self._kv_sender_info)
+
+    def check_health(self) -> None:
+        return None
+
     def shutdown(self) -> None:
         self.shutdown_calls += 1
 
@@ -96,7 +142,6 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
     def __init__(self, *args, rpc_result: Any = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.rpc_result = rpc_result
-        self.collective_rpc_calls: list[tuple[str, float | None, tuple[Any, ...], dict[str, Any]]] = []
 
     async def collective_rpc_async(
         self,
@@ -318,7 +363,7 @@ def _build_harness(
 
 
 async def _shutdown_orchestrator(orchestrator_fixture: OrchestratorFixture) -> None:
-    orchestrator_fixture.request_sync_q.put_nowait({"type": "shutdown"})
+    orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
     await asyncio.to_thread(orchestrator_fixture.thread.join, 5)
     if orchestrator_fixture.thread.is_alive():
         raise AssertionError("Timed out waiting for orchestrator thread shutdown")
@@ -333,7 +378,7 @@ async def _wait_for(predicate, *, timeout: float = 2.0) -> None:
         await asyncio.sleep(0.01)
 
 
-async def _get_output_message(orchestrator_fixture: OrchestratorFixture, *, timeout: float = 2.0) -> dict:
+async def _get_output_message(orchestrator_fixture: OrchestratorFixture, *, timeout: float = 2.0) -> OutputMessage:
     deadline = time.monotonic() + timeout
     while True:
         if time.monotonic() >= deadline:
@@ -343,11 +388,15 @@ async def _get_output_message(orchestrator_fixture: OrchestratorFixture, *, time
         except queue.Empty:
             await asyncio.sleep(0.01)
             continue
-        if msg.get("type") == "output":
+        if isinstance(msg, OutputMessage):
             return msg
 
 
-async def _get_rpc_message(orchestrator_fixture: OrchestratorFixture, *, timeout: float = 2.0) -> dict:
+async def _get_rpc_message(
+    orchestrator_fixture: OrchestratorFixture,
+    *,
+    timeout: float = 2.0,
+) -> CollectiveRPCResultMessage:
     deadline = time.monotonic() + timeout
     rpc_sync_q = orchestrator_fixture.queues[2].sync_q
     while True:
@@ -369,24 +418,22 @@ async def _enqueue_add_request(
     final_stage_id: int,
 ) -> None:
     orchestrator_fixture.request_sync_q.put_nowait(
-        {
-            "type": "add_request",
-            "request_id": request_id,
-            "prompt": prompt,
-            "original_prompt": original_prompt,
-            "sampling_params_list": sampling_params_list,
-            "final_stage_id": final_stage_id,
-        }
+        StageSubmissionMessage(
+            type="add_request",
+            request_id=request_id,
+            prompt=prompt,
+            original_prompt=original_prompt,
+            output_prompt_text=None,
+            sampling_params_list=sampling_params_list,
+            final_stage_id=final_stage_id,
+            preprocess_ms=0.0,
+            enqueue_ts=time.perf_counter(),
+        )
     )
 
 
 async def _enqueue_abort_request(orchestrator_fixture: OrchestratorFixture, request_ids: list[str]) -> None:
-    orchestrator_fixture.request_sync_q.put_nowait(
-        {
-            "type": "abort",
-            "request_ids": request_ids,
-        }
-    )
+    orchestrator_fixture.request_sync_q.put_nowait(AbortRequestMessage(request_ids=request_ids))
 
 
 def test_stage_engine_core_client_shutdown_cleans_children_if_base_shutdown_fails(monkeypatch):
@@ -457,7 +504,7 @@ def orchestrator_factory():
 
     for fixture in fixtures:
         if fixture.thread.is_alive():
-            fixture.request_sync_q.put_nowait({"type": "shutdown"})
+            fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
             fixture.thread.join(timeout=5)
         for q in fixture.queues:
             q.close()
@@ -505,10 +552,10 @@ async def test_run_two_stage_llm(orchestrator_factory) -> None:
 
         output_msg = await _get_output_message(orchestrator_fixture)
 
-        assert output_msg["request_id"] == "req-llm"
-        assert output_msg["stage_id"] == 1
-        assert output_msg["finished"] is True
-        assert output_msg["engine_outputs"].request_id == "req-llm"
+        assert output_msg.request_id == "req-llm"
+        assert output_msg.stage_id == 1
+        assert output_msg.finished is True
+        assert output_msg.engine_outputs.request_id == "req-llm"
         assert "req-llm" not in orchestrator_fixture.orchestrator.request_states
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
@@ -541,10 +588,10 @@ async def test_run_single_stage_diffusion(orchestrator_factory) -> None:
 
         output_msg = await _get_output_message(orchestrator_fixture)
 
-        assert output_msg["request_id"] == "req-diff"
-        assert output_msg["stage_id"] == 0
-        assert output_msg["finished"] is True
-        assert output_msg["engine_outputs"].request_id == "req-diff"
+        assert output_msg.request_id == "req-diff"
+        assert output_msg.stage_id == 0
+        assert output_msg.finished is True
+        assert output_msg.engine_outputs.request_id == "req-diff"
         assert "req-diff" not in orchestrator_fixture.orchestrator.request_states
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
@@ -589,10 +636,10 @@ async def test_run_llm_to_diffusion(orchestrator_factory) -> None:
 
         output_msg = await _get_output_message(orchestrator_fixture)
 
-        assert output_msg["request_id"] == "req-img"
-        assert output_msg["stage_id"] == 1
-        assert output_msg["finished"] is True
-        assert output_msg["engine_outputs"].request_id == "req-img"
+        assert output_msg.request_id == "req-img"
+        assert output_msg.stage_id == 1
+        assert output_msg.finished is True
+        assert output_msg.engine_outputs.request_id == "req-img"
         assert "req-img" not in orchestrator_fixture.orchestrator.request_states
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
@@ -633,9 +680,9 @@ async def test_run_async_chunk(orchestrator_factory) -> None:
 
         output_msg = await _get_output_message(orchestrator_fixture)
 
-        assert output_msg["request_id"] == "req-async"
-        assert output_msg["stage_id"] == 1
-        assert output_msg["finished"] is True
+        assert output_msg.request_id == "req-async"
+        assert output_msg.stage_id == 1
+        assert output_msg.finished is True
         assert "req-async" not in orchestrator_fixture.orchestrator.request_states
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
@@ -757,9 +804,9 @@ async def test_multi_replica_round_robin_distribution(orchestrator_factory) -> N
         stage1.push_engine_core_outputs(_engine_core_outputs("s1-raw", 2.0))
         output_msg = await _get_output_message(orchestrator_fixture)
 
-        assert output_msg["request_id"] == "req-0"
-        assert output_msg["stage_id"] == 1
-        assert output_msg["finished"] is True
+        assert output_msg.request_id == "req-0"
+        assert output_msg.stage_id == 1
+        assert output_msg.finished is True
         assert "req-0" not in orchestrator_fixture.orchestrator.request_states
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
@@ -927,12 +974,17 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
     orchestrator.stage_pools = [pool]
 
     await orchestrator._handle_streaming_update(
-        {
-            "request_id": "req-stream",
-            "prompt": SimpleNamespace(request_id="req-stream", prompt_token_ids=[1], resumable=True),
-            "sampling_params_list": [_sampling_params()],
-            "output_prompt_text": "segment-2",
-        }
+        StageSubmissionMessage(
+            type="streaming_update",
+            request_id="req-stream",
+            prompt=SimpleNamespace(request_id="req-stream", prompt_token_ids=[1], resumable=True),
+            original_prompt={"prompt": "segment-2"},
+            output_prompt_text="segment-2",
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+            preprocess_ms=0.0,
+            enqueue_ts=time.perf_counter(),
+        )
     )
 
     assert pool.calls == [("req-stream", "segment-2")]
@@ -1024,12 +1076,14 @@ async def test_collective_rpc_ignores_invalid_stage_ids(orchestrator_factory, ca
         target_logger.setLevel(logging.WARNING)
         try:
             orchestrator_fixture.request_sync_q.put_nowait(
-                {
-                    "type": "collective_rpc",
-                    "rpc_id": "rpc-1",
-                    "method": "list_loras",
-                    "stage_ids": [99, 1],
-                }
+                CollectiveRPCRequestMessage(
+                    rpc_id="rpc-1",
+                    method="list_loras",
+                    timeout=None,
+                    args=(),
+                    kwargs={},
+                    stage_ids=[99, 1],
+                )
             )
 
             msg = await _get_rpc_message(orchestrator_fixture)
@@ -1037,10 +1091,10 @@ async def test_collective_rpc_ignores_invalid_stage_ids(orchestrator_factory, ca
             target_logger.removeHandler(caplog.handler)
             target_logger.setLevel(prev_level)
 
-        assert msg["type"] == "collective_rpc_result"
-        assert msg["rpc_id"] == "rpc-1"
-        assert msg["stage_ids"] == [1]
-        assert msg["results"] == [{"stage": 1}]
+        assert msg.type == "collective_rpc_result"
+        assert msg.rpc_id == "rpc-1"
+        assert msg.stage_ids == [1]
+        assert msg.results == [{"stage": 1}]
         assert not stage0.collective_rpc_calls
         assert len(stage1.collective_rpc_calls) == 1
         assert "collective_rpc: ignoring invalid stage_id 99" in caplog.text
@@ -1084,15 +1138,14 @@ async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator
         await _wait_for(lambda: len(stage0_r1.add_request_calls) == 1)
 
         orchestrator_fixture.request_sync_q.put_nowait(
-            {
-                "type": "add_companion_request",
-                "companion_id": "parent-neg",
-                "parent_id": "parent",
-                "role": "negative",
-                "prompt": SimpleNamespace(request_id="parent-neg", prompt_token_ids=[9]),
-                "companion_prompt_text": {"prompt": "negative"},
-                "sampling_params_list": [_sampling_params()],
-            }
+            AddCompanionRequestMessage(
+                companion_id="parent-neg",
+                parent_id="parent",
+                role="negative",
+                prompt=SimpleNamespace(request_id="parent-neg", prompt_token_ids=[9]),
+                companion_prompt_text={"prompt": "negative"},
+                sampling_params_list=[_sampling_params()],
+            )
         )
         await _wait_for(lambda: len(stage0_r1.add_request_calls) == 2)
 
