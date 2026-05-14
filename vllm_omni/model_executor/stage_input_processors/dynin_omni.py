@@ -116,9 +116,13 @@ def _bridge_tokens(
         if not runtime_bridge_info:
             runtime_bridge_info = mm_out.get("runtime_info", {}) or {}
 
-        additional_information: dict[str, Any] = _normalize_additional_info(src_additional_info)
-        additional_information.update(_normalize_additional_info(runtime_bridge_info))
-        additional_information["detok_id"] = [detok_id]
+        dynin_info: dict[str, Any] = _normalize_additional_info(src_additional_info)
+        dynin_info.update(_normalize_additional_info(runtime_bridge_info))
+        dynin_info["detok_id"] = [detok_id]
+        # All dynin fields live under ``OmniInputStruct.dynin``
+        # (DyninOmniInputStruct). The schema flatly rejects unknown top-level
+        # keys, so nesting is required for serialize_additional_information.
+        additional_information: dict[str, Any] = {"dynin": dynin_info}
 
         next_inputs.append(
             OmniTokensPrompt(

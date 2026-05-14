@@ -22,6 +22,7 @@ from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 
+from vllm_omni.data_entry_keys import OmniPayloadStruct
 from vllm_omni.model_executor.models.fish_speech.dac_utils import (
     DAC_HOP_LENGTH,
     DAC_NUM_CODEBOOKS,
@@ -195,7 +196,7 @@ class FishSpeechDACDecoder(nn.Module):
         positions: torch.Tensor | None = None,
         intermediate_tensors: Any = None,
         inputs_embeds: torch.Tensor | None = None,
-        runtime_additional_information: list[dict[str, Any]] | None = None,
+        model_intermediate_buffer_struct: list[OmniPayloadStruct] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
         """Decode codec codes into audio waveform.
@@ -226,13 +227,12 @@ class FishSpeechDACDecoder(nn.Module):
         valid_codes_qf: list[torch.Tensor] = []
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
-        if runtime_additional_information is not None:
-            for i, info in enumerate(runtime_additional_information):
+        if model_intermediate_buffer_struct is not None:
+            for i, payload in enumerate(model_intermediate_buffer_struct):
                 if i >= len(left_context_size):
                     break
-                meta = info.get("meta", {}) if isinstance(info, dict) else {}
-                if "left_context_size" in meta:
-                    left_context_size[i] = meta["left_context_size"]
+                if payload.meta is not None and payload.meta.left_context_size is not None:
+                    left_context_size[i] = payload.meta.left_context_size
 
         for i, req_ids in enumerate(request_ids_list):
             if req_ids.numel() < 1:

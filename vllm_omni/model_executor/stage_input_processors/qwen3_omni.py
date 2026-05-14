@@ -19,15 +19,14 @@ from vllm_omni.data_entry_keys import (
     MetaStruct,
     OmniPayload,
     OmniPayloadStruct,
-    to_dict,
 )
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
-    extract_language_from_prompt,
-    extract_language_from_request,
-    extract_speaker_from_prompt,
-    extract_speaker_from_request,
+    input_language_from_prompt,
+    input_language_from_request,
+    input_speaker_from_prompt,
+    input_speaker_from_request,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,16 +47,16 @@ def _layer_tensor(layers: dict[Any, Any], key: str) -> torch.Tensor | None:
     return val if isinstance(val, torch.Tensor) else None
 
 
-def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | str = "cuda") -> int:
+def _compute_talker_prompt_ids_length(info: OmniPayloadStruct, device: torch.device | str = "cuda") -> int:
     im_start_token_id = 151644
     system_token_id = 8948
     user_token_id = 872
     assistant_token_id = 77091
 
-    ids = info.get("ids", {})
-    thinker_sequences = torch.tensor(ids["all"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
+    ids = info.ids
+    thinker_sequences = torch.tensor(ids.all, dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
 
-    input_ids = torch.tensor(ids["prompt"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
+    input_ids = torch.tensor(ids.prompt, dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
 
     im_start_indexes = torch.cat(
         [
@@ -315,8 +314,8 @@ def thinker2talker_async_chunk(
             thinker_hid is not None,
         )
         return None
-    speaker = extract_speaker_from_request(request)
-    language = extract_language_from_request(request)
+    speaker = input_speaker_from_request(request)
+    language = input_language_from_request(request)
 
     def _maybe_cpu(t: Any) -> torch.Tensor | None:
         return t.detach().cpu() if isinstance(t, torch.Tensor) else None
@@ -339,15 +338,13 @@ def thinker2talker_async_chunk(
         )
         if transfer_manager.request_payload.get(request_id) is None:
             if not is_finished:
-                transfer_manager.request_payload[request_id] = to_dict(payload)
+                transfer_manager.request_payload[request_id] = payload
                 return None
         else:
-            save_payload = transfer_manager.request_payload.pop(request_id)
-            payload.embed.prefill = torch.cat(
-                (save_payload.get("embed", {}).get("prefill"), payload.embed.prefill), dim=0
-            )
+            save_payload: OmniPayloadStruct = transfer_manager.request_payload.pop(request_id)
+            payload.embed.prefill = torch.cat((save_payload.embed.prefill, payload.embed.prefill), dim=0)
             payload.hidden_states.output = torch.cat(
-                (save_payload.get("hidden_states", {}).get("output"), payload.hidden_states.output), dim=0
+                (save_payload.hidden_states.output, payload.hidden_states.output), dim=0
             )
     else:
         output_token_ids = _ensure_list(request.output_token_ids)
@@ -464,16 +461,15 @@ def thinker2talker(
             ),
             hidden_states=HiddenStatesStruct(output=thinker_hid),
             ids=IdsStruct(all=thinker_sequences, prompt=thinker_input_ids),
-            speaker=extract_speaker_from_prompt(prompt, index=i),
-            language=extract_language_from_prompt(prompt, index=i),
+            speaker=input_speaker_from_prompt(prompt, index=i),
+            language=input_language_from_prompt(prompt, index=i),
         )
-        info = to_dict(payload)
-        prompt_len = _compute_talker_prompt_ids_length(info, device=device)
+        prompt_len = _compute_talker_prompt_ids_length(payload, device=device)
 
         talker_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[0] * prompt_len,
-                additional_information=info,
+                additional_information=payload,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
             )

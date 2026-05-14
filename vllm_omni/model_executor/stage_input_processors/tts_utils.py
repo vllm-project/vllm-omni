@@ -9,68 +9,70 @@ processor (qwen3_omni, qwen2_5_omni, qwen3_tts, etc.).
 
 from typing import Any
 
+from vllm_omni.data_entry_keys import OmniInputStruct
+
+# =============================================================================
+# Read from ``OmniInputStruct`` — producers emit ``OmniInputStruct(...)``
+# directly on ``additional_information``. Per-model substructs live under
+# their model name (e.g. ``qwen3_tts.task_type``).
+# =============================================================================
+
+
+def input_field_from_request(request: Any, field: str) -> Any:
+    """Read a top-level ``OmniInputStruct`` field from the request envelope."""
+    add_info = getattr(request, "additional_information", None)
+    if isinstance(add_info, OmniInputStruct):
+        return getattr(add_info, field, None)
+    return None
+
+
+def _input_struct(prompt: dict[str, Any] | list[dict[str, Any]] | None, index: int) -> OmniInputStruct | None:
+    if prompt is None:
+        return None
+    p = prompt[index] if isinstance(prompt, list) and index < len(prompt) else prompt
+    if not isinstance(p, dict):
+        return None
+    add_info = p.get("additional_information")
+    return add_info if isinstance(add_info, OmniInputStruct) else None
+
+
+def input_speaker_from_request(request: Any) -> str | None:
+    val = input_field_from_request(request, "speaker")
+    if isinstance(val, list) and val:
+        val = val[0]
+    if isinstance(val, str) and val.strip():
+        return val.lower().strip()
+    return None
+
+
+def input_language_from_request(request: Any) -> list[str] | None:
+    val = input_field_from_request(request, "language")
+    if isinstance(val, list) and val:
+        return val
+    if isinstance(val, str) and val.strip():
+        return [val.strip()]
+    return None
+
+
+def input_speaker_from_prompt(prompt: dict[str, Any] | list[dict[str, Any]] | None, index: int = 0) -> list[str] | None:
+    inp = _input_struct(prompt, index)
+    if inp is None or inp.speaker is None:
+        return None
+    return inp.speaker if isinstance(inp.speaker, list) else [inp.speaker]
+
+
+def input_language_from_prompt(
+    prompt: dict[str, Any] | list[dict[str, Any]] | None, index: int = 0
+) -> list[str] | None:
+    inp = _input_struct(prompt, index)
+    if inp is None or inp.language is None:
+        return None
+    return inp.language if isinstance(inp.language, list) else [inp.language]
+
+
 # =============================================================================
 # Speaker helpers
 # =============================================================================
-
-
-def extract_speaker_from_runtime_info(
-    runtime_additional_information: list[dict[str, Any]] | None,
-) -> str | None:
-    """Extract speaker from per-request runtime info dicts.
-
-    Iterates through the list of per-request info dicts and returns the first
-    non-empty speaker string found, normalized to lowercase.
-
-    Args:
-        runtime_additional_information: List of per-request additional info
-            dicts, as passed to the model's forward() method.
-
-    Returns:
-        The speaker string (lowercase, stripped), or None if not present.
-    """
-    if not runtime_additional_information:
-        return None
-    for info in runtime_additional_information:
-        vt = info.get("speaker")
-        if vt is None:
-            continue
-        if isinstance(vt, (list, tuple)) and len(vt) > 0:
-            vt = vt[0]
-        if isinstance(vt, str) and vt.strip():
-            return vt.lower().strip()
-        if vt is not None:
-            return str(vt).lower().strip()
-    return None
-
-
-def extract_speaker_from_request(request: Any) -> str | None:
-    """Extract speaker from a request's additional_information field.
-
-    Reads from the structured ``additional_information.entries["speaker"]``
-    field used by the engine serialization layer.
-
-    Args:
-        request: An OmniEngineCoreRequest (or compatible object) with an
-            ``additional_information`` attribute.
-
-    Returns:
-        The speaker string (lowercase, stripped), or None if not present.
-    """
-    additional_information = getattr(request, "additional_information", None)
-    if additional_information is None:
-        return None
-    entries = getattr(additional_information, "entries", None)
-    if not isinstance(entries, dict):
-        return None
-    entry = entries.get("speaker")
-    if entry is None:
-        return None
-    list_data = getattr(entry, "list_data", None)
-    if isinstance(list_data, list) and list_data:
-        val = list_data[0]
-        return val.lower().strip() if isinstance(val, str) else str(val).lower().strip()
-    return None
 
 
 def extract_speaker_from_prompt(
@@ -106,55 +108,6 @@ def extract_speaker_from_prompt(
 # =============================================================================
 # Language helpers
 # =============================================================================
-
-
-def extract_language_from_runtime_info(
-    runtime_additional_information: list[dict[str, Any]] | None,
-) -> str | None:
-    """Extract language from per-request runtime info dicts.
-    Args:
-        runtime_additional_information: List of per-request additional info
-            dicts, as passed to the model's forward() method.
-
-    Returns:
-        The language string (e.g. "Chinese", "English", "Auto"), or None.
-    """
-    if not runtime_additional_information:
-        return None
-    for info in runtime_additional_information:
-        lang = info.get("language")
-        if lang is None:
-            continue
-        if isinstance(lang, (list, tuple)) and len(lang) > 0:
-            return lang
-        if isinstance(lang, str) and lang.strip():
-            return [lang.strip()]
-    return None
-
-
-def extract_language_from_request(request: Any) -> str | None:
-    """Extract language from a request's additional_information field.
-
-    Args:
-        request: An OmniEngineCoreRequest (or compatible object) with an
-            ``additional_information`` attribute.
-
-    Returns:
-        The language string, or None if not present.
-    """
-    additional_information = getattr(request, "additional_information", None)
-    if additional_information is None:
-        return None
-    entries = getattr(additional_information, "entries", None)
-    if not isinstance(entries, dict):
-        return None
-    entry = entries.get("language")
-    if entry is None:
-        return None
-    list_data = getattr(entry, "list_data", None)
-    if isinstance(list_data, list) and list_data:
-        return list_data
-    return None
 
 
 def extract_language_from_prompt(

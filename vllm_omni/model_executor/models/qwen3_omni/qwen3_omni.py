@@ -36,7 +36,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.data_entry_keys import Embeddings, HiddenStates, Ids, OmniPayload, OmniPayloadMeta
+from vllm_omni.data_entry_keys import Embeddings, HiddenStates, Ids, OmniPayload, OmniPayloadMeta, OmniPayloadStruct
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
@@ -328,7 +328,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         codec: torch.Tensor | None = None,
         sampling_metadata: SamplingMetadata | None = None,
         logits_index: int | None = None,
-        runtime_additional_information: list[dict[str, Any]] | None = None,
+        model_intermediate_buffer_struct: list[OmniPayloadStruct] | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors | OmniOutput:
         """
@@ -428,14 +428,13 @@ class Qwen3OmniMoeForConditionalGeneration(
                 )
                 codes = input_ids_flatten.reshape(1, 16, -1)
 
-            # Generate audio from codec codes
-            # Get every request's left_context_size from runtime_additional_information (passed via kwargs)
+            # Generate audio from codec codes.
+            # Per-request left_context_size from the typed payload struct.
             left_context_size = []
-            if runtime_additional_information is not None:
-                for info in runtime_additional_information:
-                    meta = info.get("meta", {})
-                    if "left_context_size" in meta:
-                        left_context_size.append(meta["left_context_size"])
+            if model_intermediate_buffer_struct is not None:
+                for payload in model_intermediate_buffer_struct:
+                    if payload.meta is not None and payload.meta.left_context_size is not None:
+                        left_context_size.append(payload.meta.left_context_size)
             else:
                 logger.debug("No additional_information provided to code2wav stage.")
             audio_tensors = self.generate_audio(codes, left_context_size, seq_token_counts)
@@ -494,13 +493,8 @@ class Qwen3OmniMoeForConditionalGeneration(
             # preprocess function, the code_predictor_codes are stored in the info_dict list.
             # We need to merge the tensors from different requests into a single tensor.
             # In the future, we may allow user to custom an aggregated function.
-            info_dicts = kwargs.get("model_intermediate_buffer")
-            if info_dicts is None:
-                info_dicts = kwargs.get("runtime_additional_information")
-
-            if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
-                logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
-            code_predictor_codes = [info.get("codes", {}).get("audio") for info in info_dicts]
+            info_structs: list[OmniPayloadStruct] = kwargs.get("model_intermediate_buffer_struct") or []
+            code_predictor_codes = [s.codes.audio if s.codes is not None else None for s in info_structs]
             audio_codes = torch.cat(code_predictor_codes, dim=0)
             multimodal_outputs: OmniPayload = {"codes": {"audio": audio_codes}}
             span_len = audio_codes.shape[0]

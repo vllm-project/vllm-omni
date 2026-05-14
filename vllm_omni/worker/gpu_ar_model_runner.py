@@ -38,7 +38,7 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
-from vllm_omni.data_entry_keys import flatten_payload
+from vllm_omni.data_entry_keys import OmniInputStruct, OmniPayloadStruct, flatten_payload, to_input_struct
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
@@ -253,9 +253,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
             # If this happens, it generally means the model is not following the correct
             # interface yet and is therefore currently not compatible with prefix cache.
-            if multimodal_outputs is not None and not isinstance(multimodal_outputs, dict):
+            if (
+                multimodal_outputs is not None
+                and not isinstance(multimodal_outputs, dict)
+                and not isinstance(multimodal_outputs, OmniPayloadStruct)
+            ):
                 logger.warning_once(
-                    "prefix caching expects mm outputs to be a dict, but got %s",
+                    "prefix caching expects mm outputs to be a dict or OmniPayloadStruct, but got %s",
                     type(multimodal_outputs),
                 )
 
@@ -1034,11 +1038,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return req_id
 
         add_info = self.model_intermediate_buffer.get(req_id, {})
-        global_id = add_info.get("global_request_id")
-        if global_id:
-            if isinstance(global_id, list) and global_id:
-                global_id = global_id[0]
-            if isinstance(global_id, bytes):
-                return global_id.decode("utf-8")
-            return str(global_id)
-        return req_id
+        input_fields = set(OmniInputStruct.__struct_fields__)
+        i_dict = {k: v for k, v in add_info.items() if k in input_fields}
+        input_struct = to_input_struct(i_dict) if i_dict else None
+        if input_struct is None or input_struct.global_request_id is None:
+            return req_id
+        val = input_struct.global_request_id
+        if isinstance(val, list):
+            val = val[0] if val else None
+        return str(val) if val else req_id

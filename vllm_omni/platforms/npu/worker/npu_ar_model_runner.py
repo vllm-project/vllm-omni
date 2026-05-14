@@ -41,7 +41,7 @@ from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, global_stream
 from vllm_ascend.worker.model_runner_v1 import graph_capture
 
-from vllm_omni.data_entry_keys import flatten_payload
+from vllm_omni.data_entry_keys import OmniInputStruct, flatten_payload, to_input_struct
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
@@ -1041,12 +1041,13 @@ class NPUARModelRunner(OmniNPUModelRunner):
             return req_id
 
         add_info = self.model_intermediate_buffer.get(req_id, {})
-        global_id = add_info.get("global_request_id")
-        if global_id:
-            if isinstance(global_id, list) and global_id:
-                global_id = global_id[0]
-            if isinstance(global_id, bytes):
-                return global_id.decode("utf-8")
-            return str(global_id)
-        return req_id
+        input_fields = set(OmniInputStruct.__struct_fields__)
+        i_dict = {k: v for k, v in add_info.items() if k in input_fields}
+        input_struct = to_input_struct(i_dict) if i_dict else None
+        if input_struct is None or input_struct.global_request_id is None:
+            return req_id
+        val = input_struct.global_request_id
+        if isinstance(val, list):
+            val = val[0] if val else None
+        return str(val) if val else req_id
     #  -------------------------------------- Omni-new -------------------------------------------------

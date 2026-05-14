@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.data_entry_keys import MingTTSInputStruct, OmniInputStruct
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -302,21 +303,22 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        runtime_additional_information: list[dict] | None = None,
         **kwargs,
     ) -> OmniOutput:
         """Run TTS generation and return audio output.
 
         The full autoregressive generation loop is executed inside this method.
         """
-        additional_info = self._extract_additional_info(runtime_additional_information)
-        params = self._resolve_generation_params(additional_info)
-        voice = self._resolve_voice(additional_info)
+        input_struct = self._extract_additional_info(kwargs.get("model_input_struct"))
+        params = self._resolve_generation_params(input_struct)
+        voice = self._resolve_voice(input_struct)
 
+        text_field = input_struct.text if input_struct is not None else None
+        text = text_field[0] if isinstance(text_field, list) and text_field else (text_field or "")
         latents = self._generate_latents(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
-            text=additional_info.get("text", ""),
+            text=text,
             params=params,
             voice=voice,
         )
@@ -324,33 +326,45 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
 
     @staticmethod
     def _extract_additional_info(
-        runtime_additional_information: list[dict] | None,
-    ) -> dict[str, Any]:
-        if runtime_additional_information and len(runtime_additional_information) > 0:
-            return runtime_additional_information[0] or {}
-        return {}
+        model_input_struct: list[OmniInputStruct | None] | None,
+    ) -> OmniInputStruct | None:
+        if model_input_struct and len(model_input_struct) > 0:
+            return model_input_struct[0]
+        return None
 
-    def _resolve_generation_params(self, additional_info: dict[str, Any]) -> _GenerationParams:
+    @staticmethod
+    def _unwrap_scalar(value: Any) -> Any:
+        return value[0] if isinstance(value, list) and value else value
+
+    def _resolve_generation_params(self, input_struct: OmniInputStruct | None) -> _GenerationParams:
         # "omni"    : thinker -> talker hand-off with hardcoded defaults
         # "instruct": standalone TTS with caller-supplied sampling knobs
-        ming_task = additional_info.get("ming_task", "instruct")
+        ming: MingTTSInputStruct | None = input_struct.ming if input_struct is not None else None
+        ming_task = (ming.ming_task if ming is not None else None) or "instruct"
 
         if ming_task == "omni":
             prompt = MING_DEFAULT_PROMPT
             instruction = None
-            use_zero_spk_emb = additional_info.get("spk_emb") is None
+            use_zero_spk_emb = (ming.spk_emb_tensor if ming is not None else None) is None and (
+                ming.spk_emb if ming is not None else None
+            ) is None
             cfg = 2.0
             sigma = 0.25
             temperature = 0.0
             max_steps = 200
         else:
-            prompt = additional_info.get("prompt", MING_DEFAULT_PROMPT)
-            instruction = additional_info.get("instruction", None)
-            use_zero_spk_emb = additional_info.get("use_zero_spk_emb", False)
-            cfg = additional_info.get("cfg", self.cfg_strength)
-            sigma = additional_info.get("sigma", 0.25)
-            temperature = additional_info.get("temperature", 0.0)
-            max_steps = int(additional_info.get("max_steps", additional_info.get("max_decode_steps", 200)))
+            prompt = (ming.prompt if ming is not None else None) or MING_DEFAULT_PROMPT
+            instruction_field = input_struct.instruction if input_struct is not None else None
+            instruction = self._unwrap_scalar(instruction_field)
+            use_zero_spk_emb = bool((ming.use_zero_spk_emb if ming is not None else None) or False)
+            cfg = (ming.cfg if ming is not None else None) or self.cfg_strength
+            sigma = (ming.sigma if ming is not None else None) or 0.25
+            temperature = (ming.temperature if ming is not None else None) or 0.0
+            max_steps = int(
+                (ming.max_steps if ming is not None else None)
+                or (ming.max_decode_steps if ming is not None else None)
+                or 200
+            )
 
         return _GenerationParams(
             prompt=prompt,
@@ -360,19 +374,24 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             temperature=temperature,
             max_steps=max_steps,
             use_zero_spk_emb=use_zero_spk_emb,
-            max_text_length=int(additional_info.get("max_text_length", 50)),
-            use_static_cache=bool(additional_info.get("use_static_cache", True)),
-            stream_decode=bool(additional_info.get("stream_decode", True)),
+            max_text_length=int((ming.max_text_length if ming is not None else None) or 50),
+            use_static_cache=bool((ming.use_static_cache if ming is not None else True) if ming is not None else True),
+            stream_decode=bool((ming.stream_decode if ming is not None else True) if ming is not None else True),
         )
 
-    def _resolve_voice(self, additional_info: dict[str, Any]) -> _VoiceContext:
-        spk_emb = additional_info.get("spk_emb", None)
-        prompt_text = additional_info.get("prompt_text", None)
-        prompt_wav_lat = additional_info.get("prompt_wav_lat", None)
-        prompt_wav_emb = additional_info.get("prompt_wav_emb", None)
+    def _resolve_voice(self, input_struct: OmniInputStruct | None) -> _VoiceContext:
+        ming: MingTTSInputStruct | None = input_struct.ming if input_struct is not None else None
+        # Stage-processed tensor wins over user-provided list.
+        spk_emb_tensor = ming.spk_emb_tensor if ming is not None else None
+        spk_emb = spk_emb_tensor if spk_emb_tensor is not None else (ming.spk_emb if ming is not None else None)
+        prompt_text_field = input_struct.prompt_text if input_struct is not None else None
+        prompt_text = self._unwrap_scalar(prompt_text_field)
+        prompt_wav_lat = ming.prompt_wav_lat if ming is not None else None
+        prompt_wav_emb = ming.prompt_wav_emb if ming is not None else None
         already_projected = False
 
-        voice_name = additional_info.get("voice_name", None)
+        voice_name_field = input_struct.voice_name if input_struct is not None else None
+        voice_name = self._unwrap_scalar(voice_name_field)
         if voice_name and spk_emb is None and voice_name in self.voice_presets:
             preset = self.voice_presets.get(voice_name) or {}
             prompt_wav_lat = preset.get("prompt_wav_lat")

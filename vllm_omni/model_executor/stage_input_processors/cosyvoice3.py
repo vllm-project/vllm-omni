@@ -4,7 +4,6 @@ from collections import defaultdict
 from contextlib import nullcontext
 from typing import Any
 
-import numpy as np
 import torch
 from vllm.inputs import TextPrompt
 
@@ -12,7 +11,9 @@ from vllm_omni.data_entry_keys import (
     CodesStruct,
     EmbeddingsStruct,
     MetaStruct,
+    OmniInputStruct,
     OmniPayloadStruct,
+    to_dict,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -57,29 +58,20 @@ def _to_cpu_tensor(x: Any) -> torch.Tensor | None:
 
 
 def _decode_additional_information(raw_info: Any) -> dict[str, Any]:
+    """Normalize ``additional_information`` to a dict view.
+
+    After step 3 (envelope drop), the engine carries either a dict (pre-
+    serialization) or one of the typed structs ``OmniInputStruct`` /
+    ``OmniPayloadStruct`` (post-serialization). Both flatten to a dict here so
+    downstream call sites can use ``.get(...)`` uniformly.
+    """
     if raw_info is None:
         return {}
     if isinstance(raw_info, dict):
         return raw_info
-
-    entries = getattr(raw_info, "entries", None)
-    if not isinstance(entries, dict):
-        return {}
-
-    decoded: dict[str, Any] = {}
-    for key, entry in entries.items():
-        tensor_data = getattr(entry, "tensor_data", None)
-        if tensor_data is not None:
-            dtype_name = getattr(entry, "tensor_dtype", "float32")
-            tensor_shape = getattr(entry, "tensor_shape", None)
-            if tensor_shape is None:
-                continue
-            dt = np.dtype(dtype_name)
-            arr = np.frombuffer(tensor_data, dtype=dt).reshape(tensor_shape)
-            decoded[key] = torch.from_numpy(arr.copy())
-        else:
-            decoded[key] = getattr(entry, "list_data", None)
-    return decoded
+    if isinstance(raw_info, (OmniInputStruct, OmniPayloadStruct)):
+        return to_dict(raw_info)
+    raise TypeError(f"Unsupported additional_information type: {type(raw_info)!r}")
 
 
 def text2flow(

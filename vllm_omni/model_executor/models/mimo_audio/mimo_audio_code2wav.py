@@ -4,7 +4,6 @@ import os
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 import torchaudio
@@ -19,6 +18,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.data_entry_keys import OmniPayloadStruct
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import TALKER_CODEC_PAD_TOKEN_ID, MiMoAudioConfig
 from vllm_omni.model_executor.models.mimo_audio.cuda_graph_decoder_wrapper import CUDAGraphMiMoDecoderWrapper
 from vllm_omni.model_executor.models.mimo_audio.modeling_audio_tokenizer import MiMoAudioTokenizer
@@ -505,7 +505,7 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
     def _split_flat_codes_for_requests(
         ids: torch.Tensor,
         seq_token_counts: list[int] | None,
-        runtime_additional_information: list[dict[str, Any]] | None,
+        payload_structs: list[OmniPayloadStruct] | None,
     ) -> list[torch.Tensor]:
         """Split flat codec token ids per request.
 
@@ -517,11 +517,11 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         if n == 0:
             return [ids]
 
-        if runtime_additional_information and all(
-            isinstance(info.get("meta", {}).get("code_flat_numel"), int) and int(info["meta"]["code_flat_numel"]) > 0
-            for info in runtime_additional_information
+        if payload_structs and all(
+            p.meta is not None and p.meta.code_flat_numel is not None and p.meta.code_flat_numel > 0
+            for p in payload_structs
         ):
-            sizes = [int(info["meta"]["code_flat_numel"]) for info in runtime_additional_information]
+            sizes = [int(p.meta.code_flat_numel) for p in payload_structs]
             if sum(sizes) == n:
                 parts: list[torch.Tensor] = []
                 offset = 0
@@ -541,19 +541,21 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
     @staticmethod
     def _mimo_codec_runtime_lists(
         num_req: int,
-        runtime_additional_information: list[dict[str, Any]] | None,
+        payload_structs: list[OmniPayloadStruct] | None,
     ) -> tuple[list[int | None], list[int | None]]:
-        """Per-request ``left_context_size`` / ``codec_chunk_frames`` from runtime buffer."""
+        """Per-request ``left_context_size`` / ``codec_chunk_frames`` from payload meta."""
         left_frames: list[int | None] = [None] * num_req
         chunk_frames: list[int | None] = [None] * num_req
-        if not runtime_additional_information:
+        if not payload_structs:
             return left_frames, chunk_frames
-        for i in range(min(num_req, len(runtime_additional_information))):
-            meta = runtime_additional_information[i].get("meta", {})
-            if "left_context_size" in meta:
-                left_frames[i] = int(meta["left_context_size"])
-            if "codec_chunk_frames" in meta:
-                chunk_frames[i] = int(meta["codec_chunk_frames"])
+        for i in range(min(num_req, len(payload_structs))):
+            meta = payload_structs[i].meta
+            if meta is None:
+                continue
+            if meta.left_context_size is not None:
+                left_frames[i] = int(meta.left_context_size)
+            if meta.codec_chunk_frames is not None:
+                chunk_frames[i] = int(meta.codec_chunk_frames)
         return left_frames, chunk_frames
 
     def chunked_decode_streaming(
@@ -590,13 +592,10 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         self,
         input_ids: torch.Tensor | None = None,
         codes: torch.Tensor | None = None,
-        runtime_additional_information: list[dict[str, Any]] | None = None,
+        model_intermediate_buffer_struct: list[OmniPayloadStruct] | None = None,
         **kwargs,
     ) -> OmniOutput | torch.Tensor | IntermediateTensors:
-        if runtime_additional_information is None:
-            runtime_additional_information = kwargs.get("model_intermediate_buffer") or kwargs.get(
-                "runtime_additional_information"
-            )
+        payload_structs = model_intermediate_buffer_struct
         code_tensor = codes if codes is not None else input_ids
         empty = torch.zeros((0,), dtype=torch.float32, device=self.device)
 
@@ -608,10 +607,8 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
 
         is_async_chunk = getattr(self.vllm_config.model_config, "async_chunk", False)
         ids = code_tensor.reshape(-1).to(dtype=torch.long)
-        request_ids_list = self._split_flat_codes_for_requests(
-            ids, kwargs.get("seq_token_counts"), runtime_additional_information
-        )
-        per_left, per_chunk = self._mimo_codec_runtime_lists(len(request_ids_list), runtime_additional_information)
+        request_ids_list = self._split_flat_codes_for_requests(ids, kwargs.get("seq_token_counts"), payload_structs)
+        per_left, per_chunk = self._mimo_codec_runtime_lists(len(request_ids_list), payload_structs)
 
         is_capturing = torch.cuda.is_current_stream_capturing()
         if is_capturing:

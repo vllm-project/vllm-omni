@@ -22,6 +22,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors,
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
+from vllm_omni.data_entry_keys import OmniInputStruct, OmniPayloadStruct, to_input_struct, to_struct
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -43,6 +44,11 @@ class OmniGPUModelRunner(GPUModelRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
+        # Persistent ``OmniInputStruct`` per request. Built lazily from
+        # ``model_intermediate_buffer`` and kept across steps so model mutations
+        # (e.g. voxcpm ``_voxcpm_stream_key``) survive without dict write-back.
+        # Synced with dict writes via ``_resync_input_struct``.
+        self.model_input_struct_buffer: dict[str, OmniInputStruct] = {}
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
         # The Omni tensor prefix cache will be allocated
@@ -267,6 +273,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.model_intermediate_buffer.pop(req_id, None)
+            self.model_input_struct_buffer.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
             if hasattr(self, "_downstream_payload_cache"):
                 self._downstream_payload_cache.pop(req_id, None)
@@ -940,8 +947,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         return hidden_states, hidden_states[logit_indices_device]
 
     # ------------------------------------------------------------------
-    # Payload decoding helpers (torch.Tensor passthrough + legacy
-    # PromptEmbedsPayload / AdditionalInformationPayload support)
+    # Payload decoding helpers (torch.Tensor passthrough +
+    # PromptEmbedsPayload support)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -1024,6 +1031,57 @@ class OmniGPUModelRunner(GPUModelRunner):
                 per_req_runtime_info.append({})
         return per_req_runtime_info
 
+    def _resync_input_struct(self, req_id: str, info: dict[str, Any]) -> OmniInputStruct | None:
+        """Return the persistent ``OmniInputStruct`` for ``req_id``, building or
+        refreshing it from ``info`` when the dict carries fields the cached
+        struct doesn't yet have. The struct instance is preserved across calls
+        so model mutations persist.
+        """
+        if not info:
+            self.model_input_struct_buffer.pop(req_id, None)
+            return None
+        input_fields = set(OmniInputStruct.__struct_fields__)
+        i_dict = {k: v for k, v in info.items() if k in input_fields}
+        if not i_dict:
+            self.model_input_struct_buffer.pop(req_id, None)
+            return None
+        cached = self.model_input_struct_buffer.get(req_id)
+        if cached is None:
+            cached = to_input_struct(i_dict)
+            self.model_input_struct_buffer[req_id] = cached
+            return cached
+        # Refresh fields that arrived on the dict from external writes
+        # (e.g., scheduler / connector updates); keep model mutations that
+        # only live on the struct (the model never writes those into the dict).
+        for k, v in i_dict.items():
+            setattr(cached, k, v)
+        return cached
+
+    def _gather_runtime_additional_information_struct(
+        self,
+        buffer_map: list[dict],
+    ) -> tuple[list[OmniPayloadStruct], list[OmniInputStruct | None]]:
+        """Build the per-step payload struct list and return the persistent input
+        struct list.
+
+        Payload structs are rebuilt each step (they reflect the latest stage
+        output). Input structs are persistent (held in
+        ``model_input_struct_buffer``) so model mutations such as
+        ``_voxcpm_stream_key`` survive across steps without dict write-back.
+        """
+        payload_fields = set(OmniPayloadStruct.__struct_fields__)
+        payload_list: list[OmniPayloadStruct] = []
+        input_list: list[OmniInputStruct | None] = []
+        for info, req_id in zip(buffer_map, self.input_batch.req_ids, strict=False):
+            if not info:
+                payload_list.append(OmniPayloadStruct())
+                input_list.append(None)
+                continue
+            p_dict = {k: v for k, v in info.items() if k in payload_fields}
+            payload_list.append(to_struct(p_dict) if p_dict else OmniPayloadStruct())
+            input_list.append(self._resync_input_struct(req_id, info))
+        return payload_list, input_list
+
     def _compute_request_token_spans(self, num_scheduled_tokens_np) -> list[tuple[int, int]]:
         """Compute (start, end) token spans for each request within the flattened step sequence."""
         req_token_spans: list[tuple[int, int]] = []
@@ -1041,6 +1099,12 @@ class OmniGPUModelRunner(GPUModelRunner):
             model_kwargs_extra["model_intermediate_buffer"] = buffer_map
             # Backward compatible: also emit old name
             model_kwargs_extra["runtime_additional_information"] = buffer_map
+            # Typed views for migrated consumers (3a.2b): payload-shaped struct
+            # for stage-output reads, input-shaped struct for input-side reads.
+            (
+                model_kwargs_extra["model_intermediate_buffer_struct"],
+                model_kwargs_extra["model_input_struct"],
+            ) = self._gather_runtime_additional_information_struct(buffer_map)
         except Exception as e:
             logger.error(f"[OMNI DEBUG] Error building model_kwargs_extra: {e}")
             import traceback
@@ -1319,8 +1383,12 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # call the custom process function
                 req_infos["request_id"] = req_id
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
+                req_input_struct = self._resync_input_struct(req_id, req_infos)
                 req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                    input_ids=input_ids[s:e], input_embeds=embed_slice, **req_infos
+                    input_ids=input_ids[s:e],
+                    input_embeds=embed_slice,
+                    model_input_struct=req_input_struct,
+                    **req_infos,
                 )
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(

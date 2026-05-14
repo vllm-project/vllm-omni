@@ -10,17 +10,16 @@ from vllm_omni.data_entry_keys import (
     MetaStruct,
     OmniPayload,
     OmniPayloadStruct,
-    to_dict,
 )
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
     compute_dynamic_initial_chunk_size,
     max_ic_for_chunk_size,
 )
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
-    extract_language_from_prompt,
-    extract_language_from_request,
-    extract_speaker_from_prompt,
-    extract_speaker_from_request,
+    input_language_from_prompt,
+    input_language_from_request,
+    input_speaker_from_prompt,
+    input_speaker_from_request,
 )
 
 logger = init_logger(__name__)
@@ -102,19 +101,20 @@ def talker2code2wav(
             ref_code_len = 0
         # Code2Wav expects codebook-major flat: [Q*num_frames]
         codec_codes = audio_codes.transpose(0, 1).cpu().reshape(-1).tolist()
-        additional_information = to_dict(
-            OmniPayloadStruct(
-                meta=MetaStruct(left_context_size=ref_code_len) if ref_code_len > 0 else None,
-                speaker=extract_speaker_from_prompt(prompt, index=i),
-                language=extract_language_from_prompt(prompt, index=i),
-            )
+        speaker = input_speaker_from_prompt(prompt, index=i)
+        language = input_language_from_prompt(prompt, index=i)
+        meta = MetaStruct(left_context_size=ref_code_len) if ref_code_len > 0 else None
+        additional_information = (
+            OmniPayloadStruct(meta=meta, speaker=speaker, language=language)
+            if (meta is not None or speaker is not None or language is not None)
+            else None
         )
         code2wav_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=codec_codes,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
-                additional_information=additional_information if additional_information else None,
+                additional_information=additional_information,
             )
         )
     return code2wav_inputs
@@ -170,15 +170,14 @@ def talker2code2wav_async_chunk(
     initial_chunk_size = configured_initial_chunk_size
     additional_information = getattr(request, "additional_information", None)
 
-    if (
-        additional_information is not None
-        and hasattr(additional_information, "entries")
-        and "initial_codec_chunk_frames" in additional_information.entries
-    ):
-        entry = additional_information.entries["initial_codec_chunk_frames"]
-        if entry.list_data is not None and len(entry.list_data) == 1:
-            initial_chunk_size = int(entry.list_data[0])
-            fixed_initial_chunk_size = True
+    if additional_information is not None:
+        from vllm_omni.data_entry_keys import OmniInputStruct
+
+        if isinstance(additional_information, OmniInputStruct):
+            override = additional_information.initial_codec_chunk_frames
+            if override is not None:
+                initial_chunk_size = int(override)
+                fixed_initial_chunk_size = True
 
     # Dynamic IC: cache per request so boundaries stay stable for its lifetime.
     if not fixed_initial_chunk_size:
@@ -262,6 +261,6 @@ def talker2code2wav_async_chunk(
             left_context_size=left_context_size,
             finished=torch.tensor(finished, dtype=torch.bool),
         ),
-        speaker=extract_speaker_from_request(request),
-        language=extract_language_from_request(request),
+        speaker=input_speaker_from_request(request),
+        language=input_language_from_request(request),
     )

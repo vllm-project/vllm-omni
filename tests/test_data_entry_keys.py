@@ -12,14 +12,11 @@ from vllm_omni.data_entry_keys import (
     MetaStruct,
     OmniPayload,
     OmniPayloadStruct,
-    deserialize_payload,
     flatten_payload,
-    serialize_payload,
     to_dict,
     to_struct,
     unflatten_payload,
 )
-from vllm_omni.engine import AdditionalInformationPayload
 
 
 class TestOmniPayloadStruct:
@@ -135,8 +132,12 @@ class TestWireEquivalenceStructVsDict:
     def _assert_decoded_equal(a, b):
         if isinstance(a, dict):
             assert isinstance(b, dict)
-            assert sorted(a.keys()) == sorted(b.keys())
-            for k in a:
+            # ``type`` is the msgspec tag emitted by tagged Structs; the dict
+            # round-trip never carries it. Compare on the data keys.
+            a_keys = sorted(k for k in a if k != "type")
+            b_keys = sorted(k for k in b if k != "type")
+            assert a_keys == b_keys
+            for k in a_keys:
                 TestWireEquivalenceStructVsDict._assert_decoded_equal(a[k], b[k])
         elif isinstance(a, torch.Tensor):
             assert isinstance(b, torch.Tensor)
@@ -298,83 +299,37 @@ class TestFlattenUnflattenRoundTrip:
         assert restored["meta"]["ar_width"] == 8
 
 
-class TestSerializeDeserializePayload:
-    def test_tensor_round_trip(self):
-        original: OmniPayload = {
-            "hidden_states": {"output": torch.tensor([[1.0, 2.0], [3.0, 4.0]])},
-        }
-        wire = serialize_payload(original)
-        assert isinstance(wire, AdditionalInformationPayload)
-        restored = deserialize_payload(wire)
-        assert torch.equal(restored["hidden_states"]["output"], original["hidden_states"]["output"])
+class TestOmniInputStruct:
+    def test_forbid_unknown_fields(self):
+        from vllm_omni.data_entry_keys import OmniInputStruct
 
-    def test_list_round_trip(self):
-        original: OmniPayload = {
-            "ids": {"prompt": [10, 20, 30]},
-        }
-        wire = serialize_payload(original)
-        restored = deserialize_payload(wire)
-        assert restored["ids"]["prompt"] == [10, 20, 30]
+        with pytest.raises(msgspec.ValidationError):
+            msgspec.convert({"not_a_real_field": 1}, OmniInputStruct)
 
-    def test_finished_tensor_round_trip(self):
-        original: OmniPayload = {
-            "meta": {"finished": torch.tensor(True, dtype=torch.bool), "left_context_size": 5},
-        }
-        wire = serialize_payload(original)
-        restored = deserialize_payload(wire)
-        assert isinstance(restored["meta"]["finished"], torch.Tensor)
-        assert restored["meta"]["finished"].dtype == torch.bool
-        assert restored["meta"]["finished"].item() is True
-        assert restored["meta"]["left_context_size"] == 5
+    def test_forbid_unknown_per_model_fields(self):
+        from vllm_omni.data_entry_keys import OmniInputStruct
 
-    def test_mixed_types_round_trip(self):
-        original: OmniPayload = {
-            "hidden_states": {"output": torch.tensor([1.0, 2.0])},
-            "ids": {"all": [1, 2, 3]},
-            "meta": {"finished": torch.tensor(False, dtype=torch.bool), "ar_width": 4},
-            "codes": {"audio": torch.tensor([3.0])},
-        }
-        wire = serialize_payload(original)
-        restored = deserialize_payload(wire)
-        assert torch.equal(restored["hidden_states"]["output"], original["hidden_states"]["output"])
-        assert restored["ids"]["all"] == [1, 2, 3]
-        assert restored["meta"]["finished"].item() is False
-        assert restored["meta"]["ar_width"] == 4
-        assert torch.equal(restored["codes"]["audio"], original["codes"]["audio"])
+        with pytest.raises(msgspec.ValidationError):
+            msgspec.convert({"qwen3_tts": {"not_a_real_field": 1}}, OmniInputStruct)
 
-    def test_hidden_states_layers_round_trip(self):
-        original = {
-            "hidden_states": {
-                "output": torch.tensor([1.0]),
-                "layers": {0: torch.tensor([2.0]), 24: torch.tensor([3.0])},
-            },
-        }
-        wire = serialize_payload(original)
-        restored = deserialize_payload(wire)
-        assert torch.equal(restored["hidden_states"]["output"], torch.tensor([1.0]))
-        assert torch.equal(restored["hidden_states"]["layers"][0], torch.tensor([2.0]))
-        assert torch.equal(restored["hidden_states"]["layers"][24], torch.tensor([3.0]))
+    def test_encode_decode_struct_native_round_trip(self):
+        """``encode_struct``/``decode_struct`` preserve nested struct + tensor data."""
+        from vllm_omni.data_entry_keys import (
+            CodesStruct,
+            MetaStruct,
+            OmniPayloadStruct,
+            decode_struct,
+            encode_struct,
+        )
 
-    def test_tensor_dtype_preserved(self):
-        # bfloat16 excluded: numpy() doesn't support it; callers must cast before serializing.
-        for dtype in [torch.float16, torch.float32, torch.int64, torch.int32, torch.bool]:
-            original: OmniPayload = {"codes": {"audio": torch.tensor([1], dtype=dtype)}}
-            wire = serialize_payload(original)
-            restored = deserialize_payload(wire)
-            assert restored["codes"]["audio"].dtype == dtype, f"dtype mismatch for {dtype}"
-
-    def test_tensor_shape_preserved(self):
-        t = torch.randn(3, 4, 5)
-        original: OmniPayload = {"hidden_states": {"output": t}}
-        wire = serialize_payload(original)
-        restored = deserialize_payload(wire)
-        assert restored["hidden_states"]["output"].shape == (3, 4, 5)
-        assert torch.allclose(restored["hidden_states"]["output"], t)
-
-    def test_empty_payload_returns_none(self):
-        assert serialize_payload({}) is None
-
-    def test_none_values_skipped(self):
-        original: OmniPayload = {"meta": {"finished": None}}
-        wire = serialize_payload(original)
-        assert wire is None
+        original = OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor([1.0, 2.0, 3.0])),
+            meta=MetaStruct(left_context_size=7, finished=torch.tensor(True, dtype=torch.bool)),
+        )
+        data = encode_struct(original)
+        assert isinstance(data, bytes) and len(data) > 0
+        restored = decode_struct(data, OmniPayloadStruct)
+        assert restored.meta.left_context_size == 7
+        assert restored.meta.finished.dtype == torch.bool
+        assert restored.meta.finished.item() is True
+        assert torch.equal(restored.codes.audio, original.codes.audio)

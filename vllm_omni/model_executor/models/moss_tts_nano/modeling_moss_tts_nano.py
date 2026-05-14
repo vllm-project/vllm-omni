@@ -30,6 +30,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
+from vllm_omni.data_entry_keys import MossTTSInputStruct, OmniInputStruct
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.utils import reinit_rotary_inv_freq
 
@@ -111,9 +112,11 @@ def _to_mono_1d(waveform: Any) -> torch.Tensor:
     return chunk.reshape(-1)
 
 
-def _pick(info: dict, key: str, default):
-    """Extract scalar from additional_information dict (list or plain value)."""
-    val = info.get(key, default)
+def _pick(obj: OmniInputStruct | MossTTSInputStruct | None, key: str, default):
+    """Read ``key`` from a typed struct; unwrap list-shaped scalars."""
+    if obj is None:
+        return default
+    val = getattr(obj, key, default)
     if isinstance(val, (list, tuple)) and len(val) > 0:
         return val[0]
     return val if val is not None else default
@@ -246,7 +249,7 @@ class MossTTSNanoForGeneration(nn.Module):
     # Streaming generator management
     # ------------------------------------------------------------------
 
-    def _create_stream_gen(self, info: dict[str, Any]):
+    def _create_stream_gen(self, info: OmniInputStruct):
         """Create an inference_stream() generator for a request.
 
         Yields (waveform_tensor, is_last) tuples.
@@ -258,19 +261,20 @@ class MossTTSNanoForGeneration(nn.Module):
             yield torch.zeros((sr,), dtype=torch.float32), True
             return
 
-        mode: str = str(_pick(info, "mode", _DEFAULT_MODE))
-        prompt_audio_path: str | None = _pick(info, "prompt_audio_path", None)
+        moss = info.moss
+        mode: str = str(_pick(moss, "mode", _DEFAULT_MODE))
+        prompt_audio_path: str | None = _pick(moss, "prompt_audio_path", None)
         if prompt_audio_path is not None:
             prompt_audio_path = str(prompt_audio_path)
         # Voice-cloning path: serving layer passes the resolved waveform as
         # (wav_list, sample_rate) so we can avoid re-decoding base64 and the
         # model owns temp-file lifecycle.
-        prompt_audio_array = _pick(info, "prompt_audio_array", None)
+        prompt_audio_array = _pick(moss, "prompt_audio_array", None)
         prompt_text: str | None = _pick(info, "prompt_text", None)
         if prompt_text is not None:
             prompt_text = str(prompt_text)
-        max_new_frames: int = int(_pick(info, "max_new_frames", _DEFAULT_MAX_NEW_FRAMES))
-        seed: int | None = _pick(info, "seed", None)
+        max_new_frames: int = int(_pick(moss, "max_new_frames", _DEFAULT_MAX_NEW_FRAMES))
+        seed: int | None = _pick(moss, "seed", None)
         if seed is not None:
             # Upstream inference_stream relies on global RNG state. With
             # max_num_seqs > 1, concurrent seeded requests will race to set
@@ -287,14 +291,14 @@ class MossTTSNanoForGeneration(nn.Module):
             _cuda_rng_state = None
 
         sampling = {
-            "text_temperature": float(_pick(info, "text_temperature", _DEFAULT_TEXT_TEMPERATURE)),
-            "text_top_p": float(_pick(info, "text_top_p", _DEFAULT_TEXT_TOP_P)),
-            "text_top_k": int(_pick(info, "text_top_k", _DEFAULT_TEXT_TOP_K)),
-            "audio_temperature": float(_pick(info, "audio_temperature", _DEFAULT_AUDIO_TEMPERATURE)),
-            "audio_top_p": float(_pick(info, "audio_top_p", _DEFAULT_AUDIO_TOP_P)),
-            "audio_top_k": int(_pick(info, "audio_top_k", _DEFAULT_AUDIO_TOP_K)),
+            "text_temperature": float(_pick(moss, "text_temperature", _DEFAULT_TEXT_TEMPERATURE)),
+            "text_top_p": float(_pick(moss, "text_top_p", _DEFAULT_TEXT_TOP_P)),
+            "text_top_k": int(_pick(moss, "text_top_k", _DEFAULT_TEXT_TOP_K)),
+            "audio_temperature": float(_pick(moss, "audio_temperature", _DEFAULT_AUDIO_TEMPERATURE)),
+            "audio_top_p": float(_pick(moss, "audio_top_p", _DEFAULT_AUDIO_TOP_P)),
+            "audio_top_k": int(_pick(moss, "audio_top_k", _DEFAULT_AUDIO_TOP_K)),
             "audio_repetition_penalty": float(
-                _pick(info, "audio_repetition_penalty", _DEFAULT_AUDIO_REPETITION_PENALTY)
+                _pick(moss, "audio_repetition_penalty", _DEFAULT_AUDIO_REPETITION_PENALTY)
             ),
         }
 
@@ -397,7 +401,7 @@ class MossTTSNanoForGeneration(nn.Module):
         positions: torch.Tensor | None = None,
         intermediate_tensors: Any = None,
         inputs_embeds: torch.Tensor | None = None,
-        runtime_additional_information: list[dict[str, Any]] | None = None,
+        model_input_struct: list[OmniInputStruct | None] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
         sr = getattr(self.config, "audio_tokenizer_sample_rate", 48000)
@@ -405,16 +409,16 @@ class MossTTSNanoForGeneration(nn.Module):
         empty = torch.zeros((0,), dtype=torch.float32)
         hidden = self._make_dummy_hidden(input_ids)
 
-        infos = runtime_additional_information or [{}]
+        input_structs: list[OmniInputStruct | None] = model_input_struct or [None]
 
-        if not runtime_additional_information or all(info.get("_is_dummy") for info in infos):
+        if not model_input_struct or all(s is None or s._is_dummy for s in input_structs):
             # Dummy/warmup path: finish immediately for every row.
-            self._ar_last_chunk_flags = [True] * len(infos)
+            self._ar_last_chunk_flags = [True] * len(input_structs)
             return OmniOutput(
                 text_hidden_states=hidden,
                 multimodal_outputs={
-                    "model_outputs": [empty] * len(infos),
-                    "sr": [sr_tensor] * len(infos),
+                    "model_outputs": [empty] * len(input_structs),
+                    "sr": [sr_tensor] * len(input_structs),
                 },
             )
 
@@ -425,27 +429,25 @@ class MossTTSNanoForGeneration(nn.Module):
         srs: list[torch.Tensor] = []
         last_chunk_flags: list[bool] = []
 
-        for info in infos:
-            if info.get("_is_dummy"):
+        for s in input_structs:
+            if s is None or s._is_dummy:
                 outputs.append(empty)
                 srs.append(sr_tensor)
                 last_chunk_flags.append(True)
                 continue
 
             # Per-request key so concurrent / consecutive requests don't
-            # share a generator. ``global_request_id`` is set by the engine
-            # (see info keys ``['text', 'mode', 'prompt_audio_array',
-            # 'global_request_id', 'omni_final_stage_id', 'generated_len']``).
+            # share a generator. ``global_request_id`` is set by the engine.
             # ``_omni_req_id`` is a legacy fallback that is never set in
             # the current engine; falling back to a constant collapses all
             # requests onto one generator and lets a stale generator from
             # request N replay its remaining chunks for request N+1, which
             # surfaces as request N+1's audio matching request N's input.
-            request_key = str(info.get("global_request_id") or info.get("_omni_req_id") or id(info))
+            request_key = str(_pick(s, "global_request_id", None) or s._omni_req_id or id(s))
 
             # Create generator on first call for this request.
             if request_key not in self._stream_gens:
-                self._stream_gens[request_key] = self._create_stream_gen(info)
+                self._stream_gens[request_key] = self._create_stream_gen(s)
 
             generator = self._stream_gens[request_key]
             try:

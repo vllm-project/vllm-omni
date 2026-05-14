@@ -353,7 +353,7 @@ def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
 
     assert len(prompts) == 1
     prompt = prompts[0]
-    assert prompt["additional_information"] == {"meta": {"left_context_size": 2}}
+    assert prompt["additional_information"].meta.left_context_size == 2
     assert prompt["prompt_token_ids"] == [
         9,
         8,
@@ -401,4 +401,4 @@ def test_non_async_processor_filters_out_of_range_codec_values():
     prompt = prompts[0]
     # Only ref_code (1 frame) + 2 valid frames = 3 frames * 4 quantizers = 12 codes
     assert len(prompt["prompt_token_ids"]) == 4 * 3
-    assert prompt["additional_information"] == {"meta": {"left_context_size": 1}}
+    assert prompt["additional_information"].meta.left_context_size == 1

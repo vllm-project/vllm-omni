@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
-from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.engine import AdditionalInformationField
 
 
 @dataclass
@@ -23,7 +23,7 @@ class OmniNewRequestData(NewRequestData):
     """
 
     external_req_id: str | None = None
-    additional_information: AdditionalInformationPayload | None = None
+    additional_information: AdditionalInformationField = None
 
     @classmethod
     def from_request(

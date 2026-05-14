@@ -1883,6 +1883,8 @@ class OmniConnectorModelRunnerMixin:
         """
         if hasattr(self, "model_intermediate_buffer"):
             self.model_intermediate_buffer.pop(req_id, None)
+        if hasattr(self, "model_input_struct_buffer"):
+            self.model_input_struct_buffer.pop(req_id, None)
         self.drop_inactive_request_delivery_state(req_id)
 
     # ------------------------------------------------------------------ #

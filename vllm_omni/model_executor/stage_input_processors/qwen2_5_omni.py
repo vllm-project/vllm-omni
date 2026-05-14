@@ -7,7 +7,6 @@ from vllm_omni.data_entry_keys import (
     IdsStruct,
     OmniPayload,
     OmniPayloadStruct,
-    to_dict,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -39,12 +38,10 @@ def thinker2talker(
         thinker_hidden_states = latent.clone().detach().to(latent.device)
         decode_hidden = thinker_hidden_states[prompt_token_ids_len:].to(torch.float32)
         prefill_hidden = thinker_hidden_states[:prompt_token_ids_len].to(torch.float32)
-        additional_information = to_dict(
-            OmniPayloadStruct(
-                hidden_states=HiddenStatesStruct(output=decode_hidden, output_shape=list(decode_hidden.shape)),
-                embed=EmbeddingsStruct(prefill=prefill_hidden, prefill_shape=list(prefill_hidden.shape)),
-                ids=IdsStruct(prompt=list(prompt_token_ids), output=list(thinker_output_ids)),
-            )
+        additional_information = OmniPayloadStruct(
+            hidden_states=HiddenStatesStruct(output=decode_hidden, output_shape=list(decode_hidden.shape)),
+            embed=EmbeddingsStruct(prefill=prefill_hidden, prefill_shape=list(prefill_hidden.shape)),
+            ids=IdsStruct(prompt=list(prompt_token_ids), output=list(thinker_output_ids)),
         )
         talker_inputs.append(
             OmniTokensPrompt(

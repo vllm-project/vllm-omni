@@ -11,10 +11,13 @@ from dataclasses import dataclass
 from enum import IntEnum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
+
+if TYPE_CHECKING:
+    from vllm_omni.data_entry_keys import DyninOmniInputStruct
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -208,15 +211,21 @@ def unwrap_first_value(value: Any, default: Any = None) -> Any:
     return value
 
 
-def normalize_runtime_info(runtime_additional_information: Any) -> dict[str, Any]:
-    if isinstance(runtime_additional_information, list):
-        if not runtime_additional_information:
-            return {}
-        first = runtime_additional_information[0]
-        return first if isinstance(first, dict) else {}
-    if isinstance(runtime_additional_information, dict):
-        return runtime_additional_information
-    return {}
+def normalize_runtime_info(model_input_struct: Any) -> DyninOmniInputStruct | None:
+    """Return the dynin sub-struct from a per-step ``model_input_struct`` list.
+
+    Returns ``None`` when no input struct is available for this request.
+    """
+    from vllm_omni.data_entry_keys import DyninOmniInputStruct, OmniInputStruct
+
+    first: Any = model_input_struct
+    if isinstance(first, list):
+        first = first[0] if first else None
+    if isinstance(first, OmniInputStruct):
+        return first.dynin
+    if isinstance(first, DyninOmniInputStruct):
+        return first
+    return None
 
 
 def logical_dynin_task(task: Any) -> str:
@@ -356,11 +365,13 @@ def _to_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
-def _runtime_value(runtime_info: dict[str, Any], key: str) -> Any:
-    return unwrap_first_value(runtime_info.get(key), None)
+def _runtime_value(runtime_info: DyninOmniInputStruct | None, key: str) -> Any:
+    if runtime_info is None:
+        return None
+    return unwrap_first_value(getattr(runtime_info, key, None), None)
 
 
-def _runtime_first_value(runtime_info: dict[str, Any], keys: tuple[str, ...]) -> Any:
+def _runtime_first_value(runtime_info: DyninOmniInputStruct | None, keys: tuple[str, ...]) -> Any:
     for key in keys:
         value = _runtime_value(runtime_info, key)
         if value is not None:
@@ -440,7 +451,7 @@ def _resolve_existing_path(path_like: Any, source_name: str) -> str | None:
     return None
 
 
-def _resolve_config_path(vllm_config: VllmConfig, runtime_info: dict[str, Any]) -> str | None:
+def _resolve_config_path(vllm_config: VllmConfig, runtime_info: DyninOmniInputStruct | None) -> str | None:
     for value, name in (
         (_runtime_value(runtime_info, "dynin_config_path"), "runtime_info.dynin_config_path"),
         (os.getenv("DYNIN_CONFIG_PATH"), "DYNIN_CONFIG_PATH"),
@@ -504,10 +515,8 @@ def _load_omega_config(config_path: str) -> Any:
 def resolve_dynin_infer_sources(
     *,
     vllm_config: VllmConfig,
-    runtime_info: dict[str, Any] | None = None,
+    runtime_info: DyninOmniInputStruct | None = None,
 ) -> DyninInferSources:
-    runtime_info = runtime_info or {}
-
     base_model_source = str(getattr(vllm_config.model_config, "model", ""))
     base_model_path = Path(base_model_source).expanduser()
     local_vllm_model_source = str(base_model_path) if base_model_path.is_dir() else None

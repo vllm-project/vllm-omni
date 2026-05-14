@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from vllm.v1.request import Request, RequestStatus
 
-from vllm_omni.data_entry_keys import OmniPayloadStruct, unflatten_payload
+from vllm_omni.data_entry_keys import OmniPayloadStruct, to_dict, to_struct, unflatten_payload
 
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec
@@ -156,7 +156,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             meta = payload_data.get("meta", {})
             if self.model_mode == "ar":
                 merged_payload = self._update_request_payload(external_req_id, payload_data)
-                request.additional_information = merged_payload
+                # Stage-to-stage payload is always OmniPayloadStruct-shaped;
+                # type it before handing off so downstream typed consumers
+                # don't need a ``to_struct`` bounce.
+                request.additional_information = to_struct(merged_payload)
                 if meta.get("finished"):
                     self.finished_requests.add(req_id)
             else:
@@ -169,8 +172,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 elif new_ids is None:
                     new_ids = []
                 request.prompt_token_ids = new_ids
+                # Build merged dict for this chunk (preserves the per-chunk
+                # accumulator semantics), then convert back to ``OmniPayloadStruct``
+                # at the assignment boundary.
                 prev_info = getattr(request, "additional_information", None)
-                info = dict(prev_info) if isinstance(prev_info, dict) else {}
+                info: dict[str, Any] = to_dict(prev_info) if prev_info is not None else {}
                 for key, value in payload_data.items():
                     if key == "codes":
                         continue
@@ -184,7 +190,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         info[key] = merged_sub
                         continue
                     info[key] = value
-                request.additional_information = info
+                request.additional_information = to_struct(info)
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.

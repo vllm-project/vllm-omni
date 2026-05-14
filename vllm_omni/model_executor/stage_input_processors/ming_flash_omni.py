@@ -8,6 +8,7 @@ from typing import Any
 
 from vllm.inputs import TextPrompt
 
+from vllm_omni.data_entry_keys import MingTTSInputStruct, OmniInputStruct
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 
@@ -51,15 +52,22 @@ def thinker2talker(
         # Get the generated text from thinker
         generated_text = output.text if hasattr(output, "text") and output.text else ""
 
-        # Extract additional information from the original prompt
+        # Extract additional information from the original prompt. After the
+        # input migration this is an ``OmniInputStruct``; we read via
+        # attribute access and reach ming-specific fields under ``.ming``.
         original_prompt = prompt[i] if i < len(prompt) else None
-        additional_info = {}
+        additional_info: OmniInputStruct | None = None
         if original_prompt is not None and hasattr(original_prompt, "additional_information"):
-            additional_info = original_prompt.additional_information or {}
+            ai = original_prompt.additional_information
+            if isinstance(ai, OmniInputStruct):
+                additional_info = ai
+        ming_info = additional_info.ming if additional_info is not None else None
 
         # spk_emb can arrive serialised as a plain list from JSON requests;
-        # the talker's spk_head wants a torch tensor.
-        spk_emb = additional_info.get("spk_emb", None)
+        # the talker's spk_head wants a torch tensor. The converted tensor is
+        # carried downstream via ``MingTTSInputStruct.spk_emb_tensor`` (the
+        # input-list slot stays typed as ``list[float]``).
+        spk_emb = ming_info.spk_emb if ming_info is not None else None
         if isinstance(spk_emb, list) and spk_emb and not hasattr(spk_emb[0], "device"):
             import torch
 
@@ -80,16 +88,25 @@ def thinker2talker(
         # `ming_task="omni"` so any stray caller overrides are ignored.
         # Voice presets are resolved by voice_name in the talker's
         # forward() from its registered_prompts cache.
-        talker_info = {
-            "ming_task": "omni",
-            "text": generated_text,
-            "spk_emb": spk_emb,
-            "voice_name": additional_info.get("voice_name", "DB30"),
-            "prompt_text": additional_info.get("prompt_text", None),
-            "prompt_wav_lat": additional_info.get("prompt_wav_lat", None),
-            "prompt_wav_emb": additional_info.get("prompt_wav_emb", None),
-            "max_text_length": additional_info.get("max_text_length", 50),
-        }
+        # ``voice_name``/``prompt_text`` are cross-model top-level fields;
+        # ``prompt_wav_*`` and ``max_text_length`` are ming-specific.
+        _voice_name = (additional_info.voice_name if additional_info is not None else None) or "DB30"
+        _prompt_text = additional_info.prompt_text if additional_info is not None else None
+        _prompt_wav_lat = ming_info.prompt_wav_lat if ming_info is not None else None
+        _prompt_wav_emb = ming_info.prompt_wav_emb if ming_info is not None else None
+        _max_text_length = (ming_info.max_text_length if ming_info is not None else None) or 50
+        talker_info = OmniInputStruct(
+            text=generated_text,
+            voice_name=_voice_name,
+            prompt_text=_prompt_text,
+            ming=MingTTSInputStruct(
+                ming_task="omni",
+                spk_emb_tensor=spk_emb if hasattr(spk_emb, "device") else None,
+                prompt_wav_lat=_prompt_wav_lat,
+                prompt_wav_emb=_prompt_wav_emb,
+                max_text_length=_max_text_length,
+            ),
+        )
 
         # Use dummy token IDs (talker builds its own embeddings from text)
         talker_inputs.append(

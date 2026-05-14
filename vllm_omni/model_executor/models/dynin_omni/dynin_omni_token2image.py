@@ -8,6 +8,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.data_entry_keys import DyninOmniInputStruct
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .dynin_omni import DyninOmniStageBase
@@ -53,8 +54,8 @@ class DyninOmniToken2Image(DyninOmniStageBase):
         del positions, intermediate_tensors, inputs_embeds
         if input_ids is None:
             raise ValueError("token2image stage requires input_ids")
-        runtime_info = normalize_runtime_info(kwargs.get("runtime_additional_information"))
-        detok_id = int(unwrap_first_value(runtime_info.get("detok_id"), 0))
+        runtime_info = normalize_runtime_info(kwargs.get("model_input_struct"))
+        detok_id = int(unwrap_first_value(runtime_info.detok_id if runtime_info else None, 0))
         tokens = coerce_token_ids_1d(input_ids)
 
         if detok_id != DetokTarget.IMAGE:
@@ -75,15 +76,17 @@ class DyninOmniToken2Image(DyninOmniStageBase):
             },
         )
 
-    def _decode_image_tokens(self, tokens: torch.Tensor, runtime_info: dict[str, Any]) -> torch.Tensor:
+    def _decode_image_tokens(self, tokens: torch.Tensor, runtime_info: DyninOmniInputStruct | None) -> torch.Tensor:
         # Follow DYNIN validation path:
         #   tokens -> clamp -> vq_model.decode_code -> (x+1)/2 -> [0,1].
         vq_model = self._ensure_vq_model(runtime_info=runtime_info, ref_device=tokens.device)
-        codebook_size = int(unwrap_first_value(runtime_info.get("codebook_size"), 8192))
-        image_vocab_offset = unwrap_first_value(runtime_info.get("image_vocab_offset"), None)
+        codebook_size = int(unwrap_first_value(runtime_info.codebook_size if runtime_info else None, 8192))
+        image_vocab_offset = unwrap_first_value(runtime_info.image_vocab_offset if runtime_info else None, None)
         if image_vocab_offset is None:
-            text_vocab_size = unwrap_first_value(runtime_info.get("text_vocab_size"), None)
-            num_new_special_tokens = int(unwrap_first_value(runtime_info.get("num_new_special_tokens"), 0))
+            text_vocab_size = unwrap_first_value(runtime_info.text_vocab_size if runtime_info else None, None)
+            num_new_special_tokens = int(
+                unwrap_first_value(runtime_info.num_new_special_tokens if runtime_info else None, 0)
+            )
             if text_vocab_size is not None:
                 image_vocab_offset = int(text_vocab_size) + num_new_special_tokens
 
@@ -100,14 +103,14 @@ class DyninOmniToken2Image(DyninOmniStageBase):
             raise RuntimeError(f"Unexpected MAGVIT decode output shape: {tuple(decoded.shape)}")
         return decoded[0].contiguous()
 
-    def _ensure_vq_model(self, runtime_info: dict[str, Any], ref_device: torch.device) -> Any:
+    def _ensure_vq_model(self, runtime_info: DyninOmniInputStruct | None, ref_device: torch.device) -> Any:
         sources = resolve_dynin_infer_sources(vllm_config=self.vllm_config, runtime_info=runtime_info)
         model_path = str(sources.vq_image_source)
         local_files_only = bool(sources.vq_image_local_files_only)
         if self._vq_model is None or self._vq_model_path != model_path or self._vq_local_files_only != local_files_only:
             disable_xet = unwrap_first_value(
-                runtime_info.get("hf_hub_disable_xet"),
-                unwrap_first_value(runtime_info.get("disable_hf_xet"), True),
+                runtime_info.hf_hub_disable_xet if runtime_info else None,
+                unwrap_first_value(runtime_info.disable_hf_xet if runtime_info else None, True),
             )
             if _to_bool(disable_xet, default=True):
                 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")

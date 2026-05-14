@@ -12,6 +12,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.data_entry_keys import to_dict as _struct_to_dict
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .dynin_omni import DyninOmniStageBase
@@ -655,7 +656,12 @@ class DyninOmniToken2Text(DyninOmniStageBase):
         if input_ids is None:
             raise ValueError("token2text stage requires input_ids")
         try:
-            runtime_info = normalize_runtime_info(kwargs.get("runtime_additional_information"))
+            runtime_info_struct = normalize_runtime_info(kwargs.get("model_input_struct"))
+            # token2text drives the dynin pipeline via dict-based merges (see
+            # ``_merge_runtime_info_missing_values``, ``_build_downstream_runtime_info``).
+            # Convert the typed struct to its dict view at the stage boundary;
+            # internal mutation/merge keeps dict semantics.
+            runtime_info = _struct_to_dict(runtime_info_struct) if runtime_info_struct else {}
             runtime_info = self._bootstrap_runtime_info_if_needed(
                 input_ids=input_ids,
                 runtime_info=runtime_info,

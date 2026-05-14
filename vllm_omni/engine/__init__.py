@@ -2,8 +2,6 @@
 Engine components for vLLM-Omni.
 """
 
-from typing import Any
-
 import msgspec
 import torch
 from vllm.v1.engine import (
@@ -11,6 +9,8 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
 )
+
+from vllm_omni.data_entry_keys import OmniInputStruct, OmniPayloadStruct
 
 
 class PromptEmbedsPayload(msgspec.Struct):
@@ -26,35 +26,10 @@ class PromptEmbedsPayload(msgspec.Struct):
     dtype: str
 
 
-class AdditionalInformationEntry(msgspec.Struct):
-    """One entry of additional_information.
-
-    Three supported forms are encoded:
-      - tensor: data/shape/dtype
-      - list: a Python list (msgspec-serializable)
-      - scalar: a Python scalar (msgspec-serializable)
-    Exactly one of (tensor_data, list_data, scalar_data) should be non-None.
-    """
-
-    # Tensor form
-    tensor_data: bytes | None = None
-    tensor_shape: list[int] | None = None
-    tensor_dtype: str | None = None
-
-    # List form
-    list_data: list[Any] | None = None
-
-    # Scalar form
-    scalar_data: Any | None = None
-
-
-class AdditionalInformationPayload(msgspec.Struct):
-    """Serialized dictionary payload for additional_information.
-
-    Keys are strings; values are encoded as AdditionalInformationEntry.
-    """
-
-    entries: dict[str, AdditionalInformationEntry]
+# Tagged-union envelope for OmniEngineCoreRequest.additional_information.
+# msgspec dispatches between OmniInputStruct (request controls) and
+# OmniPayloadStruct (stage outputs) via class-name tag.
+AdditionalInformationField = OmniInputStruct | OmniPayloadStruct | None
 
 
 class OmniEngineCoreRequest(EngineCoreRequest):
@@ -69,12 +44,12 @@ class OmniEngineCoreRequest(EngineCoreRequest):
     torch.Tensor before constructing this request.
 
     Attributes:
-        additional_information: Optional serialized additional information
-            dictionary containing tensors or lists to pass along with the request
+        additional_information: Optional typed payload — either an
+            ``OmniInputStruct`` (request-side controls) or an
+            ``OmniPayloadStruct`` (stage-to-stage outputs).
     """
 
-    # Optional additional information dictionary (serialized)
-    additional_information: AdditionalInformationPayload | None = None
+    additional_information: AdditionalInformationField = None
 
     @classmethod
     def from_request(
@@ -82,7 +57,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         request: EngineCoreRequest,
         *,
         prompt_embeds: torch.Tensor | None = None,
-        additional_information: AdditionalInformationPayload | None = None,
+        additional_information: AdditionalInformationField = None,
     ) -> "OmniEngineCoreRequest":
         """Clone an EngineCoreRequest into an OmniEngineCoreRequest with optional payload overrides."""
 

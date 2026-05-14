@@ -54,6 +54,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema
 
+from vllm_omni.data_entry_keys import OmniPayloadStruct
 from vllm_omni.model_executor.models.mimo_audio.config_mimo_audio import MiMoAudioConfig
 from vllm_omni.platforms import current_omni_platform
 
@@ -1027,9 +1028,16 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             else _default_query_start_loc
         )
 
-        runtime_additional_information = kwargs.get("runtime_additional_information", [])
-        if runtime_additional_information:
-            request_ids = [info.get("req_id", str(i)) for i, info in enumerate(runtime_additional_information)]
+        payload_structs: list[OmniPayloadStruct] = kwargs.get("model_intermediate_buffer_struct") or []
+        if payload_structs:
+
+            def _req_id(payload: OmniPayloadStruct, fallback: str) -> str:
+                meta_req_id = payload.meta.req_id if payload.meta is not None else None
+                if isinstance(meta_req_id, list) and meta_req_id:
+                    return str(meta_req_id[0])
+                return fallback
+
+            request_ids = [_req_id(payload, str(i)) for i, payload in enumerate(payload_structs)]
         else:
             request_ids = [str(i) for i in range(len(query_start_loc[1:]))] if query_start_loc is not None else []
         num_reqs = len(request_ids)

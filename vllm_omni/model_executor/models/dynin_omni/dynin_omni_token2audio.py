@@ -10,6 +10,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.data_entry_keys import DyninOmniInputStruct
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .dynin_omni import DyninOmniStageBase
@@ -150,8 +151,8 @@ class DyninOmniToken2Audio(DyninOmniStageBase):
         if input_ids is None:
             raise ValueError("token2audio stage requires input_ids")
 
-        runtime_info = normalize_runtime_info(kwargs.get("runtime_additional_information"))
-        detok_id = int(unwrap_first_value(runtime_info.get("detok_id"), 0))
+        runtime_info = normalize_runtime_info(kwargs.get("model_input_struct"))
+        detok_id = int(unwrap_first_value(runtime_info.detok_id if runtime_info else None, 0))
         tokens = coerce_token_ids_1d(input_ids)
 
         if detok_id != DetokTarget.AUDIO:
@@ -174,15 +175,17 @@ class DyninOmniToken2Audio(DyninOmniStageBase):
             },
         )
 
-    def _decode_audio_tokens(self, tokens: torch.Tensor, runtime_info: dict[str, Any]) -> tuple[torch.Tensor, int]:
+    def _decode_audio_tokens(
+        self, tokens: torch.Tensor, runtime_info: DyninOmniInputStruct | None
+    ) -> tuple[torch.Tensor, int]:
         # Follow DYNIN validation path:
         #   token list -> "<|speech_x|>" string -> vq_model_audio.decode(...).
         vq_audio = self._ensure_vq_audio(runtime_info=runtime_info, ref_device=tokens.device)
 
-        audio_codebook_size = int(unwrap_first_value(runtime_info.get("audio_codebook_size"), 4096))
+        audio_codebook_size = int(unwrap_first_value(runtime_info.audio_codebook_size if runtime_info else None, 4096))
         audio_vocab_offset = unwrap_first_value(
-            runtime_info.get("audio_vocab_offset"),
-            unwrap_first_value(runtime_info.get("t2s_vocab_start"), None),
+            runtime_info.audio_vocab_offset if runtime_info else None,
+            unwrap_first_value(runtime_info.t2s_vocab_start if runtime_info else None, None),
         )
 
         token_ids = tokens.to(torch.long)
@@ -197,10 +200,10 @@ class DyninOmniToken2Audio(DyninOmniStageBase):
         speech_unit_for_decode = "".join(f"<|speech_{unit}|>" for unit in speech_unit_str.split(" ") if unit != "")
 
         condition = unwrap_first_value(
-            runtime_info.get("condition"),
-            unwrap_first_value(runtime_info.get("t2s_condition"), None),
+            runtime_info.condition if runtime_info else None,
+            unwrap_first_value(runtime_info.t2s_condition if runtime_info else None, None),
         )
-        output_wav_file = unwrap_first_value(runtime_info.get("output_wav_file"), None)
+        output_wav_file = unwrap_first_value(runtime_info.output_wav_file if runtime_info else None, None)
         created_tmp = False
         if output_wav_file is None:
             fd, tmp_wav = tempfile.mkstemp(prefix="dynin_t2s_", suffix=".wav")
@@ -225,8 +228,8 @@ class DyninOmniToken2Audio(DyninOmniStageBase):
 
         sample_rate = int(
             unwrap_first_value(
-                runtime_info.get("sr"),
-                unwrap_first_value(runtime_info.get("sample_rate"), 24000),
+                runtime_info.sr if runtime_info else None,
+                unwrap_first_value(runtime_info.sample_rate if runtime_info else None, 24000),
             )
         )
         try:
@@ -240,7 +243,7 @@ class DyninOmniToken2Audio(DyninOmniStageBase):
             pass
         return audio_array, sample_rate
 
-    def _ensure_vq_audio(self, runtime_info: dict[str, Any], ref_device: torch.device) -> Any:
+    def _ensure_vq_audio(self, runtime_info: DyninOmniInputStruct | None, ref_device: torch.device) -> Any:
         sources = resolve_dynin_infer_sources(vllm_config=self.vllm_config, runtime_info=runtime_info)
         model_path = str(sources.vq_audio_source)
         local_files_only = bool(sources.vq_audio_local_files_only)

@@ -113,14 +113,18 @@ def test_load_poll(build_adapter):
 
     adapter.load_async(request)
     payload: OmniPayload = {
-        "codes": {"audio": [[1]]},
+        "codes": {"audio": torch.tensor([[1]])},
         "hidden_states": {"output": torch.tensor([[2.0]])},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }
     connector.get.return_value = (payload, 16)
     adapter._poll_single_request(request)
 
-    assert request.additional_information == payload
+    # chunk_transfer_adapter now stores a typed ``OmniPayloadStruct``.
+    assert isinstance(request.additional_information, OmniPayloadStruct)
+    assert torch.equal(request.additional_information.codes.audio, payload["codes"]["audio"])
+    assert torch.equal(request.additional_information.hidden_states.output, payload["hidden_states"]["output"])
+    assert bool(request.additional_information.meta.finished.item()) is True
     assert adapter.get_req_chunk["req-1"] == 1
     assert "req-1" in adapter._finished_load_reqs
     assert "req-1" in adapter.finished_requests
@@ -238,13 +242,14 @@ def test_load_poll_ar_request_additional_information_concats_tensors(build_adapt
 
     adapter._poll_single_request(request)
 
+    assert isinstance(request.additional_information, OmniPayloadStruct)
     assert torch.equal(
-        request.additional_information["hidden_states"]["output"],
+        request.additional_information.hidden_states.output,
         torch.tensor([[1.0], [2.0]]),
     )
     # Keys absent from the new chunk are dropped (matches main's behavior).
-    assert "ids" not in request.additional_information
-    assert request.additional_information["meta"]["finished"].item() is True
+    assert request.additional_information.ids is None
+    assert request.additional_information.meta.finished.item() is True
 
 
 def test_process_and_restore_queues(build_adapter):
@@ -683,6 +688,8 @@ def test_wire_round_trip_struct_to_dict_contract():
     assert torch.equal(decoded["codes"]["audio"], torch.tensor([1, 2, 3], dtype=torch.int64))
 
     expected = to_dict(struct)
-    assert set(decoded.keys()) == set(expected.keys())
-    assert set(decoded["meta"].keys()) == set(expected["meta"].keys())
-    assert set(decoded["codes"].keys()) == set(expected["codes"].keys())
+    # ``type`` is the msgspec tag emitted by tagged Structs; ignore it for the
+    # dict-key contract check.
+    assert {k for k in decoded if k != "type"} == set(expected.keys())
+    assert {k for k in decoded["meta"] if k != "type"} == set(expected["meta"].keys())
+    assert {k for k in decoded["codes"] if k != "type"} == set(expected["codes"].keys())

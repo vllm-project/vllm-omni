@@ -37,6 +37,7 @@ from vllm.multimodal.processing import (
 )
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.data_entry_keys import OmniInputStruct
 from vllm_omni.model_executor.models.omnivoice.config import OmniVoiceConfig
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -329,9 +330,9 @@ class OmniVoiceModel(
 
     def _forward_generator(self, input_ids: torch.Tensor, kwargs: dict) -> OmniOutput:
         """Run generator stage: text → 8-codebook audio tokens."""
-        runtime_info = kwargs.get("runtime_additional_information", [])
+        input_structs: list[OmniInputStruct | None] = kwargs.get("model_input_struct") or []
 
-        if not runtime_info:
+        if not input_structs or input_structs[0] is None:
             # Profiling / dummy run — return a plain tensor (not OmniOutput)
             # so the v1 model runner's _dummy_run can index into it.
             return torch.zeros(
@@ -340,7 +341,7 @@ class OmniVoiceModel(
                 dtype=torch.float32,
             )
 
-        info = runtime_info[0]
+        info = input_structs[0]
         device = input_ids.device
         num_codebooks = self.config.num_audio_codebook
         mask_id = self.config.audio_mask_id
@@ -357,7 +358,8 @@ class OmniVoiceModel(
 
         if not hasattr(self, "_duration_estimator"):
             self._duration_estimator = RuleDurationEstimator()
-        raw_text = info.get("raw_text", "")
+        text_field = info.text
+        raw_text = text_field[0] if isinstance(text_field, list) and text_field else (text_field or "")
         if raw_text:
             target_len = self._duration_estimator.estimate_duration(raw_text, "Nice to meet you.", 25)
             target_len = max(1, int(target_len))
@@ -367,7 +369,8 @@ class OmniVoiceModel(
             target_len = max(int(text_len * 1.77), 25)
 
         # Get reference audio tokens if available
-        ref_audio_tokens = info.get("ref_audio_tokens", None)
+        omnivoice_struct = info.omnivoice
+        ref_audio_tokens = omnivoice_struct.ref_audio_tokens if omnivoice_struct is not None else None
 
         # Build input_ids tensor: [2*B, 8, S]
         # B=1, conditional + unconditional
@@ -445,9 +448,9 @@ class OmniVoiceModel(
 
     def _forward_decoder(self, input_ids: torch.Tensor, kwargs: dict) -> OmniOutput:
         """Run decoder stage: 8-codebook tokens → audio waveform."""
-        runtime_info = kwargs.get("runtime_additional_information", [])
+        payload_structs = kwargs.get("model_intermediate_buffer_struct") or []
 
-        if not runtime_info:
+        if not payload_structs:
             # Profiling / dummy run — return plain tensor for v1 runner compat
             return torch.zeros(
                 (input_ids.shape[0], self.config.llm_hidden_size),
@@ -455,8 +458,7 @@ class OmniVoiceModel(
                 dtype=torch.float32,
             )
 
-        info = runtime_info[0]
-        audio_tokens = info.get("audio_tokens", None)
+        audio_tokens = payload_structs[0].audio_tokens
 
         if audio_tokens is None:
             raise RuntimeError("No audio_tokens received from generator stage")

@@ -85,6 +85,7 @@ from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.data_entry_keys import OmniInputStruct
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
@@ -638,26 +639,25 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())
-        if normalized is not None:
-            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
-                engine_prompt["additional_information"] = {}
-            engine_prompt["additional_information"]["speaker"] = [normalized]
-
         language = getattr(request, "language", None)
-        if language is not None and isinstance(language, str) and language.strip():
-            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
-                engine_prompt["additional_information"] = {}
-            engine_prompt["additional_information"]["language"] = [language.strip()]
-
         # Style instruction — used by Ming-flash-omni instruct TTS path
         # (ming_task="instruct").  For the omni speech path the thinker2talker
         # bridge drops this field to match upstream omni_audio_generation
         # which hardcodes instruction=None.
         instructions = getattr(request, "instructions", None)
+
+        input_struct: OmniInputStruct | None = None
+        if normalized is not None:
+            input_struct = input_struct or OmniInputStruct()
+            input_struct.speaker = [normalized]
+        if language is not None and isinstance(language, str) and language.strip():
+            input_struct = input_struct or OmniInputStruct()
+            input_struct.language = [language.strip()]
         if instructions is not None and isinstance(instructions, str) and instructions.strip():
-            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
-                engine_prompt["additional_information"] = {}
-            engine_prompt["additional_information"]["instruction"] = instructions.strip()
+            input_struct = input_struct or OmniInputStruct()
+            input_struct.instruction = instructions.strip()
+        if input_struct is not None:
+            engine_prompt["additional_information"] = input_struct
 
         return conversation, [engine_prompt]
 
