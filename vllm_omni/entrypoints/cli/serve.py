@@ -472,30 +472,25 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="Scheduler flow_shift for video models (e.g., 5.0 for 720p, 12.0 for 480p).",
         )
-        # vLLM already registers --kv-cache-dtype for the serve parser.
-        # However vLLM's default is "auto". For vLLM-Omni diffusion config,
-        # we want the default to be None unless users explicitly set it.
-        kv_cache_dtype_action = serve_parser._option_string_actions.get("--kv-cache-dtype")
-        if kv_cache_dtype_action is not None:
-            kv_cache_dtype_action.default = None
-        else:
-            omni_config_group.add_argument(
-                "--kv-cache-dtype",
-                type=str,
-                default=None,
-                help="Config-level KV cache dtype (e.g. fp8).",
-            )
+        # Diffusion KV-cache quantization uses dedicated flags so we do not reuse
+        # vLLM's --kv-cache-dtype (AR cache dtype, default "auto").
         omni_config_group.add_argument(
-            "--kv-cache-skip-steps",
+            "--diffusion-kv-cache-dtype",
             type=str,
             default=None,
-            help="Config-level KV-cache quantization skip-step selector, e.g. '0-9,20,25-30'.",
+            help="Diffusion attention KV cache dtype (e.g. fp8). Separate from vLLM --kv-cache-dtype.",
         )
         omni_config_group.add_argument(
-            "--kv-cache-skip-layers",
+            "--diffusion-kv-cache-skip-steps",
             type=str,
             default=None,
-            help="Config-level KV-cache quantization skip-layer selector, e.g. '0,1,4-8'.",
+            help="Diffusion KV-cache quantization skip-step selector, e.g. '0-9,20,25-30'.",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-kv-cache-skip-layers",
+            type=str,
+            default=None,
+            help="Diffusion KV-cache quantization skip-layer selector, e.g. '0,1,4-8'.",
         )
         omni_config_group.add_argument(
             "--cfg-parallel-size",
