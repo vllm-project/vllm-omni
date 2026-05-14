@@ -68,6 +68,9 @@ PROCESS_KILL_ERROR_KEYWORDS = (
     "500",
     "503",
 )
+# RFC#2366 signal x target matrix:
+# - worker / serve-root: SIGTERM, SIGKILL
+# - serve-tree: SIGTERM, SIGINT, SIGKILL
 SERVE_SIGNAL_PARAMS = [
     pytest.param("SIGTERM", id="sigterm"),
     pytest.param("SIGKILL", id="sigkill"),
