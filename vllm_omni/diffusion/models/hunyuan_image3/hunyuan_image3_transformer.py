@@ -471,8 +471,21 @@ class Resolution:
         return f"{self.h}x{self.w}"
 
 
+# Baked-in extras matching the official model's
+# `HunyuanImage3ImageProcessor.vae_reso_group` (image_processor.py:147-152).
+# These four aspect buckets sit at ratio_token indices 33-36 in the trained
+# model and the AR was trained to address them, so any deviation breaks the
+# ratio-token vocab → output-shape lookup.
+HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS: tuple[str, ...] = (
+    "1024x768",
+    "1280x720",
+    "768x1024",
+    "720x1280",
+)
+
+
 class ResolutionGroup:
-    def __init__(self, base_size=None, step=None, align=1):
+    def __init__(self, base_size=None, step=None, align=1, extra_resolutions=None):
         self.align = align
         self.base_size = base_size
         assert base_size % align == 0, f"base_size {base_size} is not divisible by align {align}"
@@ -485,6 +498,11 @@ class ResolutionGroup:
 
         self.step = step
         self.data = self._calc_by_step()
+
+        if extra_resolutions is not None:
+            for er in extra_resolutions:
+                if not any(r.ratio == er.ratio for r in self.data):
+                    self.data.append(er)
 
         self.ratio = np.array([x.ratio for x in self.data])
         self.attr = ["" for _ in range(len(self.data))]
@@ -1351,7 +1369,10 @@ class HunyuanImage3ImageProcessor:
     def __init__(self, config):
         self.config = config
 
-        self.reso_group = ResolutionGroup(base_size=config.image_base_size)
+        self.reso_group = ResolutionGroup(
+            base_size=config.image_base_size,
+            extra_resolutions=[Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
+        )
         self.vae_processor = transforms.Compose(
             [
                 transforms.ToTensor(),
