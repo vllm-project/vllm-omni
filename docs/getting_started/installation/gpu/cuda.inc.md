@@ -20,13 +20,24 @@ Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** 
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
-uv pip install vllm --torch-backend=auto
+uv pip install vllm==0.20.0 --torch-backend=auto
+```
+The 0.20.0 release of vLLM ships CUDA 13.0-compatible binaries by default. For CUDA 12, you need to install it using
+
+```bash
+uv pip install vllm --extra-index-url https://wheels.vllm.ai/0.20.1/cu129 --extra-index-url https://download.pytorch.org/whl/cu129 --index-strategy unsafe-best-match
 ```
 
 #### Installation of vLLM-Omni
 
 ```bash
 uv pip install vllm-omni
+```
+
+For CUDA 12, please also install:
+
+```bash
+ uv pip install https://wheels.vllm.ai/omni/fa3-fwd/fa3_fwd-0.0.3%2Bcu12-cp39-abi3-manylinux_2_24_x86_64.whl
 ```
 
 To run Gradio demos, also install the optional extras:
@@ -44,8 +55,6 @@ If you do not need to modify source code of vLLM, you can directly install the s
 ```bash
 uv pip install vllm==0.20.0 --torch-backend=auto
 ```
-
-The 0.20.0 release of vLLM ships CUDA 13.0-compatible binaries by default. If you need a different CUDA variant or want to reuse an existing PyTorch installation, build vLLM from source instead.
 
 #### Installation of vLLM-Omni
 Since vllm-omni is rapidly evolving, it's recommended to install it from source
