@@ -120,6 +120,9 @@ Configuration classes.
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLConfig][]
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLTextConfig][]
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLVisionConfig][]
+- [vllm_omni.transformers_utils.configs.omnivoice.OmniVoiceConfig][]
+- [vllm_omni.transformers_utils.configs.voxcpm.VoxCPMConfig][]
+- [vllm_omni.transformers_utils.configs.voxcpm2.VoxCPM2Config][]
 
 ## Workers
 
