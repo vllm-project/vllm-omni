@@ -472,9 +472,13 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="Scheduler flow_shift for video models (e.g., 5.0 for 720p, 12.0 for 480p).",
         )
-        # vLLM already registers --kv-cache-dtype for the serve parser. Keep
-        # this fallback only for older vLLM versions where the option is absent.
-        if "--kv-cache-dtype" not in serve_parser._option_string_actions:
+        # vLLM already registers --kv-cache-dtype for the serve parser.
+        # However vLLM's default is "auto". For vLLM-Omni diffusion config,
+        # we want the default to be None unless users explicitly set it.
+        kv_cache_dtype_action = serve_parser._option_string_actions.get("--kv-cache-dtype")
+        if kv_cache_dtype_action is not None:
+            kv_cache_dtype_action.default = None
+        else:
             omni_config_group.add_argument(
                 "--kv-cache-dtype",
                 type=str,
