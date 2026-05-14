@@ -20,7 +20,7 @@ from vllm_omni.platforms import current_omni_platform
 
 QUANTIZED_MODEL = os.environ.get(
     "QWEN_IMAGE_AUTOROUND_MODEL",
-    "/mnt/disk1/yiliu7/Yi30/Qwen-Image-W4A16",
+    "INC4AI/Qwen-Image-AutoRound-W4A16",
 )
 
 HEIGHT = 512
