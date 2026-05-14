@@ -28,7 +28,40 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | `pipeline_parallel_size` | int | optional | `1` | **Pipeline-wide.** PP degree for every stage. |
 
 Note: for diffusion path, `distributed_executor_backend` currently defaults to
-`mp`, and `ray` / `external_launcher` are not fully supported yet.
+`mp`. The diffusion Ray executor can be selected with `ray`; `external_launcher`
+is not fully supported yet.
+
+### Diffusion Ray executor
+
+Use `distributed_executor_backend: ray` when a diffusion stage should run its
+workers as Ray actors instead of local multiprocessing workers. Ray is optional;
+install it in the environment that launches vLLM-Omni before selecting this
+backend:
+
+```bash
+pip install "ray[default]"
+```
+
+For single-process offline usage, pass the backend directly:
+
+```python
+from vllm_omni import Omni
+from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+omni = Omni(
+    model="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    distributed_executor_backend="ray",
+    num_gpus=2,
+    parallel_config=DiffusionParallelConfig(
+        sequence_parallel_size=2,
+        ulysses_degree=2,
+    ),
+)
+```
+
+For a Ray cluster, pass the cluster address through `ray_address`, for example
+`"auto"` for an already-started local cluster or `"ray://host:port"` for a Ray
+client endpoint.
 
 ### Stage fields
 
