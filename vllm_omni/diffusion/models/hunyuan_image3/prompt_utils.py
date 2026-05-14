@@ -17,6 +17,7 @@ canonical mapping for both flows.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from .system_prompt import get_system_prompt
@@ -50,6 +51,7 @@ _TASK_PRESETS: dict[str, tuple[str, str | None, str | None]] = {
     "i2t": ("en_unified", None, None),
     "it2i_think": ("en_unified", "think", "<think>"),
     "it2i_recaption": ("en_unified", "recaption", "<recaption>"),
+    "it2i_think_recaption": ("en_unified", "think_recaption", "<think>"),
     "t2i": ("en_unified", "image", None),
     "t2i_vanilla": ("en_vanilla", "image", None),
     "t2i_think": ("en_unified", "think", "<think>"),
@@ -128,13 +130,19 @@ def build_prompt(
     return "".join(parts)
 
 
+@dataclass
+class PromptTokensResult:
+    token_ids: list[int]  # The tokenized prompt
+    system_prompt_type: str  # The effective system prompt type used
+
+
 def build_prompt_tokens(
     user_prompt: str,
     tokenizer,
     task: str = "it2i_think",
     sys_type: str | None = None,
     custom_system_prompt: str | None = None,
-) -> list[int]:
+) -> PromptTokensResult:
     """Segment-by-segment tokenization that matches HF apply_chat_template.
 
     Calling tokenizer.encode(build_prompt(...)) on the full string lets BPE
@@ -144,6 +152,9 @@ def build_prompt_tokens(
     each segment independently and concatenates token_ids, so no cross-
     boundary merge happens. We replicate that here and feed the result to
     Omni via OmniTokensPrompt (prompt_token_ids).
+
+    Returns:
+        PromptTokensResult
     """
     if task not in _TASK_PRESETS:
         raise ValueError(f"Unknown task {task!r}. Choose from: {available_tasks()}")
@@ -162,7 +173,11 @@ def build_prompt_tokens(
     # protect, fall back to whole-string encode.
     if task == "t2i_vanilla":
         s = build_prompt(user_prompt, task, sys_type, custom_system_prompt)
-        return tokenizer.encode(s, add_special_tokens=False)
+        token_ids = tokenizer.encode(s, add_special_tokens=False)
+        return PromptTokensResult(
+            token_ids=token_ids,
+            system_prompt_type=effective_sys_type,
+        )
 
     system_prompt = get_system_prompt(effective_sys_type, preset_bot_task, custom_system_prompt)
     # Do NOT strip -- HF apply_chat_template keeps the system prompt's
@@ -180,7 +195,11 @@ def build_prompt_tokens(
     ids += tokenizer.encode("\n\nAssistant: ", add_special_tokens=False)
     if trig_id is not None:
         ids += [trig_id]
-    return ids
+
+    return PromptTokensResult(
+        token_ids=ids,
+        system_prompt_type=effective_sys_type,
+    )
 
 
 __all__ = ["build_prompt", "build_prompt_tokens", "resolve_stop_token_ids", _TASK_PRESETS]

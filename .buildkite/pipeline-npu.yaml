@@ -1,0 +1,108 @@
+steps:
+  - label: ":buildkit: Build and Push NPU Test Image - A2"
+    key: image-build
+    agents:
+      queue: "ascend-a2b3"
+      resource_class: "npu-1"
+    plugins:
+      - kubernetes:
+          metadata:
+            annotations:
+              vault.hashicorp.com/agent-init-first: "true"
+              vault.hashicorp.com/agent-inject: "true"
+              vault.hashicorp.com/agent-inject-perms-ca.pem: "0400"
+              vault.hashicorp.com/agent-inject-perms-cert.pem: "0400"
+              vault.hashicorp.com/agent-inject-perms-config.json: "0400"
+              vault.hashicorp.com/agent-inject-perms-key.pem: "0400"
+              vault.hashicorp.com/agent-inject-secret-ca.pem: internal/data/ascend/buildkitd
+              vault.hashicorp.com/agent-inject-secret-cert.pem: internal/data/ascend/buildkitd
+              vault.hashicorp.com/agent-inject-secret-config.json: internal/data/ascend/buildkitd
+              vault.hashicorp.com/agent-inject-secret-key.pem: internal/data/ascend/buildkitd
+              vault.hashicorp.com/agent-inject-template-ca.pem: "{{- with secret \"internal/data/ascend/buildkitd\" -}}\n{{ .Data.data.RootCA }}\n{{- end }}"
+              vault.hashicorp.com/agent-inject-template-cert.pem: "{{- with secret \"internal/data/ascend/buildkitd\" -}}\n{{ .Data.data.ClientCaCert }}\n{{- end }}"
+              vault.hashicorp.com/agent-inject-template-config.json: "{{- with secret \"internal/data/ascend/buildkitd\" -}}\n{{ .Data.data.dockerConfig }}\n{{- end }}"
+              vault.hashicorp.com/agent-inject-template-key.pem: "{{- with secret \"internal/data/ascend/buildkitd\" -}}\n{{ .Data.data.ClientCaKey }}\n{{- end }}"
+              vault.hashicorp.com/agent-pre-populate-only: "true"
+              vault.hashicorp.com/agent-run-as-group: "1000"
+              vault.hashicorp.com/agent-run-as-user: "1000"
+              vault.hashicorp.com/agent-service-account-token-volume-name: token-vol
+              vault.hashicorp.com/role: ascend-gha-runners
+              vault.hashicorp.com/secret-volume-path: /home/user/.docker/
+              vault.hashicorp.com/tls-skip-verify: "true"
+          podSpecPatch:
+            volumes:
+            - name: token-vol
+              projected:
+                defaultMode: 420
+                sources:
+                - serviceAccountToken:
+                    audience: api
+                    expirationSeconds: 600
+                    path: token
+    env:
+      VLLM_IMAGE_TAG: "${BUILDKITE_COMMIT}"
+      IMAGE_NAME: "vllm-omni-ci-npu"
+      IMAGE_REGISTRY: "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry"
+      BUILDKITD_ADDR: "tcp://buildkitd-service.buildkitd:1234"
+    command: |
+      set -ex
+
+      echo "--- Building and pushing NPU Test Image"
+      echo "Image: $${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
+      echo "buildkitd address: $${BUILDKITD_ADDR}"
+
+      if ! command -v buildctl &> /dev/null; then
+        echo "Installing buildctl..."
+        mkdir -p /tmp/buildkit
+        BUILDKIT_VERSION="v0.29.0"
+        wget -q "https://github.com/moby/buildkit/releases/download/$${BUILDKIT_VERSION}/buildkit-$${BUILDKIT_VERSION}.linux-arm64.tar.gz" -O /tmp/buildkit.tar.gz
+        tar -xzf /tmp/buildkit.tar.gz -C /tmp/buildkit
+        cp /tmp/buildkit/bin/buildctl /usr/local/bin/
+      fi
+
+      export DOCKER_CONFIG=/home/user/.docker
+      buildctl \
+        --addr="$${BUILDKITD_ADDR}" \
+        --tlscacert=/home/user/.docker/ca.pem \
+        --tlscert=/home/user/.docker/cert.pem \
+        --tlskey=/home/user/.docker/key.pem \
+        build \
+        --frontend dockerfile.v0 \
+        --local context=. \
+        --local dockerfile=./docker \
+        --opt filename=Dockerfile.npu.ci \
+        --secret id=dockerconfig,src=/home/user/.docker/config.json \
+        --output type=image,name=$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG},push=true \
+        --progress=plain
+
+      echo "--- Image pushed successfully"
+      echo "$${IMAGE_REGISTRY}/$${IMAGE_NAME}:$${VLLM_IMAGE_TAG}"
+
+  # - label: "Upload Ready Pipeline"
+  #   depends_on: image-build
+  #   key: upload-ready-pipeline
+  #   if: build.branch != "main" && build.pull_request.labels includes "npu-test"
+  #   agents:
+  #     queue: "ascend-a2b3"
+  #     resource_class: "npu-1"
+  #   command: |
+  #     buildkite-agent pipeline upload .buildkite/test-npu-ready.yaml
+
+  # L4 Test — main+NIGHTLY=1 (scheduled), or PR with specific label (e.g. add label then Rebuild)
+  - label: "Upload Nightly Pipeline"
+    depends_on: image-build
+    key: upload-nightly-pipeline
+    if: >-
+      (build.branch == "main" && build.env("NIGHTLY") == "1") ||
+      (build.branch != "main" && (
+        build.pull_request.labels includes "nightly-test" ||
+        build.pull_request.labels includes "omni-test" ||
+        build.pull_request.labels includes "tts-test" ||
+        build.pull_request.labels includes "diffusion-x2iat-test" ||
+        build.pull_request.labels includes "diffusion-x2v-test"
+      ))
+    commands:
+      - buildkite-agent pipeline upload .buildkite/test-npu-nightly.yaml
+    agents:
+      queue: "ascend-a2b3"
+      resource_class: "npu-1"

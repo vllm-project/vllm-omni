@@ -877,43 +877,78 @@ class AsyncOmniEngine:
         stage_plans: Sequence[LogicalStageInitPlan],
         stage_init_timeout: int,
     ) -> dict[int, list[Any | None]]:
-        """Initialize all stage replicas in parallel."""
+        """Initialize all stage replicas.
+
+        Diffusion replicas are launched **inline on the orchestrator thread**
+        (the long-lived daemon thread created in ``__init__``). Their
+        ``mp.Process`` workers are therefore parented by a thread whose
+        lifetime equals the engine's lifetime. Submitting diffusion init to a
+        scoped ``ThreadPoolExecutor`` causes the clone-parent Python thread to
+        be destroyed at the end of init, which under Ray's actor subreaper
+        leads the spawned ``DiffusionWorker`` processes to be silently
+        ``SIGKILL``ed (exitcode -9). See git blame on this method.
+
+        LLM replicas keep using the parallel init executor.
+        """
 
         stage_launch_lock = threading.Lock()
         initialized_clients_by_stage: dict[int, list[Any | None]] = {
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
         }
-        total_replicas = sum(len(plan.replicas) for plan in stage_plans)
-        future_to_replica: dict[concurrent.futures.Future[Any], tuple[int, int]] = {}
         primary_exc: Exception | None = None
 
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, total_replicas),
-            thread_name_prefix="stage-init",
-        ) as init_executor:
-            for plan in stage_plans:
-                for replica in plan.replicas:
+        # Partition replicas: diffusion runs inline on the caller's thread;
+        # LLM replicas are submitted to a scoped ThreadPoolExecutor.
+        diffusion_replicas: list[tuple[int, ReplicaInitPlan]] = []
+        llm_replicas: list[tuple[int, ReplicaInitPlan]] = []
+        for plan in stage_plans:
+            for replica in plan.replicas:
+                if replica.metadata.stage_type == "diffusion":
+                    diffusion_replicas.append((plan.stage_idx, replica))
+                else:
+                    llm_replicas.append((plan.stage_idx, replica))
+
+        # --- 1) Diffusion replicas: inline on the orchestrator thread. ---
+        for stage_idx, replica in diffusion_replicas:
+            try:
+                initialized_clients_by_stage[stage_idx][replica.replica_id] = self._initialize_replica(
+                    replica,
+                    stage_init_timeout,
+                    stage_launch_lock,
+                )
+            except Exception as exc:
+                primary_exc = exc
+                break
+
+        # --- 2) LLM replicas: parallel init via a scoped ThreadPoolExecutor. ---
+        if primary_exc is None and llm_replicas:
+            future_to_replica: dict[concurrent.futures.Future[Any], tuple[int, int]] = {}
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, len(llm_replicas)),
+                thread_name_prefix="stage-init",
+            ) as init_executor:
+                for stage_idx, replica in llm_replicas:
                     future = init_executor.submit(
                         self._initialize_replica,
                         replica,
                         stage_init_timeout,
                         stage_launch_lock,
                     )
-                    future_to_replica[future] = (plan.stage_idx, replica.replica_id)
+                    future_to_replica[future] = (stage_idx, replica.replica_id)
 
-            for future in concurrent.futures.as_completed(future_to_replica):
-                stage_idx, replica_id = future_to_replica[future]
-                try:
-                    initialized_clients_by_stage[stage_idx][replica_id] = future.result()
-                except concurrent.futures.CancelledError:
-                    continue
-                except Exception as exc:
-                    if primary_exc is None:
-                        primary_exc = exc
-                        for other_future in future_to_replica:
-                            if other_future is future:
-                                continue
-                            other_future.cancel()
+                for future in concurrent.futures.as_completed(future_to_replica):
+                    stage_idx, replica_id = future_to_replica[future]
+                    try:
+                        initialized_clients_by_stage[stage_idx][replica_id] = future.result()
+                    except concurrent.futures.CancelledError:
+                        continue
+                    except Exception as exc:
+                        if primary_exc is None:
+                            primary_exc = exc
+                            for other_future in future_to_replica:
+                                if other_future is future:
+                                    continue
+                                other_future.cancel()
 
         if primary_exc is not None:
             setattr(primary_exc, "_initialized_clients_by_stage", initialized_clients_by_stage)
@@ -1455,6 +1490,7 @@ class AsyncOmniEngine:
             "max_num_seqs": kwargs.get("max_num_seqs") or 1,
             "parallel_config": parallel_config,
             "model_class_name": kwargs.get("model_class_name", None),
+            "additional_config": kwargs.get("additional_config", None),
             "step_execution": kwargs.get("step_execution", False),
             "vae_use_slicing": kwargs.get("vae_use_slicing", False),
             "vae_use_tiling": kwargs.get("vae_use_tiling", False),
@@ -1477,6 +1513,9 @@ class AsyncOmniEngine:
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),
+            "kv_cache_dtype": kwargs.get("kv_cache_dtype", None),
+            "kv_cache_skip_steps": kwargs.get("kv_cache_skip_steps", None),
+            "kv_cache_skip_layers": kwargs.get("kv_cache_skip_layers", None),
             **({"diffusion_attention_config": attention_config} if attention_config is not None else {}),
             "force_cutlass_fp8": bool(kwargs.get("force_cutlass_fp8", False)),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
@@ -1606,6 +1645,11 @@ class AsyncOmniEngine:
                     continue
                 if not hasattr(cfg, "engine_args") or cfg.engine_args is None:
                     cfg.engine_args = OmegaConf.create({})
+                additional_config = kwargs.get("additional_config")
+                if additional_config is not None:
+                    current_additional_config = getattr(cfg.engine_args, "additional_config", None)
+                    if current_additional_config in (None, {}):
+                        cfg.engine_args.additional_config = additional_config
                 if kwargs.get("lora_path") is not None:
                     if not hasattr(cfg.engine_args, "lora_path") or cfg.engine_args.lora_path is None:
                         cfg.engine_args.lora_path = kwargs["lora_path"]
@@ -1651,6 +1695,24 @@ class AsyncOmniEngine:
                 if quantization is not None:
                     if not hasattr(cfg.engine_args, "quantization") or cfg.engine_args.quantization is None:
                         cfg.engine_args.quantization = quantization
+                kv_cache_dtype = kwargs.get("kv_cache_dtype")
+                if kv_cache_dtype is not None:
+                    if not hasattr(cfg.engine_args, "kv_cache_dtype") or cfg.engine_args.kv_cache_dtype is None:
+                        cfg.engine_args.kv_cache_dtype = kv_cache_dtype
+                kv_cache_skip_steps = kwargs.get("kv_cache_skip_steps")
+                if kv_cache_skip_steps is not None:
+                    if (
+                        not hasattr(cfg.engine_args, "kv_cache_skip_steps")
+                        or cfg.engine_args.kv_cache_skip_steps is None
+                    ):
+                        cfg.engine_args.kv_cache_skip_steps = kv_cache_skip_steps
+                kv_cache_skip_layers = kwargs.get("kv_cache_skip_layers")
+                if kv_cache_skip_layers is not None:
+                    if (
+                        not hasattr(cfg.engine_args, "kv_cache_skip_layers")
+                        or cfg.engine_args.kv_cache_skip_layers is None
+                    ):
+                        cfg.engine_args.kv_cache_skip_layers = kv_cache_skip_layers
             except Exception as e:
                 logger.warning("Failed to inject LoRA config for stage: %s", e)
 

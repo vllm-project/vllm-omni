@@ -78,6 +78,7 @@ def test_available_tasks_covers_all_modalities():
         "i2t",
         "it2i_think",
         "it2i_recaption",
+        "it2i_think_recaption",
         "t2i_think",
         "t2i_recaption",
         "t2i_vanilla",
@@ -99,6 +100,7 @@ def test_resolve_stop_token_ids_uses_answer_for_generation_tasks():
         "i2t",
         "it2i_think",
         "it2i_recaption",
+        "it2i_think_recaption",
         "t2i_think",
         "t2i_recaption",
     ],
@@ -125,7 +127,7 @@ def test_build_prompt_string_structure_chat_template(task: str):
     # documentation, so substring index() catches the wrong occurrence -- use
     # endswith() which directly captures "trigger is at the tail" (the Part A
     # fix: trigger goes AFTER `Assistant: `, not before user_prompt).
-    if task in ("it2i_think", "t2i_think"):
+    if task in ("it2i_think", "t2i_think", "it2i_think_recaption"):
         assert s.endswith("Assistant: <think>"), (
             f"Trigger <think> must be appended right after `Assistant: ` (Part A fix). Got tail: ...{s[-40:]!r}"
         )
@@ -180,14 +182,16 @@ def test_build_prompt_tokens_segments_each_boundary():
 
 def test_build_prompt_tokens_image_placeholder_present_for_image_tasks():
     tok = FakeTokenizer()
-    ids = build_prompt_tokens("hi", tok, task="i2t")
+    result = build_prompt_tokens("hi", tok, task="i2t")
+    ids = result.token_ids
     assert ids[0] == FakeTokenizer.SPECIAL["<|startoftext|>"], "BOS (<|startoftext|>) must be the first token"
     assert FakeTokenizer.SPECIAL["<img>"] in ids, "<img> placeholder must be present for i2t/it2i tasks"
 
 
 def test_build_prompt_tokens_no_image_for_text_only_tasks():
     tok = FakeTokenizer()
-    ids = build_prompt_tokens("hi", tok, task="t2t")
+    result = build_prompt_tokens("hi", tok, task="t2t")
+    ids = result.token_ids
     assert FakeTokenizer.SPECIAL["<img>"] not in ids, "<img> must NOT appear for text-only tasks"
 
 
@@ -203,14 +207,16 @@ def test_build_prompt_tokens_no_image_for_text_only_tasks():
 def test_build_prompt_tokens_trigger_is_last_token(task: str, trigger_id: int):
     """Trigger tag id must be the LAST token (after `Assistant: ` segment)."""
     tok = FakeTokenizer()
-    ids = build_prompt_tokens("hi", tok, task=task)
+    result = build_prompt_tokens("hi", tok, task=task)
+    ids = result.token_ids
     assert ids[-1] == trigger_id
 
 
 def test_build_prompt_tokens_no_trigger_for_plain_tasks():
     """Tasks without trigger_tag (t2t / i2t) must NOT append a trigger id."""
     tok = FakeTokenizer()
-    ids = build_prompt_tokens("hi", tok, task="t2t")
+    result = build_prompt_tokens("hi", tok, task="t2t")
+    ids = result.token_ids
     assert ids[-1] not in {
         FakeTokenizer.SPECIAL["<think>"],
         FakeTokenizer.SPECIAL["<recaption>"],
@@ -305,7 +311,8 @@ def test_segment_tokenize_diverges_from_full_string_encode():
     tok = AutoTokenizer.from_pretrained(_HUNYUAN_MODEL_ID, trust_remote_code=True)
 
     user_prompt = "写一首关于夜的诗。"
-    seg_ids = build_prompt_tokens(user_prompt, tok, task="i2t")
+    result = build_prompt_tokens(user_prompt, tok, task="i2t")
+    seg_ids = result.token_ids
     full_ids = tok.encode(build_prompt(user_prompt, task="i2t"), add_special_tokens=False)
 
     assert seg_ids != full_ids, (

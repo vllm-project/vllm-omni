@@ -64,6 +64,7 @@ _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
 _COSYVOICE3_TTS_MODEL_STAGES = {"cosyvoice3_talker"}
 _OMNIVOICE_TTS_MODEL_STAGES = {"omnivoice_generator"}
+_COVO_AUDIO_MODEL_STAGES = {"fused_thinker_talker"}
 _VOXCPM_TTS_MODEL_STAGES = {"latent_generator", "vae"}
 _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
 _MING_TTS_MODEL_STAGES = {"ming_tts"}
@@ -74,6 +75,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _FISH_TTS_MODEL_STAGES
     | _COSYVOICE3_TTS_MODEL_STAGES
     | _OMNIVOICE_TTS_MODEL_STAGES
+    | _COVO_AUDIO_MODEL_STAGES
     | _VOXCPM_TTS_MODEL_STAGES
     | _VOXCPM2_TTS_MODEL_STAGES
     | _MING_TTS_MODEL_STAGES
@@ -325,6 +327,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             and getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None) == "fish_speech_slow_ar"
         )
         self._fish_speech_tokenizer = None
+        self._covo_audio_tokenizer = None
 
         self._is_cosyvoice3 = (
             self._tts_stage is not None
@@ -490,6 +493,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "cosyvoice3"
         if model_stage in _OMNIVOICE_TTS_MODEL_STAGES:
             return "omnivoice"
+        if model_stage in _COVO_AUDIO_MODEL_STAGES:
+            model_arch = getattr(self._tts_stage.engine_args, "model_arch", None)
+            if model_arch and "CovoAudio" in model_arch:
+                return "covo_audio"
         if model_stage in (_VOXCPM_TTS_MODEL_STAGES | _VOXCPM2_TTS_MODEL_STAGES):
             has_vae_stage = any(
                 getattr(getattr(stage, "engine_args", None), "model_stage", None) == "vae"
@@ -1874,6 +1881,41 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "mm_processor_kwargs": mm_kwargs,
         }
 
+    # ---- Covo-Audio helpers ----
+
+    def _build_covo_audio_prompt(
+        self,
+        request: OpenAICreateSpeechRequest,
+    ) -> dict[str, Any]:
+        """Build a chat-style prompt for Covo-Audio-Chat.
+
+        Covo-Audio requires a specific system prompt that instructs the model
+        to interleave text and audio tokens in its output.  We render the
+        messages through the chat template and pass prompt_token_ids so that
+        the engine does not need to re-tokenize.
+        """
+        from transformers import AutoTokenizer
+
+        from vllm_omni.model_executor.models.covo_audio.prompt_utils import (
+            build_covo_audio_prompt_token_ids,
+        )
+
+        if self._covo_audio_tokenizer is None:
+            model_name = self.engine_client.model_config.model
+            try:
+                self._covo_audio_tokenizer = AutoTokenizer.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"Failed to load Covo-Audio tokenizer from '{model_name}': {exc}") from exc
+
+        prompt_ids = build_covo_audio_prompt_token_ids(
+            self._covo_audio_tokenizer,
+            request.input,
+        )
+        return {"prompt_token_ids": prompt_ids}
+
     def _apply_cosyvoice3_dynamic_tokens(
         self,
         sampling_params_list: list,
@@ -2014,6 +2056,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt["lang"] = request.language
             if request.instructions:
                 prompt["instruct"] = request.instructions
+        elif self._tts_model_type == "covo_audio":
+            prompt = self._build_covo_audio_prompt(request)
+            tts_params = {}
         elif self._tts_model_type == "voxcpm2":
             # voxcpm2 doesn't use `_apply_uploaded_speaker` because the prompt builder needs the
             # raw waveform tuple for prefill-length accounting, not a base64 data URL.
@@ -2100,6 +2145,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id = request_id or f"speech-{random_uuid()}"
         if self._is_fish_speech:
             model_type = "fish_speech"
+        elif self._tts_model_type == "covo_audio":
+            model_type = "covo_audio"
         elif self._tts_model_type == "voxtral_tts":
             model_type = "voxtral_tts"
         elif self._tts_model_type == "cosyvoice3":
@@ -2348,10 +2395,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 "ref_audio" in prompt,
             )
 
+            # Apply extra_params from the request to sampling params
+            sampling_params_list = self._diffusion_engine.default_sampling_params_list
+            if request.extra_params is not None:
+                if not isinstance(request.extra_params, dict):
+                    raise ValueError("extra_params must be a JSON object/dict.")
+                import copy
+
+                sampling_params_list = copy.deepcopy(sampling_params_list)
+                if sampling_params_list[0].extra_args is None:
+                    sampling_params_list[0].extra_args = {}
+                sampling_params_list[0].extra_args.update(request.extra_params)
+                logger.info("Applied extra_params to diffusion: %s", request.extra_params)
+
             generator = self._diffusion_engine.generate(
                 prompt=prompt,
                 request_id=request_id,
-                sampling_params_list=self._diffusion_engine.default_sampling_params_list,
+                sampling_params_list=sampling_params_list,
                 output_modalities=["audio"],
             )
 

@@ -222,7 +222,7 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         self.assertEqual(req.prompt_token_ids, [10, 20, 30])
         self.assertEqual(req.num_computed_tokens, 0)
         self.assertIsNone(req.additional_information)
-        self.assertEqual(req._omni_initial_model_buffer, {"left_context_size": 25})
+        self.assertEqual(req._omni_initial_model_buffer, {"meta": {"left_context_size": 25}})
 
 
 class TestChunkCoordinatorPostprocess(unittest.TestCase):
