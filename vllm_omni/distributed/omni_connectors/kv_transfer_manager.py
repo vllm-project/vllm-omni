@@ -1328,12 +1328,9 @@ class OmniKVTransferManager:
             if not kv_payload:
                 return False
 
-            self._apply_request_kv_payload(
-                req,
-                kv_payload,
-                target_device,
-            )
+            self._apply_request_kv_payload(req, kv_payload, target_device)
             return True
+
         kv_payload: dict[str, object] | None = None
         if world.rank_in_group == 0:
             received = self.receive_multi_kv_cache(req, cfg_kv_collect_func, torch.device("cpu"))
