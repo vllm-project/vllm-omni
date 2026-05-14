@@ -73,13 +73,15 @@ python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
 ```
 
 ### Voice cloning
-Pass a reference audio. Note that CosyVoice3's `--prompt-text` is a system-style prompt for the GPT stage, not a reference transcript:
+If `--ref-audio` is omitted, the script downloads the upstream
+[`zero_shot_prompt.wav`](https://github.com/FunAudioLLM/CosyVoice/blob/main/asset/zero_shot_prompt.wav) from the CosyVoice repo into the current directory.
+To use your own clip, pass `--ref-audio /path/to/reference.wav`, and modify `--prompt-text` correspondingly.
 ```bash
 python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
     --model pretrained_models/Fun-CosyVoice3-0.5B \
     --tokenizer pretrained_models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
-    --ref-audio prompt.wav \
-    --prompt-text "You are a helpful assistant.<|endofprompt|>Testing my voices. Why should I not?"
+    --ref-audio /path/to/reference.wav \
+    --prompt-text "You are a helpful assistant.<|endofprompt|>Trascript in your ref audio clip"
 ```
 
 ### Streaming
