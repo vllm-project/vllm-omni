@@ -11,12 +11,10 @@ Coverage (H100, since model cannot fit L4):
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 PROMPT = "A cat walking across a sunlit garden, cinematic lighting, slow motion."
 NEGATIVE_PROMPT = "low quality, blurry, distorted"
@@ -66,8 +64,6 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases(MODEL),

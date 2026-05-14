@@ -4,12 +4,15 @@
 import threading
 from collections import deque
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -109,7 +112,11 @@ def test_load_poll(build_adapter):
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
 
     adapter.load_async(request)
-    payload = {"code_predictor_codes": [[1]], "hidden_states": torch.tensor([[2.0]]), "finished": True}
+    payload: OmniPayload = {
+        "codes": {"audio": [[1]]},
+        "hidden_states": {"output": torch.tensor([[2.0]])},
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
     connector.get.return_value = (payload, 16)
     adapter._poll_single_request(request)
 
@@ -133,11 +140,54 @@ def test_save_async(build_adapter):
     assert task["is_finished"] is False
 
 
+def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, monkeypatch):
+    """Producer may return a struct with ``meta=None`` (e.g. payload that
+    carries only ``embed`` or ``codes``). The sender's ``meta is not None``
+    guard handles this without AttributeError; ``finished_flag`` is None and
+    the cleanup path is not triggered.
+    """
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-no-meta", RequestStatus.WAITING, external_req_id="ext-no-meta")
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.tensor([1, 2], dtype=torch.long)),
+    )
+    cleanup_calls = []
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: cleanup_calls.append((a, kw)))
+
+    adapter._send_single_request({"pooling_output": None, "request": request, "is_finished": False})
+
+    assert cleanup_calls == []  # no terminal cleanup; meta.finished is unobservable
+
+
+def test_send_single_request_empty_struct_goes_on_wire(build_adapter, monkeypatch):
+    """Pin the contract: an explicitly empty ``OmniPayloadStruct()`` passes
+    the ``payload_data is None`` check and gets sent. To skip a chunk, the
+    producer must return ``None``, not an empty struct. (Filtering empty
+    structs at the adapter would require introspecting all struct fields on
+    every send and was rejected for cost vs. value.)
+    """
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-empty", RequestStatus.WAITING, external_req_id="ext-empty")
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter._send_single_request({"pooling_output": None, "request": request, "is_finished": False})
+
+    assert connector.put.called
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert isinstance(sent_payload, OmniPayloadStruct)
+    assert sent_payload.meta is None  # confirms it's the empty struct on the wire
+
+
 def test_send_single_request_cleans_up_after_finished_payload(build_adapter, monkeypatch):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-finished", RequestStatus.FINISHED_STOPPED, external_req_id="ext-finished")
 
-    adapter.custom_process_next_stage_input_func = lambda **kwargs: {"x": [1], "finished": True}
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool))
+    )
     cleanup_calls = []
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: cleanup_calls.append((a, kw)))
 
@@ -152,12 +202,49 @@ def test_send_single_request_cleans_up_after_finished_payload(build_adapter, mon
 def test_update_request_payload(build_adapter):
     adapter, _ = build_adapter()
 
-    adapter._update_request_payload("ext", {"h": torch.tensor([[1.0]]), "codes": [1], "finished": False})
-    merged = adapter._update_request_payload("ext", {"h": torch.tensor([[2.0]]), "codes": [2], "finished": True})
+    first: OmniPayload = {
+        "hidden_states": {"output": torch.tensor([[1.0]])},
+        "codes": {"audio": [1]},
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+    }
+    adapter._update_request_payload("ext", first)
+    second: OmniPayload = {
+        "hidden_states": {"output": torch.tensor([[2.0]])},
+        "codes": {"audio": [2]},
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+    merged = adapter._update_request_payload("ext", second)
 
-    assert torch.equal(merged["h"], torch.tensor([[1.0], [2.0]]))
-    assert merged["codes"] == [1, 2]
-    assert merged["finished"] is True
+    assert torch.equal(merged["hidden_states"]["output"], torch.tensor([[1.0], [2.0]]))
+    assert merged["codes"]["audio"] == [1, 2]
+    assert merged["meta"]["finished"].item() is True
+
+
+def test_load_poll_ar_request_additional_information_concats_tensors(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="ar")
+    request = _req("req-merged", RequestStatus.WAITING, external_req_id="ext-merged")
+
+    adapter.request_ids_mapping["req-merged"] = "ext-merged"
+    adapter.request_payload["ext-merged"] = {
+        "hidden_states": {"output": torch.tensor([[1.0]])},
+        "ids": {"prompt": [11, 12]},
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+    }
+    payload: OmniPayload = {
+        "hidden_states": {"output": torch.tensor([[2.0]])},
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+    connector.get.return_value = (payload, 8)
+
+    adapter._poll_single_request(request)
+
+    assert torch.equal(
+        request.additional_information["hidden_states"]["output"],
+        torch.tensor([[1.0], [2.0]]),
+    )
+    # Keys absent from the new chunk are dropped (matches main's behavior).
+    assert "ids" not in request.additional_information
+    assert request.additional_information["meta"]["finished"].item() is True
 
 
 def test_process_and_restore_queues(build_adapter):
@@ -319,7 +406,10 @@ def test_cleanup_after_poll_flow(build_adapter):
     adapter.load_async(request)
 
     adapter.request_ids_mapping["req-flow"] = "ext-flow"
-    payload = {"hidden_states": torch.tensor([[1.0]]), "finished": True}
+    payload: OmniPayload = {
+        "hidden_states": {"output": torch.tensor([[1.0]])},
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
     connector.get.return_value = (payload, 8)
     adapter._poll_single_request(request)
 
@@ -333,6 +423,27 @@ def test_cleanup_after_poll_flow(build_adapter):
     assert "req-flow" not in adapter.get_req_chunk
     assert "req-flow" not in adapter.request_ids_mapping
     assert "ext-flow" not in adapter.request_payload
+
+
+def test_finish_requests_restores_status(build_adapter):
+    """Abort path must pop ``requests_origin_status`` and restore pre-wait status.
+
+    While ``process_pending_chunks`` holds a request off the scheduler queues, the
+    adapter records the prior status (WAITING or RUNNING). ``finish_requests`` must
+    put that status back on the live ``Request`` so base ``Scheduler.finish_requests``
+    can finish bookkeeping without inconsistent state / crashes.
+    """
+    adapter, _ = build_adapter(stage_id=1)
+    req_id = "req-abort-during-chunk"
+    prior = RequestStatus.RUNNING
+    request = _req(req_id, RequestStatus.WAITING_FOR_CHUNK)
+    adapter.requests_origin_status[req_id] = prior
+    requests_map = {req_id: request}
+
+    adapter.finish_requests([req_id], RequestStatus.FINISHED_ABORTED, requests_map)
+
+    assert request.status == prior
+    assert req_id not in adapter.requests_origin_status
 
 
 # ---------------------------------------------------------------
@@ -388,8 +499,8 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
         client_index=0,
         take_events=lambda: [],
         trace_headers=None,
-        num_cached_tokens=0,
-        num_external_computed_tokens=0,
+        has_encoder_inputs=False,
+        take_prefill_stats=lambda: None,
         num_nans_in_logits=0,
         get_finished_reason=lambda: "stop",
     )
@@ -469,8 +580,8 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
         client_index=0,
         take_events=lambda: [],
         trace_headers=None,
-        num_cached_tokens=0,
-        num_external_computed_tokens=0,
+        has_encoder_inputs=False,
+        take_prefill_stats=lambda: None,
         num_nans_in_logits=0,
         get_finished_reason=lambda: "stop",
     )
@@ -508,3 +619,70 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
 
     assert len(cleanup_calls) == 0
     assert len(save_calls) == 1
+
+
+def test_omni_ar_scheduler_finish_requests(mocker: MockerFixture):
+    """``OmniARScheduler.finish_requests`` must run chunk adapter hook before vLLM base."""
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+
+    order: list[str] = []
+
+    adapter = mocker.MagicMock()
+
+    def _adapter_finish(request_ids, finished_status, requests):
+        order.append("adapter")
+        return []
+
+    adapter.finish_requests.side_effect = _adapter_finish
+
+    def _super_finish(_self, request_ids, finished_status):
+        order.append("super")
+        return []
+
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched.chunk_transfer_adapter = adapter
+    sched.requests = {}
+
+    with patch.object(VLLMScheduler, "finish_requests", _super_finish):
+        OmniARScheduler.finish_requests(sched, ["r1"], RequestStatus.FINISHED_ABORTED)
+
+    assert order == ["adapter", "super"]
+
+
+def test_wire_round_trip_struct_to_dict_contract():
+    """Pin the wire contract: encoding ``OmniPayloadStruct`` and decoding it
+    yields a dict equivalent to ``to_dict(struct)``.
+
+    The chunk-adapter sender uses struct attribute access while the receiver
+    uses dict-key access. This works only because ``OmniMsgpackDecoder`` has
+    no target type and decodes structs back to plain dicts. If this test
+    breaks, the receiver's dict access will silently drop fields or KeyError.
+    """
+    from vllm_omni.data_entry_keys import CodesStruct, to_dict
+    from vllm_omni.distributed.omni_connectors.utils.serialization import (
+        OmniMsgpackDecoder,
+        OmniMsgpackEncoder,
+    )
+
+    struct = OmniPayloadStruct(
+        meta=MetaStruct(
+            finished=torch.tensor(True, dtype=torch.bool),
+            left_context_size=12,
+        ),
+        codes=CodesStruct(audio=torch.tensor([1, 2, 3], dtype=torch.int64)),
+    )
+
+    encoded = OmniMsgpackEncoder().encode(struct)
+    decoded = OmniMsgpackDecoder().decode(encoded)
+
+    assert isinstance(decoded, dict)
+    assert isinstance(decoded["meta"], dict)
+    assert isinstance(decoded["meta"]["finished"], torch.Tensor)
+    assert bool(decoded["meta"]["finished"].item()) is True
+    assert decoded["meta"]["left_context_size"] == 12
+    assert torch.equal(decoded["codes"]["audio"], torch.tensor([1, 2, 3], dtype=torch.int64))
+
+    expected = to_dict(struct)
+    assert set(decoded.keys()) == set(expected.keys())
+    assert set(decoded["meta"].keys()) == set(expected["meta"].keys())
+    assert set(decoded["codes"].keys()) == set(expected["codes"].keys())

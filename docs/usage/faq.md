@@ -4,14 +4,6 @@
 
 A: Now, we support natively disaggregated deployment for different model stages within a model. There is a restriction that one chip can only have one AutoRegressive model stage. This is because the unified KV cache management of vLLM. Stages of other types can coexist within a chip. The restriction will be resolved in later version.
 
-> Q: When trying to run examples, I encounter error about backend of librosa or soundfile. How to solve it?
-
-A: If you encounter error about backend of librosa, try to install ffmpeg with command below.
-```
-sudo apt update
-sudo apt install ffmpeg
-```
-
 > Q: I see GPU OOM or "free memory is less than desired GPU memory utilization" errors. How can I fix it?
 
 A: Refer to [GPU memory calculation and configuration](../configuration/gpu_memory_utilization.md) for guidance on tuning `gpu_memory_utilization` and related settings.

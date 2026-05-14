@@ -94,16 +94,21 @@ def main():
             print(f"Video frames: shape={video_frames.shape}, dtype={video_frames.dtype}")
 
             audio_waveform = None
-            if hasattr(first, "multimodal_output") and first.multimodal_output:
-                audio_waveform = first.multimodal_output.get("audio")
+            mm = first.multimodal_output or {}
+            if mm:
+                audio_waveform = mm.get("audio")
                 if audio_waveform is not None:
                     print(f"Audio waveform: shape={audio_waveform.shape}, dtype={audio_waveform.dtype}")
+
+            output_fps = float(mm.get("fps", 25))
+            output_sr = int(mm.get("audio_sample_rate", 24000))
+            print(f"Using fps={output_fps}, audio_sample_rate={output_sr} from model output")
 
             video_bytes = mux_video_audio_bytes(
                 video_frames,
                 audio_waveform,
-                fps=25.0,
-                audio_sample_rate=44100,
+                fps=output_fps,
+                audio_sample_rate=output_sr,
             )
             with open(args.output, "wb") as f:
                 f.write(video_bytes)

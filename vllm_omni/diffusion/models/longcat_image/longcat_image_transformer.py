@@ -582,6 +582,7 @@ class LongCatImageTransformer2DModel(nn.Module):
     """
 
     _repeated_blocks = ["LongCatImageTransformerBlock", "LongCatImageSingleTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 
     # Sequence Parallelism for LongCat (following diffusers' _cp_plan pattern)
     _sp_plan = {

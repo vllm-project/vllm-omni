@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
-import os
 from functools import cache, lru_cache
 
 import numpy as np
@@ -9,7 +8,8 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
-from librosa.filters import mel as librosa_mel_fn
+
+from vllm_omni.utils.audio import mel_filter_bank
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +34,13 @@ def _get_mel_basis(
     fmax: float | None,
     device_str: str,
 ) -> torch.Tensor:
-    mel = librosa_mel_fn(sr=sampling_rate, n_fft=n_fft, n_mels=num_mels, fmin=fmin, fmax=fmax)
-    return torch.from_numpy(mel).float().to(torch.device(device_str))
+    return mel_filter_bank(
+        sr=sampling_rate,
+        n_fft=n_fft,
+        n_mels=num_mels,
+        fmin=fmin,
+        fmax=fmax,
+    ).to(torch.device(device_str))
 
 
 @lru_cache
@@ -122,42 +127,8 @@ def exact_div(x, y):
 
 @cache
 def mel_filters(device, n_mels: int) -> torch.Tensor:
-    """
-    load the mel filterbank matrix for projecting STFT into a Mel spectrogram.
-    Allows decoupling librosa dependency; saved using:
-
-        np.savez_compressed(
-            "mel_filters.npz",
-            mel_80=librosa.filters.mel(sr=16000, n_fft=400, n_mels=80),
-            mel_128=librosa.filters.mel(sr=16000, n_fft=400, n_mels=128),
-        )
-    """
-    assert n_mels in {80, 128}, f"Unsupported n_mels: {n_mels}"
-
-    filters_path = os.path.join(os.path.dirname(__file__), "assets", "mel_filters.npz")
-    if not os.path.exists(filters_path):
-        source_url = "https://raw.githubusercontent.com/openai/whisper/main/whisper/assets/mel_filters.npz"
-        os.makedirs(os.path.dirname(filters_path), exist_ok=True)
-        try:
-            import urllib.request
-
-            with urllib.request.urlopen(source_url, timeout=30) as resp:
-                with open(filters_path, "wb") as f_out:
-                    f_out.write(resp.read())
-            logger.info("Downloaded mel_filters.npz from %s", source_url)
-        except Exception as e:
-            raise FileNotFoundError(
-                "Missing CosyVoice3 mel filter asset:\n"
-                f"  {filters_path}\n"
-                "Auto-download failed. Download it manually from:\n"
-                f"  {source_url}\n"
-                "Example:\n"
-                f"  mkdir -p {os.path.dirname(filters_path)} && "
-                f"curl -L {source_url} -o {filters_path}"
-            ) from e
-
-    with np.load(filters_path, allow_pickle=False) as f:
-        return torch.from_numpy(f[f"mel_{n_mels}"]).to(device)
+    """Compute mel filterbank matrix for projecting STFT into a Mel spectrogram."""
+    return mel_filter_bank(sr=16000, n_fft=400, n_mels=n_mels).to(device)
 
 
 def log_mel_spectrogram(

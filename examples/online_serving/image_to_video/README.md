@@ -26,6 +26,23 @@ The script allows overriding:
 - `CACHE_BACKEND` (default: `none`)
 - `ENABLE_CACHE_DIT_SUMMARY` (default: `0`)
 
+### Ascend / Local LightX2V Example
+
+For a local Wan2.2-LightX2V Diffusers directory on Ascend/NPU, you can start the server like this:
+
+```bash
+vllm serve /path/to/Wan2.2-I2V-A14B-LightX2V-Diffusers-Lightning \
+  --omni \
+  --port 8091 \
+  --flow-shift 12 \
+  --cfg-parallel-size 1 \
+  --ulysses-degree 4 \
+  --use-hsdp \
+  --trust-remote-code \
+  --allowed-local-media-path / \
+  --seed 42
+```
+
 ## Async Job Behavior
 
 `POST /v1/videos` is asynchronous. It creates a video job and immediately
@@ -69,9 +86,34 @@ curl -X POST http://localhost:8091/v1/videos/sync \
   -F "guidance_scale_2=1.0" \
   -F "boundary_ratio=0.875" \
   -F "flow_shift=12.0" \
+  -F 'extra_params={"sample_solver":"euler"}' \
   -F "seed=42" \
   -o sync_i2v_output.mp4
 ```
+
+For Wan Lightning/Distill checkpoints, pass `{"sample_solver":"euler"}` via `extra_params`. The default solver is `unipc`.
+
+Example matching the local LightX2V deployment above:
+
+```bash
+curl -sS -X POST http://localhost:8091/v1/videos/sync \
+  -H "Accept: video/mp4" \
+  -F "prompt=A cat playing with yarn" \
+  -F "input_reference=@/path/to/input.jpg" \
+  -F "width=832" \
+  -F "height=480" \
+  -F "num_frames=81" \
+  -F "fps=16" \
+  -F "num_inference_steps=4" \
+  -F "guidance_scale=1.0" \
+  -F "guidance_scale_2=1.0" \
+  -F "boundary_ratio=0.875" \
+  -F "seed=42" \
+  -F 'extra_params={"sample_solver":"euler"}' \
+  -o ./output.mp4
+```
+
+Use `/v1/videos/sync` if you want to write the MP4 directly to a file. `POST /v1/videos` is async and returns job metadata, not inline `b64_json`.
 
 ## Storage
 
@@ -96,6 +138,9 @@ export VLLM_OMNI_STORAGE_MAX_CONCURRENCY=8
 # Basic image-to-video generation
 bash run_curl_image_to_video.sh
 
+# Wan Lightning/Distill checkpoints
+SAMPLE_SOLVER=euler bash run_curl_image_to_video.sh
+
 # Or execute directly (OpenAI-style multipart)
 create_response=$(curl -s http://localhost:8091/v1/videos \
   -H "Accept: application/json" \
@@ -111,6 +156,7 @@ create_response=$(curl -s http://localhost:8091/v1/videos \
   -F "guidance_scale_2=1.0" \
   -F "boundary_ratio=0.875" \
   -F "flow_shift=12.0" \
+  -F 'extra_params={"sample_solver":"euler"}' \
   -F "seed=42")
 
 video_id=$(echo "$create_response" | jq -r '.id')
@@ -169,8 +215,11 @@ curl -X POST http://localhost:8091/v1/videos \
   -F "guidance_scale_2=1.0" \
   -F "boundary_ratio=0.875" \
   -F "flow_shift=12.0" \
+  -F 'extra_params={"sample_solver":"euler"}' \
   -F "seed=42"
 ```
+
+`sample_solver` is supported by Wan2.2 online serving through the existing `extra_params` field, which is merged into the pipeline `extra_args`. Use `unipc` for the default multistep solver, or `euler` for Lightning/Distill checkpoints.
 
 ## Create Response Format
 

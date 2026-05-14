@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import queue
 import threading
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from pytest_mock import MockerFixture
 
 from vllm_omni.diffusion.data import DiffusionOutput, DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
@@ -20,6 +21,7 @@ from vllm_omni.diffusion.sched import (
     StepScheduler,
 )
 from vllm_omni.diffusion.sched.interface import CachedRequestData, NewRequestData
+from vllm_omni.diffusion.worker.utils import RunnerOutput
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -34,7 +36,7 @@ def _make_request(req_id: str) -> OmniDiffusionRequest:
 
 
 def _make_request_output(req_id: str, *, error: str | None = None, finished: bool = True):
-    return SimpleNamespace(
+    return RunnerOutput(
         req_id=req_id,
         step_index=None,
         finished=finished,
@@ -49,7 +51,7 @@ def _make_step_output(
     finished: bool = False,
     error: str | None = None,
 ):
-    return SimpleNamespace(
+    return RunnerOutput(
         req_id=req_id,
         step_index=step_index,
         finished=finished,
@@ -91,25 +93,26 @@ class _StubScheduler(SchedulerInterface):
         self._sched_req_id = request.request_ids[0]
         self._state = None
         self._scheduled = False
+        self.max_num_running_reqs = 1
 
     def initialize(self, od_config) -> None:
         self.initialized_with = od_config
 
     def add_request(self, request: OmniDiffusionRequest) -> str:
         assert request is self._request
-        self._state = Mock(sched_req_id=self._sched_req_id, req=request)
+        self._state = SimpleNamespace(sched_req_id=self._sched_req_id, req=request)
         return self._sched_req_id
 
     def schedule(self):
         if self._scheduled or self._state is None:
-            return Mock(
+            return SimpleNamespace(
                 scheduled_new_reqs=[],
                 scheduled_cached_reqs=CachedRequestData.make_empty(),
                 scheduled_req_ids=[],
                 is_empty=True,
             )
         self._scheduled = True
-        return Mock(
+        return SimpleNamespace(
             scheduled_new_reqs=[NewRequestData.from_state(self._state)],
             scheduled_cached_reqs=CachedRequestData.make_empty(),
             scheduled_req_ids=[self._state.sched_req_id],
@@ -153,7 +156,7 @@ class _StubScheduler(SchedulerInterface):
 class TestRequestScheduler:
     def setup_method(self) -> None:
         self.scheduler: RequestScheduler = RequestScheduler()
-        self.scheduler.initialize(Mock())
+        self.scheduler.initialize(SimpleNamespace())
 
     def test_single_request_success_lifecycle(self) -> None:
         req_id = self.scheduler.add_request(_make_request("a"))
@@ -218,6 +221,46 @@ class TestRequestScheduler:
         assert third.num_running_reqs == 1
         assert third.num_waiting_reqs == 0
 
+    def test_batches_compatible_requests_up_to_max_num_seqs(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_id_a = scheduler.add_request(_make_request("a"))
+        req_id_b = scheduler.add_request(_make_request("b"))
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_id_a, req_id_b]
+        assert sched_output.num_running_reqs == 2
+        assert sched_output.num_waiting_reqs == 0
+
+    def test_incompatible_waiting_head_blocks_later_compatible_request(self) -> None:
+        scheduler = RequestScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=3))
+
+        req_id_a = scheduler.add_request(_make_request("a"))
+        req_id_b = scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_b"],
+                sampling_params=OmniDiffusionSamplingParams(width=768),
+                request_ids=["b"],
+            )
+        )
+        scheduler.add_request(_make_request("c"))
+
+        first = scheduler.schedule()
+
+        assert _new_ids(first) == [req_id_a]
+        assert first.num_running_reqs == 1
+        assert first.num_waiting_reqs == 2
+
+        scheduler.update_from_output(first, _make_request_output(req_id_a))
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == [req_id_b]
+        assert second.num_running_reqs == 1
+        assert second.num_waiting_reqs == 1
+
     def test_abort_request_for_waiting_and_running(self) -> None:
         req_id_a = self.scheduler.add_request(_make_request("a"))
         req_id_b = self.scheduler.add_request(_make_request("b"))
@@ -276,23 +319,23 @@ class TestRequestScheduler:
 
 
 class TestDiffusionEngine:
-    def test_add_req_and_wait_for_response_single_path(self) -> None:
+    def test_add_req_and_wait_for_response_single_path(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.scheduler = RequestScheduler()
-        engine.scheduler.initialize(Mock())
+        engine.scheduler.initialize(SimpleNamespace())
         engine._rpc_lock = threading.RLock()
         engine.abort_queue = queue.Queue()
 
         request = _make_request("engine")
         runner_output = _make_request_output("engine")
-        engine.execute_fn = Mock(return_value=runner_output)
+        engine.execute_fn = mocker.Mock(return_value=runner_output)
 
         output = engine.add_req_and_wait_for_response(request)
 
         assert output is runner_output.result
         engine.execute_fn.assert_called_once()
 
-    def test_supports_scheduler_interface_injection(self) -> None:
+    def test_supports_scheduler_interface_injection(self, mocker: MockerFixture) -> None:
         request = _make_request("engine_iface")
         runner_output = _make_request_output("engine_iface")
         scheduler = _StubScheduler(request, runner_output)
@@ -301,33 +344,45 @@ class TestDiffusionEngine:
         engine.scheduler = scheduler
         engine._rpc_lock = threading.RLock()
         engine.abort_queue = queue.Queue()
-        engine.execute_fn = Mock(return_value=runner_output)
+        engine.execute_fn = mocker.Mock(return_value=runner_output)
 
         output = engine.add_req_and_wait_for_response(request)
 
         assert output is runner_output.result
         engine.execute_fn.assert_called_once()
 
-    def test_initializes_injected_scheduler(self) -> None:
+    def test_initializes_injected_scheduler(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
         request = _make_request("init")
         scheduler = _StubScheduler(request, DiffusionOutput(output=None))
-        od_config = Mock(model_class_name="mock_model")
-        fake_executor_cls = Mock(return_value=Mock())
+        od_config = SimpleNamespace(model_class_name="mock_model")
+        fake_executor_cls = mocker.Mock(return_value=mocker.Mock())
 
-        with (
-            patch("vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func", return_value=None),
-            patch("vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func", return_value=None),
-            patch("vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class", return_value=fake_executor_cls),
-            patch.object(DiffusionEngine, "_dummy_run", return_value=None),
-        ):
-            DiffusionEngine(od_config, scheduler=scheduler)
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
+            lambda *args, **kwargs: fake_executor_cls,
+        )
+        monkeypatch.setattr(DiffusionEngine, "_dummy_run", lambda self: None)
+
+        DiffusionEngine(od_config, scheduler=scheduler)
 
         assert scheduler.initialized_with is od_config
         fake_executor_cls.assert_called_once_with(od_config)
 
     def test_scheduler_alias_keeps_default_request_scheduler(self) -> None:
         scheduler = Scheduler()
-        scheduler.initialize(Mock())
+        scheduler.initialize(SimpleNamespace())
 
         req_id = scheduler.add_request(_make_request("alias"))
         sched_output = scheduler.schedule()
@@ -336,20 +391,27 @@ class TestDiffusionEngine:
         assert req_id in finished
         assert scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_COMPLETED
 
-    def test_step_raises_aborted_error(self) -> None:
+    @pytest.mark.asyncio
+    async def test_step_raises_aborted_error(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._loop_started = False
+        engine._init_lock = asyncio.Lock()
+        engine.main_loop = asyncio.get_running_loop()
+        engine.stop_event = threading.Event()
         engine.pre_process_func = None
-        engine.add_req_and_wait_for_response = Mock(
+        engine.async_add_req_and_wait_for_response = mocker.AsyncMock(
             return_value=DiffusionOutput(aborted=True, abort_message="Request req-abort aborted.")
         )
 
         with pytest.raises(DiffusionRequestAbortedError, match="Request req-abort aborted"):
-            engine.step(_make_request("req-abort"))
+            await engine.step(_make_request("req-abort"))
 
     def test_abort_queue_marks_request_finished_aborted(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._rpc_lock = threading.RLock()
+        engine._cv = threading.Condition(engine._rpc_lock)
         engine.scheduler = RequestScheduler()
-        engine.scheduler.initialize(Mock())
+        engine.scheduler.initialize(SimpleNamespace())
         engine.abort_queue = queue.Queue()
 
         req_id = engine.scheduler.add_request(_make_request("req-abort"))
@@ -361,7 +423,7 @@ class TestDiffusionEngine:
     def test_finalize_finished_request_returns_aborted_output(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.scheduler = RequestScheduler()
-        engine.scheduler.initialize(Mock())
+        engine.scheduler.initialize(SimpleNamespace())
 
         req_id = engine.scheduler.add_request(_make_request("req-finalize"))
         engine.scheduler.finish_requests(req_id, DiffusionRequestStatus.FINISHED_ABORTED)
@@ -371,29 +433,40 @@ class TestDiffusionEngine:
         assert output.aborted is True
         assert output.abort_message == "Request req-finalize aborted."
 
-    def test_initializes_step_scheduler_when_step_execution_enabled(self) -> None:
-        od_config = Mock(model_class_name="mock_model")
+    def test_initializes_step_scheduler_when_step_execution_enabled(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+    ) -> None:
+        od_config = SimpleNamespace(model_class_name="mock_model")
         od_config.step_execution = True
-        fake_executor = Mock()
-        fake_executor_cls = Mock(return_value=fake_executor)
+        fake_executor = mocker.Mock()
+        fake_executor_cls = mocker.Mock(return_value=fake_executor)
 
-        with (
-            patch("vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func", return_value=None),
-            patch("vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func", return_value=None),
-            patch("vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class", return_value=fake_executor_cls),
-            patch.object(DiffusionEngine, "_dummy_run", return_value=None),
-        ):
-            engine = DiffusionEngine(od_config)
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_post_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.get_diffusion_pre_process_func",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.diffusion_engine.DiffusionExecutor.get_class",
+            lambda *args, **kwargs: fake_executor_cls,
+        )
+        monkeypatch.setattr(DiffusionEngine, "_dummy_run", lambda self: None)
+        engine = DiffusionEngine(od_config)
 
         assert isinstance(engine.scheduler, StepScheduler)
         assert engine.execute_fn is fake_executor.execute_step
         fake_executor_cls.assert_called_once_with(od_config)
 
-    def test_dummy_run_raises_on_output_error(self) -> None:
+    def test_dummy_run_raises_on_output_error(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
-        engine.od_config = Mock(model_class_name="mock_model")
+        engine.od_config = SimpleNamespace(model_class_name="mock_model", diffusion_load_format="default")
         engine.pre_process_func = None
-        engine.add_req_and_wait_for_response = Mock(return_value=DiffusionOutput(error="boom"))
+        engine.add_req_and_wait_for_response = mocker.Mock(return_value=DiffusionOutput(error="boom"))
 
         with pytest.raises(RuntimeError, match="Dummy run failed: boom"):
             engine._dummy_run()
@@ -402,7 +475,7 @@ class TestDiffusionEngine:
 class TestStepScheduler:
     def setup_method(self) -> None:
         self.scheduler: StepScheduler = StepScheduler()
-        self.scheduler.initialize(Mock())
+        self.scheduler.initialize(SimpleNamespace())
 
     def test_single_request_step_lifecycle(self) -> None:
         request = _make_step_request("step", num_inference_steps=3)
@@ -496,7 +569,7 @@ class TestStepScheduler:
         sched_output = self.scheduler.schedule()
         finished = self.scheduler.update_from_output(
             sched_output,
-            SimpleNamespace(
+            RunnerOutput(
                 req_id=req_id,
                 step_index=None,
                 finished=True,
@@ -552,6 +625,64 @@ class TestStepScheduler:
         )
         assert finished == {req_id}
         assert self.scheduler.get_request_state(req_id).status == DiffusionRequestStatus.FINISHED_ABORTED
+
+    def test_batches_compatible_step_requests(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_a = scheduler.add_request(_make_step_request("a"))
+        req_b = scheduler.add_request(_make_step_request("b"))
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_a, req_b]
+        assert sched_output.num_running_reqs == 2
+        assert sched_output.num_waiting_reqs == 0
+
+    def test_step_batch_allows_different_num_inference_steps(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+
+        req_a = scheduler.add_request(_make_step_request("a", num_inference_steps=2))
+        req_b = scheduler.add_request(_make_step_request("b", num_inference_steps=4))
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_a, req_b]
+        assert sched_output.num_running_reqs == 2
+        assert sched_output.num_waiting_reqs == 0
+
+    def test_step_batch_rejects_different_sampling_key(self) -> None:
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=3))
+
+        req_a = scheduler.add_request(_make_step_request("a"))
+        req_b = scheduler.add_request(
+            _make_step_request(
+                "b",
+                sampling_params=OmniDiffusionSamplingParams(
+                    height=768,
+                    num_inference_steps=4,
+                ),
+            )
+        )
+        scheduler.add_request(_make_step_request("c"))
+
+        sched_output = scheduler.schedule()
+
+        assert _new_ids(sched_output) == [req_a]
+        assert sched_output.num_running_reqs == 1
+        assert sched_output.num_waiting_reqs == 2
+
+        scheduler.update_from_output(
+            sched_output,
+            _make_step_output(req_a, step_index=4, finished=True),
+        )
+        second = scheduler.schedule()
+
+        assert _new_ids(second) == [req_b]
+        assert second.num_running_reqs == 1
+        assert second.num_waiting_reqs == 1
 
     def test_preempt_request_preserves_step_index(self) -> None:
         request = _make_step_request("preempt", num_inference_steps=3)

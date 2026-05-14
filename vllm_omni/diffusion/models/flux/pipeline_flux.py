@@ -25,11 +25,13 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
 from vllm_omni.diffusion.models.flux import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 logger = logging.getLogger(__name__)
@@ -106,7 +108,11 @@ class FluxPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipe
         self.vae = AutoencoderKL.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self.device
         )
-        self.transformer = FluxTransformer2DModel(od_config=od_config, quant_config=od_config.quantization_config)
+
+        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, FluxTransformer2DModel)
+        self.transformer = FluxTransformer2DModel(
+            **transformer_kwargs, od_config=od_config, quant_config=od_config.quantization_config
+        )
 
         self.tokenizer = CLIPTokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
         self.tokenizer_2 = T5TokenizerFast.from_pretrained(
@@ -660,3 +666,11 @@ class FluxPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipe
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+
+class FluxDMD2Pipeline(DMD2PipelineMixin, FluxPipeline):
+    """Flux pipeline for FastGen DMD2-distilled models."""
+
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
+        super().__init__(od_config=od_config, prefix=prefix)
+        self.__init_dmd2__()

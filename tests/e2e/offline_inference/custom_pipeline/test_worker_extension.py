@@ -10,7 +10,7 @@ import pytest
 from tests.e2e.offline_inference.custom_pipeline.worker_extension import (
     vLLMOmniColocateWorkerExtensionForTest,
 )
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.worker.diffusion_worker import CustomPipelineWorkerExtension
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 

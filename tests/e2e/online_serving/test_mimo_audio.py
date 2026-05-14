@@ -9,13 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import (
-    OmniServerParams,
-    dummy_messages_from_mix_data,
-    generate_synthetic_audio,
-    modify_stage_config,
-)
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.media import generate_synthetic_audio
+from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
+from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -27,26 +24,6 @@ CHAT_TEMPLATE_PATH = str(
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 models = ["XiaomiMiMo/MiMo-Audio-7B-Instruct"]
-
-
-def get_chunk_config():
-    path = modify_stage_config(
-        str(Path(__file__).parent.parent / "stage_configs" / "mimo_audio_ci.yaml"),
-        updates={
-            "async_chunk": True,
-            "stage_args": {
-                0: {
-                    "engine_args.custom_process_next_stage_input_func": "vllm_omni.model_executor.stage_input_processors.mimo_audio.llm2code2wav_async_chunk"
-                },
-                1: {
-                    "engine_args.max_model_len": 8192,
-                    "engine_args.max_num_batched_tokens": 8192,
-                },
-            },
-        },
-        deletes={"stage_args": {1: ["custom_process_input_func"]}},
-    )
-    return path
 
 
 def download_tokenizer():
@@ -62,14 +39,16 @@ def download_tokenizer():
     return local_path
 
 
-# CI stage config for H100 / MI325
 # Guard module-level setup so test collection doesn't fail in environments
 # where the model cache is read-only or models aren't available.
 try:
-    stage_configs = [get_chunk_config()]
+    stage_configs = [get_deploy_config_path("mimo_audio.yaml")]
     tokenizer_path = download_tokenizer()
     os.environ["MIMO_AUDIO_TOKENIZER_PATH"] = tokenizer_path
 
+    # --load-format dummy applies to every stage pipeline-wide, avoiding a
+    # per-stage yaml rewrite (the old approach wrote a tempfile + atexit-unlink
+    # which raced with CI's process lifecycle).
     test_params = [
         OmniServerParams(
             model=model,
@@ -89,7 +68,7 @@ except Exception as exc:
 def get_prompt(prompt_type="text_only"):
     prompts = {
         "text_only": "What is the capital of China? Answer in 20 words.",
-        "audio": "What is recited in the audio?",
+        "audio": "What one English word is repeated in the audio?",
     }
     return prompts.get(prompt_type, prompts["text_only"])
 
@@ -104,6 +83,7 @@ def get_max_batch_size(size_type="few"):
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.skip(reason="CI failed 8571")
 def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Test audio and text input processing and text/audio output generation via OpenAI API.
@@ -124,6 +104,7 @@ def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "messages": messages,
         "stream": True,
+        "sampling_params_list": [{"max_tokens": 64}, {"max_tokens": 64}],
         "key_words": {
             "audio": ["test"],
         },

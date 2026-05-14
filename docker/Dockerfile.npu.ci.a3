@@ -1,0 +1,42 @@
+ARG VLLM_ASCEND_IMAGE=quay.io/ascend/vllm-ascend
+ARG VLLM_ASCEND_TAG=nightly-main-a3
+FROM ${VLLM_ASCEND_IMAGE}:${VLLM_ASCEND_TAG}
+
+ARG APP_DIR=/vllm-workspace/vllm-omni
+WORKDIR ${APP_DIR}
+COPY . .
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        libxcb1 && \
+    rm -rf /var/cache/apt/* && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    source /usr/local/Ascend/nnal/atb/set_env.sh && \
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/`uname -i`-linux/devlib && \
+    python3 -m pip install -U pip && \
+    python3 -m pip install -v \
+      "pytest>=7.0.0" \
+      "pytest-asyncio>=0.21.0" \
+      "pytest-cov>=4.0.0" \
+      "pytest-mock>=3.10.0" \
+      "openpyxl>=3.0.0" \
+      --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
+      --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
+      --default-timeout=60 && \
+    python3 -m pip install -v -e /vllm-workspace/vllm-omni/ --no-build-isolation \
+      --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
+      --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
+      --default-timeout=60
+
+ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+ENTRYPOINT []

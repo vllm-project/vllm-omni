@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for Int8 quantization config."""
 
-from unittest.mock import MagicMock, patch
-
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -102,7 +100,7 @@ def test_quantization_config_string_and_dict_equivalent():
     assert config_str.quantization_config.activation_scheme == config_dict.quantization_config.activation_scheme
 
 
-def test_get_quant_method(mocker: MockerFixture):
+def test_get_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     """Test for get_quant_method method for GPU"""
     from vllm_omni.quantization.int8_config import Int8OnlineLinearMethod
 
@@ -111,18 +109,16 @@ def test_get_quant_method(mocker: MockerFixture):
     def _fake_init(self, quant_config):
         pass
 
-    layer = MagicMock(spec=LinearBase)
+    layer = mocker.Mock(spec=LinearBase)
     mocker.patch.object(Int8OnlineLinearMethod, "__init__", _fake_init)
 
     prefix = "test_layer"
 
     # Mock the platform to be GPU
-    with (
-        patch("vllm_omni.platforms.current_omni_platform.is_cuda", return_value=True),
-        patch("vllm_omni.platforms.current_omni_platform.is_npu", return_value=False),
-    ):
-        method = config.get_quant_method(layer, prefix)
-        assert isinstance(method, Int8OnlineLinearMethod)
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    method = config.get_quant_method(layer, prefix)
+    assert isinstance(method, Int8OnlineLinearMethod)
 
     # Test skipping quantization for a layer
     config.ignored_layers = [prefix]
@@ -130,22 +126,20 @@ def test_get_quant_method(mocker: MockerFixture):
     assert isinstance(method, UnquantizedLinearMethod)
 
 
-def test_get_npu_quant_method():
+def test_get_npu_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     """Test for get_quant_method method for NPU"""
     from vllm_omni.quantization.int8_config import NPUInt8OnlineLinearMethod
 
     config = build_quant_config("int8")
 
-    layer = MagicMock(spec=LinearBase)
+    layer = mocker.Mock(spec=LinearBase)
     prefix = "test_layer"
 
     # Mock the platform to be NPU
-    with (
-        patch("vllm_omni.platforms.current_omni_platform.is_cuda", return_value=False),
-        patch("vllm_omni.platforms.current_omni_platform.is_npu", return_value=True),
-    ):
-        method = config.get_quant_method(layer, prefix)
-        assert isinstance(method, NPUInt8OnlineLinearMethod)
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    method = config.get_quant_method(layer, prefix)
+    assert isinstance(method, NPUInt8OnlineLinearMethod)
 
     # Test skipping quantization for a layer
     config.ignored_layers = [prefix]
@@ -245,7 +239,7 @@ class TestNPUInt8LinearMethod:
 
     @pytest.fixture
     def mock_torch_npu(self, mocker):
-        torch_npu = MagicMock()
+        torch_npu = mocker.MagicMock()
 
         mocker.patch("vllm_omni.quantization.int8_config.torch_npu", return_value=torch_npu)
         mocker.patch(

@@ -10,6 +10,7 @@ reducing kernel launch overhead during inference.
 import torch
 from torch.cuda import CUDAGraph
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -88,6 +89,8 @@ class CUDAGraphDecoderWrapper:
         dtype: torch.dtype = torch.long,
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
+        decode_chunk_size: int = 300,
+        decode_left_context: int = 25,
     ):
         if device.type != "cuda" or not self.enabled or self._warmed_up:
             return
@@ -99,6 +102,8 @@ class CUDAGraphDecoderWrapper:
             self.capture_sizes = self.compute_capture_sizes(
                 codec_chunk_frames=codec_chunk_frames,
                 codec_left_context_frames=codec_left_context_frames,
+                decode_chunk_size=decode_chunk_size,
+                decode_left_context=decode_left_context,
             )
 
         logger.info("Starting CUDA Graph warmup for %d sizes: %s", len(self.capture_sizes), self.capture_sizes)
@@ -109,7 +114,7 @@ class CUDAGraphDecoderWrapper:
             with torch.no_grad():
                 _ = self.decoder(dummy)
 
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
 
         for size in self.capture_sizes:
             try:
@@ -125,11 +130,11 @@ class CUDAGraphDecoderWrapper:
         static_input = torch.zeros(1, self.num_quantizers, size, dtype=dtype, device=device)
         with torch.no_grad():
             _ = self.decoder(static_input)
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
 
         graph = CUDAGraph()
         with torch.no_grad():
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
                 static_output = self.decoder(static_input)
 
         self.graphs[size] = graph
@@ -138,6 +143,15 @@ class CUDAGraphDecoderWrapper:
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         if not self.enabled or not self._warmed_up or codes.shape[0] != 1:
+            return self.decoder(codes)
+
+        # Inner CUDA graph replay is illegal while an outer stream capture is
+        # active (e.g. vLLM's cudagraph_mode=FULL warmup on Stage 1). Fall back
+        # to eager in that case so the outer capture can complete. The guard is
+        # a no-op at runtime: is_current_stream_capturing() returns False
+        # outside the startup capture window, so normal inference still hits
+        # the graph fast path.
+        if torch.cuda.is_current_stream_capturing():
             return self.decoder(codes)
 
         actual_size = codes.shape[-1]

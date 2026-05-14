@@ -291,8 +291,18 @@ def test_deterministic_across_calls(decoder, wrapper):
             [2, 4, 8, 16, 25, 32, 50, 64, 128, 256, 325],
             [512],
         ),
+        (
+            {
+                "codec_chunk_frames": 25,
+                "codec_left_context_frames": 72,
+                "decode_chunk_size": 400,
+                "decode_left_context": 17,
+            },
+            [2, 4, 8, 16, 25, 32, 64, 97, 128, 256, 417],
+            [325, 512],
+        ),
     ],
-    ids=["default", "streaming_c33", "streaming_c25"],
+    ids=["default", "streaming_c33", "streaming_c25", "custom_decode_chunk"],
 )
 def test_compute_capture_sizes(kwargs, expected_in, not_expected):
     """compute_capture_sizes produces expected sizes capped by max useful size."""
@@ -314,9 +324,7 @@ def test_compute_capture_sizes(kwargs, expected_in, not_expected):
 )
 def test_snakebeta_triton_vs_eager(batch, channels, seq_len):
     """Fused Triton SnakeBeta kernel must match eager PyTorch output."""
-    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
-        SnakeBeta,
-    )
+    from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
 
     if not SnakeBeta._init_triton():
         pytest.skip("Triton not available")

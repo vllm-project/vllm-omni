@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
 import math
 import typing
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -17,14 +18,29 @@ from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.multimodal import BaseDummyOptions
-from vllm.distributed import get_pp_group
+from vllm.distributed import (
+    get_ep_group,
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import SharedFusedMoE
+from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
+
+try:
+    from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
+except ImportError:
+    # PyPI vllm 0.20.x neither exports `SharedFusedMoE` from the package top-level
+    # nor ships a `shared_fused_moe.py` submodule. The functionality lives on
+    # `FusedMoE` directly (which gained a `shared_experts` parameter), so alias
+    # the symbol — call sites only use the classmethod `make_expert_params_mapping`
+    # and `__init__(shared_experts=..., ...)` which are present on `FusedMoE`.
+    from vllm.model_executor.layers.fused_moe import FusedMoE as SharedFusedMoE
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -37,7 +53,9 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.hunyuan_v1 import (
+    HunYuanMLP,
     HunYuanModel,
+    HunYuanSparseMoeBlock,
     _get_cla_factor,
     _is_moe,
 )
@@ -77,7 +95,9 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.tokenizer import get_tokenizer
 from vllm.utils.tensor_schema import TensorSchema
+from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.model_executor.models.hunyuan_image3.autoencoder_kl_3d import AutoencoderKLConv3D
 from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjector, Siglip2VisionTransformer
@@ -111,7 +131,7 @@ class HunyuanModel(HunYuanModel):
         if _is_moe(self.config):
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)
-            fused_moe_expert_mapping = SharedFusedMoE.make_expert_params_mapping(
+            fused_moe_expert_mapping = fused_moe_make_expert_params_mapping(
                 model=self,
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
@@ -175,8 +195,11 @@ class HunyuanModel(HunYuanModel):
                     return True
             return False
 
+        skipped_unexpected: set[str] = set()
+
         for name, loaded_weight in weights:
             if contains_unexpected_keyword(name, unexpected_keywords):
+                skipped_unexpected.add(name)
                 continue
 
             if "rotary_emb.inv_freq" in name:
@@ -362,6 +385,17 @@ class HunyuanModel(HunYuanModel):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
+
+        if skipped_unexpected:
+            logger.warning_once(
+                "Skipped %d weights matching unexpected_keywords "
+                "(e.g. vae, vision_model, patch_embed, timestep_emb). "
+                "If upstream renamed components, these may be silently "
+                "lost. Skipped names: %s",
+                len(skipped_unexpected),
+                sorted(skipped_unexpected)[:10],
+            )
+
         return loaded_params
 
 
@@ -826,8 +860,6 @@ class HunyuanImage3Processor:
         else:
             raise TypeError(f"Unsupported image type: {type(image_input)}.")
 
-        torch_dtype = getattr(self.hf_config, "torch_dtype", torch.bfloat16)
-
         batch_data = []
         for image in images:
             current_info = {}
@@ -837,20 +869,38 @@ class HunyuanImage3Processor:
 
             # VIT processing
             vit_pixel_values = self.vision_encoder_processor(image)
-            # shape: (seq_len, num_channels * patch_size * patch_size)
-            current_info["vit_pixel_values"] = vit_pixel_values["pixel_values"].squeeze(0)
-            # shape: (seq_len, )
-            current_info["vit_pixel_attention_mask"] = vit_pixel_values["pixel_attention_mask"].squeeze(0)
-            # shape: (2, )
-            current_info["vit_spatial_shapes"] = vit_pixel_values["spatial_shapes"].squeeze(0)
+            # transformers>=5.x returns lists; stack to tensor when needed
+            _pv = vit_pixel_values["pixel_values"]
+            if isinstance(_pv, list):
+                _pv = torch.stack(_pv, dim=0)
+            current_info["vit_pixel_values"] = _pv.squeeze(0)
+            _pam = vit_pixel_values["pixel_attention_mask"]
+            if isinstance(_pam, list):
+                _pam = torch.stack(_pam, dim=0)
+            current_info["vit_pixel_attention_mask"] = _pam.squeeze(0)
+            _ss = vit_pixel_values["spatial_shapes"]
+            if isinstance(_ss, list):
+                _ss = torch.tensor(_ss, dtype=torch.long)
+            current_info["vit_spatial_shapes"] = _ss.squeeze(0)
 
-            # VAE processing
+            # VAE processing.
+            # The resize/crop math here mirrors HF's `resize_and_crop` with
+            # crop_type="center" (hunyuan3.0_ins/image_processor.py:61). VAE
+            # normalize uses the same transforms.Compose([ToTensor,
+            # Normalize([0.5], [0.5])]) as HF's `pil_image_to_tensor`. So
+            # numerical output of this branch should match HF up to floating-
+            # point reduction order.
             image_width, image_height = self.reso_group.get_target_size(image.width, image.height)
             resized_image = self._resize_and_crop(image, (image_width, image_height))
             vae_pixel_values = self.vae_processor(resized_image)
             token_height = image_height // (self.hf_config.vae_downsample_factor[0] * self.hf_config.patch_size)
             token_width = image_width // (self.hf_config.vae_downsample_factor[1] * self.hf_config.patch_size)
-            current_info["vae_pixel_values"] = vae_pixel_values.squeeze(0).to(dtype=torch_dtype)
+            # Keep fp32 — the VAE encoder casts to model dtype at its boundary
+            # (see _vae_encode). Casting to bf16 here costs ~7e-4 mean-abs-diff
+            # bf16 quantization error on every pixel vs HF (which keeps fp32
+            # in build_cond_images), measurable as a real numerical drift in
+            # downstream image embeddings.
+            current_info["vae_pixel_values"] = vae_pixel_values.squeeze(0)
             current_info["vae_token_grid_hw"] = torch.tensor([token_height, token_width])
 
             # size
@@ -1036,6 +1086,25 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
             if ratio_token_id is None:
                 raise ValueError(f"Ratio token '<img_ratio_{_ratio_index}>' not found in tokenizer vocabulary")
 
+            # NOTE on the timestep slot:
+            # HF's apply_chat_template emits the literal <timestep> token id
+            # 128017 here. HF's modeling forward (`instantiate_continuous_tokens`,
+            # see hunyuan3.0_ins/modeling_hunyuan_image_3.py:1964) then *scatter-
+            # replaces* the embedding at that position with `timestep_emb(0)`
+            # for cond images. So the wte embedding of <timestep> is irrelevant
+            # at runtime — what matters is the timestep_emb injection.
+            #
+            # vllm-omni achieves the same effect via the multimodal-embedding
+            # merger: we put an <img> (128006) placeholder here and ship a
+            # `timestep_emb(0)` tensor at the head of `embed_multimodal()`'s
+            # combined_embeddings. The merger replaces this placeholder's
+            # embedding with the timestep tensor, yielding a final hidden
+            # state numerically equivalent to HF at that position.
+            #
+            # Keep this slot as <img> (NOT <timestep>): switching to <timestep>
+            # requires either (a) a second PromptReplacement targeting 128017,
+            # or (b) the merger's embed_token_id to be a list — neither is
+            # currently supported by PromptUpdateDetails.select_token_id.
             replacement = (
                 [boi_token_id]
                 + [base_size_token_id]
@@ -1052,6 +1121,197 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
         return [
             PromptReplacement(modality="image", target=[img_token_id], replacement=get_replacement_image),
         ]
+
+
+def _hunyuan_image3_unpack_packed_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unpack pre-computed ``(topk_weights, topk_indices)`` packed by
+    :class:`HunyuanImage3SparseMoeBlock` into ``gating_output``.
+
+    Used as ``custom_routing_function`` for the underlying ``SharedFusedMoE``,
+    bypassing its bf16 ``topk_softmax`` CUDA op so the routing decision can
+    be made in fp32 (matching the reference implementation).
+
+    Layout of ``gating_output`` (shape ``[num_tokens, top_k * 2]``)::
+
+        [:, :top_k]  -> topk_weights (already softmax'd + renormalized in fp32,
+                                      stored as fp32 for transport)
+        [:, top_k:]  -> topk_indices (cast to fp32 for transport, restored to int32)
+    """
+    topk_weights = gating_output[:, :topk].contiguous()
+    topk_indices = gating_output[:, topk:]
+    return topk_weights.to(torch.float32), topk_indices.to(torch.int32)
+
+
+class HunyuanImage3SparseMoeBlock(HunYuanSparseMoeBlock):
+    """MoE block with FP32 routing for byte-level alignment with HF.
+
+    The reference ``modeling_hunyuan_image_3.py`` runs the router in fp32:
+
+    - ``HunyuanTopKGate.wg`` is constructed as ``nn.Linear(..., dtype=torch.float32)``
+      and ``hidden_states`` is cast to fp32 before the matmul (line 1114-1116).
+    - ``HunyuanMoE.forward`` wraps the gate call in
+      ``with torch.autocast('cuda', enabled=False):`` to defeat any AMP cast
+      (line 1204-1205), then calls ``easy_topk`` which does
+      ``F.softmax`` → ``torch.topk`` → divide by
+      ``torch.clamp(weight_sums, min=1e-8)`` → cast back to bf16, all in fp32
+      (line 1132-1139, 1206-1207).
+
+    vLLM's stock ``HunYuanSparseMoeBlock`` instead builds the gate as a
+    default-dtype ``ReplicatedLinear`` (bf16) and lets ``SharedFusedMoE``'s
+    ``topk_softmax`` CUDA op consume bf16 logits, which can flip top-k
+    boundary decisions vs HF on close routing scores. With ``num_experts=64``,
+    ``top_k=8`` per layer × 32 MoE layers, even a small per-token flip rate
+    cascades into divergent expert outputs and KV-cache state, eventually
+    flipping the top-1 decoded token.
+
+    This subclass:
+
+    1. Replaces ``self.gate`` with a fp32 ``ReplicatedLinear``.
+    2. Replaces ``self.experts`` with a ``SharedFusedMoE`` whose routing is a
+       no-op unpack of our pre-computed (topk_weights, topk_indices) — the
+       fp32 softmax/topk/renormalize is done in :meth:`forward` here, exactly
+       mirroring HF's ``easy_topk`` math (including ``clamp(min=1e-8)``).
+    """
+
+    def __init__(
+        self,
+        config,
+        quant_config=None,
+        layer_id: int = -1,
+        prefix: str = "",
+        enable_eplb: bool = False,
+    ) -> None:
+        # Bypass ``HunYuanSparseMoeBlock.__init__`` — it would build a wasteful
+        # bf16 gate + a stub ``SharedFusedMoE`` we'd then have to del+recreate
+        # (which trips ``ValueError: Duplicate layer name`` because the stub
+        # already registered itself in ``compilation_config.static_forward_context``).
+        # Instead, set up ``nn.Module`` ourselves and construct the fp32 gate
+        # + ``custom_routing_function``-driven ``SharedFusedMoE`` directly,
+        # mirroring the parent's structure 1:1 except for the routing dtype.
+        nn.Module.__init__(self)
+
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.ep_group = get_ep_group().device_group
+        self.ep_rank = get_ep_group().rank_in_group
+        self.ep_size = self.ep_group.size()
+        self.n_routed_experts = config.num_experts
+
+        if self.tp_size > config.num_experts:
+            raise ValueError(
+                f"Tensor parallel size {self.tp_size} is greater than the number of experts {config.num_experts}."
+            )
+
+        if isinstance(config.moe_topk, list):
+            top_k = config.moe_topk[layer_id]
+        else:
+            top_k = config.moe_topk
+        self.top_k = top_k
+
+        intermediate_size = config.intermediate_size
+        if config.moe_intermediate_size is not None:
+            intermediate_size = (
+                config.moe_intermediate_size
+                if isinstance(config.moe_intermediate_size, int)
+                else config.moe_intermediate_size[layer_id]
+            )
+
+        vllm_config = get_current_vllm_config()
+        eplb_config = vllm_config.parallel_config.eplb_config
+        self.enable_eplb = enable_eplb
+        self.n_logical_experts = self.n_routed_experts
+        self.n_redundant_experts = eplb_config.num_redundant_experts
+        self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
+        self.n_local_physical_experts = self.n_physical_experts // self.ep_size
+        self.physical_expert_start = self.ep_rank * self.n_local_physical_experts
+        self.physical_expert_end = self.physical_expert_start + self.n_local_physical_experts
+
+        # FP32 router gate (HF: ``wg = nn.Linear(..., dtype=torch.float32)``).
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=None,
+            params_dtype=torch.float32,
+            prefix=f"{prefix}.gate",
+        )
+
+        if config.use_mixed_mlp_moe > 0:
+            num_shared_expert = (
+                config.num_shared_expert[layer_id]
+                if isinstance(config.num_shared_expert, list)
+                else config.num_shared_expert
+            )
+            self.shared_mlp = HunYuanMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size * num_shared_expert,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+                prefix=f"{prefix}.shared_mlp",
+            )
+        else:
+            self.shared_mlp = None
+
+        # Experts with our ``_hunyuan_image3_unpack_packed_topk`` custom
+        # routing — we feed it (topk_weights, topk_indices) packed into
+        # ``router_logits`` in ``forward()`` so the bf16 ``topk_softmax``
+        # CUDA op is bypassed entirely. ``renormalize=False`` because we
+        # already did clamp+divide in fp32 to match HF's
+        # ``topk_weight = topk_weight_1 / clamp(sum, min=1e-8)``.
+        self.experts = SharedFusedMoE(
+            shared_experts=self.shared_mlp,
+            num_experts=self.n_routed_experts,
+            top_k=top_k,
+            hidden_size=config.hidden_size,
+            intermediate_size=intermediate_size,
+            renormalize=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.experts",
+            enable_eplb=self.enable_eplb,
+            num_redundant_experts=self.n_redundant_experts,
+            custom_routing_function=_hunyuan_image3_unpack_packed_topk,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        orig_shape = hidden_states.shape
+        hidden_dim = hidden_states.shape[-1]
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # FP32 router (HF: `with torch.autocast('cuda', enabled=False): ...`
+        # plus `if self.wg.weight.dtype == torch.float32: hidden_states.float()`).
+        # ``self.gate.weight`` is fp32 (params_dtype=torch.float32), so the
+        # ReplicatedLinear matmul runs in fp32 once we cast the input.
+        router_logits, _ = self.gate(hidden_states.float())
+
+        # softmax + topk + clamp-divide renormalization, all in fp32 — matches
+        # ``HunyuanTopKGate.easy_topk`` exactly.
+        gates = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+        topk_weights, topk_indices = torch.topk(gates, self.top_k, dim=-1)
+        weight_sums = topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights / weight_sums.clamp(min=1e-8)
+
+        # Cast topk weights to model dtype for the expert MLP combine.
+        # HF: ``topk_weights = topk_weights.to(hidden_states.dtype)`` (line 1207).
+        topk_weights = topk_weights.to(hidden_states.dtype)
+
+        # Pack (weights, indices) into the ``router_logits`` slot so
+        # ``_hunyuan_image3_unpack_packed_topk`` can pull them back out
+        # inside ``SharedFusedMoE``. Both halves are stored as fp32 for
+        # transport — the indices get cast back to int32 on unpack.
+        packed_routing = torch.cat([topk_weights.float(), topk_indices.to(torch.float32)], dim=-1)
+
+        # vllm 0.20+ FusedMoE merges shared-experts internally and runs the
+        # TP all-reduce inside its forward (we no longer pass
+        # `reduce_results=False`). The tuple `(routed, shared)` return shape
+        # from the legacy SharedFusedMoE is gone; the result is the
+        # already-combined, already-reduced tensor.
+        final_hidden_states = self.experts(hidden_states=hidden_states, router_logits=packed_routing)
+        return final_hidden_states.view(orig_shape)
 
 
 class HunyuanImage3RotaryEmbedding(nn.Module):
@@ -1149,6 +1409,8 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
     HunyuanImage3Inputs: TypeAlias = HunyuanImage3PixelInputs
 
+    prefer_model_sampler = True
+
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -1199,6 +1461,10 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         else:
             self.lm_head = PPMissingLayer()
 
+        # --- AR-stage components ---
+        # These are needed for image encoding in the AR stage.
+        # If a future text-only stage is added, gate on vllm_config.model_config.model_stage.
+
         # vae
         self.vae = AutoencoderKLConv3D.from_config(config.vae)
         self.patch_embed = UNetDown(
@@ -1226,7 +1492,134 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self._mrope_joint_img_sep_token_id = tokenizer.convert_tokens_to_ids("<joint_img_sep>")
         self._mrope_max_num_patches = config.vit_processor.get("max_num_patches", 729)
 
+        # Special token IDs for logits processors (stage transitions).
+        # These mirror the official tokenization_hunyuan_image_3.py setup.
+        self._end_of_think_id = tokenizer.convert_tokens_to_ids("</think>")
+        self._recaption_id = tokenizer.convert_tokens_to_ids("<recaption>")
+        self._end_of_recaption_id = tokenizer.convert_tokens_to_ids("</recaption>")
+        self._answer_id = tokenizer.convert_tokens_to_ids("<answer>")
+        self._end_of_answer_id = tokenizer.convert_tokens_to_ids("</answer>")
+        image_base_size = getattr(config, "image_base_size", 1024)
+        self._size_token_id = tokenizer.convert_tokens_to_ids(f"<img_size_{image_base_size}>")
+        self._start_ratio_id = tokenizer.convert_tokens_to_ids("<img_ratio_0>")
+        self._end_ratio_id = tokenizer.convert_tokens_to_ids("<img_ratio_32>")
+        ratio_33 = tokenizer.convert_tokens_to_ids("<img_ratio_33>")
+        ratio_36 = tokenizer.convert_tokens_to_ids("<img_ratio_36>")
+        self._ratio_other_slices = [(ratio_33, ratio_36 + 1)]
+        # Build the full set of ratio token IDs for use as stop tokens.
+        self._all_ratio_ids = set(range(self._start_ratio_id, self._end_ratio_id + 1))
+        for s, e in self._ratio_other_slices:
+            self._all_ratio_ids.update(range(s, e))
+
+        # Determine mode: comprehension (I2T/T2T) vs generation (IT2I/T2I).
+        engine_output_type = getattr(vllm_config.model_config, "engine_output_type", None)
+        self._is_comprehension = engine_output_type in (None, "text")
+
+        # For comprehension mode, block image generation tokens but allow
+        # text structure tokens (<think>, <answer>, etc.) so the model can
+        # follow its natural generation pattern. Runtime sampling params
+        # decide stop tokens from the active bot_task, matching the official
+        # HunyuanImage3 generation path without hard-coded YAML token ids.
+        self._blocked_token_ids: set[int] = set()
+        if self._is_comprehension:
+            self._blocked_token_ids.update(
+                [
+                    self._mrope_boi_token_id,  # <boi>
+                    self._mrope_eoi_token_id,  # <eoi>
+                    self._size_token_id,  # <img_size_*>
+                ]
+            )
+            self._blocked_token_ids.update(self._all_ratio_ids)
+
+        # For generation mode, build stage transition map.
+        # Official logic: </think> → [<recaption>],
+        #   </recaption> → [<answer>, <boi>, <img_size_*>]
+        # After <img_size_*>, restrict vocab to ratio tokens only.
+        # Stage-transition forced sequences, keyed by trigger token.
+        self._stage_transitions: dict[int, list[int]] = {}
+        if not self._is_comprehension:
+            self._stage_transitions[self._end_of_think_id] = [
+                self._recaption_id,
+            ]
+            self._stage_transitions[self._end_of_recaption_id] = [
+                self._answer_id,
+                self._mrope_boi_token_id,
+                self._size_token_id,
+            ]
+
+        self._sampler: Sampler | None = None
+        self._eos_token_id: int = tokenizer.eos_token_id
+
         self._replace_rotary_embeddings()
+        self._patch_moe_blocks()
+
+    def _patch_moe_blocks(self):
+        """Replace stock ``HunYuanSparseMoeBlock`` instances with
+        :class:`HunyuanImage3SparseMoeBlock`, which routes in fp32 to match
+        the HF reference (``modeling_hunyuan_image_3.HunyuanMoE``).
+
+        Stock vLLM builds the router gate as a default-dtype (bf16)
+        ``ReplicatedLinear`` and lets ``SharedFusedMoE``'s ``topk_softmax``
+        kernel consume bf16 logits, which is the largest deterministic
+        precision gap remaining vs HF after the prompt/preprocessing
+        alignment fixes. See ``HunyuanImage3SparseMoeBlock`` docstring for
+        the full rationale.
+
+        Must run before weight loading (still inside ``__init__``) so the
+        replacement gate's fp32 ``params_dtype`` is honored when the
+        checkpoint is loaded.
+        """
+        if not _is_moe(self.config):
+            return
+        enable_eplb = getattr(self.vllm_config.parallel_config, "enable_eplb", False)
+        ccfg = self.vllm_config.compilation_config
+        replaced = 0
+        for layer_id, layer in enumerate(self.model.layers):
+            mlp = getattr(layer, "mlp", None)
+            if isinstance(mlp, HunYuanSparseMoeBlock) and not isinstance(mlp, HunyuanImage3SparseMoeBlock):
+                # Pop the OLD experts' registration from
+                # ``static_forward_context`` first — otherwise the new
+                # ``SharedFusedMoE`` built inside
+                # :class:`HunyuanImage3SparseMoeBlock` will trip
+                # ``ValueError: Duplicate layer name`` (see
+                # vllm/model_executor/layers/fused_moe/layer.py:327).
+                old_prefix = f"model.layers.{layer_id}.mlp.experts"
+                ccfg.static_forward_context.pop(old_prefix, None)
+                if old_prefix in ccfg.static_all_moe_layers:
+                    ccfg.static_all_moe_layers.remove(old_prefix)
+
+                # Free the OLD MoE block's GPU buffers BEFORE allocating
+                # the replacement. The parent ``SharedFusedMoE`` pre-
+                # allocates the full ``[num_experts, ...]`` expert weight
+                # tensors at ``__init__`` (~750 MiB per layer per worker
+                # on this 80B model with TP=2), so without this drop we
+                # transiently double the MoE footprint and OOM near the
+                # gpu_memory_utilization cap.
+                layer.mlp = None
+                del mlp
+                gc.collect()
+                torch.accelerator.empty_cache()
+
+                layer.mlp = HunyuanImage3SparseMoeBlock(
+                    config=self.config,
+                    quant_config=self.quant_config,
+                    layer_id=layer_id,
+                    prefix=f"model.layers.{layer_id}.mlp",
+                    enable_eplb=enable_eplb,
+                )
+                replaced += 1
+        logger.info(
+            "Replaced %d HunYuanSparseMoeBlock layers with "
+            "HunyuanImage3SparseMoeBlock (fp32 router matching HF reference)",
+            replaced,
+        )
+        if replaced == 0:
+            logger.warning(
+                "HunyuanImage3: _patch_moe_blocks replaced 0 layers. "
+                "Routing will run in bf16 instead of fp32 — output will "
+                "diverge from the HF reference more than necessary. "
+                "Check that model.layers[*].mlp is HunYuanSparseMoeBlock."
+            )
 
     def _replace_rotary_embeddings(self):
         """Replace vLLM's standard MRotaryEmbedding with the custom
@@ -1257,6 +1650,12 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             head_dim,
             rope_theta,
         )
+        if replaced == 0:
+            raise RuntimeError(
+                "HunyuanImage3: _replace_rotary_embeddings replaced 0 layers. "
+                "The custom interleaved 2D mRoPE is not active — model outputs "
+                "will be incorrect. Check that model.layers[*].self_attn.rotary_emb exists."
+            )
 
     def _parse_and_validate_image_input(
         self,
@@ -1272,6 +1671,10 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         vae_token_grid_hw = kwargs.pop("vae_token_grid_hw", None)
 
         if vit_pixel_values is None or vae_pixel_values is None:
+            return None
+
+        # Handle empty batch (e.g., during profiling with 0 images / T2T mode)
+        if vit_pixel_values.numel() == 0 or vae_pixel_values.numel() == 0:
             return None
 
         return HunyuanImage3PixelInputs(
@@ -1294,6 +1697,18 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         Encode images through VAE encoder.
         """
         config = self.vae.config
+
+        # Cast pixel input to model dtype here (at the encoder boundary)
+        # rather than inside HunyuanImage3Processor.process_image. This
+        # matches HF's path which keeps fp32 pixels in build_cond_images and
+        # only casts inside the VAE forward — preserving fp32 precision in
+        # the multimodal_data dict and minimizing precision drift vs HF.
+        # Verified by pixel-tensor diff: removing the early bf16 cast brings
+        # omni's vae_pixel_values byte-identical to HF's (within fp32 noise),
+        # whereas an early cast leaves a ~7e-4 mean-abs-diff bf16 quantization
+        # error on every element.
+        if images.dtype != self.vae.dtype:
+            images = images.to(dtype=self.vae.dtype)
 
         vae_encode_result = self.vae.encode(images)
         latents = vae_encode_result.latent_dist.sample()
@@ -1405,11 +1820,14 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             "Each image should have both VAE and ViT embeddings."
         )
 
-        # Order per image: timestep -> VAE tokens -> ViT tokens
+        # Order per image: timestep -> VAE tokens -> ViT tokens.
+        # The <img> placeholder at the timestep slot (see _get_prompt_updates)
+        # gets its embedding replaced by `timestep_emb(0)` here, which is what
+        # HF achieves via instantiate_continuous_tokens at runtime.
         combined_embeddings: list[torch.Tensor] = []
         num_images = len(vae_token_embeddings)
         for img_idx in range(num_images):
-            # 1. Timestep embedding
+            # 1. Timestep embedding (cond image timestep == 0)
             timestep = torch.zeros((1,)).to(vit_embeddings.device).to(vit_embeddings.dtype)
             timestep_emb = self._timestep_encode(timestep)
 
@@ -1472,6 +1890,112 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
+    # ------------------------------------------------------------------
+    # Custom sampler — applies HunyuanImage3-specific logits processors
+    # before the standard sampling step.
+    #
+    # Comprehension (I2T / T2T):
+    #   Block generation-specific special tokens so sampling can't
+    #   accidentally produce <answer>, <boi>, ratio tokens, etc.
+    #
+    # Generation (IT2I / T2I think):
+    #   1. _StageTransitionLogitsProcessor — force token sequences at
+    #      transition boundaries (</think> → <recaption>, etc.)
+    #   2. _ConditionalSliceVocabLogitsProcessor — after <img_size_*>,
+    #      restrict vocab to ratio tokens only (greedy).
+    # ------------------------------------------------------------------
+
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> SamplerOutput | None:
+        if logits is None or logits.numel() == 0:
+            return None
+
+        if self._sampler is None:
+            self._sampler = Sampler()
+
+        min_score = torch.finfo(logits.dtype).min
+
+        assert logits.shape[0] == 1, f"HunyuanImage3 sampler requires max_num_seqs=1, got batch size {logits.shape[0]}"
+
+        for req_idx in range(logits.shape[0]):
+            decoded_tokens: list[int] = (
+                sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
+            )
+            last_token = decoded_tokens[-1] if decoded_tokens else -1
+
+            if self._is_comprehension:
+                for tid in self._blocked_token_ids:
+                    logits[req_idx, tid] = min_score
+            else:
+                forced = self._get_forced_token(decoded_tokens)
+                if forced is not None:
+                    logits[req_idx].fill_(min_score)
+                    logits[req_idx, forced] = 0
+                elif last_token == self._size_token_id:
+                    self._apply_ratio_restriction(logits, req_idx, min_score)
+                elif last_token in self._all_ratio_ids:
+                    logits[req_idx].fill_(min_score)
+                    logits[req_idx, self._eos_token_id] = 0
+
+        return self._sampler(logits=logits, sampling_metadata=sampling_metadata)
+
+    def _get_forced_token(self, decoded_tokens: list[int]) -> int | None:
+        """Derive the next forced token from output history (stateless).
+
+        Scans decoded_tokens backwards for the most recent trigger token,
+        then prefix-matches the forced sequence against what followed.
+        Returns the next token to force, or None if the sequence is complete
+        or history has diverged from the expected forced sequence.
+        """
+        for i in range(len(decoded_tokens) - 1, -1, -1):
+            trigger = decoded_tokens[i]
+            if trigger not in self._stage_transitions:
+                continue
+
+            forced_seq = self._stage_transitions[trigger]
+            emitted = decoded_tokens[i + 1 :]
+
+            matched = 0
+            for expected, actual in zip(forced_seq, emitted):
+                if actual != expected:
+                    # History diverged from the expected forced sequence.
+                    # Stop applying transition forcing for safety.
+                    return None
+                matched += 1
+
+            if matched < len(forced_seq):
+                return forced_seq[matched]
+            return None
+
+        return None
+
+    def _apply_ratio_restriction(
+        self,
+        logits: torch.Tensor,
+        req_idx: int,
+        min_score: float,
+    ) -> None:
+        """Port of official _ConditionalSliceVocabLogitsProcessor.__call__.
+
+        After the size token, only allow ratio tokens and pick greedily.
+        """
+        original = logits[req_idx].clone()
+        logits[req_idx].fill_(min_score)
+        # Allow primary ratio range.
+        logits[req_idx, self._start_ratio_id : self._end_ratio_id + 1] = original[
+            self._start_ratio_id : self._end_ratio_id + 1
+        ]
+        # Allow extra ratio slices.
+        for s, e in self._ratio_other_slices:
+            logits[req_idx, s:e] = original[s:e]
+        # Force greedy: keep only the argmax.
+        max_id = logits[req_idx].argmax().item()
+        logits[req_idx].fill_(min_score)
+        logits[req_idx, max_id] = 0
+
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
     ) -> IntermediateTensors:
@@ -1507,9 +2031,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         input_tokens: list[int],
         mm_features: list[MultiModalFeatureSpec] | None = None,
         *,
-        hf_config: PretrainedConfig,
-        image_grid_thw: list[list[int]] | torch.Tensor,
-        video_grid_thw: list[list[int]] | torch.Tensor,
+        hf_config: PretrainedConfig | None = None,
+        image_grid_thw: list[list[int]] | torch.Tensor | None = None,
+        video_grid_thw: list[list[int]] | torch.Tensor | None = None,
         second_per_grid_ts: list[float] | None = None,
         context_len: int = 0,
         seq_len: int | None = None,

@@ -5,6 +5,8 @@ Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inf
 
 A unified script for text-to-video generation. Supports multiple models with model-aware defaults.
 
+For backend selection and SageAttention usage, see the [Diffusion Attention Backends](../../diffusion/attention_backends.md) guide.
+
 ## Supported Models
 
 | Model | Default Resolution | Default Frames | Default Steps | Guidance | VRAM (BF16) |

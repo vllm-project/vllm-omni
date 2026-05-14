@@ -313,7 +313,7 @@ The registry uses lazy loading, so the model class is imported only when needed.
 
 ## Stage Configuration
 
-Create a YAML configuration file in `vllm_omni/model_executor/stage_configs/`. For a complete example, see the [Qwen3-Omni configuration file](gh-file:vllm_omni/model_executor/stage_configs/qwen3_omni_moe.yaml).
+Create a YAML configuration file in `vllm_omni/deploy/`. For a complete example, see the [Qwen3-Omni configuration file](gh-file:vllm_omni/deploy/qwen3_omni_moe.yaml).
 
 ### Key Configuration Fields
 
@@ -408,18 +408,17 @@ Understanding the data structures is crucial for implementing stage transitions:
 
 **Input to your function:**
 - `stage_list[source_stage_id].engine_outputs`: List of `EngineCoreOutput` objects
-  - Each contains `outputs`: List of `RequestOutput` objects
-  - Each `RequestOutput` has:
-    - `token_ids`: Generated token IDs
-    - `multimodal_output`: Dict with keys like `"code_predictor_codes"`, etc.
-      - These are the hidden states or intermediate outputs from the model's forward pass
-    - `prompt_token_ids`: Original prompt token IDs
+-   -  Each contains `outputs`: List of `RequestOutput` objects
+    - Each `RequestOutput` has:
+-   -  - `token_ids`: Generated token IDs
+       - `multimodal_output`: Dict with keys like `"code_predictor_codes"`, etc.These are the hidden states or intermediate outputs from the model's forward pass
+       - `prompt_token_ids`: Original prompt token IDs
 
 **Output from your function:**
 - Must return `list[OmniTokensPrompt]` where each `OmniTokensPrompt` contains:
-  - `prompt_token_ids`: List[int] - Token IDs for the next stage
-  - `additional_information`: Dict[str, Any] - Optional metadata (e.g., embeddings, hidden states)
-  - `multi_modal_data`: Optional multimodal data if needed
+-   - `prompt_token_ids`: List[int] - Token IDs for the next stage
+    - `additional_information`: Dict[str, Any] - Optional metadata (e.g., embeddings, hidden states)
+    - `multi_modal_data`: Optional multimodal data if needed
 
 ### How Model Outputs Are Stored
 
@@ -614,7 +613,7 @@ For a complete reference implementation, see:
 - **Thinker**: `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_moe_thinker.py`
 - **Talker**: `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_moe_talker.py`
 - **Code2Wav**: `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_code2wav.py`
-- **Stage config**: `vllm_omni/model_executor/stage_configs/qwen3_omni_moe.yaml`
+- **Stage config**: `vllm_omni/deploy/qwen3_omni_moe.yaml`
 - **Input processors**: `vllm_omni/model_executor/stage_input_processors/qwen3_omni.py`
 - **Registry**: `vllm_omni/model_executor/models/registry.py`
 - **Testing**: `vllm_omni/tests/e2e/offline_inference/test_qwen3_omni.py`

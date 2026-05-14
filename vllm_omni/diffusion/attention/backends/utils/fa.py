@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Adapted from https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_flash_attention_utils.py
+from functools import lru_cache
+
 import torch
 import torch.nn.functional as F
+from vllm.logger import init_logger
 
 from vllm_omni.platforms import current_omni_platform
+
+logger = init_logger(__name__)
 
 # Flash Attention function detection with fallback chain
 flash_attn_func = None
@@ -38,8 +43,10 @@ elif current_omni_platform.is_xpu():
     except (ImportError, ModuleNotFoundError):
         pass
 elif current_omni_platform.is_musa():
-    # XXX (MUSA): Add MUSA-specific Flash Attention when available
-    pass
+    try:
+        from flash_attn_interface import flash_attn_func, flash_attn_varlen_func  # noqa: F401
+    except (ImportError, ModuleNotFoundError):
+        pass
 else:
     # CUDA: try FA3 -> FA2 fallback chain
     # Try FA3 from fa3-fwd PyPI package
@@ -71,9 +78,64 @@ else:
         except (ImportError, ModuleNotFoundError):
             pass
 
+    # Fallback: Try vLLM's encapsulated flash attention dispatcher
+    # TODO discuss priority and remove potentially redundant fallbacks
+    if flash_attn_varlen_func is None:
+        try:
+            from vllm.vllm_flash_attn import (  # noqa: F401
+                flash_attn_varlen_func,
+            )
+        except (ImportError, ModuleNotFoundError):
+            pass
+
 # If no FA backend available, SDPA backend will be selected at the platform level
 # flash_attn_func and flash_attn_varlen_func will be None
 HAS_FLASH_ATTN = flash_attn_func is not None or flash_attn_varlen_func is not None
+
+
+@lru_cache(maxsize=1)
+def is_flash_attn_installed() -> bool:
+    """Return whether a Flash Attention backend package is importable.
+
+    Shared by CUDA/ROCm/MUSA platforms.
+    """
+    try:
+        # Check for any FA backend: FA3 (fa3_fwd_interface, flash_attn_interface) or FA2 (flash_attn)
+        # Try FA3 from fa3-fwd PyPI package
+        try:
+            import fa3_fwd_interface  # noqa: F401
+
+            return True
+        except (ImportError, ModuleNotFoundError):
+            pass
+
+        # Try FA3 from flash-attention source build
+        try:
+            import flash_attn_interface  # noqa: F401
+
+            return True
+        except (ImportError, ModuleNotFoundError):
+            pass
+
+        # Try FA2 from flash-attn package
+        from flash_attn import __version__
+
+        if __version__ < "2.6.0":
+            raise ImportError("install flash_attn >= 2.6.0")
+        return True
+    except (ImportError, ModuleNotFoundError):
+        pass
+
+    # Try vLLM's flash attention wrapper
+    try:
+        from vllm.vllm_flash_attn import (  # noqa: F401
+            flash_attn_varlen_func,
+        )
+
+        return True
+    except (ImportError, ModuleNotFoundError):
+        logger.warning("No Flash Attention backend found, using pytorch SDPA implementation")
+        return False
 
 
 def _index_first_axis(tensor, indices):

@@ -78,7 +78,24 @@ class MooncakeStoreConnector(OmniConnectorBase):
         try:
             serialized_data = self.serialize_obj(data)
             key = self._make_key(put_key, from_stage, to_stage)
-            self.store.put(key, serialized_data, self.pin)
+            put_rc = self.store.put(key, serialized_data, self.pin)
+
+            if isinstance(put_rc, bool):
+                put_ok = put_rc
+            else:
+                put_ok = put_rc is None or put_rc == 0
+
+            if not put_ok:
+                self._metrics["errors"] += 1
+                logger.error(
+                    "MooncakeStoreConnector put failed for %s (%s -> %s), rc=%r, %d bytes",
+                    key,
+                    from_stage,
+                    to_stage,
+                    put_rc,
+                    len(serialized_data),
+                )
+                return False, 0, None
 
             self._metrics["puts"] += 1
             self._metrics["bytes_transferred"] += len(serialized_data)

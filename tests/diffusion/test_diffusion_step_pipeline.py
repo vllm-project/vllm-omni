@@ -2,18 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for step-level diffusion execution across runner / worker / executor / engine."""
 
+import contextlib
 import os
 import queue
 import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 import torch
+from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -77,12 +78,12 @@ class _StepPipeline:
         self.prepare_calls += 1
         state.timesteps = [torch.tensor(10), torch.tensor(5)]
         state.latents = torch.tensor([0.0])
+        state.prompt_embeds = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
         return state
 
-    def denoise_step(self, state, **kwargs):
-        del state, kwargs
+    def denoise_step(self, input_batch, **kwargs):
         self.denoise_calls += 1
-        return torch.tensor([1.0])
+        return torch.full_like(input_batch.prompt_embeds, fill_value=0.5)
 
     def step_scheduler(self, state, noise_pred, **kwargs):
         del noise_pred, kwargs
@@ -145,6 +146,7 @@ class _DistributedStepPipeline(CFGParallelMixin):
         state.step_index = 0
         state.scheduler = self.scheduler
         state.do_true_cfg = self.mode == "cfg"
+        state.prompt_embeds = torch.tensor([[0.0, 0.0], [1.0, 1.0]])
         return state
 
     def denoise_step(self, state, **kwargs):
@@ -229,9 +231,20 @@ def _make_engine_request(req_id: str = "req-1", num_inference_steps: int = 2) ->
     )
 
 
+def _make_vllm_config():
+    @contextlib.contextmanager
+    def set_priority(*args, **kwargs):
+        yield
+
+    return SimpleNamespace(
+        kernel_config=SimpleNamespace(ir_op_priority=SimpleNamespace(set_priority=set_priority)),
+        compilation_config=SimpleNamespace(ir_enable_torch_wrap=True),
+    )
+
+
 def _make_runner():
     runner = object.__new__(DiffusionModelRunner)
-    runner.vllm_config = object()
+    runner.vllm_config = _make_vllm_config()
     runner.od_config = SimpleNamespace(
         cache_backend=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
@@ -247,7 +260,7 @@ def _make_runner():
 
 def _make_distributed_runner(mode: str, device: torch.device):
     runner = object.__new__(DiffusionModelRunner)
-    runner.vllm_config = object()
+    runner.vllm_config = _make_vllm_config()
     runner.od_config = SimpleNamespace(
         cache_backend=None,
         parallel_config=SimpleNamespace(use_hsdp=False),
@@ -291,6 +304,7 @@ def _make_engine(scheduler, execute_fn=None) -> DiffusionEngine:
     engine.scheduler = scheduler
     engine.execute_fn = execute_fn
     engine._rpc_lock = threading.RLock()
+    engine._cv = threading.Condition(engine._rpc_lock)
     engine.abort_queue = queue.Queue()
     return engine
 
@@ -327,10 +341,11 @@ def _distributed_step_worker(local_rank: int, world_size: int, mode: str, master
             raise ValueError(f"Unsupported distributed test mode: {mode}")
 
         runner = _make_distributed_runner(mode, device)
-        output = DiffusionModelRunner.execute_stepwise(
+        result = DiffusionModelRunner.execute_stepwise(
             runner,
             _make_scheduler_output(_make_step_request(num_inference_steps=1), step_id=0),
         )
+        output = result.get_req_output("req-1")
 
         assert output.finished is True
         assert output.result is not None
@@ -354,14 +369,16 @@ class TestRunner:
         req = _make_step_request()
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
-        first = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
+        result = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
+        first = result.get_req_output("req-1")
         assert first.req_id == "req-1"
         assert first.step_index == 1
         assert first.finished is False
         assert first.result is None
         assert "req-1" in runner.state_cache
 
-        second = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
+        result = DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
+        second = result.get_req_output("req-1")
         assert second.req_id == "req-1"
         assert second.step_index == 2
         assert second.finished is True
@@ -393,8 +410,8 @@ class TestRunner:
             num_waiting_reqs=0,
         )
 
-        with pytest.raises(ValueError, match="batch_size=1"):
-            DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+        result = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+        assert len(result) == 2
 
     def test_rejects_missing_cached_state(self):
         runner = _make_runner()
@@ -408,8 +425,8 @@ class TestRunner:
         req = _make_step_request()
         monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
 
-        output = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
-
+        result = DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(req, step_id=0))
+        output = result.get_req_output("req-1")
         assert output.req_id == "req-1"
         assert output.step_index == 0
         assert output.finished is True
@@ -444,7 +461,7 @@ class TestRunner:
                 return False
 
         runner = object.__new__(DiffusionModelRunner)
-        runner.vllm_config = object()
+        runner.vllm_config = _make_vllm_config()
         runner.od_config = SimpleNamespace(
             enable_cpu_offload=False,
             enable_layerwise_offload=False,
@@ -542,11 +559,11 @@ class TestWorker:
 class TestExecutor:
     """MultiprocDiffusionExecutor.execute_step"""
 
-    def test_execute_step_passes_through_runner_output(self):
+    def test_execute_step_passes_through_runner_output(self, mocker: MockerFixture):
         executor = object.__new__(MultiprocDiffusionExecutor)
         executor._ensure_open = lambda: None
         expected = RunnerOutput(req_id="req-step", step_index=1, finished=False, result=None)
-        executor.collective_rpc = Mock(return_value=expected)
+        executor.collective_rpc = mocker.Mock(return_value=expected)
 
         request = _make_engine_request("req-step", num_inference_steps=2)
         scheduler_output = _make_scheduler_output(request, sched_req_id="req-step")
@@ -578,9 +595,9 @@ class TestEngine:
             ),
         ],
     )
-    def test_step_engine_returns_error(self, execute_fn, expected_error):
+    def test_step_engine_returns_error(self, execute_fn, expected_error, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(Mock())
+        scheduler.initialize(SimpleNamespace())
         engine = _make_engine(scheduler, execute_fn=execute_fn)
 
         output = engine.add_req_and_wait_for_response(_make_engine_request("req-error", num_inference_steps=2))
@@ -588,9 +605,9 @@ class TestEngine:
         assert output.output is None
         assert expected_error in output.error
 
-    def test_step_execution_completes(self):
+    def test_step_execution_completes(self, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(Mock())
+        scheduler.initialize(SimpleNamespace())
         engine = _make_engine(scheduler)
         request = _make_engine_request("req-step", num_inference_steps=2)
 
@@ -614,9 +631,9 @@ class TestEngine:
         assert output.error is None
         assert torch.equal(output.output, torch.tensor([2.0]))
 
-    def test_step_abort_stops_rescheduling_after_first_step(self):
+    def test_step_abort_stops_rescheduling_after_first_step(self, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(Mock())
+        scheduler.initialize(SimpleNamespace())
         engine = _make_engine(scheduler)
         request = _make_engine_request("req-stop", num_inference_steps=4)
 
@@ -639,9 +656,9 @@ class TestEngine:
         assert step["n"] == 1
         _assert_aborted_output(output, "req-stop")
 
-    def test_step_abort_after_reschedule_returns_aborted_output(self):
+    def test_step_abort_after_reschedule_returns_aborted_output(self, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(Mock())
+        scheduler.initialize(SimpleNamespace())
         engine = _make_engine(scheduler)
         request = _make_engine_request("req-mid", num_inference_steps=4)
 
@@ -666,9 +683,9 @@ class TestEngine:
         assert step["n"] == 2
         _assert_aborted_output(output, "req-mid")
 
-    def test_finished_step_without_result_returns_error(self):
+    def test_finished_step_without_result_returns_error(self, mocker: MockerFixture):
         scheduler = StepScheduler()
-        scheduler.initialize(Mock())
+        scheduler.initialize(SimpleNamespace())
         engine = _make_engine(
             scheduler,
             execute_fn=lambda _: RunnerOutput(

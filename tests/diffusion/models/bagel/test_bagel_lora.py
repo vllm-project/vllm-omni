@@ -11,7 +11,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from tests.diffusion.lora.conftest import (
+from tests.diffusion.lora.helpers import (
     DummyBaseLayerWithLoRA,
     FakeLinearBase,
     fake_replace_submodule,

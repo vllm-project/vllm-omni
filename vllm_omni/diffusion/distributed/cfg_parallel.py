@@ -9,12 +9,15 @@ from abc import ABCMeta
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
+
+logger = init_logger(__name__)
 
 
 def _wrap(pred: torch.Tensor | tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
@@ -30,6 +33,24 @@ def _unwrap(pred: tuple[torch.Tensor, ...]) -> torch.Tensor | tuple[torch.Tensor
 def _slice_pred(pred: tuple[torch.Tensor, ...], output_slice: int) -> tuple[torch.Tensor, ...]:
     """Slice each element along dim 1."""
     return tuple(p[:, :output_slice] for p in pred)
+
+
+def _dispatch_branches(n_branches: int, n_ranks: int) -> list[list[int]]:
+    """
+    Round-robin dispatch N branches to M ranks.
+
+    Rule: branch i → rank (i % n_ranks).
+
+    Examples:
+        _dispatch_branches(3, 2) -> [[0, 2], [1]]
+        _dispatch_branches(3, 3) -> [[0], [1], [2]]
+        _dispatch_branches(4, 2) -> [[0, 2], [1, 3]]
+        _dispatch_branches(4, 4) -> [[0], [1], [2], [3]]
+    """
+    assignments: list[list[int]] = [[] for _ in range(n_ranks)]
+    for i in range(n_branches):
+        assignments[i % n_ranks].append(i)
+    return assignments
 
 
 class CFGParallelMixin(metaclass=ABCMeta):
@@ -183,6 +204,165 @@ class CFGParallelMixin(metaclass=ABCMeta):
 
         results = []
         for p, n in zip(pos_t, neg_t):
+            comb = n + true_cfg_scale * (p - n)
+            if cfg_normalize:
+                comb = self.cfg_normalize_function(p, comb)
+            results.append(comb)
+        return _unwrap(tuple(results))
+
+    # ── N-branch CFG interface (for 3+ branch models) ──
+
+    def predict_noise_with_multi_branch_cfg(
+        self,
+        do_true_cfg: bool,
+        true_cfg_scale: float | dict[str, float],
+        branches_kwargs: list[dict[str, Any]],
+        cfg_normalize: bool = False,
+        output_slice: int | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """
+        Predict noise with N-branch CFG dispatch across M GPUs.
+
+        This is the multi-branch counterpart of predict_noise_maybe_with_cfg().
+        Use this for models with 3 or more CFG branches (e.g., OmniGen2, Bagel,
+        DreamID). Existing 2-branch models should continue using
+        predict_noise_maybe_with_cfg().
+
+        Args:
+            do_true_cfg: Whether to apply CFG.
+            true_cfg_scale: CFG scale factor (passed to combine_multi_branch_cfg_noise).
+            branches_kwargs: List of N dicts, each containing kwargs for one
+                predict_noise() call. branches_kwargs[0] is always the
+                positive/conditional branch.
+            cfg_normalize: Whether to normalize (passed to combine_multi_branch_cfg_noise).
+            output_slice: If set, slice each output to [:, :output_slice].
+
+        Returns:
+            Combined noise prediction, identical on all ranks in CFG parallel.
+        """
+        if do_true_cfg:
+            n_branches = len(branches_kwargs)
+            cfg_world_size = get_classifier_free_guidance_world_size()
+            cfg_parallel_ready = cfg_world_size > 1
+
+            if cfg_parallel_ready:
+                return self._predict_multi_branch_parallel(
+                    branches_kwargs,
+                    n_branches,
+                    cfg_world_size,
+                    true_cfg_scale,
+                    cfg_normalize,
+                    output_slice,
+                )
+            else:
+                # Sequential: run all N branches on single device
+                preds: list[torch.Tensor | tuple[torch.Tensor, ...]] = []
+                for kw in branches_kwargs:
+                    pred = _wrap(self.predict_noise(**kw))
+                    if output_slice is not None:
+                        pred = _slice_pred(pred, output_slice)
+                    preds.append(_unwrap(pred))
+                return self.combine_multi_branch_cfg_noise(preds, true_cfg_scale, cfg_normalize)
+        else:
+            # No CFG: only compute positive/conditional prediction
+            pred = self.predict_noise(**branches_kwargs[0])
+            if output_slice is not None:
+                pred = _unwrap(_slice_pred(_wrap(pred), output_slice))
+            return pred
+
+    def _predict_multi_branch_parallel(
+        self,
+        branches_kwargs: list[dict[str, Any]],
+        n_branches: int,
+        cfg_world_size: int,
+        true_cfg_scale: float,
+        cfg_normalize: bool,
+        output_slice: int | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Dispatch N branches across M ranks, all_gather, then combine."""
+        cfg_group = get_cfg_group()
+        cfg_rank = get_classifier_free_guidance_rank()
+
+        if cfg_world_size > n_branches:
+            logger.warning_once(
+                "cfg_parallel_size=%d > n_branches=%d, %d GPU(s) will be idle for CFG",
+                cfg_world_size,
+                n_branches,
+                cfg_world_size - n_branches,
+            )
+
+        # Assign branches to ranks via round-robin
+        assignments = _dispatch_branches(n_branches, cfg_world_size)
+        my_branch_ids = assignments[cfg_rank]
+        max_per_rank = max(len(a) for a in assignments)
+
+        # Run assigned branches
+        my_preds: list[tuple[torch.Tensor, ...]] = []
+        for bid in my_branch_ids:
+            pred = _wrap(self.predict_noise(**branches_kwargs[bid]))
+            if output_slice is not None:
+                pred = _slice_pred(pred, output_slice)
+            my_preds.append(pred)
+
+        # Idle ranks (cfg_world_size > n_branches) run a forward pass to get the output shape for all_gather.
+        # Output shape cannot be inferred from kwargs — may be tuple, sliced, etc.
+        if not my_preds:
+            pred = _wrap(self.predict_noise(**branches_kwargs[0]))
+            if output_slice is not None:
+                pred = _slice_pred(pred, output_slice)
+            my_preds.append(pred)
+
+        # Pad to max_per_rank with zeros so all ranks have same size
+        ref_pred = my_preds[0]
+        while len(my_preds) < max_per_rank:
+            my_preds.append(tuple(torch.zeros_like(t) for t in ref_pred))
+
+        # All-gather each output element separately (like predict_noise_maybe_with_cfg)
+        # For each slot, gather across ranks; then pick valid results by owner_rank
+        # all_slots[slot][elem_idx] = [rank0_tensor, rank1_tensor, ...]
+        all_slots: list[list[list[torch.Tensor]]] = []
+        for slot in range(max_per_rank):
+            slot_results: list[list[torch.Tensor]] = []
+            for p in my_preds[slot]:
+                gathered = cfg_group.all_gather(p, separate_tensors=True)
+                slot_results.append(gathered)
+            all_slots.append(slot_results)
+
+        # Reconstruct final_preds in branch order
+        final_preds: list[torch.Tensor | tuple[torch.Tensor, ...]] = []
+        for bid in range(n_branches):
+            owner_rank = bid % cfg_world_size
+            slot_idx = bid // cfg_world_size
+            elements = tuple(all_slots[slot_idx][elem_idx][owner_rank] for elem_idx in range(len(ref_pred)))
+            final_preds.append(_unwrap(elements))
+
+        return self.combine_multi_branch_cfg_noise(final_preds, true_cfg_scale, cfg_normalize)
+
+    def combine_multi_branch_cfg_noise(
+        self,
+        predictions: list[torch.Tensor | tuple[torch.Tensor, ...]],
+        true_cfg_scale: float | dict[str, float],
+        cfg_normalize: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """
+        Combine N branch predictions. Default: standard 2-branch CFG formula.
+
+        Override this method for custom multi-branch combine logic.
+
+        Args:
+            predictions: List of N predictions, where predictions[0] is always
+                the positive/conditional branch.
+            true_cfg_scale: CFG scale factor (float for 2-branch, dict for multi-branch).
+            cfg_normalize: Whether to normalize the combined prediction.
+
+        Returns:
+            Combined noise prediction.
+        """
+        positive = _wrap(predictions[0])
+        negative = _wrap(predictions[1])
+
+        results = []
+        for p, n in zip(positive, negative):
             comb = n + true_cfg_scale * (p - n)
             if cfg_normalize:
                 comb = self.cfg_normalize_function(p, comb)
