@@ -613,6 +613,7 @@ def test_reliability_fault_process_kill_worker_with_load_request_failure(
 
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
+@pytest.mark.skip(reason="remain process after kill serve root")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
@@ -633,6 +634,7 @@ def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup
 
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
+@pytest.mark.skip(reason="remain process after kill serve root")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)

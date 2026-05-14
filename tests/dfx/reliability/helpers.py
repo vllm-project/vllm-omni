@@ -4,6 +4,10 @@ This module keeps fault injection callable from tests directly:
 - GPU OOM (CUDA sidecar memory hog)
 - process kill by pattern and signal
 - post-ready hooks via ``fault_injector`` / ``omni_server_after_fault`` fixtures
+
+Worker PID classification for post-fault GPU/process checks uses substring markers
+(see :data:`DEFAULT_RUNTIME_WORKER_MARKERS` and ``server.reliability_worker_*`` attrs
+documented on :func:`_resolve_runtime_worker_markers`).
 """
 
 from __future__ import annotations
@@ -27,6 +31,15 @@ import psutil
 import pytest
 
 logger = logging.getLogger(__name__)
+
+# Substrings matched against ``psutil.Process.name`` + argv text for classifying GPU
+# workers under the test server tree. Extend per-suite via
+# ``server.reliability_worker_markers_extra`` or replace via
+# ``server.reliability_worker_markers`` (see ``_resolve_runtime_worker_markers``).
+DEFAULT_RUNTIME_WORKER_MARKERS: tuple[str, ...] = (
+    "multiprocessing.spawn",
+    "VLLM::Worker",
+)
 
 
 @dataclass
@@ -453,6 +466,61 @@ def _safe_proc_info(pid: int) -> tuple[str, str]:
         return "<unknown>", "<unavailable>"
 
 
+def _normalize_worker_marker_substrings(seq: Sequence[Any], *, context: str) -> tuple[str, ...]:
+    """Return deduped non-empty marker substrings; raises if any entry is blank."""
+    out: list[str] = []
+    for item in seq:
+        s = str(item).strip()
+        if not s:
+            raise ValueError(f"{context}: worker marker must be a non-empty string, got {item!r}")
+        out.append(s)
+    return tuple(dict.fromkeys(out))
+
+
+def _resolve_runtime_worker_markers(
+    server: Any,
+    injector_markers_extra: Sequence[str] | None,
+) -> tuple[str, ...]:
+    """Resolve which substrings classify worker PIDs for fault snapshots.
+
+    If ``server.reliability_worker_markers`` is set to a sequence, **only** those
+    markers are used (no defaults). Otherwise defaults from
+    :data:`DEFAULT_RUNTIME_WORKER_MARKERS` are merged with:
+
+    - ``server.reliability_worker_markers_extra`` when present, and
+    - ``injector_markers_extra`` from :func:`make_server_root_kill_fault_injector` /
+      :func:`make_server_tree_kill_fault_injector`.
+    """
+    replace = getattr(server, "reliability_worker_markers", None)
+    if replace is not None:
+        return _normalize_worker_marker_substrings(replace, context="server.reliability_worker_markers")
+
+    merged: list[str] = []
+    merged.extend(DEFAULT_RUNTIME_WORKER_MARKERS)
+    extra_attr = getattr(server, "reliability_worker_markers_extra", None)
+    if extra_attr is not None:
+        merged.extend(
+            _normalize_worker_marker_substrings(extra_attr, context="server.reliability_worker_markers_extra")
+        )
+    if injector_markers_extra is not None:
+        merged.extend(
+            _normalize_worker_marker_substrings(
+                injector_markers_extra,
+                context="injector worker_markers_extra",
+            )
+        )
+    return tuple(dict.fromkeys(merged))
+
+
+def _pid_looks_like_runtime_worker(pid: int, markers: Sequence[str]) -> bool:
+    """True when process name or argv contains any resolved worker marker substring."""
+    if not markers:
+        return False
+    name, cmdline = _safe_proc_info(pid)
+    text = f"{name} {cmdline}"
+    return any(marker in text for marker in markers)
+
+
 def _list_server_process_tree(server: Any) -> list[int]:
     """Return [root, descendants...] PIDs for the current test server instance."""
     root_proc = getattr(server, "proc", None)
@@ -613,7 +681,12 @@ def assert_no_worker_residual_and_gpu_release(
         pytest.fail(f"[{scenario}] missing reliability fault snapshot on server")
     worker_pids = [int(pid) for pid in snapshot.get("worker_pids", [])]
     if not worker_pids:
-        pytest.skip(f"[{scenario}] no worker PIDs captured for this run")
+        markers = snapshot.get("worker_markers", [])
+        pytest.skip(
+            f"[{scenario}] no worker PIDs captured for this run "
+            f"(markers tried: {markers!r}; set server.reliability_worker_markers_extra "
+            "or server.reliability_worker_markers, or pass worker_markers_extra=... to the injector)"
+        )
 
     worker_pid_set = set(worker_pids)
     deadline = time.monotonic() + timeout_sec
@@ -633,19 +706,26 @@ def assert_no_worker_residual_and_gpu_release(
     assert not last_gpu_leaks, f"[{scenario}] worker GPU memory not released: {last_gpu_leaks}"
 
 
-def _capture_server_fault_snapshot(server: Any) -> dict[str, list[int]]:
+def _capture_server_fault_snapshot(
+    server: Any,
+    *,
+    worker_markers_extra: Sequence[str] | None = None,
+) -> dict[str, list[int]]:
     """Capture current server process snapshot for post-fault assertions."""
+    markers = _resolve_runtime_worker_markers(server, worker_markers_extra)
     tree_pids = _list_server_process_tree(server)
     root_pid = tree_pids[0] if tree_pids else None
     worker_pids: list[int] = []
     for pid in tree_pids:
-        _, cmdline = _safe_proc_info(pid)
-        if "multiprocessing.spawn" in cmdline:
+        if root_pid is not None and int(pid) == int(root_pid):
+            continue
+        if _pid_looks_like_runtime_worker(pid, markers):
             worker_pids.append(pid)
     snapshot = {
         "root_pids": [root_pid] if root_pid is not None else [],
         "tree_pids": tree_pids,
         "worker_pids": worker_pids,
+        "worker_markers": list(markers),
     }
     setattr(server, "reliability_fault_snapshot", snapshot)
     return snapshot
@@ -655,12 +735,18 @@ def make_server_root_kill_fault_injector(
     *,
     signal_name: str = "SIGKILL",
     post_kill_wait_seconds: float = 0.0,
+    worker_markers_extra: Sequence[str] | None = None,
 ) -> FaultInjector:
-    """Kill only the current server root process (simulate first strike on PID1-like process)."""
+    """Kill only the current server root process (simulate first strike on PID1-like process).
+
+    ``worker_markers_extra`` is merged into worker PID detection for the fault snapshot
+    (after :data:`DEFAULT_RUNTIME_WORKER_MARKERS` unless
+    ``server.reliability_worker_markers`` replaces the set entirely).
+    """
 
     def _inject(server: Any) -> None:
         _log_server_process_tree(server)
-        snapshot = _capture_server_fault_snapshot(server)
+        snapshot = _capture_server_fault_snapshot(server, worker_markers_extra=worker_markers_extra)
         root_pids = snapshot["root_pids"]
         if not root_pids:
             pytest.skip("no server root process found for root-kill injection")
@@ -685,12 +771,16 @@ def make_server_tree_kill_fault_injector(
     signal_name: str = "SIGKILL",
     post_kill_wait_seconds: float = 0.0,
     inter_kill_wait_seconds: float = 0.2,
+    worker_markers_extra: Sequence[str] | None = None,
 ) -> FaultInjector:
-    """Kill current server root first, then kill all remaining descendants."""
+    """Kill current server root first, then kill all remaining descendants.
+
+    See :func:`make_server_root_kill_fault_injector` for ``worker_markers_extra``.
+    """
 
     def _inject(server: Any) -> None:
         _log_server_process_tree(server)
-        snapshot = _capture_server_fault_snapshot(server)
+        snapshot = _capture_server_fault_snapshot(server, worker_markers_extra=worker_markers_extra)
         tree_pids = [int(pid) for pid in snapshot["tree_pids"]]
         if not tree_pids:
             pytest.skip("no server process tree found for tree-kill injection")
