@@ -30,6 +30,18 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 
+
+from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.layers.adalayernorm import (
+    AdaLayerNormContinuous,
+    AdaLayerNormZero,
+    AdaLayerNormZeroSingle,
+)
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
+
+logger = init_logger(__name__)
+
 def _safe_quant_config(quant_config: "QuantizationConfig | None") -> "QuantizationConfig | None":
     """Return quant_config only if it is safe to propagate here, else None.
 
@@ -45,18 +57,6 @@ def _safe_quant_config(quant_config: "QuantizationConfig | None") -> "Quantizati
     if isinstance(quant_config, INCConfig):
         return quant_config
     return None
-
-
-from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.layers.adalayernorm import (
-    AdaLayerNormContinuous,
-    AdaLayerNormZero,
-    AdaLayerNormZeroSingle,
-)
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
-
-logger = init_logger(__name__)
 
 
 class ColumnParallelApproxGELU(nn.Module):
