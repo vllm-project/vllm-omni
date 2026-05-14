@@ -240,9 +240,9 @@ def test_thinker_prefix_caching(omni_server, openai_client, run_level) -> None:
 def test_thinker_prefix_caching_audio_output(omni_server, openai_client) -> None:
     """
     Verify that thinker prefix caching does not hang when the request
-    produces audio output (text + audio modalities).  This exercises the
-    pooler_output path with prefix-cached multimodal tensors flowing through
-    the full thinker -> talker -> code2wav pipeline.
+    produces audio output (text + audio modalities).  Sends two identical
+    requests so the second exercises the prefix-cached path through the
+    full thinker -> talker -> code2wav pipeline.
 
     Regression test for https://github.com/vllm-project/vllm-omni/issues/3510
     """
@@ -256,8 +256,10 @@ def test_thinker_prefix_caching_audio_output(omni_server, openai_client) -> None
         "messages": messages,
         "stream": True,
         "key_words": {
-            "audio": ["test"],
+            "audio": ["beijing"],
         },
     }
 
+    # First request warms the prefix cache; second request hits it.
+    openai_client.send_omni_request(request_config, request_num=1)
     openai_client.send_omni_request(request_config, request_num=1)
