@@ -10,6 +10,7 @@ from tqdm.auto import tqdm
 from vllm.logger import init_logger
 from vllm.sampling_params import RequestOutputKind
 
+from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import OmniBase
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
@@ -33,7 +34,7 @@ class Omni(OmniBase):
         for stage_id, params in enumerate(sampling_params_list):
             sp = copy.deepcopy(params)
             stage_meta = self.engine.get_stage_metadata(stage_id)
-            if stage_meta.get("stage_type") != "diffusion" and hasattr(sp, "output_kind"):
+            if stage_meta.stage_type != "diffusion" and hasattr(sp, "output_kind"):
                 sp.output_kind = RequestOutputKind.FINAL_ONLY
             effective_params.append(sp)
         return effective_params
@@ -181,7 +182,7 @@ class Omni(OmniBase):
                 if output_to_yield is not None:
                     yield output_to_yield
 
-                if msg.get("finished"):
+                if isinstance(msg, OutputMessage) and msg.finished:
                     active_reqs.discard(req_id)
                     if pbar is not None:
                         pbar.update(1)
