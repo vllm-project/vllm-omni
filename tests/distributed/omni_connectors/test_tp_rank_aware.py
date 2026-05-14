@@ -115,39 +115,43 @@ class TestConnectorKeyFormat:
 class TestRankMapping:
     """Verify get_kv_target_ranks and get_kv_source_ranks for various TP configs."""
 
-    def test_homogeneous_tp2_rank0(self):
-        topo = KVTPTopology(source_tp_size=2, target_tp_size=2, local_rank=0)
-        assert get_kv_target_ranks(topo) == [0]
-        assert get_kv_source_ranks(topo) == [0]
+    @pytest.mark.parametrize(
+        "tp_size,local_rank",
+        [
+            (2, 0),
+            (2, 1),
+            (4, 3),
+        ],
+    )
+    def test_homogeneous_tp(self, tp_size, local_rank):
+        """Homogeneous TP: each rank sends/receives to/from itself."""
+        topo = KVTPTopology(source_tp_size=tp_size, target_tp_size=tp_size, local_rank=local_rank)
+        assert get_kv_target_ranks(topo) == [local_rank]
+        assert get_kv_source_ranks(topo) == [local_rank]
 
-    def test_homogeneous_tp2_rank1(self):
-        topo = KVTPTopology(source_tp_size=2, target_tp_size=2, local_rank=1)
-        assert get_kv_target_ranks(topo) == [1]
-        assert get_kv_source_ranks(topo) == [1]
+    @pytest.mark.parametrize(
+        "local_rank,expected_source_ranks",
+        [
+            (0, [0, 1]),  # rank 0 receives from sender ranks 0 and 1
+            (1, [2, 3]),  # rank 1 receives from sender ranks 2 and 3
+        ],
+    )
+    def test_sender_gt_receiver_tp4_to_tp2(self, local_rank, expected_source_ranks):
+        """Receiver with source_tp=4, target_tp=2."""
+        topo = KVTPTopology(source_tp_size=4, target_tp_size=2, local_rank=local_rank)
+        assert get_kv_source_ranks(topo) == expected_source_ranks
 
-    def test_homogeneous_tp4_rank3(self):
-        topo = KVTPTopology(source_tp_size=4, target_tp_size=4, local_rank=3)
-        assert get_kv_target_ranks(topo) == [3]
-        assert get_kv_source_ranks(topo) == [3]
-
-    def test_sender_gt_receiver_tp4_to_tp2_rank0(self):
-        """Receiver rank 0 should receive from sender rank 0 and 1."""
-        topo = KVTPTopology(source_tp_size=4, target_tp_size=2, local_rank=0)
-        assert get_kv_source_ranks(topo) == [0, 1]
-
-    def test_sender_gt_receiver_tp4_to_tp2_rank1(self):
-        """Receiver rank 1 should receive from sender rank 2 and 3."""
-        topo = KVTPTopology(source_tp_size=4, target_tp_size=2, local_rank=1)
-        assert get_kv_source_ranks(topo) == [2, 3]
-
-    def test_sender_lt_receiver_tp2_to_tp4_rank0(self):
-        """Sender rank 0 should send to receiver ranks 0 and 1."""
-        topo = KVTPTopology(source_tp_size=2, target_tp_size=4, local_rank=0)
-        assert get_kv_target_ranks(topo) == [0, 1]
-
-    def test_sender_lt_receiver_tp2_to_tp4_rank1(self):
-        topo = KVTPTopology(source_tp_size=2, target_tp_size=4, local_rank=1)
-        assert get_kv_target_ranks(topo) == [2, 3]
+    @pytest.mark.parametrize(
+        "local_rank,expected_target_ranks",
+        [
+            (0, [0, 1]),  # sender rank 0 sends to receiver ranks 0 and 1
+            (1, [2, 3]),  # sender rank 1 sends to receiver ranks 2 and 3
+        ],
+    )
+    def test_sender_lt_receiver_tp2_to_tp4(self, local_rank, expected_target_ranks):
+        """Sender with source_tp=2, target_tp=4."""
+        topo = KVTPTopology(source_tp_size=2, target_tp_size=4, local_rank=local_rank)
+        assert get_kv_target_ranks(topo) == expected_target_ranks
 
     def test_receiver_lt_sender_source_ranks(self):
         """Receiver rank 0 with tp2_to_tp4 should source from rank 0 only."""
@@ -174,21 +178,21 @@ class TestBuildRankAwareRecvKeys:
         assert key == "omni_stage0_to_stage1_kv_cache_req-1"
         assert rank is None
 
-    def test_homogeneous_tp2_rank0(self):
-        topo = KVTPTopology(source_tp_size=2, target_tp_size=2, local_rank=0)
+    @pytest.mark.parametrize(
+        "local_rank,expected_key,expected_rank",
+        [
+            (0, "req-1_stage0_0_0_0", 0),
+            (1, "req-1_stage0_0_1_1", 1),
+        ],
+    )
+    def test_homogeneous_tp2(self, local_rank, expected_key, expected_rank):
+        """Homogeneous TP=2: each rank gets one key."""
+        topo = KVTPTopology(source_tp_size=2, target_tp_size=2, local_rank=local_rank)
         pairs = build_rank_aware_recv_keys("req-1", "stage0", "stage1", topo)
         assert len(pairs) == 1
         key, rank = pairs[0]
-        assert key == "req-1_stage0_0_0_0"
-        assert rank == 0
-
-    def test_homogeneous_tp2_rank1(self):
-        topo = KVTPTopology(source_tp_size=2, target_tp_size=2, local_rank=1)
-        pairs = build_rank_aware_recv_keys("req-1", "stage0", "stage1", topo)
-        assert len(pairs) == 1
-        key, rank = pairs[0]
-        assert key == "req-1_stage0_0_1_1"
-        assert rank == 1
+        assert key == expected_key
+        assert rank == expected_rank
 
     def test_heterogeneous_tp4_to_tp2_rank0_gets_two_keys(self):
         """Receiver rank 0 with source_tp=4, target_tp=2 should get 2 keys."""
@@ -311,9 +315,16 @@ class TestReceiveConstructsMetadata:
         assert len(calls) > 0
         assert calls[0]["metadata"] is None
 
-    def test_homogeneous_tp2_rank0_passes_metadata(self):
-        """TP=2 rank 0: metadata should point to sender rank 0's port."""
-        mgr = _make_manager(from_tp=2, to_tp=2, local_rank=0, recv_timeout=0.05)
+    @pytest.mark.parametrize(
+        "local_rank,expected_port_offset",
+        [
+            (0, 0),
+            (1, 1),
+        ],
+    )
+    def test_homogeneous_tp2_passes_metadata(self, local_rank, expected_port_offset):
+        """TP=2: metadata should point to sender rank's port with correct offset."""
+        mgr = _make_manager(from_tp=2, to_tp=2, local_rank=local_rank, recv_timeout=0.05)
         mgr.update_sender_info({"host": "10.0.0.1", "zmq_port": 50151})
 
         calls = []
@@ -330,24 +341,7 @@ class TestReceiveConstructsMetadata:
         meta = calls[0]["metadata"]
         assert meta is not None
         assert meta["source_host"] == "10.0.0.1"
-        assert meta["source_port"] == 50151 + 0 * KV_RANK_PORT_STRIDE
-
-    def test_homogeneous_tp2_rank1_passes_metadata_with_offset(self):
-        mgr = _make_manager(from_tp=2, to_tp=2, local_rank=1, recv_timeout=0.05)
-        mgr.update_sender_info({"host": "10.0.0.1", "zmq_port": 50151})
-
-        calls = []
-
-        class _Connector:
-            def get(self, from_stage, to_stage, get_key, metadata=None):
-                calls.append({"key": get_key, "metadata": metadata})
-                return None
-
-        mgr._connector = _Connector()
-        mgr.receive_kv_cache_for_request("req-1")
-
-        meta = calls[0]["metadata"]
-        assert meta["source_port"] == 50151 + 1 * KV_RANK_PORT_STRIDE
+        assert meta["source_port"] == 50151 + expected_port_offset * KV_RANK_PORT_STRIDE
 
     def test_heterogeneous_tp4_to_tp2_rank0_multiple_metadata(self):
         """Receiver rank 0 with source_tp=4, target_tp=2 should call get() with
