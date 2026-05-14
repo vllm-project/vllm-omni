@@ -38,7 +38,8 @@ logger = logging.getLogger(__name__)
 # ``server.reliability_worker_markers`` (see ``_resolve_runtime_worker_markers``).
 DEFAULT_RUNTIME_WORKER_MARKERS: tuple[str, ...] = (
     "multiprocessing.spawn",
-    "VLLM::Worker",
+    # Covers ``VLLM::Worker``, ``VLLM::StageEngineCoreProc_*`` (Omni stage engines), etc.
+    "VLLM::",
 )
 
 
@@ -541,9 +542,9 @@ def _pids_in_server_tree_substring_match(server: Any, pattern: str, *, limit: in
     """Return up to ``limit`` PIDs in the server tree whose name+cmdline contains ``pattern`` literally.
 
     ``pgrep -f`` matches the process command line used by procps and does not consult the
-    short process name; vLLM often exposes ``VLLM::Worker`` via prctl/setproctitle in
-    ``ps``/``name()`` only. This helper keeps kill injection aligned with
-    :func:`_safe_proc_info` / fault snapshots.
+    short process name; vLLM-Omni often exposes titles like ``VLLM::Worker`` or
+    ``VLLM::StageEngineCoreProc_*`` via prctl/setproctitle in ``ps``/``name()`` only.
+    This helper keeps kill injection aligned with :func:`_safe_proc_info` / fault snapshots.
     """
     if limit <= 0:
         return []
@@ -845,7 +846,7 @@ def make_process_kill_fault_injector(
 
     1. **Server process tree** (``psutil``): literal substring match against
        ``Process.name()`` plus argv text. This matches how :func:`_safe_proc_info`
-       logs processes and catches titles such as ``VLLM::Worker`` that often do not
+       logs processes and catches vLLM-style titles (``VLLM::...``) that often do not
        appear in ``pgrep -f``\'s command-line view.
     2. **``pgrep -f``** (legacy): scoped to the server PID tree when it is known;
        uses procps regular-expression rules for the pattern.

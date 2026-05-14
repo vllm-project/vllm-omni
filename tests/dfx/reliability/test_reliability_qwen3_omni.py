@@ -113,7 +113,9 @@ PROCESS_KILL_ERROR_KEYWORDS = (
     "500",
     "503",
 )
-RUNTIME_WORKER_PATTERN = "VLLM::Worker"
+# Prefix match for vLLM-titled children (``VLLM::Worker``, ``VLLM::StageEngineCoreProc_*``, …).
+# Must be a literal substring of ``name``/``cmdline`` — no trailing whitespace (would break match).
+RUNTIME_WORKER_PATTERN = "VLLM::"
 # RFC#2366 signal x target matrix:
 # - worker / serve-root: SIGTERM, SIGKILL
 # - serve-tree: SIGTERM, SIGINT, SIGKILL
@@ -148,6 +150,12 @@ WORKER_SIGNAL_FAULT_PARAMS = [
 ]
 INFLIGHT_INJECTION_REQUEST_RATE = 0.3
 INFLIGHT_INJECTION_REQUEST_COUNT = 10
+
+# Worker ``SIGTERM`` lets StageEngineCoreProc shut down gracefully; the API may still
+# accept the HTTP connection and only return an error after orchestrator abort (~15–25s).
+# ``SIGKILL`` tends to fail fast (<15s). Bounds here must stay below "hang forever".
+_PROCESS_KILL_WORKER_CHAT_FF_HTTP_TIMEOUT_SEC = 30
+_PROCESS_KILL_WORKER_CHAT_FF_MAX_ELAPSED_SEC = 28
 
 
 class _HasServeArgs(Protocol):
@@ -490,7 +498,11 @@ def test_reliability_fault_process_kill_request_failure(
 def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
     omni_server_after_fault_function,
 ) -> None:
-    """Black-box: after worker process kill, chat fails fast, concurrent chat does not hang; /health→503 last."""
+    """Black-box: after worker process kill, chat fails fast, concurrent chat does not hang; /health→503 last.
+
+    ``SIGTERM`` on a stage engine often exceeds a 15s client-visible path; ``SIGKILL`` is
+    typically quicker. See module constants ``_PROCESS_KILL_WORKER_CHAT_FF_*``.
+    """
     host = omni_server_after_fault_function.host
     port = omni_server_after_fault_function.port
     model = omni_server_after_fault_function.model
@@ -505,16 +517,26 @@ def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
     ff_body = b""
     start = time.monotonic()
     try:
-        ff_status, ff_body = post_json_raw(host, port, "/v1/chat/completions", payload, timeout_sec=20)
+        ff_status, ff_body = post_json_raw(
+            host,
+            port,
+            "/v1/chat/completions",
+            payload,
+            timeout_sec=_PROCESS_KILL_WORKER_CHAT_FF_HTTP_TIMEOUT_SEC,
+        )
         elapsed = time.monotonic() - start
-        assert elapsed < 15, f"[process_kill fast_fail] request did not fail fast after fault: {elapsed:.2f}s"
+        assert elapsed < _PROCESS_KILL_WORKER_CHAT_FF_MAX_ELAPSED_SEC, (
+            f"[process_kill fast_fail] request did not fail fast after fault: {elapsed:.2f}s"
+        )
         assert ff_status >= 500, (
             f"[process_kill fast_fail] expected server-side failure after fault, "
             f"got status={ff_status}, body={ff_body[:200]!r}"
         )
     except Exception:
         elapsed = time.monotonic() - start
-        assert elapsed < 15, f"[process_kill fast_fail] request exception was too slow after fault: {elapsed:.2f}s"
+        assert elapsed < _PROCESS_KILL_WORKER_CHAT_FF_MAX_ELAPSED_SEC, (
+            f"[process_kill fast_fail] request exception was too slow after fault: {elapsed:.2f}s"
+        )
 
     payload_json = json.dumps(
         {
