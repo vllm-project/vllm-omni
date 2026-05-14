@@ -605,6 +605,7 @@ def build_engine_args_dict(
     default_sp = _to_dict(getattr(stage_config, "default_sampling_params", {}))
     engine_args_dict["has_sampling_extra_args"] = bool(default_sp.get("extra_args"))
 
+    # TODO: Remove this after the performance regression is fixed
     # Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni to avoid performance regression
     _maybe_set_qwen3_omni_moe_env(engine_args_dict)
 
