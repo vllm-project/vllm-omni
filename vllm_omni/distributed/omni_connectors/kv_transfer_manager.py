@@ -1311,6 +1311,11 @@ class OmniKVTransferManager:
                             )
                     elif sp_size > 1:
                         kv_payload = self._collect_request_kv_payload(req)
+                else:
+                    # Owner receive failed: send None sentinel to CFG followers to avoid deadlock
+                    if cfg_size > 1:
+                        for dst_cfg_rank in range(1, cfg_size):
+                            cfg_group.send_object(None, dst_cfg_rank)
             elif sp_rank == 0 and cfg_size > 1:
                 kv_payload = cfg_group.recv_object(0)
             # sp broadcast

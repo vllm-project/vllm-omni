@@ -995,6 +995,49 @@ class TestDistributedReceive:
         assert len(sp_group.broadcast_calls) == 1
         assert sp_group.broadcast_calls[0][0] is None
 
+    def test_cfg_sp_owner_receive_failure_sends_none_to_avoid_deadlock(self):
+        """When CFG+SP owner's receive_multi_kv_cache returns False, it must
+        send None sentinel to all CFG followers to prevent them from blocking
+        forever in recv_object. This test verifies the deadlock fix."""
+        mgr = _make_manager(from_tp=2, to_tp=4, local_rank=0)
+        req = SimpleNamespace(request_id="req-1", sampling_params=SimpleNamespace())
+        world_group = _MockBroadcastGroup(world_size=8, rank_in_group=0)
+        cfg_group = _MockBroadcastGroup(world_size=2, rank_in_group=0)
+        sp_group = _MockBroadcastGroup(world_size=2, rank_in_group=0, broadcast_value=None)
+
+        mgr.receive_multi_kv_cache = MagicMock(return_value=False)
+        with (
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_world_group", return_value=world_group),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_rank",
+                return_value=0,
+            ),
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_cfg_group", return_value=cfg_group),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
+                return_value=0,
+            ),
+            patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=sp_group),
+        ):
+            assert mgr.receive_multi_kv_cache_distributed(req) is False
+
+        # Owner attempted to receive but failed
+        mgr.receive_multi_kv_cache.assert_called_once()
+        # CRITICAL: Owner must send None to cfg_rank=1 to prevent deadlock
+        assert len(cfg_group.send_calls) == 1
+        assert cfg_group.send_calls[0] == (1, None)
+        # SP broadcast still called but with None
+        assert len(sp_group.broadcast_calls) == 1
+        assert sp_group.broadcast_calls[0][0] is None
+
 
 # ── TP auto-detect ───────────────────────────────────────────────────
 
