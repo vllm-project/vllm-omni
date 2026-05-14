@@ -34,8 +34,8 @@ def _safe_quant_config(quant_config: "QuantizationConfig | None") -> "Quantizati
     """Return quant_config only if it is safe to propagate here, else None.
 
     Dual-stream transformer_blocks, norm modulation layers, and norm_out are
-    kept at full precision for FP8 (see #2728). INC-based quantization (e.g.
-    AutoRound W4A16) needs the config propagated so packed weights load
+    kept at full precision for FP8 (see #2728). Offline quantization (e.g.
+    INC/AutoRound W4A16) needs the config propagated so packed weights load
     correctly.
     """
     if quant_config is None:
