@@ -537,6 +537,29 @@ def _list_server_process_tree(server: Any) -> list[int]:
     return [root_pid, *descendants]
 
 
+def _pids_in_server_tree_substring_match(server: Any, pattern: str, *, limit: int) -> list[int]:
+    """Return up to ``limit`` PIDs in the server tree whose name+cmdline contains ``pattern`` literally.
+
+    ``pgrep -f`` matches the process command line used by procps and does not consult the
+    short process name; vLLM often exposes ``VLLM::Worker`` via prctl/setproctitle in
+    ``ps``/``name()`` only. This helper keeps kill injection aligned with
+    :func:`_safe_proc_info` / fault snapshots.
+    """
+    if limit <= 0:
+        return []
+    tree = _list_server_process_tree(server)
+    if not tree or not pattern:
+        return []
+    hits: list[int] = []
+    for pid in tree:
+        if len(hits) >= limit:
+            break
+        name, cmdline = _safe_proc_info(int(pid))
+        if pattern in f"{name} {cmdline}":
+            hits.append(int(pid))
+    return hits
+
+
 def _log_server_process_tree(server: Any) -> None:
     """Print server process tree for debugging fault injection targets."""
     pids = _list_server_process_tree(server)
@@ -816,11 +839,18 @@ def make_process_kill_fault_injector(
     limit: int = 1,
     post_kill_wait_seconds: float = 0.0,
 ) -> FaultInjector:
-    """Build a post-ready injector that kills processes matched by ``pgrep -f``.
+    """Build a post-ready injector that kills processes matched by ordered ``grep_patterns``.
 
-    Tries each pattern in order until at least one PID is killed. If none match,
-    the returned callable issues ``pytest.skip`` (same behavior as the previous
-    inline reliability test).
+    Matching is tried in two phases per pattern (first hit wins):
+
+    1. **Server process tree** (``psutil``): literal substring match against
+       ``Process.name()`` plus argv text. This matches how :func:`_safe_proc_info`
+       logs processes and catches titles such as ``VLLM::Worker`` that often do not
+       appear in ``pgrep -f``\'s command-line view.
+    2. **``pgrep -f``** (legacy): scoped to the server PID tree when it is known;
+       uses procps regular-expression rules for the pattern.
+
+    If neither phase finds a target, the returned callable issues ``pytest.skip``.
 
     Args:
         grep_patterns: One pattern or an ordered list of patterns.
@@ -837,9 +867,45 @@ def make_process_kill_fault_injector(
             logger.warning(
                 "[reliability][process-kill] no server process tree found; fallback to global pgrep matching"
             )
+
+        def _kill_and_wait(filtered: list[int], pattern: str, *, source: str) -> None:
+            sig = getattr(signal, signal_name, None)
+            if sig is None:
+                raise ValueError(f"Unsupported signal_name: {signal_name}")
+            for pid in filtered:
+                name, cmdline = _safe_proc_info(pid)
+                print(
+                    f"[reliability][process-kill] killing pid={pid} name={name} signal={signal_name} "
+                    f"source={source} cmdline={cmdline}",
+                    flush=True,
+                )
+                os.kill(pid, sig)
+            print(
+                f"[reliability][process-kill] matched pattern={pattern!r} source={source} "
+                f"killed_pids={filtered} killed_count={len(filtered)}",
+                flush=True,
+            )
+            if post_kill_wait_seconds > 0:
+                print(
+                    f"[reliability][process-kill] waiting {post_kill_wait_seconds:.2f}s after kill",
+                    flush=True,
+                )
+                time.sleep(post_kill_wait_seconds)
+
         for pattern in patterns:
             print(
-                f"[reliability][process-kill] trying pattern={pattern} signal={signal_name} limit={limit}",
+                f"[reliability][process-kill] trying server_tree substring pattern={pattern!r} "
+                f"signal={signal_name} limit={limit}",
+                flush=True,
+            )
+            tree_hits = _pids_in_server_tree_substring_match(server, pattern, limit=limit)
+            if tree_hits:
+                _kill_and_wait(tree_hits, pattern, source="server_tree")
+                return
+
+        for pattern in patterns:
+            print(
+                f"[reliability][process-kill] trying pgrep -f pattern={pattern!r} signal={signal_name} limit={limit}",
                 flush=True,
             )
             pids = inject_process_kill(
@@ -858,26 +924,7 @@ def make_process_kill_fault_injector(
                 )
                 continue
             if filtered:
-                sig = getattr(signal, signal_name, None)
-                if sig is None:
-                    raise ValueError(f"Unsupported signal_name: {signal_name}")
-                for pid in filtered:
-                    name, cmdline = _safe_proc_info(pid)
-                    print(
-                        f"[reliability][process-kill] killing pid={pid} name={name} signal={signal_name} cmdline={cmdline}",
-                        flush=True,
-                    )
-                    os.kill(pid, sig)
-                print(
-                    f"[reliability][process-kill] matched pattern={pattern} killed_pids={filtered} killed_count={len(filtered)}",
-                    flush=True,
-                )
-                if post_kill_wait_seconds > 0:
-                    print(
-                        f"[reliability][process-kill] waiting {post_kill_wait_seconds:.2f}s after kill",
-                        flush=True,
-                    )
-                    time.sleep(post_kill_wait_seconds)
+                _kill_and_wait(filtered, pattern, source="pgrep")
                 return
         logger.warning(
             "[reliability][process-kill] no process matched patterns=%s signal=%s limit=%s",
