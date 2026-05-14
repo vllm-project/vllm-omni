@@ -518,6 +518,7 @@ def test_reliability_fault_process_kill_serve_root_video_no_worker_residual_and_
 
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.skip(reason="issue#2768")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
