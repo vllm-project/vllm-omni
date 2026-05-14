@@ -41,9 +41,11 @@ def _safe_quant_config(quant_config: "QuantizationConfig | None") -> "Quantizati
     if quant_config is None:
         return None
     from vllm.model_executor.layers.quantization.inc import INCConfig
+
     if isinstance(quant_config, INCConfig):
         return quant_config
     return None
+
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
