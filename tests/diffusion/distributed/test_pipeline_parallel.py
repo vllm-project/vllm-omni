@@ -10,6 +10,7 @@ from vllm.model_executor.models.utils import PPMissingLayer, make_empty_intermed
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
+import vllm_omni.diffusion.distributed.pipeline_parallel as pp_module
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_env,
@@ -53,8 +54,22 @@ class FakeWork:
 class SimpleScheduler:
     """Minimal diffusion-step scheduler: latents -= 0.1 * noise_pred."""
 
-    def step(self, noise_pred: torch.Tensor, t, latents: torch.Tensor, return_dict: bool = False):
+    def step(self, noise_pred: torch.Tensor, t, latents: torch.Tensor):
         return (latents - 0.1 * noise_pred,)
+
+
+class FakeVAE:
+    def __init__(self, distributed_enabled: bool = False):
+        self.calls = 0
+        self.distributed_enabled = distributed_enabled
+
+    def decode(self, z: torch.Tensor):
+        """Original decode docstring."""
+        self.calls += 1
+        return (z + 1,)
+
+    def is_distributed_enabled(self) -> bool:
+        return self.distributed_enabled
 
 
 class MockPipelineParallel(PipelineParallelMixin, CFGParallelMixin):
@@ -271,6 +286,69 @@ class TestDiffuseWrapper:
 
         assert _DiffusePP.diffuse.__name__ == "diffuse"
         assert _DiffusePP.diffuse.__doc__ == "Original diffuse docstring."
+
+
+class TestVaeDecodeGuard:
+    pytestmark = [pytest.mark.cpu]
+
+    @staticmethod
+    def _make_pipeline(distributed_enabled: bool = False) -> PipelineParallelMixin:
+        class _DecodePP(PipelineParallelMixin, CFGParallelMixin):
+            def __init__(self):
+                self.vae = FakeVAE(distributed_enabled=distributed_enabled)
+
+        return _DecodePP()
+
+    @staticmethod
+    def _set_rank(monkeypatch, world_size: int, first_stage: bool) -> None:
+        monkeypatch.setattr(pp_module, "get_pipeline_parallel_world_size", lambda: world_size)
+        monkeypatch.setattr(pp_module, "is_pipeline_first_stage", lambda: first_stage)
+
+    def test_calls_original_decode_when_pp_disabled(self, monkeypatch):
+        self._set_rank(monkeypatch, world_size=1, first_stage=True)
+        pipeline = self._make_pipeline()
+        z = torch.ones(2, 3)
+
+        output = pipeline.vae.decode(z)[0]
+
+        assert pipeline.vae.calls == 1
+        torch.testing.assert_close(output, z + 1)
+
+    def test_calls_original_decode_on_first_stage(self, monkeypatch):
+        self._set_rank(monkeypatch, world_size=2, first_stage=True)
+        pipeline = self._make_pipeline()
+        z = torch.ones(2, 3)
+
+        output = pipeline.vae.decode(z)[0]
+
+        assert pipeline.vae.calls == 1
+        torch.testing.assert_close(output, z + 1)
+
+    def test_skips_decode_on_non_first_stage(self, monkeypatch):
+        self._set_rank(monkeypatch, world_size=2, first_stage=False)
+        pipeline = self._make_pipeline()
+        z = torch.ones(2, 3)
+
+        output = pipeline.vae.decode(z)
+
+        assert pipeline.vae.calls == 0
+        assert output is None
+
+    def test_calls_original_decode_when_distributed_vae_enabled(self, monkeypatch):
+        self._set_rank(monkeypatch, world_size=2, first_stage=False)
+        pipeline = self._make_pipeline(distributed_enabled=True)
+        z = torch.ones(2, 3)
+
+        output = pipeline.vae.decode(z)[0]
+
+        assert pipeline.vae.calls == 1
+        torch.testing.assert_close(output, z + 1)
+
+    def test_decode_wrapper_preserves_metadata(self):
+        pipeline = self._make_pipeline()
+
+        assert pipeline.vae.decode.__name__ == "decode"
+        assert pipeline.vae.decode.__doc__ == "Original decode docstring."
 
 
 @pytest.mark.cpu

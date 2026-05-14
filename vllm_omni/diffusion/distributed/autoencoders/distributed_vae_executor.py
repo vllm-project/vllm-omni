@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.distributed.parallel_state import get_dit_group, get_pipeline_parallel_world_size, get_pp_group
+from vllm_omni.diffusion.distributed.parallel_state import get_dit_group
 
 logger = init_logger(__name__)
 
@@ -117,11 +117,6 @@ class DistributedVaeExecutor:
         return assigned
 
     def execute(self, z: torch.Tensor, operator: DistributedOperator, broadcast_result: bool = True):
-        # With Pipeline Parallel, middle ranks (world size 3 or more) hold stale latents after the denoising loop.
-        # Broadcast from rank 0 so every rank splits identical tiles.
-        if get_pipeline_parallel_world_size() > 2:
-            z = get_pp_group().broadcast(z, src=0)
-
         pp_size = min(self.parallel_size, self.world_size)
 
         # 1. Split into tiles

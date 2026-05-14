@@ -13,6 +13,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
     get_pipeline_parallel_world_size,
     get_pp_group,
+    is_pipeline_first_stage,
 )
 
 
@@ -108,6 +109,18 @@ class PipelineParallelMixin:
                 f"PP-aware predict/scheduler wrappers and their `super()` calls delegate to CFGParallelMixin."
             )
 
+        init = cls.__dict__.get("__init__")
+        if callable(init):
+
+            @wraps(init)
+            def wrapped_init(self, *args: Any, **kwargs: Any) -> None:
+                init(self, *args, **kwargs)
+                vae = getattr(self, "vae", None)
+                if vae is not None and hasattr(vae, "decode"):
+                    self._wrapped_vae_decode()
+
+            cls.__init__ = wrapped_init
+
         diffuse = cls.__dict__.get("diffuse")
         if callable(diffuse):
 
@@ -119,6 +132,24 @@ class PipelineParallelMixin:
                     self._sync_pp_send()
 
             cls.diffuse = wrapped_diffuse
+
+    def _wrapped_vae_decode(self) -> None:
+        orig_decode = self.vae.decode
+        vae_distributed = hasattr(self.vae, "is_distributed_enabled") and self.vae.is_distributed_enabled()
+
+        @wraps(orig_decode)
+        def wrapped_decode(z: torch.Tensor, *args: Any, **kwargs: Any):
+            if vae_distributed:
+                # Middle ranks (world size 3 or more) hold stale latents after the denoising loop.
+                # Broadcast from rank 0 so every rank splits identical tiles.
+                if get_pipeline_parallel_world_size() > 2:
+                    z = get_pp_group().broadcast(z, src=0)
+                return orig_decode(z, *args, **kwargs)
+            elif is_pipeline_first_stage():
+                return orig_decode(z, *args, **kwargs)
+            return None
+
+        self.vae.decode = wrapped_decode
 
     @property
     def _pp_send_work(self) -> list[torch.distributed.Work]:

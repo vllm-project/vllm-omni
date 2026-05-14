@@ -31,7 +31,7 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.distributed.parallel_state import get_pp_group
+from vllm_omni.diffusion.distributed.parallel_state import is_pipeline_first_stage, is_pipeline_last_stage
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -882,7 +882,7 @@ class WanTransformer3DModel(nn.Module):
         # 1. Patch & position embedding
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)
         # Patch embedding only on first PP stage; other stages receive hidden_states via P2P
-        if get_pp_group().is_first_rank:
+        if is_pipeline_first_stage():
             self.patch_embedding = Conv3dLayer(
                 in_channels=in_channels,
                 out_channels=inner_dim,
@@ -921,7 +921,7 @@ class WanTransformer3DModel(nn.Module):
         )
 
         # 4. Output norm & projection — only on the last PP stage
-        if get_pp_group().is_last_rank:
+        if is_pipeline_last_stage():
             self.norm_out = AdaLayerNorm(inner_dim, elementwise_affine=False, eps=eps)
             self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
         else:
@@ -929,7 +929,7 @@ class WanTransformer3DModel(nn.Module):
 
         # SP helper modules
         self.timestep_proj_prepare = TimestepProjPrepare()
-        if get_pp_group().is_last_rank:
+        if is_pipeline_last_stage():
             self.output_scale_shift_prepare = OutputScaleShiftPrepare(inner_dim)
         else:
             self.output_scale_shift_prepare = PPMissingLayer()
@@ -971,7 +971,7 @@ class WanTransformer3DModel(nn.Module):
             self._hidden_states_shape = hidden_states.shape
             self._cached_rope_emb = rotary_emb
 
-        if get_pp_group().is_first_rank:
+        if is_pipeline_first_stage():
             # Patch embedding and flatten to sequence
             # (hidden_states is sharded at blocks.0 input by _sp_plan)
             hidden_states = self.patch_embedding(hidden_states)
@@ -1028,7 +1028,7 @@ class WanTransformer3DModel(nn.Module):
         for block in self.blocks[self.start_layer : self.end_layer]:
             hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask)
 
-        if not get_pp_group().is_last_rank:
+        if not is_pipeline_last_stage():
             # Non-last PP stage: hand the token sequence to the caller via IntermediateTensors.
             # predict_noise will broadcast it to the next stage before calling that stage's forward.
             return IntermediateTensors({"hidden_states": hidden_states})
