@@ -1270,11 +1270,19 @@ class OmniKVTransferManager:
             cfg_size = get_classifier_free_guidance_world_size()
             cfg_rank = get_classifier_free_guidance_rank()
             cfg_group = get_cfg_group()
+        except Exception:
+            cfg_size = 1
+            cfg_rank = 0
+            cfg_group = None
+
+        try:
             sp_size = get_sequence_parallel_world_size()
             sp_rank = get_sequence_parallel_rank()
             sp_group = get_sp_group()
         except Exception:
-            pass
+            sp_size = 1
+            sp_rank = 0
+            sp_group = None
 
         if tp_active and (cfg_size <= 1 and sp_size <= 1):
             logger.info(
