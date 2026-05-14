@@ -4,7 +4,9 @@ See examples/offline_inference/vace/vace_video_generation.md
 """
 
 from pathlib import Path
+
 import pytest
+
 from tests.examples.helpers import EXAMPLES, ExampleRunner, ReadmeSnippet
 from tests.helpers.assertions import assert_video_valid
 from tests.helpers.mark import hardware_marks
@@ -19,7 +21,6 @@ pytestmark = [
 VACE_SCRIPT = EXAMPLES / "offline_inference" / "vace" / "vace_video_generation.py"
 README_PATH = VACE_SCRIPT.with_name("vace_video_generation.md")
 EXAMPLE_OUTPUT_SUBFOLDER = "example_offline_vace"
-
 
 README_SNIPPETS = ReadmeSnippet.extract_readme_snippets(README_PATH)
 
