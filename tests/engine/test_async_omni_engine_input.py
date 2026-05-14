@@ -4,7 +4,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 
 from vllm_omni.engine import OmniEngineCoreRequest
-from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -27,7 +27,7 @@ def test_build_add_request_message_preserves_additional_information(mocker: Mock
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
     engine.default_sampling_params_list = [params]
-    engine.stage_metadata = [{"stage_type": "llm"}]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
     engine.supported_tasks = ("speech",)
 
     input_processor = mocker.Mock()
@@ -53,7 +53,7 @@ def test_build_add_request_message_preserves_additional_information(mocker: Mock
         arrival_time=0.0,
     )
 
-    request = msg["prompt"]
+    request = msg.prompt
     assert isinstance(request, OmniEngineCoreRequest)
     assert request.external_req_id == "req-1"
     assert request.additional_information is not None
@@ -66,7 +66,7 @@ def test_build_add_request_message_with_resumable_streaming(mocker: MockerFixtur
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
     engine.default_sampling_params_list = [params]
-    engine.stage_metadata = [{"stage_type": "llm"}]
+    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
     engine.supported_tasks = ("generate",)
 
     input_processor = mocker.Mock()
@@ -85,6 +85,6 @@ def test_build_add_request_message_with_resumable_streaming(mocker: MockerFixtur
         message_type="streaming_update",
     )
 
-    assert msg["type"] == "streaming_update"
+    assert msg.type == "streaming_update"
     input_processor.process_inputs.assert_called_once()
     assert input_processor.process_inputs.call_args.kwargs["resumable"] is True
