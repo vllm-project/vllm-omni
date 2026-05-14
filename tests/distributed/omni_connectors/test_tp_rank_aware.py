@@ -679,19 +679,25 @@ class TestDistributedReceive:
 
     # ── SP-only scenarios ────────────────────────────────────────────
 
-    def test_sp_only_owner_receives_then_broadcasts(self):
-        """SP-only (sp_size=2, cfg_size=1): sp_rank=0 (owner) receives
-        on CPU, collects payload, then broadcasts via sp_group."""
+    @pytest.mark.parametrize(
+        "sp_rank,world_rank_in_group,is_owner",
+        [
+            (0, 0, True),  # owner receives and broadcasts
+            (1, 1, False),  # follower receives via broadcast
+        ],
+    )
+    def test_sp_only_scenarios(self, sp_rank, world_rank_in_group, is_owner):
+        """SP-only (sp_size=2, cfg_size=1): Test owner and follower behavior."""
         mgr = _make_manager(from_tp=2, to_tp=4, local_rank=0)
         req = SimpleNamespace(request_id="req-1", sampling_params=SimpleNamespace())
-        world_group = _MockBroadcastGroup(world_size=4, rank_in_group=0)
+        world_group = _MockBroadcastGroup(world_size=4, rank_in_group=world_rank_in_group)
         sp_payload = {
             "past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
             "kv_metadata": {"source": "owner"},
             "sp.past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
             "sp.kv_metadata": {"source": "owner"},
         }
-        sp_group = _MockBroadcastGroup(world_size=2, rank_in_group=0, broadcast_value=sp_payload)
+        sp_group = _MockBroadcastGroup(world_size=2, rank_in_group=sp_rank, broadcast_value=sp_payload)
 
         def _receive(req_obj, cfg_func, target_device):
             req_obj.past_key_values = SimpleNamespace(key_cache=[torch.tensor([1.0])])
@@ -718,96 +724,84 @@ class TestDistributedReceive:
             ),
             patch(
                 "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
-                return_value=0,
+                return_value=sp_rank,
             ),
             patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=sp_group),
         ):
             assert mgr.receive_multi_kv_cache_distributed(req) is True
 
-        # Owner should call receive_multi_kv_cache with cpu device
-        mgr.receive_multi_kv_cache.assert_called_once()
-        assert mgr.receive_multi_kv_cache.call_args.args[2] == torch.device("cpu")
-        # SP broadcast should be called once (from src=0)
+        # Verify behavior based on role
+        if is_owner:
+            mgr.receive_multi_kv_cache.assert_called_once()
+            assert mgr.receive_multi_kv_cache.call_args.args[2] == torch.device("cpu")
+            assert sp_group.broadcast_calls[0][1] == 0
+        else:
+            mgr.receive_multi_kv_cache.assert_not_called()
+
         assert len(sp_group.broadcast_calls) == 1
-        assert sp_group.broadcast_calls[0][1] == 0  # src=0
-        # Payload should be applied to req
-        assert req.kv_metadata == {"source": "owner"}
-
-    def test_sp_only_follower_receives_via_broadcast(self):
-        """SP-only (sp_size=2, cfg_size=1): sp_rank=1 (follower) does NOT
-        call receive_multi_kv_cache but gets payload via sp broadcast."""
-        mgr = _make_manager(from_tp=2, to_tp=4, local_rank=0)
-        req = SimpleNamespace(request_id="req-1", sampling_params=SimpleNamespace())
-        world_group = _MockBroadcastGroup(world_size=4, rank_in_group=1)
-        sp_payload = {
-            "past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
-            "kv_metadata": {"source": "owner"},
-            "sp.past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
-            "sp.kv_metadata": {"source": "owner"},
-        }
-        sp_group = _MockBroadcastGroup(world_size=2, rank_in_group=1, broadcast_value=sp_payload)
-
-        mgr.receive_multi_kv_cache = MagicMock(return_value=True)
-        with (
-            patch("vllm_omni.diffusion.distributed.parallel_state.get_world_group", return_value=world_group),
-            patch(
-                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_world_size",
-                return_value=1,
-            ),
-            patch(
-                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_rank",
-                return_value=0,
-            ),
-            patch("vllm_omni.diffusion.distributed.parallel_state.get_cfg_group", return_value=None),
-            patch(
-                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_world_size",
-                return_value=2,
-            ),
-            patch(
-                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
-                return_value=1,
-            ),
-            patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=sp_group),
-        ):
-            assert mgr.receive_multi_kv_cache_distributed(req) is True
-
-        # Follower should NOT call receive_multi_kv_cache
-        mgr.receive_multi_kv_cache.assert_not_called()
-        # SP broadcast should be called (follower receives via broadcast)
-        assert len(sp_group.broadcast_calls) == 1
-        # Payload should be applied to req
         assert torch.equal(req.past_key_values.key_cache[0], torch.tensor([1.0]))
         assert req.sampling_params.kv_metadata == {"source": "owner"}
 
     # ── CFG + SP mixed scenarios ─────────────────────────────────────
 
-    def test_cfg_sp_owner_receives_then_cfg_scatter_and_sp_broadcast(self):
-        """CFG+SP (cfg_size=2, sp_size=2): cfg_rank=0 & sp_rank=0 (owner)
-        receives, builds cfg payloads, sends to cfg_rank=1, then sp broadcasts."""
+    @pytest.mark.parametrize(
+        "cfg_rank,sp_rank,world_rank_in_group,role",
+        [
+            (0, 0, 0, "owner"),  # owner: receives, cfg scatter, sp broadcast
+            (1, 0, 2, "cfg_follower_sp_leader"),  # cfg follower + sp leader: cfg recv, sp broadcast
+            (0, 1, 1, "sp_follower"),  # sp follower: only sp broadcast
+        ],
+    )
+    def test_cfg_sp_mixed_scenarios(self, cfg_rank, sp_rank, world_rank_in_group, role):
+        """CFG+SP (cfg_size=2, sp_size=2): Test various rank combinations."""
         mgr = _make_manager(from_tp=2, to_tp=4, local_rank=0)
         req = SimpleNamespace(request_id="req-1", sampling_params=SimpleNamespace())
-        world_group = _MockBroadcastGroup(world_size=8, rank_in_group=0)
-        cfg_group = _MockBroadcastGroup(world_size=2, rank_in_group=0)
-        owner_sp_payload = {
-            "past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
-            "kv_metadata": {"source": "owner"},
-            "sp.past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
-            "sp.kv_metadata": {"source": "owner"},
-            "sp.cfg_branch_roles": ["cfg_text"],
-            "sp.cfg_active_branch": None,
-        }
-        sp_group = _MockBroadcastGroup(world_size=2, rank_in_group=0, broadcast_value=owner_sp_payload)
+        world_group = _MockBroadcastGroup(world_size=8, rank_in_group=world_rank_in_group)
 
-        def _receive(req_obj, cfg_func, target_device):
-            req_obj.past_key_values = SimpleNamespace(key_cache=[torch.tensor([1.0])])
-            req_obj.kv_metadata = {"source": "owner"}
-            req_obj.sampling_params.past_key_values = req_obj.past_key_values
-            req_obj.sampling_params.kv_metadata = req_obj.kv_metadata
-            req_obj.sampling_params.cfg_text_past_key_values = SimpleNamespace(key_cache=[torch.tensor([2.0])])
-            req_obj.sampling_params.cfg_text_kv_metadata = {"source": "cfg_text"}
-            return True
+        # Setup payloads based on role
+        if role == "owner":
+            owner_sp_payload = {
+                "past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
+                "kv_metadata": {"source": "owner"},
+                "sp.past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
+                "sp.kv_metadata": {"source": "owner"},
+                "sp.cfg_branch_roles": ["cfg_text"],
+                "sp.cfg_active_branch": None,
+            }
+            cfg_group = _MockBroadcastGroup(world_size=2, rank_in_group=cfg_rank)
+            sp_group = _MockBroadcastGroup(world_size=2, rank_in_group=sp_rank, broadcast_value=owner_sp_payload)
 
-        mgr.receive_multi_kv_cache = MagicMock(side_effect=_receive)
+            def _receive(req_obj, cfg_func, target_device):
+                req_obj.past_key_values = SimpleNamespace(key_cache=[torch.tensor([1.0])])
+                req_obj.kv_metadata = {"source": "owner"}
+                req_obj.sampling_params.past_key_values = req_obj.past_key_values
+                req_obj.sampling_params.kv_metadata = req_obj.kv_metadata
+                req_obj.sampling_params.cfg_text_past_key_values = SimpleNamespace(key_cache=[torch.tensor([2.0])])
+                req_obj.sampling_params.cfg_text_kv_metadata = {"source": "cfg_text"}
+                return True
+
+            mgr.receive_multi_kv_cache = MagicMock(side_effect=_receive)
+        else:
+            cfg_payload = {
+                "past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
+                "kv_metadata": {"source": "main"},
+                "sp.past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
+                "sp.kv_metadata": {"source": "main"},
+                "sp.cfg_active_branch": "cfg_text" if role == "cfg_follower_sp_leader" else None,
+                "sp.cfg_branch_roles": ["cfg_text"],
+                "sp.cfg_branch_past_key_values": {
+                    "cfg_text": SimpleNamespace(key_cache=[torch.tensor([2.0])]),
+                }
+                if role == "cfg_follower_sp_leader"
+                else {},
+            }
+            if role == "cfg_follower_sp_leader":
+                cfg_payload["sp.cfg_text_past_key_values"] = SimpleNamespace(key_cache=[torch.tensor([2.0])])
+
+            cfg_group = _MockBroadcastGroup(world_size=2, rank_in_group=cfg_rank, recv_value=cfg_payload)
+            sp_group = _MockBroadcastGroup(world_size=2, rank_in_group=sp_rank, broadcast_value=cfg_payload)
+            mgr.receive_multi_kv_cache = MagicMock(return_value=True)
+
         with (
             patch("vllm_omni.diffusion.distributed.parallel_state.get_world_group", return_value=world_group),
             patch(
@@ -816,7 +810,7 @@ class TestDistributedReceive:
             ),
             patch(
                 "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_rank",
-                return_value=0,
+                return_value=cfg_rank,
             ),
             patch("vllm_omni.diffusion.distributed.parallel_state.get_cfg_group", return_value=cfg_group),
             patch(
@@ -825,144 +819,51 @@ class TestDistributedReceive:
             ),
             patch(
                 "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
-                return_value=0,
+                return_value=sp_rank,
             ),
             patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=sp_group),
         ):
             assert mgr.receive_multi_kv_cache_distributed(req) is True
 
-        # Owner should receive
-        mgr.receive_multi_kv_cache.assert_called_once()
-        assert mgr.receive_multi_kv_cache.call_args.args[2] == torch.device("cpu")
-        # CFG scatter: should send to cfg_rank=1
-        assert [dst for dst, _ in cfg_group.send_calls] == [1]
-        cfg_rank1_payload = cfg_group.send_calls[0][1]
-        assert cfg_rank1_payload["sp.cfg_active_branch"] == "cfg_text"
-        # SP broadcast should be called
-        assert len(sp_group.broadcast_calls) == 1
-        assert sp_group.broadcast_calls[0][1] == 0  # src=0
+        # Verify behavior based on role
+        if role == "owner":
+            mgr.receive_multi_kv_cache.assert_called_once()
+            assert mgr.receive_multi_kv_cache.call_args.args[2] == torch.device("cpu")
+            assert [dst for dst, _ in cfg_group.send_calls] == [1]
+            assert cfg_group.send_calls[0][1]["sp.cfg_active_branch"] == "cfg_text"
+            assert len(sp_group.broadcast_calls) == 1
+            assert sp_group.broadcast_calls[0][1] == 0
+        elif role == "cfg_follower_sp_leader":
+            mgr.receive_multi_kv_cache.assert_not_called()
+            assert cfg_group.recv_calls == [0]
+            assert len(sp_group.broadcast_calls) == 1
+            assert sp_group.broadcast_calls[0][1] == 0
+            assert req.sampling_params.cfg_active_branch == "cfg_text"
+            assert torch.equal(
+                req.sampling_params.cfg_branch_past_key_values["cfg_text"].key_cache[0],
+                torch.tensor([2.0]),
+            )
+        else:  # sp_follower
+            mgr.receive_multi_kv_cache.assert_not_called()
+            assert cfg_group.recv_calls == []
+            assert cfg_group.send_calls == []
+            assert len(sp_group.broadcast_calls) == 1
+            assert torch.equal(req.past_key_values.key_cache[0], torch.tensor([1.0]))
+            assert req.kv_metadata == {"source": "main"}
 
-    def test_cfg_sp_cfg_follower_sp_leader_receives_via_cfg_recv(self):
-        """CFG+SP (cfg_size=2, sp_size=2): cfg_rank=1 & sp_rank=0
-        receives its branch payload via cfg_group.recv_object, then
-        broadcasts to its SP peers."""
+    @pytest.mark.parametrize(
+        "has_cfg,cfg_size",
+        [
+            (False, 1),  # SP-only: owner receive failure
+            (True, 2),  # CFG+SP: owner receive failure with deadlock prevention
+        ],
+    )
+    def test_owner_receive_failure_scenarios(self, has_cfg, cfg_size):
+        """Test receive failure handling in SP-only and CFG+SP scenarios."""
         mgr = _make_manager(from_tp=2, to_tp=4, local_rank=0)
         req = SimpleNamespace(request_id="req-1", sampling_params=SimpleNamespace())
-        world_group = _MockBroadcastGroup(world_size=8, rank_in_group=2)
-        cfg_payload = {
-            "past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
-            "kv_metadata": {"source": "main"},
-            "sp.past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
-            "sp.kv_metadata": {"source": "main"},
-            "sp.cfg_active_branch": "cfg_text",
-            "sp.cfg_branch_roles": ["cfg_text"],
-            "sp.cfg_branch_past_key_values": {
-                "cfg_text": SimpleNamespace(key_cache=[torch.tensor([2.0])]),
-            },
-            "sp.cfg_text_past_key_values": SimpleNamespace(key_cache=[torch.tensor([2.0])]),
-        }
-        cfg_group = _MockBroadcastGroup(world_size=2, rank_in_group=1, recv_value=cfg_payload)
-        sp_group = _MockBroadcastGroup(world_size=2, rank_in_group=0, broadcast_value=cfg_payload)
-
-        mgr.receive_multi_kv_cache = MagicMock(return_value=True)
-        with (
-            patch("vllm_omni.diffusion.distributed.parallel_state.get_world_group", return_value=world_group),
-            patch(
-                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_world_size",
-                return_value=2,
-            ),
-            patch(
-                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_rank",
-                return_value=1,
-            ),
-            patch("vllm_omni.diffusion.distributed.parallel_state.get_cfg_group", return_value=cfg_group),
-            patch(
-                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_world_size",
-                return_value=2,
-            ),
-            patch(
-                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
-                return_value=0,
-            ),
-            patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=sp_group),
-        ):
-            assert mgr.receive_multi_kv_cache_distributed(req) is True
-
-        # Should NOT call receive_multi_kv_cache (not owner)
-        mgr.receive_multi_kv_cache.assert_not_called()
-        # Should receive from cfg_group
-        assert cfg_group.recv_calls == [0]
-        # Should broadcast to SP peers
-        assert len(sp_group.broadcast_calls) == 1
-        assert sp_group.broadcast_calls[0][1] == 0  # src=0
-        # Payload should be applied
-        assert req.sampling_params.cfg_active_branch == "cfg_text"
-        assert torch.equal(
-            req.sampling_params.cfg_branch_past_key_values["cfg_text"].key_cache[0],
-            torch.tensor([2.0]),
-        )
-
-    def test_cfg_sp_sp_follower_receives_only_via_sp_broadcast(self):
-        """CFG+SP (cfg_size=2, sp_size=2): cfg_rank=0 & sp_rank=1
-        is NOT owner (sp_rank != 0), does NOT call receive or cfg_recv,
-        only gets payload via sp_group.broadcast_object."""
-        mgr = _make_manager(from_tp=2, to_tp=4, local_rank=0)
-        req = SimpleNamespace(request_id="req-1", sampling_params=SimpleNamespace())
-        world_group = _MockBroadcastGroup(world_size=8, rank_in_group=1)
-        cfg_group = _MockBroadcastGroup(world_size=2, rank_in_group=0)
-        sp_payload = {
-            "past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
-            "kv_metadata": {"source": "owner"},
-            "sp.past_key_values": SimpleNamespace(key_cache=[torch.tensor([1.0])]),
-            "sp.kv_metadata": {"source": "owner"},
-            "sp.cfg_branch_roles": ["cfg_text"],
-            "sp.cfg_active_branch": None,
-        }
-        sp_group = _MockBroadcastGroup(world_size=2, rank_in_group=1, broadcast_value=sp_payload)
-
-        mgr.receive_multi_kv_cache = MagicMock(return_value=True)
-        with (
-            patch("vllm_omni.diffusion.distributed.parallel_state.get_world_group", return_value=world_group),
-            patch(
-                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_world_size",
-                return_value=2,
-            ),
-            patch(
-                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_rank",
-                return_value=0,
-            ),
-            patch("vllm_omni.diffusion.distributed.parallel_state.get_cfg_group", return_value=cfg_group),
-            patch(
-                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_world_size",
-                return_value=2,
-            ),
-            patch(
-                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
-                return_value=1,
-            ),
-            patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=sp_group),
-        ):
-            assert mgr.receive_multi_kv_cache_distributed(req) is True
-
-        # Should NOT call receive_multi_kv_cache (not owner, sp_rank=1)
-        mgr.receive_multi_kv_cache.assert_not_called()
-        # Should NOT do cfg recv (sp_rank != 0)
-        assert cfg_group.recv_calls == []
-        # Should NOT do cfg send
-        assert cfg_group.send_calls == []
-        # Should receive via SP broadcast
-        assert len(sp_group.broadcast_calls) == 1
-        # Payload should be applied
-        assert torch.equal(req.past_key_values.key_cache[0], torch.tensor([1.0]))
-        assert req.kv_metadata == {"source": "owner"}
-
-    def test_sp_owner_receive_failure_returns_false(self):
-        """When SP owner's receive_multi_kv_cache returns False, all ranks
-        should get False (kv_payload stays None after broadcast)."""
-        mgr = _make_manager(from_tp=2, to_tp=4, local_rank=0)
-        req = SimpleNamespace(request_id="req-1", sampling_params=SimpleNamespace())
-        world_group = _MockBroadcastGroup(world_size=4, rank_in_group=0)
-        # broadcast_value=None simulates all ranks receiving None
+        world_group = _MockBroadcastGroup(world_size=4 if not has_cfg else 8, rank_in_group=0)
+        cfg_group = _MockBroadcastGroup(world_size=2, rank_in_group=0) if has_cfg else None
         sp_group = _MockBroadcastGroup(world_size=2, rank_in_group=0, broadcast_value=None)
 
         mgr.receive_multi_kv_cache = MagicMock(return_value=False)
@@ -970,47 +871,7 @@ class TestDistributedReceive:
             patch("vllm_omni.diffusion.distributed.parallel_state.get_world_group", return_value=world_group),
             patch(
                 "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_world_size",
-                return_value=1,
-            ),
-            patch(
-                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_rank",
-                return_value=0,
-            ),
-            patch("vllm_omni.diffusion.distributed.parallel_state.get_cfg_group", return_value=None),
-            patch(
-                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_world_size",
-                return_value=2,
-            ),
-            patch(
-                "vllm_omni.diffusion.distributed.parallel_state.get_sequence_parallel_rank",
-                return_value=0,
-            ),
-            patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group", return_value=sp_group),
-        ):
-            assert mgr.receive_multi_kv_cache_distributed(req) is False
-
-        # Owner attempted to receive but failed
-        mgr.receive_multi_kv_cache.assert_called_once()
-        # SP broadcast still called but with None
-        assert len(sp_group.broadcast_calls) == 1
-        assert sp_group.broadcast_calls[0][0] is None
-
-    def test_cfg_sp_owner_receive_failure_sends_none_to_avoid_deadlock(self):
-        """When CFG+SP owner's receive_multi_kv_cache returns False, it must
-        send None sentinel to all CFG followers to prevent them from blocking
-        forever in recv_object. This test verifies the deadlock fix."""
-        mgr = _make_manager(from_tp=2, to_tp=4, local_rank=0)
-        req = SimpleNamespace(request_id="req-1", sampling_params=SimpleNamespace())
-        world_group = _MockBroadcastGroup(world_size=8, rank_in_group=0)
-        cfg_group = _MockBroadcastGroup(world_size=2, rank_in_group=0)
-        sp_group = _MockBroadcastGroup(world_size=2, rank_in_group=0, broadcast_value=None)
-
-        mgr.receive_multi_kv_cache = MagicMock(return_value=False)
-        with (
-            patch("vllm_omni.diffusion.distributed.parallel_state.get_world_group", return_value=world_group),
-            patch(
-                "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_world_size",
-                return_value=2,
+                return_value=cfg_size,
             ),
             patch(
                 "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_rank",
@@ -1031,12 +892,14 @@ class TestDistributedReceive:
 
         # Owner attempted to receive but failed
         mgr.receive_multi_kv_cache.assert_called_once()
-        # CRITICAL: Owner must send None to cfg_rank=1 to prevent deadlock
-        assert len(cfg_group.send_calls) == 1
-        assert cfg_group.send_calls[0] == (1, None)
         # SP broadcast still called but with None
         assert len(sp_group.broadcast_calls) == 1
         assert sp_group.broadcast_calls[0][0] is None
+
+        # CFG+SP: owner must send None to cfg followers to prevent deadlock
+        if has_cfg:
+            assert len(cfg_group.send_calls) == 1
+            assert cfg_group.send_calls[0] == (1, None)
 
 
 # ── TP auto-detect ───────────────────────────────────────────────────
