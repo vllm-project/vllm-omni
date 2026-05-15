@@ -5,9 +5,10 @@ This module keeps fault injection callable from tests directly:
 - process kill by pattern and signal
 - post-ready hooks via ``fault_injector`` / ``omni_server_after_fault`` fixtures
 
-Worker PID classification for post-fault GPU/process checks uses substring markers
-(see :data:`DEFAULT_RUNTIME_WORKER_MARKERS` and ``server.reliability_worker_*`` attrs
-documented on :func:`_resolve_runtime_worker_markers`).
+Worker PID classification (``worker_pids`` in snapshots) is still used for logging /
+markers; post-fault **process** cleanup assertions use the full captured
+``tree_pids`` (serve root + descendants at fault time) — see
+:func:`assert_no_server_tree_process_residual_and_gpu_release`.
 """
 
 from __future__ import annotations
@@ -659,6 +660,56 @@ def list_alive_pids(pids: Sequence[int]) -> list[int]:
     return [int(pid) for pid in pids if psutil.pid_exists(int(pid))]
 
 
+def reliability_ps_ef_active_modes() -> frozenset[str]:
+    """Which ``ps -ef`` transcript modes are enabled via ``RELIABILITY_PS_EF``.
+
+    Values (case-insensitive):
+
+    - unset / ``0`` / ``off`` / ``false`` — disabled
+    - ``1`` / ``on`` / ``session`` — session start + finish only
+    - ``each`` / ``test`` / ``per-test`` — before + after every collected test node
+    - ``all`` — session + per-test
+
+    Per-test dumps run **after** function-scoped fixtures (e.g. ``omni_server_function``)
+    tear down, so the ``after`` transcript reflects post-server cleanup for that test.
+    """
+    raw = os.environ.get("RELIABILITY_PS_EF", "").strip().lower()
+    if raw in ("", "0", "false", "no", "off"):
+        return frozenset()
+    if raw in ("1", "true", "yes", "on", "session"):
+        return frozenset({"session"})
+    if raw in ("each", "test", "per-test"):
+        return frozenset({"each"})
+    if raw == "all":
+        return frozenset({"session", "each"})
+    return frozenset({"each"})
+
+
+def dump_ps_ef_transcript(phase: str) -> None:
+    """Print ``ps -ef`` to stdout for manual leak triage (POSIX only)."""
+    print(f"[reliability][ps-ef] === {phase} ===", flush=True)
+    if os.name == "nt":
+        print("[reliability][ps-ef] skipped: Windows has no standard ``ps -ef``", flush=True)
+        return
+    try:
+        proc = subprocess.run(
+            ["ps", "-ef"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if proc.stdout:
+            print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n", flush=True)
+        if proc.stderr:
+            print(proc.stderr, flush=True)
+        if proc.returncode != 0:
+            print(f"[reliability][ps-ef] ps exited with code {proc.returncode}", flush=True)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"[reliability][ps-ef] failed to run ps: {exc}", flush=True)
+    print(f"[reliability][ps-ef] === end {phase} ===", flush=True)
+
+
 def query_gpu_compute_pid_used_memory_mb() -> dict[int, int] | None:
     """Query NVIDIA compute-process memory map (pid -> used MB).
 
@@ -692,6 +743,59 @@ def query_gpu_compute_pid_used_memory_mb() -> dict[int, int] | None:
     return pid_to_mem_mb
 
 
+def worker_residual_timeout_after_kill_signal(signal_name: str) -> float:
+    """Wall-clock budget for fault-snapshot PIDs / GPU to clear after ``signal_name``."""
+    if signal_name == "SIGKILL":
+        return 30.0
+    if signal_name == "SIGINT":
+        return 120.0
+    if signal_name == "SIGTERM":
+        return 90.0
+    return 30.0
+
+
+def assert_no_server_tree_process_residual_and_gpu_release(
+    server: Any,
+    *,
+    scenario: str,
+    timeout_sec: float = 30.0,
+    poll_interval_sec: float = 0.5,
+) -> None:
+    """Assert no live PIDs remain from the fault-time server tree and no GPU use by those PIDs.
+
+    Uses ``reliability_fault_snapshot["tree_pids"]`` (root + all descendants captured at
+    injection time), not the marker-filtered ``worker_pids`` subset — so helpers like
+    ``multiprocessing.resource_tracker`` are included in the residual check.
+
+    Note: if a child is reparented to PID 1 while staying alive, its PID is unchanged
+    and remains detected; if it **exits and a new unrelated process reuses the same
+    numeric PID**, this check may false-positive (rare on short windows).
+    """
+    snapshot = getattr(server, "reliability_fault_snapshot", None)
+    if not isinstance(snapshot, dict):
+        pytest.fail(f"[{scenario}] missing reliability fault snapshot on server")
+    tree_pids = [int(pid) for pid in snapshot.get("tree_pids", [])]
+    if not tree_pids:
+        pytest.skip(f"[{scenario}] no server process tree PIDs captured for this run")
+
+    tree_pid_set = set(tree_pids)
+    deadline = time.monotonic() + timeout_sec
+    last_alive: list[int] = []
+    last_gpu_leaks: dict[int, int] = {}
+    while time.monotonic() < deadline:
+        last_alive = list_alive_pids(tree_pids)
+        gpu_map = query_gpu_compute_pid_used_memory_mb()
+        if gpu_map is None:
+            pytest.skip(f"[{scenario}] nvidia-smi unavailable; skip GPU release assertion")
+        last_gpu_leaks = {pid: mem_mb for pid, mem_mb in gpu_map.items() if pid in tree_pid_set and mem_mb > 0}
+        if not last_alive and not last_gpu_leaks:
+            return
+        time.sleep(poll_interval_sec)
+
+    assert not last_alive, f"[{scenario}] residual server-tree processes remain alive: {last_alive}"
+    assert not last_gpu_leaks, f"[{scenario}] server-tree PID GPU memory not released: {last_gpu_leaks}"
+
+
 def assert_no_worker_residual_and_gpu_release(
     server: Any,
     *,
@@ -699,35 +803,13 @@ def assert_no_worker_residual_and_gpu_release(
     timeout_sec: float = 30.0,
     poll_interval_sec: float = 0.5,
 ) -> None:
-    """Assert no residual worker process and no GPU residency on tracked workers after fault."""
-    snapshot = getattr(server, "reliability_fault_snapshot", None)
-    if not isinstance(snapshot, dict):
-        pytest.fail(f"[{scenario}] missing reliability fault snapshot on server")
-    worker_pids = [int(pid) for pid in snapshot.get("worker_pids", [])]
-    if not worker_pids:
-        markers = snapshot.get("worker_markers", [])
-        pytest.skip(
-            f"[{scenario}] no worker PIDs captured for this run "
-            f"(markers tried: {markers!r}; set server.reliability_worker_markers_extra "
-            "or server.reliability_worker_markers, or pass worker_markers_extra=... to the injector)"
-        )
-
-    worker_pid_set = set(worker_pids)
-    deadline = time.monotonic() + timeout_sec
-    last_alive_workers: list[int] = []
-    last_gpu_leaks: dict[int, int] = {}
-    while time.monotonic() < deadline:
-        last_alive_workers = list_alive_pids(worker_pids)
-        gpu_map = query_gpu_compute_pid_used_memory_mb()
-        if gpu_map is None:
-            pytest.skip(f"[{scenario}] nvidia-smi unavailable; skip GPU release assertion")
-        last_gpu_leaks = {pid: mem_mb for pid, mem_mb in gpu_map.items() if pid in worker_pid_set and mem_mb > 0}
-        if not last_alive_workers and not last_gpu_leaks:
-            return
-        time.sleep(poll_interval_sec)
-
-    assert not last_alive_workers, f"[{scenario}] residual worker processes remain alive: {last_alive_workers}"
-    assert not last_gpu_leaks, f"[{scenario}] worker GPU memory not released: {last_gpu_leaks}"
+    """Deprecated: use :func:`assert_no_server_tree_process_residual_and_gpu_release`."""
+    assert_no_server_tree_process_residual_and_gpu_release(
+        server,
+        scenario=scenario,
+        timeout_sec=timeout_sec,
+        poll_interval_sec=poll_interval_sec,
+    )
 
 
 def _capture_server_fault_snapshot(
@@ -735,7 +817,12 @@ def _capture_server_fault_snapshot(
     *,
     worker_markers_extra: Sequence[str] | None = None,
 ) -> dict[str, list[int]]:
-    """Capture current server process snapshot for post-fault assertions."""
+    """Capture current server process snapshot for post-fault assertions.
+
+    ``tree_pids`` is ``[root, ...descendants]`` and is used by
+    :func:`assert_no_server_tree_process_residual_and_gpu_release`.
+    ``worker_pids`` is the marker-filtered subset for debugging only.
+    """
     markers = _resolve_runtime_worker_markers(server, worker_markers_extra)
     tree_pids = _list_server_process_tree(server)
     root_pid = tree_pids[0] if tree_pids else None

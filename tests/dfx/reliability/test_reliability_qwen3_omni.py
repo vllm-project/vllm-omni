@@ -22,7 +22,7 @@ from tests.dfx.conftest import (
 )
 from tests.dfx.reliability.helpers import (
     FaultInjector,
-    assert_no_worker_residual_and_gpu_release,
+    assert_no_server_tree_process_residual_and_gpu_release,
     extract_openai_error_contract_from_bytes,
     get_health_raw,
     inject_gpu_oom,
@@ -33,6 +33,7 @@ from tests.dfx.reliability.helpers import (
     post_json_raw,
     run_fault_injection_with_rate_load,
     stop_gpu_oom_hogs,
+    worker_residual_timeout_after_kill_signal,
 )
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
@@ -651,7 +652,11 @@ def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup
     port = omni_server_function.port
     _assert_post_fault_chat_fast_fail(host, port, model=omni_server_function.model, scenario=scenario)
     _assert_post_fault_health_terminal(host, port, scenario=scenario)
-    assert_no_worker_residual_and_gpu_release(omni_server_function, scenario=scenario)
+    assert_no_server_tree_process_residual_and_gpu_release(
+        omni_server_function,
+        scenario=scenario,
+        timeout_sec=worker_residual_timeout_after_kill_signal(signal_name),
+    )
 
 
 @pytest.mark.slow
@@ -682,7 +687,11 @@ def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_clean
     port = omni_server_function.port
     _assert_post_fault_chat_fast_fail(host, port, model=omni_server_function.model, scenario=scenario)
     _assert_post_fault_health_terminal(host, port, scenario=scenario)
-    assert_no_worker_residual_and_gpu_release(omni_server_function, scenario=scenario)
+    assert_no_server_tree_process_residual_and_gpu_release(
+        omni_server_function,
+        scenario=scenario,
+        timeout_sec=worker_residual_timeout_after_kill_signal(signal_name),
+    )
 
 
 @pytest.mark.slow
@@ -705,7 +714,11 @@ def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
     port = omni_server_function.port
     _assert_post_fault_chat_fast_fail(host, port, model=omni_server_function.model, scenario=scenario)
     _assert_post_fault_health_terminal(host, port, scenario=scenario)
-    assert_no_worker_residual_and_gpu_release(omni_server_function, scenario=scenario)
+    assert_no_server_tree_process_residual_and_gpu_release(
+        omni_server_function,
+        scenario=scenario,
+        timeout_sec=worker_residual_timeout_after_kill_signal(signal_name),
+    )
 
 
 @pytest.mark.slow
@@ -738,7 +751,11 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
     port = omni_server_function.port
     _assert_post_fault_chat_fast_fail(host, port, model=omni_server_function.model, scenario=scenario)
     _assert_post_fault_health_terminal(host, port, scenario=scenario)
-    assert_no_worker_residual_and_gpu_release(omni_server_function, scenario=scenario)
+    assert_no_server_tree_process_residual_and_gpu_release(
+        omni_server_function,
+        scenario=scenario,
+        timeout_sec=worker_residual_timeout_after_kill_signal(signal_name),
+    )
 
 
 @pytest.mark.slow
