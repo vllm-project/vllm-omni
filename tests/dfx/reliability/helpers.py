@@ -656,8 +656,24 @@ def run_fault_injection_with_rate_load(
 
 
 def list_alive_pids(pids: Sequence[int]) -> list[int]:
-    """Return alive PIDs from one PID list."""
-    return [int(pid) for pid in pids if psutil.pid_exists(int(pid))]
+    """Return PIDs from ``pids`` that still exist in the kernel and are **not** zombies.
+
+    After SIGTERM/SIGKILL the serve child may exit before the test harness calls
+    ``Popen.wait()``; until reaped, ``psutil.pid_exists`` stays true for the defunct
+    slot. Those PIDs must not count as "residual server processes" for leak checks.
+    """
+    out: list[int] = []
+    for pid in pids:
+        pid_i = int(pid)
+        if not psutil.pid_exists(pid_i):
+            continue
+        try:
+            if psutil.Process(pid_i).status() == psutil.STATUS_ZOMBIE:
+                continue
+        except psutil.Error:
+            continue
+        out.append(pid_i)
+    return out
 
 
 def reliability_ps_ef_active_modes() -> frozenset[str]:
@@ -766,6 +782,9 @@ def assert_no_server_tree_process_residual_and_gpu_release(
     Uses ``reliability_fault_snapshot["tree_pids"]`` (root + all descendants captured at
     injection time), not the marker-filtered ``worker_pids`` subset — so helpers like
     ``multiprocessing.resource_tracker`` are included in the residual check.
+
+    **Zombie** PIDs (exited children not yet reaped by the test ``Popen``) are excluded
+    from the "alive" list; ``psutil.pid_exists`` alone would false-positive on them.
 
     Note: if a child is reparented to PID 1 while staying alive, its PID is unchanged
     and remains detected; if it **exits and a new unrelated process reuses the same
