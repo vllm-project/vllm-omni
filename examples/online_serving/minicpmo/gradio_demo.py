@@ -18,21 +18,22 @@ Usage:
 Only one of the two endpoints is required. The dropdown auto-filters to
 configured models.
 """
+
 from __future__ import annotations
 
 import argparse
 import base64
 import io
 import os
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import gradio as gr
 import numpy as np
 import soundfile as sf
 from openai import OpenAI
 from PIL import Image
-
 
 MINICPMO45 = "MiniCPM-o-4.5"
 MINICPMO26 = "MiniCPM-o-2.6"
@@ -66,6 +67,7 @@ _AUDIO_ASSISTANT_PROMPT = {
 # ---------------------------------------------------------------------------
 # Media helpers
 # ---------------------------------------------------------------------------
+
 
 def image_to_base64_data_url(image: Image.Image) -> str:
     buf = io.BytesIO()
@@ -102,10 +104,14 @@ def ref_audio_to_data_url(path: str, target_sr: int = 16000, max_s: float | None
     data = data.astype(np.float32)
     if sr != target_sr:
         try:
-            import librosa
+            # Demo client only; librosa here resamples audio before sending to
+            # the server.  The fallback below covers environments without it.
+            import librosa  # noqa: TID251
+
             data = librosa.resample(data, orig_sr=sr, target_sr=target_sr)
         except ImportError:
             from math import gcd
+
             g = gcd(sr, target_sr)
             up, down = target_sr // g, sr // g
             idx = (np.arange(len(data) * up) / up).astype(np.int64)
@@ -180,6 +186,7 @@ def process_audio_input(audio_input: Any | None) -> tuple[np.ndarray, int] | Non
 # Per-model inference config
 # ---------------------------------------------------------------------------
 
+
 class ModelEndpoint:
     """Endpoint + TTS-trigger convention for one MiniCPM-o variant."""
 
@@ -245,6 +252,7 @@ class ModelEndpoint:
 # text-only system prompt.
 # ---------------------------------------------------------------------------
 
+
 def build_audio_assistant_system(
     ref_audio_data_url: str | None,
     language: str = "zh",
@@ -272,6 +280,7 @@ def build_audio_assistant_system(
 # ---------------------------------------------------------------------------
 # Core inference function
 # ---------------------------------------------------------------------------
+
 
 def run_inference(
     endpoint: ModelEndpoint,
@@ -417,12 +426,8 @@ def build_interface(endpoints: dict[str, ModelEndpoint], default_model: str) -> 
             )
             with gr.Column(scale=1):
                 tts_checkbox = gr.Checkbox(label="Generate speech output (TTS)", value=True)
-                max_tokens_slider = gr.Slider(
-                    label="Max tokens", minimum=32, maximum=4096, value=1024, step=32
-                )
-                temperature_slider = gr.Slider(
-                    label="Temperature", minimum=0.0, maximum=1.5, value=0.7, step=0.05
-                )
+                max_tokens_slider = gr.Slider(label="Max tokens", minimum=32, maximum=4096, value=1024, step=32)
+                temperature_slider = gr.Slider(label="Temperature", minimum=0.0, maximum=1.5, value=0.7, step=0.05)
 
         with gr.Row(elem_classes="media-row"):
             image_input = gr.Image(label="Image (optional)", type="pil", sources=["upload"])
@@ -519,6 +524,7 @@ def build_interface(endpoints: dict[str, ModelEndpoint], default_model: str) -> 
 # Entry point
 # ---------------------------------------------------------------------------
 
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--minicpmo45-api-base", default=os.environ.get("MINICPMO45_API_BASE", "http://localhost:8099/v1"))
@@ -555,6 +561,7 @@ def parse_args() -> argparse.Namespace:
 
 def _ping(api_base: str, timeout: float = 3.0) -> bool:
     import urllib.request
+
     try:
         with urllib.request.urlopen(api_base.rstrip("/").replace("/v1", "/health"), timeout=timeout):
             return True

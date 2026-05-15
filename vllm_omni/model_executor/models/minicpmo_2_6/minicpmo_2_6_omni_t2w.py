@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2025 The OpenBMB Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,7 +17,6 @@ import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cached_property
-from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -28,8 +26,14 @@ import torch.nn.utils.parametrize as P
 from huggingface_hub import hf_hub_download
 from torch.nn.utils.parametrizations import weight_norm
 from tqdm import tqdm
-from transformers import BertTokenizerFast, LlamaConfig, LlamaModel, LogitsProcessor, PreTrainedModel
-from transformers import TopKLogitsWarper, TopPLogitsWarper
+from transformers import (
+    LlamaConfig,
+    LlamaModel,
+    LogitsProcessor,
+    PreTrainedModel,
+    TopKLogitsWarper,
+    TopPLogitsWarper,
+)
 from transformers.cache_utils import DynamicCache
 from transformers.modeling_outputs import BaseModelOutputWithPast, ModelOutput
 from vllm.config import VllmConfig
@@ -60,9 +64,7 @@ logger = init_logger(__name__)
 # No need to import from MiniCPM-o-2_6
 
 
-class MiniCPMO26OmniT2WForConditionalGeneration(
-    nn.Module, SupportsPP
-):
+class MiniCPMO26OmniT2WForConditionalGeneration(nn.Module, SupportsPP):
     """MiniCPM-o Code2Wav model: Mel spectrogram → Audio waveform via Vocos.
 
     In the 3-stage pipeline (thinker → talker → code2wav):
@@ -99,9 +101,7 @@ class MiniCPMO26OmniT2WForConditionalGeneration(
         if not os.path.exists(vocos_ckpt_path):
             try:
                 vocos_ckpt_path = hf_hub_download(
-                    repo_id="openbmb/MiniCPM-o-2_6",
-                    subfolder="assets",
-                    filename="Vocos.pt"
+                    repo_id="openbmb/MiniCPM-o-2_6", subfolder="assets", filename="Vocos.pt"
                 )
             except Exception as e:
                 logger.warning(f"Failed to download Vocos from HF: {e}")
@@ -136,7 +136,12 @@ class MiniCPMO26OmniT2WForConditionalGeneration(
             args=(),
             init={"class_path": "vocos.heads.ISTFTHead", "init_args": {"dim": 512, "n_fft": 1024, "hop_length": 256}},
         )
-        vocos = Vocos(feature_extractor, backbone, head).to(self.device if hasattr(self, "device") else torch.device("cuda")).eval().to(torch.float32)
+        vocos = (
+            Vocos(feature_extractor, backbone, head)
+            .to(self.device if hasattr(self, "device") else torch.device("cuda"))
+            .eval()
+            .to(torch.float32)
+        )
         vocos.load_state_dict(torch.load(ckpt_path, weights_only=True, mmap=True))
         return vocos
 
@@ -173,9 +178,9 @@ class MiniCPMO26OmniT2WForConditionalGeneration(
         self,
         input_ids: torch.Tensor = None,
         positions: torch.Tensor = None,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        additional_information: Optional[dict[str, object]] = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        additional_information: dict[str, object] | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
         """Convert mel spectrogram to audio waveform via Vocos.
@@ -208,14 +213,14 @@ class MiniCPMO26OmniT2WForConditionalGeneration(
         logger.warning("Vocos not initialised, returning mel_spec as-is")
         return mel_spec
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return torch.zeros(1, 2, device=hidden_states.device if isinstance(hidden_states, torch.Tensor) else "cuda")
 
     def sample(
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
+    ) -> SamplerOutput | None:
         return None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -243,6 +248,7 @@ class MiniCPMO26OmniT2WForConditionalGeneration(
 
 # ============== Helper Classes and Functions for ConditionalChatTTS ==============
 
+
 @dataclass
 class ConditionalChatTTSGenerationOutput(ModelOutput):
     """
@@ -258,7 +264,7 @@ class ConditionalChatTTSGenerationOutput(ModelOutput):
 
     new_ids: torch.LongTensor = None
     audio_input_ids: torch.LongTensor = None
-    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    past_key_values: tuple[tuple[torch.FloatTensor]] | None = None
     finished: bool = None
 
 
@@ -344,9 +350,7 @@ def make_streaming_chunk_mask_generation(
     device = inputs_embeds.device
     min_dtype = torch.finfo(dtype).min
 
-    causal_mask = torch.full(
-        (1, past_seen_tokens + inputs_embeds.shape[1]), fill_value=0, dtype=dtype, device=device
-    )
+    causal_mask = torch.full((1, past_seen_tokens + inputs_embeds.shape[1]), fill_value=0, dtype=dtype, device=device)
 
     invisible_text_tokens_start = (
         min(
@@ -358,9 +362,7 @@ def make_streaming_chunk_mask_generation(
         + num_spk_emb * use_spk_emb
     )
 
-    invisible_text_tokens_end = (
-        streaming_reserved_length + 1 + num_spk_emb * use_spk_emb + 1
-    )
+    invisible_text_tokens_end = streaming_reserved_length + 1 + num_spk_emb * use_spk_emb + 1
 
     causal_mask[0, invisible_text_tokens_start:invisible_text_tokens_end] = min_dtype
 
@@ -405,13 +407,13 @@ def gen_logits(
     repetition_penalty=1.0,
 ):
     """Generate logits warpers and processors for TTS generation.
-    
+
     Args:
         num_code: Number of audio codebooks
         top_P: Top-p sampling parameter (default: 0.7)
         top_K: Top-k sampling parameter (default: 20)
         repetition_penalty: Repetition penalty parameter (default: 1.0)
-        
+
     Returns:
         Tuple of (logits_warpers, logits_processors)
     """
@@ -431,8 +433,10 @@ def gen_logits(
 # ============== DVAE and related classes ==============
 # Borrowed from MiniCPM-o-2_6/modeling_minicpmo.py
 
+
 class ConvNeXtBlock(nn.Module):
     """ConvNeXt Block copied from Vocos."""
+
     def __init__(
         self,
         dim: int,
@@ -486,19 +490,20 @@ class ConvNeXtBlock(nn.Module):
 
 class GFSQ(nn.Module):
     """Grouped Residual Finite Scalar Quantization.
-    
+
     Borrowed from https://github.com/2noise/ChatTTS/blob/main/ChatTTS/model/dvae.py
     """
+
     def __init__(
         self,
         dim: int,
-        levels: List[int],
+        levels: list[int],
         G: int,
         R: int,
         eps=1e-5,
         transpose=True,
     ):
-        super(GFSQ, self).__init__()
+        super().__init__()
         if GroupedResidualFSQ is None:
             raise ImportError("GroupedResidualFSQ from vector_quantize_pytorch is required for DVAE")
         self.quantizer = GroupedResidualFSQ(
@@ -534,9 +539,10 @@ class GFSQ(nn.Module):
 
 class DVAEDecoder(nn.Module):
     """DVAE Decoder.
-    
+
     Borrowed from https://github.com/2noise/ChatTTS/blob/main/ChatTTS/model/dvae.py
     """
+
     def __init__(
         self,
         idim: int,
@@ -582,9 +588,10 @@ class DVAEDecoder(nn.Module):
 
 class DVAE(nn.Module):
     """Discrete Variational Autoencoder for audio codec.
-    
+
     Borrowed from https://github.com/2noise/ChatTTS/blob/main/ChatTTS/model/dvae.py
     """
+
     def __init__(
         self,
     ):
@@ -675,6 +682,7 @@ class DVAE(nn.Module):
 # MelSpectrogramFeatures for ChatTTSProcessor
 try:
     import torchaudio
+
     class MelSpectrogramFeatures(torch.nn.Module):
         def __init__(
             self,
@@ -706,11 +714,12 @@ try:
             return features
 except ImportError:
     logger.warning("torchaudio not available, MelSpectrogramFeatures will not work")
+
     class MelSpectrogramFeatures(torch.nn.Module):
         def __init__(self, *args, **kwargs):
             super().__init__()
             logger.warning("Using placeholder MelSpectrogramFeatures - audio processing may not work")
-        
+
         def forward(self, audio: torch.Tensor) -> torch.Tensor:
             logger.error("Placeholder MelSpectrogramFeatures forward called")
             return torch.zeros(100, 100, device=audio.device, dtype=audio.dtype)
@@ -869,7 +878,7 @@ class ConditionalChatTTS(PreTrainedModel):
     def merge_inputs_embeds(
         self,
         input_ids: torch.Tensor,
-        lm_spk_emb_last_hidden_states: Optional[torch.Tensor] = None,
+        lm_spk_emb_last_hidden_states: torch.Tensor | None = None,
     ):
         """Merge `input_ids` and `lm_spk_emb_last_hidden_states` to `inputs_embeds`.
 
@@ -914,8 +923,8 @@ class ConditionalChatTTS(PreTrainedModel):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.LongTensor,
-        past_key_values: List[Tuple[torch.Tensor, torch.Tensor]],
-        lm_spk_emb_last_hidden_states: Optional[torch.Tensor] = None,
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]],
+        lm_spk_emb_last_hidden_states: torch.Tensor | None = None,
     ):
         """Prefill a chunk of new text tokens in streaming setting.
         Specifically speaking, update `past_key_values` using new text tokens, then the model will read the new text tokens.
@@ -959,7 +968,9 @@ class ConditionalChatTTS(PreTrainedModel):
             inputs_embeds=inputs_embeds,  # contains text and language model embedding
             use_cache=True,
             output_attentions=False,
-            cache_position=position_ids.squeeze(0),  # 1D tensor expected by new transformers for correct causal mask creation
+            cache_position=position_ids.squeeze(
+                0
+            ),  # 1D tensor expected by new transformers for correct causal mask creation
         )
 
         # Get model updated KV Cache, convert back to legacy format
@@ -991,7 +1002,7 @@ class ConditionalChatTTS(PreTrainedModel):
     def prefill_audio_ids(
         self,
         input_ids: torch.Tensor,
-        past_key_values: List[Tuple[torch.Tensor, torch.Tensor]],
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]],
         streaming_tts_text_mask=None,
         add_audio_bos: bool = True,
     ):
@@ -1051,15 +1062,15 @@ class ConditionalChatTTS(PreTrainedModel):
     def generate(
         self,
         input_ids: torch.Tensor,
-        past_key_values: List[Tuple[torch.Tensor, torch.Tensor]],
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]],
         temperature: torch.Tensor,
-        eos_token: Union[int, torch.Tensor],
+        eos_token: int | torch.Tensor,
         streaming_tts_text_mask=None,
         force_no_stop=False,
         min_new_token=10,
         max_new_token=50,
-        logits_warpers: List[LogitsProcessor] = [],
-        logits_processors: List[CustomRepetitionPenaltyLogitsProcessorRepeat] = [],
+        logits_warpers: list[LogitsProcessor] = [],
+        logits_processors: list[CustomRepetitionPenaltyLogitsProcessorRepeat] = [],
         show_tqdm=False,
     ):
         """Generate audio codes in streaming setting or non-streaming setting.
@@ -1113,7 +1124,7 @@ class ConditionalChatTTS(PreTrainedModel):
         del input_ids
         input_ids = input_ids_buf.narrow(1, 0, progress)
 
-        pbar: Optional[tqdm] = None
+        pbar: tqdm | None = None
         if show_tqdm:
             pbar = tqdm(
                 total=max_new_token,
@@ -1292,7 +1303,7 @@ class ConditionalChatTTS(PreTrainedModel):
     @torch.inference_mode()
     def decode_to_mel_specs(
         self,
-        result_list: List[torch.Tensor],
+        result_list: list[torch.Tensor],
     ):
         """Decode discrete audio codes to mel spectrograms.
 

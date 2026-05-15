@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2025 The OpenBMB Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,7 +15,6 @@
 import math
 import os
 from collections.abc import Iterable
-from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -110,14 +108,13 @@ class MiniCPMO26OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # --- LLM tokenizer (for finding spk_bos/spk_eos in prompt_token_ids) ---
         if _tts_deps and AutoTokenizer is not None:
             try:
-                self._llm_tokenizer = AutoTokenizer.from_pretrained(
-                    model_path, trust_remote_code=True
-                )
+                self._llm_tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
                 self._spk_start_id = self._llm_tokenizer.convert_tokens_to_ids("<|spk_bos|>")
                 self._spk_end_id = self._llm_tokenizer.convert_tokens_to_ids("<|spk_eos|>")
                 logger.info(
                     "Loaded LLM tokenizer; spk_start_id=%s, spk_end_id=%s",
-                    self._spk_start_id, self._spk_end_id,
+                    self._spk_start_id,
+                    self._spk_end_id,
                 )
             except Exception as e:
                 logger.warning("Failed to load LLM tokenizer: %s", e)
@@ -182,8 +179,8 @@ class MiniCPMO26OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     def _extract_spk_embeds(
         self,
         prompt_embeds: torch.Tensor,
-        prompt_token_ids: List[int],
-    ) -> Optional[torch.Tensor]:
+        prompt_token_ids: list[int],
+    ) -> torch.Tensor | None:
         """Extract speaker embedding from thinker hidden states at spk_bos/spk_eos positions."""
         if self._spk_start_id is None or self._spk_end_id is None:
             logger.warning("spk token IDs not available, cannot extract speaker embedding")
@@ -202,8 +199,9 @@ class MiniCPMO26OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         spk_end = int(end_positions[-1].item())  # exclusive end
 
         if spk_start >= spk_end or spk_end > prompt_embeds.shape[0]:
-            logger.warning("Invalid spk_bounds: start=%d, end=%d, embeds_len=%d",
-                           spk_start, spk_end, prompt_embeds.shape[0])
+            logger.warning(
+                "Invalid spk_bounds: start=%d, end=%d, embeds_len=%d", spk_start, spk_end, prompt_embeds.shape[0]
+            )
             return None
 
         return prompt_embeds[spk_start:spk_end]  # [num_spk_tokens, hidden_dim]
@@ -219,7 +217,7 @@ class MiniCPMO26OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
     # ===================== TTS text preparation =====================
 
-    def prepare_tts_text(self, text: str) -> Tuple[str, int]:
+    def prepare_tts_text(self, text: str) -> tuple[str, int]:
         """Format text for ConditionalChatTTS streaming input.
 
         Format: [Stts][spk_emb]*N + text + padding([Etts][PAD]*) + [Ptts]
@@ -242,12 +240,9 @@ class MiniCPMO26OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         return tts_text, tts_tokens_len
 
     def _build_streaming_mask(self, tts_tokens_len: int) -> torch.Tensor:
-        seq_len = (
-            1 + self.tts.num_spk_embs * self.tts.use_speaker_embedding
-            + self.tts.streaming_text_reserved_len + 1
-        )
+        seq_len = 1 + self.tts.num_spk_embs * self.tts.use_speaker_embedding + self.tts.streaming_text_reserved_len + 1
         mask = torch.zeros(seq_len, dtype=torch.int8)
-        mask[0: 1 + 1 + tts_tokens_len + 1] = 1
+        mask[0 : 1 + 1 + tts_tokens_len + 1] = 1
         mask[-1] = 1
         return mask
 
@@ -260,7 +255,7 @@ class MiniCPMO26OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         tts_text: str,
         output_chunk_size: int = 25,
         tts_max_new_tokens: int = 2048,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run the TTS pipeline: text → audio codes → mel (→ optional waveform).
 
         Args:
@@ -307,16 +302,19 @@ class MiniCPMO26OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         )
 
         condition_length = (
-            1 + self.tts.use_speaker_embedding * self.tts.num_spk_embs
-            + self.tts.streaming_text_reserved_len + 1
+            1 + self.tts.use_speaker_embedding * self.tts.num_spk_embs + self.tts.streaming_text_reserved_len + 1
         )
 
         # Initialize KV cache
         head_dim = self.tts.config.hidden_size // self.tts.config.num_attention_heads
-        past_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = [
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]] = [
             (
-                torch.zeros(1, self.tts.config.num_attention_heads, condition_length - 1, head_dim, dtype=dtype, device=device),
-                torch.zeros(1, self.tts.config.num_attention_heads, condition_length - 1, head_dim, dtype=dtype, device=device),
+                torch.zeros(
+                    1, self.tts.config.num_attention_heads, condition_length - 1, head_dim, dtype=dtype, device=device
+                ),
+                torch.zeros(
+                    1, self.tts.config.num_attention_heads, condition_length - 1, head_dim, dtype=dtype, device=device
+                ),
             )
             for _ in range(self.tts.config.num_hidden_layers)
         ]
@@ -402,7 +400,6 @@ class MiniCPMO26OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # Decode audio codes → mel spectrogram
         mel_spec = self.tts.decode_to_mel_specs(outputs.new_ids)
 
-
         waveform = None
         if self._vocos is not None:
             waveform = self._vocos.decode(mel_spec.float()).cpu().squeeze()
@@ -420,11 +417,11 @@ class MiniCPMO26OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self,
         input_ids: torch.Tensor = None,
         positions: torch.Tensor = None,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        additional_information: Optional[dict] = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        additional_information: dict | None = None,
         **kwargs,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]], IntermediateTensors]:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None] | IntermediateTensors:
         """Run full TTS pipeline.
 
         The additional_information (from stage_input_processor) carries:
@@ -454,19 +451,19 @@ class MiniCPMO26OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         if spk_embeds is None or not tts_text:
             logger.warning(
-                "Talker forward: missing spk_embeds (got %s) or tts_text='%s', "
-                "returning dummy hidden states",
+                "Talker forward: missing spk_embeds (got %s) or tts_text='%s', returning dummy hidden states",
                 type(spk_embeds).__name__ if spk_embeds is not None else "None",
                 tts_text[:50],
             )
             return None, None
 
-        logger.info("Talker generating speech for text: '%s' (spk_embeds shape: %s)",
-                     tts_text[:80], list(spk_embeds.shape))
+        logger.info(
+            "Talker generating speech for text: '%s' (spk_embeds shape: %s)", tts_text[:80], list(spk_embeds.shape)
+        )
         mel_spec, waveform = self.generate_speech(spk_embeds, tts_text)
         return mel_spec, waveform
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         # Dummy logits: the real output is the audio waveform from forward()
         # Return a single logit vector that will produce any token (doesn't matter)
         return torch.zeros(1, 2, device=hidden_states.device if isinstance(hidden_states, torch.Tensor) else "cuda")
@@ -475,7 +472,7 @@ class MiniCPMO26OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
+    ) -> SamplerOutput | None:
         return None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

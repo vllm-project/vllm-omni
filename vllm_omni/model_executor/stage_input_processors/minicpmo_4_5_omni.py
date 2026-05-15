@@ -1,5 +1,3 @@
-from typing import Union
-
 import torch
 from vllm.inputs import TextPrompt
 
@@ -9,7 +7,7 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 def llm2tts(
     stage_list,
     engine_input_source,
-    prompt: Union[OmniTokensPrompt, TextPrompt] = None,
+    prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
 ):
     """Convert thinker stage output to talker stage input for MiniCPMO Omni.
@@ -40,9 +38,7 @@ def llm2tts(
         prompt = [prompt]
 
     multi_modal_data = {
-        llm_output.request_id: p.get("multi_modal_data", None)
-        if isinstance(p, dict)
-        else None
+        llm_output.request_id: p.get("multi_modal_data", None) if isinstance(p, dict) else None
         for llm_output, p in zip(llm_outputs, prompt)
     }
 
@@ -68,7 +64,9 @@ def llm2tts(
         thinker_text = getattr(output, "text", "") or ""
 
         # Build full token sequence and extract TTS region
-        full_token_ids = list(prompt_token_ids) + (list(llm_output_ids) if not isinstance(llm_output_ids, list) else llm_output_ids)
+        full_token_ids = list(prompt_token_ids) + (
+            list(llm_output_ids) if not isinstance(llm_output_ids, list) else llm_output_ids
+        )
         full_hidden = thinker_hidden_states.to(torch.float32)
 
         # Detect TTS token IDs (4.5: 151703/151704, 2.6: 151691/151692)
@@ -80,8 +78,10 @@ def llm2tts(
 
         tts_bos_idx = tts_eos_idx = None
         for idx_t, tid in enumerate(full_token_ids):
-            if tid == tts_bos_id: tts_bos_idx = idx_t + 1
-            elif tid == tts_eos_id: tts_eos_idx = idx_t
+            if tid == tts_bos_id:
+                tts_bos_idx = idx_t + 1
+            elif tid == tts_eos_id:
+                tts_eos_idx = idx_t
 
         tts_token_ids_slice = tts_hidden_slice = None
         if tts_bos_idx is not None and full_hidden.shape[0] > tts_bos_idx:
@@ -121,7 +121,7 @@ def llm2tts(
 def tts2t2w(
     stage_list,
     engine_input_source,
-    prompt: Union[OmniTokensPrompt, TextPrompt] = None,
+    prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
 ):
     """Convert talker stage output to code2wav stage input for MiniCPMO Omni.
@@ -144,9 +144,7 @@ def tts2t2w(
         prompt = [prompt]
 
     multi_modal_data = {
-        tts_output.request_id: p.get("multi_modal_data", None)
-        if isinstance(p, dict)
-        else None
+        tts_output.request_id: p.get("multi_modal_data", None) if isinstance(p, dict) else None
         for tts_output, p in zip(tts_outputs, prompt)
     }
 
@@ -157,6 +155,7 @@ def tts2t2w(
         waveform = None
         if hasattr(output, "multimodal_output") and isinstance(output.multimodal_output, dict):
             import torch as _torch
+
             mel_spec = output.multimodal_output.get("mel_spec")
             waveform = output.multimodal_output.get("model_outputs")
             # The 4.5 talker already runs DVAE+Vocos internally and produces a
@@ -165,16 +164,23 @@ def tts2t2w(
             # (e.g. "latent"). Recover it here.
             latent = output.multimodal_output.get("latent")
             import logging as _logging
+
             _log = _logging.getLogger(__name__)
             if latent is not None:
                 if isinstance(latent, _torch.Tensor):
-                    _log.info("tts2t2w: latent tensor shape=%s dtype=%s numel=%d",
-                              tuple(latent.shape), latent.dtype, latent.numel())
+                    _log.info(
+                        "tts2t2w: latent tensor shape=%s dtype=%s numel=%d",
+                        tuple(latent.shape),
+                        latent.dtype,
+                        latent.numel(),
+                    )
                 elif isinstance(latent, list):
-                    _log.info("tts2t2w: latent is list len=%d type0=%s shape0=%s",
-                              len(latent),
-                              type(latent[0]).__name__ if latent else None,
-                              tuple(latent[0].shape) if latent and isinstance(latent[0], _torch.Tensor) else None)
+                    _log.info(
+                        "tts2t2w: latent is list len=%d type0=%s shape0=%s",
+                        len(latent),
+                        type(latent[0]).__name__ if latent else None,
+                        tuple(latent[0].shape) if latent and isinstance(latent[0], _torch.Tensor) else None,
+                    )
                 else:
                     _log.info("tts2t2w: latent type=%s", type(latent).__name__)
             if isinstance(latent, list) and latent:
@@ -193,9 +199,9 @@ def tts2t2w(
 
         if mel_spec is None and waveform is None:
             import logging
+
             logging.getLogger(__name__).warning(
-                "tts2t2w: no mel_spec/waveform found in talker output "
-                "(multimodal_output keys: %s)",
+                "tts2t2w: no mel_spec/waveform found in talker output (multimodal_output keys: %s)",
                 list(output.multimodal_output.keys())
                 if hasattr(output, "multimodal_output") and isinstance(output.multimodal_output, dict)
                 else "N/A",

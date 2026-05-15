@@ -1,5 +1,3 @@
-from typing import Union
-
 import torch
 from vllm.inputs import TextPrompt
 
@@ -9,7 +7,7 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 def llm2tts(
     stage_list,
     engine_input_source,
-    prompt: Union[OmniTokensPrompt, TextPrompt] = None,
+    prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
 ):
     """Convert thinker stage output to talker stage input for MiniCPMO Omni.
@@ -40,9 +38,7 @@ def llm2tts(
         prompt = [prompt]
 
     multi_modal_data = {
-        llm_output.request_id: p.get("multi_modal_data", None)
-        if isinstance(p, dict)
-        else None
+        llm_output.request_id: p.get("multi_modal_data", None) if isinstance(p, dict) else None
         for llm_output, p in zip(llm_outputs, prompt)
     }
 
@@ -95,7 +91,7 @@ def llm2tts(
 def tts2t2w(
     stage_list,
     engine_input_source,
-    prompt: Union[OmniTokensPrompt, TextPrompt] = None,
+    prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
 ):
     """Convert talker stage output to code2wav stage input for MiniCPMO Omni.
@@ -118,9 +114,7 @@ def tts2t2w(
         prompt = [prompt]
 
     multi_modal_data = {
-        tts_output.request_id: p.get("multi_modal_data", None)
-        if isinstance(p, dict)
-        else None
+        tts_output.request_id: p.get("multi_modal_data", None) if isinstance(p, dict) else None
         for tts_output, p in zip(tts_outputs, prompt)
     }
 
@@ -133,9 +127,9 @@ def tts2t2w(
 
         if mel_spec is None:
             import logging
+
             logging.getLogger(__name__).warning(
-                "tts2t2w: no mel_spec found in talker output "
-                "(multimodal_output keys: %s)",
+                "tts2t2w: no mel_spec found in talker output (multimodal_output keys: %s)",
                 list(output.multimodal_output.keys())
                 if hasattr(output, "multimodal_output") and isinstance(output.multimodal_output, dict)
                 else "N/A",

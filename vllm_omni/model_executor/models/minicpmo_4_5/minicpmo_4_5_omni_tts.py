@@ -1,4 +1,3 @@
-# coding=utf-8
 """MiniCPM-o 4.5 Talker + Token2Wav: MiniCPMTTS with hidden_text_merge condition.
 
 Pipeline:
@@ -8,11 +7,11 @@ Pipeline:
   4. Run MiniCPMTTS.generate() -> discrete audio tokens
   5. Run Token2wav(tokens) -> waveform bytes -> numpy array
 """
+
 import io
 import logging
 import os
-import tempfile
-from typing import Iterable, Optional, Tuple
+from collections.abc import Iterable
 
 import numpy as np
 import soundfile as sf
@@ -24,6 +23,7 @@ from vllm.model_executor.models.interfaces import SupportsPP
 
 try:
     from stepaudio2 import Token2wav as _Token2wav
+
     _stepaudio2_available = True
 except ImportError:
     _Token2wav = None
@@ -38,6 +38,7 @@ def _install_torchaudio_soundfile_shim() -> None:
     may be missing on the deployment machine."""
     try:
         import torchaudio
+
         if getattr(torchaudio, "_soundfile_shim_installed", False):
             return
         _orig_load = torchaudio.load
@@ -46,8 +47,9 @@ def _install_torchaudio_soundfile_shim() -> None:
             try:
                 return _orig_load(uri, *args, **kwargs)
             except Exception:
-                import soundfile as _sf
                 import numpy as _np
+                import soundfile as _sf
+
                 data, sr = _sf.read(uri, dtype="float32", always_2d=True)
                 wav = torch.from_numpy(_np.ascontiguousarray(data.T))
                 return wav, sr
@@ -68,6 +70,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import MiniCPMOConfig
+
         config: MiniCPMOConfig = vllm_config.model_config.hf_config
         self.config = config
         self.vllm_config = vllm_config
@@ -93,13 +96,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._assets_loaded = True
         try:
             model_path = self.vllm_config.model_config.model
-            import sys, os
+            import os
+            import sys
+
             if model_path not in sys.path:
                 sys.path.insert(0, model_path)
             from transformers.dynamic_module_utils import get_class_from_dynamic_module
-            MiniCPMTTS = get_class_from_dynamic_module(
-                "modeling_minicpmo.MiniCPMTTS", model_path
-            )
+
+            MiniCPMTTS = get_class_from_dynamic_module("modeling_minicpmo.MiniCPMTTS", model_path)
 
             prev_dtype = torch.get_default_dtype()
             torch.set_default_dtype(torch.float32)
@@ -138,7 +142,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self,
         tts_token_ids: torch.Tensor,
         tts_hidden_states: torch.Tensor,
-    ) -> Optional[np.ndarray]:
+    ) -> np.ndarray | None:
         """Run full 4.5 TTS pipeline using original MiniCPMTTS.generate."""
         self._lazy_init_tts()
         if not hasattr(self, "tts_obj") or self.tts_obj is None:
@@ -179,25 +183,30 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         generated_tokens = outputs.new_ids.squeeze(-1)
         logger.info(
             "generate_speech: generated %d audio tokens (cap=%d, text_tokens=%d)",
-            generated_tokens.shape[-1], max_new_token, num_text,
+            generated_tokens.shape[-1],
+            max_new_token,
+            num_text,
         )
 
         if self.audio_tokenizer is None:
             logger.warning("No audio_tokenizer")
             return None
 
-        import os, torchaudio
+        import torchaudio
+
         model_path = self.vllm_config.model_config.model
         default_ref = os.path.join(model_path, "assets", "HT_ref_audio.wav")
         prompt_wav_path = default_ref if os.path.exists(default_ref) else None
 
         _orig_save = torchaudio.save
+
         def _patched_save(uri, src, sample_rate, **kw):
             kw.pop("backend", None)
             if hasattr(uri, "write"):
                 sf.write(uri, src.cpu().numpy().T, sample_rate, format="WAV")
                 return
             return _orig_save(uri, src, sample_rate, backend="soundfile", **kw)
+
         torchaudio.save = _patched_save
         prev_dtype = torch.get_default_dtype()
         torch.set_default_dtype(torch.float32)
@@ -215,8 +224,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # attention caches to prompt_len + 100 steps on every chunk,
                 # keeping peak memory bounded regardless of total length.
                 STREAM_THRESHOLD = int(os.environ.get("MINICPMO45_TTS_STREAM_THRESHOLD", "2500"))  # ~100s @ 25Hz
-                CHUNK_SIZE = int(os.environ.get("MINICPMO45_TTS_STREAM_CHUNK", "50"))              # ~2s per chunk
-                MIN_TAIL = 6             # must exceed flow.pre_lookahead_len (typically 3)
+                CHUNK_SIZE = int(os.environ.get("MINICPMO45_TTS_STREAM_CHUNK", "50"))  # ~2s per chunk
+                MIN_TAIL = 6  # must exceed flow.pre_lookahead_len (typically 3)
 
                 if num_tokens <= STREAM_THRESHOLD:
                     wav_bytes = self.audio_tokenizer(token_list, prompt_wav_path)
@@ -236,18 +245,19 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
                     logger.info(
                         "generate_speech: streaming vocoder, %d tokens -> %d chunks (chunk=%d)",
-                        num_tokens, len(boundaries), CHUNK_SIZE,
+                        num_tokens,
+                        len(boundaries),
+                        CHUNK_SIZE,
                     )
 
-                    stream_cache, hift_cache_dict = \
-                        self.audio_tokenizer.set_stream_cache(prompt_wav_path)
+                    stream_cache, hift_cache_dict = self.audio_tokenizer.set_stream_cache(prompt_wav_path)
                     self.audio_tokenizer.stream_cache = stream_cache
                     self.audio_tokenizer.hift_cache_dict = hift_cache_dict
 
                     try:
                         pieces = []
                         for idx, (s, e) in enumerate(boundaries):
-                            is_last = (idx == len(boundaries) - 1)
+                            is_last = idx == len(boundaries) - 1
                             wav_np = self.audio_tokenizer.stream(
                                 token_list[s:e],
                                 prompt_wav_path,
@@ -268,7 +278,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         logger.info("generate_speech: waveform %d samples, sr=%d", waveform.shape[0], sr)
         return waveform
 
-    def _generate_tokens(self, inputs_embeds: torch.Tensor, max_new_token: int = 2048) -> Optional[torch.Tensor]:
+    def _generate_tokens(self, inputs_embeds: torch.Tensor, max_new_token: int = 2048) -> torch.Tensor | None:
         """Autoregressive generation of audio tokens using the TTS LlamaModel."""
         device = inputs_embeds.device
         eos_token = self._num_audio_tokens - 1
@@ -284,7 +294,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 emb = inputs_embeds
                 position_ids = torch.arange(condition_length, device=device).unsqueeze(0)
             else:
-                code_emb = [self.emb_code[q](new_tokens[:, t-1:t, q]) for q in range(num_vq)]
+                code_emb = [self.emb_code[q](new_tokens[:, t - 1 : t, q]) for q in range(num_vq)]
                 emb = torch.stack(code_emb, -1).sum(-1)
                 position_ids = torch.tensor([[condition_length + t - 1]], device=device)
 
@@ -311,7 +321,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 finished = True
                 break
 
-        return new_tokens[:, :t+1 if finished else t, :]
+        return new_tokens[:, : t + 1 if finished else t, :]
 
     def forward(
         self,
@@ -347,7 +357,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     def sample(self, logits, sampling_metadata):
         return None
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loaded = set()
         tts_weights = {}
         for k, v in weights:

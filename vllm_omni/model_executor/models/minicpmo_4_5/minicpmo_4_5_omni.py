@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2025 The OpenBMB Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from collections.abc import Iterable
 from functools import cached_property
-from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -29,19 +26,17 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
-from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import MiniCPMOConfig
-from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
-from vllm_omni.platforms import current_omni_platform
-
-logger = init_logger(__name__)
-
-# Import processor components from thinker module
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
     MiniCPMO45OmniLLMMultiModalProcessor,
     MiniCPMO45OmniLLMProcessingInfo,
+    MiniCPMOConfig,
 )
+from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights
+from vllm_omni.platforms import current_omni_platform
+
+logger = init_logger(__name__)
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -49,11 +44,9 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     info=MiniCPMO45OmniLLMProcessingInfo,
     dummy_inputs=MiniCPMO45OmniLLMDummyInputsBuilder,
 )
-class MiniCPMO45OmniForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE
-):
+class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, SupportsMRoPE):
     """MiniCPM-o 2.6 Omni model for conditional generation.
-    
+
     This model supports multi-stage processing:
     - thinker: Image preprocessing + Vision encoder + 3D resampler
     - talker: LLM generation
@@ -61,7 +54,7 @@ class MiniCPMO45OmniForConditionalGeneration(
     """
 
     @classmethod
-    def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
             return "(<image>./</image>)"
         if modality.startswith("video"):
@@ -77,13 +70,13 @@ class MiniCPMO45OmniForConditionalGeneration(
         multimodal_config = vllm_config.model_config.multimodal_config
         # keep vllm_config for later submodule init
         self.vllm_config = vllm_config
-        
+
         # Store configs
         self.config = config
         self.multimodal_config = multimodal_config
-        
+
         self.model_stage = vllm_config.model_config.model_stage
-        
+
         if self.model_stage == "llm":
             # Initialize thinker model (image preprocessing + vision encoder + 3D resampler)
             self.thinker = init_vllm_registered_model(
@@ -96,7 +89,7 @@ class MiniCPMO45OmniForConditionalGeneration(
             self.model = self.thinker
             self.talker = None
             self.code2wav = None
-            
+
         elif self.model_stage == "tts":
             self.thinker = None
             # Initialize talker model (LLM generation)
@@ -112,7 +105,7 @@ class MiniCPMO45OmniForConditionalGeneration(
                 self.talker.init_multi_modal(config)
             self.model = self.talker
             self.code2wav = None
-            
+
         elif self.model_stage == "t2w":
             self.thinker = None
             self.talker = None
@@ -128,19 +121,22 @@ class MiniCPMO45OmniForConditionalGeneration(
             self.model = self.code2wav
         else:
             raise ValueError(f"Invalid model stage: {self.model_stage}. Must be one of: 'llm', 'tts', 't2w'")
-        
+
         # Set up intermediate tensors
         self.make_empty_intermediate_tensors = (
-            (self.thinker.make_empty_intermediate_tensors) if self.model_stage == "llm" and self.thinker is not None else lambda: None
+            (self.thinker.make_empty_intermediate_tensors)
+            if self.model_stage == "llm" and self.thinker is not None
+            else lambda: None
         )
 
         self._language_model_names = ["model"]
-    
+
     @cached_property
     def sampler(self):
         if hasattr(self.model, "sampler"):
             return self.model.sampler
         from vllm.v1.sample.sampler import Sampler
+
         return Sampler()
 
     # -------------------- Device utilities --------------------
@@ -153,16 +149,16 @@ class MiniCPMO45OmniForConditionalGeneration(
             for _, buf in module.named_buffers(recurse=True):
                 return buf.device
             return torch.device("cpu")
-    
+
     def move_submodules_to_devices(
         self,
         *,
-        thinker_device: Optional[Union[str, torch.device]] = None,
-        talker_device: Optional[Union[str, torch.device]] = None,
-        code2wav_device: Optional[Union[str, torch.device]] = None,
+        thinker_device: str | torch.device | None = None,
+        talker_device: str | torch.device | None = None,
+        code2wav_device: str | torch.device | None = None,
     ) -> None:
         """Optionally move thinker/talker/code2wav to different devices.
-        
+
         Example:
             model.move_submodules_to_devices(
                 thinker_device='cuda:0',
@@ -176,7 +172,7 @@ class MiniCPMO45OmniForConditionalGeneration(
             self.talker.to(talker_device)
         if code2wav_device is not None and self.code2wav is not None:
             self.code2wav.to(code2wav_device)
-    
+
     def get_input_embeddings(
         self,
         input_ids: torch.Tensor,
@@ -186,8 +182,10 @@ class MiniCPMO45OmniForConditionalGeneration(
             tts_cfg = getattr(self.config, "tts_config", None)
             hs = getattr(tts_cfg, "hidden_size", 768) if tts_cfg else 768
             return torch.zeros(
-                input_ids.shape[0], hs,
-                device=input_ids.device, dtype=torch.bfloat16,
+                input_ids.shape[0],
+                hs,
+                device=input_ids.device,
+                dtype=torch.bfloat16,
             )
         return self.model.get_input_embeddings(input_ids, multimodal_embeddings)
 
@@ -200,10 +198,8 @@ class MiniCPMO45OmniForConditionalGeneration(
     ) -> torch.Tensor:
         if self.model_stage in ("talker", "code2wav"):
             return self.get_input_embeddings(input_ids)
-        return super().embed_input_ids(
-            input_ids, multimodal_embeddings, is_multimodal=is_multimodal
-        )
-    
+        return super().embed_input_ids(input_ids, multimodal_embeddings, is_multimodal=is_multimodal)
+
     def get_multimodal_embeddings(self, **kwargs):
         # Delegate to the active stage submodule when it implements MM encoding.
         mm_fn = getattr(self.model, "get_multimodal_embeddings", None)
@@ -214,22 +210,22 @@ class MiniCPMO45OmniForConditionalGeneration(
     def embed_multimodal(self, **kwargs: object):
         """vLLM V1 encoder profiling calls this; the inherited Protocol stub returns None."""
         return self.get_multimodal_embeddings(**kwargs)
-    
+
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        sampling_metadata: Optional[SamplingMetadata] = None,
-        logits_index: Optional[int] = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        sampling_metadata: SamplingMetadata | None = None,
+        logits_index: int | None = None,
         sampler=None,
-        additional_information: Optional[dict[str, object]] = None,
+        additional_information: dict[str, object] | None = None,
         **kwargs: object,
-    ) -> Union[torch.Tensor, IntermediateTensors, OmniOutput]:
+    ) -> torch.Tensor | IntermediateTensors | OmniOutput:
         """
         Forward pass for MiniCPM-o Omni model.
-        
+
         Workflow:
         1) Thinker: Image preprocessing + Vision encoder + 3D resampler → hidden states
         2) Talker: LLM generation from hidden states → text tokens
@@ -249,12 +245,12 @@ class MiniCPMO45OmniForConditionalGeneration(
                 inputs_embeds = inputs_embeds.unsqueeze(0)
                 added_batch_dim = True
             thinker_dev = self._module_device(self.thinker)
-            
+
             # if input_ids is None, set it to a zero tensor
             if input_ids is None:
                 input_ids = torch.zeros(inputs_embeds.shape[1], dtype=torch.long, device=thinker_dev).unsqueeze(0)
                 added_batch_dim = True
-            
+
             # Ensure inputs on thinker's device
             if input_ids is not None and input_ids.device != thinker_dev:
                 input_ids = input_ids.to(thinker_dev)
@@ -262,7 +258,7 @@ class MiniCPMO45OmniForConditionalGeneration(
                 positions = positions.to(thinker_dev)
             if inputs_embeds is not None and inputs_embeds.device != thinker_dev:
                 inputs_embeds = inputs_embeds.to(thinker_dev)
-            
+
             if current_omni_platform.is_npu():
                 # TODO: remove this hack when NPU supports batched inputs properly
                 thinker_input_ids = input_ids[0] if input_ids is not None and added_batch_dim else input_ids
@@ -273,8 +269,10 @@ class MiniCPMO45OmniForConditionalGeneration(
             else:
                 thinker_input_ids = input_ids[0] if input_ids is not None and added_batch_dim else input_ids
                 thinker_positions = positions[0] if positions is not None and added_batch_dim else positions
-                thinker_inputs_embeds = inputs_embeds[0] if inputs_embeds is not None and added_batch_dim else inputs_embeds
-            
+                thinker_inputs_embeds = (
+                    inputs_embeds[0] if inputs_embeds is not None and added_batch_dim else inputs_embeds
+                )
+
             # Run thinker
             thinker_output = self.thinker(
                 input_ids=thinker_input_ids,
@@ -283,23 +281,23 @@ class MiniCPMO45OmniForConditionalGeneration(
                 inputs_embeds=thinker_inputs_embeds,
                 **kwargs,
             )
-            
+
             if isinstance(thinker_output, tuple):
                 embeds, text_hidden_states = thinker_output
             else:
                 text_hidden_states = thinker_output
-            
+
             # Prepare hidden states for downstream stages
             # Ensure correct shape: (batch_size, seq_len, hidden_dim)
             if added_batch_dim:
                 text_hidden_states = text_hidden_states.squeeze(0)
-            
+
             # Return hidden states with latent in multimodal_outputs for stage_input_processors
             return OmniOutput(
                 text_hidden_states=text_hidden_states,
                 multimodal_outputs={"latent": text_hidden_states},
             )
-        
+
         # Talker stage: runs ConditionalChatTTS + DVAE → mel_spec (+ optional Vocos → waveform)
         if self.model_stage == "tts":
             if input_ids is not None:
@@ -377,7 +375,9 @@ class MiniCPMO45OmniForConditionalGeneration(
             dummy_hidden = torch.zeros(n_tokens, hidden_dim, device=device)
 
             if waveform_passthrough is not None:
-                return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs={"model_outputs": [waveform_passthrough]})
+                return OmniOutput(
+                    text_hidden_states=dummy_hidden, multimodal_outputs={"model_outputs": [waveform_passthrough]}
+                )
 
             if mel_spec is not None and isinstance(mel_spec, torch.Tensor) and mel_spec.dim() == 1:
                 return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs={"model_outputs": [mel_spec]})
@@ -394,40 +394,40 @@ class MiniCPMO45OmniForConditionalGeneration(
 
             logger.warning("Code2Wav: no mel_spec or code2wav model, returning empty")
             return OmniOutput(text_hidden_states=dummy_hidden, multimodal_outputs={"model_outputs": [torch.zeros(0)]})
-        
+
         raise ValueError(f"Unsupported model stage: {self.model_stage}")
-    
-    def compute_logits(self, hidden_states: Union[torch.Tensor, OmniOutput]) -> Optional[torch.Tensor]:
+
+    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         # Handle OmniOutput type
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
-        
+
         # Use model for logits computation
         return self.model.compute_logits(hidden_states)
-    
+
     def sample(
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
-    ) -> Optional[SamplerOutput]:
+    ) -> SamplerOutput | None:
         # Use model for sampling
         return self.model.sample(logits, sampling_metadata)
-    
+
     def generate_audio(self, code: torch.Tensor, voice_type: str = "default") -> torch.Tensor:
         """
         Generate audio from code tokens using the code2wav model.
-        
+
         Args:
             code: Code tokens from talker model
             voice_type: Voice type for speech generation (optional for MiniCPM-o)
-            
+
         Returns:
             Audio tensor
         """
         if self.code2wav is None:
             logger.warning("Code2Wav model not initialized, cannot generate audio")
             return torch.zeros(0)
-        
+
         code2wav_dev = self._module_device(self.code2wav)
         if isinstance(code, torch.Tensor):
             code_tensor = code.to(dtype=torch.long, device=code2wav_dev)
@@ -435,21 +435,21 @@ class MiniCPMO45OmniForConditionalGeneration(
             code_tensor = torch.as_tensor(code, dtype=torch.long, device=code2wav_dev)
         if code_tensor.ndim == 2 and code_tensor.shape[0] == 1:
             code_tensor = code_tensor.squeeze(0)
-        
+
         # Generate audio using code2wav model
         # TODO: Implement actual audio generation based on MiniCPM-o's code2wav implementation
         with torch.inference_mode():
             audio_tensor = self.code2wav(code_tensor)
-        
+
         return audio_tensor
-    
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for all components of the omni model."""
         loaded_weights = set()
         thinker_weights = []
         talker_weights = []
         code2wav_weights = []
-        
+
         # MiniCPM-o checkpoint prefixes → stage mapping:
         #   thinker: vpm, resampler, llm, apm, audio_projection_layer
         #   talker:  tts (ConditionalChatTTS)
@@ -467,17 +467,17 @@ class MiniCPMO45OmniForConditionalGeneration(
             thinker_loaded = self.thinker.load_weights(thinker_weights)
             thinker_loaded = add_prefix_to_loaded_weights(thinker_loaded, "thinker")
             loaded_weights.update(thinker_loaded)
-        
+
         # Load talker weights
         if self.talker is not None and talker_weights:
             talker_loaded = self.talker.load_weights(talker_weights)
             talker_loaded = add_prefix_to_loaded_weights(talker_loaded, "talker")
             loaded_weights.update(talker_loaded)
-        
+
         # Load code2wav weights
         if self.code2wav is not None and code2wav_weights:
             code2wav_loaded = self.code2wav.load_weights(code2wav_weights)
             code2wav_loaded = add_prefix_to_loaded_weights(code2wav_loaded, "code2wav")
             loaded_weights.update(code2wav_loaded)
-        
+
         return loaded_weights

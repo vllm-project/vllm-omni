@@ -1,6 +1,6 @@
 """MiniCPM-o 4.5 Token2Wav: waveform passthrough from talker output."""
+
 import logging
-from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -25,6 +25,7 @@ class MiniCPMO45OmniT2WForConditionalGeneration(nn.Module, SupportsPP):
             waveform = info.get("waveform") or info.get("mel_spec")
             if isinstance(waveform, torch.Tensor) and waveform.dim() == 1 and waveform.numel() > 100:
                 from vllm_omni.model_executor.models.output_templates import OmniOutput
+
                 dummy = torch.zeros(1, 1, device=device)
                 return OmniOutput(text_hidden_states=dummy, multimodal_outputs={"model_outputs": [waveform]})
         return torch.zeros(1, 1, device=device)

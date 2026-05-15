@@ -149,6 +149,13 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "examples/**" = ["E501"]  # Allow long lines in examples
 "tests/**" = ["E501"]  # Allow long lines in tests
+# MiniCPM-o reference modeling code vendored from upstream HF/transformers/MiniCPM-o.
+# These files keep upstream conventions (star imports, long lines, math-symbol
+# argument names) so they stay easy to diff against upstream releases.
+"vllm_omni/model_executor/models/minicpmo_2_6/minicpmo_2_6_omni_llm.py" = ["E402", "E501", "F403", "F405", "N803"]
+"vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_omni_llm.py" = ["E402", "E501", "F403", "F405", "N803"]
+"vllm_omni/model_executor/models/minicpmo_2_6/minicpmo_2_6_omni_t2w.py" = ["E501", "N803"]
+"vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_omni_t2w.py" = ["E501", "N803"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "librosa".msg = "The librosa module is banned, use vllm.multimodal helpers instead"
