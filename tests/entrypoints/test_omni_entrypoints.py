@@ -13,42 +13,38 @@ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
+from vllm_omni.engine.async_omni_engine import StageRuntimeInfo
+from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+def _stage_meta(*, stage_type: str, final_output: bool, final_output_type: str | None) -> StageRuntimeInfo:
+    return StageRuntimeInfo(
+        stage_type=stage_type,
+        final_output=final_output,
+        final_output_type=final_output_type,
+    )
+
+
 THREE_STAGE_META = [
-    {"stage_type": "llm", "final_output": True, "final_output_type": "text"},
-    {"stage_type": "llm", "final_output": False, "final_output_type": None},
-    {"stage_type": "diffusion", "final_output": True, "final_output_type": "image"},
+    _stage_meta(stage_type="llm", final_output=True, final_output_type="text"),
+    _stage_meta(stage_type="llm", final_output=False, final_output_type=None),
+    _stage_meta(stage_type="diffusion", final_output=True, final_output_type="image"),
 ]
 
 DIFFUSION_ONLY_META = [
-    {"stage_type": "diffusion", "final_output": True, "final_output_type": "image"},
+    _stage_meta(stage_type="diffusion", final_output=True, final_output_type="image"),
 ]
 
 LLM_DIFFUSION_META = [
-    {"stage_type": "llm", "final_output": True, "final_output_type": "text"},
-    {"stage_type": "diffusion", "final_output": True, "final_output_type": "image"},
+    _stage_meta(stage_type="llm", final_output=True, final_output_type="text"),
+    _stage_meta(stage_type="diffusion", final_output=True, final_output_type="image"),
 ]
-
-
-class FakeEngineOutput:
-    def __init__(
-        self,
-        *,
-        payload: str,
-        finished: bool,
-        images: list[str] | None = None,
-        stage_durations: dict[str, float] | None = None,
-    ) -> None:
-        self.payload = payload
-        self.finished = finished
-        self.images = images or []
-        self.stage_durations = stage_durations or {}
 
 
 def make_output_msg(
@@ -60,21 +56,25 @@ def make_output_msg(
     finished: bool | None = None,
     images: list[str] | None = None,
     metrics: Any = None,
-) -> dict[str, Any]:
+) -> OutputMessage:
     if finished is None:
         finished = output_finished
-    return {
-        "type": "output",
-        "request_id": request_id,
-        "stage_id": stage_id,
-        "engine_outputs": FakeEngineOutput(
-            payload=payload,
-            finished=output_finished,
-            images=images,
-        ),
-        "finished": finished,
-        "metrics": metrics,
-    }
+    final_output_type = "image" if images else "text"
+    engine_output = OmniRequestOutput(
+        request_id=request_id,
+        finished=output_finished,
+        final_output_type=final_output_type,
+        images=images or [],
+        stage_durations={},
+    )
+    engine_output.payload = payload
+    return OutputMessage(
+        request_id=request_id,
+        stage_id=stage_id,
+        engine_outputs=engine_output,
+        finished=finished,
+        metrics=metrics,
+    )
 
 
 class FakeAsyncOmniEngine:
@@ -82,7 +82,7 @@ class FakeAsyncOmniEngine:
         self,
         model: str = "dummy-model",
         *,
-        stage_metadata: list[dict[str, Any]] | None = None,
+        stage_metadata: list[StageRuntimeInfo] | None = None,
         default_sampling_params_list: list[Any] | None = None,
         on_add_request: Callable[[FakeAsyncOmniEngine, dict[str, Any]], None] | None = None,
         rpc_results: list[Any] | None = None,
@@ -102,7 +102,7 @@ class FakeAsyncOmniEngine:
         self.output_processors = [SimpleNamespace(tokenizer=None) for _ in range(self.num_stages)]
         self.input_processor = None
 
-        self.output_q: queue.Queue[dict[str, Any]] = queue.Queue()
+        self.output_q: queue.Queue[Any] = queue.Queue()
         self.submitted: list[dict[str, Any]] = []
         self.aborted: list[list[str]] = []
         self.rpc_results = rpc_results or []
@@ -133,16 +133,16 @@ class FakeAsyncOmniEngine:
     async def add_request_async(self, *args, **kwargs) -> None:
         self.add_request(*args, **kwargs)
 
-    def try_get_output(self, timeout: float = 0.001) -> dict[str, Any] | None:
+    def try_get_output(self, timeout: float = 0.001) -> Any | None:
         try:
             return self.output_q.get_nowait()
         except queue.Empty:
             return None
 
-    async def try_get_output_async(self) -> dict[str, Any] | None:
+    async def try_get_output_async(self) -> Any | None:
         return self.try_get_output()
 
-    def get_stage_metadata(self, stage_id: int) -> dict[str, Any]:
+    def get_stage_metadata(self, stage_id: int) -> StageRuntimeInfo:
         return self.stage_metadata[stage_id]
 
     def abort(self, request_ids: list[str]) -> None:
@@ -405,24 +405,22 @@ def _enqueue_async_llm_diffusion_outputs(engine: FakeAsyncOmniEngine, msg: dict[
 
 def _enqueue_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
     engine.output_q.put_nowait(
-        {
-            "type": "error",
-            "request_id": msg["request_id"],
-            "stage_id": 0,
-            "error": "engine boom",
-        }
+        ErrorMessage(
+            request_id=msg["request_id"],
+            stage_id=0,
+            error="engine boom",
+        )
     )
 
 
 def _enqueue_fatal_error_message(engine: FakeAsyncOmniEngine, msg: dict[str, Any]) -> None:
     engine.output_q.put_nowait(
-        {
-            "type": "error",
-            "fatal": True,
-            "request_id": msg["request_id"],
-            "stage_id": 2,
-            "error": "engine dead",
-        }
+        ErrorMessage(
+            fatal=True,
+            request_id=msg["request_id"],
+            stage_id=2,
+            error="engine dead",
+        )
     )
 
 
@@ -798,7 +796,7 @@ def test_omni_forces_final_only_on_llm_stages(monkeypatch: pytest.MonkeyPatch):
 
 def test_fatal_error_raises_engine_dead():
     base = _make_base()
-    msg = {"type": "error", "error": "orchestrator crashed", "fatal": True}
+    msg = ErrorMessage(error="orchestrator crashed", fatal=True)
 
     with pytest.raises(EngineDeadError, match="orchestrator crashed"):
         base._handle_output_message(msg)
@@ -806,7 +804,7 @@ def test_fatal_error_raises_engine_dead():
 
 def test_non_fatal_error_raises_runtime():
     base = _make_base()
-    msg = {"type": "error", "error": "something wrong"}
+    msg = ErrorMessage(error="something wrong")
 
     with pytest.raises(RuntimeError, match="something wrong"):
         base._handle_output_message(msg)
@@ -853,20 +851,15 @@ def _enqueue_stage_error(
     """Enqueue a stage error output, optionally killing the engine."""
     if kill_engine:
         engine._alive = False
+    engine_output = OmniRequestOutput.from_error(msg["request_id"], error_text)
+    engine_output.payload = ""
     engine.output_q.put_nowait(
-        {
-            "type": "output",
-            "request_id": msg["request_id"],
-            "stage_id": 0,
-            "engine_outputs": SimpleNamespace(
-                payload="",
-                finished=True,
-                images=[],
-                stage_durations={},
-                error=error_text,
-            ),
-            "finished": False,
-        }
+        OutputMessage(
+            request_id=msg["request_id"],
+            stage_id=0,
+            engine_outputs=engine_output,
+            finished=False,
+        )
     )
 
 

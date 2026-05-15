@@ -26,6 +26,7 @@ from vllm.tasks import SupportedTask
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import OmniACK, OmniSleepTask, OmniWakeTask
+from vllm_omni.engine.messages import ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni_base import (
     OmniBase,
@@ -416,7 +417,12 @@ class AsyncOmni(EngineClient, OmniBase):
             except (asyncio.CancelledError, GeneratorExit):
                 cancelled = True
             except Exception as error:
-                await req_state.queue.put({"request_id": request_id, "error": error})
+                await req_state.queue.put(
+                    ErrorMessage(
+                        request_id=request_id,
+                        error=str(error),
+                    )
+                )
             finally:
                 if not cancelled:
                     # Send empty final request to indicate that inputs have
@@ -501,23 +507,25 @@ class AsyncOmni(EngineClient, OmniBase):
         while True:
             result = await req_state.queue.get()
 
-            stage_id = result.get("stage_id", 0)
-
-            if result.get("type") == "error" and result.get("fatal"):
-                raise OmniEngineDeadError(
-                    result.get("error", ""),
-                    error_stage_id=result.get("stage_id"),
-                )
-
-            # Check for errors
-            if "error" in result:
+            if isinstance(result, ErrorMessage):
                 logger.error(
                     "[AsyncOmni] Orchestrator error for req=%s stage-%s: %s",
                     request_id,
-                    stage_id,
-                    result["error"],
+                    result.stage_id,
+                    result.error,
                 )
-                raise RuntimeError(result)
+                if result.fatal:
+                    raise OmniEngineDeadError(
+                        result.error,
+                        error_stage_id=result.stage_id,
+                    )
+                raise RuntimeError(result.error)
+
+            if not isinstance(result, OutputMessage):
+                logger.warning("[AsyncOmni] Dropping unexpected per-request message %r", result)
+                continue
+
+            stage_id = result.stage_id
 
             self._check_engine_output_error(result, request_id, stage_id)
 
@@ -541,7 +549,7 @@ class AsyncOmni(EngineClient, OmniBase):
                 yield output_to_yield
 
             # The Orchestrator sets "finished" when the final stage is done
-            if result.get("finished"):
+            if result.finished:
                 break
 
     # ==================== Output Handler ====================
@@ -596,29 +604,29 @@ class AsyncOmni(EngineClient, OmniBase):
             except OmniEngineDeadError as e:
                 logger.error("[AsyncOmni] Engine dead: %s", e)
                 for req_state in list(self.request_states.values()):
-                    error_msg = {
-                        "type": "error",
-                        "error": str(e),
-                        "fatal": True,
-                        "request_id": req_state.request_id,
-                    }
-                    if e.error_stage_id is not None:
-                        error_msg["stage_id"] = e.error_stage_id
+                    error_msg = ErrorMessage(
+                        error=str(e),
+                        fatal=True,
+                        request_id=req_state.request_id,
+                        stage_id=e.error_stage_id,
+                    )
                     await req_state.queue.put(error_msg)
             except EngineDeadError as e:
                 logger.error("[AsyncOmni] Engine dead: %s", e)
                 for req_state in list(self.request_states.values()):
-                    error_msg = {
-                        "type": "error",
-                        "error": str(e),
-                        "fatal": True,
-                        "request_id": req_state.request_id,
-                    }
+                    error_msg = ErrorMessage(
+                        error=str(e),
+                        fatal=True,
+                        request_id=req_state.request_id,
+                    )
                     await req_state.queue.put(error_msg)
             except Exception as e:
                 logger.exception("[AsyncOmni] final_output_loop failed.")
                 for req_state in list(self.request_states.values()):
-                    error_msg = {"request_id": req_state.request_id, "error": str(e)}
+                    error_msg = ErrorMessage(
+                        request_id=req_state.request_id,
+                        error=str(e),
+                    )
                     await req_state.queue.put(error_msg)
                 self.final_output_task = None
 

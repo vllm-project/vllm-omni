@@ -20,7 +20,7 @@ Therefore, it is recommended to install vLLM and vLLM-Omni with a **fresh new** 
 
 vLLM-Omni is built based on vLLM. Please install it with command below.
 ```bash
-uv pip install vllm --torch-backend=auto
+uv pip install vllm==0.20.0 --torch-backend=auto
 ```
 
 #### Installation of vLLM-Omni
@@ -102,7 +102,7 @@ docker run --runtime nvidia --gpus 2 \
     --env "HF_TOKEN=$HF_TOKEN" \
     -p 8091:8091 \
     --ipc=host \
-    vllm/vllm-omni:v0.18.0 \
+    vllm/vllm-omni:v0.20.0 \
     --model Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8091
 ```
 
