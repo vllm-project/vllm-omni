@@ -568,18 +568,18 @@ class OmniDiffusionConfig:
     # has already resolved to vLLM's ModelOpt FP8 linear method.
     force_cutlass_fp8: bool = False
 
-    # KV cache dtype for attention. Aligned with upstream vLLM's --kv-cache-dtype.
+    # Diffusion attention KV cache dtype (not vLLM's --kv-cache-dtype for AR models).
     # None = native dtype (no quantization).
     # "fp8" = dynamic FP8 (float8_e4m3fn) quantization per forward pass.
     # On Hopper+FA3: native FP8 attention (memory + compute savings).
     # On other backends: no benefit, backends skip quantization.
-    kv_cache_dtype: str | None = None
+    diffusion_kv_cache_dtype: str | None = None
     # Optional skip selectors for KV-cache quantization. Format: "0-9,20,25-30".
     # Listed steps/layers skip quantization; others keep quantized execution.
-    kv_cache_skip_steps: str | None = None
-    kv_cache_skip_layers: str | None = None
-    kv_cache_skip_step_indices: set[int] | None = None
-    kv_cache_skip_layer_indices: set[int] | None = None
+    diffusion_kv_cache_skip_steps: str | None = None
+    diffusion_kv_cache_skip_layers: str | None = None
+    diffusion_kv_cache_skip_step_indices: set[int] | None = None
+    diffusion_kv_cache_skip_layer_indices: set[int] | None = None
 
     # Diffusion pipeline Profiling config
     enable_diffusion_pipeline_profiler: bool = False
@@ -726,8 +726,8 @@ class OmniDiffusionConfig:
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
-        self.kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.kv_cache_skip_steps)
-        self.kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.kv_cache_skip_layers)
+        self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
+        self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
         if self.max_cpu_loras is None:
             self.max_cpu_loras = 1
@@ -873,6 +873,20 @@ class OmniDiffusionConfig:
             kwargs["quantization_config"] = kwargs.pop("quantization")
         else:
             kwargs.pop("quantization", None)
+
+        # Renamed from kv_cache_* to avoid clashing with vLLM's --kv-cache-dtype.
+        if kwargs.get("diffusion_kv_cache_dtype") is None and "kv_cache_dtype" in kwargs:
+            kwargs["diffusion_kv_cache_dtype"] = kwargs.pop("kv_cache_dtype")
+        else:
+            kwargs.pop("kv_cache_dtype", None)
+        if kwargs.get("diffusion_kv_cache_skip_steps") is None and "kv_cache_skip_steps" in kwargs:
+            kwargs["diffusion_kv_cache_skip_steps"] = kwargs.pop("kv_cache_skip_steps")
+        else:
+            kwargs.pop("kv_cache_skip_steps", None)
+        if kwargs.get("diffusion_kv_cache_skip_layers") is None and "kv_cache_skip_layers" in kwargs:
+            kwargs["diffusion_kv_cache_skip_layers"] = kwargs.pop("kv_cache_skip_layers")
+        else:
+            kwargs.pop("kv_cache_skip_layers", None)
 
         # Handle "diffusion_attention_backend" shorthand: merge into
         # diffusion_attention_config before field filtering.

@@ -103,22 +103,22 @@ def parse_args() -> argparse.Namespace:
         help="Sampling solver for Wan2.2 pipelines. Use 'euler' for Lightning/Distill setups.",
     )
     parser.add_argument(
-        "--kv-cache-dtype",
+        "--diffusion-kv-cache-dtype",
         type=str,
         default=None,
-        help="Config-level KV cache dtype (e.g. float8_e4m3fn).",
+        help="Diffusion attention KV cache dtype (e.g. float8_e4m3fn). Separate from vLLM --kv-cache-dtype.",
     )
     parser.add_argument(
-        "--kv-cache-skip-steps",
+        "--diffusion-kv-cache-skip-steps",
         type=str,
         default=None,
-        help="Config-level KV-cache quantization skip-step selector, e.g. '0-9,20,25-30'.",
+        help="Diffusion KV-cache quantization skip-step selector, e.g. '0-9,20,25-30'.",
     )
     parser.add_argument(
-        "--kv-cache-skip-layers",
+        "--diffusion-kv-cache-skip-layers",
         type=str,
         default=None,
-        help="Config-level KV-cache quantization skip-layer selector, e.g. '0,1,4-8'.",
+        help="Diffusion KV-cache quantization skip-layer selector, e.g. '0,1,4-8'.",
     )
     parser.add_argument("--output", type=str, default="i2v_output.mp4", help="Path to save the video (mp4).")
     parser.add_argument("--fps", type=int, default=None, help="Frames per second for the output video.")
@@ -334,9 +334,9 @@ def main():
         vae_use_tiling=args.vae_use_tiling,
         boundary_ratio=args.boundary_ratio,
         flow_shift=args.flow_shift,
-        kv_cache_dtype=args.kv_cache_dtype,
-        kv_cache_skip_steps=args.kv_cache_skip_steps,
-        kv_cache_skip_layers=args.kv_cache_skip_layers,
+        diffusion_kv_cache_dtype=args.diffusion_kv_cache_dtype,
+        diffusion_kv_cache_skip_steps=args.diffusion_kv_cache_skip_steps,
+        diffusion_kv_cache_skip_layers=args.diffusion_kv_cache_skip_layers,
         enable_cpu_offload=args.enable_cpu_offload,
         parallel_config=parallel_config,
         enforce_eager=args.enforce_eager,
@@ -361,9 +361,9 @@ def main():
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Frames: {args.num_frames}")
     print(f"  Solver: {args.sample_solver}")
-    print(f"  kv_cache_dtype(config): {args.kv_cache_dtype}")
-    print(f"  kv_cache_skip_steps(config): {args.kv_cache_skip_steps}")
-    print(f"  kv_cache_skip_layers(config): {args.kv_cache_skip_layers}")
+    print(f"  diffusion_kv_cache_dtype(config): {args.diffusion_kv_cache_dtype}")
+    print(f"  diffusion_kv_cache_skip_steps(config): {args.diffusion_kv_cache_skip_steps}")
+    print(f"  diffusion_kv_cache_skip_layers(config): {args.diffusion_kv_cache_skip_layers}")
     print(
         f"  Parallel configuration: cfg_parallel_size={args.cfg_parallel_size},"
         f" tensor_parallel_size={args.tensor_parallel_size}, vae_patch_parallel_size={args.vae_patch_parallel_size}"
