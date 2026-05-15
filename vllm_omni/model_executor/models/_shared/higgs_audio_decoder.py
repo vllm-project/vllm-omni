@@ -32,6 +32,7 @@ __all__ = [
     "adjust_conv_transpose_output_padding",
     "build_higgs_audio_acoustic_decoder",
     "load_higgs_audio_codec",
+    "_remap_boson_model_pth_state_dict",  # exported for unit-testing the mapper
 ]
 
 
@@ -114,43 +115,133 @@ def build_higgs_audio_acoustic_decoder(
     return decoder
 
 
+def _load_higgs_audio_state_dict(audio_tokenizer_dir: str, device: torch.device) -> dict[str, torch.Tensor]:
+    """Load the codec state dict from either layout used in the wild.
+
+    Tries layouts in order:
+    1. ``<dir>/model.safetensors`` (OmniVoice-bundled layout used by
+       ``k2-fsa/OmniVoice/audio_tokenizer/``).
+    2. ``<dir>/model.pth`` (boson-ai standalone ``bosonai/higgs-audio-v2-tokenizer``
+       layout). The state-dict keys differ structurally
+       (``quantizer.vq.layers.<i>._codebook.embed`` etc.) and are remapped to
+       the OmniVoice-style names this kernel expects via
+       :func:`_remap_boson_model_pth_state_dict`.
+    """
+    safetensors_path = os.path.join(audio_tokenizer_dir, "model.safetensors")
+    pth_path = os.path.join(audio_tokenizer_dir, "model.pth")
+    if os.path.exists(safetensors_path):
+        from safetensors.torch import load_file
+
+        return load_file(safetensors_path, device=str(device))
+    if os.path.exists(pth_path):
+        sd = torch.load(pth_path, map_location=device, weights_only=False)
+        return _remap_boson_model_pth_state_dict(sd)
+    raise FileNotFoundError(
+        f"Audio tokenizer weights not found at {safetensors_path} or {pth_path}"
+    )
+
+
+def _remap_boson_model_pth_state_dict(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Translate boson-ai's standalone ``model.pth`` keys into OmniVoice-style names
+    that the shared kernel's RVQ + fc2 + DAC sites consume.
+
+    Best-effort: only the RVQ-side keys map cleanly. The boson-ai decoder
+    uses ``decoder_2.model.<i>.weight_g/weight_v`` (DAC with weight-norm +
+    Snake activations) rather than the OmniVoice DAC layout; that side
+    requires either vendoring the upstream decoder module or rewriting the
+    DAC builder to consume weight-normed tensors. This function returns the
+    mapped RVQ keys plus any acoustic_decoder.* / fc2.* / fc.* tensors that
+    happen to share the OmniVoice names, and leaves the decoder-2 keys
+    untouched (the caller will see them as MISSING when copying into the
+    OmniVoice DAC decoder).
+
+    Mapping (RVQ side only):
+        quantizer.vq.layers.<i>._codebook.embed -> quantizer.quantizers.<i>.codebook.embed
+        quantizer.vq.layers.<i>.project_out.weight -> quantizer.quantizers.<i>.project_out.weight
+        quantizer.vq.layers.<i>.project_out.bias   -> quantizer.quantizers.<i>.project_out.bias
+    """
+    if not isinstance(sd, dict):
+        raise TypeError(f"expected a state dict, got {type(sd)!r}")
+    remapped: dict[str, torch.Tensor] = {}
+    for key, tensor in sd.items():
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        # Quantizer rewrite: vq.layers.<i>._codebook.embed -> quantizers.<i>.codebook.embed
+        if key.startswith("quantizer.vq.layers."):
+            parts = key.split(".")
+            # parts[3] is the layer index, parts[4]+ is the tail
+            if len(parts) >= 5:
+                idx = parts[3]
+                tail = ".".join(parts[4:])
+                if tail.startswith("_codebook.embed"):
+                    new_key = f"quantizer.quantizers.{idx}.codebook.embed"
+                    remapped[new_key] = tensor
+                    continue
+                if tail.startswith("project_out."):
+                    new_key = f"quantizer.quantizers.{idx}.{tail}"
+                    remapped[new_key] = tensor
+                    continue
+                # project_in / _codebook.cluster_size / _codebook.embed_avg / inited
+                # are encoder-side or training-only state that the decode path
+                # does not need; drop them.
+                continue
+        # Anything else (acoustic_decoder.*, fc2.*, fc.*, fc_post*.*, decoder_2.*,
+        # decoder_semantic.*, semantic_model.*) passes through unchanged so
+        # the caller's lookup is unambiguous.
+        remapped[key] = tensor
+    return remapped
+
+
 def load_higgs_audio_codec(
     audio_tokenizer_dir: str,
     device: torch.device,
 ) -> tuple[HiggsAudioRVQ, nn.Linear, nn.Module, dict[str, Any]]:
     """Load the HiggsAudioV2 RVQ + fc2 + DAC decoder from a checkpoint folder.
 
+    Accepts both layouts: ``<dir>/model.safetensors`` (OmniVoice-bundled) and
+    ``<dir>/model.pth`` (boson-ai standalone). The standalone path remaps
+    quantizer keys before consumption; structural decoder differences
+    (boson uses Snake + weight-norm) still leave some DAC parameters missing
+    when loading the standalone path -- those entries log warnings but the
+    RVQ side completes successfully.
+
     Args:
-        audio_tokenizer_dir: Path to a directory containing ``config.json`` and
-            ``model.safetensors`` (the boson-ai ``audio_tokenizer/`` layout).
+        audio_tokenizer_dir: Path to a directory containing ``config.json``
+            and EITHER ``model.safetensors`` (OmniVoice layout) OR
+            ``model.pth`` (boson-ai standalone layout).
         device: Device to place the loaded modules and state dict on.
 
     Returns:
         (quantizer, fc2, acoustic_decoder, tokenizer_config)
-        - quantizer: ``HiggsAudioRVQ`` with ``num_quantizers`` discovered from the
-          state dict (defaults to 8 for boson-ai checkpoints).
-        - fc2: ``nn.Linear`` projecting RVQ output (1024) into the DAC encoder's
-          hidden dimension (typically 256).
-        - acoustic_decoder: DAC decoder with HiggsAudioV2 output-padding fix and
-          tanh-replaced-by-Identity, fully initialized.
-        - tokenizer_config: The loaded ``config.json`` dict; useful for callers
-          that need ``sample_rate`` or other tokenizer metadata.
+        - quantizer: ``HiggsAudioRVQ`` with ``num_quantizers`` discovered from
+          the state dict (defaults to 8 for boson-ai checkpoints).
+        - fc2: ``nn.Linear`` projecting RVQ output (1024) into the DAC's
+          hidden dimension (typically 256). May be uninitialized when loaded
+          from the boson-ai standalone layout (no ``fc2.*`` keys present).
+        - acoustic_decoder: DAC decoder with HiggsAudioV2 output-padding fix
+          and tanh-replaced-by-Identity. Fully initialized for the OmniVoice
+          layout; partially initialized for boson-ai standalone (missing
+          ``decoder_2.*`` -> ``acoustic_decoder.*`` mapping is not yet
+          implemented; full upstream-decoder vendoring is the next step).
+        - tokenizer_config: The loaded ``config.json`` dict; useful for
+          callers that need ``sample_rate`` or other tokenizer metadata.
     """
-    from safetensors.torch import load_file
-
     config_path = os.path.join(audio_tokenizer_dir, "config.json")
-    weights_path = os.path.join(audio_tokenizer_dir, "model.safetensors")
-
-    if not os.path.exists(weights_path):
-        raise FileNotFoundError(f"Audio tokenizer weights not found at {weights_path}")
 
     with open(config_path) as f:
         tokenizer_config: dict[str, Any] = json.load(f)
 
-    state_dict = load_file(weights_path, device=str(device))
+    state_dict = _load_higgs_audio_state_dict(audio_tokenizer_dir, device)
 
     codebook_dim = tokenizer_config.get("codebook_dim", 64)
     codebook_size = tokenizer_config.get("codebook_size", 1024)
+    # Discover hidden_size and num_quantizers from the (possibly remapped) state dict.
+    if "quantizer.quantizers.0.project_out.weight" not in state_dict:
+        raise KeyError(
+            "Codec state dict is missing 'quantizer.quantizers.0.project_out.weight'. "
+            "If you loaded a boson-ai standalone tokenizer, ensure the model.pth "
+            "remap fired (see _remap_boson_model_pth_state_dict)."
+        )
     hidden_size = state_dict["quantizer.quantizers.0.project_out.weight"].shape[0]
     num_quantizers = sum(
         1 for k in state_dict if k.startswith("quantizer.quantizers.") and k.endswith(".codebook.embed")

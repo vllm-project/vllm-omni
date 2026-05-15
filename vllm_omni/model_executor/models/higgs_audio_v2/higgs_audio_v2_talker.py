@@ -857,18 +857,51 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         model_outputs: torch.Tensor | OmniOutput,
         **kwargs: Any,
     ) -> OmniOutput:
-        """Wrap raw decoder outputs into the :class:`OmniOutput` contract
-        expected by ``vllm_omni/model_executor/stage_input_processors/higgs_audio_v2.py:talker2code2wav``.
+        """Wrap raw decoder outputs into the :class:`OmniOutput` contract.
 
-        Reads the per-step audio codes from ANY of the runner-side keyword
-        sources: explicit ``audio_codes=``, the ``model_kwargs`` dict the
-        ``gpu_model_runner`` passes through, or the ``model_kwargs_extra``
-        dict. Falling back to an empty tensor when no audio is in scope
-        keeps the downstream ``talker2code2wav`` sync adapter on its happy
-        path (which already handles the empty case gracefully).
+        Mirrors the canonical Qwen3-TTS / Fish-Speech recovery pattern:
+        the runner threads per-request ``codes.audio`` into
+        ``model_intermediate_buffer`` (a list of dicts in batch order); we
+        concatenate those and trim ``text_hidden_states`` to the emitted
+        audio span. Falls back to the deprecated ``runtime_additional_information``
+        kwarg for older runners, and finally to ``audio_codes`` /
+        ``model_kwargs[audio_codes]`` for direct callers.
         """
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
+        hidden = model_outputs
+
+        # Primary contract: model_intermediate_buffer (Qwen3-TTS / Fish-Speech).
+        info_dicts = kwargs.get("model_intermediate_buffer")
+        if info_dicts is None:
+            info_dicts = kwargs.get("runtime_additional_information")
+        if info_dicts is None:
+            info_dicts = []
+
+        audio_codes_list: list[torch.Tensor] = []
+        for info in info_dicts:
+            if not isinstance(info, dict):
+                continue
+            codes_field = info.get("codes")
+            if isinstance(codes_field, dict):
+                ac = codes_field.get("audio")
+            else:
+                ac = info.get("audio_codes")
+            if isinstance(ac, torch.Tensor) and ac.numel() > 0:
+                audio_codes_list.append(ac)
+
+        if audio_codes_list:
+            audio_codes = torch.cat(audio_codes_list, dim=0)
+            span_len = int(audio_codes.shape[0])
+            if hidden is not None and span_len <= int(hidden.shape[0]):
+                hidden = hidden[:span_len]
+            return OmniOutput(
+                text_hidden_states=hidden,
+                multimodal_outputs={"codes": {"audio": audio_codes}},
+            )
+
+        # Fallbacks: explicit kwarg or wrapped model_kwargs dicts (preserved for
+        # direct-API callers that don't go through the runner buffer).
         audio_codes = kwargs.get("audio_codes")
         if audio_codes is None:
             for source_name in ("model_kwargs", "model_kwargs_extra"):
@@ -879,6 +912,35 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         if audio_codes is None:
             audio_codes = torch.empty(0, dtype=torch.long)
         return OmniOutput(
-            text_hidden_states=model_outputs,
+            text_hidden_states=hidden,
             multimodal_outputs={"codes": {"audio": audio_codes}},
         )
+
+    # ----------------------------------------------------- model-owned sampler
+    # Opt into the AR runner's model-sampler hook (see
+    # vllm_omni/worker/gpu_ar_model_runner.py:_sample). The runner calls
+    # ``self.model.sample(logits, sampling_metadata)`` when this flag is True;
+    # we delegate to the stock vLLM sampler for now and document the
+    # per-position audio-codebook-0 dispatch as the immediate follow-up. The
+    # hook itself is what unblocks an external integrator from plugging in the
+    # final audio-side sampler without touching the runner.
+    prefer_model_sampler: bool = True
+
+    def sample(self, logits: torch.Tensor, sampling_metadata: Any) -> Any:
+        """Model-owned sampler entry point.
+
+        Round-6 contract: emit text-vocab tokens via the stock sampler. The
+        per-position audio-codebook-0 dispatch (sample codebook 0 at audio
+        positions from ``audio_codebook0_logits``, persist codebooks 1..7 from
+        ``predict_audio_residual_codebooks``, then write the
+        ``[num_frames, 8]`` tensor into ``model_intermediate_buffer[req_id]
+        ["codes"]["audio"]``) is the immediate follow-up. The runner hook is
+        in place so the integration can land without touching the engine.
+        """
+        sampler = getattr(self, "_stock_sampler", None)
+        if sampler is None:
+            from vllm.model_executor.layers.sampler import Sampler
+
+            sampler = Sampler()
+            self._stock_sampler = sampler
+        return sampler(logits=logits, sampling_metadata=sampling_metadata)

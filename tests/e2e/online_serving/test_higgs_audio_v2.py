@@ -813,8 +813,14 @@ def test_talker_compute_logits_returns_tensor_and_audio_helper_runs_separately()
 
 
 def test_make_omni_output_reads_audio_codes_from_runner_kwargs() -> None:
-    """``make_omni_output`` must accept any of: explicit audio_codes,
-    model_kwargs[audio_codes], model_kwargs_extra[audio_codes]."""
+    """``make_omni_output`` must accept the canonical runner contract
+    (``model_intermediate_buffer``) and the documented fallbacks.
+
+    The runner threads per-request ``codes.audio`` into
+    ``model_intermediate_buffer`` (a list of dicts in batch order). We
+    concatenate those and trim ``text_hidden_states`` to the emitted audio
+    span -- matching the Qwen3-TTS / Fish-Speech recovery pattern.
+    """
     from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import (
         HiggsAudioV2Config,
     )
@@ -829,24 +835,94 @@ def test_make_omni_output_reads_audio_codes_from_runner_kwargs() -> None:
     torch.nn.Module.__init__(talker)
     talker.config = cfg
 
-    h = torch.zeros(1, int(cfg.hidden_size))
-    codes = torch.arange(8, dtype=torch.long)
+    hidden = torch.zeros(8, int(cfg.hidden_size))
+    codes_a = torch.arange(3, dtype=torch.long).reshape(3, 1)  # 3 frames for req0
+    codes_b = torch.arange(10, 12, dtype=torch.long).reshape(2, 1)  # 2 frames for req1
 
-    # Explicit kwarg.
-    out1 = talker.make_omni_output(h, audio_codes=codes)
-    assert torch.equal(out1.multimodal_outputs["codes"]["audio"], codes)
+    # Canonical contract: model_intermediate_buffer = [info_dict_per_request].
+    out_canonical = talker.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[
+            {"codes": {"audio": codes_a}},
+            {"codes": {"audio": codes_b}},
+        ],
+    )
+    cat = torch.cat([codes_a, codes_b], dim=0)
+    assert torch.equal(out_canonical.multimodal_outputs["codes"]["audio"], cat)
+    # text_hidden_states must be trimmed to the emitted audio span.
+    assert int(out_canonical.text_hidden_states.shape[0]) == int(cat.shape[0])
 
-    # model_kwargs dict.
-    out2 = talker.make_omni_output(h, model_kwargs={"audio_codes": codes})
-    assert torch.equal(out2.multimodal_outputs["codes"]["audio"], codes)
+    # Deprecated alias: runtime_additional_information.
+    out_legacy = talker.make_omni_output(
+        hidden,
+        runtime_additional_information=[{"codes": {"audio": codes_a}}],
+    )
+    assert torch.equal(out_legacy.multimodal_outputs["codes"]["audio"], codes_a)
 
-    # model_kwargs_extra dict.
-    out3 = talker.make_omni_output(h, model_kwargs_extra={"audio_codes": codes})
-    assert torch.equal(out3.multimodal_outputs["codes"]["audio"], codes)
+    # Direct-API fallbacks (preserved for unit tests that don't run the
+    # full runner).
+    out_explicit = talker.make_omni_output(hidden, audio_codes=codes_a)
+    assert torch.equal(out_explicit.multimodal_outputs["codes"]["audio"], codes_a)
+    out_kw = talker.make_omni_output(hidden, model_kwargs={"audio_codes": codes_a})
+    assert torch.equal(out_kw.multimodal_outputs["codes"]["audio"], codes_a)
+    out_kwx = talker.make_omni_output(hidden, model_kwargs_extra={"audio_codes": codes_a})
+    assert torch.equal(out_kwx.multimodal_outputs["codes"]["audio"], codes_a)
 
-    # No source -> empty tensor (the talker2code2wav sync adapter handles this).
-    out4 = talker.make_omni_output(h)
-    assert out4.multimodal_outputs["codes"]["audio"].numel() == 0
+    # No source -> empty tensor.
+    out_empty = talker.make_omni_output(hidden)
+    assert out_empty.multimodal_outputs["codes"]["audio"].numel() == 0
+
+
+def test_boson_model_pth_remap_rewrites_quantizer_keys() -> None:
+    """``_remap_boson_model_pth_state_dict`` translates the standalone
+    ``model.pth`` quantizer keys into the OmniVoice-style names that the
+    shared HiggsAudioRVQ kernel expects.
+    """
+    from vllm_omni.model_executor.models._shared.higgs_audio_decoder import (
+        _remap_boson_model_pth_state_dict,
+    )
+
+    boson_sd = {
+        # Boson-ai standalone tokenizer key shapes (codebook size 1024, dim 64).
+        "quantizer.vq.layers.0._codebook.embed": torch.zeros(1024, 64),
+        "quantizer.vq.layers.0.project_out.weight": torch.zeros(1024, 64),
+        "quantizer.vq.layers.0.project_out.bias": torch.zeros(1024),
+        # project_in / _codebook.cluster_size / _codebook.embed_avg / inited
+        # are encoder-side training state -- the remapper drops them.
+        "quantizer.vq.layers.0.project_in.weight": torch.zeros(64, 1024),
+        "quantizer.vq.layers.0._codebook.cluster_size": torch.zeros(1024),
+        "quantizer.vq.layers.0._codebook.embed_avg": torch.zeros(1024, 64),
+        "quantizer.vq.layers.0._codebook.inited": torch.tensor([1.0]),
+        # Acoustic-decoder keys (boson uses decoder_2.* with weight-norm; left untouched here).
+        "decoder_2.model.0.weight_g": torch.zeros(1024, 1, 1),
+        # Non-codec keys should pass through.
+        "fc2.weight": torch.zeros(256, 1024),
+        "fc2.bias": torch.zeros(256),
+    }
+    remapped = _remap_boson_model_pth_state_dict(boson_sd)
+    # The codebook-decode-essential keys are present under the new names.
+    assert "quantizer.quantizers.0.codebook.embed" in remapped
+    assert "quantizer.quantizers.0.project_out.weight" in remapped
+    assert "quantizer.quantizers.0.project_out.bias" in remapped
+    # Encoder-side training state is dropped.
+    assert all("project_in" not in k for k in remapped)
+    assert all("cluster_size" not in k for k in remapped)
+    assert all("embed_avg" not in k for k in remapped)
+    # Non-quantizer keys pass through unchanged.
+    assert "decoder_2.model.0.weight_g" in remapped
+    assert "fc2.weight" in remapped
+    assert "fc2.bias" in remapped
+
+
+def test_talker_opts_into_model_sampler() -> None:
+    """``prefer_model_sampler`` must be True so the AR runner's hook kicks in,
+    and ``sample`` must be callable with (logits, sampling_metadata)."""
+    from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_talker import (
+        HiggsAudioV2TalkerForConditionalGeneration,
+    )
+
+    assert HiggsAudioV2TalkerForConditionalGeneration.prefer_model_sampler is True
+    assert callable(getattr(HiggsAudioV2TalkerForConditionalGeneration, "sample", None))
 
 
 def test_talker_residual_codebook_predictor_emits_seven_codebooks() -> None:

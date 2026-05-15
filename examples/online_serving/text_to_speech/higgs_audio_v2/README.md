@@ -24,7 +24,7 @@ Environment overrides:
 - `GPUS` — `CUDA_VISIBLE_DEVICES` value (default `6,7`).
 - `GPU_UTIL` — `--gpu-memory-utilization` (default `0.4`).
 
-The deploy YAML's `async_chunk` flag controls streaming; flip it on once the talker AR loop is ready.
+The deploy YAML currently ships with `async_chunk: true` and `codec_streaming: true`. The stage-input processor's chunk callback and Stage-1's `forward_chunk` left-context trim are wired; what still gates a successful `POST /v1/audio/speech` smoke is the per-position audio-codebook-0 sampler dispatch in the talker AR loop (the talker has `prefer_model_sampler = True` and a `sample()` hook but delegates to the stock sampler today; the audio-position branch that samples codebook 0 from `audio_codebook0_logits` is the immediate follow-up). See `results/plan.md` AC-5 / AC-7 for the contract.
 
 ## Driving the server
 

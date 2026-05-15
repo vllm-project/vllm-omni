@@ -2,7 +2,8 @@
 
 This directory contains the higgs-audio v2 offline inference scaffolding for vllm-omni:
 
-- `reference_hf.py` — runs the upstream HF model (`bosonai/higgs-audio-v2-generation-3B-base` + `bosonai/higgs-audio-v2-tokenizer`) on a pinned prompt with greedy decode and saves the per-prompt fixture set (`tests/fixtures/higgs_audio_v2/reference_*.pt`) plus a human-readable upstream trace memo (`vllm_omni/model_executor/models/higgs_audio_v2/UPSTREAM_TRACE.md`).
+- `reference_hf.py` — runs the upstream HF model (`bosonai/higgs-audio-v2-generation-3B-base` + `bosonai/higgs-audio-v2-tokenizer`) on a pinned prompt with greedy decode and saves the per-prompt fixture set (`tests/fixtures/higgs_audio_v2/reference_*.pt`) plus a human-readable upstream trace memo (`vllm_omni/model_executor/models/higgs_audio_v2/UPSTREAM_TRACE.md`). The captured `audio_codes` / `input_ids` / `audio_token_mask` are authoritative; the `reference_pcm` is NOT (the HF AutoProcessor's audio_tokenizer was loaded with random weights). Use `reference_serve_engine.py` for an authoritative upstream PCM reference.
+- `reference_serve_engine.py` — recipe for capturing an authoritative upstream PCM reference via boson-ai's own `HiggsAudioServeEngine`. Requires the upstream `boson_multimodal` package; the script bails out with a clear install hint when that's not available.
 - `end2end.py` — exercises the vllm-omni higgs_audio_v2 path in two modes:
   - `--mode hf_reference` runs the upstream HF reference and saves a 24 kHz WAV (downloads the boson-ai checkpoints if not cached).
   - `--mode stage1_only` replays a saved fixture's `[8, T]` code tensor through vllm-omni's Stage-1 decoder (`HiggsAudioV2Code2Wav`) to validate AC-4 (Stage-1 decode parity) without invoking the 3B Stage-0 talker.
