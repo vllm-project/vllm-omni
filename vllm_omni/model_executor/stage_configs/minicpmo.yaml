@@ -9,26 +9,31 @@
 #   tts → (mel_spec) → t2w
 #   t2w → (waveform)
 #
-# Requires: 3 GPUs (or adjust devices to share)
+# Requires: 2 GPUs (or set CUDA_VISIBLE_DEVICES=<llm_gpu>,<tts_gpu>)
+#
+# Logical GPU layout:
+#   Stage 0 (llm): logical GPU 0 (~70% mem)
+#   Stage 1 (tts): logical GPU 1 (~80% mem)
+#   Stage 2 (t2w): logical GPU 1 (~20% mem, shared with tts)
 stage_args:
   - stage_id: 0
     runtime:
       process: true
-      devices: "0,2,3,4"
+      devices: "0"
       max_batch_size: 1
     engine_args:
       model_stage: llm
       model_arch: MiniCPMO26OmniForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.35
+      gpu_memory_utilization: 0.7
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: latent
       enable_prefix_caching: false
       max_num_batched_tokens: 16384
       max_num_seqs: 1
-      tensor_parallel_size: 4
+      tensor_parallel_size: 1
       limit_mm_per_prompt:
         video: 1
 
