@@ -1199,6 +1199,158 @@ class AsyncOmniEngine:
 
     # ---- request helpers ----
 
+    @staticmethod
+    def _iter_multimodal_items(value: Any) -> list[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        return [value]
+
+    def _ensure_stage_replica_mm_uuids(
+        self,
+        prompt: Any,
+        *,
+        stage_id: int,
+        replica_id: int,
+    ) -> None:
+        """Make multimodal processor-cache keys local to a stage replica.
+
+        vLLM's frontend multimodal sender cache is process-global, while each
+        vllm-omni stage replica owns a separate EngineCore receiver cache. If
+        two requests with the same image are routed to different stage-0
+        replicas, a plain content hash can make the sender omit the tensor for
+        a replica that has never received it. Prefixing user/content UUIDs with
+        the selected replica keeps cache reuse within the receiver that owns it.
+        """
+
+        if not isinstance(prompt, dict):
+            return
+
+        mm_data = prompt.get("multi_modal_data")
+        if not isinstance(mm_data, dict) or not mm_data:
+            return
+
+        from vllm.multimodal.hasher import MultiModalHasher
+
+        existing_uuids = prompt.get("multi_modal_uuids")
+        if not isinstance(existing_uuids, dict):
+            existing_uuids = {}
+
+        model_id = str(getattr(self, "model", ""))
+        scoped_uuids: dict[str, list[str | None]] = dict(existing_uuids)
+        for modality, raw_items in mm_data.items():
+            items = self._iter_multimodal_items(raw_items)
+            if not items:
+                continue
+
+            modality_existing = existing_uuids.get(modality)
+            if not isinstance(modality_existing, list):
+                modality_existing = [modality_existing] if modality_existing is not None else []
+
+            modality_uuids: list[str | None] = []
+            for idx, item in enumerate(items):
+                user_uuid = modality_existing[idx] if idx < len(modality_existing) else None
+                if user_uuid is not None:
+                    base_uuid = str(user_uuid)
+                elif item is None:
+                    base_uuid = None
+                else:
+                    base_uuid = MultiModalHasher.hash_kwargs(
+                        model_id=model_id,
+                        **{modality: item},
+                    )
+
+                if base_uuid is None:
+                    modality_uuids.append(None)
+                else:
+                    modality_uuids.append(f"stage{stage_id}:rep{replica_id}:{base_uuid}")
+
+            scoped_uuids[modality] = modality_uuids
+
+        if scoped_uuids:
+            prompt["multi_modal_uuids"] = scoped_uuids
+
+    @staticmethod
+    def _stage_pool_replica_count(stage_pool: Any) -> int:
+        try:
+            live_num_replicas = getattr(stage_pool, "live_num_replicas", None)
+            if live_num_replicas is not None:
+                return int(live_num_replicas)
+        except Exception:
+            pass
+
+        try:
+            live_replica_ids = getattr(stage_pool, "live_replica_ids", None)
+            if callable(live_replica_ids):
+                return len(live_replica_ids())
+        except Exception:
+            pass
+
+        try:
+            clients = getattr(stage_pool, "clients", None)
+            if clients is not None:
+                return sum(1 for client in clients if client is not None)
+        except Exception:
+            pass
+
+        return int(getattr(stage_pool, "num_replicas", 1) or 1)
+
+    @staticmethod
+    def _stage_pool_is_distributed(stage_pool: Any) -> bool:
+        try:
+            is_distributed = getattr(stage_pool, "is_distributed", None)
+            if is_distributed is not None:
+                return bool(is_distributed() if callable(is_distributed) else is_distributed)
+        except Exception:
+            pass
+
+        return getattr(stage_pool, "_hub", None) is not None
+
+    def _scope_stage0_multimodal_cache_to_replica(
+        self,
+        request_id: str,
+        prompt: Any,
+    ) -> int | None:
+        stage_pools = getattr(self, "stage_pools", None)
+        if isinstance(prompt, EngineCoreRequest) or not stage_pools:
+            return None
+
+        stage0_pool = stage_pools[0]
+        # TODO: Currently only supports the ar -> dit process.
+        # Future scenarios (e.g., dit -> ar) need to be added, which will require modifications here.
+        if stage0_pool.stage_type == "diffusion" or self._stage_pool_replica_count(stage0_pool) <= 1:
+            return None
+
+        # This synchronous request path can safely pre-bind local in-process
+        # replicas. Distributed head mode still uses the async picker inside
+        # StagePool.submit_initial().
+        if self._stage_pool_is_distributed(stage0_pool):
+            logger.debug(
+                "[AsyncOmniEngine] Skipping stage-0 multimodal cache scoping for distributed routing req=%s",
+                request_id,
+            )
+            return None
+
+        prompts = prompt if isinstance(prompt, list) else [prompt]
+        if not any(isinstance(p, dict) and p.get("multi_modal_data") for p in prompts):
+            return None
+
+        replica_id = stage0_pool.select_replica_id(request_id)
+        for p in prompts:
+            self._ensure_stage_replica_mm_uuids(
+                p,
+                stage_id=0,
+                replica_id=replica_id,
+            )
+
+        logger.debug(
+            "[AsyncOmniEngine] Scoped multimodal cache keys to stage-0 replica-%s for req=%s",
+            replica_id,
+            request_id,
+        )
+        return replica_id
+
     def _build_add_request_message(
         self,
         request_id: str,
@@ -1232,6 +1384,7 @@ class AsyncOmniEngine:
         # Keep the original prompt for downstream stages (they need the raw
         # dict, e.g. for multi_modal_data).
         original_prompt = prompt
+        preselected_stage0_replica: int | None = None
 
         stage_type = self.stage_metadata[0].stage_type
         output_prompt_text: Any = None
@@ -1244,21 +1397,31 @@ class AsyncOmniEngine:
                 for item in prompt:
                     _inject_global_id(item, request_id)
 
+            preselected_stage0_replica = self._scope_stage0_multimodal_cache_to_replica(
+                request_id,
+                prompt,
+            )
+
             # Full input processing (tokenization, multimodal, etc.)
             _t_preprocess = time.perf_counter()
-            request = self.input_processor.process_inputs(
-                request_id=request_id,
-                prompt=prompt,
-                params=params,
-                supported_tasks=self.supported_tasks,
-                arrival_time=arrival_time,
-                lora_request=lora_request,
-                tokenization_kwargs=tokenization_kwargs,
-                trace_headers=trace_headers,
-                priority=priority,
-                data_parallel_rank=data_parallel_rank,
-                resumable=resumable,
-            )
+            try:
+                request = self.input_processor.process_inputs(
+                    request_id=request_id,
+                    prompt=prompt,
+                    params=params,
+                    supported_tasks=self.supported_tasks,
+                    arrival_time=arrival_time,
+                    lora_request=lora_request,
+                    tokenization_kwargs=tokenization_kwargs,
+                    trace_headers=trace_headers,
+                    priority=priority,
+                    data_parallel_rank=data_parallel_rank,
+                    resumable=resumable,
+                )
+            except Exception:
+                if preselected_stage0_replica is not None and self.stage_pools:
+                    self.stage_pools[0].release_binding(request_id)
+                raise
             _preprocess_ms = (time.perf_counter() - _t_preprocess) * 1000.0
             # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
             # additional_information field in the prompt.
