@@ -1,8 +1,6 @@
 import json
 import os
-import subprocess
 import threading
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +12,7 @@ from tests.dfx.conftest import (
     create_unique_server_params,
     get_benchmark_params_for_server,
     load_configs,
+    run_benchmark,
 )
 from tests.helpers.runtime import OmniServer
 
@@ -96,91 +95,6 @@ def _safe_filename_token(value: Any | None, *, default: str = "na") -> str:
     for bad in ("/", "\\", ":", "*", "?", '"', "<", ">", "|"):
         s = s.replace(bad, "_")
     return s if s else default
-
-
-def run_benchmark(
-    args: list,
-    test_name: str,
-    flow,
-    dataset_name: str,
-    num_prompt,
-    *,
-    baseline_config: dict[str, Any] | None = None,
-    sweep_index: int | None = None,
-    request_rate: Any | None = None,
-    max_concurrency: Any | None = None,
-    random_input_len: Any | None = None,
-    random_output_len: Any | None = None,
-) -> Any:
-    """Run a single benchmark iteration and return the parsed result JSON.
-
-    After ``vllm bench`` writes the JSON, ``result["baseline"]`` holds the same
-    per-metric resolved thresholds as ``assert_result`` (via ``_baseline_thresholds_for_step``).
-    When ``random_input_len`` / ``random_output_len`` are set, they are also written into the result JSON;
-    omitted keys when not configured.
-    """
-    current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
-    ri = _safe_filename_token(random_input_len)
-    ro = _safe_filename_token(random_output_len)
-    result_filename = f"result_{test_name}_{dataset_name}_{flow}_{num_prompt}_in{ri}_out{ro}_{current_dt}.json"
-    if "--result-filename" in args:
-        print(f"The result file will be overwritten by {result_filename}")
-    command = (
-        ["vllm", "bench", "serve", "--omni"]
-        + args
-        + [
-            "--save-result",
-            "--result-dir",
-            os.environ.get("BENCHMARK_DIR", "tests"),
-            "--result-filename",
-            result_filename,
-        ]
-    )
-    process = subprocess.Popen(
-        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, universal_newlines=True
-    )
-
-    for line in iter(process.stdout.readline, ""):
-        print(line, end=" ")
-
-    for line in iter(process.stderr.readline, ""):
-        print(line, end=" ")
-
-    if "--result-dir" in command:
-        index = command.index("--result-dir")
-        result_dir = command[index + 1]
-    else:
-        result_dir = "./"
-
-    result_path = os.path.join(result_dir, result_filename)
-    if not os.path.exists(result_path):
-        with open(OMNI_RESULT_TEMPLATE_PATH, encoding="utf-8") as f:
-            template_result: dict[str, Any] = json.load(f)
-        Path(result_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(result_path, "w", encoding="utf-8") as f:
-            json.dump(template_result, f, ensure_ascii=False, indent=2)
-        print(f"Benchmark result file not generated, fallback to template: {result_path}")
-        result = template_result
-    else:
-        with open(result_path, encoding="utf-8") as f:
-            result = json.load(f)
-
-    if baseline_config:
-        result["baseline"] = _baseline_thresholds_for_step(
-            baseline_config,
-            sweep_index=sweep_index,
-            request_rate=request_rate,
-            max_concurrency=max_concurrency,
-        )
-    else:
-        result["baseline"] = {}
-    if random_input_len is not None:
-        result["random_input_len"] = random_input_len
-    if random_output_len is not None:
-        result["random_output_len"] = random_output_len
-    with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    return result
 
 
 benchmark_indices = create_benchmark_indices(BENCHMARK_CONFIGS, server_to_benchmark_mapping)
