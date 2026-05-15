@@ -307,11 +307,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 )
 
             hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
+            # FIX: The .cpu attribute of slot_mapping is stale (not updated by the Triton
+            # _compute_slot_mapping_kernel which only writes to .gpu). We must use .gpu and
+            # sync back to CPU to get the correctly computed slot mapping.
+            slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
+            slot_mapping_cpu = slot_mapping_gpu[:num_tokens_padded].cpu()
             self.omni_prefix_cache.update_omni_tensor_prefix_cache(
                 hidden_states=hs_for_cache,
                 multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
-                slot_mapping=self.input_batch.block_table[0].slot_mapping.cpu,
+                slot_mapping=slot_mapping_cpu,
                 num_tokens_padded=num_tokens_padded,
                 skip_mm_cache_keys=self._deferred_prefix_cache_mm_keys(),
             )
