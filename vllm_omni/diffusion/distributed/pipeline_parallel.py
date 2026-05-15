@@ -147,7 +147,7 @@ class PipelineParallelMixin:
                 return orig_decode(z, *args, **kwargs)
             elif is_pipeline_first_stage():
                 return orig_decode(z, *args, **kwargs)
-            return None
+            return (None,)  # decoder returns a tuple
 
         self.vae.decode = wrapped_decode
 
