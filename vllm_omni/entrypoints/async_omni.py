@@ -21,7 +21,6 @@ from vllm.outputs import PoolingRequestOutput
 from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
 from vllm.renderers.inputs.preprocess import extract_prompt_components
-from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -32,6 +31,7 @@ from vllm_omni.entrypoints.omni_base import (
     OmniBase,
     OmniEngineDeadError,
 )
+from vllm_omni.entrypoints.streaming_input import validate_streaming_input_sampling_params
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetrics
 from vllm_omni.outputs import OmniRequestOutput
@@ -456,16 +456,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
     @staticmethod
     def _validate_streaming_input_sampling_params(params: OmniSamplingParams) -> None:
-        if (
-            not isinstance(params, SamplingParams)
-            or params.n > 1
-            or params.output_kind == RequestOutputKind.FINAL_ONLY
-            or params.stop
-        ):
-            raise ValueError(
-                "Input streaming is currently supported only for SamplingParams "
-                "with n == 1, output_kind != FINAL_ONLY, and without stop strings."
-            )
+        validate_streaming_input_sampling_params(params)
 
     async def encode(
         self,

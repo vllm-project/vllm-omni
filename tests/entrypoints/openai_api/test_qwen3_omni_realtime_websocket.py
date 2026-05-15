@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import io
 import json
 import os
@@ -23,7 +24,7 @@ from tests.helpers.media import (
     generate_synthetic_audio,
 )
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -37,6 +38,7 @@ REALTIME_SYNTH_PHRASE_TEXT = (
 # The new-schema CI overlay bakes in async_chunk: False and covers CUDA/ROCm/XPU
 # via its ``platforms:`` section, so one path serves all three.
 default_stage_config = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
+async_chunk_stage_config = modify_stage_config(default_stage_config, updates={"async_chunk": True})
 
 realtime_server_params = [
     pytest.param(
@@ -46,7 +48,15 @@ realtime_server_params = [
             use_stage_cli=True,
             server_args=["--no-async-chunk"],
         ),
-        id="default",
+        id="no_async_chunk",
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=async_chunk_stage_config,
+            use_stage_cli=True,
+        ),
+        id="async_chunk",
     ),
 ]
 
@@ -74,6 +84,13 @@ def _wav_bytes_from_pcm16(pcm: bytes, sample_rate_hz: int) -> bytes:
     return buf.getvalue()
 
 
+async def _connect_local_websocket(uri: str):
+    kwargs: dict = {"max_size": 64 * 1024 * 1024}
+    if "proxy" in inspect.signature(websockets.connect).parameters:
+        kwargs["proxy"] = None
+    return await websockets.connect(uri, **kwargs)
+
+
 async def _run_realtime_audio_roundtrip(
     host: str,
     port: int,
@@ -92,7 +109,18 @@ async def _run_realtime_audio_roundtrip(
     bytes_per_ms = 16000 * 2 // 1000
     chunk_bytes = max(bytes_per_ms * chunk_ms, 2)
 
-    async with websockets.connect(uri, max_size=64 * 1024 * 1024) as ws:
+    last_connect_error: Exception | None = None
+    for attempt in range(5):
+        try:
+            ws = await _connect_local_websocket(uri)
+            break
+        except (OSError, websockets.exceptions.InvalidMessage) as exc:
+            last_connect_error = exc
+            await asyncio.sleep(1 + attempt)
+    else:
+        raise AssertionError(f"Could not connect to realtime websocket: {last_connect_error!r}")
+
+    async with ws:
         await ws.send(json.dumps({"type": "session.update", "model": model}))
         await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": False}))
 

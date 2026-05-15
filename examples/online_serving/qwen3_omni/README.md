@@ -18,9 +18,7 @@ Asynchronous chunk streaming operates as **enabled by default** within this bund
 Additionally, NPU, ROCm, and XPU per-platform configuration deltas are deterministically merged from the
 `platforms`: section of the corresponding YAML.
 
-**Note:** The OpenAI-style **`/v1/realtime`** WebSocket interface (facilitating streaming PCM audio input alongside audio and transcription output)
-is currently **unsupported** while the `async_chunk` configuration attribute is enabled.
-It is requisite to instantiate the default omni architecture or utilize a deployment configuration specifying `async_chunk: false` to facilitate real-time streaming sessions.
+The OpenAI-style **`/v1/realtime`** WebSocket interface accepts streaming PCM audio input and returns audio plus transcription events. With `async_chunk: true`, realtime sessions use a commit-then-generate bridge: the server buffers uploaded PCM chunks until `input_audio_buffer.commit` with `final: true`, then submits one normal multimodal Qwen3-Omni request through the async-chunk Thinker -> Talker -> Code2Wav pipeline. Use `--no-async-chunk` only when you specifically want the legacy streaming-input path where generation can start from a non-final commit.
 
 To explicitly utilize a custom deployment YAML, mandate the configuration path accordingly:
 ```bash
@@ -141,7 +139,9 @@ parser defaults). If you don't pass a flag, the YAML value wins.
 > bool. Pipelines that implement alternate processor functions for
 > chunked vs end-to-end modes (e.g. qwen3_tts code2wav) dispatch
 > automatically based on that bool — no extra flag or variant yaml is
-> needed.
+> needed. For `/v1/realtime`, `async_chunk: true` waits for a final commit
+> before generation, while `--no-async-chunk` preserves the legacy
+> streaming-input behavior.
 
 > ⚠️ **For multi-stage models that share GPUs (qwen3_omni_moe by default
 > shares cuda:1 between stages 1 and 2), avoid using global memory flags.**
@@ -255,7 +255,7 @@ python examples/online_serving/openai_chat_completion_client_for_multimodal_gene
 
 [`openai_realtime_client.py`](./openai_realtime_client.py) connects to **`ws://<host>:<port>/v1/realtime`**, streams a local WAV as **PCM16 mono @ 16 kHz** in fixed-size chunks (OpenAI-style `input_audio_buffer.append` / `commit`), and receives **`response.audio.delta`** (incremental PCM for the reply) plus **`transcription.*`** events. By default it concatenates audio deltas and writes **`--output-wav`** (model output is typically **24 kHz**). Optional **`--delta-dump-dir`** saves each delta as `delta_000001.wav`, … for debugging.
 
-Streaming input works well for translation-style use cases; if the Thinker runs while input is still incomplete, consider limiting **`max_tokens`** in your session / server defaults to avoid over-generation.
+Streaming input works well for translation-style use cases. In `async_chunk: true` mode, the client can still upload chunks incrementally, but generation starts after the final commit. In `--no-async-chunk` mode, a non-final commit starts the legacy streaming-input path, so consider limiting **`max_tokens`** in your session / server defaults if the Thinker runs while input is still incomplete.
 
 **Dependencies:**
 
@@ -289,10 +289,16 @@ python openai_realtime_client.py \
 | `--num-requests` | `1` | Number of sequential sessions (see `--concurrency`) |
 | `--concurrency` | `1` | Max concurrent WebSocket sessions when `--num-requests` > 1 |
 
-Ensure the server is running **without** `async_chunk` if you use `/v1/realtime`, for example:
+The default Qwen3-Omni deployment enables `async_chunk`, so the command below uses the commit-then-generate bridge:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091
+```
+
+To use the legacy realtime streaming-input path instead, disable async chunking explicitly:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 --no-async-chunk
 ```
 
 The Python client supports the following command-line arguments:
