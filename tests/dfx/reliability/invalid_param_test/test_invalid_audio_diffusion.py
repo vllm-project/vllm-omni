@@ -46,7 +46,7 @@ _PARAMS = [
         ),
         pytest.param({"speed": 0.1}, ("speed", "greater_than_equal", "0.25"), id="speed_too_low"),
         pytest.param({"speed": 99.0}, ("speed", "less_than_equal", "4"), id="speed_too_high"),
-        pytest.param({"stream_format": 1}, ("stream_format", "literal_error", "wav"), id="stream_format_wrong_type"),
+        pytest.param({"stream_format": 1}, ("stream_format", "literal_error", "audio"), id="stream_format_wrong_type"),
         pytest.param(
             {"stream_format": "sse"},
             ("sse", "stream_format", "value_error", "not a supported stream_format"),

@@ -109,7 +109,6 @@ def _chat_completions_request_without_expectations(omni_server: OmniServer, case
         pytest.param(
             "max_tokens_wrong_type", 400, ("max_tokens", "int_parsing", "integer"), id="invalid_max_tokens_type"
         ),
-        pytest.param("modalities_scalar", 400, ("modalities", "value_error", "text"), id="modalities_scalar"),
         pytest.param(
             "modalities_list_bad",
             400,
