@@ -1167,7 +1167,7 @@ def _hunyuan_image3_unpack_packed_topk(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
-    num_experts: int,
+    num_experts: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Unpack pre-computed ``(topk_weights, topk_indices)`` packed by
     :class:`HunyuanImage3SparseMoeBlock` into ``gating_output``.
