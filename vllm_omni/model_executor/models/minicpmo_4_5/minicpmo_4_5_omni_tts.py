@@ -22,6 +22,13 @@ import torch.nn.functional as F
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import SupportsPP
 
+try:
+    from stepaudio2 import Token2wav as _Token2wav
+    _stepaudio2_available = True
+except ImportError:
+    _Token2wav = None
+    _stepaudio2_available = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -105,15 +112,25 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
             token2wav_dir = os.path.join(model_path, "assets", "token2wav")
             if os.path.isdir(token2wav_dir):
-                from stepaudio2 import Token2wav
+                if not _stepaudio2_available:
+                    raise ImportError(
+                        "MiniCPM-o 4.5 token2wav stage requires the stepaudio2 package, "
+                        "which is not available on PyPI. Install it from "
+                        "https://github.com/stepfun-ai/Step-Audio2 (clone the repo and add it "
+                        "to PYTHONPATH, or `pip install -e .` inside the checkout)."
+                    )
                 prev_dtype2 = torch.get_default_dtype()
                 torch.set_default_dtype(torch.float32)
                 try:
-                    self.audio_tokenizer = Token2wav(token2wav_dir, float16=False, n_timesteps=10)
+                    self.audio_tokenizer = _Token2wav(token2wav_dir, float16=False, n_timesteps=10)
                 finally:
                     torch.set_default_dtype(prev_dtype2)
                 self.tts_obj.audio_tokenizer = self.audio_tokenizer
                 logger.info("Loaded Token2wav from %s", token2wav_dir)
+        except ImportError:
+            # Surface missing dependencies directly so users can act on them
+            # instead of getting a silent None waveform downstream.
+            raise
         except Exception as e:
             logger.error("Failed to init 4.5 TTS: %s", e, exc_info=True)
 
