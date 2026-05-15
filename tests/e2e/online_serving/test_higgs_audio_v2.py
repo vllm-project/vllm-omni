@@ -224,21 +224,22 @@ def _all_fixtures() -> list[Path]:
     return sorted(fixture_dir.glob("reference_*.pt"))
 
 
-@pytest.mark.skipif(not FIXTURE.exists(), reason="reference fixture not captured yet")
 def test_fixture_shape_invariants() -> None:
-    """Sanity check every captured fixture (AC-1, AC-2 layout requirements)."""
+    """Sanity check every captured fixture (AC-1, AC-2, AC-3 layout requirements)."""
     fixtures = _all_fixtures()
-    assert len(fixtures) >= 1, f"no reference_*.pt fixtures under {FIXTURE.parent}"
+    assert len(fixtures) == 11, (
+        f"expected 11 reference_*.pt fixtures under {FIXTURE.parent}; got {len(fixtures)}: "
+        f"{[p.name for p in fixtures]}"
+    )
     for path in fixtures:
         blob = torch.load(path, weights_only=False)
         assert blob["prompt_text"], f"empty prompt_text in {path}"
         assert blob["input_ids"].ndim == 2, f"input_ids must be 2-D in {path}"
         codes = blob["audio_codes"]
         assert codes.ndim == 3, f"audio_codes must be 3-D in {path}"
-        # Canonical layout: [B, num_codebooks=8, T]. Tolerate the older
-        # [B, T, num_codebooks=8] layout for legacy fixtures.
-        assert 8 in (int(codes.shape[1]), int(codes.shape[2])), (
-            f"audio_codes shape {tuple(codes.shape)} must include num_codebooks=8 in {path}"
+        # Canonical layout: [B, num_codebooks=8, T].
+        assert int(codes.shape[1]) == 8, (
+            f"audio_codes layout must be [B, num_codebooks=8, T] in {path}; got shape {tuple(codes.shape)}"
         )
         # Real codes only -- stream specials (>= 1024) must not appear.
         assert int(codes.min()) >= 0
@@ -250,26 +251,32 @@ def test_fixture_shape_invariants() -> None:
         assert pcm.dtype == torch.int16
         mask = blob.get("audio_token_mask")
         assert mask is not None
-        # The mask covers the FULL output sequence (prefill + every decode step)
-        # since round 2. It must be at least as long as the prompt input_ids.
-        assert int(mask.shape[1]) >= int(blob["input_ids"].shape[1])
+        # Round-3 contract: the mask covers the FULL output sequence (prompt +
+        # every generated audio frame), is strictly longer than the prompt,
+        # and contains at least one True position in the generated region.
+        input_len = int(blob["input_ids"].shape[1])
+        assert int(mask.shape[1]) > input_len, (
+            f"mask length {int(mask.shape[1])} must be strictly greater than prompt length "
+            f"{input_len} in {path} (the saved mask must cover prompt + generated positions)"
+        )
+        generated_mask = mask[:, input_len:]
+        assert bool(generated_mask.any()), (
+            f"mask in {path} has no True positions in the generated region [{input_len}:); "
+            "this would invalidate AC-3 routing-mask comparisons"
+        )
 
 
-@pytest.mark.skipif(
-    not _all_fixtures()
-    or os.environ.get("HIGGS_AUDIO_V2_FIXTURE_TOKEN_PARITY", "0") not in ("0", "")
-    and not os.environ.get("HIGGS_AUDIO_V2_REFERENCE_MODEL"),
-    reason="full token-parity check requires upstream model; skipped unless env opted in",
-)
 def test_fixture_input_ids_match_build_plain_text_prompt() -> None:
     """Verify per-prompt input_ids parity vs build_plain_text_prompt (AC-1).
 
-    Loads the upstream HF processor once and replays
-    ``build_plain_text_prompt(processor, prompt_text)`` for each fixture,
-    asserting that the resulting input_ids match the saved fixture exactly.
-    This is the canonical AC-1 positive test.
+    Self-contained: tries to load the upstream HF processor in offline-only
+    mode first (uses the project HF cache), and only falls back to a network
+    fetch when the user opted in via ``HIGGS_AUDIO_V2_REFERENCE_MODEL_NETWORK=1``.
+    Skips cleanly when the processor cannot be resolved without network.
     """
-    from transformers import AutoProcessor
+    fixtures = _all_fixtures()
+    if not fixtures:
+        pytest.skip("no reference fixtures present")
 
     from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_tokenizer import (
         build_plain_text_prompt,
@@ -279,8 +286,22 @@ def test_fixture_input_ids_match_build_plain_text_prompt() -> None:
     model_id = os.environ.get(
         "HIGGS_AUDIO_V2_REFERENCE_MODEL", "bosonai/higgs-audio-v2-generation-3B-base"
     )
-    processor = AutoProcessor.from_pretrained(model_id)
-    for path in _all_fixtures():
+    allow_network = os.environ.get("HIGGS_AUDIO_V2_REFERENCE_MODEL_NETWORK", "0") not in ("0", "")
+    try:
+        from transformers import AutoProcessor
+
+        if allow_network:
+            processor = AutoProcessor.from_pretrained(model_id)
+        else:
+            # Offline-only: rely entirely on the local HF cache; do NOT contact the hub.
+            processor = AutoProcessor.from_pretrained(model_id, local_files_only=True)
+    except Exception as exc:
+        pytest.skip(
+            f"upstream HF processor {model_id!r} unavailable offline ({exc.__class__.__name__}: {exc}); "
+            "set HIGGS_AUDIO_V2_REFERENCE_MODEL_NETWORK=1 to allow a one-time network fetch."
+        )
+
+    for path in fixtures:
         blob = torch.load(path, weights_only=False)
         out = build_plain_text_prompt(processor, blob["prompt_text"])
         emitted = input_ids_to_python_list(out)
@@ -370,13 +391,185 @@ def test_fused_weight_loader_maps_qkv_and_mlp() -> None:
     assert talker._map_simple_name("text_lm_head.weight") == "lm_head.weight"
     assert talker._map_simple_name("codebook_head_0.weight") == "audio_codebook0_head.weight"
     assert talker._map_simple_name("codebook_head_3.weight") == "code_predictor.residual_heads.2.weight"
-    assert talker._map_simple_name("model.layers.5.input_layernorm.weight") == "dual_ffns.5.input_layernorm.weight"
+    assert talker._map_simple_name("model.layers.5.input_layernorm.weight") == "layers.5.base.input_layernorm.weight"
     assert (
         talker._map_simple_name("model.layers.5.audio_post_attention_layernorm.weight")
-        == "dual_ffns.5.audio_post_attention_layernorm.weight"
+        == "layers.5.audio_post_attention_layernorm.weight"
     )
     # Unrelated key returns None.
     assert talker._map_simple_name("unrelated.weight") is None
+
+
+def _make_stub_talker():
+    """Build a HiggsAudioV2TalkerForConditionalGeneration shell with stub parameters.
+
+    The full ``__init__`` requires a live vLLM TP group; here we sidestep it by
+    constructing the parameters that ``load_weights`` writes into directly.
+    The stub is enough to exercise the fused-tensor mapping (qkv_proj,
+    gate_up_proj, audio_lm_head split) end to end.
+    """
+    from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import (
+        HiggsAudioV2Config,
+    )
+    from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_talker import (
+        HiggsAudioV2TalkerForConditionalGeneration,
+    )
+
+    cfg = HiggsAudioV2Config(num_hidden_layers=2)  # small to keep the stub fast
+    talker = HiggsAudioV2TalkerForConditionalGeneration.__new__(
+        HiggsAudioV2TalkerForConditionalGeneration
+    )
+    torch.nn.Module.__init__(talker)
+    talker.config = cfg
+    # Construct just the param tensors load_weights writes into. Names mirror
+    # what self.named_parameters() would return on a real talker.
+    hidden = int(cfg.hidden_size)
+    head_dim = int(cfg.head_dim)
+    q_dim = int(cfg.num_attention_heads) * head_dim
+    kv_dim = int(cfg.num_key_value_heads) * head_dim
+    inter = int(cfg.intermediate_size)
+    vocab = int(cfg.vocab_size)
+    num_codebooks = int(cfg.num_codebooks)
+    codebook_size = int(cfg.codebook_size)
+    n_layers = int(cfg.num_hidden_layers)
+
+    params: dict[str, torch.nn.Parameter] = {}
+    for li in range(n_layers):
+        params[f"layers.{li}.base.self_attn.qkv_proj.weight"] = torch.nn.Parameter(
+            torch.zeros(q_dim + 2 * kv_dim, hidden)
+        )
+        params[f"layers.{li}.base.mlp.gate_up_proj.weight"] = torch.nn.Parameter(
+            torch.zeros(2 * inter, hidden)
+        )
+        params[f"layers.{li}.audio_mlp.gate_up_proj.weight"] = torch.nn.Parameter(
+            torch.zeros(2 * inter, hidden)
+        )
+        params[f"layers.{li}.base.input_layernorm.weight"] = torch.nn.Parameter(torch.zeros(hidden))
+        params[f"layers.{li}.base.post_attention_layernorm.weight"] = torch.nn.Parameter(torch.zeros(hidden))
+        params[f"layers.{li}.audio_input_layernorm.weight"] = torch.nn.Parameter(torch.zeros(hidden))
+        params[f"layers.{li}.audio_post_attention_layernorm.weight"] = torch.nn.Parameter(torch.zeros(hidden))
+    params["embed_audio_tokens.weight"] = torch.nn.Parameter(torch.zeros(num_codebooks * codebook_size, hidden))
+    params["lm_head.weight"] = torch.nn.Parameter(torch.zeros(vocab, hidden))
+    params["audio_codebook0_head.weight"] = torch.nn.Parameter(torch.zeros(codebook_size, hidden))
+    for k in range(num_codebooks - 1):
+        params[f"code_predictor.residual_heads.{k}.weight"] = torch.nn.Parameter(torch.zeros(codebook_size, hidden))
+
+    # Monkey-patch named_parameters to return our stub registry.
+    talker._stub_params = params
+    talker.named_parameters = lambda *a, **kw: iter(params.items())
+    return talker, cfg, params
+
+
+def test_load_weights_fuses_qkv_and_mlp_end_to_end() -> None:
+    """Drive load_weights on a synthetic HF state_dict and verify fused outputs."""
+    talker, cfg, params = _make_stub_talker()
+    hidden = int(cfg.hidden_size)
+    head_dim = int(cfg.head_dim)
+    q_dim = int(cfg.num_attention_heads) * head_dim
+    kv_dim = int(cfg.num_key_value_heads) * head_dim
+    inter = int(cfg.intermediate_size)
+    n_layers = int(cfg.num_hidden_layers)
+    num_codebooks = int(cfg.num_codebooks)
+    codebook_size = int(cfg.codebook_size)
+
+    # Build a synthetic HF state dict with unique values per slot so we can
+    # assert the fused tensors carry the right halves.
+    hf_state: list[tuple[str, torch.Tensor]] = []
+    for li in range(n_layers):
+        # q/k/v -> qkv_proj. Use distinct constants so we can identify slabs.
+        hf_state.append((f"model.layers.{li}.self_attn.q_proj.weight", torch.full((q_dim, hidden), float(10 * li + 1))))
+        hf_state.append((f"model.layers.{li}.self_attn.k_proj.weight", torch.full((kv_dim, hidden), float(10 * li + 2))))
+        hf_state.append((f"model.layers.{li}.self_attn.v_proj.weight", torch.full((kv_dim, hidden), float(10 * li + 3))))
+        # gate/up -> gate_up_proj (text MLP).
+        hf_state.append((f"model.layers.{li}.mlp.gate_proj.weight", torch.full((inter, hidden), float(10 * li + 4))))
+        hf_state.append((f"model.layers.{li}.mlp.up_proj.weight", torch.full((inter, hidden), float(10 * li + 5))))
+        # gate/up -> gate_up_proj (audio MLP).
+        hf_state.append((f"model.layers.{li}.audio_mlp.gate_proj.weight", torch.full((inter, hidden), float(10 * li + 6))))
+        hf_state.append((f"model.layers.{li}.audio_mlp.up_proj.weight", torch.full((inter, hidden), float(10 * li + 7))))
+        # Layernorms.
+        hf_state.append((f"model.layers.{li}.input_layernorm.weight", torch.full((hidden,), float(10 * li + 8))))
+        hf_state.append((f"model.layers.{li}.post_attention_layernorm.weight", torch.full((hidden,), float(10 * li + 9))))
+        hf_state.append((f"model.layers.{li}.audio_input_layernorm.weight", torch.full((hidden,), float(100 * li + 1))))
+        hf_state.append((f"model.layers.{li}.audio_post_attention_layernorm.weight", torch.full((hidden,), float(100 * li + 2))))
+    # Audio LM head: a fused [num_codebooks * codebook_size, hidden] tensor whose
+    # per-codebook chunks carry distinct constants so we can identify the split.
+    audio_head = torch.zeros(num_codebooks * codebook_size, hidden)
+    for k in range(num_codebooks):
+        audio_head[k * codebook_size : (k + 1) * codebook_size] = float(k + 1)
+    hf_state.append(("audio_lm_head.weight", audio_head))
+    # text LM head and embed_audio_tokens.
+    hf_state.append(("text_lm_head.weight", torch.full((int(cfg.vocab_size), hidden), 999.0)))
+    hf_state.append(("model.embed_audio_tokens.embed_audio_tokens.weight", torch.full((num_codebooks * codebook_size, hidden), -1.0)))
+
+    loaded = talker.load_weights(iter(hf_state))
+
+    # Every fused / split / direct target must have landed.
+    for li in range(n_layers):
+        assert f"layers.{li}.base.self_attn.qkv_proj.weight" in loaded
+        assert f"layers.{li}.base.mlp.gate_up_proj.weight" in loaded
+        assert f"layers.{li}.audio_mlp.gate_up_proj.weight" in loaded
+        assert f"layers.{li}.base.input_layernorm.weight" in loaded
+        assert f"layers.{li}.audio_input_layernorm.weight" in loaded
+    assert "audio_codebook0_head.weight" in loaded
+    for k in range(1, num_codebooks):
+        assert f"code_predictor.residual_heads.{k - 1}.weight" in loaded
+    assert "embed_audio_tokens.weight" in loaded
+    assert "lm_head.weight" in loaded
+
+    # Validate the QKV fusion slabs for layer 0.
+    qkv0 = params["layers.0.base.self_attn.qkv_proj.weight"]
+    assert torch.equal(qkv0[:q_dim], torch.full((q_dim, hidden), 1.0))
+    assert torch.equal(qkv0[q_dim : q_dim + kv_dim], torch.full((kv_dim, hidden), 2.0))
+    assert torch.equal(qkv0[q_dim + kv_dim :], torch.full((kv_dim, hidden), 3.0))
+
+    # Validate gate_up_proj fusion for the text MLP at layer 1.
+    gate_up1 = params["layers.1.base.mlp.gate_up_proj.weight"]
+    assert torch.equal(gate_up1[:inter], torch.full((inter, hidden), 14.0))
+    assert torch.equal(gate_up1[inter:], torch.full((inter, hidden), 15.0))
+
+    # Validate audio_lm_head split.
+    assert torch.equal(params["audio_codebook0_head.weight"], torch.full((codebook_size, hidden), 1.0))
+    for k in range(1, num_codebooks):
+        assert torch.equal(
+            params[f"code_predictor.residual_heads.{k - 1}.weight"],
+            torch.full((codebook_size, hidden), float(k + 1)),
+        )
+
+
+def test_stage1_chunk_decode_trims_left_context() -> None:
+    """forward_chunk must slice off left_context_size * hop_length samples."""
+    from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import (
+        HiggsAudioV2Config,
+    )
+    from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_code2wav import (
+        HiggsAudioV2Code2Wav,
+    )
+
+    cfg = HiggsAudioV2Config()
+    stage1 = HiggsAudioV2Code2Wav(cfg)
+
+    # Monkey-patch the underlying forward to return a deterministic PCM of
+    # length (T * hop_length) given a [B, num_codebooks, T] code tensor.
+    HOP = 960
+
+    def _fake_forward(codes):
+        t = int(codes.shape[-1])
+        pcm = torch.arange(t * HOP, dtype=torch.float32).reshape(1, 1, -1)
+        return pcm
+
+    object.__setattr__(stage1, "forward", _fake_forward)
+    stage1._loaded = True
+
+    codes = torch.zeros(1, cfg.num_codebooks, 30, dtype=torch.long)  # 30 frames
+    out_no_overlap = stage1.forward_chunk(codes, left_context_size=0, hop_length=HOP)
+    assert out_no_overlap.shape[-1] == 30 * HOP
+
+    out_overlap = stage1.forward_chunk(codes, left_context_size=5, hop_length=HOP)
+    assert out_overlap.shape[-1] == 25 * HOP
+
+    # Edge case: left_context_size >= T -> empty output.
+    out_empty = stage1.forward_chunk(codes, left_context_size=30, hop_length=HOP)
+    assert out_empty.shape[-1] == 0
 
 
 def test_fused_audio_head_split_shapes() -> None:

@@ -54,7 +54,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.llama import LlamaMLP, LlamaModel
+from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaMLP, LlamaModel
 
 from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import (
     HiggsAudioV2Config,
@@ -62,6 +62,7 @@ from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2
 
 __all__ = [
     "DualFFNLayer",
+    "HiggsAudioV2DecoderLayer",
     "HiggsAudioCodePredictor",
     "HiggsAudioV2TalkerForConditionalGeneration",
 ]
@@ -189,6 +190,150 @@ class HiggsAudioRMSNorm(nn.Module):
         return (self.weight * hidden_states.to(input_dtype))
 
 
+class HiggsAudioV2DecoderLayer(nn.Module):
+    """One transformer block: vLLM-native attention + DualFFN-routed MLPs.
+
+    Wraps a stock :class:`vllm.model_executor.models.llama.LlamaDecoderLayer`
+    for the self-attention path (so PagedAttention KV caches keep working) and
+    overlays the upstream HiggsAudioV2 DualFFN routing for the layernorm + MLP
+    pairs. The implementation follows the upstream rule from
+    ``transformers.models.higgs_audio_v2.HiggsAudioV2DecoderLayer.forward``
+    described in ``UPSTREAM_TRACE.md``:
+
+    1. Pre-attention norm: per-position split into ``audio_input_layernorm``
+       (audio mask True) vs ``input_layernorm`` (audio mask False). The mixed
+       output is fed to a single shared self-attention.
+    2. Post-attention residual + dual MLP: text positions go through
+       ``mlp(post_attention_layernorm(.))`` and audio positions go through
+       ``audio_mlp(audio_post_attention_layernorm(.))``. Both deltas are added
+       to the residual.
+
+    The classical (non-fused-residual) transformer pattern is used so the per-
+    position split is straightforward. vLLM's compiled forward path passes
+    ``audio_token_mask`` through as an extra layer kwarg via
+    :class:`HiggsAudioV2TalkerForConditionalGeneration.forward`.
+    """
+
+    def __init__(self, vllm_config: VllmConfig, prefix: str, config: HiggsAudioV2Config):
+        super().__init__()
+        self.config = config
+
+        # vLLM-native attention + reference text-side norms / MLP. We reuse the
+        # whole LlamaDecoderLayer scaffold so the attention sub-module is
+        # wired into the engine's KV cache + RoPE machinery; only the forward
+        # path below diverges from the canonical Llama one.
+        self.base = LlamaDecoderLayer(vllm_config=vllm_config, prefix=f"{prefix}.base")
+
+        # Parallel audio-expert norms + MLP (mirrors upstream parameter names).
+        hidden_size = int(config.hidden_size)
+        intermediate_size = int(config.intermediate_size)
+        hidden_act = str(config.hidden_act)
+        mlp_bias = bool(getattr(config, "mlp_bias", False))
+        rms_norm_eps = float(config.rms_norm_eps)
+        self.audio_input_layernorm = HiggsAudioRMSNorm(hidden_size, eps=rms_norm_eps)
+        self.audio_post_attention_layernorm = HiggsAudioRMSNorm(hidden_size, eps=rms_norm_eps)
+        self.audio_mlp = LlamaMLP(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            hidden_act=hidden_act,
+            bias=mlp_bias,
+            prefix=f"{prefix}.audio_mlp",
+        )
+
+    # ------------------------------------------------------------------ helpers
+    def _routed_norm(
+        self,
+        hidden: torch.Tensor,
+        text_norm: nn.Module,
+        audio_norm: HiggsAudioRMSNorm,
+        audio_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Apply ``text_norm`` to non-mask positions and ``audio_norm`` to mask positions."""
+        if audio_mask is None:
+            # Bare audio context (no LM placeholder): all positions go through audio path.
+            return audio_norm(hidden)
+        mask_flat = audio_mask.reshape(-1)
+        if hidden.ndim == 3:
+            hidden_flat = hidden.reshape(-1, hidden.shape[-1])
+        else:
+            hidden_flat = hidden
+        out = hidden_flat.clone()
+        if (~mask_flat).any():
+            text_out = text_norm(hidden_flat[~mask_flat])
+            # vLLM RMSNorm forward(x) returns a single Tensor; some variants
+            # return (Tensor, residual). Normalize to Tensor.
+            if isinstance(text_out, tuple):
+                text_out = text_out[0]
+            out[~mask_flat] = text_out.to(out.dtype)
+        if mask_flat.any():
+            audio_out = audio_norm(hidden_flat[mask_flat])
+            out[mask_flat] = audio_out.to(out.dtype)
+        return out.reshape_as(hidden)
+
+    def _routed_mlp(
+        self,
+        hidden: torch.Tensor,
+        audio_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Apply ``audio_mlp`` to mask positions and ``base.mlp`` to non-mask positions."""
+        if audio_mask is None:
+            return self.audio_mlp(hidden)
+        mask_flat = audio_mask.reshape(-1)
+        if hidden.ndim == 3:
+            hidden_flat = hidden.reshape(-1, hidden.shape[-1])
+        else:
+            hidden_flat = hidden
+        out = torch.zeros_like(hidden_flat)
+        if (~mask_flat).any():
+            out[~mask_flat] = self.base.mlp(hidden_flat[~mask_flat]).to(out.dtype)
+        if mask_flat.any():
+            out[mask_flat] = self.audio_mlp(hidden_flat[mask_flat]).to(out.dtype)
+        return out.reshape_as(hidden)
+
+    # ------------------------------------------------------------------ forward
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        *,
+        audio_token_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Stage 1: pre-attention norm, classical residual pattern.
+        # (We deliberately skip the fused-residual optimization the stock
+        # LlamaDecoderLayer uses; the DualFFN per-position split is incompatible
+        # with the in-place residual mutation.)
+        if residual is not None:
+            hidden_states = hidden_states + residual
+        residual = hidden_states
+        attn_input = self._routed_norm(
+            hidden_states,
+            self.base.input_layernorm,
+            self.audio_input_layernorm,
+            audio_token_mask,
+        )
+
+        # Stage 2: shared self-attention. The vLLM LlamaAttention takes the
+        # standard (positions, hidden_states) signature.
+        attn_out = self.base.self_attn(positions=positions, hidden_states=attn_input)
+        hidden_states = residual + attn_out
+
+        # Stage 3: post-attention norm + dual MLP, classical residual pattern.
+        residual = hidden_states
+        mlp_input = self._routed_norm(
+            hidden_states,
+            self.base.post_attention_layernorm,
+            self.audio_post_attention_layernorm,
+            audio_token_mask,
+        )
+        mlp_out = self._routed_mlp(mlp_input, audio_token_mask)
+        hidden_states = residual + mlp_out
+        # We return ``None`` for the next-step residual so the next layer also
+        # uses the classical pattern (residual is fully baked into hidden_states
+        # at this point).
+        return hidden_states, None
+
+
 class HiggsAudioCodePredictor(nn.Module):
     """Fast-AR head for residual codebooks 1..N-1.
 
@@ -280,24 +425,21 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             # every attribute via PretrainedConfig.
             self.config = HiggsAudioV2Config(**hf_config.to_dict())
 
-        # ------------------------------------------------------------------ backbone
-        # We reuse vLLM's compiled LlamaModel for the attention path. The
-        # MLP/LayerNorm slots inside each decoder layer are owned by
-        # ``LlamaDecoderLayer``; the DualFFN audio expert is held alongside
-        # in ``self.dual_ffns`` (one module per layer) so weight loading and
-        # the bypass-the-MLP path remain explicit.
-        self.model = LlamaModel(vllm_config=vllm_config, prefix=f"{prefix}.model")
+        # ------------------------------------------------------------------ embedding + norm
+        # vLLM's LlamaModel exposes ``embed_tokens`` (text vocab embedding) and
+        # ``norm`` (final RMSNorm). We use it for those two pieces only; the
+        # decoder layers below are our own DualFFN-aware layers, not the
+        # canonical LlamaDecoderLayer stack.
+        self.text_model = LlamaModel(vllm_config=vllm_config, prefix=f"{prefix}.model")
 
-        # ------------------------------------------------------------------ DualFFN tier
-        # One DualFFN module per transformer layer. The text-side parameters
-        # are also held by ``self.model.layers[i].mlp`` / ``input_layernorm``
-        # / ``post_attention_layernorm``; we mirror them in DualFFN purely for
-        # the audio expert side and for the upstream-aligned weight names.
-        # During forward, the audio expert is applied as a delta on top of
-        # the LlamaModel output for positions where audio_token_mask is True.
-        self.dual_ffns = nn.ModuleList(
+        # ------------------------------------------------------------------ DualFFN-aware layer stack
+        self.layers = nn.ModuleList(
             [
-                DualFFNLayer(self.config, prefix=f"{prefix}.dual_ffns.{i}")
+                HiggsAudioV2DecoderLayer(
+                    vllm_config=vllm_config,
+                    prefix=f"{prefix}.layers.{i}",
+                    config=self.config,
+                )
                 for i in range(self.config.num_hidden_layers)
             ]
         )
@@ -452,7 +594,9 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                 self._consume_fused_audio_head(tensor, loaded)
                 continue
 
-        # Second pass: emit fused tensors.
+        # Second pass: emit fused tensors. Targets are the per-layer slots on
+        # our HiggsAudioV2DecoderLayer stack (``layers.<L>.base...`` for text-
+        # side; ``layers.<L>.audio_mlp...`` for the audio expert).
         for (layer_idx, slot, fused_kind), parts in fuse_buckets.items():
             if fused_kind == "gate_up_proj":
                 gate = parts.get("gate_proj")
@@ -461,20 +605,9 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                     continue
                 fused = torch.cat([gate, up], dim=0)
                 if slot == "mlp":
-                    target_name = f"model.layers.{layer_idx}.mlp.gate_up_proj.weight"
-                else:
-                    target_name = f"dual_ffns.{layer_idx}.audio_mlp.gate_up_proj.weight"
-                if target_name in own_params and tuple(own_params[target_name].shape) == tuple(fused.shape):
-                    with torch.no_grad():
-                        own_params[target_name].copy_(fused)
-                    loaded.add(target_name)
-                else:
-                    logger.warning(
-                        "higgs_audio_v2 load_weights: fused %s not found or shape mismatch (%s vs target %s)",
-                        target_name,
-                        tuple(fused.shape),
-                        tuple(own_params[target_name].shape) if target_name in own_params else "<missing>",
-                    )
+                    target_name = f"layers.{layer_idx}.base.mlp.gate_up_proj.weight"
+                else:  # audio_mlp
+                    target_name = f"layers.{layer_idx}.audio_mlp.gate_up_proj.weight"
             elif fused_kind == "qkv_proj":
                 q = parts.get("q_proj")
                 k = parts.get("k_proj")
@@ -482,18 +615,20 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                 if q is None or k is None or v is None:
                     continue
                 fused = torch.cat([q, k, v], dim=0)
-                target_name = f"model.layers.{layer_idx}.self_attn.qkv_proj.weight"
-                if target_name in own_params and tuple(own_params[target_name].shape) == tuple(fused.shape):
-                    with torch.no_grad():
-                        own_params[target_name].copy_(fused)
-                    loaded.add(target_name)
-                else:
-                    logger.warning(
-                        "higgs_audio_v2 load_weights: fused %s not found or shape mismatch (%s vs target %s)",
-                        target_name,
-                        tuple(fused.shape),
-                        tuple(own_params[target_name].shape) if target_name in own_params else "<missing>",
-                    )
+                target_name = f"layers.{layer_idx}.base.self_attn.qkv_proj.weight"
+            else:
+                continue
+            if target_name in own_params and tuple(own_params[target_name].shape) == tuple(fused.shape):
+                with torch.no_grad():
+                    own_params[target_name].copy_(fused)
+                loaded.add(target_name)
+            else:
+                logger.warning(
+                    "higgs_audio_v2 load_weights: fused %s not found or shape mismatch (%s vs target %s)",
+                    target_name,
+                    tuple(fused.shape),
+                    tuple(own_params[target_name].shape) if target_name in own_params else "<missing>",
+                )
         return loaded
 
     def _consume_fused_audio_head(
@@ -549,27 +684,28 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                 return None
             if idx >= 1:
                 return f"code_predictor.residual_heads.{idx - 1}.weight"
-        # Per-layer audio norms.
+        # Per-layer audio norms -> our HiggsAudioV2DecoderLayer side.
         if hf_name.startswith("model.layers.") and hf_name.endswith(
             ".audio_input_layernorm.weight"
         ):
             layer_idx = hf_name.split(".")[2]
-            return f"dual_ffns.{layer_idx}.audio_input_layernorm.weight"
+            return f"layers.{layer_idx}.audio_input_layernorm.weight"
         if hf_name.startswith("model.layers.") and hf_name.endswith(
             ".audio_post_attention_layernorm.weight"
         ):
             layer_idx = hf_name.split(".")[2]
-            return f"dual_ffns.{layer_idx}.audio_post_attention_layernorm.weight"
+            return f"layers.{layer_idx}.audio_post_attention_layernorm.weight"
+        # Per-layer text norms -> the wrapped LlamaDecoderLayer's slots.
         if hf_name.startswith("model.layers.") and hf_name.endswith(
             ".input_layernorm.weight"
         ):
             layer_idx = hf_name.split(".")[2]
-            return f"dual_ffns.{layer_idx}.input_layernorm.weight"
+            return f"layers.{layer_idx}.base.input_layernorm.weight"
         if hf_name.startswith("model.layers.") and hf_name.endswith(
             ".post_attention_layernorm.weight"
         ):
             layer_idx = hf_name.split(".")[2]
-            return f"dual_ffns.{layer_idx}.post_attention_layernorm.weight"
+            return f"layers.{layer_idx}.base.post_attention_layernorm.weight"
         return None
 
     # ----------------------------------------------------------------- forward
@@ -577,36 +713,41 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        **kwargs: Any,
+        intermediate_tensors: Any | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **_: Any,
     ) -> torch.Tensor:
-        """Forward pass.
+        """DualFFN-routed Stage-0 forward.
 
-        Status (Round 2): the DualFFN audio expert is NOT yet wired into the
-        compiled LlamaModel forward path. Returning the bare LlamaModel output
-        without DualFFN routing would silently produce wrong codebook
-        predictions (the audio_mlp / audio_input_layernorm / audio_post_attention_layernorm
-        weights would be loaded but unused), so we raise here instead of
-        returning a misleading "structural" hidden state.
-
-        Round 3 will replace this raise with the routed path described in
-        UPSTREAM_TRACE.md (DualFFN audio expert applied per layer at positions
-        where audio_token_mask is True; multi-codebook output via
-        ``audio_codebook0_head`` + ``code_predictor``). The weight loader
-        already places the audio-side parameters at the correct sites
-        (``dual_ffns.<L>.audio_mlp.gate_up_proj``, ``audio_input_layernorm``,
-        ``audio_post_attention_layernorm``, ``audio_codebook0_head``,
-        ``code_predictor.residual_heads.<k>``), so this is a pure forward-path
-        integration task with no remaining state-dict mapping work.
+        Drives the custom :class:`HiggsAudioV2DecoderLayer` stack with a
+        per-position ``audio_token_mask`` derived from the input ``input_ids``
+        (matching :func:`HiggsAudioV2Model.get_placeholder_mask`). Each layer
+        applies the upstream DualFFN routing internally; this method only
+        composes the embedding and final-norm steps around the layer loop.
         """
-        raise NotImplementedError(
-            "higgs_audio_v2 Stage-0 forward path is gated on the DualFFN "
-            "per-layer routing integration with vLLM's compiled LlamaModel. "
-            "Round 2 ships the weight mapping (fused QKV, fused gate_up_proj "
-            "for both MLP experts, audio_lm_head split into codebook heads) "
-            "and reference fixtures. Round 3 will wire the routed forward. "
-            "See vllm_omni/model_executor/models/higgs_audio_v2/UPSTREAM_TRACE.md "
-            "for the exact routing rule the integration must reproduce."
-        )
+        if inputs_embeds is None:
+            hidden_states = self.text_model.embed_tokens(input_ids)
+        else:
+            hidden_states = inputs_embeds
+
+        audio_mask = self.audio_token_mask(input_ids) if input_ids is not None else None
+
+        residual: torch.Tensor | None = None
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                residual,
+                audio_token_mask=audio_mask,
+            )
+
+        # Final norm. vLLM's compiled RMSNorm returns ``(hidden, residual)`` when
+        # called with the fused signature; we call it with the single-tensor
+        # signature since our layers already baked residual into hidden_states.
+        norm_out = self.text_model.norm(hidden_states)
+        if isinstance(norm_out, tuple):
+            norm_out = norm_out[0]
+        return norm_out
 
     def compute_logits(
         self,

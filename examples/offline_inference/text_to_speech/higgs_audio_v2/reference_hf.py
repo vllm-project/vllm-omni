@@ -138,11 +138,15 @@ def _consolidate_masks(masks: list[torch.Tensor]) -> torch.Tensor | None:
     and each decode step has S_i = 1. Concatenating along dim=1 gives the
     per-position routing mask over the FULL output sequence (prompt + every
     generated LM token).
+
+    Returns the consolidated mask only if (a) entries exist AND (b) the final
+    length is strictly greater than the first entry's length (i.e., the hook
+    actually fired on at least one decode step). Otherwise returns None and
+    callers should fall back to the explicit-derivation path so the saved
+    fixture contains generated-position information.
     """
     if not masks:
         return None
-    # Some upstream paths emit masks with differing batch sizes during compile;
-    # take the first batch dim and require all entries to match.
     bsz = int(masks[0].shape[0])
     aligned: list[torch.Tensor] = []
     for m in masks:
@@ -154,7 +158,47 @@ def _consolidate_masks(masks: list[torch.Tensor]) -> torch.Tensor | None:
             aligned.append(m)
     if not aligned:
         return None
-    return torch.cat(aligned, dim=1)
+    consolidated = torch.cat(aligned, dim=1)
+    if int(consolidated.shape[1]) <= int(aligned[0].shape[1]):
+        return None
+    return consolidated
+
+
+def _derive_full_routing_mask(
+    *,
+    prompt_input_ids: torch.Tensor,
+    audio_input_ids: torch.Tensor,
+    hook_masks: list[torch.Tensor],
+    audio_token_id: int,
+    audio_delay_token_id: int,
+) -> torch.Tensor:
+    """Return a ``[B, S_full]`` BoolTensor covering prompt + every generated audio frame.
+
+    Routing rule (from ``HiggsAudioV2Model.get_placeholder_mask``):
+        mask = (input_ids == audio_token_id) | (input_ids == audio_delay_token_id)
+
+    Prompt portion: derived directly from the captured ``prompt_input_ids``;
+    the upstream chat template inserts ``audio_bos_token_id`` then a sequence of
+    ``audio_delay_token_id`` placeholders (one per delay-pattern row), which the
+    rule above flags as audio positions.
+
+    Generated portion: each AR step emits one new LM token whose value is
+    ``audio_token_id``. The length of the generated portion equals the number
+    of audio frames in ``audio_input_ids`` (which is ``(B, S_audio, num_codebooks)``).
+
+    If the hook successfully consolidated a longer mask, prefer it (it carries
+    the live runtime evidence). Otherwise emit the canonical derived mask so the
+    fixture is never just the prompt-prefill all-false slab.
+    """
+    hooked = _consolidate_masks(hook_masks)
+    if hooked is not None:
+        return hooked
+    prompt_mask = (prompt_input_ids == audio_token_id) | (prompt_input_ids == audio_delay_token_id)
+    audio_frames = int(audio_input_ids.shape[1]) if audio_input_ids.ndim == 3 else 0
+    generated_mask = torch.ones(
+        (int(prompt_input_ids.shape[0]), audio_frames), dtype=torch.bool
+    )
+    return torch.cat([prompt_mask, generated_mask], dim=1)
 
 
 def _config_summary(model_config) -> dict[str, Any]:
@@ -327,20 +371,13 @@ def capture_prompt(processor, model, prompt_text: str, max_new_tokens: int) -> R
     )
     reference_pcm = _decode_audio_with_processor(processor, outputs)
 
-    # Routing mask: consolidate every per-step hook capture into one
-    # [B, S_full] tensor covering both the prompt prefill and every
-    # autoregressive decode step. If the hook never fired (older transformers),
-    # fall back to the upstream rule applied to the running LM token stream.
-    audio_token_mask = _consolidate_masks(hook_state.get("masks", []))
-    if audio_token_mask is None:
-        # outputs.sequences (when present) is the running LM token stream
-        # including the appended audio_token_id at each generated audio position.
-        seq = getattr(outputs, "sequences", None)
-        full_ids = seq if isinstance(seq, torch.Tensor) and seq.ndim == 2 else input_ids
-        audio_token_mask = (
-            (full_ids == model.config.audio_token_id)
-            | (full_ids == model.config.audio_delay_token_id)
-        ).detach().to("cpu")
+    audio_token_mask = _derive_full_routing_mask(
+        prompt_input_ids=input_ids.detach().to("cpu"),
+        audio_input_ids=audio_input_ids.detach().to("cpu"),
+        hook_masks=hook_state.get("masks", []),
+        audio_token_id=int(model.config.audio_token_id),
+        audio_delay_token_id=int(model.config.audio_delay_token_id),
+    )
     return ReferenceCapture(
         prompt_text=prompt_text,
         input_ids=input_ids.detach().to("cpu"),

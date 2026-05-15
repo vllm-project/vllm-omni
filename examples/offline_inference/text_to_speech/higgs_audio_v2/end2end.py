@@ -162,7 +162,10 @@ def run_stage1_only(args: argparse.Namespace) -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     config = HiggsAudioV2Config()
     code2wav = HiggsAudioV2Code2Wav(config).to(device)
-    code2wav.load_weights(model_dir=str(audio_tokenizer_dir.parent), device=device)
+    # ``audio_tokenizer_subdir`` defaults to "" (root layout), so pass the
+    # tokenizer dir directly. If the caller has overridden the config to use a
+    # nested layout, the load_weights helper joins on the subdir name.
+    code2wav.load_weights(model_dir=str(audio_tokenizer_dir), device=device)
     pcm = code2wav(codes.to(device))  # [B, 1, T*960]
     pcm = pcm.squeeze(0).squeeze(0)
     _save_wav(args.output_wav, pcm, sample_rate=int(config.sample_rate))

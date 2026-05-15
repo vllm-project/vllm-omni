@@ -88,6 +88,39 @@ class HiggsAudioV2Code2Wav(nn.Module):
             audio = audio.unsqueeze(1)
         return audio.to(device)
 
+    @torch.inference_mode()
+    def forward_chunk(
+        self,
+        audio_codes: torch.Tensor,
+        *,
+        left_context_size: int = 0,
+        hop_length: int = 960,
+    ) -> torch.Tensor:
+        """Chunked decode that trims the left-context overlap from the output PCM.
+
+        Stage 1 in streaming mode receives a window of ``left_context_size``
+        previously-emitted codec frames followed by the new chunk; the upsampled
+        PCM length for the left-context portion (``left_context_size * hop_length``)
+        is sliced off so the consumer only sees the new audio.
+
+        Mirrors the contract used by ``vllm_omni/model_executor/models/qwen3_tts/
+        qwen3_tts_code2wav.py:talker2code2wav_async_chunk`` (left_context_size
+        in codec frames, hop_length samples per frame).
+        """
+        if left_context_size < 0:
+            raise ValueError(f"left_context_size must be >= 0; got {left_context_size}")
+        if hop_length <= 0:
+            raise ValueError(f"hop_length must be > 0; got {hop_length}")
+        pcm = self.forward(audio_codes)
+        if left_context_size == 0:
+            return pcm
+        trim = left_context_size * hop_length
+        if pcm.shape[-1] <= trim:
+            # The chunk is entirely inside the left-context window; emit an
+            # empty PCM tensor with the right device + dtype.
+            return pcm[..., :0]
+        return pcm[..., trim:]
+
     # ------------------------------------------------------------------ load
     def load_weights(self, model_dir: str, device: torch.device | None = None) -> None:
         """Load codec weights for Stage 1.
