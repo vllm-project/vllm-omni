@@ -1535,9 +1535,9 @@ class AsyncOmniEngine:
             "enable_multithread_weight_load": kwargs.get("enable_multithread_weight_load", True),
             "num_weight_load_threads": kwargs.get("num_weight_load_threads", 4),
             "quantization": kwargs.get("quantization", None),
-            "kv_cache_dtype": kwargs.get("kv_cache_dtype", None),
-            "kv_cache_skip_steps": kwargs.get("kv_cache_skip_steps", None),
-            "kv_cache_skip_layers": kwargs.get("kv_cache_skip_layers", None),
+            "diffusion_kv_cache_dtype": kwargs.get("diffusion_kv_cache_dtype", None),
+            "diffusion_kv_cache_skip_steps": kwargs.get("diffusion_kv_cache_skip_steps", None),
+            "diffusion_kv_cache_skip_layers": kwargs.get("diffusion_kv_cache_skip_layers", None),
             **({"diffusion_attention_config": attention_config} if attention_config is not None else {}),
             "force_cutlass_fp8": bool(kwargs.get("force_cutlass_fp8", False)),
             "enable_diffusion_pipeline_profiler": kwargs.get("enable_diffusion_pipeline_profiler", False),
@@ -1717,24 +1717,27 @@ class AsyncOmniEngine:
                 if quantization is not None:
                     if not hasattr(cfg.engine_args, "quantization") or cfg.engine_args.quantization is None:
                         cfg.engine_args.quantization = quantization
-                kv_cache_dtype = kwargs.get("kv_cache_dtype")
-                if kv_cache_dtype is not None:
-                    if not hasattr(cfg.engine_args, "kv_cache_dtype") or cfg.engine_args.kv_cache_dtype is None:
-                        cfg.engine_args.kv_cache_dtype = kv_cache_dtype
-                kv_cache_skip_steps = kwargs.get("kv_cache_skip_steps")
-                if kv_cache_skip_steps is not None:
+                diffusion_kv_cache_dtype = kwargs.get("diffusion_kv_cache_dtype")
+                if diffusion_kv_cache_dtype is not None:
                     if (
-                        not hasattr(cfg.engine_args, "kv_cache_skip_steps")
-                        or cfg.engine_args.kv_cache_skip_steps is None
+                        not hasattr(cfg.engine_args, "diffusion_kv_cache_dtype")
+                        or cfg.engine_args.diffusion_kv_cache_dtype is None
                     ):
-                        cfg.engine_args.kv_cache_skip_steps = kv_cache_skip_steps
-                kv_cache_skip_layers = kwargs.get("kv_cache_skip_layers")
-                if kv_cache_skip_layers is not None:
+                        cfg.engine_args.diffusion_kv_cache_dtype = diffusion_kv_cache_dtype
+                diffusion_kv_cache_skip_steps = kwargs.get("diffusion_kv_cache_skip_steps")
+                if diffusion_kv_cache_skip_steps is not None:
                     if (
-                        not hasattr(cfg.engine_args, "kv_cache_skip_layers")
-                        or cfg.engine_args.kv_cache_skip_layers is None
+                        not hasattr(cfg.engine_args, "diffusion_kv_cache_skip_steps")
+                        or cfg.engine_args.diffusion_kv_cache_skip_steps is None
                     ):
-                        cfg.engine_args.kv_cache_skip_layers = kv_cache_skip_layers
+                        cfg.engine_args.diffusion_kv_cache_skip_steps = diffusion_kv_cache_skip_steps
+                diffusion_kv_cache_skip_layers = kwargs.get("diffusion_kv_cache_skip_layers")
+                if diffusion_kv_cache_skip_layers is not None:
+                    if (
+                        not hasattr(cfg.engine_args, "diffusion_kv_cache_skip_layers")
+                        or cfg.engine_args.diffusion_kv_cache_skip_layers is None
+                    ):
+                        cfg.engine_args.diffusion_kv_cache_skip_layers = diffusion_kv_cache_skip_layers
             except Exception as e:
                 logger.warning("Failed to inject LoRA config for stage: %s", e)
 

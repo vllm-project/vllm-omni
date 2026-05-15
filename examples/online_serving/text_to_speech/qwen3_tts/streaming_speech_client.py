@@ -7,6 +7,12 @@ Usage:
     # Send full text at once
     python streaming_speech_client.py --text "Hello world. How are you? I am fine."
 
+    # Pick a built-in speaker for CustomVoice models
+    python streaming_speech_client.py \
+        --text "打开电子枪，关闭扫描，切换到低倍模式。" \
+        --speaker "Serena" \
+        --language "Chinese"
+
     # Simulate STT: send text word-by-word with delay
     python streaming_speech_client.py \
         --text "Hello world. How are you? I am fine." \
@@ -211,7 +217,9 @@ def main():
 
     args = parser.parse_args()
 
-    # Build session config (only include non-None values)
+    # Build session config (only include non-None values).
+    # Server canonical field is `voice`; `speaker` is accepted as an alias
+    # (see StreamingSpeechSessionConfig.voice in protocol/audio.py).
     config = {}
     for key in [
         "model",
