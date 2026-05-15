@@ -132,6 +132,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Humanize local loop state (RLCR / gen-plan / refine-plan)
+.humanize*
+
 # Spyder project settings
 .spyderproject
 .spyproject
