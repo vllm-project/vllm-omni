@@ -1,3 +1,4 @@
+import contextlib
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -264,6 +265,14 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.omni_prefix_cache.reset_prefix_cached_new_req_ids()
 
         # Remove finished requests from the cached states.
+        # cleanup_finished_request lives on OmniConnectorModelRunnerMixin and
+        # is only safe to call once init_omni_connectors() has populated the
+        # mixin state. Archs that inherit the method via MRO without running
+        # that init must be skipped, so probe a mixin-owned attribute as the
+        # "state initialized" gate.
+        cleanup_finished_request = (
+            getattr(self, "cleanup_finished_request", None) if hasattr(self, "_request_ids_mapping") else None
+        )
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.model_intermediate_buffer.pop(req_id, None)
@@ -272,6 +281,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self._downstream_payload_cache.pop(req_id, None)
             if hasattr(self, "_talker_mtp_generators"):
                 self._talker_mtp_generators.pop(req_id, None)
+            if cleanup_finished_request is not None:
+                cleanup_finished_request(req_id)
 
         if hasattr(self, "late_interaction_runner"):
             self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
@@ -1033,8 +1044,31 @@ class OmniGPUModelRunner(GPUModelRunner):
             req_token_spans.append((start_offset, start_offset + sched_tokens))
         return req_token_spans
 
+    def _sync_local_stage_payloads(self) -> None:
+        """Move received full-payload stage inputs into model_intermediate_buffer."""
+        cache = getattr(self, "_local_stage_payload_cache", None)
+        if not cache:
+            return
+        lock = getattr(self, "_lock", None)
+        ctx = lock if lock is not None else contextlib.nullcontext()
+        with ctx:
+            if not cache:
+                return
+            active_req_ids = set(getattr(self, "requests", {}))
+            pending = set(getattr(self, "_full_payload_pending_broadcast_req_ids", set()))
+            staged = {
+                req_id: payload
+                for req_id, payload in cache.items()
+                if req_id not in pending and req_id in active_req_ids and isinstance(payload, dict)
+            }
+            for req_id in staged:
+                cache.pop(req_id, None)
+        for req_id, payload in staged.items():
+            self._update_intermediate_buffer(req_id, payload)
+
     def _build_model_kwargs_extra(self) -> dict:
         """Build extra keyword arguments passed to the model for this step."""
+        self._sync_local_stage_payloads()
         model_kwargs_extra: dict[str, object] = {}
         try:
             buffer_map = self._gather_runtime_additional_information()
@@ -1299,6 +1333,13 @@ class OmniGPUModelRunner(GPUModelRunner):
         if hasattr(self.model, "has_preprocess") or hasattr(self.model, "enable_update_additional_information"):
             if self.vllm_config.model_config.async_chunk:
                 self._update_additional_information(scheduler_output)
+            else:
+                # In full-payload (non-async-chunk) mode, connector-delivered
+                # stage payloads must override any earlier engine-level
+                # additional_information written by the legacy
+                # custom_process_input_func codec, so talker_preprocess reads
+                # the full thinker payload.
+                self._sync_local_stage_payloads()
 
         if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
             # Overlay custom prompt_embeds per request for the prompt portion;

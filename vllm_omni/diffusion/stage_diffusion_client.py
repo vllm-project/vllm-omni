@@ -29,6 +29,7 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackDecoder,
     OmniMsgpackEncoder,
 )
+from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata, terminate_alive_proc
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -57,7 +58,7 @@ def create_diffusion_client(
     )
 
 
-class StageDiffusionClient:
+class StageDiffusionClient(StageClientBase):
     """Communicates with StageDiffusionProc via ZMQ for use inside the Orchestrator.
 
     Exposes the same attributes and async methods the Orchestrator
@@ -68,6 +69,7 @@ class StageDiffusionClient:
 
     stage_type: str = "diffusion"
     replica_id: int = 0
+    is_comprehension: bool = False
 
     def __init__(
         self,

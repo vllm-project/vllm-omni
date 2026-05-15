@@ -84,6 +84,13 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        # During torch.compile tracing, fused_rms_norm writes to `out` in-place
+        # (returns None) and accesses self.weight.data, which is a DTensor under
+        # HSDP. Both patterns confuse inductor's compute_ancestors scheduler.
+        # Fall back to forward_native so inductor can fuse the pure-PyTorch ops
+        # itself.
+        if torch.compiler.is_compiling():
+            return self.forward_native(x)
         try:
             return self._forward_fused(x)
         except Exception:
@@ -93,6 +100,8 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        if torch.compiler.is_compiling():
+            return self.forward_native(x)
         try:
             return self._forward_fused(x)
         except Exception:

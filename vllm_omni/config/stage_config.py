@@ -863,6 +863,7 @@ def merge_pipeline_deploy(
             if ds.devices is not None:
                 runtime["devices"] = ds.devices
             runtime["num_replicas"] = ds.num_replicas
+        runtime["requires_multimodal_data"] = ps.requires_multimodal_data
 
         result.append(
             StageConfig(

@@ -34,7 +34,7 @@ def _req(rid, *, finished, initial_codec_chunk_frames=None):
     )
 
 
-def _tm(*, chunk_frames=25, left_context=25, max_num_seqs=1):
+def _tm(*, chunk_frames=25, left_context=25, max_num_seqs=1, initial_chunk_frames=0):
     return SimpleNamespace(
         code_prompt_token_ids=defaultdict(list),
         scheduler_max_num_seqs=max_num_seqs,
@@ -45,6 +45,7 @@ def _tm(*, chunk_frames=25, left_context=25, max_num_seqs=1):
                 "extra": {
                     "codec_chunk_frames": chunk_frames,
                     "codec_left_context_frames": left_context,
+                    "initial_codec_chunk_frames": initial_chunk_frames,
                 }
             }
         ),
@@ -79,8 +80,8 @@ def test_eof_marker_when_finished_empty():
         request=_req("r", finished=True),
         is_finished=True,
     )
-    assert p["codes"] == {"audio": []}
-    assert p["meta"]["finished"].item() is True
+    assert p.codes.audio.tolist() == []
+    assert p.meta.finished.item() is True
 
 
 def test_flush_on_finish():
@@ -93,54 +94,43 @@ def test_flush_on_finish():
         is_finished=True,
     )
     assert p is not None
-    assert p["meta"]["finished"].item() is True
-    assert len(p["codes"]["audio"]) == _Q * 24
+    assert p.meta.finished.item() is True
+    assert len(p.codes.audio) == _Q * 24
 
 
 _CASES = [
     # ── IC boundary rule ──────────────────────────────────────────────
-    # IC phase: length <= chunk_size  (uses <=, consistent with fish_speech)
-    # IC emits fill the entire first chunk_size worth of frames, so the
-    # normal phase always starts at a clean chunk boundary.
-    # initial_coverage = (chunk_size // initial_chunk_size) * initial_chunk_size
+    # initial_codec_chunk_frames only controls the first emitted chunk.
+    # After that, the processor returns to codec_chunk_frames-sized windows
+    # to avoid flooding Code2Wav with repeated tiny overlapping decodes.
     #
     # Dynamic IC=16, cs=25, initial_coverage=16
-    # IC does NOT evenly divide cs, so initial_coverage < cs.
-    # IC emits at 16; frames 17-25 remain in IC phase but 25%16!=0 -> hold.
     # Normal phase: adjusted = length - 16, emit when adjusted % 25 == 0.
-    ((25, 25, 0), 24, False, None),  # IC: 24<=25, 24%16!=0 -> hold
-    ((25, 25, 0), 25, False, None),  # IC: 25<=25, 25%16!=0 -> hold
+    ((25, 25, 0), 24, False, None),
+    ((25, 25, 0), 25, False, None),
     ((25, 25, 0), 41, False, (16, 41)),  # normal: adjusted=25, 25%25==0 -> emit, lc=16
     #
-    # Per-request IC=10, cs=25, initial_coverage=20
-    # IC does NOT evenly divide cs; IC emits at 10, 20.
-    # Frames 21-25 are still IC phase but 21..25 % 10 != 0 -> hold.
-    ((25, 25, 10), 9, False, None),  # IC: 9%10!=0 -> hold
-    ((25, 25, 10), 10, False, (0, 10)),  # IC: 10%10==0 -> emit, lc=0
-    ((25, 25, 10), 25, False, None),  # IC: 25<=25, 25%10!=0 -> hold
-    ((25, 25, 10), 45, False, (20, 45)),  # normal: adjusted=25, 25%25==0 -> emit, lc=20
+    # Per-request IC=10, cs=25: first emit at 10, then 35, 60...
+    ((25, 25, 10), 9, False, None),
+    ((25, 25, 10), 10, False, (0, 10)),
+    ((25, 25, 10), 25, False, None),
+    ((25, 25, 10), 35, False, (10, 35)),
+    ((25, 25, 10), 45, False, None),
     ((25, 25, 10), 5, True, (0, 5)),  # finished flushes IC tail
-    ((25, 25, 10), 33, True, (20, 33)),  # finished flushes normal tail
+    ((25, 25, 10), 33, True, (10, 33)),  # finished flushes normal tail
     #
-    # IC=8, cs=16: IC evenly divides chunk_size (edge case)
-    # initial_coverage = (16//8)*8 = 16 == chunk_size.
-    # IC fills the entire first chunk: emits at 8 and 16.
-    # Normal phase starts at frame 17; first normal emit at 16+16=32.
-    ((16, 25, 8), 8, False, (0, 8)),  # IC: 8%8==0 -> emit, lc=0
-    ((16, 25, 8), 16, False, (8, 16)),  # IC: 16<=16, 16%8==0 -> emit, lc=8
-    ((16, 25, 8), 24, False, None),  # normal: adjusted=8, 8%16!=0 -> hold
-    ((16, 25, 8), 32, False, (16, 32)),  # normal: adjusted=16, 16%16==0 -> first emit, lc=16
+    # IC=8, cs=16: first emit at 8, then 24, 40...
+    ((16, 25, 8), 8, False, (0, 8)),
+    ((16, 25, 8), 16, False, None),
+    ((16, 25, 8), 24, False, (8, 24)),
+    ((16, 25, 8), 32, False, None),
     #
-    # IC=5, cs=25: IC evenly divides chunk_size
-    # initial_coverage = (25//5)*5 = 25 == chunk_size.
-    # IC fills the entire first chunk: emits at 5, 10, 15, 20, 25.
-    # Normal phase starts at frame 26; first normal emit at 25+25=50.
-    # Emit intervals: 5,5,5,5,5,25,25,... — smooth transition, no gap.
-    ((25, 25, 5), 5, False, (0, 5)),  # IC: 5%5==0 -> emit, lc=0
-    ((25, 25, 5), 12, False, None),  # IC: 12%5!=0 -> hold
-    ((25, 25, 5), 25, False, (20, 25)),  # IC: 25<=25, 25%5==0 -> emit, lc=20
-    ((25, 25, 5), 30, False, None),  # normal: adjusted=5, 5%25!=0 -> hold
-    ((25, 25, 5), 50, False, (25, 50)),  # normal: adjusted=25, 25%25==0 -> first emit, lc=25
+    # IC=5, cs=25: first emit at 5, then 30, 55...
+    ((25, 25, 5), 5, False, (0, 5)),
+    ((25, 25, 5), 12, False, None),
+    ((25, 25, 5), 25, False, None),
+    ((25, 25, 5), 30, False, (5, 30)),
+    ((25, 25, 5), 50, False, None),
     #
     # Per-request override: IC=15 at n_frames=10 -> 10%15!=0 -> hold
     ((25, 25, 15), 10, False, None),
@@ -159,8 +149,8 @@ def test_streaming_phases(config, n_frames, finished, expected):
     else:
         exp_ctx, exp_window = expected
         assert payload is not None
-        assert payload["meta"]["left_context_size"] == exp_ctx
-        assert len(payload["codes"]["audio"]) == _Q * exp_window
+        assert payload.meta.left_context_size == exp_ctx
+        assert len(payload.codes.audio) == _Q * exp_window
 
 
 def test_dynamic_ic_adapts_to_load():
@@ -170,14 +160,14 @@ def test_dynamic_ic_adapts_to_load():
     # Low load (1/8) -> IC=2 -> emit at 2
     p1 = _call(tm, "r", n_frames=2)
     assert p1 is not None
-    assert len(p1["codes"]["audio"]) == _Q * 2
+    assert len(p1.codes.audio) == _Q * 2
 
-    # High load: add 4 others -> active=5/8 -> IC=8 -> emit at 8
+    # High load on a new request: active=6/8 -> IC=8 -> emit at 8
     for i in range(4):
         tm.code_prompt_token_ids[f"other-{i}"] = [[0]]
-    p2 = _call(tm, "r", n_frames=8)
+    p2 = _call(tm, "new-high-load", n_frames=8)
     assert p2 is not None
-    assert len(p2["codes"]["audio"]) == _Q * 8
+    assert len(p2.codes.audio) == _Q * 8
 
     # Requests past initial phase still count in load factor
     tm2 = _tm(max_num_seqs=4)
@@ -186,7 +176,7 @@ def test_dynamic_ic_adapts_to_load():
     # active=4/4=1.0 -> IC=16
     p3 = _call(tm2, "new", n_frames=16)
     assert p3 is not None
-    assert len(p3["codes"]["audio"]) == _Q * 16
+    assert len(p3.codes.audio) == _Q * 16
 
 
 def test_ic_load_change_mid_request():
@@ -201,19 +191,36 @@ def test_ic_load_change_mid_request():
     for i in range(6):
         tm.code_prompt_token_ids[f"other-{i}"] = [[0]] * 10
 
-    # IC for "r" is still cached as 2.
-    # initial_coverage = ((25-1)//2)*2 = 24, first normal emit at 24+25=49
+    # IC for "r" is still cached as 2. The first normal emit is at 2+25=27.
     assert _call(tm, "r", n_frames=25) is None
-    assert _call(tm, "r", n_frames=27) is None
-    p3 = _call(tm, "r", n_frames=49)
+    p3 = _call(tm, "r", n_frames=27)
     assert p3 is not None
-    assert p3["meta"]["left_context_size"] == 24
+    assert p3.meta.left_context_size == 2
 
     # A *new* request under high load gets IC=16 (not IC=2).
     # Frame 2 would emit under IC=2 but must hold under IC=16.
     assert _call(tm, "new_req", n_frames=2) is None
     p4 = _call(tm, "new_req", n_frames=16)
     assert p4 is not None
+
+
+def test_connector_initial_chunk_config_overrides_dynamic_ic():
+    tm = _tm(initial_chunk_frames=4, max_num_seqs=8)
+
+    # Under high load dynamic IC would be 16, but connector config pins the
+    # first chunk to 4 frames.
+    for i in range(7):
+        tm.code_prompt_token_ids[f"other-{i}"] = [[0]]
+
+    p1 = _call(tm, "r", n_frames=4)
+    assert p1 is not None
+    assert len(p1.codes.audio) == _Q * 4
+
+    # Only the first chunk uses the small size; the next emit is 4+25.
+    assert _call(tm, "r", n_frames=25) is None
+    p2 = _call(tm, "r", n_frames=29)
+    assert p2 is not None
+    assert p2.meta.left_context_size == 4
 
 
 @pytest.mark.parametrize(
@@ -261,15 +268,15 @@ def test_first_streaming_chunk_prepends_ref_code_context():
     )
 
     assert payload is not None
-    assert payload["meta"]["left_context_size"] == 2
-    assert len(payload["codes"]["audio"]) == _Q * 12
+    assert payload.meta.left_context_size == 2
+    assert len(payload.codes.audio) == _Q * 12
 
 
 def test_ref_code_context_applies_to_all_streaming_chunks():
     """ref_code is prepended as decoder context on every chunk, not just the first."""
     tm = _tm()
     rid = "r-ref2"
-    tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(20)]
+    tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(35)]
     tm.put_req_chunk[rid] = 1
     ref_code = torch.tensor([[9, 9, 9, 9], [8, 8, 8, 8]], dtype=torch.long)
     tm.request_payload[rid] = ref_code
@@ -283,8 +290,8 @@ def test_ref_code_context_applies_to_all_streaming_chunks():
 
     assert payload is not None
     # ref_code (2 frames) prepended as left context on second chunk too
-    assert payload["meta"]["left_context_size"] == 10 + 2
-    assert len(payload["codes"]["audio"]) == _Q * (20 + 2)
+    assert payload.meta.left_context_size == 10 + 2
+    assert len(payload.codes.audio) == _Q * (35 + 2)
 
 
 def test_ref_code_context_can_be_buffered_before_first_emit():
@@ -318,8 +325,8 @@ def test_ref_code_context_can_be_buffered_before_first_emit():
 
     assert payload is not None
     # ref_code (2 frames) is kept (not popped) for subsequent chunks
-    assert payload["meta"]["left_context_size"] == 2
-    assert len(payload["codes"]["audio"]) == _Q * 12
+    assert payload.meta.left_context_size == 2
+    assert len(payload.codes.audio) == _Q * 12
     assert rid in tm.request_payload
 
 
@@ -346,7 +353,7 @@ def test_non_async_processor_prepends_ref_code_and_sets_trim_context():
 
     assert len(prompts) == 1
     prompt = prompts[0]
-    assert prompt["additional_information"] == {"meta": {"left_context_size": [2]}}
+    assert prompt["additional_information"] == {"meta": {"left_context_size": 2}}
     assert prompt["prompt_token_ids"] == [
         9,
         8,
@@ -394,4 +401,4 @@ def test_non_async_processor_filters_out_of_range_codec_values():
     prompt = prompts[0]
     # Only ref_code (1 frame) + 2 valid frames = 3 frames * 4 quantizers = 12 codes
     assert len(prompt["prompt_token_ids"]) == 4 * 3
-    assert prompt["additional_information"] == {"meta": {"left_context_size": [1]}}
+    assert prompt["additional_information"] == {"meta": {"left_context_size": 1}}

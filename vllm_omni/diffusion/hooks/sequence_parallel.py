@@ -316,6 +316,13 @@ class SequenceParallelSplitHook(ModelHook):
             logger.warning_once(f"Expected tensor with {sp_input.expected_dims} dims, got {x.dim()}. Skipping split.")
             return x
 
+        split_dim = (
+            sp_input.split_dim if isinstance(sp_input, (SequenceParallelInput, SequenceParallelPartialInput)) else None
+        )
+        if split_dim is not None and x.size(split_dim) == 0:
+            logger.warning_once("Skip sharding for zero-sized tensors.")
+            return x
+
         def _raise_strict_divisibility_error(*, dim: int, seq_len: int, sp_size: int) -> None:
             # Keep message actionable: strict mode must be evenly shardable at the split hook level.
             msg = (
@@ -399,7 +406,7 @@ class SequenceParallelSplitHook(ModelHook):
         if is_forward_context_available():
             od_config = get_forward_context().omni_diffusion_config
             if od_config is not None:
-                attention_config = od_config.attention_config
+                attention_config = od_config.diffusion_attention_config
 
         attn_backend, _ = get_attn_backend_for_role(
             role="self",

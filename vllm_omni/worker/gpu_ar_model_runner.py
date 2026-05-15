@@ -81,6 +81,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
+        # Only Qwen3-Omni currently consumes the connector-based full-payload
+        # handoff added in this PR. Other model architectures (e.g. Bagel
+        # diffusion) retain their pre-existing runner behavior so this PR
+        # does not perturb them.
+        if getattr(self.model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration":
+            self.init_omni_connectors(
+                vllm_config=self.vllm_config,
+                model_config=self.model_config,
+                kv_transfer_manager=self.kv_transfer_manager,
+            )
         self._downstream_payload_cache: dict[str, bool] = {}
 
     def _make_buffer(self, *size, dtype, numpy=True):
@@ -261,7 +271,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
             self.omni_prefix_cache.update_omni_tensor_prefix_cache(
                 hidden_states=hidden_states,
-                multimodal_outputs=multimodal_outputs,
+                multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
                 slot_mapping=self.input_batch.block_table[0].slot_mapping.cpu,
                 num_tokens_padded=num_tokens_padded,
@@ -289,7 +299,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
                 query_start_loc=self.query_start_loc.cpu,
                 input_batch=self.input_batch,
-                multimodal_outputs=multimodal_outputs,
+                multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
                 num_scheduled_tokens=num_scheduled_tokens,
             )
         return combined_hidden_states, combined_multimodal_outputs
@@ -337,6 +347,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             request_id_resolver=self._resolve_global_request_id,
         )
 
+        if hasattr(self, "_omni_connector"):
+            for request in getattr(scheduler_output, "pending_input_registrations", []):
+                self.register_chunk_recv(request)
+            self.recv_full_payload_inputs(scheduler_output)
+            if self._pending_full_payload_send:
+                flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
+                flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
+                if flush_ids:
+                    self.flush_full_payload_outputs(flush_ids)
+
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -375,7 +395,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     if kv_ids:
                         output = copy(output)
                         output.kv_extracted_req_ids = kv_ids
-                    return output
+                    return self.attach_omni_connector_output(output)
 
             if not num_scheduled_tokens:
                 if (
@@ -399,7 +419,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     output = copy(output)
                     output.kv_extracted_req_ids = kv_ids
 
-                return output
+                return self.attach_omni_connector_output(output)
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -735,11 +755,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             if kv_connector_output.is_empty():
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
-            return output
+            return self.attach_omni_connector_output(output)
 
         # Unpack ephemeral state.
         (
@@ -954,15 +974,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     if combined_multimodal_outputs:
                         # Prefix cache enabled; all items have already been processed
                         # and split apart for each request as needed, and all tensors
-                        # have already been detached to the CPU. The only exception is
-                        # lists, which we keep as passthrough data for consistent behavior
-                        # in postprocess.
+                        # have already been detached to the CPU.  Lists are kept as
+                        # passthrough data for consistent behavior in postprocess.
+                        # Recurse into nested dicts so list-valued sub-keys (e.g.
+                        # embed.tts_bos = [tensor]) are unwrapped to bare tensors
+                        # at the leaves; downstream flatten_payload then yields a
+                        # wire-clean dict[str, torch.Tensor].
+                        def _unwrap_lists(v):
+                            if isinstance(v, list):
+                                return v[idx] if idx < len(v) else v[0]
+                            if isinstance(v, dict):
+                                return {k: _unwrap_lists(sv) for k, sv in v.items()}
+                            return v
+
                         for mm_key in combined_multimodal_outputs.keys():
-                            value = combined_multimodal_outputs[mm_key][rid]
-                            if isinstance(value, list):
-                                mm_payload[mm_key] = value[idx] if idx < len(value) else value[0]
-                            else:
-                                mm_payload[mm_key] = value
+                            mm_payload[mm_key] = _unwrap_lists(combined_multimodal_outputs[mm_key][rid])
 
                     else:
                         # Prefix cache disabled; we still need to process the data
@@ -979,6 +1005,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # Flatten nested dicts to dotted keys so pooling_output
                 # stays dict[str, torch.Tensor] for msgspec serialization.
                 pooler_output.append(flatten_payload(payload))
+
+        if pooler_output and self._should_accumulate_full_payload_output():
+            for i, rid in enumerate(req_ids_output_copy):
+                req_state = self.requests.get(rid)
+                if req_state is not None and pooler_output[i]:
+                    self.accumulate_full_payload_output(rid, pooler_output[i], req_state)
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -999,6 +1032,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 cudagraph_stats=cudagraph_stats,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
+            output.omni_connector_output = self.get_omni_connector_output()
 
         if not self.use_async_scheduling:
             return output

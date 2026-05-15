@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict
+from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
@@ -23,11 +24,15 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
-from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
+from vllm_omni.core.sched.omni_scheduling_coordinator import (
+    OmniSchedulingCoordinator,
+    uses_qwen3_omni_full_payload_input_coordinator,
+)
+from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData, OmniSchedulerOutput
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
-from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
 
 logger = init_logger(__name__)
 
@@ -39,6 +44,14 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
+        self.input_coordinator: OmniSchedulingCoordinator | None = None
+        if uses_qwen3_omni_full_payload_input_coordinator(model_config):
+            self.input_coordinator = OmniSchedulingCoordinator(
+                scheduler_max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
+                stage_id=getattr(model_config, "stage_id", 0),
+                async_chunk=False,
+            )
+        self._latest_omni_connector_output: OmniConnectorOutput | None = None
 
     def schedule(self) -> SchedulerOutput:
         """Diffusion fast path:
@@ -68,6 +81,18 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Temporary queue: preserve waiting order, do not disturb non-diffusion requests
         skipped_waiting_requests = create_request_queue(self.policy)
         req_index = 0
+        connector_output = self._latest_omni_connector_output
+        self._latest_omni_connector_output = None
+        if self.input_coordinator:
+            if connector_output and connector_output.request_metadata:
+                self.input_coordinator.update_request_metadata(
+                    self.requests, connector_output.request_metadata, model_mode="generation"
+                )
+            self.input_coordinator.process_pending_full_payload_inputs(
+                self.waiting,
+                self.running,
+                connector_output.stage_recv_req_ids if connector_output else set(),
+            )
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
 
@@ -201,7 +226,16 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
             else:
                 res = super().schedule()
-                return res
+                if self.input_coordinator:
+                    self.input_coordinator.restore_queues(self.waiting, self.running)
+                base_fields = SchedulerOutput.__dataclass_fields__.keys()
+                base_data = {name: getattr(res, name) for name in base_fields}
+                return OmniSchedulerOutput(
+                    **base_data,
+                    pending_input_registrations=(
+                        self.input_coordinator.pending_input_registrations if self.input_coordinator else []
+                    ),
+                )
 
         # Compute common prefix blocks (aligned with v1)
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
@@ -321,8 +355,17 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             # internal deques and never scheduled again.
             if self.chunk_transfer_adapter:
                 self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+            if self.input_coordinator:
+                self.input_coordinator.restore_queues(self.waiting, self.running)
 
-        return scheduler_output
+        base_fields = SchedulerOutput.__dataclass_fields__.keys()
+        base_data = {name: getattr(scheduler_output, name) for name in base_fields}
+        return OmniSchedulerOutput(
+            **base_data,
+            pending_input_registrations=(
+                self.input_coordinator.pending_input_registrations if self.input_coordinator else []
+            ),
+        )
 
     def finish_requests(self, request_ids, finished_status: RequestStatus) -> list[tuple[str, int]]:
         """Handles the finish signal from outside the scheduler.
@@ -340,7 +383,20 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
-        return super().finish_requests(request_ids, finished_status)
+        finished = super().finish_requests(request_ids, finished_status)
+        if self.input_coordinator is not None:
+            for request_id, _ in finished:
+                self._free_input_coordinator_request(request_id)
+        return finished
+
+    def _free_request(self, request: Request, delay_free_blocks: bool = False) -> dict[str, Any] | None:
+        if self.input_coordinator is None:
+            return super()._free_request(request, delay_free_blocks)
+
+        try:
+            return super()._free_request(request, delay_free_blocks)
+        finally:
+            self._free_input_coordinator_request(request.request_id)
 
     """
     Scheduler for the diffusion model.
@@ -588,6 +644,16 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # outputs this step.
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
+
+        omni_output = getattr(model_runner_output, "omni_connector_output", None)
+        if omni_output is not None:
+            self._latest_omni_connector_output = omni_output
+            if self.input_coordinator and omni_output.request_metadata:
+                self.input_coordinator.update_request_metadata(
+                    self.requests,
+                    omni_output.request_metadata,
+                    model_mode="generation",
+                )
 
         return engine_core_outputs
 

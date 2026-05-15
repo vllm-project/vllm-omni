@@ -23,6 +23,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     KV_TRANSFER_PORT_OFFSET,
 )
+from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 
 if TYPE_CHECKING:
@@ -56,7 +57,7 @@ def _default_process_engine_inputs(
     ]
 
 
-class StageEngineCoreClientBase:
+class StageEngineCoreClientBase(StageClientBase):
     """Shared stage-aware behavior for async EngineCore clients.
 
     The concrete transport/load-balancing behavior is supplied by the
