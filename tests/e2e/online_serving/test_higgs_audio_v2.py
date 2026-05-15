@@ -134,6 +134,62 @@ def test_serving_validator_rejects_multi_speaker_in_text(_make_speech_request) -
     assert "multi-speaker" in err.lower()
 
 
+@pytest.mark.parametrize(
+    "alias",
+    ["messages", "reference_audio", "voice_prompt", "speaker_audio", "speakers"],
+)
+def test_schema_rejects_rich_input_aliases_for_higgs_audio_v2(alias: str) -> None:
+    """Pydantic-level rejection: unsupported rich-input aliases never reach the validator.
+
+    These keys are not declared on the global ``OpenAICreateSpeechRequest`` schema
+    and would otherwise be silently dropped. The model-aware ``before`` validator
+    raises a ValueError when ``model="higgs_audio_v2"`` so the API surface
+    returns a deterministic 4xx with a model-named message.
+    """
+    import pydantic
+
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+
+    payload = {"input": "hi", "model": "higgs_audio_v2", alias: "something"}
+    with pytest.raises(pydantic.ValidationError) as excinfo:
+        OpenAICreateSpeechRequest.model_validate(payload)
+    msg = str(excinfo.value)
+    assert "higgs_audio_v2" in msg
+    assert alias in msg
+
+
+def test_schema_accepts_aliases_for_other_models() -> None:
+    """Pydantic must NOT reject `reference_audio` (etc.) for non-higgs models.
+
+    The model-aware reject only kicks in when ``model`` mentions ``higgs_audio_v2``;
+    other TTS models continue to receive their previous permissive behavior
+    (unknown keys are dropped silently as before).
+    """
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+
+    payload = {"input": "hi", "model": "qwen3_tts", "reference_audio": "abc"}
+    parsed = OpenAICreateSpeechRequest.model_validate(payload)
+    assert parsed.input == "hi"
+    assert parsed.model == "qwen3_tts"
+
+
+def test_schema_rejects_chatml_messages_for_higgs_audio_v2() -> None:
+    """``messages`` (ChatML rich content) is rejected at parse time."""
+    import pydantic
+
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+
+    payload = {
+        "input": "ignored",
+        "model": "higgs_audio_v2",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    with pytest.raises(pydantic.ValidationError) as excinfo:
+        OpenAICreateSpeechRequest.model_validate(payload)
+    assert "higgs_audio_v2" in str(excinfo.value)
+    assert "messages" in str(excinfo.value)
+
+
 # ------------------------------------------------------ registry / pipeline
 def test_pipeline_registry_has_higgs_audio_v2() -> None:
     from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
@@ -548,16 +604,16 @@ def test_stage1_chunk_decode_trims_left_context() -> None:
     cfg = HiggsAudioV2Config()
     stage1 = HiggsAudioV2Code2Wav(cfg)
 
-    # Monkey-patch the underlying forward to return a deterministic PCM of
-    # length (T * hop_length) given a [B, num_codebooks, T] code tensor.
+    # Monkey-patch decode_codes (the direct-decode entry point used by
+    # forward_chunk) to return a deterministic PCM of length (T * hop_length)
+    # given a [B, num_codebooks, T] code tensor.
     HOP = 960
 
-    def _fake_forward(codes):
+    def _fake_decode(codes):
         t = int(codes.shape[-1])
-        pcm = torch.arange(t * HOP, dtype=torch.float32).reshape(1, 1, -1)
-        return pcm
+        return torch.arange(t * HOP, dtype=torch.float32).reshape(1, 1, -1)
 
-    object.__setattr__(stage1, "forward", _fake_forward)
+    object.__setattr__(stage1, "decode_codes", _fake_decode)
     stage1._loaded = True
 
     codes = torch.zeros(1, cfg.num_codebooks, 30, dtype=torch.long)  # 30 frames
@@ -570,6 +626,312 @@ def test_stage1_chunk_decode_trims_left_context() -> None:
     # Edge case: left_context_size >= T -> empty output.
     out_empty = stage1.forward_chunk(codes, left_context_size=30, hop_length=HOP)
     assert out_empty.shape[-1] == 0
+
+
+def test_stage1_engine_runtime_forward_returns_omni_output() -> None:
+    """Stage-1 engine-runtime path: flat codebook-major ``input_ids`` -> OmniOutput."""
+    from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import (
+        HiggsAudioV2Config,
+    )
+    from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_code2wav import (
+        HiggsAudioV2Code2Wav,
+    )
+    from vllm_omni.model_executor.models.output_templates import OmniOutput
+
+    cfg = HiggsAudioV2Config()
+    stage1 = HiggsAudioV2Code2Wav(cfg)
+
+    HOP = 960
+    NUM_CODEBOOKS = int(cfg.num_codebooks)
+
+    def _fake_decode(codes):
+        t = int(codes.shape[-1])
+        return torch.arange(t * HOP, dtype=torch.float32).reshape(1, 1, -1)
+
+    object.__setattr__(stage1, "decode_codes", _fake_decode)
+    stage1._loaded = True
+
+    n_frames = 12
+    flat = torch.zeros(NUM_CODEBOOKS * n_frames, dtype=torch.long)
+    out = stage1.forward(input_ids=flat)
+    assert isinstance(out, OmniOutput)
+    audio_list = out.multimodal_outputs["model_outputs"]
+    sr_list = out.multimodal_outputs["sr"]
+    assert len(audio_list) == 1
+    assert audio_list[0].shape == (n_frames * HOP,)
+    assert int(sr_list[0]) == int(cfg.sample_rate)
+
+    # left_context_size consumption via runtime_additional_information.
+    out_trimmed = stage1.forward(
+        input_ids=flat,
+        runtime_additional_information=[{"meta": {"left_context_size": 5}}],
+    )
+    assert isinstance(out_trimmed, OmniOutput)
+    trimmed_audio = out_trimmed.multimodal_outputs["model_outputs"][0]
+    assert trimmed_audio.shape == ((n_frames - 5) * HOP,)
+
+
+def test_dual_ffn_routing_fault_injection_changes_audio_output() -> None:
+    """AC-3 negative: disabling the audio MLP must change the layer output on audio positions only.
+
+    Drives ``HiggsAudioV2DecoderLayer._routed_mlp`` (which is the upstream DualFFN
+    routing rule) on synthetic text/audio inputs with random text/audio MLPs.
+    Verifies:
+        1. Audio positions consume the audio MLP (zeroing it changes their output).
+        2. Text positions do NOT see the audio MLP (zeroing it leaves them unchanged).
+    The test sidesteps vLLM TP state by constructing the layer shell via __new__
+    and assigning stub modules.
+    """
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_talker import (
+        HiggsAudioV2DecoderLayer,
+    )
+
+    hidden = 8
+    inter = 16
+    torch.manual_seed(0)
+    text_mlp = torch.nn.Linear(hidden, hidden, bias=False)
+    audio_mlp = torch.nn.Linear(hidden, hidden, bias=False)
+
+    layer = HiggsAudioV2DecoderLayer.__new__(HiggsAudioV2DecoderLayer)
+    torch.nn.Module.__init__(layer)
+    # Shape the layer's expected attributes without running __init__ (avoids vLLM TP setup).
+    layer.audio_mlp = audio_mlp
+    layer.base = SimpleNamespace(mlp=text_mlp)
+
+    seq_len = 6
+    hidden_state = torch.randn(1, seq_len, hidden)
+    # Half text (mask=False), half audio (mask=True)
+    mask = torch.tensor([[False, False, False, True, True, True]])
+
+    baseline = layer._routed_mlp(hidden_state.clone(), mask)
+    # Sanity: baseline is finite and non-zero somewhere.
+    assert torch.isfinite(baseline).all()
+
+    # Fault-injection: zero out the audio MLP and recompute.
+    with torch.no_grad():
+        audio_mlp.weight.zero_()
+    with_disabled = layer._routed_mlp(hidden_state.clone(), mask)
+
+    # Audio positions (rows 3..5) must change when audio_mlp is disabled.
+    text_diff = (baseline[0, :3] - with_disabled[0, :3]).abs().max().item()
+    audio_diff = (baseline[0, 3:] - with_disabled[0, 3:]).abs().max().item()
+    assert text_diff < 1e-6, (
+        f"text positions should be unaffected by audio_mlp; got diff={text_diff}"
+    )
+    assert audio_diff > 1e-6, (
+        f"audio positions must change when audio_mlp is disabled; got diff={audio_diff}"
+    )
+
+
+def test_dual_ffn_norm_routing_splits_text_and_audio() -> None:
+    """The pre-attention norm routing must use audio_input_layernorm on audio positions only."""
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_talker import (
+        HiggsAudioRMSNorm,
+        HiggsAudioV2DecoderLayer,
+    )
+
+    hidden = 4
+    layer = HiggsAudioV2DecoderLayer.__new__(HiggsAudioV2DecoderLayer)
+    torch.nn.Module.__init__(layer)
+    text_norm = HiggsAudioRMSNorm(hidden)
+    audio_norm = HiggsAudioRMSNorm(hidden)
+    layer.base = SimpleNamespace(input_layernorm=text_norm)
+    layer.audio_input_layernorm = audio_norm
+
+    hidden_state = torch.randn(1, 5, hidden)
+    mask = torch.tensor([[False, False, True, True, True]])
+    out = layer._routed_norm(hidden_state.clone(), text_norm, audio_norm, mask)
+
+    # text positions: must equal text_norm(hidden_state[~mask])
+    text_expected = text_norm(hidden_state[0, :2])
+    assert torch.allclose(out[0, :2], text_expected, atol=1e-6)
+    # audio positions: must equal audio_norm(hidden_state[mask])
+    audio_expected = audio_norm(hidden_state[0, 2:])
+    assert torch.allclose(out[0, 2:], audio_expected, atol=1e-6)
+
+
+def test_talker_compute_logits_routes_audio_to_codebook0_head() -> None:
+    """compute_logits with audio_token_mask should produce a dict carrying the codebook-0 logits."""
+    from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import (
+        HiggsAudioV2Config,
+    )
+    from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_talker import (
+        HiggsAudioV2TalkerForConditionalGeneration,
+    )
+
+    cfg = HiggsAudioV2Config(num_hidden_layers=2)
+    talker = HiggsAudioV2TalkerForConditionalGeneration.__new__(
+        HiggsAudioV2TalkerForConditionalGeneration
+    )
+    torch.nn.Module.__init__(talker)
+    talker.config = cfg
+
+    hidden = int(cfg.hidden_size)
+    torch.manual_seed(0)
+    audio_head = torch.nn.Linear(hidden, int(cfg.codebook_size), bias=False)
+    with torch.no_grad():
+        audio_head.weight.mul_(0.01)
+
+    talker.audio_codebook0_head = audio_head
+
+    # Stub lm_head + logits_processor.
+    class _StubLP:
+        def __call__(self, head, hidden_states, sampling_metadata):
+            return torch.zeros(int(hidden_states.shape[0]), int(cfg.vocab_size))
+
+    talker.lm_head = object()  # unused by the stub
+    talker.logits_processor = _StubLP()
+
+    h = torch.randn(4, hidden)
+    mask = torch.tensor([True, False, True, False])
+    out = talker.compute_logits(h, sampling_metadata=None, audio_token_mask=mask)
+    assert isinstance(out, dict)
+    assert "audio_codebook0_logits" in out
+    assert out["audio_codebook0_logits"].shape == (2, int(cfg.codebook_size))
+    assert out["audio_mask"].sum().item() == 2
+
+
+def test_talker_residual_codebook_predictor_emits_seven_codebooks() -> None:
+    """predict_audio_residual_codebooks must return shape [N_audio, num_codebooks - 1]."""
+    from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import (
+        HiggsAudioV2Config,
+    )
+    from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_talker import (
+        HiggsAudioCodePredictor,
+        HiggsAudioV2TalkerForConditionalGeneration,
+    )
+
+    cfg = HiggsAudioV2Config(num_hidden_layers=1)
+    talker = HiggsAudioV2TalkerForConditionalGeneration.__new__(
+        HiggsAudioV2TalkerForConditionalGeneration
+    )
+    torch.nn.Module.__init__(talker)
+    talker.config = cfg
+    talker.code_predictor = HiggsAudioCodePredictor(cfg)
+
+    n_audio = 4
+    hidden = int(cfg.hidden_size)
+    h = torch.randn(n_audio, hidden)
+    cb0 = torch.zeros(n_audio, dtype=torch.long)
+    out = talker.predict_audio_residual_codebooks(h, cb0)
+    assert out.shape == (n_audio, int(cfg.num_codebooks) - 1)
+    # Codes are valid codebook indices (less than codebook_size).
+    assert int(out.max()) < int(cfg.codebook_size)
+    assert int(out.min()) >= 0
+
+
+def test_stage1_rms_threshold_is_meaningful_with_corrupted_codebook() -> None:
+    """AC-4 negative #2: a corrupted RVQ codebook must push the PCM RMS above 1e-4.
+
+    Builds a stub Stage-1 around the shared HiggsAudioRVQ kernel, generates a
+    reference PCM with the kernel at its initialized weights, then scrambles
+    one codebook and measures the normalized-float RMS difference. The
+    expectation is that the threshold is not trivially passable by any tensor
+    of similar shape.
+    """
+    from vllm_omni.model_executor.models._shared.higgs_audio_decoder import (
+        HiggsAudioRVQ,
+    )
+
+    torch.manual_seed(0)
+    num_codebooks = 8
+    codebook_size = 1024
+    codebook_dim = 64
+    hidden = 1024
+
+    rvq = HiggsAudioRVQ(
+        num_quantizers=num_codebooks,
+        codebook_size=codebook_size,
+        codebook_dim=codebook_dim,
+        hidden_size=hidden,
+    )
+    # Initialize codebooks with non-trivial weights so the test exercises real
+    # arithmetic instead of all-zeros.
+    with torch.no_grad():
+        for q in rvq.quantizers:
+            q.codebook.weight.uniform_(-0.5, 0.5)
+            q.project_out.weight.uniform_(-0.05, 0.05)
+            q.project_out.bias.zero_()
+
+    # Build a small code tensor: 1 batch, num_codebooks codebooks, 4 frames.
+    codes = torch.randint(0, codebook_size, (num_codebooks, 1, 4), dtype=torch.long)
+    baseline = rvq.decode(codes.clone())  # [1, hidden, 4]
+
+    # Corrupt codebook 0 by zeroing its codebook embedding.
+    with torch.no_grad():
+        rvq.quantizers[0].codebook.weight.zero_()
+    corrupted = rvq.decode(codes.clone())
+
+    # AC-4 negative #2 expects the RMS to exceed 1e-4 (normalized float).
+    base_f = baseline.to(torch.float32).flatten()
+    corr_f = corrupted.to(torch.float32).flatten()
+    n = min(int(base_f.shape[0]), int(corr_f.shape[0]))
+    rms = ((base_f[:n] - corr_f[:n]) ** 2).mean().sqrt().item()
+    assert rms > 1e-4, (
+        f"corrupting a codebook should push the RMS difference above the AC-4 "
+        f"threshold; got rms={rms:.3e}"
+    )
+
+
+def test_cuda_graph_wrapper_falls_back_to_eager_without_warmup() -> None:
+    """HiggsAudioV2CUDAGraphWrapper must delegate to the underlying module before warmup
+    (and pass arguments through unchanged).
+    """
+    from vllm_omni.model_executor.models.higgs_audio_v2.cuda_graph_decoder_wrapper import (
+        HiggsAudioV2CUDAGraphWrapper,
+        WrapperState,
+    )
+
+    class _Talker(torch.nn.Module):
+        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+            return input_ids * 2
+
+    talker = _Talker()
+    wrapper = HiggsAudioV2CUDAGraphWrapper(
+        talker, capture_batch_sizes=(1, 2, 4), enabled=True
+    )
+    x = torch.arange(4, dtype=torch.long).reshape(1, 4)
+    out = wrapper(input_ids=x)
+    assert torch.equal(out, x * 2)
+    # All capture sizes should still be in the NOT_CAPTURED state.
+    for b in (1, 2, 4):
+        assert wrapper._state[b] == WrapperState.NOT_CAPTURED
+    assert not wrapper.is_captured(1)
+
+
+def test_cuda_graph_wrapper_disabled_is_passthrough() -> None:
+    """``enabled=False`` -> wrapper delegates without any state machine bookkeeping."""
+    from vllm_omni.model_executor.models.higgs_audio_v2.cuda_graph_decoder_wrapper import (
+        HiggsAudioV2CUDAGraphWrapper,
+    )
+
+    class _Talker(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x + 100
+
+    wrapper = HiggsAudioV2CUDAGraphWrapper(_Talker(), capture_batch_sizes=(1,), enabled=False)
+    x = torch.tensor([[1, 2, 3]])
+    out = wrapper(x=x)
+    assert torch.equal(out, x + 100)
+
+
+def test_stage1_engine_constructor_signature() -> None:
+    """Stage-1 must accept the *, vllm_config, prefix kwargs form for engine boot."""
+    import inspect
+
+    from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_code2wav import (
+        HiggsAudioV2Code2Wav,
+    )
+
+    sig = inspect.signature(HiggsAudioV2Code2Wav.__init__)
+    params = sig.parameters
+    assert "vllm_config" in params, "Stage-1 must accept vllm_config kwarg"
+    assert "prefix" in params, "Stage-1 must accept prefix kwarg"
+    assert params["vllm_config"].kind == inspect.Parameter.KEYWORD_ONLY
 
 
 def test_fused_audio_head_split_shapes() -> None:

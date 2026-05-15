@@ -56,6 +56,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaMLP, LlamaModel
 
+from vllm_omni.model_executor.models.output_templates import OmniOutput
+
 from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import (
     HiggsAudioV2Config,
 )
@@ -752,12 +754,104 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: Any,
+        sampling_metadata: Any = None,
+        *,
+        audio_token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Standard vLLM-style logits computation against the text LM head.
+        """Per-position logits.
 
-        At audio positions, the talker emits codebook-0 via
-        :attr:`audio_codebook0_head` (and codebooks 1..7 via the code
-        predictor) instead; see ``forward`` for that branch.
+        - Text positions go through ``lm_head`` (Llama 128256-wide).
+        - Audio positions go through ``audio_codebook0_head`` (1026-wide for
+          codebook 0). Residual codebooks 1..7 are emitted by
+          ``code_predictor.predict_residual`` in :meth:`postprocess` once
+          codebook-0 has been sampled and embedded.
+
+        When ``audio_token_mask`` is omitted we default to the text LM head
+        for the entire batch (this matches the standard text-only branch
+        every other vllm-omni TTS talker exposes by default; the engine
+        passes the mask through ``extra_layer_kwargs`` via
+        :meth:`forward`).
         """
-        return self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
+        text_logits = self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
+        if audio_token_mask is None:
+            return text_logits
+
+        mask = audio_token_mask.reshape(-1).to(hidden_states.device)
+        if not mask.any():
+            return text_logits
+
+        hidden_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        audio_logits = self.audio_codebook0_head(hidden_flat[mask])  # [N_audio, codebook_size]
+        # We can't blend a 128256-wide text vocab with a 1026-wide audio
+        # vocab in one logits tensor without a vocab-routing layer; instead,
+        # return a structured result the engine can dispatch on. Defaulting
+        # to a python dict keeps this method composable with future
+        # AR-loop integration work.
+        return {
+            "text_logits": text_logits,
+            "audio_codebook0_logits": audio_logits,
+            "audio_mask": mask,
+        }
+
+    def predict_audio_residual_codebooks(
+        self,
+        hidden_states: torch.Tensor,
+        codebook0_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Emit codebooks 1..N-1 for audio positions via the fast-AR predictor.
+
+        Inputs:
+            hidden_states: ``[N_audio, hidden]`` -- last hidden state at each audio position.
+            codebook0_ids: ``[N_audio]`` -- the sampled codebook-0 token id for each position.
+
+        Returns:
+            ``[N_audio, num_codebooks - 1]`` int64 tensor of predicted codes.
+        """
+        if hidden_states.ndim != 2:
+            raise ValueError(f"hidden_states must be [N, hidden]; got shape {tuple(hidden_states.shape)}")
+        n_audio = int(hidden_states.shape[0])
+        out = torch.empty(
+            (n_audio, self.config.num_codebooks - 1), dtype=torch.long, device=hidden_states.device
+        )
+        running_hidden = hidden_states
+        prev_codes = codebook0_ids
+        for k in range(1, self.config.num_codebooks):
+            # Inject the previous codebook embedding as a residual into the
+            # running hidden state, then predict the next codebook's logits.
+            cb_embed = self.code_predictor.embed_codebook(k - 1, prev_codes)  # [N, hidden]
+            running_hidden = running_hidden + cb_embed
+            logits = self.code_predictor.predict_residual(running_hidden, k)  # [N, codebook_size]
+            next_codes = torch.argmax(logits, dim=-1)
+            out[:, k - 1] = next_codes
+            prev_codes = next_codes
+        return out
+
+    def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
+        """Embed the LM token stream, swapping in audio embeddings at placeholders.
+
+        The vLLM runner calls this before forward(); the embedding produced
+        here is what the decoder stack consumes. For text positions we use
+        the standard ``embed_tokens`` lookup; for audio positions (input id
+        equals ``audio_token_id`` or ``audio_delay_token_id``) we leave the
+        text embedding in place -- the actual audio embedding lookup is
+        deferred to the engine path that has ``audio_input_ids`` in scope.
+        Until the live engine wires audio_input_ids through, the text
+        embedding at placeholder positions acts as a deterministic dummy
+        that the DualFFN audio expert still routes correctly.
+        """
+        return self.text_model.embed_tokens(input_ids)
+
+    def make_omni_output(
+        self,
+        model_outputs: torch.Tensor | OmniOutput,
+        **kwargs: Any,
+    ) -> OmniOutput:
+        """Wrap raw decoder outputs into the :class:`OmniOutput` contract
+        expected by ``vllm_omni/model_executor/stage_input_processors/higgs_audio_v2.py:talker2code2wav``.
+        """
+        if isinstance(model_outputs, OmniOutput):
+            return model_outputs
+        return OmniOutput(
+            text_hidden_states=model_outputs,
+            multimodal_outputs={"codes": {"audio": kwargs.get("audio_codes", torch.empty(0, dtype=torch.long))}},
+        )
