@@ -150,6 +150,29 @@ class VideoGenerationRequest(BaseModel):
     )
     seed: int | None = Field(default=None, description="Random seed for reproducibility")
 
+    # vllm-omni extensions for post-generation frame interpolation.
+    enable_frame_interpolation: bool = Field(
+        default=False,
+        description="Enable post-generation RIFE frame interpolation before MP4 encoding.",
+    )
+    frame_interpolation_exp: int = Field(
+        default=1,
+        ge=1,
+        description="Interpolation exponent: 1=2x temporal resolution, 2=4x, etc.",
+    )
+    frame_interpolation_scale: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="RIFE inference scale. Use 0.5 for high-resolution inputs to save memory.",
+    )
+    frame_interpolation_model_path: str | None = Field(
+        default=None,
+        description=(
+            "Local directory or Hugging Face repo ID containing RIFE flownet.pkl weights. "
+            "Defaults to elfgum/RIFE-4.22.lite."
+        ),
+    )
+
     # vllm-omni extension for per-request LoRA.
     lora: dict[str, Any] | None = Field(
         default=None,
@@ -159,6 +182,12 @@ class VideoGenerationRequest(BaseModel):
             "(e.g. name|lora_name|adapter, path|lora_path|local_path, "
             "scale|lora_scale, int_id|lora_int_id)."
         ),
+    )
+
+    # Generic model-specific parameters
+    extra_params: dict[str, Any] | None = Field(
+        default=None,
+        description=("Optional model-specific parameters passed directly to the model's extra_args. "),
     )
 
     def resolve_video_params(self) -> VideoParams:
@@ -195,10 +224,18 @@ class VideoGenerationResponse(BaseModel):
 
     created: int = Field(..., description="Unix timestamp of when the generation completed")
     data: list[VideoData] = Field(..., description="Array of generated videos")
+    stage_durations: dict[str, float] = Field(
+        default_factory=dict,
+        description="Profiler stage durations reported by the diffusion pipeline.",
+    )
+    peak_memory_mb: float = Field(
+        default=0.0,
+        description="Peak device memory usage in MB reported by the diffusion pipeline.",
+    )
 
 
 class VideoError(BaseModel):
-    code: str = Field(..., description="A machine-readable error code that was returned.")
+    code: int | str = Field(..., description="A machine-readable error code that was returned.")
     message: str = Field(..., description="A human-readable description of the error that was returned.")
 
 
@@ -244,6 +281,14 @@ class VideoResponse(BaseModel):
         description="Filename of the saved output video files for this job.",
     )
     inference_time_s: float | None = Field(default=None, description="End-to-end inference time in seconds.")
+    stage_durations: dict[str, float] = Field(
+        default_factory=dict,
+        description="Profiler stage durations reported by the diffusion pipeline.",
+    )
+    peak_memory_mb: float = Field(
+        default=0.0,
+        description="Peak device memory usage in MB reported by the diffusion pipeline.",
+    )
 
     @property
     def file_extension(self) -> str:

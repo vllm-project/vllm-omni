@@ -107,7 +107,7 @@ Only specific types of PRs will be reviewed. The PR title is prefixed appropriat
 - `[CI/Build]` for build or continuous integration improvements.
 - `[Doc]` for documentation fixes and improvements.
 - `[Model]` for adding a new model or improving an existing model. Model name should appear in the title.
-- `[Frontend]` For changes on the vLLM-Omni frontend (e.g., OpenAI API server, `OmniLLM` class, etc.)
+- `[Frontend]` For changes on the vLLM-Omni frontend (e.g., OpenAI API server, `Omni`/`AsyncOmni`, etc.)
 - `[Kernel]` for changes affecting CUDA kernels or other compute kernels.
 - `[Core]` for changes in the core vLLM-Omni logic (e.g., `OmniProcessor`, `OmniARScheduler`, etc.)
 - `[Hardware][Vendor]` for hardware-specific changes. Vendor name should appear in the prefix, such as [Ascend] for Ascend NPUs.

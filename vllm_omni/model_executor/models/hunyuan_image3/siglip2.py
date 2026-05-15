@@ -393,7 +393,7 @@ class Siglip2Encoder(nn.Module):
                 Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
                 - 1 for tokens that are **not masked**,
                 - 0 for tokens that are **masked**.
-                [What are attention masks?](../glossary#attention-mask)
+                What are attention masks? See HuggingFace documentation for details.
             output_attentions (`bool`, *optional*):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
                 returned tensors for more detail.

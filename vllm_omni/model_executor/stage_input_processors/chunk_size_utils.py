@@ -11,7 +11,7 @@ def max_ic_for_chunk_size(chunk_size: int) -> int:
 
 def compute_dynamic_initial_chunk_size(
     active_requests: int,
-    max_batch_size: int,
+    max_num_seqs: int,
     max_ic: int,
 ) -> int:
     """Select IC from power-of-2 steps [2, 4, ..., max_ic] based on load factor.
@@ -26,8 +26,8 @@ def compute_dynamic_initial_chunk_size(
         v <<= 1
     if not steps:
         return max(1, max_ic)
-    if max_batch_size <= 0:
+    if max_num_seqs <= 0:
         return steps[0]
-    load_factor = min(active_requests / max_batch_size, 1.0)
+    load_factor = min(active_requests / max_num_seqs, 1.0)
     idx = int(round(load_factor * (len(steps) - 1)))
     return steps[idx]

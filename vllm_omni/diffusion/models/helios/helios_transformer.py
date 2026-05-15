@@ -5,7 +5,7 @@
 import math
 from collections.abc import Iterable
 from functools import lru_cache
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -28,6 +28,11 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import (
+        QuantizationConfig,
+    )
 
 logger = init_logger(__name__)
 
@@ -57,10 +62,16 @@ def apply_rotary_emb_helios(
     """
     x_1, x_2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
     cos, sin = freqs_cis.unsqueeze(-2).chunk(2, dim=-1)
-    out = torch.empty_like(hidden_states)
-    out[..., 0::2] = x_1 * cos[..., 0::2] - x_2 * sin[..., 1::2]
-    out[..., 1::2] = x_1 * sin[..., 1::2] + x_2 * cos[..., 0::2]
-    return out.type_as(hidden_states)
+    # Use stack+flatten instead of strided slice assignment for contiguous
+    # memory layout and better performance on GPU/NPU (#2436, cf. PR #2393).
+    rotated = torch.stack(
+        (
+            x_1 * cos[..., 0::2] - x_2 * sin[..., 1::2],
+            x_1 * sin[..., 1::2] + x_2 * cos[..., 0::2],
+        ),
+        dim=-1,
+    )
+    return rotated.flatten(-2, -1).type_as(hidden_states)
 
 
 class DistributedRMSNorm(nn.Module):
@@ -96,7 +107,15 @@ class DistributedRMSNorm(nn.Module):
 class ColumnParallelGELU(nn.Module):
     """Column parallel linear with GELU activation."""
 
-    def __init__(self, dim_in: int, dim_out: int, *, approximate: str = "tanh", bias: bool = True):
+    def __init__(
+        self,
+        dim_in: int,
+        dim_out: int,
+        *,
+        approximate: str = "tanh",
+        bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+    ):
         super().__init__()
         self.proj = ColumnParallelLinear(
             dim_in,
@@ -104,6 +123,7 @@ class ColumnParallelGELU(nn.Module):
             bias=bias,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
         )
         self.approximate = approximate
 
@@ -121,18 +141,15 @@ class HeliosFeedForward(nn.Module):
         inner_dim: int,
         dim_out: int | None = None,
         bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
     ) -> None:
         super().__init__()
         dim_out = dim_out or dim
 
-        self.net_0 = ColumnParallelGELU(dim, inner_dim, approximate="tanh", bias=bias)
+        self.net_0 = ColumnParallelGELU(dim, inner_dim, approximate="tanh", bias=bias, quant_config=quant_config)
         self.net_1 = nn.Identity()
         self.net_2 = RowParallelLinear(
-            inner_dim,
-            dim_out,
-            bias=bias,
-            input_is_parallel=True,
-            return_bias=False,
+            inner_dim, dim_out, bias=bias, input_is_parallel=True, return_bias=False, quant_config=quant_config
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -262,6 +279,7 @@ class HeliosSelfAttention(nn.Module):
         dropout: float = 0.0,
         is_amplify_history: bool = False,
         history_scale_mode: str = "per_head",
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
 
@@ -275,6 +293,7 @@ class HeliosSelfAttention(nn.Module):
             head_size=head_dim,
             total_num_heads=num_heads,
             bias=True,
+            quant_config=quant_config,
         )
 
         self.num_heads = self.to_qkv.num_heads
@@ -290,6 +309,7 @@ class HeliosSelfAttention(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
         )
         self.dropout = nn.Dropout(dropout)
 
@@ -368,6 +388,7 @@ class HeliosCrossAttention(nn.Module):
         head_dim: int,
         eps: float = 1e-5,
         dropout: float = 0.0,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
 
@@ -382,6 +403,7 @@ class HeliosCrossAttention(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
         )
         self.to_k = ColumnParallelLinear(
             dim,
@@ -389,6 +411,7 @@ class HeliosCrossAttention(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
         )
         self.to_v = ColumnParallelLinear(
             dim,
@@ -396,6 +419,7 @@ class HeliosCrossAttention(nn.Module):
             bias=True,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
         )
 
         tp_size = get_tensor_model_parallel_world_size()
@@ -411,6 +435,7 @@ class HeliosCrossAttention(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
         )
         self.dropout = nn.Dropout(dropout)
 
@@ -461,6 +486,7 @@ class HeliosTransformerBlock(nn.Module):
         guidance_cross_attn: bool = False,
         is_amplify_history: bool = False,
         history_scale_mode: str = "per_head",
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
 
@@ -475,19 +501,17 @@ class HeliosTransformerBlock(nn.Module):
             eps=eps,
             is_amplify_history=is_amplify_history,
             history_scale_mode=history_scale_mode,
+            quant_config=quant_config,
         )
 
         # 2. Cross-attention
         self.attn2 = HeliosCrossAttention(
-            dim=dim,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            eps=eps,
+            dim=dim, num_heads=num_heads, head_dim=head_dim, eps=eps, quant_config=quant_config
         )
         self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
 
         # 3. Feed-forward
-        self.ffn = HeliosFeedForward(dim=dim, inner_dim=ffn_dim, dim_out=dim)
+        self.ffn = HeliosFeedForward(dim=dim, inner_dim=ffn_dim, dim_out=dim, quant_config=quant_config)
         self.norm3 = FP32LayerNorm(dim, eps, elementwise_affine=False)
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
@@ -558,7 +582,7 @@ class HeliosTransformer3DModel(nn.Module):
     """
 
     _repeated_blocks = ["HeliosTransformerBlock"]
-    _layerwise_offload_blocks_attr = "blocks"
+    _layerwise_offload_blocks_attrs = ["blocks"]
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
     }
@@ -602,6 +626,7 @@ class HeliosTransformer3DModel(nn.Module):
         has_multi_term_memory_patch: bool = True,
         is_amplify_history: bool = False,
         history_scale_mode: str = "per_head",
+        quant_config: "QuantizationConfig | None" = None,
     ) -> None:
         super().__init__()
 
@@ -689,6 +714,7 @@ class HeliosTransformer3DModel(nn.Module):
                     guidance_cross_attn=guidance_cross_attn,
                     is_amplify_history=is_amplify_history,
                     history_scale_mode=history_scale_mode,
+                    quant_config=quant_config,
                 )
                 for _ in range(num_layers)
             ]

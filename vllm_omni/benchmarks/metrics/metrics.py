@@ -185,10 +185,13 @@ def calculate_metrics(
                     # Note : this may inflate the output token count slightly
                     output_len = len(tokenizer(outputs[i].generated_text, add_special_tokens=False).input_ids)
             actual_output_lens.append(output_len)
-            total_input += input_requests[i].prompt_len
+            total_input += outputs[i].prompt_len
             tpot = 0
             if output_len > 1:
-                latency_minus_ttft = outputs[i].text_latency - outputs[i].ttft
+                try:
+                    latency_minus_ttft = outputs[i].text_latency - outputs[i].ttft
+                except Exception:
+                    latency_minus_ttft = outputs[i].latency - outputs[i].ttft
                 tpot = latency_minus_ttft / (output_len - 1)
                 tpots.append(tpot)
             # Note: if output_len <= 1, we regard tpot as 0 for goodput

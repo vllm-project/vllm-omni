@@ -34,6 +34,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.model_executor.layers.timestep_embedding import DiTTimestepEmbedding
 from vllm_omni.model_executor.models.qwen2_5_omni.audio_length import cap_and_align_mel_length, resolve_max_mel_frames
 from vllm_omni.platforms import current_omni_platform
 
@@ -596,36 +597,6 @@ class DiTAttention(nn.Module):
         attention_output = self.to_out[1](attention_output)
 
         return attention_output
-
-
-# time step conditioning embedding
-class SinusPositionEmbedding(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, hidden_states, scale=1000):
-        device = hidden_states.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device).float() * -emb)
-        emb = scale * hidden_states.unsqueeze(1) * emb.unsqueeze(0)
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb.type_as(hidden_states)
-
-
-class DiTTimestepEmbedding(nn.Module):
-    def __init__(self, dim, freq_embed_dim=256):
-        super().__init__()
-        self.time_embed = SinusPositionEmbedding(freq_embed_dim)
-        self.time_mlp = nn.ModuleList([nn.Linear(freq_embed_dim, dim), nn.SiLU(), nn.Linear(dim, dim)])
-
-    def forward(self, timestep):  # noqa: F821
-        time_hidden = self.time_embed(timestep)
-        time_hidden = time_hidden.to(timestep.dtype)
-        for layer in self.time_mlp:
-            time_hidden = layer(time_hidden)  # b d
-        return time_hidden
 
 
 class DiTDecoderLayer(nn.Module):

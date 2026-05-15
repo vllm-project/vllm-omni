@@ -1,0 +1,217 @@
+[
+    {
+        "test_name": "test_ltx2_baseline_eager",
+        "description": "Single-device baseline with enforce-eager (no torch.compile)",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Lightricks/LTX-2",
+            "serve_args": {
+                "enforce-eager": true,
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "256x256_145f_steps6",
+                "dataset": "random",
+                "task": "t2v",
+                "backend": "v1/videos",
+                "width": 256,
+                "height": 256,
+                "num-frames": 145,
+                "fps": 24,
+                "num-inference-steps": 6,
+                "num-prompts": 3,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true
+            },
+            {
+                "name": "480x768_41f_steps20",
+                "dataset": "random",
+                "task": "t2v",
+                "backend": "v1/videos",
+                "width": 768,
+                "height": 480,
+                "num-frames": 41,
+                "fps": 24,
+                "num-inference-steps": 20,
+                "num-prompts": 3,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true
+            }
+        ]
+    },
+
+    {
+        "test_name": "test_ltx2_torch_compile",
+        "description": "Single-device with torch.compile (default, no enforce-eager)",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Lightricks/LTX-2",
+            "serve_args": {
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "256x256_145f_steps6",
+                "dataset": "random",
+                "task": "t2v",
+                "backend": "v1/videos",
+                "width": 256,
+                "height": 256,
+                "num-frames": 145,
+                "fps": 24,
+                "num-inference-steps": 6,
+                "num-prompts": 3,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true
+            },
+            {
+                "name": "480x768_41f_steps20",
+                "dataset": "random",
+                "task": "t2v",
+                "backend": "v1/videos",
+                "width": 768,
+                "height": 480,
+                "num-frames": 41,
+                "fps": 24,
+                "num-inference-steps": 20,
+                "num-prompts": 3,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true
+            }
+        ]
+    },
+
+    {
+        "test_name": "test_ltx2_cfg2_eager",
+        "description": "CFG-parallel=2 with enforce-eager",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Lightricks/LTX-2",
+            "serve_args": {
+                "cfg-parallel-size": 2,
+                "enforce-eager": true,
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "256x256_145f_steps6",
+                "dataset": "random",
+                "task": "t2v",
+                "backend": "v1/videos",
+                "width": 256,
+                "height": 256,
+                "num-frames": 145,
+                "fps": 24,
+                "num-inference-steps": 6,
+                "num-prompts": 3,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true
+            },
+            {
+                "name": "480x768_41f_steps20",
+                "dataset": "random",
+                "task": "t2v",
+                "backend": "v1/videos",
+                "width": 768,
+                "height": 480,
+                "num-frames": 41,
+                "fps": 24,
+                "num-inference-steps": 20,
+                "num-prompts": 3,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true
+            }
+        ]
+    },
+
+    {
+        "test_name": "test_ltx2_cfg2_compile",
+        "description": "CFG-parallel=2 with torch.compile",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Lightricks/LTX-2",
+            "serve_args": {
+                "cfg-parallel-size": 2,
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "256x256_145f_steps6",
+                "dataset": "random",
+                "task": "t2v",
+                "backend": "v1/videos",
+                "width": 256,
+                "height": 256,
+                "num-frames": 145,
+                "fps": 24,
+                "num-inference-steps": 6,
+                "num-prompts": 3,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true
+            },
+            {
+                "name": "480x768_41f_steps20",
+                "dataset": "random",
+                "task": "t2v",
+                "backend": "v1/videos",
+                "width": 768,
+                "height": 480,
+                "num-frames": 41,
+                "fps": 24,
+                "num-inference-steps": 20,
+                "num-prompts": 3,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true
+            }
+        ]
+    },
+
+    {
+        "test_name": "test_ltx2_cache_dit_eager",
+        "description": "CacheDiT with enforce-eager",
+        "server_type": "vllm-omni",
+        "server_params": {
+            "model": "Lightricks/LTX-2",
+            "serve_args": {
+                "cache-backend": "cache_dit",
+                "enforce-eager": true,
+                "enable-diffusion-pipeline-profiler": true
+            }
+        },
+        "benchmark_params": [
+            {
+                "name": "256x256_145f_steps6",
+                "dataset": "random",
+                "task": "t2v",
+                "backend": "v1/videos",
+                "width": 256,
+                "height": 256,
+                "num-frames": 145,
+                "fps": 24,
+                "num-inference-steps": 6,
+                "num-prompts": 3,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true
+            },
+            {
+                "name": "480x768_41f_steps20",
+                "dataset": "random",
+                "task": "t2v",
+                "backend": "v1/videos",
+                "width": 768,
+                "height": 480,
+                "num-frames": 41,
+                "fps": 24,
+                "num-inference-steps": 20,
+                "num-prompts": 3,
+                "max-concurrency": 1,
+                "enable-negative-prompt": true
+            }
+        ]
+    }
+]

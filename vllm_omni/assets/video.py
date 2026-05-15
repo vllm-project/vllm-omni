@@ -1,6 +1,6 @@
-import librosa
 import numpy as np
 from vllm.assets.video import VideoAsset
+from vllm.multimodal.media.audio import load_audio
 
 
 def extract_video_audio(path: str = None, sampling_rate: int = 16000) -> np.ndarray:
@@ -12,5 +12,5 @@ def extract_video_audio(path: str = None, sampling_rate: int = 16000) -> np.ndar
     """
     if not path:
         path = VideoAsset(name="baby_reading").video_path
-    audio_signal, sr = librosa.load(path, sr=sampling_rate)
+    audio_signal, sr = load_audio(path, sr=sampling_rate)
     return audio_signal

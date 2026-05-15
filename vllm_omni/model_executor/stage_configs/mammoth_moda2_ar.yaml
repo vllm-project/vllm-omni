@@ -8,9 +8,9 @@ stage_args:
   - stage_id: 0
     runtime:
       devices: "0"
-      max_batch_size: 16
     engine_args:
       model_stage: ar
+      max_num_seqs: 16
       model_arch: MammothModa2ForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler

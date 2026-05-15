@@ -74,28 +74,21 @@ body:
       If relevant, add a minimal example so that we can reproduce the error by running the code. It is very important for the snippet to be as succinct (minimal) as possible, so please take time to trim down any irrelevant code to help us debug efficiently. We are going to copy-paste your code and we expect to get the same result as you did: avoid any external data, and include the relevant imports, etc. For example:
 
       ```python
-      from vllm_omni import OmniLLM, create_ar_stage_config, create_dit_stage_config
+      from vllm_omni.entrypoints.omni import Omni
+      from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+      from vllm import SamplingParams
 
-      # Create stage configurations
-      ar_config = create_ar_stage_config(
-          stage_id=0,
-          model_path="Qwen/Qwen3-0.6B",
-          input_modalities=["text"],
-          output_modalities=["text"]
+      omni = Omni(
+          model="Qwen/Qwen-Image",
+          stage_configs_path="/path/to/stage_configs.yaml",
       )
 
-      dit_config = create_dit_stage_config(
-          stage_id=1,
-          model_path="stabilityai/stable-diffusion-2-1",
-          input_modalities=["text"],
-          output_modalities=["image"]
-      )
-
-      # Initialize OmniLLM
-      omni = OmniLLM([ar_config, dit_config])
-
-      # Generate
-      outputs = omni.generate(prompt="A scenic watercolor painting of a lighthouse at sunset")
+      prompts = [{"prompt": "A scenic watercolor painting of a lighthouse at sunset"}]
+      sampling_params_list = [
+          SamplingParams(max_tokens=1),
+          OmniDiffusionSamplingParams(num_outputs_per_prompt=1),
+      ]
+      outputs = omni.generate(prompts=prompts, sampling_params_list=sampling_params_list)
       ```
 
       If the code is too long (hopefully, it isn't), feel free to put it in a public gist and link it in the issue: https://gist.github.com.

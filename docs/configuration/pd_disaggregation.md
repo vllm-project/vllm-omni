@@ -11,7 +11,7 @@ deployment-specific values usually change per environment:
 - connector backend and connector ports
 - connector IPs or bootstrap addresses
 
-Start from the [default Qwen3-Omni stage config](gh-file:vllm_omni/model_executor/stage_configs/qwen3_omni_moe.yaml)
+Start from the [default Qwen3-Omni stage config](gh-file:vllm_omni/deploy/qwen3_omni_moe.yaml)
 and copy it to your own file, for example `qwen3_omni_pd.yaml`. Then apply the
 changes below.
 
@@ -32,8 +32,8 @@ stage_args:
     is_prefill_only: true
     runtime:
       devices: "0"
-      max_batch_size: 16
     engine_args:
+      max_num_seqs: 16
       model_stage: thinker
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: ar
@@ -70,8 +70,8 @@ stage_args:
     is_decode_only: true
     runtime:
       devices: "1"
-      max_batch_size: 64
     engine_args:
+      max_num_seqs: 64
       model_stage: thinker
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: ar
@@ -128,7 +128,8 @@ After inserting the extra thinker stage, renumber the remaining stages:
   - stage_id: 3
     runtime:
       devices: "2"
-      max_batch_size: 1
+    engine_args:
+      max_num_seqs: 1
     engine_input_source: [2]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
 ```
@@ -144,19 +145,13 @@ Compared with the default Qwen3-Omni config:
 ```yaml
 runtime:
   enabled: true
-  defaults:
-    window_size: -1
-    max_inflight: 1
   edges:
     - from: 0
       to: 1
-      window_size: -1
     - from: 1
       to: 2
-      window_size: -1
     - from: 2
       to: 3
-      window_size: -1
 ```
 
 ## 4. Launch with your custom config

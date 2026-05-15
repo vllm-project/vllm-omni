@@ -15,6 +15,15 @@ _MODEL_COEFFICIENTS = {
         -3.82021401e00,
         2.64230861e-01,
     ],
+    # Flux2 Klein transformer coefficients
+    # Same as FLUX.1 (similar dual-stream architecture)
+    "Flux2Klein": [
+        4.98651651e02,
+        -2.83781631e02,
+        5.58554382e01,
+        -3.82021401e00,
+        2.64230861e-01,
+    ],
     # Qwen-Image transformer coefficients from ComfyUI-TeaCache
     # Tuned specifically for Qwen's dual-stream transformer architecture
     # Used for all Qwen-Image Family pipelines, in general
@@ -37,6 +46,35 @@ _MODEL_COEFFICIENTS = {
         3.20000000e00,
         -2.00000000e-02,
     ],
+    # Estimated TeaCache polynomial coefficients for StableAudioDiTModel.
+    "StableAudioDiTModel": [
+        121.77490545701518,
+        -153.7449426160371,
+        68.05368574596551,
+        -12.281286412689623,
+        1.0733905006198015,
+    ],
+    # HunyuanImage3 pipeline coefficients
+    # Calibrated via polyfit on 3920 data points (80 prompts × 49 steps).
+    # Maps time_embed rel_l1 (range ~0.12-0.54) to output rel_l1 (range ~0.01-0.53).
+    "HunyuanImage3Pipeline": [
+        1.04117826e02,
+        -1.26848482e02,
+        5.68168652e01,
+        -1.04182570e01,
+        6.78098549e-01,
+    ],
+    # Flux2 transformer coefficients
+    # Copied from Qwen-Image, need to be tuned specifically for Flux2 in future
+    "Flux2Transformer2DModel": [
+        -4.50000000e02,
+        2.80000000e02,
+        -4.50000000e01,
+        3.20000000e00,
+        -2.00000000e-02,
+    ],
+    # LongCat Image transformer coefficients
+    "LongCatImageTransformer2DModel": [652.5980, -424.1615, 84.5526, -4.5923, 0.1694],
 }
 
 

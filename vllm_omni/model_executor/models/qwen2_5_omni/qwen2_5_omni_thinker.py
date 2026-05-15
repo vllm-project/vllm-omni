@@ -64,6 +64,10 @@ from vllm.multimodal.processing.processor import (
 )
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.quantization.component_config import (
+    resolve_encoder_quant_config,
+)
+
 try:
     import flash_attn
 except (ImportError, ModuleNotFoundError):
@@ -102,6 +106,15 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
                 tokenizer = self.info.get_tokenizer()
                 audio_pad_id = tokenizer.convert_tokens_to_ids("<|audio_pad|>")
                 use_audio_in_video = audio_pad_id not in prompt_ids
+            # for mutilmodality cache
+            if any(item is None for item in mm_kwargs["video"]):
+                video_token_id = self.info.get_hf_config().video_token_id
+                audio_token_id = self.info.get_hf_config().audio_token_id
+                video_audio_item_num = sum(id in (video_token_id, audio_token_id) for id in prompt_ids)
+                audio_updates_num = len(mm_prompt_updates.get("audio", []))
+                video_updates_num = len(mm_prompt_updates.get("video", []))
+                if video_audio_item_num != video_updates_num + audio_updates_num:
+                    use_audio_in_video = True
 
         if is_update_applied:
             mm_placeholders = self._find_mm_placeholders(
@@ -259,8 +272,6 @@ class Qwen2_5OmniConditionalGenerationMixin(Qwen2_5OmniConditionalGenerationMixi
     def _process_video_input(
         self,
         video_input: Qwen2_5_VLVideoInputs,
-        video_hashes: list[str] = None,
-        cached_video_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         if video_input["type"] == "video_embeds":
             return video_input["video_embeds"].type(self.visual.dtype)
@@ -350,6 +361,12 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
 
         self.quant_config = quant_config
 
+        # Pre-quantized checkpoints (modelopt NVFP4/FP8/MXFP8) only quantize
+        # the Thinker LM. Vision encoder weights remain in BF16 with no FP8
+        # scale tensors; passing quant_config causes FP8 kernels to run on
+        # BF16 weights, producing garbage embeddings. Keep None for encoders.
+        visual_quant_config = resolve_encoder_quant_config(quant_config)
+
         with self._mark_tower_model(vllm_config, "audio"):
             if multimodal_config.get_limit_per_prompt("audio"):
                 self.audio_tower = Qwen2_5OmniAudioEncoder(thinker_config.audio_config)
@@ -361,7 +378,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 self.visual = Qwen2_5_VisionTransformer(
                     vision_config=thinker_config.vision_config,
                     norm_eps=getattr(thinker_config.text_config, "rms_norm_eps", 1e-6),
-                    quant_config=quant_config,
+                    quant_config=visual_quant_config,
                     prefix=maybe_prefix(prefix, "visual"),
                 )
             else:
@@ -586,19 +603,30 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
         multimodal_embeddings: MultiModalEmbeddings | None = None,
         *,
         is_multimodal: torch.Tensor | None = None,
-        handle_oov_mm_token: bool = False,
     ) -> torch.Tensor:
         if multimodal_embeddings is None or is_multimodal is None:
             return super().embed_input_ids(input_ids)
 
+        inputs_embeds = self._embed_text_input_ids(
+            input_ids,
+            self.get_language_model().embed_input_ids,
+            is_multimodal=is_multimodal,
+        )
+
+        if len(multimodal_embeddings) == 0:
+            return inputs_embeds
+
         # Check for audio-in-video: interleaved video and audio tokens
         # in the multimodal region. Only use the interleaved path when
         # needed; otherwise fall back to the default parent implementation.
+        # vLLM's _gather_mm_embeddings builds is_multimodal on CPU for merge
+        # indexing; bitwise ops with input_ids require the same device.
+        is_mm_device = is_multimodal.to(device=input_ids.device, non_blocking=True)
         video_token_id = self.config.video_token_index
         audio_token_id = self.config.audio_token_index
 
-        is_video = is_multimodal & (input_ids == video_token_id)
-        is_audio = is_multimodal & (input_ids == audio_token_id)
+        is_video = is_mm_device & (input_ids == video_token_id)
+        is_audio = is_mm_device & (input_ids == audio_token_id)
 
         num_video = is_video.sum().item()
         num_audio = is_audio.sum().item()
@@ -608,14 +636,13 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
                 input_ids,
                 self.get_language_model().embed_input_ids,
                 is_multimodal=is_multimodal,
-                handle_oov_mm_token=handle_oov_mm_token,
             )
             return merge_interleaved_embeddings(
                 inputs_embeds,
                 multimodal_embeddings,
                 is_video,
                 is_audio,
-                is_multimodal,
+                is_mm_device,
                 num_video,
                 num_audio,
             )
@@ -625,7 +652,6 @@ class Qwen2_5OmniThinkerForConditionalGeneration(
             input_ids,
             multimodal_embeddings=multimodal_embeddings,
             is_multimodal=is_multimodal,
-            handle_oov_mm_token=handle_oov_mm_token,
         )
 
     def forward(

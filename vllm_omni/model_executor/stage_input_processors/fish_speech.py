@@ -5,9 +5,13 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
-logger = init_logger(__name__)
+from vllm_omni.data_entry_keys import (
+    CodesStruct,
+    MetaStruct,
+    OmniPayloadStruct,
+)
 
-_NUM_CODEBOOKS = 10  # 1 semantic + 9 residual
+logger = init_logger(__name__)
 
 
 def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
@@ -26,16 +30,14 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
 
 
 def slow_ar_to_dac_decoder(
-    stage_list: list[Any],
-    engine_input_source: list[int],
-    prompt: Any = None,
-    requires_multimodal_data: bool = False,
+    source_outputs: list[Any],
+    _prompt: Any = None,
+    _requires_multimodal_data: bool = False,
 ) -> list[Any]:
     """Non-async processor: wait for Slow AR to finish, then pass all codes to DAC decoder."""
     from vllm_omni.inputs.data import OmniTokensPrompt
-    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import _validate_stage_inputs
 
-    slow_ar_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    slow_ar_outputs = source_outputs
     dac_inputs: list[OmniTokensPrompt] = []
 
     for output in slow_ar_outputs:
@@ -63,7 +65,7 @@ def slow_ar_to_dac_decoder_async_chunk(
     pooling_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
-) -> dict[str, Any] | None:
+) -> OmniPayloadStruct | None:
     """Async streaming processor: emit code chunks as they are produced.
 
     Accumulates per-step codes and emits fixed-size chunks with left context
@@ -76,8 +78,7 @@ def slow_ar_to_dac_decoder_async_chunk(
     if isinstance(pooling_output, dict):
         frame = _extract_last_frame(pooling_output)
         if frame is not None:
-            codec_codes = frame.cpu().tolist()
-            transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+            transfer_manager.code_prompt_token_ids[request_id].append(frame.detach().to(device="cpu", dtype=torch.long))
     elif not finished:
         return None
 
@@ -112,10 +113,10 @@ def slow_ar_to_dac_decoder_async_chunk(
 
     if length <= 0:
         if finished:
-            return {
-                "code_predictor_codes": [],
-                "finished": torch.tensor(True, dtype=torch.bool),
-            }
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+            )
         return None
 
     in_initial_phase = initial_chunk_size > 0 and length <= chunk_size
@@ -142,10 +143,13 @@ def slow_ar_to_dac_decoder_async_chunk(
         window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
     # Pack into codebook-major flat codes.
-    code_predictor_codes = torch.tensor(window_frames).transpose(0, 1).reshape(-1).tolist()
+    stacked_frames = torch.stack(window_frames, dim=0)
+    code_predictor_codes = stacked_frames.transpose(0, 1).reshape(-1)
 
-    return {
-        "code_predictor_codes": code_predictor_codes,
-        "left_context_size": left_context_size,
-        "finished": torch.tensor(finished, dtype=torch.bool),
-    }
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=code_predictor_codes),
+        meta=MetaStruct(
+            left_context_size=left_context_size,
+            finished=torch.tensor(finished, dtype=torch.bool),
+        ),
+    )

@@ -1,0 +1,109 @@
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: token2text
+      model_arch: DyninOmniForConditionalGeneration
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      engine_output_type: latent
+      trust_remote_code: false
+      enforce_eager: true
+      enable_prefix_caching: false
+      async_scheduling: false
+      max_num_batched_tokens: 32768
+    output_connectors:
+      to_stage_1: mooncake_connector
+    final_output: true
+    final_output_type: text
+
+  - stage_id: 1
+    stage_type: llm
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: token2image
+      model_arch: DyninOmniForConditionalGeneration
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      engine_output_type: latent
+      trust_remote_code: false
+      enforce_eager: true
+      enable_prefix_caching: false
+      async_scheduling: false
+      max_num_batched_tokens: 32768
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.dynin_omni.token2text_to_token2image
+    final_output: true
+    final_output_type: image
+    input_connectors:
+      from_stage_0: mooncake_connector
+    output_connectors:
+      to_stage_2: mooncake_connector
+
+  - stage_id: 2
+    stage_type: llm
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: token2audio
+      model_arch: DyninOmniForConditionalGeneration
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      engine_output_type: latent
+      trust_remote_code: false
+      enforce_eager: true
+      enable_prefix_caching: false
+      async_scheduling: false
+      max_num_batched_tokens: 32768
+    engine_input_source: [1]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.dynin_omni.token2image_to_token2audio
+    final_output: true
+    final_output_type: audio
+    input_connectors:
+      from_stage_1: mooncake_connector
+
+# Top-level runtime config (concise): default windows and stage edges
+runtime:
+  enabled: true
+  ####
+  # same as Qwen2.5_omni version
+  # Distributed connectors configuration (optional)
+  # More connectors will be supported in the future.
+  connectors:
+    # Mooncake connector for cross-node/intra-node communication
+    mooncake_connector:
+      name: MooncakeConnector
+      extra:
+        host: "127.0.0.1"
+        metadata_server: "http://10.90.67.86:8080/metadata"
+        master: "10.90.67.86:50051"
+        segment: 512000000    # 512MB
+        localbuf: 64000000     # 64MB
+        proto: "tcp"
+
+    # Yuanrong connector for cross-node/intra-node communication
+    yuanrong_connector:
+      name: YuanrongConnector
+      extra:
+        host: "127.0.0.1"
+        port: "35000"
+
+    # SharedMemory connector for intra-node communication
+    # Alternative SHM connector with different threshold
+    shared_memory_connector:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536 # 64KB threshold
+    ####
+
+  edges:
+    - from: 0
+      to: 1
+    - from: 1
+      to: 2

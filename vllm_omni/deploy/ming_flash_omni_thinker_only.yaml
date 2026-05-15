@@ -1,0 +1,36 @@
+# Ming-flash-omni-2.0 thinker-only deploy: multimodal understanding -> text.
+#
+# Single-stage configuration that drops the talker; useful when only text
+# output is required (chat / understanding / reasoning)
+#
+# Stage 0: Thinker — TP=4 across GPUs 0-3 with full memory budget since no
+# talker shares the last device.
+pipeline: ming_flash_omni_thinker_only
+async_chunk: false
+
+trust_remote_code: true
+distributed_executor_backend: mp
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: false
+    tensor_parallel_size: 4
+    max_num_batched_tokens: 32768
+    devices: "0,1,2,3"
+    # disable fused allreduce+rms for flashinfer version mismatch for now
+    compilation_config:
+      pass_config:
+        fuse_allreduce_rms: false
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      max_tokens: 2048
+      repetition_penalty: 1.05
+      detokenize: true
+      ignore_eos: false
+
+# Ming-flash-omni-2.0 has only been verified on CUDA devices
+platforms: {}

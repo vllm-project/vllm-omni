@@ -11,8 +11,8 @@ import time
 import traceback
 from collections.abc import Iterable, Sequence
 from enum import StrEnum, auto
+from types import SimpleNamespace
 from typing import Any, NamedTuple
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import requests
@@ -27,10 +27,12 @@ from comfyui_vllm_omni.nodes import (
 )
 from comfyui_vllm_omni.utils.types import AutoregressionSamplingParams, DiffusionSamplingParams, WanModelSpecificParams
 from PIL import Image
+from pytest_mock import MockerFixture
 from vllm import SamplingParams
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
+from vllm_omni.entrypoints.async_omni import AsyncOmni as RealAsyncOmni
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -43,7 +45,7 @@ class ServerCase(NamedTuple):
 
     served_model: str
     stage_list: list
-    stage_configs: list[dict]
+    stage_configs: list[Any]
     outputs: list[OmniRequestOutput]
 
 
@@ -215,9 +217,10 @@ def _build_diffusion_video_output() -> OmniRequestOutput:
 
 
 def _build_diffusion_image_output_for_chat_endpoint() -> OmniRequestOutput:
-    request_output = MagicMock()
-    request_output.images = [_build_image_output(color="blue")]
-    request_output.finished = True
+    request_output = SimpleNamespace(
+        images=[_build_image_output(color="blue")],
+        finished=True,
+    )
     return OmniRequestOutput(
         request_id="test_req_img_chat",
         finished=True,
@@ -260,6 +263,40 @@ def _assert_model_param_values(received: OmniSamplingParams, expected: dict):
         assert actual_value == expected_value, (
             f"Expected model param '{expected_param_name}'={expected_value}, got {actual_value}. The received sampling params: {received}"
         )
+
+
+def _make_stage_config(
+    stage_type: str,
+    *,
+    is_comprehension: bool = False,
+    model_stage: str | None = None,
+):
+    engine_args = SimpleNamespace()
+    if model_stage is not None:
+        engine_args.model_stage = model_stage
+    return SimpleNamespace(
+        stage_type=stage_type,
+        is_comprehension=is_comprehension,
+        engine_args=engine_args,
+    )
+
+
+def _stage_type(stage: Any) -> str | None:
+    return getattr(stage, "stage_type", None)
+
+
+def _build_output_modalities(stage_configs: list[Any]) -> list[str]:
+    modalities: list[str] = []
+    for stage in stage_configs:
+        final_output = getattr(stage, "final_output", False)
+        final_output_type = getattr(stage, "final_output_type", None)
+        if final_output and isinstance(final_output_type, str):
+            modalities.append(final_output_type)
+    if modalities:
+        return modalities
+    if any(_stage_type(stage) == "diffusion" for stage in stage_configs):
+        return ["image"]
+    return ["text", "audio"]
 
 
 def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: SamplingCase, server_case: ServerCase):
@@ -353,41 +390,55 @@ def sampling_case(request) -> SamplingCase:
 
 
 @pytest.fixture
-def mock_async_omni(server_case: ServerCase, sampling_case: SamplingCase):
+def mock_async_omni(
+    server_case: ServerCase,
+    sampling_case: SamplingCase,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+):
     async def _mock_preprocess_chat(self, *args, **kwargs):
         return ([{"role": "user", "content": "test"}], [{"prompt": "test prompt"}])
 
     # Need to mock AsyncOmni itself (not only its generate method) because
     # 1. The API layer uses its stage_list and stage_configs attributes
     # 2. Its __init__ method has slow side effects (model & config loading).
-    with (
-        patch("vllm_omni.entrypoints.openai.api_server.AsyncOmni") as MockAsyncOmni,
-        patch(
-            "vllm_omni.entrypoints.openai.serving_chat.OmniOpenAIServingChat._preprocess_chat",
-            new=_mock_preprocess_chat,
-        ),
-    ):
-        mock_instance = AsyncMock()
-        mock_instance.generate = _build_mock_outputs(server_case.outputs, sampling_case, server_case)
+    mock_async_omni_cls = mocker.patch("vllm_omni.entrypoints.openai.api_server.AsyncOmni")
+    monkeypatch.setattr(
+        "vllm_omni.entrypoints.openai.serving_chat.OmniOpenAIServingChat._preprocess_chat",
+        _mock_preprocess_chat,
+    )
 
-        mock_instance.stage_list = server_case.stage_list
-        mock_instance.stage_configs = server_case.stage_configs
-        mock_instance.default_sampling_params_list = [
-            SamplingParams() if stage.get("stage_type") != "diffusion" else MagicMock()
-            for stage in server_case.stage_configs
-        ]
-        mock_instance.errored = False
-        mock_instance.dead_error = RuntimeError("Mock engine error")
-        mock_instance.model_config = MagicMock(max_model_len=4096, io_processor_plugin=None)
-        mock_instance.io_processor = MagicMock()
-        mock_instance.input_processor = MagicMock()
-        mock_instance.shutdown = MagicMock()
-        mock_instance.get_vllm_config = AsyncMock(return_value=None)
-        mock_instance.get_supported_tasks = AsyncMock(return_value=["generate"])
-        mock_instance.get_tokenizer = AsyncMock(return_value=None)
+    mock_instance = mocker.AsyncMock(spec=RealAsyncOmni)
+    mock_instance.generate = _build_mock_outputs(server_case.outputs, sampling_case, server_case)
 
-        MockAsyncOmni.return_value = mock_instance
-        yield MockAsyncOmni
+    mock_instance.stage_list = server_case.stage_list
+    mock_instance.stage_configs = server_case.stage_configs
+    mock_instance.output_modalities = _build_output_modalities(server_case.stage_configs)
+    mock_instance.default_sampling_params_list = [
+        SamplingParams() if _stage_type(stage) != "diffusion" else mocker.MagicMock()
+        for stage in server_case.stage_configs
+    ]
+    mock_instance.errored = False
+    mock_instance.dead_error = RuntimeError("Mock engine error")
+    mock_instance.model_config = mocker.MagicMock(
+        max_model_len=4096,
+        io_processor_plugin=None,
+        allowed_local_media_path=None,
+        allowed_media_domains=None,
+    )
+    # Mimic Qwen3-TTS talker speaker config so CustomVoice validation passes.
+    mock_instance.model_config.hf_config = mocker.MagicMock()
+    mock_instance.model_config.hf_config.talker_config = mocker.MagicMock()
+    mock_instance.model_config.hf_config.talker_config.speaker_id = {"Vivian": 0}
+    mock_instance.io_processor = mocker.MagicMock()
+    mock_instance.input_processor = mocker.MagicMock()
+    mock_instance.shutdown = mocker.MagicMock()
+    mock_instance.get_vllm_config = mocker.AsyncMock(return_value=None)
+    mock_instance.get_supported_tasks = mocker.AsyncMock(return_value=["generate"])
+    mock_instance.get_tokenizer = mocker.AsyncMock(return_value=None)
+
+    mock_async_omni_cls.return_value = mock_instance
+    yield mock_async_omni_cls
 
 
 @pytest.fixture
@@ -444,7 +495,7 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
             ServerCase(
                 served_model="Tongyi-MAI/Z-Image-Turbo",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion"}],
+                stage_configs=[_make_stage_config("diffusion")],
                 outputs=[_build_diffusion_image_output_for_images_endpoint()],
             ),
             "Tongyi-MAI/Z-Image-Turbo",
@@ -455,7 +506,7 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
             ServerCase(
                 served_model="ByteDance-Seed/BAGEL-7B-MoT",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion"}],
+                stage_configs=[_make_stage_config("diffusion")],
                 outputs=[_build_diffusion_image_output_for_chat_endpoint()],
             ),
             "ByteDance-Seed/BAGEL-7B-MoT",
@@ -466,7 +517,7 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
             ServerCase(
                 served_model="Qwen/Qwen-Image-Edit",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion"}],
+                stage_configs=[_make_stage_config("diffusion")],
                 outputs=[_build_diffusion_image_output_for_images_endpoint()],
             ),
             "Qwen/Qwen-Image-Edit",
@@ -477,7 +528,7 @@ def api_server(unused_tcp_port_factory, server_case: ServerCase, mock_async_omni
             ServerCase(
                 served_model="ByteDance-Seed/BAGEL-7B-MoT",
                 stage_list=["diffusion"],
-                stage_configs=[{"stage_type": "diffusion"}],
+                stage_configs=[_make_stage_config("diffusion")],
                 outputs=[_build_diffusion_image_output_for_chat_endpoint()],
             ),
             "ByteDance-Seed/BAGEL-7B-MoT",
@@ -537,14 +588,14 @@ async def test_image_generation_node(api_server: str, model: str, image_input: b
             ServerCase(
                 served_model="Qwen/Qwen2.5-Omni-7B",
                 stage_list=[
-                    MagicMock(is_comprehension=True, model_stage="llm"),
-                    MagicMock(is_comprehension=False, model_stage="llm"),
-                    MagicMock(is_comprehension=False, model_stage="llm"),
+                    SimpleNamespace(is_comprehension=True, model_stage="llm"),
+                    SimpleNamespace(is_comprehension=False, model_stage="llm"),
+                    SimpleNamespace(is_comprehension=False, model_stage="llm"),
                 ],
                 stage_configs=[
-                    {"stage_type": "llm"},
-                    {"stage_type": "llm"},
-                    {"stage_type": "llm"},
+                    _make_stage_config("llm", is_comprehension=True, model_stage="thinker"),
+                    _make_stage_config("llm", is_comprehension=False, model_stage="talker"),
+                    _make_stage_config("llm", is_comprehension=False, model_stage="code2wav"),
                 ],
                 outputs=[_build_audio_chat_output(), _build_text_output("Understanding response")],
             ),
@@ -599,7 +650,7 @@ async def test_understanding_node(api_server: str, sampling_case: SamplingCase):
             ServerCase(
                 served_model="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
                 stage_list=["llm"],
-                stage_configs=[{"stage_type": "llm"}],
+                stage_configs=[_make_stage_config("llm", model_stage="qwen3_tts")],
                 outputs=[_build_audio_speech_output()],
             ),
             VLLMOmniTTS,
@@ -617,7 +668,7 @@ async def test_understanding_node(api_server: str, sampling_case: SamplingCase):
             ServerCase(
                 served_model="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
                 stage_list=["llm"],
-                stage_configs=[{"stage_type": "llm"}],
+                stage_configs=[_make_stage_config("llm", model_stage="qwen3_tts")],
                 outputs=[_build_audio_speech_output()],
             ),
             VLLMOmniVoiceClone,
