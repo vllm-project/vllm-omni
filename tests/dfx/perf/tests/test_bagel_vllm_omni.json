@@ -7,7 +7,7 @@
       "model": "ByteDance-Seed/BAGEL-7B-MoT",
       "serve_args": {
         "enable-diffusion-pipeline-profiler": true,
-        "deploy-config": "vllm_omni/deploy/bagel_single_stage.yaml",
+        "deploy-config": "../vllm_omni/deploy/bagel_single_stage.yaml",
         "no-async-chunk": true,
         "tensor-parallel-size": 1,
         "cfg-parallel-size": 1,
@@ -62,7 +62,7 @@
       "model": "ByteDance-Seed/BAGEL-7B-MoT",
       "serve_args": {
         "enable-diffusion-pipeline-profiler": true,
-        "deploy-config": "vllm_omni/deploy/bagel.yaml",
+        "deploy-config": "../vllm_omni/deploy/bagel.yaml",
         "no-async-chunk": true,
         "tensor-parallel-size": 1,
         "cfg-parallel-size": 1,
