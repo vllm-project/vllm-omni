@@ -78,7 +78,8 @@ class MiniCPMO26OmniT2WForConditionalGeneration(
 
         if not _tts_deps:
             raise ImportError(
-                "TTS dependencies not available. Please install vector_quantize_pytorch and vocos."
+                "MiniCPM-o 2.6 token-to-waveform stage requires vector_quantize_pytorch and vocos. "
+                "Install them with: pip install 'vllm-omni[minicpmo]'"
             )
 
         # TTS (ConditionalChatTTS) is now in talker stage;
