@@ -20,11 +20,16 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.omni_scheduling_coordinator import (
+    OmniSchedulingCoordinator,
+    uses_qwen3_omni_full_payload_input_coordinator,
+)
 from vllm_omni.core.sched.output import OmniSchedulerOutput
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
 
@@ -75,6 +80,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
+        self.input_coordinator: OmniSchedulingCoordinator | None = None
+        if uses_qwen3_omni_full_payload_input_coordinator(model_config):
+            self.input_coordinator = OmniSchedulingCoordinator(
+                scheduler_max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
+                stage_id=getattr(model_config, "stage_id", 0),
+                async_chunk=False,
+            )
+        self._latest_omni_connector_output: OmniConnectorOutput | None = None
         # Snapshot prompt length for each streaming input update
         self._new_prompt_len_snapshot: dict[str, int] = {}
 
@@ -190,6 +203,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return False
 
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
+        connector_output = self._latest_omni_connector_output
+        self._latest_omni_connector_output = None
+        if self.input_coordinator:
+            if connector_output and connector_output.request_metadata:
+                self.input_coordinator.update_request_metadata(
+                    self.requests, connector_output.request_metadata, model_mode="ar"
+                )
+            self.input_coordinator.process_pending_full_payload_inputs(
+                self.waiting,
+                self.running,
+                connector_output.stage_recv_req_ids if connector_output else set(),
+            )
+
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
 
@@ -199,6 +225,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if self.chunk_transfer_adapter:
                 # Add request waiting for chunk to the waiting and running queue
                 self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+            if self.input_coordinator:
+                self.input_coordinator.restore_queues(self.waiting, self.running)
         try:
             # Late import to avoid circulars in some launch modes
             from .output import OmniNewRequestData
@@ -239,9 +267,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Wrap in omni scheduler output to carry transfer metadata.
         base_fields = SchedulerOutput.__dataclass_fields__.keys()
         base_data = {name: getattr(scheduler_output, name) for name in base_fields}
+        input_regs = self.input_coordinator.pending_input_registrations if self.input_coordinator else []
         return OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_reqs,
+            pending_input_registrations=input_regs,
         )
 
     def update_from_output(
@@ -534,6 +564,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
+        omni_output = getattr(model_runner_output, "omni_connector_output", None)
+        if omni_output is not None:
+            self._latest_omni_connector_output = omni_output
+            if self.input_coordinator and omni_output.request_metadata:
+                self.input_coordinator.update_request_metadata(
+                    self.requests,
+                    omni_output.request_metadata,
+                    model_mode="ar",
+                )
+
         # Free blocks that were held for transfer (kv_ready and
         # active_kv_transfers updates already done before the per-request loop).
         if kv_extracted_ids:
@@ -572,7 +612,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
-        return super().finish_requests(request_ids, finished_status)
+        finished = super().finish_requests(request_ids, finished_status)
+        input_coordinator = getattr(self, "input_coordinator", None)
+        if input_coordinator is not None:
+            for request_id, _ in finished:
+                self._free_input_coordinator_request(request_id)
+        return finished
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         """
@@ -616,10 +661,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     # It triggered but hasn't finished yet. We MUST wait.
                     logger.debug(f"[Omni] Request {request_id} finished but transfer is still ACTIVE. Waiting.")
                     self.waiting_for_transfer_free.add(request_id)
+                    if self.input_coordinator is not None:
+                        self._free_input_coordinator_request(request_id)
                     kv_xfer_params = None
                     return kv_xfer_params
                 elif request_id in self.waiting_for_transfer_free:
                     # Blocks held until KV extraction completes in a future step.
+                    if self.input_coordinator is not None:
+                        self._free_input_coordinator_request(request_id)
                     return None
                 else:
                     logger.debug(
@@ -654,10 +703,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     if isinstance(add_info, dict):
                         add_info.update(kv_xfer_params)
 
+                if self.input_coordinator is not None:
+                    self._free_input_coordinator_request(request_id)
                 return kv_xfer_params
 
         # 3. Standard Freeing
         delay_free_blocks |= connector_delay_free_blocks
+        if self.input_coordinator is not None:
+            self._free_input_coordinator_request(request_id)
         if not delay_free_blocks:
             self._free_blocks(request)
 

@@ -283,11 +283,13 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
                 cond_image_infos = [_build_cond_joint_image(image) for image in image_list]
                 prompt["additional_information"]["batch_cond_image_info"] = cond_image_infos
 
+                bridge_h = prompt.get("height") if isinstance(prompt, dict) else None
+                bridge_w = prompt.get("width") if isinstance(prompt, dict) else None
                 first_image_w, first_image_h = _to_pil_image(image_list[0]).size
                 if request.sampling_params.width is None:
-                    request.sampling_params.width = int(first_image_w)
+                    request.sampling_params.width = int(bridge_w or first_image_w)
                 if request.sampling_params.height is None:
-                    request.sampling_params.height = int(first_image_h)
+                    request.sampling_params.height = int(bridge_h or first_image_h)
 
             request.prompts[i] = prompt
 
@@ -539,7 +541,12 @@ class HunyuanImage3Pipeline(
         timestep_scatter_index: BatchRaggedTensor,
     ):
         batch_size, seq_len, n_embd = x.shape
-        # batch_size x n x n_embd
+        # `_encode_cond_image` returns `t` as list[Tensor] for the
+        # multi-image branch (outer length = batch_size, currently fixed
+        # at 1 by the stage runtime `max_batch_size`); flatten to a Tensor
+        # before reshape.
+        if isinstance(t, list):
+            t = torch.cat([ti.reshape(-1) for ti in t], dim=0)
         timestep_scatter_src = self.timestep_emb(t.reshape(-1)).reshape(batch_size, -1, n_embd)
         x.scatter_(
             dim=1,
@@ -627,7 +634,11 @@ class HunyuanImage3Pipeline(
             if isinstance(vae_encode_result, torch.Tensor):
                 latents = vae_encode_result
             else:
-                latents = vae_encode_result.latent_dist.sample()
+                # Match HunyuanImage-3's cond encode path: sample the
+                # posterior, but use a fixed generator so repeated online
+                # requests are deterministic.
+                _cond_vae_gen = torch.Generator(device=image.device).manual_seed(0)
+                latents = vae_encode_result.latent_dist.sample(_cond_vae_gen)
             if hasattr(config, "shift_factor") and config.shift_factor:
                 latents.sub_(config.shift_factor)
             if hasattr(config, "scaling_factor") and config.scaling_factor:
@@ -1353,25 +1364,21 @@ class HunyuanImage3Pipeline(
         use_system_prompt = extra_args.get("use_system_prompt")
         system_prompt = extra_args.get("system_prompt")
         # Fall back to per-prompt use_system_prompt forwarded by ar2diffusion
-        if use_system_prompt is None and req.prompts:
+        if req.prompts:
             first_prompt = req.prompts[0]
             if isinstance(first_prompt, dict):
-                use_system_prompt = first_prompt.get("use_system_prompt")
+                if use_system_prompt is None:
+                    use_system_prompt = first_prompt.get("use_system_prompt")
+                if system_prompt is None:
+                    system_prompt = first_prompt.get("system_prompt")
         if use_system_prompt is not None:
             system_prompt = get_system_prompt(use_system_prompt, "image", system_prompt)
             system_prompt = system_prompt.strip() if system_prompt is not None else ""
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
 
-        # Extract AR-generated CoT/recaption text from each prompt's extra dict.
-        # The AR-side stage input processor (``ar2diffusion``) already prepends
-        # the trigger tag (e.g. ``<think>``) when the AR used the KV-reuse
-        # pretrain format, so ``ar_generated_text`` is a self-contained string
-        # and ``get_cot_sections()`` can parse the think/recaption structure
-        # directly.
-        cot_text_list = []
-        for p in req.prompts:
-            extra = p.get("extra", {}) if isinstance(p, dict) else {}
-            cot_text_list.append(extra.get("ar_generated_text") or None)
+        cot_text_list = [
+            (p.get("extra", {}).get("ar_generated_text") if isinstance(p, dict) else None) or None for p in req.prompts
+        ]
         cot_text = (
             [self._normalize_cot_text(t) for t in cot_text_list] if any(t is not None for t in cot_text_list) else None
         )

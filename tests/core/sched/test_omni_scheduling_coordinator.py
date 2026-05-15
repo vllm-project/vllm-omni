@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for OmniSchedulingCoordinator (formerly ChunkSchedulingCoordinator).
+"""Unit tests for OmniSchedulingCoordinator.
 
 These tests use mock request objects and mock queues.  They do not require
 GPU, vLLM runtime, or any connector.
@@ -11,10 +11,12 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 import vllm_omni.core.sched.omni_scheduling_coordinator as coord_mod
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
-    ChunkSchedulingCoordinator,
     OmniSchedulingCoordinator,
+    uses_qwen3_omni_full_payload_input_coordinator,
 )
 
 # ------------------------------------------------------------------ #
@@ -89,11 +91,55 @@ class MockQueue:
 # ------------------------------------------------------------------ #
 
 
+class TestFullPayloadCoordinatorSelection(unittest.TestCase):
+    def test_qwen3_omni_talker_and_code2wav_use_full_payload_input_coordinator(self):
+        for model_stage in ("talker", "code2wav"):
+            model_config = SimpleNamespace(
+                stage_id=1,
+                async_chunk=False,
+                model_arch="Qwen3OmniMoeForConditionalGeneration",
+                model_stage=model_stage,
+            )
+
+            self.assertTrue(uses_qwen3_omni_full_payload_input_coordinator(model_config))
+
+    def test_async_chunk_and_non_qwen3_omni_do_not_use_full_payload_input_coordinator(self):
+        cases = [
+            SimpleNamespace(
+                stage_id=1,
+                async_chunk=True,
+                model_arch="Qwen3OmniMoeForConditionalGeneration",
+                model_stage="talker",
+            ),
+            SimpleNamespace(
+                stage_id=1,
+                async_chunk=False,
+                model_arch="Qwen3TTSForConditionalGeneration",
+                model_stage="code2wav",
+            ),
+            SimpleNamespace(
+                stage_id=1,
+                async_chunk=False,
+                model_arch="Qwen2_5OmniForConditionalGeneration",
+                model_stage="talker",
+            ),
+            SimpleNamespace(
+                stage_id=0,
+                async_chunk=False,
+                model_arch="Qwen3OmniMoeForConditionalGeneration",
+                model_stage="thinker",
+            ),
+        ]
+
+        for model_config in cases:
+            self.assertFalse(uses_qwen3_omni_full_payload_input_coordinator(model_config))
+
+
 class TestChunkCoordinatorStateTransition(unittest.TestCase):
     """Test 5: process_pending_chunks transitions WAITING_FOR_CHUNK → target."""
 
     def test_ready_request_transitions_to_waiting(self):
-        coord = ChunkSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
+        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
 
         req = _make_request("r1", status=RequestStatus.WAITING_FOR_CHUNK)
         waiting = MockQueue([req])
@@ -110,7 +156,7 @@ class TestChunkCoordinatorStateTransition(unittest.TestCase):
         self.assertIn("r1", coord.requests_with_ready_chunks)
 
     def test_non_ready_stays_waiting_for_chunk(self):
-        coord = ChunkSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
+        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
 
         req = _make_request("r1", status=RequestStatus.WAITING_FOR_CHUNK)
         waiting = MockQueue([req])
@@ -126,7 +172,7 @@ class TestChunkCoordinatorStateTransition(unittest.TestCase):
         self.assertEqual(req.status, RequestStatus.WAITING_FOR_CHUNK)
 
     def test_stage_0_is_noop(self):
-        coord = ChunkSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=0)
+        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=0)
         req = _make_request("r1")
         waiting = MockQueue([req])
         running: list = []
@@ -144,7 +190,7 @@ class TestChunkCoordinatorRestoreQueues(unittest.TestCase):
     """Test 6: restore_queues returns waiting-for-chunk requests."""
 
     def test_restore(self):
-        coord = ChunkSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
+        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
 
         r1 = _make_request("r1")
         r2 = _make_request("r2")
@@ -166,7 +212,7 @@ class TestChunkCoordinatorFinishedSignal(unittest.TestCase):
     """Test 8: chunk_finished_req_ids → finished_requests."""
 
     def test_finished_signal(self):
-        coord = ChunkSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
+        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
 
         req = _make_request("r1", status=RequestStatus.WAITING_FOR_CHUNK)
         waiting = MockQueue([req])
@@ -187,7 +233,7 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
 
     def test_ar_mode_no_longer_sets_additional_information(self):
         """AR mode only processes scheduling metadata, not full payloads."""
-        coord = ChunkSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
+        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
 
         req = _make_request("r1")
         requests = {"r1": req}
@@ -204,10 +250,14 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         self.assertIsNone(getattr(req, "additional_information", None))
 
     def test_generation_mode(self):
-        coord = ChunkSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
+        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
 
         req = _make_request("r1")
         req.prompt_token_ids = [0, 0, 0]
+        req.num_prompt_tokens = 3
+        req.num_computed_tokens = 3
+        req._all_token_ids = [0, 0, 0, 99]
+        req._output_token_ids = [99]
         requests = {"r1": req}
 
         request_metadata = {
@@ -220,16 +270,61 @@ class TestChunkCoordinatorUpdateRequestMetadata(unittest.TestCase):
         coord.update_request_metadata(requests, request_metadata, model_mode="generation")
 
         self.assertEqual(req.prompt_token_ids, [10, 20, 30])
+        self.assertEqual(req.num_prompt_tokens, 3)
         self.assertEqual(req.num_computed_tokens, 0)
+        self.assertEqual(req._all_token_ids, [10, 20, 30])
+        self.assertEqual(req._output_token_ids, [])
         self.assertIsNone(req.additional_information)
         self.assertEqual(req._omni_initial_model_buffer, {"meta": {"left_context_size": 25}})
+
+    def test_generation_mode_flattens_tensor_code_predictor_codes(self):
+        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
+
+        req = _make_request("r1")
+        req.prompt_token_ids = [9]
+        req.num_prompt_tokens = 1
+        req._all_token_ids = [9, 8]
+        req._output_token_ids = [8]
+        requests = {"r1": req}
+
+        coord.update_request_metadata(
+            requests,
+            {"r1": {"code_predictor_codes": torch.tensor([[1, 2, 3]], dtype=torch.long)}},
+            model_mode="generation",
+        )
+
+        self.assertEqual(req.prompt_token_ids, [1, 2, 3])
+        self.assertEqual(req.num_prompt_tokens, 3)
+        self.assertEqual(req._all_token_ids, [1, 2, 3])
+        self.assertEqual(req._output_token_ids, [])
+
+    def test_generation_mode_flattens_nested_code_predictor_codes(self):
+        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
+
+        req = _make_request("r1")
+        req.prompt_token_ids = [9]
+        req.num_prompt_tokens = 1
+        req._all_token_ids = [9, 8]
+        req._output_token_ids = [8]
+        requests = {"r1": req}
+
+        coord.update_request_metadata(
+            requests,
+            {"r1": {"code_predictor_codes": [[1, 2], [3, 4]]}},
+            model_mode="generation",
+        )
+
+        self.assertEqual(req.prompt_token_ids, [1, 2, 3, 4])
+        self.assertEqual(req.num_prompt_tokens, 4)
+        self.assertEqual(req._all_token_ids, [1, 2, 3, 4])
+        self.assertEqual(req._output_token_ids, [])
 
 
 class TestChunkCoordinatorPostprocess(unittest.TestCase):
     """Test postprocess_scheduler_output clears ready chunks."""
 
     def test_clear_ready(self):
-        coord = ChunkSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
+        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1)
         coord.requests_with_ready_chunks = {"r1", "r2"}
 
         new_req = SimpleNamespace(req_id="r1")
@@ -365,6 +460,33 @@ class TestWaitingForInputTransition(unittest.TestCase):
 
         self.assertEqual(len(coord.pending_input_registrations), 1)
         self.assertEqual(coord.pending_input_registrations[0].request_id, "r1")
+
+    def test_idle_cycles_retain_received_marker_before_request_appears(self):
+        coord = OmniSchedulingCoordinator(
+            scheduler_max_num_seqs=10,
+            stage_id=1,
+            async_chunk=False,
+        )
+        coord._full_payload_input_received.add("late")
+        coord.finished_requests.add("late")
+
+        waiting = MockQueue()
+        running: list = []
+
+        coord.process_pending_full_payload_inputs(waiting, running, stage_recv_req_ids=set())
+
+        self.assertIn("late", coord._full_payload_input_received)
+        self.assertIn("late", coord.finished_requests)
+
+        late_req = _make_request("late", status=RequestStatus.WAITING)
+        waiting.add_request(late_req)
+
+        coord.process_pending_full_payload_inputs(waiting, running, stage_recv_req_ids=set())
+
+        self.assertEqual(late_req.status, RequestStatus.WAITING)
+        self.assertEqual(coord.pending_input_registrations, [])
+        self.assertIn("late", coord._full_payload_input_received)
+        self.assertIn("late", coord.finished_requests)
 
 
 class TestTimeoutDetection(unittest.TestCase):
@@ -508,14 +630,18 @@ class TestTimeoutDetection(unittest.TestCase):
         self.assertEqual(len(coord._waiting_for_input), 0)
 
     def test_free_finished_request_clears_waiting_since(self):
-        """free_finished_request clears _waiting_since."""
+        """free_finished_request clears coordinator lifecycle markers."""
         coord = OmniSchedulingCoordinator(
             scheduler_max_num_seqs=10,
             stage_id=1,
         )
         coord._waiting_since["r1"] = 0.0
+        coord._full_payload_input_received.add("r1")
+        coord.finished_requests.add("r1")
         coord.free_finished_request("r1")
         self.assertNotIn("r1", coord._waiting_since)
+        self.assertNotIn("r1", coord._full_payload_input_received)
+        self.assertNotIn("r1", coord.finished_requests)
 
     def test_timeout_from_running_queue_full_lifecycle(self):
         """End-to-end: request from running → WAITING_FOR_CHUNK → restore →
