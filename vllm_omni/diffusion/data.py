@@ -814,6 +814,15 @@ class OmniDiffusionConfig:
                 # (non-DiT models don't have a separate transformer folder/config)
                 if self.diffusion_load_format == "diffusers":
                     self.set_tf_model_config(TransformerConfig())
+                    try:
+                        diffusers_pipeline_cls_name = config_dict["_class_name"]
+                        self.diffusers_pipeline_cls = getattr(diffusers, diffusers_pipeline_cls_name)
+                    except (KeyError, AttributeError) as exc:
+                        logger.warning(
+                            "Could not find valid _class_name for diffusers pipeline in model_index.json: %s. "
+                            "Without the underlying pipeline class the dummy run may omit required inputs.",
+                            exc,
+                        )
                 else:
                     tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model)
                     self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
@@ -824,7 +833,13 @@ class OmniDiffusionConfig:
             # (non-DiT models don't have a separate transformer folder/config)
             if self.diffusion_load_format == "diffusers":
                 self.set_tf_model_config(TransformerConfig())
-                self.update_multimodal_support()
+                logger.warning(
+                    "Could not find valid model_index.json per diffusers format. "
+                    "This model is likely unsupported by the diffusers backend. "
+                    "Also, without knowing the underlying diffusers pipeline class from model_index.json, "
+                    "the dummy run will input only text prompt, which may cause errors for pipelines "
+                    "that require additional inputs."
+                )
             else:
                 cfg = get_hf_file_to_dict("config.json", self.model)
                 if cfg is None:
