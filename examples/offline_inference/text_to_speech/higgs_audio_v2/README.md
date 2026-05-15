@@ -56,7 +56,7 @@ python examples/offline_inference/text_to_speech/higgs_audio_v2/end2end.py \
     --output-wav hello_hf_reference.wav
 ```
 
-This is useful as a smoke test when validating a fresh install before exercising the vllm-omni Stage-0 talker integration. The 3B Stage-0 talker is structurally registered in this repo but its AR-loop integration is gated on the upstream-trace memo and reference fixtures captured by `reference_hf.py`; see the model package `__init__.py` and `vllm_omni/model_executor/models/higgs_audio_v2/UPSTREAM_TRACE.md` for the contract.
+This is the upstream smoke path; useful when validating a fresh install. The vllm-omni Stage-0 talker is registered with a full DualFFN-routed forward and HF→vLLM-native weight loader, but the sampler-side dispatch that emits codebook-0 IDs at audio positions still lands in a follow-up; until that ships, the live `/v1/audio/speech` smoke path requires the upstream-traced sampler-codebook adapter described in `vllm_omni/model_executor/models/higgs_audio_v2/UPSTREAM_TRACE.md` and at the model-package `__init__.py` / talker docstring.
 
 ## Scope (v1)
 

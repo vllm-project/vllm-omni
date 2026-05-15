@@ -758,40 +758,51 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         *,
         audio_token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Per-position logits.
+        """Sampler-compatible logits tensor.
 
-        - Text positions go through ``lm_head`` (Llama 128256-wide).
-        - Audio positions go through ``audio_codebook0_head`` (1026-wide for
-          codebook 0). Residual codebooks 1..7 are emitted by
-          ``code_predictor.predict_residual`` in :meth:`postprocess` once
-          codebook-0 has been sampled and embedded.
+        Returns a single ``[N, vocab_size]`` tensor that the stock
+        vLLM AR runner pipes through ``.contiguous()`` and a generic
+        sampler. For Round-5 the contract is intentionally tensor-only:
 
-        When ``audio_token_mask`` is omitted we default to the text LM head
-        for the entire batch (this matches the standard text-only branch
-        every other vllm-omni TTS talker exposes by default; the engine
-        passes the mask through ``extra_layer_kwargs`` via
-        :meth:`forward`).
+        - Text-position logits come from ``lm_head`` (128256-wide Llama vocab).
+        - Audio-position logits at audio_token_id placeholders are also
+          read from ``lm_head`` for now; the per-position codebook-0
+          routing path described in ``UPSTREAM_TRACE.md`` lives in
+          :meth:`audio_codebook0_logits` and is consumed by a separate
+          codebook-0 sampling adapter (round-6 follow-up). The previous
+          dict-return form broke the AR runner's
+          ``compute_logits(...).contiguous()`` contract; this restores
+          tensor-only output so the engine can boot the talker even before
+          the dedicated audio-sampler dispatch lands.
+
+        Call :meth:`audio_codebook0_logits` for the audio-side 1026-wide
+        head; that helper is exercised by unit tests + the upcoming
+        sampler dispatch.
         """
-        text_logits = self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
-        if audio_token_mask is None:
-            return text_logits
+        _ = audio_token_mask  # The mask is consumed by audio_codebook0_logits, not here.
+        return self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
 
+    def audio_codebook0_logits(
+        self,
+        hidden_states: torch.Tensor,
+        audio_token_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Codebook-0 logits at audio positions, ``[N_audio, codebook_size]``.
+
+        Separated from :meth:`compute_logits` so the AR runner can pipe a
+        tensor through the stock sampler while a dedicated codebook-0
+        sampling adapter consumes this tensor in parallel. Returns an
+        empty tensor when ``audio_token_mask`` selects no positions.
+        """
         mask = audio_token_mask.reshape(-1).to(hidden_states.device)
-        if not mask.any():
-            return text_logits
-
         hidden_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
-        audio_logits = self.audio_codebook0_head(hidden_flat[mask])  # [N_audio, codebook_size]
-        # We can't blend a 128256-wide text vocab with a 1026-wide audio
-        # vocab in one logits tensor without a vocab-routing layer; instead,
-        # return a structured result the engine can dispatch on. Defaulting
-        # to a python dict keeps this method composable with future
-        # AR-loop integration work.
-        return {
-            "text_logits": text_logits,
-            "audio_codebook0_logits": audio_logits,
-            "audio_mask": mask,
-        }
+        if not mask.any():
+            return torch.empty(
+                (0, int(self.config.codebook_size)),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        return self.audio_codebook0_head(hidden_flat[mask])
 
     def predict_audio_residual_codebooks(
         self,
@@ -848,10 +859,26 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
     ) -> OmniOutput:
         """Wrap raw decoder outputs into the :class:`OmniOutput` contract
         expected by ``vllm_omni/model_executor/stage_input_processors/higgs_audio_v2.py:talker2code2wav``.
+
+        Reads the per-step audio codes from ANY of the runner-side keyword
+        sources: explicit ``audio_codes=``, the ``model_kwargs`` dict the
+        ``gpu_model_runner`` passes through, or the ``model_kwargs_extra``
+        dict. Falling back to an empty tensor when no audio is in scope
+        keeps the downstream ``talker2code2wav`` sync adapter on its happy
+        path (which already handles the empty case gracefully).
         """
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
+        audio_codes = kwargs.get("audio_codes")
+        if audio_codes is None:
+            for source_name in ("model_kwargs", "model_kwargs_extra"):
+                source = kwargs.get(source_name)
+                if isinstance(source, dict) and "audio_codes" in source:
+                    audio_codes = source["audio_codes"]
+                    break
+        if audio_codes is None:
+            audio_codes = torch.empty(0, dtype=torch.long)
         return OmniOutput(
             text_hidden_states=model_outputs,
-            multimodal_outputs={"codes": {"audio": kwargs.get("audio_codes", torch.empty(0, dtype=torch.long))}},
+            multimodal_outputs={"codes": {"audio": audio_codes}},
         )

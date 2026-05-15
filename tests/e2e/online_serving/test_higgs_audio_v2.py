@@ -375,17 +375,20 @@ def test_fixture_input_ids_match_build_plain_text_prompt() -> None:
 )
 @pytest.mark.xfail(
     reason=(
-        "AC-4 RMS parity against the upstream codec is gated on either (a) "
-        "vendoring boson-ai's higgs_audio_tokenizer module so its state_dict "
-        "loads cleanly into our HiggsAudioRVQ kernel, or (b) shipping a "
-        "model.pth -> shared-kernel state_dict mapper. The boson-ai standalone "
-        "tokenizer at bosonai/higgs-audio-v2-tokenizer publishes model.pth with "
-        "keys like `quantizer.vq.layers.<i>._codebook.embed` and an upstream "
+        "AC-4 RMS parity is blocked on TWO independent gaps: (1) the committed "
+        "reference_pcm tensors are not authoritative upstream PCM -- the "
+        "AutoProcessor's audio_tokenizer was loaded with random weights from "
+        "the wrong section of the safetensors blob, so every saved reference_pcm "
+        "has abs.max=706 / abs.mean=398.7 regardless of prompt (silent-noise "
+        "fingerprint). (2) the boson-ai standalone tokenizer at "
+        "bosonai/higgs-audio-v2-tokenizer publishes model.pth with keys like "
+        "`quantizer.vq.layers.<i>._codebook.embed` and an upstream "
         "DAC+Snake+weight-norm decoder, which differs structurally from the "
-        "OmniVoice-bundled audio_tokenizer (`quantizer.quantizers.<i>.codebook.embed`, "
-        "plain DAC). The shared kernel currently expects the OmniVoice layout. "
-        "See goal-tracker Open Issue 'Stage-1 codec weights for the standalone "
-        "boson-ai tokenizer repo'."
+        "OmniVoice-bundled audio_tokenizer that the shared kernel was built "
+        "against. Unblocking requires (a) capturing a real upstream PCM "
+        "reference via boson-ai's own ServeEngine, AND (b) implementing a "
+        "model.pth -> shared-kernel mapper OR vendoring the upstream codec. "
+        "See goal-tracker Open Issue 'AC-4 RMS positive parity'."
     ),
     strict=False,
 )
@@ -754,8 +757,12 @@ def test_dual_ffn_norm_routing_splits_text_and_audio() -> None:
     assert torch.allclose(out[0, 2:], audio_expected, atol=1e-6)
 
 
-def test_talker_compute_logits_routes_audio_to_codebook0_head() -> None:
-    """compute_logits with audio_token_mask should produce a dict carrying the codebook-0 logits."""
+def test_talker_compute_logits_returns_tensor_and_audio_helper_runs_separately() -> None:
+    """compute_logits MUST return a tensor (the AR runner pipes the result
+    through ``.contiguous()`` + a generic sampler). Codebook-0 audio routing
+    lives in :meth:`audio_codebook0_logits`, which the dedicated audio-side
+    sampler dispatch (round-6 follow-up) consumes in parallel.
+    """
     from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import (
         HiggsAudioV2Config,
     )
@@ -775,24 +782,71 @@ def test_talker_compute_logits_routes_audio_to_codebook0_head() -> None:
     audio_head = torch.nn.Linear(hidden, int(cfg.codebook_size), bias=False)
     with torch.no_grad():
         audio_head.weight.mul_(0.01)
-
     talker.audio_codebook0_head = audio_head
 
-    # Stub lm_head + logits_processor.
     class _StubLP:
         def __call__(self, head, hidden_states, sampling_metadata):
             return torch.zeros(int(hidden_states.shape[0]), int(cfg.vocab_size))
 
-    talker.lm_head = object()  # unused by the stub
+    talker.lm_head = object()
     talker.logits_processor = _StubLP()
 
     h = torch.randn(4, hidden)
     mask = torch.tensor([True, False, True, False])
+
+    # 1. compute_logits returns a tensor that the runner can call .contiguous() on.
     out = talker.compute_logits(h, sampling_metadata=None, audio_token_mask=mask)
-    assert isinstance(out, dict)
-    assert "audio_codebook0_logits" in out
-    assert out["audio_codebook0_logits"].shape == (2, int(cfg.codebook_size))
-    assert out["audio_mask"].sum().item() == 2
+    assert isinstance(out, torch.Tensor)
+    assert out.shape == (4, int(cfg.vocab_size))
+    _ = out.contiguous()  # smoke-test the runner-side call site
+
+    # 2. audio_codebook0_logits returns the 1026-wide codebook-0 logits at
+    # masked positions only.
+    cb0 = talker.audio_codebook0_logits(h, mask)
+    assert isinstance(cb0, torch.Tensor)
+    assert cb0.shape == (2, int(cfg.codebook_size))
+
+    # 3. Empty mask -> empty audio logits, runner-safe.
+    empty_mask = torch.zeros(4, dtype=torch.bool)
+    cb0_empty = talker.audio_codebook0_logits(h, empty_mask)
+    assert cb0_empty.shape == (0, int(cfg.codebook_size))
+
+
+def test_make_omni_output_reads_audio_codes_from_runner_kwargs() -> None:
+    """``make_omni_output`` must accept any of: explicit audio_codes,
+    model_kwargs[audio_codes], model_kwargs_extra[audio_codes]."""
+    from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import (
+        HiggsAudioV2Config,
+    )
+    from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_talker import (
+        HiggsAudioV2TalkerForConditionalGeneration,
+    )
+
+    cfg = HiggsAudioV2Config(num_hidden_layers=1)
+    talker = HiggsAudioV2TalkerForConditionalGeneration.__new__(
+        HiggsAudioV2TalkerForConditionalGeneration
+    )
+    torch.nn.Module.__init__(talker)
+    talker.config = cfg
+
+    h = torch.zeros(1, int(cfg.hidden_size))
+    codes = torch.arange(8, dtype=torch.long)
+
+    # Explicit kwarg.
+    out1 = talker.make_omni_output(h, audio_codes=codes)
+    assert torch.equal(out1.multimodal_outputs["codes"]["audio"], codes)
+
+    # model_kwargs dict.
+    out2 = talker.make_omni_output(h, model_kwargs={"audio_codes": codes})
+    assert torch.equal(out2.multimodal_outputs["codes"]["audio"], codes)
+
+    # model_kwargs_extra dict.
+    out3 = talker.make_omni_output(h, model_kwargs_extra={"audio_codes": codes})
+    assert torch.equal(out3.multimodal_outputs["codes"]["audio"], codes)
+
+    # No source -> empty tensor (the talker2code2wav sync adapter handles this).
+    out4 = talker.make_omni_output(h)
+    assert out4.multimodal_outputs["codes"]["audio"].numel() == 0
 
 
 def test_talker_residual_codebook_predictor_emits_seven_codebooks() -> None:
@@ -917,6 +971,103 @@ def test_cuda_graph_wrapper_disabled_is_passthrough() -> None:
     x = torch.tensor([[1, 2, 3]])
     out = wrapper(x=x)
     assert torch.equal(out, x + 100)
+
+
+def test_fixture_reference_pcm_provenance_documented() -> None:
+    """Document (and fail loudly when it ever changes) that the captured
+    ``reference_pcm`` is currently NOT authoritative upstream PCM.
+
+    Round-2/3 review noted -- and a direct probe in round 5 confirms -- that
+    every saved ``reference_pcm`` tensor has the same abs.max=706 and
+    abs.mean ~= 398.7 regardless of prompt content. This is the silent-noise
+    fingerprint of the upstream AutoProcessor's audio_tokenizer being loaded
+    with random weights from the wrong section of the model.safetensors blob.
+
+    This test exists so the FIRST round that captures a real upstream PCM
+    reference will trip an obvious failure here, signaling that the AC-4
+    positive RMS test should also be flipped from xfail to a real
+    assertion. Until then, fixtures' reference_pcm is suitable only for
+    shape / dtype / sample-rate checks, NOT for content parity.
+    """
+    fixture = REPO_ROOT / "tests" / "fixtures" / "higgs_audio_v2" / "reference_hello_world.pt"
+    if not fixture.exists():
+        pytest.skip("reference fixture not present")
+    blob = torch.load(fixture, weights_only=False)
+    pcm = blob["reference_pcm"].abs()
+    # The silent-noise fingerprint: max in the low hundreds and mean very
+    # close to the constant. If a future round captures a real PCM reference,
+    # abs.max will be in the 10000+ range and abs.mean will vary per prompt.
+    assert int(pcm.max()) < 5000, (
+        f"reference_hello_world.pt abs.max={int(pcm.max())} > 5000 suggests a "
+        "real upstream PCM reference was captured; flip the AC-4 xfail to "
+        "an active assertion."
+    )
+
+
+def test_ac9_offline_smoke_runs_through_shared_codec() -> None:
+    """AC-9 offline smoke test (clean-machine target).
+
+    Loads the committed reference fixture, builds the shared HiggsAudio codec
+    kernel with random-but-valid weights, runs the codes through Stage-1's
+    direct decode API, and asserts the result is a non-degenerate 24 kHz
+    PCM tensor of the expected shape. This exercises the path documented in
+    `examples/offline_inference/text_to_speech/higgs_audio_v2/README.md`
+    (``--mode stage1_only``) without requiring the boson-ai checkpoint to be
+    downloaded.
+
+    Real-checkpoint replay still requires the boson-ai tokenizer + the
+    upstream codec weight format; that path is exercised by
+    ``test_stage1_decode_parity_rms`` (currently ``xfail`` for the reasons
+    documented there).
+    """
+    from vllm_omni.model_executor.models._shared.higgs_audio_decoder import (
+        HiggsAudioRVQ,
+    )
+    from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import (
+        HiggsAudioV2Config,
+    )
+    from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_code2wav import (
+        HiggsAudioV2Code2Wav,
+    )
+
+    fixture = REPO_ROOT / "tests" / "fixtures" / "higgs_audio_v2" / "reference_hello_world.pt"
+    if not fixture.exists():
+        pytest.skip("reference fixture not present")
+    blob = torch.load(fixture, weights_only=False)
+    codes = blob["audio_codes"].long()
+    if codes.shape[1] != 8 and codes.shape[2] == 8:
+        codes = codes.transpose(1, 2).contiguous()
+    assert codes.shape[1] == 8
+
+    cfg = HiggsAudioV2Config()
+    stage1 = HiggsAudioV2Code2Wav(cfg)
+
+    # Build a synthetic but valid Stage-1 stack with the shared kernel.
+    # Random weights are fine for the AC-9 SHAPE smoke (no parity).
+    torch.manual_seed(0)
+    quantizer = HiggsAudioRVQ(
+        num_quantizers=int(cfg.num_codebooks),
+        codebook_size=int(cfg.num_real_codes),
+        codebook_dim=64,
+        hidden_size=1024,
+    )
+    fc2 = torch.nn.Linear(1024, 256)
+    decoder_stub = torch.nn.ConvTranspose1d(256, 1, kernel_size=960, stride=960)
+    with torch.no_grad():
+        decoder_stub.weight.uniform_(-0.01, 0.01)
+        decoder_stub.bias.zero_()
+    stage1.quantizer = quantizer
+    stage1.fc2 = fc2
+    stage1.acoustic_decoder = decoder_stub
+    stage1._loaded = True
+
+    pcm = stage1.decode_codes(codes)
+    # Shape: [B, 1, T * hop=960]
+    expected_samples = int(codes.shape[2]) * 960
+    assert pcm.shape == (1, 1, expected_samples), (
+        f"AC-9 offline smoke expected PCM shape (1, 1, {expected_samples}); got {tuple(pcm.shape)}"
+    )
+    assert torch.isfinite(pcm).all()
 
 
 def test_stage1_engine_constructor_signature() -> None:
