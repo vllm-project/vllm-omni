@@ -1,0 +1,70 @@
+# higgs-audio v2 deploy: Stage 0 (talker) -> Stage 1 (code2wav) via shared memory.
+#
+# Phase-1 scope is plain text -> 24 kHz speech only; voice cloning, multi-speaker,
+# ChatML rich messages, and music/sound-event prompts are rejected by the
+# request validator with explicit 4xx (see
+# vllm_omni/entrypoints/openai/serving_speech.py and
+# vllm_omni/model_executor/models/higgs_audio_v2/higgs_audio_v2_tokenizer.py).
+#
+# `async_chunk` defaults to false so the first online integration validates
+# the non-streaming path before flipping streaming on (DEC-1 in results/plan.md
+# is PENDING; the flip lives in a follow-up).
+async_chunk: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      codec_streaming: false
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 5000
+      connector_get_max_wait: 500
+      # Used only when async_chunk is flipped to true.
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+      initial_codec_chunk_frames: 1
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.4
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    max_num_batched_tokens: 2048
+    # max_model_len covers prompt + max_new_tokens (default <=1500 codec
+    # frames per DEC-4, so 4096 is comfortable).
+    max_model_len: 4096
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1500
+      seed: 42
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.3
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: false
+    # Prefill length is num_codebooks * num_frames; 8 * 8192 = 65536 covers
+    # the upper bound at max_new_tokens=1500 plus headroom.
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.0
