@@ -118,8 +118,13 @@ class TestRelabelGauge:
         )
 
     def test_labels_positional_passthrough(self, registry):
-        # Phase 2.2's per_engine_labelvalues setter feeds positional 3-tuples;
-        # our mixin must not mangle positional .labels() calls.
+        # Phase 2.4 double-rewrite guard: Phase 2.2b's per_engine_labelvalues
+        # setter rewrites the values to 3-tuple [model_name, stage, replica]
+        # BEFORE create_metric_per_engine fans them into .labels(*values). The
+        # mixin must detect that args length already matches the rewritten
+        # labelnames and pass through, otherwise it would re-interpret
+        # args[engine_label_index] as an engine_idx and splice (stage, replica)
+        # again, blowing label count to 4.
         g = _RelabelGauge(
             name="omni_test_gauge_pos",
             documentation="test",
@@ -379,3 +384,105 @@ class TestOmniPrometheusStatLogger:
 
         assert dict(_ENGINE_INDEX_MAP) == srm
         assert 99 not in _ENGINE_INDEX_MAP  # old entry was cleared
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.4 — helper-class wraps for upstream's spec_decoding / kv_connector
+# / perf_metrics sub-collectors. Without these, OmniPrometheusStatLogger
+# crashes at startup with `Incorrect label count` because each helper builds
+# its internal Counter/Gauge/Histogram families with raw 2-element labelnames
+# (passed via constructor arg) while consuming the rewritten 3-element
+# per_engine_labelvalues from the property descriptor.
+# ---------------------------------------------------------------------------
+
+
+from vllm_omni.metrics.stat_logger import (
+    _OmniKVConnectorProm,
+    _OmniPerfMetricsProm,
+    _OmniSpecDecodingProm,
+)
+
+
+class TestHelperClassWraps:
+    def test_perf_metrics_wrap_routes_through_relabel_counter(self):
+        assert _OmniPerfMetricsProm._counter_cls is _RelabelCounter
+
+    def test_spec_decoding_wrap_routes_through_relabel_counter(self):
+        assert _OmniSpecDecodingProm._counter_cls is _RelabelCounter
+
+    def test_kv_connector_wrap_routes_through_all_three_relabel_classes(self):
+        # KVConnector lets each connector build any of Gauge/Counter/Histogram,
+        # so all three slots must be intercepted.
+        assert _OmniKVConnectorProm._gauge_cls is _RelabelGauge
+        assert _OmniKVConnectorProm._counter_cls is _RelabelCounter
+        assert _OmniKVConnectorProm._histogram_cls is _RelabelHistogram
+
+    def test_omni_logger_slots_point_to_helper_subclasses(self):
+        # Upstream's PrometheusStatLogger.__init__ instantiates each sub-helper
+        # via `self._<name>_cls(...)`, so the slot overrides on the omni
+        # subclass are what routes through to the relabel mixin.
+        assert OmniPrometheusStatLogger._perf_metrics_cls is _OmniPerfMetricsProm
+        assert OmniPrometheusStatLogger._spec_decoding_cls is _OmniSpecDecodingProm
+        assert OmniPrometheusStatLogger._kv_connector_cls is _OmniKVConnectorProm
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.4 double-rewrite guard. The mixin's positional-args path used to
+# unconditionally splice (stage, replica) at engine_label_index. After Phase
+# 2.2b started rewriting per_engine_labelvalues to 3-tuples *before* feeding
+# them into create_metric_per_engine, that splice ran a second time on the
+# already-rewritten values, blowing the label count to 4. The guard now
+# detects len(args) == len(self._labelnames) and short-circuits to passthrough.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fresh_registry():
+    from prometheus_client import CollectorRegistry as _R
+
+    return _R()
+
+
+class TestDoubleRewriteGuard:
+    def test_pre_rewritten_3tuple_passes_through(self, fresh_registry):
+        # 2-label original → 3-label rewritten family. Caller passes 3 values
+        # (the rewritten shape) and they should land verbatim, not get
+        # re-spliced.
+        _ENGINE_INDEX_MAP.clear()
+        _ENGINE_INDEX_MAP[0] = ("0", "0")
+        _ENGINE_INDEX_MAP[1] = ("1", "0")
+        g = _RelabelGauge(
+            name="dr_pre_rewritten",
+            documentation="t",
+            labelnames=["model_name", "engine"],
+            registry=fresh_registry,
+        )
+        # 3 positional args matching the rewritten 3-label family.
+        g.labels("m", "1", "0").set(42)
+        out = generate_latest(fresh_registry).decode()
+        assert (
+            'dr_pre_rewritten{model_name="m",replica="0",stage="1"} 42.0' in out
+        )
+
+    def test_legacy_2tuple_with_extra_label_still_splices(self, fresh_registry):
+        # 3-label original (engine in middle) → 4-label rewritten family.
+        # Caller passes 3 values matching the ORIGINAL labelnames (the
+        # gauge_waiting_by_reason / counter_request_success pattern from
+        # upstream loggers.py:646, 679). The mixin must splice
+        # (stage, replica) at engine's position to reach the 4-label family.
+        _ENGINE_INDEX_MAP.clear()
+        _ENGINE_INDEX_MAP[1] = ("1", "0")
+        c = _RelabelCounter(
+            name="dr_legacy_with_extra",
+            documentation="t",
+            labelnames=["model_name", "engine", "reason"],
+            registry=fresh_registry,
+        )
+        # 3 positional args matching ORIGINAL labelnames (model_name,
+        # engine_str, reason).
+        c.labels("m", "1", "stop").inc(3)
+        out = generate_latest(fresh_registry).decode()
+        assert (
+            'dr_legacy_with_extra_total{model_name="m",reason="stop",replica="0",stage="1"} 3.0'
+            in out
+        )

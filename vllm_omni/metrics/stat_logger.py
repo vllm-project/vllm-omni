@@ -13,7 +13,10 @@ from __future__ import annotations
 
 from prometheus_client import Counter, Gauge, Histogram
 from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorProm
 from vllm.v1.metrics.loggers import PrometheusStatLogger
+from vllm.v1.metrics.perf import PerfMetricsProm
+from vllm.v1.spec_decode.metrics import SpecDecodingProm
 
 # Process-wide translation table written by OmniPrometheusStatLogger at init.
 # Keys are flat engine_idx values (as upstream PrometheusStatLogger sees them);
@@ -94,7 +97,23 @@ class _RelabelMixin:
     def labels(self, *args, **kwargs):
         if self._engine_label_index >= 0:
             if args:
-                # Positional form: replace args[engine_idx] with (stage, replica).
+                # Positional form. There are TWO upstream patterns:
+                #
+                # (a) Pre-rewritten path: create_metric_per_engine fans
+                #     `per_engine_labelvalues` (already a 3-tuple
+                #     [model_name, stage, replica] thanks to the property-
+                #     descriptor setter on OmniPrometheusStatLogger) into
+                #     `metric.labels(*values)`. len(args) matches the
+                #     rewritten label set already, so just pass through.
+                #
+                # (b) Legacy 2-tuple path: upstream sites like
+                #     `counter_request_success.labels(model_name, str(idx),
+                #     str(reason))` pass values shaped to the *original*
+                #     labelnames (engine still present at idx). Here
+                #     len(args) is short by 1 — splice (stage, replica)
+                #     in place of the engine value at engine_label_index.
+                if len(args) == len(self._labelnames):
+                    return super().labels(*args, **kwargs)
                 idx = self._engine_label_index
                 if idx < len(args):
                     stage, replica = _engine_to_stage_replica(args[idx])
@@ -118,6 +137,41 @@ class _RelabelHistogram(_RelabelMixin, Histogram):
     pass
 
 
+# ----------------------------------------------------------------------------
+# Helper-class wraps for the three sub-metric collectors that upstream
+# PrometheusStatLogger constructs in its __init__ (loggers.py:438-446):
+#
+#     self.spec_decoding_prom = self._spec_decoding_cls(...)
+#     self.kv_connector_prom = self._kv_connector_cls(...)
+#     self.perf_metrics_prom = self._perf_metrics_cls(...)
+#
+# Each helper receives raw `labelnames` as a constructor argument and uses
+# its own class-level `_counter_cls` / `_gauge_cls` / `_histogram_cls` slots
+# to build internal Counter/Gauge/Histogram families. The slot overrides on
+# OmniPrometheusStatLogger only reach families created via *its* slots, so
+# the helpers would otherwise still construct 2-label families and then hit
+# `Incorrect label count` when create_metric_per_engine feeds the rewritten
+# 3-element per_engine_labelvalues. Subclassing each helper and overriding
+# its slots routes the relabel mixin through to the helper-internal families
+# too. The helper kept seeing the OLD 2-element labelnames param, but that
+# is fine because the wrapper rewrites it at family-creation time.
+# ----------------------------------------------------------------------------
+
+
+class _OmniPerfMetricsProm(PerfMetricsProm):
+    _counter_cls = _RelabelCounter
+
+
+class _OmniSpecDecodingProm(SpecDecodingProm):
+    _counter_cls = _RelabelCounter
+
+
+class _OmniKVConnectorProm(KVConnectorProm):
+    _gauge_cls = _RelabelGauge
+    _counter_cls = _RelabelCounter
+    _histogram_cls = _RelabelHistogram
+
+
 class OmniPrometheusStatLogger(PrometheusStatLogger):
     """Wrap upstream PrometheusStatLogger to expose per-(stage, replica) labels.
 
@@ -136,6 +190,13 @@ class OmniPrometheusStatLogger(PrometheusStatLogger):
     _gauge_cls = _RelabelGauge
     _counter_cls = _RelabelCounter
     _histogram_cls = _RelabelHistogram
+    # Inject helper-class wraps too so the perf / spec-decoding / kv-connector
+    # sub-collectors get the same labelname rewrite and don't crash with
+    # `Incorrect label count` when create_metric_per_engine fans out the
+    # rewritten 3-element per_engine_labelvalues over their internal families.
+    _perf_metrics_cls = _OmniPerfMetricsProm
+    _spec_decoding_cls = _OmniSpecDecodingProm
+    _kv_connector_cls = _OmniKVConnectorProm
 
     def __init__(
         self,
