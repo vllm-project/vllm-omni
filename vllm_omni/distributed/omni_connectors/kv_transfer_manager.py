@@ -1247,6 +1247,9 @@ class OmniKVTransferManager:
             get_cfg_group,
             get_classifier_free_guidance_rank,
             get_classifier_free_guidance_world_size,
+            get_sequence_parallel_rank,
+            get_sequence_parallel_world_size,
+            get_sp_group,
             get_world_group,
         )
 
@@ -1260,6 +1263,9 @@ class OmniKVTransferManager:
         cfg_size = 1
         cfg_rank = 0
         cfg_group = None
+        sp_size = 1
+        sp_rank = 0
+        sp_group = None
         try:
             cfg_size = get_classifier_free_guidance_world_size()
             cfg_rank = get_classifier_free_guidance_rank()
@@ -1269,7 +1275,16 @@ class OmniKVTransferManager:
             cfg_rank = 0
             cfg_group = None
 
-        if tp_active and cfg_size <= 1:
+        try:
+            sp_size = get_sequence_parallel_world_size()
+            sp_rank = get_sequence_parallel_rank()
+            sp_group = get_sp_group()
+        except Exception:
+            sp_size = 1
+            sp_rank = 0
+            sp_group = None
+
+        if tp_active and (cfg_size <= 1 and sp_size <= 1):
             logger.info(
                 "Rank-aware KV receive: rank %s independently receiving (from_tp=%s, to_tp=%s)",
                 topo.local_rank,
@@ -1278,16 +1293,45 @@ class OmniKVTransferManager:
             )
             return self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
 
-        if tp_active and cfg_size > 1 and cfg_group is not None:
+        if tp_active and (cfg_size > 1 or sp_size > 1):
             kv_payload: dict[str, object] | None = None
-            if cfg_rank == 0:
-                received = self.receive_multi_kv_cache(req, cfg_kv_collect_func, torch.device("cpu"))
-                rank_payloads = self._build_cfg_rank_local_payloads(req, cfg_size) if received else [None] * cfg_size
-                kv_payload = rank_payloads[0]
-                for dst_rank in range(1, cfg_size):
-                    cfg_group.send_object(rank_payloads[dst_rank], dst_rank)
-            else:
+            is_owner = cfg_rank == 0 and sp_rank == 0
+
+            # step1: only owner need to receive
+            if is_owner:
+                received = self.receive_multi_kv_cache(
+                    req,
+                    cfg_kv_collect_func,
+                    torch.device("cpu"),
+                )
+                if received:
+                    if cfg_size > 1:  # build cfg-local payloads
+                        cfg_rank_payloads = self._build_cfg_rank_local_payloads(
+                            req,
+                            cfg_size,
+                        )
+                        kv_payload = cfg_rank_payloads[0]
+                        # send to other cfg
+                        for dst_cfg_rank in range(1, cfg_size):
+                            cfg_group.send_object(
+                                cfg_rank_payloads[dst_cfg_rank],
+                                dst_cfg_rank,
+                            )
+                    elif sp_size > 1:
+                        kv_payload = self._collect_request_kv_payload(req)
+                else:
+                    # Owner receive failed: send None sentinel to CFG followers to avoid deadlock
+                    if cfg_size > 1:
+                        for dst_cfg_rank in range(1, cfg_size):
+                            cfg_group.send_object(None, dst_cfg_rank)
+            elif sp_rank == 0 and cfg_size > 1:
                 kv_payload = cfg_group.recv_object(0)
+            # sp broadcast
+            if sp_size > 1 and sp_group is not None:
+                kv_payload = sp_group.broadcast_object(
+                    kv_payload,
+                    src=0,
+                )
 
             if not kv_payload:
                 return False

@@ -1992,8 +1992,6 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
         min_score = torch.finfo(logits.dtype).min
 
-        assert logits.shape[0] == 1, f"HunyuanImage3 sampler requires max_num_seqs=1, got batch size {logits.shape[0]}"
-
         for req_idx in range(logits.shape[0]):
             decoded_tokens: list[int] = (
                 sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
