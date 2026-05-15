@@ -88,7 +88,7 @@ def test_text_to_text(omni_runner, omni_runner_handler):
         "modalities": ["text"],
     }
     response = omni_runner_handler.send_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"
     assert response.text_content and len(response.text_content.strip()) > 0
 
 
@@ -112,7 +112,7 @@ def test_audio_to_text(omni_runner, omni_runner_handler):
         "modalities": ["text"],
     }
     response = omni_runner_handler.send_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"
     assert response.text_content and len(response.text_content.strip()) > 0
 
 
@@ -134,7 +134,7 @@ def test_image_to_text(omni_runner, omni_runner_handler):
         "modalities": ["text"],
     }
     response = omni_runner_handler.send_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"
     assert response.text_content and len(response.text_content.strip()) > 0
 
 
@@ -156,7 +156,7 @@ def test_video_to_text(omni_runner, omni_runner_handler):
         "modalities": ["text"],
     }
     response = omni_runner_handler.send_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"
     assert response.text_content and len(response.text_content.strip()) > 0
 
 
@@ -178,7 +178,7 @@ def test_video_to_audio(omni_runner, omni_runner_handler):
         "modalities": ["audio"],
     }
     response = omni_runner_handler.send_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"
 
 
 # ------------------------------------------------------------------
@@ -205,4 +205,4 @@ def test_mix_to_audio(omni_runner, omni_runner_handler):
         "modalities": ["audio"],
     }
     response = omni_runner_handler.send_request(request_config)
-    assert response.success, f"Request failed: {response.error_message}"
+    assert response.success, "Request failed"

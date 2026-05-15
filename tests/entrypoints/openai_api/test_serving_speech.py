@@ -1,5 +1,6 @@
 # tests/entrypoints/openai/test_serving_speech.py
 import asyncio
+import json
 import logging
 import os
 import struct
@@ -559,6 +560,19 @@ class TestSpeechAPI:
         assert response.status_code == 404
         result = response.json()
         assert "not found" in result["detail"]
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        ["   ", "evil/name", ".", "..", "bad\x00voice"],
+    )
+    def test_delete_voice_invalid_name_returns_400(self, client, bad_name):
+        from urllib.parse import quote
+
+        enc = quote(bad_name, safe="")
+        response = client.delete(f"/v1/audio/voices/{enc}")
+        assert response.status_code == 400
+        lowered = json.dumps(response.json()).lower()
+        assert "invalid voice name" in lowered
 
     # ── speaker_embedding upload via voices endpoint ──
 
