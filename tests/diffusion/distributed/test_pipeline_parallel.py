@@ -54,7 +54,7 @@ class FakeWork:
 class SimpleScheduler:
     """Minimal diffusion-step scheduler: latents -= 0.1 * noise_pred."""
 
-    def step(self, noise_pred: torch.Tensor, t, latents: torch.Tensor):
+    def step(self, noise_pred: torch.Tensor, t, latents: torch.Tensor, return_dict: bool = False):
         return (latents - 0.1 * noise_pred,)
 
 
