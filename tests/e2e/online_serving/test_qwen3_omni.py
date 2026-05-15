@@ -239,11 +239,13 @@ def test_thinker_prefix_caching_audio_output(omni_server, openai_client) -> None
         system_prompt=get_system_prompt(),
         content_text=get_prompt(),
     )
-
     request_config = {
         "model": omni_server.model,
         "messages": messages,
-        "stream": False,  # Don't stream since we need full token details
+        "stream": True,
+        "stream_options": {
+            "include_usage": True,
+        },
     }
 
     _run_prefix_cache_check(openai_client, request_config)
