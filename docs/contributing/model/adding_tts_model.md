@@ -977,3 +977,50 @@ For more information, see:
 - [Architecture Overview](../../design/architecture_overview.md)
 - [Async Chunk Design](../../design/feature/async_chunk.md)
 - [Stage Configuration Guide](../../configuration/stage_configs.md)
+
+---
+
+## Appendix: DualFFN (higgs-audio v2)
+
+higgs-audio v2 is the first vllm-omni TTS model with a vLLM-native **Llama-3.2-3B backbone** and a per-position routed **audio-expert FFN** ("DualFFN"). Every other talker in the repo uses a Qwen3 backbone, so this appendix captures the integration pattern for future Llama-backed models.
+
+### Architecture in one paragraph
+
+The Stage-0 model is a Llama-3.2-3B (28 layers, hidden=3072, GQA 24Q/8KV, head_dim=128, vocab=128256). Each transformer block carries TWO parallel pre-norm + MLP paths: the standard text path (`input_layernorm`, `post_attention_layernorm`, `mlp`) and an audio path (`audio_input_layernorm`, `audio_post_attention_layernorm`, `audio_mlp`). A per-position `audio_token_mask: BoolTensor[B, S]` selects between them. The mask comes from the upstream rule
+
+```python
+audio_token_mask = (input_ids == audio_token_id) | (input_ids == audio_delay_token_id)
+```
+
+where `audio_token_id=128016` is the audio placeholder and `audio_delay_token_id=128014` is the delay-pattern filler. Text positions go through the text path; audio positions go through the audio path; both deltas are ADDED to the residual.
+
+### Audio embedding and codebook structure
+
+- 8 codebooks of vocabulary `codebook_size=1026`. Real code IDs live in `[0, 1023]`; `audio_stream_bos_id=1024` and `audio_stream_eos_id=1025` are stream markers that must never reach the codec decoder.
+- Audio frames are embedded by a fused `nn.Embedding(num_codebooks * codebook_size, hidden_size)` plus per-codebook offset lookup; the resulting embeddings are summed across codebooks.
+- Stage 0 emits codebook 0 via an audio LM head; codebooks 1..7 come from a fast-AR `HiggsAudioCodePredictor` (mirrors the qwen3_tts code-predictor pattern).
+
+### Delay pattern
+
+Codebook k is staggered by k frames (canonical MusicGen pattern `[0, 1, 2, 3, 4, 5, 6, 7]`). Until codebook k's BOS counter reaches 0, the talker is forced to emit `audio_stream_bos_id` for that codebook; symmetric handling on the EOS side. `HiggsAudioV2DelayPatternLogitsProcessor` in upstream `transformers` is the canonical reference; the vllm-omni implementation re-derives the same constraints at Stage 0.
+
+### HF -> vLLM weight mapping checklist
+
+When adapting a Llama+DualFFN HF checkpoint to vllm-omni:
+- `model.layers.<L>.{q,k,v}_proj.weight` -> fused `model.layers.<L>.self_attn.qkv_proj.weight` (concatenate dim 0; GQA reshape preserves Q heads + KV heads + head_dim).
+- `model.layers.<L>.mlp.{gate,up}_proj.weight` -> fused `model.layers.<L>.mlp.gate_up_proj.weight` (concatenate dim 0).
+- `model.layers.<L>.audio_mlp.{gate,up}_proj.weight` -> fused `dual_ffns.<L>.audio_mlp.gate_up_proj.weight` (same shape transform as the text path).
+- `model.layers.<L>.{input,post_attention,audio_input,audio_post_attention}_layernorm.weight` -> the corresponding norms on the DualFFN module (the audio pair) and the vLLM `LlamaDecoderLayer` (the text pair).
+- `embed_audio_tokens.weight` -> the top-level audio embedding table (used in the Stage 0 input-embedding substitution).
+- `codebook_head_<k>.weight` -> `audio_codebook0_head.weight` for `k=0`, `code_predictor.residual_heads[k-1].weight` for `k >= 1`.
+
+### Reference files
+
+| File | Purpose |
+|------|---------|
+| `vllm_omni/model_executor/models/higgs_audio_v2/UPSTREAM_TRACE.md` | Source-of-truth memo: DualFFN routing rule, delay pattern, audio embeddings, stream specials, prompt template. |
+| `vllm_omni/model_executor/models/higgs_audio_v2/higgs_audio_v2_talker.py` | Stage 0: DualFFNLayer, HiggsAudioCodePredictor, weight mapping. |
+| `vllm_omni/model_executor/models/higgs_audio_v2/higgs_audio_v2_code2wav.py` | Stage 1 on the shared HiggsAudio decoder kernel; rejects code IDs >= 1024. |
+| `vllm_omni/model_executor/models/_shared/higgs_audio_decoder.py` | Shared kernel (RVQ + DAC) consumed by both this model and OmniVoice. |
+| `examples/offline_inference/text_to_speech/higgs_audio_v2/reference_hf.py` | Capture deterministic upstream fixtures + the trace memo. |
+| `tests/e2e/online_serving/test_higgs_audio_v2.py` | Validator scope tests + Stage-1 stream-special rejection + AC-4 RMS parity skeleton. |

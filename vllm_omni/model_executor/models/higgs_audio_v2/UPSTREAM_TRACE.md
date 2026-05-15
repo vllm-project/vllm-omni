@@ -116,6 +116,16 @@ record described at the top of `reference_hf.py`. The captured fields satisfy:
 ## Pinned prompt list
 
 - 'Hello world.'
+- 'The quick brown fox jumps over the lazy dog.'
+- 'It was the night before my birthday.'
+- 'She sells seashells by the seashore.'
+- 'Innovation distinguishes between a leader and a follower.'
+- 'Mary had a little lamb whose fleece was white as snow.'
+- 'Time flies like an arrow; fruit flies like a banana.'
+- 'All that glitters is not gold.'
+- 'An apple a day keeps the doctor away.'
+- 'May the force be with you, always.'
+- 'To be or not to be, that is the question.'
 
 ## Notes for the vllm-omni implementation
 

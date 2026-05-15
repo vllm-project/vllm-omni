@@ -1448,9 +1448,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _validate_higgs_audio_v2_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate higgs_audio_v2 request parameters. Returns error message or None.
 
-        v1 scope is plain text -> 24 kHz speech only. Voice cloning, ChatML rich
-        messages, multi-speaker tags, and reference audio are rejected with a
-        deterministic 4xx (AC-5 in results/plan.md).
+        v1 scope is plain text -> 24 kHz speech only. Reject every Speech-API
+        field that pulls the request out of that scope: voice/speaker selection
+        (no preset speakers in v1), voice-cloning fields (ref_audio, ref_text,
+        x_vector_only_mode, speaker_embedding), task_type and language (single
+        plain-text mode only), `instructions` (style/emotion control), and
+        non-1.0 `speed`. Multi-speaker `[SPEAKERn]` tags inside the text body
+        are also rejected.
         """
         from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_tokenizer import (
             MULTI_SPEAKER_TAG_PATTERN,
@@ -1458,21 +1462,54 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         if not request.input or not request.input.strip():
             return "higgs_audio_v2: input text cannot be empty"
+
+        # Voice cloning + speaker-selection fields are entirely out of scope.
         if request.ref_audio is not None:
-            return (
-                "higgs_audio_v2 v1 does not support voice cloning; the 'ref_audio' "
-                "field is not allowed"
-            )
+            return "higgs_audio_v2 v1 does not support 'ref_audio' (voice cloning is out of scope)"
         if request.ref_text:
+            return "higgs_audio_v2 v1 does not support 'ref_text' (voice cloning is out of scope)"
+        if request.x_vector_only_mode is not None:
             return (
-                "higgs_audio_v2 v1 does not support voice cloning; the 'ref_text' "
-                "field is not allowed"
+                "higgs_audio_v2 v1 does not support 'x_vector_only_mode' "
+                "(voice-cloning helper field)"
             )
+        if request.speaker_embedding is not None:
+            return (
+                "higgs_audio_v2 v1 does not support 'speaker_embedding' "
+                "(voice-cloning helper field)"
+            )
+        if request.voice:
+            return (
+                "higgs_audio_v2 v1 does not support 'voice'/'speaker' selection; "
+                f"the model produces plain text -> speech only and does not honor voice={request.voice!r}"
+            )
+        if request.instructions:
+            return (
+                "higgs_audio_v2 v1 does not support 'instructions' (voice "
+                "style/emotion control); supply plain text instead"
+            )
+        if request.task_type is not None:
+            return (
+                "higgs_audio_v2 v1 does not support 'task_type'; the model is "
+                "single-mode plain text -> speech"
+            )
+        if request.language is not None:
+            return (
+                "higgs_audio_v2 v1 does not accept 'language' overrides; the "
+                "model infers language from the input text"
+            )
+        if request.speed is not None and request.speed != 1.0:
+            return (
+                "higgs_audio_v2 v1 does not support 'speed' adjustments; the "
+                "audio is rendered at native rate (24 kHz)"
+            )
+
         if MULTI_SPEAKER_TAG_PATTERN.search(request.input):
             return (
                 "higgs_audio_v2 v1 does not support multi-speaker [SPEAKERn] tags; "
                 "remove the tag from the input"
             )
+
         if request.max_new_tokens is not None:
             if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
                 return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"

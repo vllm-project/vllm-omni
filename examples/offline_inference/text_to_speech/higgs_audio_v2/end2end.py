@@ -38,6 +38,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -83,6 +84,46 @@ def run_hf_reference(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_audio_tokenizer_dir(explicit: str | None) -> Path:
+    """Locate the boson-ai audio_tokenizer subdir for Stage-1 weight loading.
+
+    Resolution order:
+    1. Explicit ``--audio-tokenizer-dir`` argument.
+    2. ``HIGGS_AUDIO_V2_TOKENIZER_DIR`` env var.
+    3. HF hub snapshot under ``$HF_HOME`` (or ``~/.cache/huggingface``) for
+       ``models--bosonai--higgs-audio-v2-tokenizer``; we resolve via
+       ``huggingface_hub.snapshot_download`` which auto-uses any cached copy.
+
+    Raises ``FileNotFoundError`` if no path can be resolved.
+    """
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if (path / "config.json").exists():
+            return path
+        if (path / "audio_tokenizer" / "config.json").exists():
+            return path / "audio_tokenizer"
+        raise FileNotFoundError(
+            f"--audio-tokenizer-dir {explicit!r} does not contain a config.json "
+            "or an audio_tokenizer subdir"
+        )
+    env_dir = os.environ.get("HIGGS_AUDIO_V2_TOKENIZER_DIR")
+    if env_dir:
+        return _resolve_audio_tokenizer_dir(env_dir)
+
+    # Try HF cache via snapshot_download (no-op when already cached).
+    from huggingface_hub import snapshot_download
+
+    snapshot = Path(snapshot_download("bosonai/higgs-audio-v2-tokenizer"))
+    candidate = snapshot / "audio_tokenizer"
+    if candidate.exists():
+        return candidate
+    if (snapshot / "config.json").exists():
+        return snapshot
+    raise FileNotFoundError(
+        f"Could not locate audio_tokenizer files under {snapshot}"
+    )
+
+
 def run_stage1_only(args: argparse.Namespace) -> int:
     from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import (
         HiggsAudioV2Config,
@@ -96,20 +137,32 @@ def run_stage1_only(args: argparse.Namespace) -> int:
         print(f"fixture not found: {fixture_path}", file=sys.stderr)
         return 1
     blob = torch.load(fixture_path, weights_only=False)
-    # ``audio_codes`` in the fixture is shape [1, num_codebooks, T] OR
-    # [1, T, num_codebooks] depending on the revert path. Normalize to
-    # [B, num_codebooks, T] before sending to Stage 1.
+    # ``audio_codes`` in the fixture is canonical [1, num_codebooks=8, T] since
+    # round 2. Tolerate the legacy [1, T, 8] layout for older fixtures.
     codes = blob["audio_codes"].long()
     if codes.ndim != 3:
         print(f"unexpected audio_codes shape: {tuple(codes.shape)}", file=sys.stderr)
         return 1
     if codes.shape[1] != 8 and codes.shape[2] == 8:
         codes = codes.transpose(1, 2).contiguous()
+    if codes.shape[1] != 8:
+        print(
+            f"audio_codes second dim must be num_codebooks=8 after normalization; got "
+            f"{tuple(codes.shape)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        audio_tokenizer_dir = _resolve_audio_tokenizer_dir(args.audio_tokenizer_dir)
+    except (FileNotFoundError, OSError) as exc:
+        print(f"could not resolve audio tokenizer dir: {exc}", file=sys.stderr)
+        return 1
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     config = HiggsAudioV2Config()
     code2wav = HiggsAudioV2Code2Wav(config).to(device)
-    code2wav.load_weights(model_dir=str(Path(args.audio_tokenizer_dir).parent), device=device)
+    code2wav.load_weights(model_dir=str(audio_tokenizer_dir.parent), device=device)
     pcm = code2wav(codes.to(device))  # [B, 1, T*960]
     pcm = pcm.squeeze(0).squeeze(0)
     _save_wav(args.output_wav, pcm, sample_rate=int(config.sample_rate))

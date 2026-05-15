@@ -363,64 +363,185 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         top-level entries. The vLLM-native layout uses fused QKV/MLP tensors,
         so we transform the relevant pairs at load time:
 
-          * Attention: HF ``q_proj/k_proj/v_proj`` -> vLLM ``qkv_proj``
-            (packed ``[hidden + 2 * kv_dim, hidden]`` with GQA reshape;
-            24 Q heads, 8 KV heads, head_dim=128).
-          * RoPE: parameters are read from ``self.config.rope_parameters``
+          * Attention: HF ``q_proj/k_proj/v_proj`` -> vLLM ``qkv_proj`` (packed
+            ``[hidden + 2 * kv_dim, hidden]``; for GQA with 24 Q heads, 8 KV
+            heads, head_dim=128 the slabs are
+            ``q_proj[3072, 3072]``, ``k_proj[1024, 3072]``, ``v_proj[1024, 3072]``
+            -> ``qkv_proj[5120, 3072]``).
+          * RoPE parameters are read from ``self.config.rope_parameters`` and
+            consumed by vLLM's LlamaAttention without any weight transform
             (``rope_type="llama3"``, factor=32, low_freq_factor=0.125,
             high_freq_factor=0.5, original_max_position_embeddings=1024).
           * Text MLP: HF ``mlp.gate_proj`` + ``mlp.up_proj`` ->
             vLLM ``mlp.gate_up_proj`` (concatenated on dim 0).
           * Audio MLP: HF ``audio_mlp.gate_proj`` + ``audio_mlp.up_proj`` ->
-            vLLM ``dual_ffns.<L>.audio_mlp.gate_up_proj``.
-          * Audio layer norms: HF ``audio_input_layernorm`` /
-            ``audio_post_attention_layernorm`` -> our ``dual_ffns.<L>.*``.
-          * Audio token embedding: HF ``embed_audio_tokens.weight`` is copied
-            verbatim into ``self.embed_audio_tokens``.
-          * Audio codebook heads: HF ``codebook_head_0..N-1`` are copied
-            into ``audio_codebook0_head`` (idx 0) and
-            ``code_predictor.residual_heads[idx-1]`` (idx >= 1).
+            vLLM ``dual_ffns.<L>.audio_mlp.gate_up_proj`` (same shape transform).
+          * Layer norms: HF ``input_layernorm`` / ``post_attention_layernorm``
+            -> ``dual_ffns.<L>.{input,post_attention}_layernorm``. Audio norms
+            -> ``dual_ffns.<L>.{audio_input,audio_post_attention}_layernorm``.
+          * Audio token embedding: HF ``model.embed_audio_tokens.weight`` (with
+            optional outer ``embed_audio_tokens.`` prefix from upstream's
+            HiggsAudioV2Embeddings) -> ``self.embed_audio_tokens.weight``.
+          * Audio codebook heads: HF ``audio_lm_head.weight`` -> the fused 8x1026
+            head from which Stage 0 reads codebook 0 directly and codebook 1..7
+            via the fast-AR code predictor's residual heads. (Boson-ai's actual
+            checkpoint exposes a single fused ``audio_lm_head`` of shape
+            ``[num_codebooks * codebook_size, hidden]``, not one head per
+            codebook; we split it into the per-codebook heads at load time.)
 
-        The full transcription will be exercised end-to-end once the reference
-        fixtures land. Until then, this routine performs the structural copy
-        for parameters whose names map 1:1 and logs anything left over so a
-        Codex review (task13) can confirm coverage.
+        Round-2 status: this routine covers the simple, fused-QKV, and fused-MLP
+        transcriptions. The remaining gap (full Stage-0 forward integration with
+        vLLM's PagedAttention scheduler so the loaded weights drive a working
+        greedy decode) is tracked as an Open Issue in the goal tracker.
         """
         loaded: set[str] = set()
         own_params = dict(self.named_parameters())
-        # Build helper lookups for fused QKV / fused MLP.
-        for name, tensor in weights:
-            # Direct names (audio token embedding, lm_head, audio codebook
-            # head 0, layer norms, code predictor residual heads).
+
+        # First pass: collect tensors that need fusing (q/k/v, gate/up for each
+        # MLP slot). We accumulate into per-(layer, slot, kind) buckets and
+        # commit the fused tensor once all parts have arrived.
+        fuse_buckets: dict[tuple[int, str, str], dict[str, torch.Tensor]] = {}
+
+        def _try_simple(name: str, tensor: torch.Tensor) -> bool:
             mapped = self._map_simple_name(name)
-            if mapped is None:
+            if mapped is None or mapped not in own_params:
+                return False
+            target = own_params[mapped]
+            if tuple(target.shape) != tuple(tensor.shape):
+                logger.warning(
+                    "higgs_audio_v2 load_weights: shape mismatch %s -> %s: %s vs %s",
+                    name,
+                    mapped,
+                    tuple(tensor.shape),
+                    tuple(target.shape),
+                )
+                return False
+            with torch.no_grad():
+                target.copy_(tensor)
+            loaded.add(mapped)
+            return True
+
+        def _stash_fusion(name: str, tensor: torch.Tensor) -> bool:
+            parts = name.split(".")
+            if len(parts) < 5 or parts[0] != "model" or parts[1] != "layers":
+                return False
+            try:
+                layer_idx = int(parts[2])
+            except ValueError:
+                return False
+            tail = ".".join(parts[3:])
+            for slot in ("mlp", "audio_mlp"):
+                for kind in ("gate_proj", "up_proj"):
+                    if tail == f"{slot}.{kind}.weight":
+                        fuse_buckets.setdefault((layer_idx, slot, "gate_up_proj"), {})[kind] = tensor
+                        return True
+            for kind in ("q_proj", "k_proj", "v_proj"):
+                if tail == f"self_attn.{kind}.weight":
+                    fuse_buckets.setdefault((layer_idx, "self_attn", "qkv_proj"), {})[kind] = tensor
+                    return True
+            return False
+
+        for name, tensor in weights:
+            if _try_simple(name, tensor):
                 continue
-            if mapped in own_params:
-                target = own_params[mapped]
-                if tuple(target.shape) == tuple(tensor.shape):
+            if _stash_fusion(name, tensor):
+                continue
+            # audio code head: upstream has a fused [num_codebooks*codebook_size, hidden]
+            # head; split into codebook-0 head + residual heads.
+            if name in ("audio_lm_head.weight",):
+                self._consume_fused_audio_head(tensor, loaded)
+                continue
+
+        # Second pass: emit fused tensors.
+        for (layer_idx, slot, fused_kind), parts in fuse_buckets.items():
+            if fused_kind == "gate_up_proj":
+                gate = parts.get("gate_proj")
+                up = parts.get("up_proj")
+                if gate is None or up is None:
+                    continue
+                fused = torch.cat([gate, up], dim=0)
+                if slot == "mlp":
+                    target_name = f"model.layers.{layer_idx}.mlp.gate_up_proj.weight"
+                else:
+                    target_name = f"dual_ffns.{layer_idx}.audio_mlp.gate_up_proj.weight"
+                if target_name in own_params and tuple(own_params[target_name].shape) == tuple(fused.shape):
                     with torch.no_grad():
-                        target.copy_(tensor)
-                    loaded.add(mapped)
+                        own_params[target_name].copy_(fused)
+                    loaded.add(target_name)
                 else:
                     logger.warning(
-                        "Shape mismatch loading %s -> %s: %s vs %s",
-                        name,
-                        mapped,
-                        tuple(tensor.shape),
-                        tuple(target.shape),
+                        "higgs_audio_v2 load_weights: fused %s not found or shape mismatch (%s vs target %s)",
+                        target_name,
+                        tuple(fused.shape),
+                        tuple(own_params[target_name].shape) if target_name in own_params else "<missing>",
+                    )
+            elif fused_kind == "qkv_proj":
+                q = parts.get("q_proj")
+                k = parts.get("k_proj")
+                v = parts.get("v_proj")
+                if q is None or k is None or v is None:
+                    continue
+                fused = torch.cat([q, k, v], dim=0)
+                target_name = f"model.layers.{layer_idx}.self_attn.qkv_proj.weight"
+                if target_name in own_params and tuple(own_params[target_name].shape) == tuple(fused.shape):
+                    with torch.no_grad():
+                        own_params[target_name].copy_(fused)
+                    loaded.add(target_name)
+                else:
+                    logger.warning(
+                        "higgs_audio_v2 load_weights: fused %s not found or shape mismatch (%s vs target %s)",
+                        target_name,
+                        tuple(fused.shape),
+                        tuple(own_params[target_name].shape) if target_name in own_params else "<missing>",
                     )
         return loaded
+
+    def _consume_fused_audio_head(
+        self, fused: torch.Tensor, loaded: set[str]
+    ) -> None:
+        """Split the fused ``audio_lm_head[num_codebooks*codebook_size, hidden]``
+        into ``audio_codebook0_head`` + the code predictor's residual heads.
+        """
+        own_params = dict(self.named_parameters())
+        num_codebooks = int(self.config.num_codebooks)
+        codebook_size = int(self.config.codebook_size)
+        hidden = int(self.config.hidden_size)
+        if tuple(fused.shape) != (num_codebooks * codebook_size, hidden):
+            logger.warning(
+                "higgs_audio_v2: unexpected audio_lm_head shape %s; expected %s",
+                tuple(fused.shape),
+                (num_codebooks * codebook_size, hidden),
+            )
+            return
+        chunks = fused.split(codebook_size, dim=0)
+        if "audio_codebook0_head.weight" in own_params:
+            with torch.no_grad():
+                own_params["audio_codebook0_head.weight"].copy_(chunks[0])
+            loaded.add("audio_codebook0_head.weight")
+        for k, chunk in enumerate(chunks[1:], start=1):
+            name = f"code_predictor.residual_heads.{k - 1}.weight"
+            if name in own_params:
+                with torch.no_grad():
+                    own_params[name].copy_(chunk)
+                loaded.add(name)
 
     # --------------------------------------------------------------- helpers
     def _map_simple_name(self, hf_name: str) -> str | None:
         """Translate the simple (non-fused) HF parameter names to vLLM names."""
-        if hf_name == "embed_audio_tokens.weight":
+        # Upstream nests the audio embedding as
+        # ``model.embed_audio_tokens.embed_audio_tokens.weight``; the boson-ai
+        # checkpoint also uses this exact key. Accept both nested and flat.
+        if hf_name in (
+            "embed_audio_tokens.weight",
+            "model.embed_audio_tokens.embed_audio_tokens.weight",
+            "model.embed_audio_tokens.weight",
+        ):
             return "embed_audio_tokens.weight"
-        if hf_name in ("lm_head.weight",):
+        if hf_name in ("lm_head.weight", "text_lm_head.weight"):
             return "lm_head.weight"
+        # Per-codebook head, when the upstream exports it un-fused.
         if hf_name == "codebook_head_0.weight":
             return "audio_codebook0_head.weight"
-        # Residual codebook heads 1..N-1 (linear, weight-only).
         if hf_name.startswith("codebook_head_") and hf_name.endswith(".weight"):
             try:
                 idx = int(hf_name[len("codebook_head_") : -len(".weight")])
@@ -460,20 +581,31 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
     ) -> torch.Tensor:
         """Forward pass.
 
-        Phase-1 structural forward: delegates the heavy lifting to vLLM's
-        compiled ``LlamaModel`` and applies the DualFFN audio expert as a
-        residual delta on positions where the audio_token_mask is True. The
-        AR-loop integration with PagedAttention KV caches and the
-        ``HiggsAudioV2DelayPatternLogitsProcessor`` is gated on the reference
-        fixtures + UPSTREAM_TRACE.md (see module docstring). When the model
-        runner attempts to invoke this forward without those fixtures in
-        place we raise a clear error so the loop surface the gap instead of
-        silently returning wrong outputs.
+        Status (Round 2): the DualFFN audio expert is NOT yet wired into the
+        compiled LlamaModel forward path. Returning the bare LlamaModel output
+        without DualFFN routing would silently produce wrong codebook
+        predictions (the audio_mlp / audio_input_layernorm / audio_post_attention_layernorm
+        weights would be loaded but unused), so we raise here instead of
+        returning a misleading "structural" hidden state.
+
+        Round 3 will replace this raise with the routed path described in
+        UPSTREAM_TRACE.md (DualFFN audio expert applied per layer at positions
+        where audio_token_mask is True; multi-codebook output via
+        ``audio_codebook0_head`` + ``code_predictor``). The weight loader
+        already places the audio-side parameters at the correct sites
+        (``dual_ffns.<L>.audio_mlp.gate_up_proj``, ``audio_input_layernorm``,
+        ``audio_post_attention_layernorm``, ``audio_codebook0_head``,
+        ``code_predictor.residual_heads.<k>``), so this is a pure forward-path
+        integration task with no remaining state-dict mapping work.
         """
         raise NotImplementedError(
-            "higgs_audio_v2 Stage-0 forward is structural-only in this round; "
-            "the AR-loop integration is gated on UPSTREAM_TRACE.md + reference "
-            "fixtures and is tracked in the RLCR goal tracker."
+            "higgs_audio_v2 Stage-0 forward path is gated on the DualFFN "
+            "per-layer routing integration with vLLM's compiled LlamaModel. "
+            "Round 2 ships the weight mapping (fused QKV, fused gate_up_proj "
+            "for both MLP experts, audio_lm_head split into codebook heads) "
+            "and reference fixtures. Round 3 will wire the routed forward. "
+            "See vllm_omni/model_executor/models/higgs_audio_v2/UPSTREAM_TRACE.md "
+            "for the exact routing rule the integration must reproduce."
         )
 
     def compute_logits(

@@ -80,7 +80,13 @@ class HiggsAudioV2Config(PretrainedConfig):
         use_audio_dual_ffn: bool = True,
         # --- Stage-1 tokenizer / codec decoder ---
         # Path to the audio-tokenizer subdir (relative to the model directory).
-        audio_tokenizer_subdir: str = "audio_tokenizer",
+        # Empty string means the model_dir itself contains config.json +
+        # model.safetensors (the layout used by the standalone
+        # ``bosonai/higgs-audio-v2-tokenizer`` HF repo). Non-empty means the
+        # tokenizer files live in ``<model_dir>/<subdir>/`` (the layout used by
+        # the 3B Stage-0 checkpoint which bundles its tokenizer under
+        # ``audio_tokenizer/``).
+        audio_tokenizer_subdir: str = "",
         # --- Misc ---
         use_cache: bool = True,
         **kwargs: Any,

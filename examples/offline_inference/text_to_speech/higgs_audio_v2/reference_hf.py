@@ -45,9 +45,18 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
 DEFAULT_PROMPTS: tuple[str, ...] = (
+    # AC-1 / AC-2 require the pinned "Hello world." + 10 additional prompts.
     "Hello world.",
     "The quick brown fox jumps over the lazy dog.",
     "It was the night before my birthday.",
+    "She sells seashells by the seashore.",
+    "Innovation distinguishes between a leader and a follower.",
+    "Mary had a little lamb whose fleece was white as snow.",
+    "Time flies like an arrow; fruit flies like a banana.",
+    "All that glitters is not gold.",
+    "An apple a day keeps the doctor away.",
+    "May the force be with you, always.",
+    "To be or not to be, that is the question.",
 )
 
 
@@ -90,9 +99,16 @@ def _build_text_template_record(processor, prompt_text: str) -> dict[str, Any]:
     return {"prompt_text": prompt_text, "rendered_chat_template": rendered}
 
 
-def _capture_audio_token_mask(model: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """Install a one-shot forward hook on the first decoder layer to record the routing mask."""
-    state: dict[str, torch.Tensor] = {}
+def _capture_audio_token_mask(model: torch.nn.Module) -> dict[str, Any]:
+    """Install a forward hook on the first decoder layer to record the routing mask.
+
+    The hook fires once per decoder step. We record each step's mask separately
+    so the final captured artifact covers BOTH the prefill (entire prompt) and
+    every autoregressive decode step (one token per step). The full routing
+    trace concatenated along the sequence dim is what AC-3 needs to compare
+    against.
+    """
+    state: dict[str, Any] = {"masks": []}
 
     inner_model = getattr(model, "model", None) or model
     layers = getattr(inner_model, "layers", None)
@@ -101,17 +117,44 @@ def _capture_audio_token_mask(model: torch.nn.Module) -> dict[str, torch.Tensor]
 
     def _hook(_module, args, kwargs):
         mask = kwargs.get("audio_token_mask")
-        if mask is not None and "mask" not in state:
-            state["mask"] = mask.detach().to("cpu").clone()
+        if mask is None:
+            return
+        state["masks"].append(mask.detach().to("cpu").clone())
 
     state["_handle"] = layers[0].register_forward_pre_hook(_hook, with_kwargs=True)
     return state
 
 
-def _release_hook(state: dict[str, torch.Tensor]) -> None:
+def _release_hook(state: dict[str, Any]) -> None:
     handle = state.pop("_handle", None)
     if handle is not None:
         handle.remove()
+
+
+def _consolidate_masks(masks: list[torch.Tensor]) -> torch.Tensor | None:
+    """Concatenate per-step routing masks into one [B, S_full] tensor.
+
+    Each entry has shape ``[B, S_i]``; the prefill step has S_0 = prompt length,
+    and each decode step has S_i = 1. Concatenating along dim=1 gives the
+    per-position routing mask over the FULL output sequence (prompt + every
+    generated LM token).
+    """
+    if not masks:
+        return None
+    # Some upstream paths emit masks with differing batch sizes during compile;
+    # take the first batch dim and require all entries to match.
+    bsz = int(masks[0].shape[0])
+    aligned: list[torch.Tensor] = []
+    for m in masks:
+        if int(m.shape[0]) != bsz:
+            continue
+        if m.ndim == 1:
+            aligned.append(m.unsqueeze(0))
+        else:
+            aligned.append(m)
+    if not aligned:
+        return None
+    return torch.cat(aligned, dim=1)
 
 
 def _config_summary(model_config) -> dict[str, Any]:
@@ -203,7 +246,9 @@ def _extract_audio_input_ids(generate_output) -> torch.Tensor:
     raise RuntimeError("Could not locate audio_input_ids in model.generate() output")
 
 
-def _strip_delay_and_extract_codes(processor, audio_input_ids: torch.Tensor, audio_stream_bos_id: int) -> torch.Tensor:
+def _strip_delay_and_extract_codes(
+    processor, audio_input_ids: torch.Tensor, audio_stream_bos_id: int, num_codebooks: int
+) -> torch.Tensor:
     """Revert delay pattern and trim to real codes only, mirroring batch_decode internals.
 
     Returns a ``LongTensor`` of shape ``[1, num_codebooks, T]`` with values in
@@ -212,8 +257,11 @@ def _strip_delay_and_extract_codes(processor, audio_input_ids: torch.Tensor, aud
     # Find the last audio_stream_bos position; everything before is the prompt context.
     audio_bos_token_idxs = (audio_input_ids == audio_stream_bos_id).all(-1).nonzero()
     if audio_bos_token_idxs.numel() == 0:
-        # No audio was generated; return empty tensor of correct shape.
-        return audio_input_ids[:, :0, :].transpose(1, 2).clone()
+        # No audio was generated; return canonical empty [B, num_codebooks, 0] tensor.
+        return torch.zeros(
+            (int(audio_input_ids.shape[0]), num_codebooks, 0),
+            dtype=torch.long,
+        )
     start = int(audio_bos_token_idxs[-1, -1].item())
     trimmed = audio_input_ids[:, start:]
     # Find EOS to clip the tail. (Bounded by sequence length if no EOS yet.)
@@ -229,10 +277,20 @@ def _strip_delay_and_extract_codes(processor, audio_input_ids: torch.Tensor, aud
     for b in range(trimmed.shape[0]):
         row = trimmed[b, 1:end]  # [S', num_codebooks]
         reverted = processor.revert_delay_pattern(row).clip(0, audio_stream_bos_id - 1)
-        # revert_delay_pattern returns [num_codebooks, T]
         if reverted.ndim != 2:
             raise RuntimeError(f"revert_delay_pattern returned shape {tuple(reverted.shape)}; expected 2-D")
-        codes.append(reverted)
+        # ``revert_delay_pattern`` returns ``[T, num_codebooks]`` in current transformers.
+        # Normalize to ``[num_codebooks, T]`` (the documented Stage-1 contract).
+        if int(reverted.shape[0]) == num_codebooks:
+            normalized = reverted
+        elif int(reverted.shape[1]) == num_codebooks:
+            normalized = reverted.transpose(0, 1).contiguous()
+        else:
+            raise RuntimeError(
+                f"revert_delay_pattern returned unexpected shape {tuple(reverted.shape)}; "
+                f"expected one axis of size num_codebooks={num_codebooks}"
+            )
+        codes.append(normalized)
     return torch.stack(codes, dim=0).to(torch.long).detach().cpu()
 
 
@@ -262,16 +320,26 @@ def capture_prompt(processor, model, prompt_text: str, max_new_tokens: int) -> R
 
     audio_input_ids = _extract_audio_input_ids(outputs)
     real_codes = _strip_delay_and_extract_codes(
-        processor, audio_input_ids, model.config.audio_stream_bos_id
+        processor,
+        audio_input_ids,
+        model.config.audio_stream_bos_id,
+        int(model.config.num_codebooks),
     )
     reference_pcm = _decode_audio_with_processor(processor, outputs)
 
-    audio_token_mask = hook_state.get("mask")
+    # Routing mask: consolidate every per-step hook capture into one
+    # [B, S_full] tensor covering both the prompt prefill and every
+    # autoregressive decode step. If the hook never fired (older transformers),
+    # fall back to the upstream rule applied to the running LM token stream.
+    audio_token_mask = _consolidate_masks(hook_state.get("masks", []))
     if audio_token_mask is None:
-        # Re-derive the mask from input_ids (matches HiggsAudioV2Model.get_placeholder_mask)
+        # outputs.sequences (when present) is the running LM token stream
+        # including the appended audio_token_id at each generated audio position.
+        seq = getattr(outputs, "sequences", None)
+        full_ids = seq if isinstance(seq, torch.Tensor) and seq.ndim == 2 else input_ids
         audio_token_mask = (
-            (input_ids == model.config.audio_token_id)
-            | (input_ids == model.config.audio_delay_token_id)
+            (full_ids == model.config.audio_token_id)
+            | (full_ids == model.config.audio_delay_token_id)
         ).detach().to("cpu")
     return ReferenceCapture(
         prompt_text=prompt_text,

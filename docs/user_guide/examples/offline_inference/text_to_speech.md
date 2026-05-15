@@ -23,6 +23,7 @@ list of supported architectures across all modalities, see
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design (`--instruct`), language (`--lang`) | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants (`--query-type`) | 24 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets (`--voice`) | 24 kHz |
+| higgs-audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` + `bosonai/higgs-audio-v2-tokenizer` | 2 (talker + code2wav, DualFFN) | — (v1) | — (v1) | plain-text only; voice / ref_audio / ref_text / task_type / language / x_vector_only_mode / speaker_embedding / non-1.0 speed are all 4xx | 24 kHz |
 
 ## Common Quick Start
 
@@ -358,6 +359,29 @@ Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-T
 - `--num-prompts N` replicates the prompt for performance measurement.
 - `--concurrency M` requires `--streaming` and must evenly divide `--num-prompts`.
 - Run `--help` for the full argument surface.
+
+---
+
+## higgs-audio v2
+
+```bash
+# Capture the upstream HF reference (downloads the boson-ai checkpoints).
+python examples/offline_inference/text_to_speech/higgs_audio_v2/reference_hf.py \
+    --max-new-tokens 100 \
+    --output-dir tests/fixtures/higgs_audio_v2 \
+    --write-trace
+
+# Replay a captured fixture through vllm-omni's Stage-1 decoder for AC-4 parity.
+python examples/offline_inference/text_to_speech/higgs_audio_v2/end2end.py \
+    --mode stage1_only \
+    --fixture tests/fixtures/higgs_audio_v2/reference_hello_world.pt \
+    --compare-with-reference \
+    --output-wav stage1_replay.wav
+```
+
+The Stage-0 talker uses a vLLM-native Llama-3.2-3B backbone with a DualFFN audio expert (see `docs/contributing/model/adding_tts_model.md` for the architectural appendix). Stage 1 reuses the OmniVoice HiggsAudio decoder kernel via the shared utility at `vllm_omni/model_executor/models/_shared/higgs_audio_decoder.py`.
+
+Scope (v1, see `results/plan.md` AC-5 for the full list): plain text -> 24 kHz speech only. Voice cloning, multi-speaker dialogue, language overrides, `task_type`, `speed != 1.0`, and reference audio are rejected with explicit 4xx by the request validator.
 
 ## Example materials
 

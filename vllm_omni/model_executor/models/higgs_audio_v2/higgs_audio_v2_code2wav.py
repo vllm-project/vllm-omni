@@ -90,10 +90,18 @@ class HiggsAudioV2Code2Wav(nn.Module):
 
     # ------------------------------------------------------------------ load
     def load_weights(self, model_dir: str, device: torch.device | None = None) -> None:
-        """Load codec weights from the audio_tokenizer subdir of the model dir."""
+        """Load codec weights for Stage 1.
+
+        ``model_dir`` may be either the standalone tokenizer repo (containing
+        ``config.json`` + ``model.safetensors`` at the root) or the 3B Stage-0
+        checkpoint that bundles the tokenizer at ``<model_dir>/audio_tokenizer/``.
+        The ``audio_tokenizer_subdir`` config field controls which layout
+        applies; an empty subdir means the model_dir IS the tokenizer dir.
+        """
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        audio_tokenizer_path = os.path.join(model_dir, self.config.audio_tokenizer_subdir)
+        subdir = self.config.audio_tokenizer_subdir or ""
+        audio_tokenizer_path = os.path.join(model_dir, subdir) if subdir else model_dir
         quantizer, fc2, acoustic_decoder, _tokenizer_config = load_higgs_audio_codec(
             audio_tokenizer_path, device
         )
