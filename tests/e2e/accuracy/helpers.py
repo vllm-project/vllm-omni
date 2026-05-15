@@ -1,9 +1,11 @@
 import os
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
+import requests
 import torch
 from PIL import Image
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
@@ -161,6 +163,16 @@ class CLIPScorer:
         similarity = (img_emb * txt_emb).sum(dim=-1)
         return float(similarity.item() * 100)
 
+    def image_image_score(self, image1: Image.Image, image2: Image.Image) -> float:
+        inputs = self._processor(text=[""], images=[image1, image2], return_tensors="pt", padding=True)
+        with torch.no_grad():
+            outputs = self._model(**inputs)
+        img_emb1, img_emb2 = outputs.image_embeds.chunk(2)
+        img_emb1 = img_emb1 / img_emb1.norm(p=2, dim=-1, keepdim=True)
+        img_emb2 = img_emb2 / img_emb2.norm(p=2, dim=-1, keepdim=True)
+        similarity = (img_emb1 * img_emb2).sum(dim=-1)
+        return float(similarity.item() * 100)
+
     def assert_score(self, *, model_name: str, image: Image.Image, text: str, threshold: float) -> None:
         value = self.score(image, text)
         print(f"{model_name} CLIP score:")
@@ -180,3 +192,73 @@ def _pil_to_batched_tensor(image: Image.Image, *, compare_mode: str) -> torch.Te
     array = np.asarray(image.convert(compare_mode), dtype=np.float32) / 255.0
     tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
     return tensor
+
+
+class SemanticSimilarityScorer:
+    """Semantic similarity scorer for text-text and image-text comparisons"""
+
+    def __init__(
+        self,
+        text_model_name: str = "BAAI/bge-m3",
+    ):
+        """
+        Initialize semantic similarity scorer
+
+        Args:
+            text_model_name: Model for text-text similarity (BGE-M3)
+        """
+        self._text_model = None
+        self._text_model_name = text_model_name
+
+    def _load_text_model(self):
+        """Lazy load text similarity model (BGE-M3)"""
+        if self._text_model is None:
+            try:
+                from FlagEmbedding import BGEM3FlagModel
+
+                print(f"Loading text similarity model: {self._text_model_name}")
+                self._text_model = BGEM3FlagModel(self._text_model_name, use_fp16=True)
+            except ImportError:
+                raise ImportError("FlagEmbedding not installed. Install with: pip install FlagEmbedding")
+        return self._text_model
+
+    def text_similarity(self, text1: str, text2: str) -> float:
+        """
+        Compute semantic similarity between two texts using BGE-M3
+        """
+        results = {}
+        # 1. Text prefix matching (maximum matching character length)
+        match_count = 0
+        for char_vllm, char_ref in zip(text1, text2):
+            if char_vllm == char_ref:
+                match_count += 1
+            else:
+                break
+        results["text_prefix_match_count"] = match_count
+
+        # 2. Full CoT semantic similarity comparison
+        model = self._load_text_model()
+        emb1 = model.encode([text1], return_dense=True, return_sparse=False, return_colbert_vecs=False)["dense_vecs"][0]
+        emb2 = model.encode([text2], return_dense=True, return_sparse=False, return_colbert_vecs=False)["dense_vecs"][0]
+        similarity = np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
+        results["cot_semantic_sim"] = float(similarity)
+        return results
+
+    def release_models(self):
+        """Release loaded models to free memory"""
+        if self._text_model is not None:
+            del self._text_model
+            self._text_model = None
+
+
+def download_images(urls: list[str]) -> list[Image.Image]:
+    """Download and cache multiple images"""
+    images = []
+    for i, url in enumerate(urls):
+        print(f"Downloading image {i} from {url}")
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        image = Image.open(BytesIO(response.content)).convert("RGB")
+        images.append(image)
+
+    return images
