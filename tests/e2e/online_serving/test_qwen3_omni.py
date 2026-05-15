@@ -46,26 +46,26 @@ if current_omni_platform.is_xpu():
 else:  # CUDA + ROCm MI325 share the same deploy config
     stage_configs = [get_chunk_config()]
 
-# Create parameter combinations for model and stage config
-test_params = [
-    OmniServerParams(model=model, stage_config_path=stage_config) for model in models for stage_config in stage_configs
-]
-# For prefix caching, we enable it on the thinker (stage 0) via CLI override
+# For prefix caching checks against we enable it on the thinker and talker via CLI override
 # and enable prompt token details so that we can determine if any tokens were cached.
+# We also explicitly set block size so that we can make sure the cached token counts are a
+# multiple of the block size.
 BLOCK_SIZE = 16
-prefix_test_params = [
+test_params = [
     OmniServerParams(
         model=model,
-        stage_config_path=_CI_DEPLOY,
+        stage_config_path=stage_config,
+        use_stage_cli=True,
         server_args=[
             "--block-size",
             str(BLOCK_SIZE),
             "--stage-overrides",
-            '{"0": {"enable_prefix_caching": true}}',
+            '{"0": {"enable_prefix_caching": true}, "1": {"enable_prefix_caching": true}}',
             "--enable-prompt-tokens-details",
         ],
     )
     for model in models
+    for stage_config in stage_configs
 ]
 
 
@@ -170,7 +170,7 @@ def _run_prefix_cache_check(openai_client, request_config: dict):
     """Make two requests given a request config, and validate that:
     1. The second request actually had cached tokens
     2. The number of cached tokens is divisible by the block size used in
-    prefix_test_params, because currently upstream vLLM does not cache partial
+    test_params, because currently upstream vLLM does not cache partial
     blocks.
     """
     openai_client.send_omni_request(request_config, request_num=1)[0]
@@ -191,7 +191,7 @@ def _run_prefix_cache_check(openai_client, request_config: dict):
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", prefix_test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_thinker_prefix_caching_text_output(omni_server, openai_client) -> None:
     """
     Test thinker prefix caching by sending identical requests with an image (i.e.,
@@ -225,7 +225,7 @@ def test_thinker_prefix_caching_text_output(omni_server, openai_client) -> None:
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", prefix_test_params, indirect=True)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_thinker_prefix_caching_audio_output(omni_server, openai_client) -> None:
     """
     Verify that thinker prefix caching does not hang when the request
