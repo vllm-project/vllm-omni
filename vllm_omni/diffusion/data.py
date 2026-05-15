@@ -835,7 +835,7 @@ class OmniDiffusionConfig:
                 self.set_tf_model_config(TransformerConfig())
                 logger.warning(
                     "Could not find valid model_index.json per diffusers format. "
-                    "This model is suspectedly unsupported by the diffusers backend. "
+                    "This model is likely unsupported by the diffusers backend. "
                     "Also, without knowing the underlying diffusers pipeline class from model_index.json, "
                     "the dummy run will input only text prompt, which may cause errors for pipelines "
                     "that require additional inputs."
