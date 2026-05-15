@@ -61,7 +61,11 @@ test_params = [
             model=model,
             stage_config_path=default_path,
             use_stage_cli=True,
-            server_args=["--no-async-chunk"],
+            server_args=[
+                "--no-async-chunk",
+                "--stage-overrides",
+                '{"0": {"enable_prefix_caching": true}, "1": {"enable_prefix_caching": true}}',
+            ],
         ),
         id="default",
     ),
