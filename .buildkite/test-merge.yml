@@ -172,7 +172,7 @@ steps:
               pytest -s -v tests/e2e/online_serving/test_qwen3_tts_customvoice.py tests/e2e/offline_inference/test_qwen3_tts_customvoice.py -m 'advanced_model and cuda' --run-level 'advanced_model'
             "
         agents:
-          queue: "gpu_1_queue"
+          queue: "gpu_4_queue"
         plugins:
           - docker#v5.2.0:
               image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
@@ -193,7 +193,7 @@ steps:
               pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py tests/e2e/offline_inference/test_qwen3_tts_base.py -m 'advanced_model and cuda' --run-level 'advanced_model'
             "
         agents:
-          queue: "gpu_1_queue"
+          queue: "gpu_4_queue"
         plugins:
           - docker#v5.2.0:
               image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT

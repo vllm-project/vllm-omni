@@ -93,7 +93,13 @@ def _run(stage_config_path: str, output_path: Path) -> tuple[Image.Image, str, f
     from vllm_omni.platforms import current_omni_platform
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    result = build_prompt_tokens(PROMPT, tokenizer, task="it2i_recaption", sys_type="en_unified")
+    result = build_prompt_tokens(
+        PROMPT,
+        tokenizer,
+        task="it2i",
+        bot_task="recaption",
+        sys_type="en_unified",
+    )
     token_ids = result.token_ids
     system_prompt_type = result.system_prompt_type
 

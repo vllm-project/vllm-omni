@@ -1,7 +1,7 @@
 # HunyuanImage-3.0-Instruct deploy: AR (stage 0) + DiT (stage 1)
 # with AR-to-DiT KV reuse. The base CUDA layout uses 2 GPUs for AR
 # and 2 GPUs for DiT.
-pipeline: hunyuan_image3
+pipeline: hunyuan_image_3_moe
 async_chunk: false
 trust_remote_code: true
 
@@ -22,7 +22,13 @@ connectors:
 
 stages:
   - stage_id: 0
-    is_comprehension: false
+    # ``is_comprehension`` in vllm-omni names the tokenizer-owning AR stage
+    # (see config/stage_config.py + serving_chat AR-stage lookup), independent
+    # of whether the AR's task is comprehension (i2t/t2t) or generation
+    # (it2i/t2i). HunyuanImage-3.0's stage-0 owns the tokenizer and emits the
+    # cot+ratio token sequence consumed by stage-1, so it must be marked True
+    # for the serving path to set AR seed/stop_token_ids on this stage.
+    is_comprehension: true
     final_output: true
     final_output_type: text
     max_num_seqs: 1
@@ -38,7 +44,7 @@ stages:
     omni_kv_config:
       need_send_cache: true
     output_connectors:
-      to_stage_1: shared_memory_connector
+      to_stage_1: rdma_connector
     default_sampling_params:
       temperature: 0.0
       top_p: 1
@@ -58,7 +64,7 @@ stages:
       tensor_parallel_size: 2
       enable_expert_parallel: true
     input_connectors:
-      from_stage_0: shared_memory_connector
+      from_stage_0: rdma_connector
     default_sampling_params:
       num_inference_steps: 50
       guidance_scale: 0
@@ -83,7 +89,9 @@ platforms:
         max_num_batched_tokens: 8192
         parallel_config:
           tensor_parallel_size: 4
-          enable_expert_parallel: true
+          enable_expert_parallel: false
+          sequence_parallel_size: 1
+          ulysses_degree: 1
 
   xpu:
     stages:

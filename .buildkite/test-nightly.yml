@@ -388,7 +388,7 @@ steps:
                   - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
                     resources:
                       limits:
-                        nvidia.com/gpu: 1
+                        nvidia.com/gpu: 2
                     volumeMounts:
                       - name: devshm
                         mountPath: /dev/shm
