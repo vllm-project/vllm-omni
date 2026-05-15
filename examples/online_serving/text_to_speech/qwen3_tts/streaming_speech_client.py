@@ -7,8 +7,9 @@ Usage:
     # Send full text at once
     python streaming_speech_client.py --text "Hello world. How are you? I am fine."
 
-    # TTS with certain speaker
-    python streaming_speech_client_ori.py --text "Hello world. How are you? I am fine." \
+    # Pick a built-in speaker for CustomVoice models
+    python streaming_speech_client.py \
+        --text "打开电子枪，关闭扫描，切换到低倍模式。" \
         --speaker "Serena" \
         --language "Chinese"
 
@@ -216,11 +217,13 @@ def main():
 
     args = parser.parse_args()
 
-    # Build session config (only include non-None values)
+    # Build session config (only include non-None values).
+    # Server canonical field is `voice`; `speaker` is accepted as an alias
+    # (see StreamingSpeechSessionConfig.voice in protocol/audio.py).
     config = {}
     for key in [
         "model",
-        # "speaker",
+        "speaker",
         "task_type",
         "language",
         "instructions",
@@ -233,9 +236,6 @@ def main():
         val = getattr(args, key.replace("-", "_"), None)
         if val is not None:
             config[key] = val
-    # Server receive voice instead of speaker to control
-    if args.speaker:
-        config["voice"] = args.speaker.lower().strip()
     if args.stream_audio:
         config["stream_audio"] = True
     if args.x_vector_only_mode:
