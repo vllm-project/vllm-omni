@@ -14,15 +14,12 @@ from tests.helpers.stage_config import get_deploy_config_path
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 
-models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
-
 # Set VLLM_TEST_PD_MODE=1 to test PD disaggregation (follow-up — deploy overlay not yet migrated).
 _USE_PD = os.environ.get("VLLM_TEST_PD_MODE", "0") == "1"
 
+_MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 _CI_DEPLOY = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
 
-
-stage_configs = [_CI_DEPLOY]
 
 # For prefix caching checks against we enable it on the thinker and talker via CLI override
 # and enable prompt token details so that we can determine if any tokens were cached.
@@ -30,21 +27,22 @@ stage_configs = [_CI_DEPLOY]
 # multiple of the block size.
 BLOCK_SIZE = 16
 test_params = [
-    OmniServerParams(
-        model=model,
-        stage_config_path=stage_config,
-        use_stage_cli=True,
-        server_args=[
-            "--no-async-chunk",
-            "--block-size",
-            str(BLOCK_SIZE),
-            "--stage-overrides",
-            '{"0": {"enable_prefix_caching": true}, "1": {"enable_prefix_caching": true}}',
-            "--enable-prompt-tokens-details",
-        ],
+    pytest.param(
+        OmniServerParams(
+            model=_MODEL,
+            stage_config_path=_CI_DEPLOY,
+            use_stage_cli=True,
+            server_args=[
+                "--no-async-chunk",
+                "--block-size",
+                str(BLOCK_SIZE),
+                "--stage-overrides",
+                '{"0": {"enable_prefix_caching": true}, "1": {"enable_prefix_caching": true}}',
+                "--enable-prompt-tokens-details",
+            ],
+        ),
+        id="default",
     )
-    for model in models
-    for stage_config in stage_configs
 ]
 
 
