@@ -53,6 +53,17 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
     - Executes generation process and returns tensors via `pooler_output`.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Scope full-payload connector init to Qwen3-Omni: other generation
+        # models (e.g. Bagel DiT) retain their pre-existing runner setup
+        # so this refactor does not perturb them.
+        if getattr(self.model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration":
+            self.init_omni_connectors(
+                vllm_config=self.vllm_config,
+                model_config=self.model_config,
+            )
+
     def _update_request_states(self, scheduler_output: SchedulerOutput):
         # remove requests
         for req_id in scheduler_output.finished_req_ids:
@@ -89,6 +100,16 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
+        if hasattr(self, "_omni_connector"):
+            for request in getattr(scheduler_output, "pending_input_registrations", []):
+                self.register_chunk_recv(request)
+            self.recv_full_payload_inputs(scheduler_output)
+            if self._pending_full_payload_send:
+                flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
+                flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
+                if flush_ids:
+                    self.flush_full_payload_outputs(flush_ids)
+
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -110,7 +131,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 self._update_request_states(scheduler_output)
             deferred_state_corrections_fn = self._update_states(scheduler_output)
             if not scheduler_output.total_num_scheduled_tokens:
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -118,7 +139,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     encoder_cache=self.encoder_cache,
                 ) as ec_connector_output:
                     self._execute_mm_encoder(scheduler_output)
-                    return make_empty_encoder_model_runner_output(scheduler_output)
+                    return self.attach_omni_connector_output(make_empty_encoder_model_runner_output(scheduler_output))
 
             if not num_scheduled_tokens:
                 if (
@@ -134,9 +155,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     self._dummy_run(1)
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
+                    return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
 
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                result = self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                return self.attach_omni_connector_output(result)
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -338,11 +360,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             if kv_connector_output.is_empty():
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
-            return output
+            return self.attach_omni_connector_output(output)
 
         # Unpack ephemeral state.
         (
@@ -403,6 +425,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
+        if self._should_accumulate_full_payload_output():
+            for i, rid in enumerate(req_ids_output_copy):
+                req_state = self.requests.get(rid)
+                if req_state is not None and pooler_output[i]:
+                    self.accumulate_full_payload_output(rid, pooler_output[i], req_state)
+
         output = OmniModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -415,6 +443,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             cudagraph_stats=cudagraph_stats,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
         )
+        output.omni_connector_output = self.get_omni_connector_output()
 
         if not self.use_async_scheduling:
             return output

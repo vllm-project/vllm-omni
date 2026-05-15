@@ -237,14 +237,22 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         prompt_token_ids = tokenizer.encode(prompt_template)
 
+        # In non-async-chunk (full-payload) mode the engine treats each
+        # streaming TokensPrompt as a fresh decode, so mid-stream segment
+        # yields cause the thinker to emit duplicate responses and the
+        # talker to emit duplicate audio. Defer all audio to the final
+        # flush so the thinker sees one complete prompt.
+        async_chunk = getattr(model_config, "async_chunk", False)
+
         async for audio_chunk in audio_stream:
             buffer.write_audio(audio_chunk)
 
-            while (segment := buffer.read_audio()) is not None:
-                yield TokensPrompt(
-                    prompt_token_ids=prompt_token_ids,
-                    multi_modal_data={"audio": segment},
-                )
+            if async_chunk:
+                while (segment := buffer.read_audio()) is not None:
+                    yield TokensPrompt(
+                        prompt_token_ids=prompt_token_ids,
+                        multi_modal_data={"audio": segment},
+                    )
 
         remaining = buffer.flush()
         if remaining is not None and len(remaining) > 0:
