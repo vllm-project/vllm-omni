@@ -618,12 +618,12 @@ class MiniCPMVImageProcessor(BaseImageProcessor):
                     slice_images.append(patches[i][j])
         return slice_images
 
-    def get_sliced_grid(self, image_size, max_slice_nums, nerver_split=False):
+    def get_sliced_grid(self, image_size, max_slice_nums, never_split=False):
         original_width, original_height = image_size
         log_ratio = math.log(original_width / original_height)
         ratio = original_width * original_height / (self.scale_resolution * self.scale_resolution)
         multiple = min(math.ceil(ratio), max_slice_nums)
-        if multiple <= 1 or nerver_split:
+        if multiple <= 1 or never_split:
             return None
         candidate_split_grids_nums = []
         for i in [multiple - 1, multiple, multiple + 1]:
@@ -852,7 +852,7 @@ def trunc_normal_tf_(
     best when :math:`a \\leq \text{mean} \\leq b`.
     NOTE: this 'tf' variant behaves closer to Tensorflow / JAX impl where the
     bounds [a, b] are applied when sampling the normal distribution with mean=0, std=1.0
-    and the result is subsquently scaled and shifted by the mean and std args.
+    and the result is subsequently scaled and shifted by the mean and std args.
     Args:
         tensor: an n-dimensional `torch.Tensor`
         mean: the mean of the normal distribution
