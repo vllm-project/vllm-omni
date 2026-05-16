@@ -391,6 +391,8 @@ class StageDiffusionClient(StageClientBase):
             return self._output_queue.get_nowait()
         except asyncio.QueueEmpty:
             if self._engine_dead:
+                if self._shutting_down:
+                    return None
                 raise EngineDeadError()
             if not self._shutting_down and self._owns_process and self._proc is not None and not self._proc.is_alive():
                 self._engine_dead = True

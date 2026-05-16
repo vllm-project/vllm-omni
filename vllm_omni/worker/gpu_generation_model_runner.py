@@ -9,6 +9,7 @@ from __future__ import annotations
 import gc
 import logging
 from copy import copy
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -18,7 +19,9 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    RoutedExpertsCapturer,
+    extract_routed_experts_for_current_batch,
+    get_global_experts_capturer,
+    issue_routing_d2h_copy,
 )
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -27,6 +30,7 @@ from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -111,11 +115,21 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     self.flush_full_payload_outputs(flush_ids)
 
         if self.routed_experts_initialized:
-            capturer = RoutedExpertsCapturer.get_instance()
-            if capturer is not None:
-                capturer.clear_buffer()  # noqa
-            else:
-                logger.error("RoutedExpertsCapturer not initialized.")
+            capturer = get_global_experts_capturer()
+            if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
+                capturer.finalize_pending_copy()
+
+        # If ngram_gpu is used, we need to copy the scheduler_output to avoid
+        # the modification has influence on the scheduler_output in engine core process.
+        # The replace is much faster than deepcopy.
+        if self.speculative_config is not None and self.speculative_config.use_ngram_gpu():
+            num_scheduled_tokens_copy = scheduler_output.num_scheduled_tokens.copy()
+            spec_decode_tokens_copy = scheduler_output.scheduled_spec_decode_tokens.copy()
+            scheduler_output = replace(
+                scheduler_output,
+                num_scheduled_tokens=num_scheduled_tokens_copy,
+                scheduled_spec_decode_tokens=spec_decode_tokens_copy,
+            )
 
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
@@ -339,6 +353,14 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
+        if self.routed_experts_initialized and hasattr(self, "_positions_cpu"):
+            issue_routing_d2h_copy(
+                input_batch_req_ids=self.input_batch.req_ids,
+                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                positions=self.positions,
+                positions_cpu=self._positions_cpu,
+            )
+
         return None
 
     @torch.inference_mode()
@@ -425,6 +447,15 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
+        routed_experts_dict = None
+        if self.routed_experts_initialized:
+            routed_experts_dict = extract_routed_experts_for_current_batch(
+                req_ids=req_ids_output_copy,
+                requests=self.requests,
+                req_id_to_index=self.input_batch.req_id_to_index,
+                num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
+                max_model_len=self.max_model_len,
+            )
         if self._should_accumulate_full_payload_output():
             for i, rid in enumerate(req_ids_output_copy):
                 req_state = self.requests.get(rid)
@@ -442,6 +473,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             num_nans_in_logits={},
             cudagraph_stats=cudagraph_stats,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+            routed_experts_dict=routed_experts_dict,
         )
         output.omni_connector_output = self.get_omni_connector_output()
 
@@ -751,7 +783,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                         device=self.device,
                     )
 
-                intermediate_tensors = self.sync_and_slice_intermediate_tensors(num_tokens_padded, None, False)
+                intermediate_tensors = self.sync_and_gather_intermediate_tensors(num_tokens_padded, None, False)
 
             if ubatch_slices_padded is not None:
                 # Adjust values to reflect a single ubatch.
@@ -794,7 +826,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             ):
                 assert isinstance(
                     self.drafter,
-                    EagleProposer | DFlashProposer | DraftModelProposer | ExtractHiddenStatesProposer,
+                    EagleProposer | DFlashProposer | DraftModelProposer | ExtractHiddenStatesProposer | Gemma4Proposer,
                 )
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.
