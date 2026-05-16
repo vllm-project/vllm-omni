@@ -47,10 +47,7 @@ def _looks_like_dreamzero(model_name: str) -> bool:
             action_head_cfg.get("_target_")
             == "groot.vla.model.dreamzero.action_head.wan_flow_matching_action_tf.WANPolicyHead"
             and diffusion_model_cfg.get("_target_")
-            == (
-                "groot.vla.model.dreamzero.modules."
-                "wan_video_dit_action_casual_chunk.CausalWanModel"
-            )
+            == ("groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk.CausalWanModel")
         )
     except Exception:
         return False

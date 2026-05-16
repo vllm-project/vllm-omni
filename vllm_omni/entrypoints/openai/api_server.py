@@ -1426,9 +1426,7 @@ async def realtime_robot_openpi(websocket: WebSocket):
     serving = getattr(websocket.app.state, "openai_serving_realtime_robot", None)
     if serving is None:
         await websocket.accept()
-        await websocket.send_json(
-            {"type": "error", "error": "Robot policy not available", "code": "unsupported"}
-        )
+        await websocket.send_json({"type": "error", "error": "Robot policy not available", "code": "unsupported"})
         await websocket.close()
         return
     connection = RobotRealtimeConnection(websocket, serving)
