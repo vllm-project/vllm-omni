@@ -986,8 +986,7 @@ class OmniDiffusionConfig:
                                 == "groot.vla.model.dreamzero.action_head.wan_flow_matching_action_tf.WANPolicyHead"
                                 and diffusion_model_cfg.get("_target_")
                                 == (
-                                    "groot.vla.model.dreamzero.modules."
-                                    "wan_video_dit_action_casual_chunk.CausalWanModel"
+                                    "groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk.CausalWanModel"
                                 )
                             )
                     if looks_like_dreamzero or self.model_class_name == "DreamZeroPipeline":

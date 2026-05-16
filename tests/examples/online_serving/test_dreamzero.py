@@ -16,9 +16,9 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import OmniServerParams
-from tests.examples.conftest import run_cmd
-from tests.utils import hardware_test
+from tests.examples.helpers import run_cmd
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServerParams
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 

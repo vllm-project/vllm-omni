@@ -4,6 +4,7 @@ stage_args:
     runtime:
       devices: "0"
     engine_args:
+      dtype: bfloat16
       model_stage: diffusion
       model_class_name: DreamZeroPipeline
       distributed_executor_backend: "mp"

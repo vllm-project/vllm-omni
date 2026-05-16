@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import asyncio
 import queue
 import threading
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -448,11 +447,7 @@ class TestDiffusionEngine:
     @pytest.mark.asyncio
     async def test_step_raises_aborted_error(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
-        engine._closed = False
-        engine._loop_started = True
-        engine._init_lock = asyncio.Lock()
-        engine.main_loop = asyncio.get_running_loop()
-        engine.stop_event = threading.Event()
+        engine._check_and_start_background_loop = mocker.AsyncMock()
         engine.pre_process_func = None
         engine.async_add_req_and_wait_for_response = mocker.AsyncMock(
             return_value=DiffusionOutput(aborted=True, abort_message="Request req-abort aborted.")
@@ -527,7 +522,8 @@ class TestDiffusionEngine:
         with pytest.raises(RuntimeError, match="Dummy run failed: boom"):
             engine._dummy_run()
 
-    def test_step_multi_request_reuses_multimodal_slice_logic(self) -> None:
+    @pytest.mark.asyncio
+    async def test_step_multi_request_reuses_multimodal_slice_logic(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.od_config = SimpleNamespace(
             model_class_name="mock_model",
@@ -535,7 +531,8 @@ class TestDiffusionEngine:
         )
         engine.pre_process_func = None
         engine.post_process_func = None
-        engine.add_req_and_wait_for_response = Mock(
+        engine._check_and_start_background_loop = mocker.AsyncMock()
+        engine.async_add_req_and_wait_for_response = mocker.AsyncMock(
             return_value=DiffusionOutput(
                 output={
                     "video": ["frame-0", "frame-1"],
@@ -555,7 +552,7 @@ class TestDiffusionEngine:
         )
 
         with patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False):
-            outputs = engine.step(request)
+            outputs = await engine.step(request)
 
         assert len(outputs) == 2
         assert outputs[0].images == ["frame-0"]

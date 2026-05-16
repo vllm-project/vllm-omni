@@ -13,10 +13,10 @@ _DEMO_PORT = int(os.environ.get("VLLM_OMNI_DEMO_PORT", "8000"))
 
 # Import base configs at module top level so the subclasses below are pickle-
 # resolvable (worker processes import this module fresh via __main__).
-from molmo_spaces.configs.policy_configs_baselines import (
+from molmo_spaces.configs.policy_configs_baselines import (  # noqa: E402
     DreamZeroPolicyConfig,
 )
-from molmo_spaces.evaluation.configs.evaluation_configs import (
+from molmo_spaces.evaluation.configs.evaluation_configs import (  # noqa: E402
     DreamZeroPolicyEvalConfig,
 )
 
@@ -55,9 +55,7 @@ def main() -> int:
 
     os.environ["VLLM_OMNI_DEMO_HOST"] = args.host
     os.environ["VLLM_OMNI_DEMO_PORT"] = str(args.port)
-    DreamZeroVllmOmniPolicyConfig.model_fields["remote_config"].default = dict(
-        host=args.host, port=args.port
-    )
+    DreamZeroVllmOmniPolicyConfig.model_fields["remote_config"].default = dict(host=args.host, port=args.port)
 
     # Import after env vars are set so MuJoCo picks EGL.
     from molmo_spaces.evaluation import run_evaluation
@@ -82,10 +80,7 @@ def main() -> int:
         episode_idx=args.episode_idx,
     )
 
-    print(
-        f"[eval] success={results.success_count}/{results.total_count} "
-        f"({results.success_rate:.1%})"
-    )
+    print(f"[eval] success={results.success_count}/{results.total_count} ({results.success_rate:.1%})")
     print(f"[eval] output_dir={results.output_dir}")
     return 0
 
