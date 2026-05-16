@@ -46,7 +46,7 @@ the client, and produces speech audio incorporating the result.
 }
 ```
 
-`voice` is optional. Qwen3-Omni supports `"ethan"` (default), `"chelsie"`,
+`voice` is optional. Qwen3-Omni supports `"ethan"`, `"chelsie"` (default),
 and `"aiden"`. Omitting `voice` falls back to the model's default voice.
 
 ## Tool definition format
