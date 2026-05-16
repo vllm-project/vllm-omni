@@ -99,7 +99,6 @@ Configuration classes.
 - [vllm_omni.diffusion.cache.teacache.config.TeaCacheConfig][]
 - [vllm_omni.distributed.omni_connectors.utils.config.ConnectorSpec][]
 - [vllm_omni.distributed.omni_connectors.utils.config.OmniTransferConfig][]
-- [vllm_omni.model_executor.models.cosyvoice3.config.CosyVoice3Config][]
 - [vllm_omni.model_executor.models.fish_speech.configuration_fish_speech.FishSpeechConfig][]
 - [vllm_omni.model_executor.models.fish_speech.configuration_fish_speech.FishSpeechFastARConfig][]
 - [vllm_omni.model_executor.models.fish_speech.configuration_fish_speech.FishSpeechSlowARConfig][]
@@ -116,10 +115,14 @@ Configuration classes.
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1DecoderDiTConfig][]
 - [vllm_omni.model_executor.models.qwen3_tts.tokenizer_25hz.configuration_qwen3_tts_tokenizer_v1.Qwen3TTSTokenizerV1EncoderConfig][]
+- [vllm_omni.transformers_utils.configs.cosyvoice3.CosyVoice3Config][]
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Config][]
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLConfig][]
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLTextConfig][]
 - [vllm_omni.transformers_utils.configs.mammoth_moda2.Mammothmoda2Qwen2_5_VLVisionConfig][]
+- [vllm_omni.transformers_utils.configs.omnivoice.OmniVoiceConfig][]
+- [vllm_omni.transformers_utils.configs.voxcpm.VoxCPMConfig][]
+- [vllm_omni.transformers_utils.configs.voxcpm2.VoxCPM2Config][]
 
 ## Workers
 

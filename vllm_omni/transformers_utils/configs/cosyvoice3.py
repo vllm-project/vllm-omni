@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 
 
@@ -131,3 +132,8 @@ class CosyVoice3Config(PretrainedConfig):
                 "cond_channels": 512,
             },
         }
+
+
+AutoConfig.register("cosyvoice3", CosyVoice3Config)
+
+__all__ = ["CosyVoice3Config"]
