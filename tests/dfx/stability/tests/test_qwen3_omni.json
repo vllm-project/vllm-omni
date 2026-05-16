@@ -1,60 +1,8 @@
 [
     {
-        "test_name": "test_qwen3_omni_stability",
-        "server_params": {
-            "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-            "stage_overrides": {
-                "2": {
-                    "max_num_batched_tokens": 1000000
-                }
-            }
-        },
-        "benchmark_params": [
-            {
-                "dataset_name": "random-mm",
-                "backend": "openai-chat-omni",
-                "endpoint": "/v1/chat/completions",
-                "duration_sec": 86400,
-                "request_rate": 0.3,
-                "num_prompts_per_batch": 10,
-                "random_input_len": {
-                    "min": 0,
-                    "max": 8000
-                },
-                "random_output_len": {
-                    "min": 0,
-                    "max": 1000
-                },
-                "random_range_ratio": 0.0,
-                "random_mm_base_items_per_request": {
-                    "min": 0,
-                    "max": 6
-                },
-                "random_mm_num_mm_items_range_ratio": 0.0,
-                "random_mm_limit_mm_per_prompt": {
-                    "image": 2,
-                    "video": 2,
-                    "audio": 2
-                },
-                "random_mm_bucket_config": {
-                    "(128-1024, 128-1024, 1)": 0.34,
-                    "(256-1080, 256-1920, 2-16)": 0.33,
-                    "(0, 1-60, 1-3)": 0.33
-                },
-                "ignore_eos": true,
-                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration"
-            }
-        ]
-    },
-    {
         "test_name": "test_qwen3_omni_stability_async_chunk",
         "server_params": {
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-            "stage_overrides": {
-                "2": {
-                    "max_num_batched_tokens": 1000000
-                }
-            },
             "extra_cli_args": ["--async-chunk"]
         },
         "benchmark_params": [
@@ -64,7 +12,7 @@
                 "endpoint": "/v1/chat/completions",
                 "duration_sec": 86400,
                 "max_concurrency": 2,
-                "num_prompts_per_batch": 10,
+                "num_prompts_per_batch": 50,
                 "random_input_len": {
                     "min": 0,
                     "max": 8000

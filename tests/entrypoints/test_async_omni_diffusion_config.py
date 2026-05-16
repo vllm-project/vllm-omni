@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -287,3 +289,56 @@ def test_serve_cli_accepts_diffusion_attention_backend():
     assert isinstance(diffusion_attention_config, AttentionConfig)
     assert diffusion_attention_config.default is not None
     assert diffusion_attention_config.default.backend == "FLASH_ATTN"
+
+
+def test_serve_cli_accepts_additional_config():
+    """Ensure diffusion serve CLI exposes additional_config and forwards it to stage config."""
+    parser = FlexibleArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Qwen/Qwen-Image",
+            "--omni",
+            "--additional-config",
+            '{"torchair_graph_config":{"enabled":true}}',
+        ]
+    )
+
+    stage_cfg = _create_default_diffusion_stage_cfg(args)[0]
+    engine_args = stage_cfg["engine_args"]
+
+    assert args.additional_config == {"torchair_graph_config": {"enabled": True}}
+    assert engine_args["additional_config"] == {"torchair_graph_config": {"enabled": True}}
+
+
+def test_resolve_stage_configs_injects_additional_config_into_diffusion_stage(mocker):
+    """Ensure YAML/deploy stage resolution forwards top-level additional_config."""
+    fake_diffusion_stage = SimpleNamespace(
+        stage_type="diffusion",
+        engine_args=SimpleNamespace(),
+    )
+    fake_llm_stage = SimpleNamespace(
+        stage_type="llm",
+        engine_args=SimpleNamespace(),
+    )
+    mocker.patch(
+        "vllm_omni.engine.async_omni_engine.load_and_resolve_stage_configs",
+        return_value=("dummy.yaml", [fake_llm_stage, fake_diffusion_stage]),
+    )
+
+    engine = AsyncOmniEngine.__new__(AsyncOmniEngine)
+    engine._strip_single_engine_args = lambda kwargs: kwargs
+
+    _, stage_configs = engine._resolve_stage_configs(
+        "dummy-model",
+        {
+            "stage_configs_path": "dummy.yaml",
+            "additional_config": {"torchair_graph_config": {"enabled": True}},
+        },
+    )
+
+    assert not hasattr(stage_configs[0].engine_args, "additional_config")
+    assert stage_configs[1].engine_args.additional_config == {"torchair_graph_config": {"enabled": True}}

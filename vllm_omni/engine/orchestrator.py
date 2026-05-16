@@ -24,6 +24,18 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.messages import (
+    AbortRequestMessage,
+    AddCompanionRequestMessage,
+    CollectiveRPCRequestMessage,
+    CollectiveRPCResultMessage,
+    EngineQueueMessage,
+    ErrorMessage,
+    OutputMessage,
+    ShutdownRequestMessage,
+    StageMetricsMessage,
+    StageSubmissionMessage,
+)
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.outputs import OmniRequestOutput
@@ -115,9 +127,9 @@ class Orchestrator:
 
     def __init__(
         self,
-        request_async_queue: janus.AsyncQueue[dict[str, Any]],
-        output_async_queue: janus.AsyncQueue[dict[str, Any]],
-        rpc_async_queue: janus.AsyncQueue[dict[str, Any]],
+        request_async_queue: janus.AsyncQueue[EngineQueueMessage],
+        output_async_queue: janus.AsyncQueue[EngineQueueMessage],
+        rpc_async_queue: janus.AsyncQueue[EngineQueueMessage],
         stage_pools: list[StagePool],
         *,
         async_chunk: bool = False,
@@ -196,36 +208,38 @@ class Orchestrator:
         """Read messages from the main thread via request_async_queue."""
         while True:
             msg = await self.request_async_queue.get()
-            msg_type = msg.get("type")
 
-            if msg_type == "add_request":
-                await self._handle_add_request(msg)
-            elif msg_type == "streaming_update":
-                await self._handle_streaming_update(msg)
-            elif msg_type == "add_companion_request":
+            if isinstance(msg, StageSubmissionMessage):
+                if msg.type == "add_request":
+                    await self._handle_add_request(msg)
+                elif msg.type == "streaming_update":
+                    await self._handle_streaming_update(msg)
+                else:
+                    logger.warning("[Orchestrator] Unknown stage submission type: %s", msg.type)
+            elif isinstance(msg, AddCompanionRequestMessage):
                 await self._handle_add_companion(msg)
-            elif msg_type == "abort":
+            elif isinstance(msg, AbortRequestMessage):
                 await self._handle_abort(msg)
-            elif msg_type == "collective_rpc":
+            elif isinstance(msg, CollectiveRPCRequestMessage):
                 await self._handle_collective_rpc(msg)
-            elif msg_type == "shutdown":
+            elif isinstance(msg, ShutdownRequestMessage):
                 logger.info("[Orchestrator] Received shutdown signal")
                 self._shutdown_event.set()
                 self._shutdown_stages()
                 break
             else:
-                logger.warning("[Orchestrator] Unknown message type: %s", msg_type)
+                logger.warning("[Orchestrator] Unknown message type: %s", type(msg).__name__)
 
-    async def _handle_add_request(self, msg: dict[str, Any]) -> None:
+    async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
         stage_id = 0
-        request_id = msg["request_id"]
-        prompt = msg["prompt"]
-        original_prompt = msg.get("original_prompt", prompt)
-        sampling_params_list = msg["sampling_params_list"]
+        request_id = msg.request_id
+        prompt = msg.prompt
+        original_prompt = msg.original_prompt
+        sampling_params_list = msg.sampling_params_list
         if not sampling_params_list:
             raise ValueError(f"Missing sampling params for stage 0. Got {len(sampling_params_list)} stage params.")
-        final_stage_id = msg["final_stage_id"]
+        final_stage_id = msg.final_stage_id
 
         logger.debug(
             "[Orchestrator] _handle_add_request: stage=%s req=%s "
@@ -249,27 +263,27 @@ class Orchestrator:
         self.request_states[request_id] = req_state
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         req_state.stage_submit_ts[stage_id] = _time.time()
-        enqueue_ts = msg.get("enqueue_ts", 0.0)
+        enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
             req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
-        preprocess_ms = msg.get("preprocess_ms", 0.0)
+        preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
         await self.stage_pools[stage_id].submit_initial(
             request_id,
             req_state,
             prompt,
-            prompt_text=msg.get("output_prompt_text"),
+            prompt_text=msg.output_prompt_text,
         )
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
 
-    async def _handle_streaming_update(self, msg: dict[str, Any]) -> None:
+    async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
         """Handle a streaming_update message for an existing request."""
         stage_id = 0
-        request_id = msg["request_id"]
-        request = msg["prompt"]
+        request_id = msg.request_id
+        request = msg.prompt
 
         req_state = self.request_states.get(request_id)
         if req_state is None:
@@ -277,13 +291,22 @@ class Orchestrator:
                 "[Orchestrator] streaming_update for unknown req=%s, falling back to add_request",
                 request_id,
             )
-            fallback_msg = dict(msg)
-            fallback_msg["type"] = "add_request"
+            fallback_msg = StageSubmissionMessage(
+                type="add_request",
+                request_id=msg.request_id,
+                prompt=msg.prompt,
+                original_prompt=msg.original_prompt,
+                output_prompt_text=msg.output_prompt_text,
+                sampling_params_list=msg.sampling_params_list,
+                final_stage_id=msg.final_stage_id,
+                preprocess_ms=msg.preprocess_ms,
+                enqueue_ts=msg.enqueue_ts,
+            )
             await self._handle_add_request(fallback_msg)
             return
 
-        if "sampling_params_list" in msg and msg["sampling_params_list"]:
-            req_state.sampling_params_list = msg["sampling_params_list"]
+        if msg.sampling_params_list:
+            req_state.sampling_params_list = msg.sampling_params_list
 
         req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()
@@ -291,16 +314,16 @@ class Orchestrator:
             request_id,
             req_state,
             request,
-            prompt_text=msg.get("output_prompt_text"),
+            prompt_text=msg.output_prompt_text,
         )
 
-    async def _handle_add_companion(self, msg: dict[str, Any]) -> None:
+    async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
-        companion_id = msg["companion_id"]
-        parent_id = msg["parent_id"]
-        role = msg["role"]
-        companion_prompt = msg["prompt"]
-        sampling_params_list = msg["sampling_params_list"]
+        companion_id = msg.companion_id
+        parent_id = msg.parent_id
+        role = msg.role
+        companion_prompt = msg.prompt
+        sampling_params_list = msg.sampling_params_list
 
         parent_state = self.request_states.get(parent_id)
         if parent_state is None:
@@ -326,7 +349,7 @@ class Orchestrator:
             companion_id,
             companion_state,
             companion_prompt,
-            prompt_text=msg.get("companion_prompt_text"),
+            prompt_text=msg.companion_prompt_text,
             affinity_request_id=parent_id,
         )
 
@@ -338,9 +361,9 @@ class Orchestrator:
             companion_replica_id,
         )
 
-    async def _handle_abort(self, msg: dict[str, Any]) -> None:
+    async def _handle_abort(self, msg: AbortRequestMessage) -> None:
         """Handle an abort message from the main thread."""
-        request_ids = msg["request_ids"]
+        request_ids = msg.request_ids
         await self._cleanup_request_ids(
             self._cfg_tracker.abort_parents(request_ids),
             abort=True,
@@ -359,14 +382,14 @@ class Orchestrator:
         for pool in self.stage_pools:
             pool.release_bindings(request_ids)
 
-    async def _handle_collective_rpc(self, msg: dict[str, Any]) -> None:
+    async def _handle_collective_rpc(self, msg: CollectiveRPCRequestMessage) -> None:
         """Handle a control-plane RPC request from the main thread."""
-        rpc_id = msg["rpc_id"]
-        method = msg["method"]
-        timeout = msg.get("timeout")
-        args = tuple(msg.get("args", ()))
-        kwargs = dict(msg.get("kwargs") or {})
-        requested_stage_ids = msg.get("stage_ids")
+        rpc_id = msg.rpc_id
+        method = msg.method
+        timeout = msg.timeout
+        args = msg.args
+        kwargs = dict(msg.kwargs)
+        requested_stage_ids = msg.stage_ids
 
         target_pools: list[StagePool] = []
         if requested_stage_ids is None:
@@ -393,13 +416,12 @@ class Orchestrator:
                 results.append(stage_result)
 
         await self.rpc_async_queue.put(
-            {
-                "type": "collective_rpc_result",
-                "rpc_id": rpc_id,
-                "method": method,
-                "stage_ids": stage_ids,
-                "results": results,
-            }
+            CollectiveRPCResultMessage(
+                rpc_id=rpc_id,
+                method=method,
+                stage_ids=stage_ids,
+                results=results,
+            )
         )
 
     # ---- Orchestration loop ----
@@ -469,13 +491,12 @@ class Orchestrator:
                             for req_id, req_state in list(self.request_states.items()):
                                 if stage_id in req_state.stage_submit_ts:
                                     await self.output_async_queue.put(
-                                        {
-                                            "type": "error",
-                                            "error": str(e),
-                                            "fatal": True,
-                                            "request_id": req_id,
-                                            "stage_id": stage_id,
-                                        }
+                                        ErrorMessage(
+                                            error=str(e),
+                                            fatal=True,
+                                            request_id=req_id,
+                                            stage_id=stage_id,
+                                        )
                                     )
                                     self.request_states.pop(req_id, None)
                             self._shutdown_event.set()
@@ -534,12 +555,11 @@ class Orchestrator:
         else:
             parent_id = output.request_id
         await self.output_async_queue.put(
-            {
-                "type": "error",
-                "request_id": parent_id,
-                "stage_id": stage_id,
-                "error": output.error,
-            }
+            ErrorMessage(
+                request_id=parent_id,
+                stage_id=stage_id,
+                error=output.error,
+            )
         )
         await self._cleanup_request_ids(
             [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)],
@@ -596,25 +616,23 @@ class Orchestrator:
 
         if self.stage_pools[stage_id].final_output:
             await self.output_async_queue.put(
-                {
-                    "type": "output",
-                    "request_id": req_id,
-                    "stage_id": stage_id,
-                    "engine_outputs": output,
-                    "metrics": stage_metrics,
-                    "finished": finished and stage_id == req_state.final_stage_id,
-                    "stage_submit_ts": submit_ts,
-                }
+                OutputMessage(
+                    request_id=req_id,
+                    stage_id=stage_id,
+                    engine_outputs=output,
+                    metrics=stage_metrics,
+                    finished=finished and stage_id == req_state.final_stage_id,
+                    stage_submit_ts=submit_ts,
+                )
             )
         elif stage_metrics is not None:
             await self.output_async_queue.put(
-                {
-                    "type": "stage_metrics",
-                    "request_id": req_id,
-                    "stage_id": stage_id,
-                    "metrics": stage_metrics,
-                    "stage_submit_ts": submit_ts,
-                }
+                StageMetricsMessage(
+                    request_id=req_id,
+                    stage_id=stage_id,
+                    metrics=stage_metrics,
+                    stage_submit_ts=submit_ts,
+                )
             )
 
         if self._pd_pair is not None and finished and stage_id == self._pd_pair[0]:
@@ -775,79 +793,120 @@ class Orchestrator:
         """Forward output from the current logical stage to the next one."""
         next_logical = src_stage_id + 1
         next_pool = self.stage_pools[next_logical]
-        next_client = next_pool.stage_client
+
+        if next_pool.stage_type == "diffusion":
+            await self._forward_to_diffusion_stage(
+                req_id,
+                src_stage_id,
+                output,
+                req_state,
+            )
+        else:
+            await self._forward_to_llm_stage(
+                req_id,
+                src_stage_id,
+                output,
+                req_state,
+                is_streaming_session=is_streaming_session,
+                is_final_update=is_final_update,
+            )
+
+    async def _forward_to_diffusion_stage(
+        self,
+        req_id: str,
+        src_stage_id: int,
+        output: Any,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Forward output from an LLM stage to the next diffusion stage."""
+        next_logical = src_stage_id + 1
+        next_pool = self.stage_pools[next_logical]
+        params = req_state.sampling_params_list[next_logical]
+        source_outputs = [output]
+        already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
+
+        diffusion_client = next_pool.stage_client
+        if diffusion_client.custom_process_input_func is not None:
+            _t_ar2d = _time.perf_counter()
+            diffusion_prompt = diffusion_client.custom_process_input_func(
+                source_outputs,
+                req_state.prompt,
+                getattr(diffusion_client, "requires_multimodal_data", False),
+            )
+            _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
+            req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
+            logger.info(
+                "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
+                req_id,
+                _dt_ar2d,
+                src_stage_id,
+                next_logical,
+            )
+            if isinstance(diffusion_prompt, list):
+                if not diffusion_prompt:
+                    error_output = OmniRequestOutput.from_error(
+                        req_id,
+                        f"Stage-{src_stage_id} produced no valid inputs for diffusion stage-{next_logical}",
+                    )
+                    logger.warning(
+                        "[Orchestrator] req=%s stage=%d produced empty diffusion inputs for stage=%d; "
+                        "routing terminal error output",
+                        req_id,
+                        src_stage_id,
+                        next_logical,
+                    )
+                    await self.output_async_queue.put(
+                        OutputMessage(
+                            request_id=req_id,
+                            stage_id=next_logical,
+                            engine_outputs=error_output,
+                            metrics=None,
+                            finished=True,
+                        )
+                    )
+                    await self._cleanup_request_ids(
+                        [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                    )
+                    return
+                if already_submitted and len(diffusion_prompt) == 1:
+                    diffusion_prompt = diffusion_prompt[0]
+        else:
+            diffusion_prompt = req_state.prompt
+
+        if already_submitted:
+            await next_pool.submit_update(req_id, req_state, diffusion_prompt)
+        else:
+            await next_pool.submit_initial(
+                req_id,
+                req_state,
+                diffusion_prompt,
+                submit_kwargs={
+                    "kv_sender_info": self._build_kv_sender_info(
+                        list(getattr(diffusion_client, "engine_input_source", None) or [src_stage_id]),
+                        request_id=req_id,
+                    )
+                },
+                params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
+            )
+        req_state.stage_submit_ts[next_logical] = _time.time()
+
+    async def _forward_to_llm_stage(
+        self,
+        req_id: str,
+        src_stage_id: int,
+        output: Any,
+        req_state: OrchestratorRequestState,
+        *,
+        is_streaming_session: bool = False,
+        is_final_update: bool = False,
+    ) -> None:
+        """Forward output from the current stage to the next LLM stage."""
+        next_logical = src_stage_id + 1
+        next_pool = self.stage_pools[next_logical]
         params = req_state.sampling_params_list[next_logical]
         source_outputs = [output]
         next_stage_resumable = is_streaming_session and not is_final_update
         already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
-        requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
-
-        if next_pool.stage_type == "diffusion":
-            if next_client.custom_process_input_func is not None:
-                _t_ar2d = _time.perf_counter()
-                diffusion_prompt = next_client.custom_process_input_func(
-                    source_outputs,
-                    req_state.prompt,
-                    requires_multimodal_data,
-                )
-                _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
-                req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
-                logger.info(
-                    "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
-                    req_id,
-                    _dt_ar2d,
-                    src_stage_id,
-                    next_logical,
-                )
-                if isinstance(diffusion_prompt, list):
-                    if not diffusion_prompt:
-                        error_output = OmniRequestOutput.from_error(
-                            req_id,
-                            f"Stage-{src_stage_id} produced no valid inputs for diffusion stage-{next_logical}",
-                        )
-                        logger.warning(
-                            "[Orchestrator] req=%s stage=%d produced empty diffusion inputs for stage=%d; "
-                            "routing terminal error output",
-                            req_id,
-                            src_stage_id,
-                            next_logical,
-                        )
-                        await self.output_async_queue.put(
-                            {
-                                "type": "output",
-                                "request_id": req_id,
-                                "stage_id": next_logical,
-                                "engine_outputs": error_output,
-                                "metrics": None,
-                                "finished": True,
-                            }
-                        )
-                        await self._cleanup_request_ids(
-                            [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
-                        )
-                        return
-                    if already_submitted and len(diffusion_prompt) == 1:
-                        diffusion_prompt = diffusion_prompt[0]
-            else:
-                diffusion_prompt = req_state.prompt
-
-            if already_submitted:
-                await next_pool.submit_update(req_id, req_state, diffusion_prompt)
-            else:
-                await next_pool.submit_initial(
-                    req_id,
-                    req_state,
-                    diffusion_prompt,
-                    submit_kwargs={
-                        "kv_sender_info": self._build_kv_sender_info(
-                            list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
-                            request_id=req_id,
-                        )
-                    },
-                    params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
-                )
-            req_state.stage_submit_ts[next_logical] = _time.time()
-            return
 
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
         if self._pd_pair is not None and (src_stage_id, next_logical) == self._pd_pair:
@@ -894,6 +953,7 @@ class Orchestrator:
                 {},
             )[req_id] = req_state.pd_prefill_multimodal_output
 
+        next_client = next_pool.llm_stage_client
         try:
             next_inputs = next_client.process_engine_inputs(
                 source_outputs,
@@ -912,7 +972,7 @@ class Orchestrator:
         for next_input in next_inputs:
             # Only AR thinker stages consume encoder mm_features; downstream
             # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
-            model_stage = getattr(next_client, "model_stage", None)
+            model_stage = next_client.model_stage
             mm_features = req_state.mm_features if model_stage == "thinker" else None
             request = build_engine_core_request_from_tokens(
                 request_id=req_id,
@@ -962,7 +1022,7 @@ class Orchestrator:
                     req_state.prompt,
                     submit_kwargs={
                         "kv_sender_info": self._build_kv_sender_info(
-                            list(getattr(next_pool.stage_client, "engine_input_source", None) or [next_stage_id - 1]),
+                            list(next_pool.stage_client.engine_input_source or [next_stage_id - 1]),
                             request_id=request_id,
                         )
                     },
@@ -1009,14 +1069,14 @@ class Orchestrator:
                 continue
 
             sender_pool = self.stage_pools[sender_stage_id]
-            sender_stage = sender_pool.get_bound_client(request_id) if request_id is not None else None
-            if sender_stage is None:
-                sender_stage = sender_pool.stage_client
-            get_sender_info = getattr(sender_stage, "get_kv_sender_info", None)
-            if not callable(get_sender_info):
+            if sender_pool.stage_type == "diffusion":
                 continue
 
-            sender_info = get_sender_info()
+            sender_stage = sender_pool.get_bound_llm_client(request_id) if request_id is not None else None
+            if sender_stage is None:
+                sender_stage = sender_pool.llm_stage_client
+
+            sender_info = sender_stage.get_kv_sender_info()
             if not sender_info:
                 logger.warning(
                     "[Orchestrator] Stage-%s has no KV sender info available",
@@ -1050,16 +1110,15 @@ class Orchestrator:
                 msg = self.request_async_queue.get_nowait()
             except Exception:
                 break
-            if msg.get("type") == "add_request":
-                req_id = msg["request_id"]
+            if isinstance(msg, StageSubmissionMessage) and msg.type == "add_request":
+                req_id = msg.request_id
                 await self.output_async_queue.put(
-                    {
-                        "type": "error",
-                        "error": self._fatal_error,
-                        "fatal": True,
-                        "request_id": req_id,
-                        "stage_id": self._fatal_error_stage_id,
-                    }
+                    ErrorMessage(
+                        error=self._fatal_error,
+                        fatal=True,
+                        request_id=req_id,
+                        stage_id=self._fatal_error_stage_id,
+                    )
                 )
                 notified.add(req_id)
 
@@ -1069,13 +1128,12 @@ class Orchestrator:
         for req_id in list(self.request_states):
             if req_id not in notified:
                 await self.output_async_queue.put(
-                    {
-                        "type": "error",
-                        "error": self._fatal_error,
-                        "fatal": True,
-                        "request_id": req_id,
-                        "stage_id": self._fatal_error_stage_id,
-                    }
+                    ErrorMessage(
+                        error=self._fatal_error,
+                        fatal=True,
+                        request_id=req_id,
+                        stage_id=self._fatal_error_stage_id,
+                    )
                 )
             self.request_states.pop(req_id, None)
 

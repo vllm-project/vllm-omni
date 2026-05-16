@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from typing import Any
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
@@ -75,3 +76,4 @@ class OmniSchedulerOutput(SchedulerOutput):
     """Scheduler output with omni-specific transfer metadata."""
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
+    pending_input_registrations: list[Any] = field(default_factory=list)

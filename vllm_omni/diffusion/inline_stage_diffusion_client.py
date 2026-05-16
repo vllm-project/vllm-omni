@@ -20,6 +20,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.diffusion.data import DiffusionRequestAbortedError
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -31,11 +32,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class InlineStageDiffusionClient:
+class InlineStageDiffusionClient(StageClientBase):
     """Runs DiffusionEngine in a thread executor inside the Orchestrator."""
 
     stage_type: str = "diffusion"
     replica_id: int = 0
+    is_comprehension: bool = False
 
     def __init__(
         self,

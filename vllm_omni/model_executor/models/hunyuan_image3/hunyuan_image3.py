@@ -737,7 +737,7 @@ class HunyuanImage3Processor:
     class ResolutionGroup:
         """Group of resolutions for image processing."""
 
-        def __init__(self, base_size=None, step=None, align=1):
+        def __init__(self, base_size=None, step=None, align=1, extra_resolutions=None):
             self.align = align
             self.base_size = base_size
             assert base_size % align == 0, f"base_size {base_size} is not divisible by align {align}"
@@ -750,6 +750,11 @@ class HunyuanImage3Processor:
 
             self.step = step
             self.data = self._calc_by_step()
+
+            if extra_resolutions is not None:
+                for er in extra_resolutions:
+                    if not any(r.ratio == er.ratio for r in self.data):
+                        self.data.append(er)
 
             self.ratio = np.array([x.ratio for x in self.data])
             self.attr = ["" for _ in range(len(self.data))]
@@ -815,7 +820,18 @@ class HunyuanImage3Processor:
     def __init__(self, tokenizer, hf_config, **kwargs: object):
         self.tokenizer = tokenizer
         self.hf_config = hf_config
-        self.reso_group = self.ResolutionGroup(base_size=hf_config.image_base_size)
+        # `HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS` mirrors the official
+        # `vae_reso_group` extras (image_processor.py:147-152). Build with
+        # this processor's inner Resolution class so `data` stays
+        # type-homogeneous.
+        from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
+            HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS,
+        )
+
+        self.reso_group = self.ResolutionGroup(
+            base_size=hf_config.image_base_size,
+            extra_resolutions=[HunyuanImage3Processor.Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
+        )
         self.vision_encoder_processor = Siglip2ImageProcessorFast.from_dict(hf_config.vit_processor)
         self.vae_processor = transforms.Compose(
             [
@@ -860,6 +876,13 @@ class HunyuanImage3Processor:
         else:
             raise TypeError(f"Unsupported image type: {type(image_input)}.")
 
+        # Each cond image keeps its own VAE bucket (mirrors official HF's
+        # ragged behavior in `_encode_cond_image`). VAE pixel tensors have
+        # different (H_i, W_i) per image, so they're flattened to 1-D and
+        # concatenated; vLLM `flat_from_sizes("image", vae_pixel_size)` slices
+        # them back per-image at consumption time. VIT (Siglip2 naflex) pads
+        # to `max_num_patches` so VIT fields keep the existing `batched`
+        # stack path.
         batch_data = []
         for image in images:
             current_info = {}
@@ -883,68 +906,80 @@ class HunyuanImage3Processor:
                 _ss = torch.tensor(_ss, dtype=torch.long)
             current_info["vit_spatial_shapes"] = _ss.squeeze(0)
 
-            # VAE processing.
-            # The resize/crop math here mirrors HF's `resize_and_crop` with
-            # crop_type="center" (hunyuan3.0_ins/image_processor.py:61). VAE
-            # normalize uses the same transforms.Compose([ToTensor,
-            # Normalize([0.5], [0.5])]) as HF's `pil_image_to_tensor`. So
-            # numerical output of this branch should match HF up to floating-
-            # point reduction order.
+            # VAE: per-image bucket via `reso_group.get_target_size`; mirrors
+            # HF's `resize_and_crop` (crop_type="center", the official
+            # generate_image default with infer_align_image_size=False).
+            # Keep fp32 — the VAE encoder casts to model dtype at its
+            # boundary (see `_vae_encode`).
             image_width, image_height = self.reso_group.get_target_size(image.width, image.height)
             resized_image = self._resize_and_crop(image, (image_width, image_height))
-            vae_pixel_values = self.vae_processor(resized_image)
+            vae_pixel_values = self.vae_processor(resized_image).squeeze(0)
             token_height = image_height // (self.hf_config.vae_downsample_factor[0] * self.hf_config.patch_size)
             token_width = image_width // (self.hf_config.vae_downsample_factor[1] * self.hf_config.patch_size)
-            # Keep fp32 — the VAE encoder casts to model dtype at its boundary
-            # (see _vae_encode). Casting to bf16 here costs ~7e-4 mean-abs-diff
-            # bf16 quantization error on every pixel vs HF (which keeps fp32
-            # in build_cond_images), measurable as a real numerical drift in
-            # downstream image embeddings.
-            current_info["vae_pixel_values"] = vae_pixel_values.squeeze(0)
+
+            current_info["vae_pixel_values_flat"] = vae_pixel_values.reshape(-1)
+            current_info["vae_pixel_size"] = torch.tensor(vae_pixel_values.numel(), dtype=torch.long)
             current_info["vae_token_grid_hw"] = torch.tensor([token_height, token_width])
 
-            # size
             base_size, ratio_index = self.reso_group.get_base_size_and_ratio_index(image_width, image_height)
             current_info["base_size"] = torch.tensor(base_size)
             current_info["ratio_index"] = torch.tensor(ratio_index)
 
             batch_data.append(current_info)
 
-        # Stack the tensors in the list into a batch dimension (B, ...)
-        final_image_info = {}
-        if len(batch_data) > 0:
-            for key in batch_data[0].keys():
-                final_image_info[key] = torch.stack([d[key] for d in batch_data], dim=0)
+        final_image_info: dict[str, torch.Tensor] = {}
+        if not batch_data:
+            return final_image_info
 
-        if final_image_info:
-            shapes_info = {k: tuple(v.shape) for k, v in final_image_info.items()}
-            logger.info(f"Successfully processed {len(images)} image(s). Final tensor shapes: {shapes_info}")
+        # Same-shape fields: stack along a new image-batch dim as before.
+        same_shape_keys = [
+            "vit_pixel_values",
+            "vit_pixel_attention_mask",
+            "vit_spatial_shapes",
+            "vae_token_grid_hw",
+            "vae_pixel_size",
+            "base_size",
+            "ratio_index",
+        ]
+        for key in same_shape_keys:
+            final_image_info[key] = torch.stack([d[key] for d in batch_data], dim=0)
+
+        # Variable-shape VAE pixels: 1-D concat across images (paired with
+        # `vae_pixel_size` via `flat_from_sizes` in `_get_mm_fields_config`).
+        final_image_info["vae_pixel_values"] = torch.cat([d["vae_pixel_values_flat"] for d in batch_data], dim=0)
+
+        shapes_info = {k: tuple(v.shape) for k, v in final_image_info.items()}
+        logger.info(f"Successfully processed {len(images)} image(s). Final tensor shapes: {shapes_info}")
 
         return final_image_info
 
-    def _resize_and_crop(self, image: Image.Image, target_size: tuple[int, int]) -> Image.Image:
+    def _resize_and_crop(
+        self,
+        image: Image.Image,
+        target_size: tuple[int, int],
+        crop_type: str = "resize",
+    ) -> Image.Image:
+        # Default mode mirrors the official `infer_align_image_size=True`
+        # path (image_processor.py:355 → crop_type="resize") used by the
+        # IT2I demo: stretch the cond image to the bucket dims so its
+        # `<img_ratio_*>` tag and ViT/VAE features stay aligned with the
+        # bucket, instead of dropping content via center crop.
         tw, th = target_size
+        if crop_type == "resize":
+            return image.resize((tw, th), resample=Image.Resampling.LANCZOS)
         w, h = image.size
-
         tr = th / tw
         r = h / w
-
-        # resize
         if r < tr:
             resize_height = th
             resize_width = int(round(th / h * w))
         else:
             resize_width = tw
             resize_height = int(round(tw / w * h))
-
         image = image.resize((resize_width, resize_height), resample=Image.Resampling.LANCZOS)
-
-        # center crop
         crop_top = int(round((resize_height - th) / 2.0))
         crop_left = int(round((resize_width - tw) / 2.0))
-
-        image = image.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
-        return image
+        return image.crop((crop_left, crop_top, crop_left + tw, crop_top + th))
 
 
 class HunyuanImage3ProcessingInfo(BaseProcessingInfo):
@@ -1030,8 +1065,13 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
             config["vit_pixel_attention_mask"] = MultiModalFieldConfig.batched("image")
         if "vit_spatial_shapes" in hf_inputs:
             config["vit_spatial_shapes"] = MultiModalFieldConfig.batched("image")
-        if "vae_pixel_values" in hf_inputs:
-            config["vae_pixel_values"] = MultiModalFieldConfig.batched("image")
+        # `vae_pixel_values` is a 1-D concatenation of variable-shape per-image
+        # VAE tensors (see `process_image`). `vae_pixel_size` carries the
+        # per-image flat length so vLLM can split the buffer back per image.
+        if "vae_pixel_values" in hf_inputs and "vae_pixel_size" in hf_inputs:
+            config["vae_pixel_values"] = MultiModalFieldConfig.flat_from_sizes("image", hf_inputs["vae_pixel_size"])
+        if "vae_pixel_size" in hf_inputs:
+            config["vae_pixel_size"] = MultiModalFieldConfig.batched("image")
         if "vae_token_grid_hw" in hf_inputs:
             config["vae_token_grid_hw"] = MultiModalFieldConfig.batched("image")
         if "base_size" in hf_inputs:
@@ -1085,38 +1125,37 @@ class HunyuanImage3MultiModalProcessor(BaseMultiModalProcessor[HunyuanImage3Proc
             ratio_token_id = tokenizer.convert_tokens_to_ids(f"<img_ratio_{_ratio_index}>")
             if ratio_token_id is None:
                 raise ValueError(f"Ratio token '<img_ratio_{_ratio_index}>' not found in tokenizer vocabulary")
+            timestep_token_id = tokenizer.convert_tokens_to_ids("<timestep>")
+            if timestep_token_id is None:
+                raise ValueError("Timestep token '<timestep>' not found in tokenizer vocabulary")
 
-            # NOTE on the timestep slot:
-            # HF's apply_chat_template emits the literal <timestep> token id
-            # 128017 here. HF's modeling forward (`instantiate_continuous_tokens`,
-            # see hunyuan3.0_ins/modeling_hunyuan_image_3.py:1964) then *scatter-
-            # replaces* the embedding at that position with `timestep_emb(0)`
-            # for cond images. So the wte embedding of <timestep> is irrelevant
-            # at runtime — what matters is the timestep_emb injection.
+            # Use the real <timestep> token id (HF parity). The trained wte
+            # at this slot is overwritten with timestep_emb(0) at runtime by
+            # `embed_input_ids`.
             #
-            # vllm-omni achieves the same effect via the multimodal-embedding
-            # merger: we put an <img> (128006) placeholder here and ship a
-            # `timestep_emb(0)` tensor at the head of `embed_multimodal()`'s
-            # combined_embeddings. The merger replaces this placeholder's
-            # embedding with the timestep tensor, yielding a final hidden
-            # state numerically equivalent to HF at that position.
-            #
-            # Keep this slot as <img> (NOT <timestep>): switching to <timestep>
-            # requires either (a) a second PromptReplacement targeting 128017,
-            # or (b) the merger's embed_token_id to be a list — neither is
-            # currently supported by PromptUpdateDetails.select_token_id.
+            # Mark <img>*VAE + <joint_img_sep> + <img>*ViT as one contiguous
+            # embed run so vLLM's prefix-LM mask treats it as a single
+            # bidirectional region, mirroring official `joint_image_slices`
+            # full-attention range (image_processor.py:388, with
+            # cond_token_attn_type effectively spanning VAE+sep+ViT). With the
+            # default `select_token_id(<img>)` mask, sep splits the run into
+            # two regions; that asymmetry is what biased multi-image AR
+            # ratio prediction to the first image's bucket.
             replacement = (
                 [boi_token_id]
                 + [base_size_token_id]
                 + [ratio_token_id]
-                + [img_token_id] * timestep_token_num
+                + [timestep_token_id] * timestep_token_num
                 + [img_token_id] * vae_token_num
                 + [joint_img_sep_token_id]
                 + [img_token_id] * vit_token_num
                 + [eoi_token_id]
             )
             logger.debug(f"actual replacement token count: {timestep_token_num + vae_token_num + vit_token_num}")
-            return PromptUpdateDetails.select_token_id(replacement, embed_token_id=img_token_id)
+            return PromptUpdateDetails.select_token_ids(
+                replacement,
+                embed_token_ids=[img_token_id, joint_img_sep_token_id],
+            )
 
         return [
             PromptReplacement(modality="image", target=[img_token_id], replacement=get_replacement_image),
@@ -1128,6 +1167,7 @@ def _hunyuan_image3_unpack_packed_topk(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+    num_experts: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Unpack pre-computed ``(topk_weights, topk_indices)`` packed by
     :class:`HunyuanImage3SparseMoeBlock` into ``gating_output``.
@@ -1501,6 +1541,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         self._end_of_answer_id = tokenizer.convert_tokens_to_ids("</answer>")
         image_base_size = getattr(config, "image_base_size", 1024)
         self._size_token_id = tokenizer.convert_tokens_to_ids(f"<img_size_{image_base_size}>")
+        self._timestep_token_id = tokenizer.convert_tokens_to_ids("<timestep>")
         self._start_ratio_id = tokenizer.convert_tokens_to_ids("<img_ratio_0>")
         self._end_ratio_id = tokenizer.convert_tokens_to_ids("<img_ratio_32>")
         ratio_33 = tokenizer.convert_tokens_to_ids("<img_ratio_33>")
@@ -1668,6 +1709,9 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         vit_pixel_attention_mask = kwargs.pop("vit_pixel_attention_mask", None)
         vit_spatial_shapes = kwargs.pop("vit_spatial_shapes", None)
         vae_pixel_values = kwargs.pop("vae_pixel_values", None)
+        # vae_pixel_size is only metadata for vLLM's flat_from_sizes split;
+        # we reconstruct per-image shapes from vae_token_grid_hw below.
+        kwargs.pop("vae_pixel_size", None)
         vae_token_grid_hw = kwargs.pop("vae_token_grid_hw", None)
 
         if vit_pixel_values is None or vae_pixel_values is None:
@@ -1677,13 +1721,36 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         if vit_pixel_values.numel() == 0 or vae_pixel_values.numel() == 0:
             return None
 
+        # `vae_pixel_values` arrives as a 1-D concatenation of per-image flat
+        # buffers (see `process_image` + `flat_from_sizes`). Reconstruct a
+        # list of per-image (3, H_i, W_i) tensors using the per-image grid
+        # dims so the downstream VAE encoder can run image-by-image.
+        vae_factor_h = self.config.vae_downsample_factor[0] * self.config.patch_size
+        vae_factor_w = self.config.vae_downsample_factor[1] * self.config.patch_size
+        num_images = vae_token_grid_hw.shape[0]
+        vae_image_list: list[torch.Tensor] = []
+        offset = 0
+        flat = vae_pixel_values.reshape(-1)
+        for i in range(num_images):
+            token_h, token_w = vae_token_grid_hw[i].tolist()
+            h_i = int(token_h) * vae_factor_h
+            w_i = int(token_w) * vae_factor_w
+            n_i = 3 * h_i * w_i
+            vae_image_list.append(flat[offset : offset + n_i].reshape(3, h_i, w_i))
+            offset += n_i
+        if offset != flat.numel():
+            raise ValueError(
+                f"vae_pixel_values size mismatch: consumed {offset} of {flat.numel()} elements "
+                f"across {num_images} images (token_grid_hw={vae_token_grid_hw.tolist()})"
+            )
+
         return HunyuanImage3PixelInputs(
             type="pixel_values",
             pixel_values={
                 "vit_pixel_values": vit_pixel_values,
                 "vit_pixel_attention_mask": vit_pixel_attention_mask,
                 "vit_spatial_shapes": vit_spatial_shapes,
-                "vae_pixel_values": vae_pixel_values,
+                "vae_pixel_values": vae_image_list,
                 "vae_token_grid_hw": vae_token_grid_hw,
             },
         )
@@ -1711,7 +1778,11 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             images = images.to(dtype=self.vae.dtype)
 
         vae_encode_result = self.vae.encode(images)
-        latents = vae_encode_result.latent_dist.sample()
+        # Match HunyuanImage-3's cond encode path: sample the posterior, but
+        # use a fixed generator so online requests do not consume the global
+        # RNG and drift across a long-running server.
+        _cond_vae_gen = torch.Generator(device=images.device).manual_seed(0)
+        latents = vae_encode_result.latent_dist.sample(_cond_vae_gen)
 
         # Apply shift and scaling factors if present
         if hasattr(config, "shift_factor") and config.shift_factor:
@@ -1795,22 +1866,12 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         # Perform ViT encoding
         vit_embeddings = self._vit_encode(vit_pixel_values, vit_pixel_attention_mask, vit_spatial_shapes)
 
-        # Perform VAE encoding
-        t, latents = self._vae_encode(vae_pixel_values, vae_cfg_factor)
-
-        # Process VAE latents through patch_embed to convert to token embeddings
-        # VAE latents are in (B, C, H, W) format, need to be converted to (B, seq_len, hidden_size)
+        # VAE encode + patch_embed per image — each cond image is at its own
+        # `reso_group` bucket so shapes are ragged across the image-batch dim.
         vae_token_embeddings = []
-        batch_size = latents.shape[0]
-        for i in range(batch_size):
-            t_i = t[i]
-            latents_i = latents[i : i + 1]  # Shape: (1, C, H, W)
-
-            # Time embedding for VAE processing
-            t_emb = self.time_embed(t_i)
-
-            # Process VAE latent through patch_embed
-            # Input: (1, C, H, W) -> Output: (1, seq_len, hidden_size)
+        for vae_image_i in vae_pixel_values:
+            t_i, latents_i = self._vae_encode(vae_image_i.unsqueeze(0), vae_cfg_factor)
+            t_emb = self.time_embed(t_i[0])
             vae_tokens, _, _ = self.patch_embed(latents_i, t_emb)
             vae_token_embeddings.append(vae_tokens)
 
@@ -1820,27 +1881,31 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             "Each image should have both VAE and ViT embeddings."
         )
 
-        # Order per image: timestep -> VAE tokens -> ViT tokens.
-        # The <img> placeholder at the timestep slot (see _get_prompt_updates)
-        # gets its embedding replaced by `timestep_emb(0)` here, which is what
-        # HF achieves via instantiate_continuous_tokens at runtime.
+        # Order per image: VAE tokens -> <joint_img_sep> wte -> ViT tokens.
+        # The <joint_img_sep> wte is included so it joins the bidirectional
+        # MM region (matching the official `joint_image_slices` full-attn
+        # range that spans VAE+sep+ViT). The merger replaces the sep slot
+        # with this wte tensor, which is numerically identical to what
+        # `model.embed_input_ids` would produce — no semantic change for
+        # single-image, but with multi-image the sep position now sits
+        # inside the bidirectional region (matching how the model was
+        # trained).
+        sep_token_id = self._mrope_joint_img_sep_token_id
+        sep_input_ids = torch.tensor([sep_token_id], device=vit_embeddings.device, dtype=torch.long)
+        sep_embed = self.model.embed_input_ids(sep_input_ids).to(vit_embeddings.dtype)
+
+        # The <timestep> slot at the head of each per-image scaffold is NOT
+        # included here — its embedding is patched in by `embed_input_ids`
+        # via a token-id mask, mirroring HF's `instantiate_continuous_tokens`
+        # scatter-replace.
         combined_embeddings: list[torch.Tensor] = []
         num_images = len(vae_token_embeddings)
         for img_idx in range(num_images):
-            # 1. Timestep embedding (cond image timestep == 0)
-            timestep = torch.zeros((1,)).to(vit_embeddings.device).to(vit_embeddings.dtype)
-            timestep_emb = self._timestep_encode(timestep)
-
-            # 2. VAE image token embeddings
             vae_token_embed = vae_token_embeddings[img_idx]
-            # Remove batch dimension if present: (B, seq_len, hidden_size) -> (seq_len, hidden_size)
             if vae_token_embed.ndim == 3:
                 vae_token_embed = vae_token_embed.squeeze(0)
-
-            # 3. ViT image embeddings
             vit_embed = vit_embeddings[img_idx]
-
-            stacked_embed = torch.cat([timestep_emb, vae_token_embed, vit_embed], dim=0)
+            stacked_embed = torch.cat([vae_token_embed, sep_embed, vit_embed], dim=0)
             combined_embeddings.append(stacked_embed)
 
         return combined_embeddings
@@ -1853,14 +1918,23 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         is_multimodal: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Embed input IDs with optional multimodal embeddings."""
-        # Get text embeddings
         inputs_embeds = self.model.embed_input_ids(input_ids)
 
-        # If no multimodal embeddings, return text embeddings
+        # Patch <timestep> slots with timestep_emb(0). HF parity: the trained
+        # wte at this slot is irrelevant; runtime uses
+        # `instantiate_continuous_tokens(timestep_emb(0))`. With multi-image,
+        # keeping these slots as <img> ids merged the timestep position into
+        # the bidirectional MM region and biased AR ratio prediction toward
+        # the first image's bucket.
+        timestep_mask = input_ids == self._timestep_token_id
+        n_timestep = int(timestep_mask.sum().item())
+        if n_timestep > 0:
+            timestep_input = torch.zeros((n_timestep,), device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+            inputs_embeds[timestep_mask] = self._timestep_encode(timestep_input)
+
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
             return inputs_embeds
 
-        # Merge multimodal embeddings with text embeddings
         merged_embeds = _merge_multimodal_embeddings(
             inputs_embeds=inputs_embeds,
             multimodal_embeddings=multimodal_embeddings,
@@ -1917,8 +1991,6 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             self._sampler = Sampler()
 
         min_score = torch.finfo(logits.dtype).min
-
-        assert logits.shape[0] == 1, f"HunyuanImage3 sampler requires max_num_seqs=1, got batch size {logits.shape[0]}"
 
         for req_idx in range(logits.shape[0]):
             decoded_tokens: list[int] = (
@@ -2076,6 +2148,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
         boi_token_id = self._mrope_boi_token_id
         eoi_token_id = self._mrope_eoi_token_id
         joint_img_sep_token_id = self._mrope_joint_img_sep_token_id
+        timestep_token_id = self._timestep_token_id
 
         # Build position arrays
         t_pos: list[int] = []  # temporal (same as 1D for this model)
@@ -2092,7 +2165,7 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
 
             if tok == boi_token_id:
                 # Found start of image block.
-                # Structure: <boi> <size> <ratio> <img>*timestep <img>*vae
+                # Structure: <boi> <size> <ratio> <timestep> <img>*vae
                 #            <joint_img_sep> <img>*vit <eoi>
                 # <boi> token
                 t_pos.append(pos)
@@ -2117,8 +2190,8 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                     pos += 1
                     i += 1
 
-                # Timestep token (1 <img> token)
-                if i < n and input_tokens[i] == img_token_id:
+                # <timestep> token (1 token)
+                if i < n and input_tokens[i] == timestep_token_id:
                     t_pos.append(pos)
                     h_pos.append(pos)
                     w_pos.append(pos)

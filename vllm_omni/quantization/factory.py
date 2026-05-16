@@ -41,6 +41,13 @@ def _build_int8(**kw: Any) -> QuantizationConfig:
     return DiffusionInt8Config(**kw)
 
 
+def _build_mxfp8(**kw: Any) -> QuantizationConfig:
+    """Lazy import for W8A8 MXFP8 diffusion config (NPU only)."""
+    from .mxfp8_config import DiffusionMXFP8Config
+
+    return DiffusionMXFP8Config(**kw)
+
+
 def _build_inc(**kw: Any) -> QuantizationConfig:
     """Lazy import for INC/AutoRound config with checkpoint kwarg normalization."""
     from .inc_config import OmniINCConfig
@@ -58,6 +65,7 @@ def _build_inc(**kw: Any) -> QuantizationConfig:
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "gguf": _build_gguf,
     "int8": _build_int8,
+    "mxfp8": _build_mxfp8,
     "inc": _build_inc,
     "auto-round": _build_inc,
     "auto_round": _build_inc,

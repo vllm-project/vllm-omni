@@ -10,31 +10,8 @@
                 "backend": "openai-audio-speech",
                 "endpoint": "/v1/audio/speech",
                 "duration_sec": 86400,
-                "request_rate": 0.3,
-                "num_prompts_per_batch": 10,
-                "random_input_len": {
-                    "min": 0,
-                    "max": 1000
-                },
-                "random_output_len": {
-                    "min": 0,
-                    "max": 1000
-                },
-                "random_range_ratio": 0.0,
-                "extra_body": {
-                    "voice": "Vivian",
-                    "language": "English"
-                },
-                "ignore_eos": true,
-                "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration"
-            },
-            {
-                "dataset_name": "random",
-                "backend": "openai-audio-speech",
-                "endpoint": "/v1/audio/speech",
-                "duration_sec": 86400,
                 "max_concurrency": 2,
-                "num_prompts_per_batch": 10,
+                "num_prompts_per_batch": 50,
                 "random_input_len": {
                     "min": 0,
                     "max": 1000
