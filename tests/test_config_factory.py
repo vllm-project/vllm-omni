@@ -1504,7 +1504,7 @@ class TestSentinelDefaultPrecedence:
     def test_none_value_skipped_yaml_wins(self):
         stages = self._stages({"max_num_seqs": None})
         assert stages[2].runtime_overrides.get("max_num_seqs") is None
-        assert "max_num_seqs" not in stages[2].yaml_engine_args
+        assert stages[2].yaml_engine_args["max_num_seqs"] == 64
 
     def test_empty_kwargs_yaml_only(self):
         stages = self._stages({})
@@ -1597,6 +1597,41 @@ class TestSentinelDefaultPrecedence:
         assert "custom_process_next_stage_input_func" not in sync_stages[0].yaml_engine_args
         assert sync_stages[1].custom_process_input_func is not None
         assert sync_stages[1].custom_process_input_func.endswith("talker2code2wav")
+
+    def test_async_chunk_dispatches_qwen3_omni_processors(self):
+        import runpy
+        from pathlib import Path
+
+        from vllm_omni.config.stage_config import DeployConfig, merge_pipeline_deploy
+
+        pipeline_path = (
+            Path(__file__).parent.parent / "vllm_omni" / "model_executor" / "models" / "qwen3_omni" / "pipeline.py"
+        )
+        pipeline = runpy.run_path(str(pipeline_path))["QWEN3_OMNI_PIPELINE"]
+
+        async_stages = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=True))
+        assert (
+            async_stages[0]
+            .yaml_engine_args["custom_process_next_stage_input_func"]
+            .endswith("thinker2talker_async_chunk")
+        )
+        assert (
+            async_stages[1]
+            .yaml_engine_args["custom_process_next_stage_input_func"]
+            .endswith("talker2code2wav_async_chunk")
+        )
+
+        sync_stages = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))
+        assert (
+            sync_stages[0]
+            .yaml_engine_args["custom_process_next_stage_input_func"]
+            .endswith("thinker2talker_full_payload")
+        )
+        assert (
+            sync_stages[1]
+            .yaml_engine_args["custom_process_next_stage_input_func"]
+            .endswith("talker2code2wav_full_payload")
+        )
 
 
 class TestSamplingConstraintsPrecedence:
