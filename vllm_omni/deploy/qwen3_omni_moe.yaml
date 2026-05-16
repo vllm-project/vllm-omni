@@ -24,7 +24,12 @@ stages:
   - stage_id: 0
     max_num_batched_tokens: 32768
     max_num_seqs: 64
-    gpu_memory_utilization: 0.9
+    # Thinker (Qwen3-30B-A3B bf16 ≈ 61 GiB) needs util ≲ 0.23 on 80 GB GPUs:
+    # vLLM v1 does NOT subtract loaded weights from the util multiplier
+    # (effective KV = util * total VRAM, stacked on top of loaded weights).
+    # 0.15 leaves a safe headroom across H100/A100/etc.; bump if you have
+    # spare VRAM and want a larger KV-cache budget.
+    gpu_memory_utilization: 0.15
     trust_remote_code: true
     enable_prefix_caching: false
     devices: "0"

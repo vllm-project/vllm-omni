@@ -341,7 +341,12 @@ INSTRUCTIONS = (
 
 
 async def run_client(
-    url: str, model: str, input_wavs: list[Path], output_wav: Path, api_key: str | None = None
+    url: str,
+    model: str,
+    input_wavs: list[Path],
+    output_wav: Path,
+    api_key: str | None = None,
+    voice: str | None = None,
 ) -> None:
     """Connect once, run a turn per input WAV, and print a session summary."""
     print(f"[{_ts()}] Connecting to {url}")
@@ -353,16 +358,12 @@ async def run_client(
     async with websockets.connect(url, max_size=64 * 1024 * 1024, additional_headers=extra_headers) as ws:
         await _wait_session_created(ws)
 
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "session.update",
-                    "model": model,
-                    "session": {"tools": TOOL_DEFINITIONS, "instructions": INSTRUCTIONS},
-                }
-            )
-        )
-        print(f"[{_ts()}] session.update sent ({len(TOOL_DEFINITIONS)} tools)")
+        session: dict = {"tools": TOOL_DEFINITIONS, "instructions": INSTRUCTIONS}
+        if voice:
+            session["voice"] = voice
+        await ws.send(json.dumps({"type": "session.update", "model": model, "session": session}))
+        voice_str = f", voice={voice!r}" if voice else ""
+        print(f"[{_ts()}] session.update sent ({len(TOOL_DEFINITIONS)} tools{voice_str})")
 
         for turn_idx, in_wav in enumerate(input_wavs):
             label = f"turn{turn_idx + 1}"
@@ -448,9 +449,17 @@ def main() -> None:
         default=None,
         help="Bearer token sent as Authorization header (required by deployments with auth enabled).",
     )
+    parser.add_argument(
+        "--voice",
+        default=None,
+        help=(
+            "Talker voice name. Qwen3-Omni supports 'ethan' (default), 'chelsie', and 'aiden'. "
+            "Omitting this falls back to the model's default voice."
+        ),
+    )
 
     args = parser.parse_args()
-    asyncio.run(run_client(args.url, args.model, args.input_wav, args.output_wav, args.api_key))
+    asyncio.run(run_client(args.url, args.model, args.input_wav, args.output_wav, args.api_key, args.voice))
 
 
 if __name__ == "__main__":

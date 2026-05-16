@@ -32,7 +32,7 @@ the client, and produces speech audio incorporating the result.
 ## `session.update` payload
 
 `session.update` carries the served model name and the session config
-(instructions and tool definitions):
+(instructions, tool definitions, and optional talker voice):
 
 ```json
 {
@@ -40,10 +40,14 @@ the client, and produces speech audio incorporating the result.
   "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
   "session": {
     "instructions": "You are a helpful voice assistant. Use tools when appropriate.",
-    "tools": [ /* see Tool definition format below */ ]
+    "tools": [ /* see Tool definition format below */ ],
+    "voice": "ethan"
   }
 }
 ```
+
+`voice` is optional. Qwen3-Omni supports `"ethan"` (default), `"chelsie"`,
+and `"aiden"`. Omitting `voice` falls back to the model's default voice.
 
 ## Tool definition format
 
@@ -146,19 +150,16 @@ user line instead of a placeholder.
 
 ## Running the example
 
-`/v1/realtime` requires `async_chunk: false`. The bundled Qwen3-Omni deploy
-config ships with `async_chunk: true`, so use the small overlay yaml in this
-directory which inherits from the production config and flips that flag plus
-retunes memory for 80 GB A100s — see the file header for the GPU memory math
-if you need to retune for different hardware:
+Start the server with the bundled Qwen3-Omni deploy config:
 
 ```bash
 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
-    --deploy-config examples/online_serving/qwen3_omni/realtime_tools/qwen3_omni_moe_realtime.yaml
+    --deploy-config vllm_omni/deploy/qwen3_omni_moe.yaml
 ```
 
-For a quick smoke test on H100 (or any GPU where the bundled memory ratios
-work) you can skip the overlay and just pass `--no-async-chunk`.
+The deploy config ships with a conservative stage-0 `gpu_memory_utilization`
+that fits on 80 GB GPUs (H100, A100). If you have a larger card or want a
+bigger KV-cache budget, copy the yaml and bump that field.
 
 Run the example client (registers a real ``get_current_weather`` tool plus a
 similarly-named ``get_city_timezone`` *trap* tool — useful for verifying the
@@ -171,6 +172,14 @@ python examples/online_serving/qwen3_omni/realtime_tools/realtime_tools_client.p
     --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
     --input-wav ask_weather.wav \
     --output-wav response.wav
+```
+
+Pass `--voice` to select a talker voice (`ethan`, `chelsie`, or `aiden`):
+
+```bash
+python examples/online_serving/qwen3_omni/realtime_tools/realtime_tools_client.py \
+    --voice chelsie \
+    --input-wav ask_weather.wav --output-wav response.wav
 ```
 
 `--input-wav` accepts multiple files to run sequential turns over a single
@@ -187,9 +196,6 @@ Input WAVs must be mono 16-bit PCM at 16 kHz.
 
 ## Limitations
 
-- `/v1/realtime` requires `async_chunk: false` in the deployment config
-  (see "Running the example" above). The default Qwen3-Omni config has
-  `async_chunk: true` and is not usable here.
 - Conversation history grows with each turn within a session; very long
   sessions or large tool responses may approach the smallest stage's
   `max_model_len`. The server logs a warning when the estimated prompt

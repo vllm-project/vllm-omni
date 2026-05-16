@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import time
 from collections.abc import AsyncGenerator
 from typing import cast
@@ -64,6 +65,10 @@ class RealtimeConnection(VllmRealtimeConnection):
         # Tool calling and conversation state
         self.tools: list[dict] | None = None
         self.instructions: str | None = None
+        # Voice for talker synthesis; None falls back to the model default.
+        # Set via session.update with "voice": "<name>". Supported names are
+        # model-defined (e.g. Qwen3-Omni: "ethan", "chelsie", "aiden").
+        self.voice: str | None = None
         self.conversation_items: list[dict] = []
         self.conversation_context: str | None = None
 
@@ -149,7 +154,12 @@ class RealtimeConnection(VllmRealtimeConnection):
             session = event.get("session", {})
             self.tools = session.get("tools")
             self.instructions = session.get("instructions")
-            logger.info(f"Session updated with {len(self.tools) if self.tools else 0} tools")
+            voice = session.get("voice")
+            if voice and isinstance(voice, str) and voice.strip():
+                self.voice = voice.strip().lower()
+            logger.info(
+                f"Session updated with {len(self.tools) if self.tools else 0} tools, voice={self.voice!r}"
+            )
             await super().handle_event(event)
 
         elif event_type == RealtimeEventType.INPUT_AUDIO_BUFFER_COMMIT:
@@ -513,46 +523,48 @@ class RealtimeConnection(VllmRealtimeConnection):
             ref_audio = self._cached_user_audio if self._cached_user_audio else self._turn_audio_cache
             audio_array = np.concatenate(ref_audio) if ref_audio else np.zeros(8000, dtype=np.float32)
 
-            # Estimate total tokens (text + ~640 samples per audio token at
-            # 16 kHz) and warn when it eats into the smallest stage's budget.
-            prompt_token_count = -1
-            if self.tokenizer is not None:
+            # Token-budget estimate / warning lives on the debug path only:
+            # the tokenizer.encode call costs real time on every turn just to
+            # produce an advisory log line. Enable DEBUG logging to see it.
+            if logger.isEnabledFor(logging.DEBUG):
+                prompt_token_count = -1
+                if self.tokenizer is not None:
+                    try:
+                        prompt_token_count = len(self.tokenizer.encode(full_prompt))
+                    except Exception as exc:
+                        logger.warning("Could not count prompt tokens: %s", exc)
+                estimated_audio_tokens = audio_array.size // 640
+                estimated_total = max(prompt_token_count, 0) + estimated_audio_tokens
+
+                stage_limits: list[tuple[int, int]] = []
                 try:
-                    prompt_token_count = len(self.tokenizer.encode(full_prompt))
+                    for idx, vllm_cfg in enumerate(getattr(self.engine, "stage_vllm_configs", []) or []):
+                        if vllm_cfg is None:
+                            continue
+                        model_config = getattr(vllm_cfg, "model_config", None)
+                        if model_config is None:
+                            continue
+                        mml = getattr(model_config, "max_model_len", None)
+                        if mml:
+                            stage_limits.append((idx, int(mml)))
                 except Exception as exc:
-                    logger.warning("Could not count prompt tokens: %s", exc)
-            estimated_audio_tokens = audio_array.size // 640
-            estimated_total = max(prompt_token_count, 0) + estimated_audio_tokens
+                    logger.debug("Could not read per-stage max_model_len: %s", exc)
 
-            stage_limits: list[tuple[int, int]] = []
-            try:
-                for idx, vllm_cfg in enumerate(getattr(self.engine, "stage_vllm_configs", []) or []):
-                    if vllm_cfg is None:
-                        continue
-                    model_config = getattr(vllm_cfg, "model_config", None)
-                    if model_config is None:
-                        continue
-                    mml = getattr(model_config, "max_model_len", None)
-                    if mml:
-                        stage_limits.append((idx, int(mml)))
-            except Exception as exc:
-                logger.debug("Could not read per-stage max_model_len: %s", exc)
-
-            if stage_limits:
-                min_limit = min(m for _, m in stage_limits)
-                # 50% threshold leaves headroom for the codec generation that
-                # follows the prompt.
-                if estimated_total > min_limit // 2:
-                    logger.warning(
-                        "audio-pass prompt (~%d tokens) is %d%% of the smallest "
-                        "stage's max_model_len (%d). Codec generation needs the "
-                        "remaining budget — hangs or truncated audio likely if "
-                        "total runs past that limit. Consider trimming history "
-                        "or shortening tool responses.",
-                        estimated_total,
-                        int(100 * estimated_total / min_limit),
-                        min_limit,
-                    )
+                if stage_limits:
+                    min_limit = min(m for _, m in stage_limits)
+                    # 50% threshold leaves headroom for the codec generation that
+                    # follows the prompt.
+                    if estimated_total > min_limit // 2:
+                        logger.warning(
+                            "audio-pass prompt (~%d tokens) is %d%% of the smallest "
+                            "stage's max_model_len (%d). Codec generation needs the "
+                            "remaining budget — hangs or truncated audio likely if "
+                            "total runs past that limit. Consider trimming history "
+                            "or shortening tool responses.",
+                            estimated_total,
+                            int(100 * estimated_total / min_limit),
+                            min_limit,
+                        )
 
             prompt = {
                 "prompt": full_prompt,
@@ -560,6 +572,8 @@ class RealtimeConnection(VllmRealtimeConnection):
                     "audio": (audio_array, 16000),
                 },
             }
+            if self.voice:
+                prompt["additional_information"] = {"speaker": [self.voice]}
 
             request_id = f"rt-{self.connection_id}-{uuid4()}-aud"
             self._active_request_ids.add(request_id)
