@@ -8,7 +8,7 @@ Usage:
     # run a 4.5 server on :8099
     python gradio_demo.py \
         --minicpmo45-api-base http://localhost:8099/v1 \
-        --minicpmo45-model /cache/caitianchi/model/MiniCPM-o-4_5_full \
+        --minicpmo45-model openbmb/MiniCPM-o-4_5 \
         --port 7862
 """
 
@@ -511,7 +511,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--minicpmo45-api-base", default=os.environ.get("MINICPMO45_API_BASE", "http://localhost:8099/v1"))
     p.add_argument(
         "--minicpmo45-model",
-        default=os.environ.get("MINICPMO45_MODEL", "/cache/caitianchi/model/MiniCPM-o-4_5_full"),
+        default=os.environ.get("MINICPMO45_MODEL", "openbmb/MiniCPM-o-4_5"),
     )
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=7862)
