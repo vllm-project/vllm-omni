@@ -15,7 +15,6 @@ import pytest
 import torch
 import yaml
 from PIL import Image
-from tabulate import tabulate
 
 from tests.e2e.accuracy.helpers import (
     CLIPScorer,
@@ -208,9 +207,11 @@ def _run_offline(stage_configs_path: str, output_path: Path) -> tuple[Image.Imag
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="Needs 4+ GPUs (2 AR + 2 DiT)")
-def test_text_to_image_alignment(accuracy_artifact_root: Path, accuracy_assets_root: Path) -> None:
+def test_image_to_image_alignment(accuracy_artifact_root: Path, accuracy_assets_root: Path) -> None:
     if importlib.util.find_spec("FlagEmbedding") is None:
         raise ImportError("Missing dependency: FlagEmbedding\nInstall with: pip install FlagEmbedding")
+    from tabulate import tabulate  # lazy import
+
     """KV reuse ON vs OFF: same pipeline, same seed → PSNR >= 10 dB."""
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-offline-kv-reuse")
 
