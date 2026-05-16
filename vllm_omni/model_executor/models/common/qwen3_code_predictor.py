@@ -351,8 +351,10 @@ class CodePredictorBaseModel(nn.Module):
         # native bf16 support (Turing, Volta).  The RMSNorm and RoPE
         # layers already upcast internally; this extends the same
         # treatment to attention and MLP.
+        # autocast to float32 is unsupported on CPU; skip fp32 upcast there
+        # (CPU uses full-precision intermediates internally).
         input_dtype = inputs_embeds.dtype
-        use_fp32 = input_dtype == torch.float16
+        use_fp32 = input_dtype == torch.float16 and inputs_embeds.device.type != "cpu"
         if use_fp32:
             inputs_embeds = inputs_embeds.float()
         hidden_states = inputs_embeds
