@@ -157,9 +157,7 @@ class RealtimeConnection(VllmRealtimeConnection):
             voice = session.get("voice")
             if voice and isinstance(voice, str) and voice.strip():
                 self.voice = voice.strip().lower()
-            logger.info(
-                f"Session updated with {len(self.tools) if self.tools else 0} tools, voice={self.voice!r}"
-            )
+            logger.info(f"Session updated with {len(self.tools) if self.tools else 0} tools, voice={self.voice!r}")
             await super().handle_event(event)
 
         elif event_type == RealtimeEventType.INPUT_AUDIO_BUFFER_COMMIT:
@@ -665,9 +663,11 @@ class RealtimeConnection(VllmRealtimeConnection):
 
                     # Unlock streaming once enough text has been generated
                     # without a tool call open tag — safe to start sending audio.
-                    if (not audio_streaming_unlocked
-                            and tc_open not in spoken_text
-                            and len(spoken_text) >= _AUDIO_UNLOCK_CHARS):
+                    if (
+                        not audio_streaming_unlocked
+                        and tc_open not in spoken_text
+                        and len(spoken_text) >= _AUDIO_UNLOCK_CHARS
+                    ):
                         audio_streaming_unlocked = True
                         logger.info(
                             "audio streaming unlocked at %.2fs (%d chars, %d buffered chunk(s))",
