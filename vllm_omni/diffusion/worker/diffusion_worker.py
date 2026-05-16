@@ -97,7 +97,7 @@ def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _Diffus
 
 @contextmanager
 def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[None]:
-    from vllm.model_executor.layers.quantization import modelopt as vllm_modelopt
+    import vllm.model_executor.layers.quantization.modelopt as vllm_modelopt
 
     linear_method_cls = getattr(quant_config, "LinearMethodCls", None)
     if linear_method_cls in {

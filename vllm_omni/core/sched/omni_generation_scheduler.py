@@ -337,6 +337,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     lora_request=nr.lora_request,
                     # Enrich with omni payloads from the live request object
                     prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
+                    prompt_is_token_ids=nr.prompt_is_token_ids,
                     additional_information=(getattr(request, "additional_information", None) if request else None),
                 )
                 new_list.append(omni_nr)
@@ -520,7 +521,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 stopped = True
 
             if stopped:
-                routed_experts = self._get_routed_experts(request)
+                if (
+                    model_runner_output.routed_experts_dict is not None
+                    and req_id in model_runner_output.routed_experts_dict
+                ):
+                    routed_experts = model_runner_output.routed_experts_dict[req_id]
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:

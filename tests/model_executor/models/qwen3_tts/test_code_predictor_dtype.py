@@ -48,6 +48,7 @@ def _build_mock_modules(mocker: MockerFixture) -> dict[str, object]:
     """Build the dict of modules to inject into sys.modules."""
     platforms_mock = mocker.MagicMock()
     platforms_mock.current_omni_platform.supports_torch_inductor.return_value = False
+    platforms_mock.current_omni_platform.is_npu.return_value = False
 
     logger_mock = mocker.MagicMock()
     logger_mock.init_logger = lambda name: mocker.MagicMock()
@@ -211,6 +212,10 @@ class TestCodePredictorDtypeAlignment:
         predictor._model_dtype = torch.float16
         predictor._compiled_model_fwd = predictor.model.forward
 
+        # Ensure NPU path is not taken on non-NPU hardware
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
+
         # _warmup_buckets should fix the dtype mismatch
         predictor._warmup_buckets()
 
@@ -230,6 +235,9 @@ class TestCodePredictorDtypeAlignment:
         predictor = predictor.to(torch.float16)
 
         assert predictor._model_dtype is None
+        # Ensure NPU path is not taken on non-NPU hardware
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
         predictor._setup_compile()
         assert predictor._model_dtype == torch.float16
 

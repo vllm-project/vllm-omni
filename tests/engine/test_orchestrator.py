@@ -79,7 +79,7 @@ class FakeStageClient:
         self._diffusion_outputs = queue.Queue()
 
     # Orchestrator-facing interface.
-    async def add_request_async(self, *args, **_kwargs) -> None:
+    async def add_request_async(self, *args, **kwargs) -> None:
         self.add_request_calls.append(args)
 
     async def get_output_async(self):
@@ -448,7 +448,7 @@ def test_stage_engine_core_client_shutdown_cleans_children_if_base_shutdown_fail
             assert recursive
             return [fake_child]
 
-    def fail_base_shutdown(self):
+    def fail_base_shutdown(self, **kwargs):
         raise RuntimeError("base shutdown failed")
 
     monkeypatch.setattr(psutil, "Process", FakePsutilProcess)
@@ -480,7 +480,7 @@ def test_stage_engine_core_client_shutdown_kills_stubborn_children(monkeypatch):
 
     monkeypatch.setattr(psutil, "Process", FakePsutilProcess)
     monkeypatch.setattr(psutil, "wait_procs", lambda procs, timeout: ([], list(procs)))
-    monkeypatch.setattr(AsyncMPClient, "shutdown", lambda self: None)
+    monkeypatch.setattr(AsyncMPClient, "shutdown", lambda self, **kwargs: None)
 
     client = object.__new__(StageEngineCoreClient)
     client._proc = fake_proc
@@ -994,7 +994,7 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
 @pytest.mark.asyncio
 async def test_stage_pool_submit_initial_rolls_back_output_processor_when_client_submit_fails() -> None:
     class FailingStageClient(FakeStageClient):
-        async def add_request_async(self, *args, **_kwargs) -> None:
+        async def add_request_async(self, *args, **kwargs) -> None:
             raise RuntimeError("submit failed")
 
     class TrackingOutputProcessor(FakeOutputProcessor):
