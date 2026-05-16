@@ -284,7 +284,6 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
     [
         pytest.param(
             "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-            marks=pytest.mark.skip(reason="#3488"),
         ),
     ],
 )

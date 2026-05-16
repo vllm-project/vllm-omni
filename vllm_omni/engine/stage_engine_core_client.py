@@ -23,6 +23,7 @@ from vllm.v1.engine.exceptions import EngineDeadError
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     KV_TRANSFER_PORT_OFFSET,
 )
+from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 
 if TYPE_CHECKING:
@@ -56,7 +57,7 @@ def _default_process_engine_inputs(
     ]
 
 
-class StageEngineCoreClientBase:
+class StageEngineCoreClientBase(StageClientBase):
     """Shared stage-aware behavior for async EngineCore clients.
 
     The concrete transport/load-balancing behavior is supplied by the
@@ -79,7 +80,8 @@ class StageEngineCoreClientBase:
     def make_async_mp_client(
         vllm_config: Any,
         executor_class: type,
-        metadata: StageMetadata,
+        log_stats: bool = False,
+        metadata: StageMetadata | None = None,
         client_addresses: dict[str, str] | None = None,
         proc: Any = None,
         engine_manager: Any = None,
@@ -92,6 +94,7 @@ class StageEngineCoreClientBase:
         client_args = dict(
             vllm_config=vllm_config,
             executor_class=executor_class,
+            log_stats=log_stats,
             metadata=metadata,
             client_addresses=client_addresses,
             proc=proc,
@@ -440,7 +443,7 @@ class StageEngineCoreClientBase:
             kwargs=kwargs,
         )
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown managed resources and any externally spawned subprocess."""
         child_procs: list[psutil.Process] = []
         if self._proc is not None and self._proc.pid is not None:
@@ -450,7 +453,7 @@ class StageEngineCoreClientBase:
                 child_procs = []
 
         try:
-            super().shutdown()
+            super().shutdown(timeout=timeout)
         finally:
             if self._proc is not None and self._proc.is_alive():
                 self._proc.terminate()

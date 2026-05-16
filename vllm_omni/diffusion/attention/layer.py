@@ -171,7 +171,7 @@ class Attention(nn.Module):
     def _init_kv_cache_quantization(self, config) -> None:
         if config is None:
             return
-        dtype = config.kv_cache_dtype
+        dtype = config.diffusion_kv_cache_dtype
         if dtype:
             if config.parallel_config.ring_degree > 1:
                 raise ValueError(
@@ -190,8 +190,8 @@ class Attention(nn.Module):
                 )
                 dtype = None
         self._kv_cache_dtype = dtype
-        self._kv_cache_skip_steps = config.kv_cache_skip_step_indices
-        self._kv_cache_skip_layers = config.kv_cache_skip_layer_indices
+        self._kv_cache_skip_steps = config.diffusion_kv_cache_skip_step_indices
+        self._kv_cache_skip_layers = config.diffusion_kv_cache_skip_layer_indices
 
     def _should_apply_kv_cache_quant(self) -> bool:
         skip_steps = self._kv_cache_skip_steps
