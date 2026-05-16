@@ -9,10 +9,13 @@ import json
 import os
 from collections.abc import Iterable
 from contextlib import nullcontext
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
@@ -67,14 +70,27 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
     return {}
 
 
-def create_transformer_from_config(config: dict) -> LTX2VideoTransformer3DModel:
-    """Create LTX2VideoTransformer3DModel from config dict."""
-    if not config:
+def create_transformer_from_config(
+    config: dict,
+    quant_config: QuantizationConfig | None = None,
+) -> LTX2VideoTransformer3DModel:
+    """Create LTX2VideoTransformer3DModel from config dict.
+
+    `quant_config` is forwarded to the transformer constructor. The
+    `quantization_config` field that offline-quantization tooling (e.g.
+    Wan2.2's merge_mxfp8_checkpoint.py) injects into transformer/config.json
+    is not auto-detected here — no such tooling targets LTX-2 yet. Users pass
+    quantization explicitly via OmniDiffusionConfig.quantization_config.
+    """
+    if not config and quant_config is None:
         return LTX2VideoTransformer3DModel()
 
     signature = inspect.signature(LTX2VideoTransformer3DModel.__init__)
     allowed_keys = set(signature.parameters.keys())
     kwargs = {k: v for k, v in config.items() if k in allowed_keys}
+    if quant_config is not None:
+        kwargs["quant_config"] = quant_config
+
     return LTX2VideoTransformer3DModel(**kwargs)
 
 
@@ -213,8 +229,16 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             local_files_only=local_files_only,
         ).to(self.device)
 
+        # Only the DiT transformer participates in quantization. VAE, audio
+        # VAE, vocoder, text encoder, and connectors stay in their native dtype
+        # because (a) they are perceptually sensitive (VAE) or already small
+        # (vocoder, connectors), and (b) we have no per-component plumbing on
+        # those direct-from-pretrained loads. Users wanting fine-grained routing
+        # within the transformer can pass a `ComponentQuantizationConfig` whose
+        # keys are prefixes under the transformer (e.g. "transformer_blocks").
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(transformer_config)
+        quant_config = getattr(self.od_config, "quantization_config", None)
+        self.transformer = create_transformer_from_config(transformer_config, quant_config=quant_config)
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
