@@ -1,22 +1,15 @@
-"""Gradio demo for MiniCPM-o (4.5 + 2.6) online serving through vllm-omni.
+"""Gradio demo for MiniCPM-o 4.5 online serving through vllm-omni.
 
 Supports:
 - Text / Image / Audio / Video inputs (OpenAI chat-completions multimodal format).
 - Text + audio outputs, returned side-by-side in the UI.
-- Live switching between a MiniCPM-o 4.5 endpoint and a MiniCPM-o 2.6
-  endpoint. Each model has its own OpenAI-compatible vllm-omni server.
 
 Usage:
-    # run 4.5 server on :8099 and optionally 2.6 on :8091
+    # run a 4.5 server on :8099
     python gradio_demo.py \
         --minicpmo45-api-base http://localhost:8099/v1 \
         --minicpmo45-model /cache/caitianchi/model/MiniCPM-o-4_5_full \
-        --minicpmo26-api-base http://localhost:8091/v1 \
-        --minicpmo26-model /cache/guiqingxin/MiniCPM-o-2_6 \
         --port 7862
-
-Only one of the two endpoints is required. The dropdown auto-filters to
-configured models.
 """
 
 from __future__ import annotations
@@ -36,15 +29,12 @@ from openai import OpenAI
 from PIL import Image
 
 MINICPMO45 = "MiniCPM-o-4.5"
-MINICPMO26 = "MiniCPM-o-2.6"
 
 # Default reference audio per model, relative to the model path. Used to build
-# the audio_assistant system prompt so that (a) the LLM adopts the "speak in
-# this voice" persona (matches the official MiniCPM-o demo) and (b) for 2.6
-# the speaker-embedding extraction has a real voice sample to condition on.
+# the audio_assistant system prompt so that the LLM adopts the "speak in this
+# voice" persona (matches the official MiniCPM-o demo).
 _DEFAULT_REF_AUDIO = {
     MINICPMO45: "assets/HT_ref_audio.wav",
-    MINICPMO26: "assets/demo.wav",
 }
 
 # audio_assistant prompt text, mirrors MiniCPMO.get_sys_prompt("audio_assistant")
@@ -164,7 +154,7 @@ def process_audio_input(audio_input: Any | None) -> tuple[np.ndarray, int] | Non
 
     if isinstance(audio_input, tuple) and len(audio_input) == 2:
         a, b = audio_input
-        if isinstance(a, (int, float)) and isinstance(b, np.ndarray):
+        if isinstance(a, int | float) and isinstance(b, np.ndarray):
             sr, audio_np = int(a), b
         elif isinstance(a, str):
             loaded = _from_path(a)
@@ -226,20 +216,11 @@ class ModelEndpoint:
         """Extra kwargs passed to chat.completions.create for this model.
 
         4.5: use_tts_template=True chat-template flag appends <|tts_bos|>.
-        2.6: mm_processor_kwargs.use_tts=True injects the full
-             <|spk_bos|><|spk|><|spk_eos|><|tts_bos|> suffix.
         """
         if self.name == MINICPMO45:
             return {
                 "extra_body": {
                     "chat_template_kwargs": {"use_tts_template": True},
-                    "modalities": ["text", "audio"],
-                },
-            }
-        if self.name == MINICPMO26:
-            return {
-                "extra_body": {
-                    "mm_processor_kwargs": {"use_tts": True},
                     "modalities": ["text", "audio"],
                 },
             }
@@ -401,7 +382,7 @@ def build_interface(endpoints: dict[str, ModelEndpoint], default_model: str) -> 
         gr.Markdown(
             "# vLLM-Omni · MiniCPM-o Online Demo\n"
             "Multimodal chat (text / image / audio / video in; text + speech out) for "
-            "MiniCPM-o 4.5 and MiniCPM-o 2.6 served by vllm-omni."
+            "MiniCPM-o 4.5 served by vllm-omni."
         )
 
         with gr.Row():
@@ -532,11 +513,6 @@ def parse_args() -> argparse.Namespace:
         "--minicpmo45-model",
         default=os.environ.get("MINICPMO45_MODEL", "/cache/caitianchi/model/MiniCPM-o-4_5_full"),
     )
-    p.add_argument("--minicpmo26-api-base", default=os.environ.get("MINICPMO26_API_BASE", ""))
-    p.add_argument(
-        "--minicpmo26-model",
-        default=os.environ.get("MINICPMO26_MODEL", ""),
-    )
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=7862)
     p.add_argument("--share", action="store_true")
@@ -579,17 +555,8 @@ def main() -> None:
         print(f"[4.5] {args.minicpmo45_api_base}  ({status})")
         endpoints[MINICPMO45] = ModelEndpoint(MINICPMO45, args.minicpmo45_api_base, args.minicpmo45_model)
 
-    if args.minicpmo26_api_base and args.minicpmo26_model:
-        ok = _ping(args.minicpmo26_api_base)
-        status = "reachable" if ok else "not reachable (will error on generate)"
-        print(f"[2.6] {args.minicpmo26_api_base}  ({status})")
-        endpoints[MINICPMO26] = ModelEndpoint(MINICPMO26, args.minicpmo26_api_base, args.minicpmo26_model)
-
     if not endpoints:
-        raise SystemExit(
-            "No endpoints configured. Pass --minicpmo45-api-base/--minicpmo45-model and/or "
-            "--minicpmo26-api-base/--minicpmo26-model."
-        )
+        raise SystemExit("No endpoints configured. Pass --minicpmo45-api-base/--minicpmo45-model.")
 
     default_model = next(iter(endpoints.keys()))
     demo = build_interface(endpoints, default_model)

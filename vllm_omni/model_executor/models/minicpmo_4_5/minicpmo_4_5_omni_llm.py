@@ -1352,7 +1352,7 @@ class SiglipPreTrainedModel(PreTrainedModel):
             nn.init.normal_(module.fc2.weight)
             nn.init.normal_(module.fc1.bias, std=1e-6)
             nn.init.normal_(module.fc2.bias, std=1e-6)
-        elif isinstance(module, (nn.Linear, nn.Conv2d)):
+        elif isinstance(module, nn.Linear | nn.Conv2d):
             lecun_normal_(module.weight)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
@@ -3819,7 +3819,7 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         # Normalize input format
         if not isinstance(pixel_values_list, list):
             pixel_values_list = [pixel_values_list]
-        if not isinstance(tgt_sizes, (list, torch.Tensor)):
+        if not isinstance(tgt_sizes, list | torch.Tensor):
             tgt_sizes = [tgt_sizes] if tgt_sizes is not None else []
 
         # Convert to tensors if needed

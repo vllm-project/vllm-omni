@@ -71,11 +71,6 @@ demo = [
     "gradio>=6.7.0",
 ]
 
-minicpmo = [
-    "vector_quantize_pytorch>=1.14.0",
-    "vocos>=0.1.0",
-]
-
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",
@@ -152,9 +147,7 @@ ignore = [
 # MiniCPM-o reference modeling code vendored from upstream HF/transformers/MiniCPM-o.
 # These files keep upstream conventions (star imports, long lines, math-symbol
 # argument names) so they stay easy to diff against upstream releases.
-"vllm_omni/model_executor/models/minicpmo_2_6/minicpmo_2_6_omni_llm.py" = ["E402", "E501", "F403", "F405", "N803"]
 "vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_omni_llm.py" = ["E402", "E501", "F403", "F405", "N803"]
-"vllm_omni/model_executor/models/minicpmo_2_6/minicpmo_2_6_omni_t2w.py" = ["E501", "N803"]
 "vllm_omni/model_executor/models/minicpmo_4_5/minicpmo_4_5_omni_t2w.py" = ["E501", "N803"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
