@@ -796,6 +796,14 @@ class WorkerProc:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
 
+        # Set process title for visibility in nvidia-smi / htop (optional, non-fatal)
+        try:
+            import setproctitle
+
+            setproctitle.setproctitle(f"vLLM-Omni::StageDiffusionProc-{rank}")
+        except ImportError:
+            pass  # setproctitle not installed, skip process title setting
+
         load_omni_general_plugins()
         worker_proc = WorkerProc(
             od_config,
