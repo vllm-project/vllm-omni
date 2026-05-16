@@ -34,6 +34,16 @@ Video example (text-to-video):
         --height 720 --width 1280 \
         --num-frames 81 --num-inference-steps 40 --seed 42
 
+LTX-2 example (text-to-video; audio output is generated but not scored by LPIPS):
+    python benchmarks/diffusion/quantization_quality.py \
+        --model Lightricks/LTX-Video-2 \
+        --task t2v \
+        --quantization fp8 int8 \
+        --prompts \
+            "A serene lakeside sunrise with mist over the water" \
+        --height 704 --width 1216 \
+        --num-frames 121 --num-inference-steps 40 --seed 42
+
 Multiple quantization methods:
     python benchmarks/diffusion/quantization_quality.py \
         --model Tongyi-MAI/Z-Image-Turbo \
