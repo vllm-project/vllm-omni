@@ -127,6 +127,74 @@ def assert_image_sequence_similarity(
         )
 
 
+def assert_images_pixel_close(
+    *,
+    model_name: str,
+    vllm_image: Image.Image,
+    diffusers_image: Image.Image,
+    mean_threshold: float,
+    p99_threshold: float,
+    compare_mode: str = "RGB",
+) -> None:
+    """Assert full-image pixel closeness between online serving and diffusers output.
+
+    Match the threshold style used by diffusion parallelism tests: convert both
+    images to float32 RGB tensors in the [0, 1] range, then compare mean and p99
+    absolute channel differences.
+
+    Accuracy improves as both values move lower:
+    - ``mean_abs_diff`` tracks global average drift across the whole image.
+    - ``p99_abs_diff`` tracks tail drift while ignoring the noisiest 1% of
+      channel samples.
+
+    The printed mismatch ratios are diagnostics only. ``pixel_ratio`` counts
+    pixels where any channel exceeds a tolerance, while ``channel_ratio`` counts
+    individual channel samples above that tolerance.
+    """
+    assert vllm_image.size == diffusers_image.size, (
+        f"Online and diffusers output sizes mismatch: online={vllm_image.size}, diffusers={diffusers_image.size}"
+    )
+
+    vllm_array = np.asarray(vllm_image.convert(compare_mode), dtype=np.float32) / 255.0
+    diffusers_array = np.asarray(diffusers_image.convert(compare_mode), dtype=np.float32) / 255.0
+    channel_abs_diff = np.abs(vllm_array - diffusers_array)
+    mean_abs_diff = float(channel_abs_diff.mean())
+    p99_abs_diff = float(np.quantile(channel_abs_diff, 0.99))
+    percentiles = {
+        percentile: float(np.quantile(channel_abs_diff, percentile / 100.0)) for percentile in (50, 90, 95, 99, 99.9)
+    }
+
+    print(f"{model_name} pixel metrics:")
+    print(
+        f"  mean_abs_diff: value={mean_abs_diff:.6e}, threshold<={mean_threshold:.6e}, "
+        "range=[0, 1], lower_is_better=True"
+    )
+    print(
+        f"  p99_abs_diff: value={p99_abs_diff:.6e}, threshold<={p99_threshold:.6e}, range=[0, 1], lower_is_better=True"
+    )
+    print("  abs_diff_percentiles:")
+    for percentile, value in percentiles.items():
+        print(f"    p{percentile}: value={value:.6e}, range=[0, 1], lower_is_better=True")
+    print("  mismatch_ratios_by_channel_threshold:")
+    for tolerance in (0, 1, 2, 4, 8, 16, 32, 64, 128):
+        normalized_tolerance = tolerance / 255.0
+        pixel_mismatch = np.any(channel_abs_diff > normalized_tolerance, axis=-1)
+        pixel_mismatch_ratio = float(np.count_nonzero(pixel_mismatch) / pixel_mismatch.size)
+        channel_mismatch_ratio = float(
+            np.count_nonzero(channel_abs_diff > normalized_tolerance) / channel_abs_diff.size
+        )
+        print(
+            f"    threshold>{normalized_tolerance:.6e} ({tolerance}/255): pixel_ratio={pixel_mismatch_ratio:.8f}, "
+            f"channel_ratio={channel_mismatch_ratio:.8f}"
+        )
+
+    assert mean_abs_diff <= mean_threshold and p99_abs_diff <= p99_threshold, (
+        f"Image diff exceeded threshold for {model_name}: mean_abs_diff={mean_abs_diff:.6e}, "
+        f"p99_abs_diff={p99_abs_diff:.6e} (thresholds: mean<={mean_threshold:.6e}, "
+        f"p99<={p99_threshold:.6e})"
+    )
+
+
 def compute_image_ssim_psnr(
     *,
     prediction: Image.Image,
