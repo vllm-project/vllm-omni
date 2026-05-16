@@ -277,7 +277,11 @@ class Orchestrator:
         )
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
+            # For resumable (streaming-input) requests the full prompt isn't
+            # available yet — defer prewarm to the final streaming_update where
+            # resumable=False and the complete token IDs are known.
+            if not req_state.streaming.enabled:
+                await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
 
     async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
         """Handle a streaming_update message for an existing request."""
@@ -316,6 +320,14 @@ class Orchestrator:
             request,
             prompt_text=msg.output_prompt_text,
         )
+
+        # Fire deferred async_chunk prewarm on the final commit (resumable=False).
+        # At this point the thinker has the complete prompt and will start
+        # decoding immediately, so downstream stages need to be ready.
+        is_final = not bool(getattr(request, "resumable", True))
+        if self.async_chunk and stage_id == 0 and req_state.final_stage_id > 0 and is_final:
+            if not self._next_stage_already_submitted(stage_id, req_state):
+                await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
     async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""

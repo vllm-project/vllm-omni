@@ -17,7 +17,7 @@
 #       --deploy-config examples/online_serving/qwen3_omni/realtime_tools/qwen3_omni_moe_realtime.yaml
 base_config: ../../../../vllm_omni/deploy/qwen3_omni_moe.yaml
 
-async_chunk: false
+async_chunk: true
 
 stages:
   - stage_id: 0

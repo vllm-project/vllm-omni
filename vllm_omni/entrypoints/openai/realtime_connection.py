@@ -578,6 +578,16 @@ class RealtimeConnection(VllmRealtimeConnection):
             last_progress_len = 0
             last_progress_time = t_audio_start
             audio_pass_tool_call_detected = False
+            # Buffer audio chunks until the thinker has generated enough text
+            # that a tool call is no longer possible. With async_chunk the
+            # pipeline runs in parallel so audio may arrive mid-thinker; we
+            # hold it here and flush once unlocked, or discard on tool call.
+            # Without async_chunk audio only arrives after the thinker
+            # finishes anyway, so the buffer just flushes immediately.
+            # The unlock threshold is model-defined (see model_cls).
+            _AUDIO_UNLOCK_CHARS = self.model_cls.REALTIME_AUDIO_UNLOCK_CHARS
+            pending_audio: list[tuple[np.ndarray, int]] = []
+            audio_streaming_unlocked = False
             try:
                 async for output in result_gen:
                     if output.outputs:
@@ -628,19 +638,46 @@ class RealtimeConnection(VllmRealtimeConnection):
                                 )
                             )
                             logger.info(
-                                "audio-pass tool call detected at %.2fs — aborting; emitted %d tool call(s)",
+                                "audio-pass tool call detected at %.2fs — aborting; "
+                                "discarding %d buffered audio chunk(s); emitted %d tool call(s)",
                                 time.monotonic() - t_audio_start,
+                                len(pending_audio),
                                 len(self.current_tool_calls),
                             )
+                            pending_audio.clear()
                             await self.engine.abort(request_id)
                             audio_pass_tool_call_detected = True
                             break
 
+                    # Unlock streaming once enough text has been generated
+                    # without a tool call open tag — safe to start sending audio.
+                    if (not audio_streaming_unlocked
+                            and tc_open not in spoken_text
+                            and len(spoken_text) >= _AUDIO_UNLOCK_CHARS):
+                        audio_streaming_unlocked = True
+                        logger.info(
+                            "audio streaming unlocked at %.2fs (%d chars, %d buffered chunk(s))",
+                            time.monotonic() - t_audio_start,
+                            len(spoken_text),
+                            len(pending_audio),
+                        )
+
                     audio_chunks, sample_rate = self._extract_audio_chunks(output)
                     for chunk in audio_chunks:
-                        sent_audio = True
-                        audio_chunk_count += 1
-                        await self._send_audio_delta(chunk, sample_rate)
+                        if audio_streaming_unlocked:
+                            sent_audio = True
+                            audio_chunk_count += 1
+                            await self._send_audio_delta(chunk, sample_rate)
+                        else:
+                            pending_audio.append((chunk, sample_rate))
+
+                    # Flush any buffered chunks once unlocked.
+                    if audio_streaming_unlocked and pending_audio:
+                        for chunk, sr in pending_audio:
+                            sent_audio = True
+                            audio_chunk_count += 1
+                            await self._send_audio_delta(chunk, sr)
+                        pending_audio.clear()
 
                     # Periodic progress: text accumulating without audio
                     # chunks ⇒ stage-1 hang; neither ticking ⇒ stage-0 hang.
@@ -652,6 +689,13 @@ class RealtimeConnection(VllmRealtimeConnection):
                     if not self._is_connected:
                         break
             finally:
+                # Flush buffered audio only on a clean (no-tool-call) exit.
+                if not audio_pass_tool_call_detected:
+                    for chunk, sample_rate in pending_audio:
+                        sent_audio = True
+                        audio_chunk_count += 1
+                        await self._send_audio_delta(chunk, sample_rate)
+                pending_audio.clear()
                 # Final state — visible even when stage-1/2 hangs.
                 logger.info(
                     "audio-pass exit: %.2fs | spoken_len=%d | audio_chunks=%d | sent_audio=%s",

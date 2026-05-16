@@ -292,6 +292,14 @@ class Qwen3OmniMoeForConditionalGeneration(
     # to early-abort transcription once a full turn has been produced.
     ASSISTANT_TURN_END = "<|im_end|>"
 
+    # Number of generated characters the realtime connection must observe
+    # without seeing a tool-call open tag before it can safely start streaming
+    # audio to the client. Sized to the length of TOOL_CALL_OPEN ("<tool_call>")
+    # because tool calls always appear at the very start of a response — once
+    # we've generated this many characters without seeing it, a tool call can
+    # no longer begin.
+    REALTIME_AUDIO_UNLOCK_CHARS = len(TOOL_CALL_OPEN)
+
     # Strips any Qwen special token (<|im_start|>, <|audio_*|>, etc.) from
     # generated text before it's stored in conversation history.
     _SPECIAL_TOKEN_RE: re.Pattern = re.compile(r"<\|[^|]*\|>")

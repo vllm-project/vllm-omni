@@ -544,13 +544,11 @@ async def build_async_omni_from_stage_config(
 
 
 async def _warmup_realtime(engine_client: EngineClient, state: State) -> None:
-    """Run one thinker-only pass to warm the GPU before accepting requests.
+    """Run a full pipeline warmup pass before accepting requests.
 
     Eliminates the cold-start latency spike on the first real /v1/realtime
-    request. Only stage 0 (thinker) is exercised — it accounts for most of
-    the cold-start cost as the largest model in the pipeline. Stages 1+2
-    (talker, code2wav) are skipped to avoid overflowing their audio buffers
-    with a synthetic silent input.
+    request by exercising all three stages (thinker, talker, code2wav) with
+    a short silent audio input.
 
     Skipped if the realtime serving object is absent (non-omni or
     pure-diffusion deployments) or if the model class lacks realtime support.
@@ -567,29 +565,34 @@ async def _warmup_realtime(engine_client: EngineClient, state: State) -> None:
     if model_cls is None or not hasattr(model_cls, "build_audio_pass_prompt"):
         return
 
-    logger.info("[warmup] Running realtime thinker warmup pass...")
+    logger.info("[warmup] Running realtime warmup pass (thinker + talker + code2wav)...")
     try:
-        # 0.5 s of silence at 16 kHz — triggers a real thinker forward pass
-        # without generating audio (output_modalities=["text"] keeps stages
-        # 1+2 out of the picture, avoiding audio-buffer size constraints that
-        # vary by deploy config).
-        silence = np.zeros(8000, dtype=np.float32)
+        # 4 s of silence at 16 kHz — sized to roughly match a typical
+        # user-utterance length so the thinker prefill captures CUDA graphs /
+        # MoE expert routing for the sequence-length buckets a real first
+        # turn will hit. Shorter inputs leave kernels JIT-compiling on the
+        # first real request, defeating the purpose of warmup.
+        silence = np.zeros(16000 * 4, dtype=np.float32)
+        # Include a representative system body so the prompt size also matches
+        # what a tools/instructions session produces — a one-line placeholder
+        # is enough to exercise the system-block prefill path.
+        system_body = "You are a helpful assistant."
         prompt = {
-            "prompt": model_cls.build_audio_pass_prompt(None, ""),
+            "prompt": model_cls.build_audio_pass_prompt(system_body, ""),
             "multi_modal_data": {"audio": (silence, 16000)},
         }
         request_id = f"warmup-{uuid4()}"
         generator = engine_client.generate(
             prompt=prompt,
             request_id=request_id,
-            output_modalities=["text"],
+            output_modalities=["audio"],
             sampling_params_list=coerce_param_message_types(
                 list(engine_client.default_sampling_params_list), is_streaming=True
             ),
         )
         async for _ in generator:
             pass
-        logger.info("[warmup] Realtime thinker warmup complete.")
+        logger.info("[warmup] Realtime warmup complete (all stages).")
     except Exception:
         logger.warning("[warmup] Realtime warmup pass failed (non-fatal).", exc_info=True)
 
@@ -1430,22 +1433,6 @@ async def streaming_video_chat(websocket: WebSocket):
 @router.websocket("/v1/realtime")
 async def realtime_websocket(websocket: WebSocket):
     """WebSocket endpoint for OpenAI-style realtime interactions."""
-    engine_client = getattr(websocket.app.state, "engine_client", None)
-    if engine_client is not None and getattr(engine_client, "async_chunk", False):
-        await websocket.accept()
-        await websocket.send_json(
-            {
-                "type": "error",
-                "error": (
-                    "The /v1/realtime API is not supported when async_chunk is enabled on the server. "
-                    "Use a stage configuration with async_chunk disabled and restart the server before using "
-                    "this endpoint."
-                ),
-                "code": "unsupported",
-            }
-        )
-        await websocket.close()
-        return
     serving = getattr(websocket.app.state, "openai_serving_realtime", None)
     if serving is None:
         await websocket.accept()
