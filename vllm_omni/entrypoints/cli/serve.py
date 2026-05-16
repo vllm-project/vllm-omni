@@ -21,11 +21,9 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.cli.diffusion_args import (
-    add_diffusion_cfg_parallel_arg,
     add_diffusion_cpu_offload_arg,
     add_diffusion_sequence_parallel_args,
     add_diffusion_vae_memory_args,
-    add_diffusion_vae_patch_parallel_arg,
     add_diffusion_weight_loading_args,
 )
 from vllm_omni.entrypoints.cli.logo import log_logo
@@ -387,8 +385,42 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="Scheduler flow_shift for video models (e.g., 5.0 for 720p, 12.0 for 480p).",
         )
-        add_diffusion_cfg_parallel_arg(omni_config_group)
-        add_diffusion_vae_patch_parallel_arg(omni_config_group)
+        # Diffusion KV-cache quantization uses dedicated flags so we do not reuse
+        # vLLM's --kv-cache-dtype (AR cache dtype, default "auto").
+        omni_config_group.add_argument(
+            "--diffusion-kv-cache-dtype",
+            type=str,
+            default=None,
+            help="Diffusion attention KV cache dtype (e.g. fp8). Separate from vLLM --kv-cache-dtype.",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-kv-cache-skip-steps",
+            type=str,
+            default=None,
+            help="Diffusion KV-cache quantization skip-step selector, e.g. '0-9,20,25-30'.",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-kv-cache-skip-layers",
+            type=str,
+            default=None,
+            help="Diffusion KV-cache quantization skip-layer selector, e.g. '0,1,4-8'.",
+        )
+        omni_config_group.add_argument(
+            "--cfg-parallel-size",
+            type=int,
+            default=1,
+            choices=[1, 2],
+            help="Number of devices for CFG parallel computation for diffusion models. "
+            "Equivalent to setting DiffusionParallelConfig.cfg_parallel_size.",
+        )
+        omni_config_group.add_argument(
+            "--vae-patch-parallel-size",
+            type=int,
+            default=1,
+            help="VAE Patch Parallelism degree for diffusion models. "
+            "Distributes VAE decode workload across multiple ranks by splitting the latent spatially. "
+            "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
+        )
 
         # Default sampling parameters
         omni_config_group.add_argument(
