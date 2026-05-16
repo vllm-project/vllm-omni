@@ -18,7 +18,7 @@ This folder provides a unified CLI script for text-to-video generation using vLL
 
 ### Supported Models
 
-| Model | Default Resolution | Default Frames | Default Steps | Guidance | VRAM Notes |
+| Model | Preset Resolution | Preset Frames | Preset Steps | Guidance | VRAM Notes |
 | ----- | ------------------ | -------------- | ------------- | -------- | ---------- |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720 x 1280 | 81 | 40 | 4.0 | Around 60 GiB BF16 for basic single-card usage |
 | `Lightricks/LTX-2` | 512 x 768 | 121 | 40 | 4.0 | Memory use depends on frame count, tensor parallelism, and audio export |
@@ -63,7 +63,7 @@ python text_to_video.py \
 | `--num-frames` | int | model-specific | Number of generated frames |
 | `--num-inference-steps` | int | model-specific | Diffusion sampling steps |
 | `--guidance-scale` | float | model-specific | Classifier-free guidance scale |
-| `--fps` | int | model-specific | Frames per second for the saved MP4 |
+| `--fps` | int | model-specific | Frames per second for the saved MP4; also used as the generation frame rate when `--frame-rate` is omitted |
 | `--output` | str | model-specific | Path to save the generated video |
 | `--vae-use-slicing` | flag | off | Enable VAE slicing for memory optimization |
 | `--vae-use-tiling` | flag | off | Enable VAE tiling for memory optimization |
@@ -73,7 +73,7 @@ python text_to_video.py \
 | `--ring-degree` | int | `1` | Ring sequence parallel degree |
 | `--enable-cpu-offload` | flag | off | Enable CPU offloading for diffusion models |
 | `--enable-layerwise-offload` | flag | off | Enable layerwise offloading on DiT modules |
-| `--frame-rate` | float | `None` | Optional generation frame rate for pipelines that require it, such as LTX2 |
+| `--frame-rate` | float | `None` | Optional generation frame rate passed to sampling params for pipelines that require it, such as LTX2 |
 | `--audio-sample-rate` | int | `24000` | Audio sample rate when the pipeline returns audio |
 | `--quantization` | str | `None` | Quantization method: `fp8` or `gguf` |
 | `--flow-shift` | float | model-specific | Scheduler `flow_shift` parameter |

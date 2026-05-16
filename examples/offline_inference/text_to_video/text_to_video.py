@@ -35,6 +35,15 @@ _MODEL_PRESETS = {
         "fps": 24,
         "output": "hunyuan_video_15_output.mp4",
     },
+    "ltx2": {
+        "height": 512,
+        "width": 768,
+        "num_frames": 121,
+        "num_inference_steps": 40,
+        "guidance_scale": 4.0,
+        "fps": 24,
+        "output": "ltx2_output.mp4",
+    },
 }
 
 
@@ -42,6 +51,8 @@ def _detect_preset(model: str) -> dict:
     model_lower = model.lower()
     if "hunyuan" in model_lower:
         return _MODEL_PRESETS["hunyuan"]
+    if "ltx-2" in model_lower or "ltx2" in model_lower:
+        return _MODEL_PRESETS["ltx2"]
     return _MODEL_PRESETS["wan"]
 
 
@@ -245,6 +256,8 @@ def main():
     for key, default_val in preset.items():
         if getattr(args, key.replace("-", "_"), None) is None:
             setattr(args, key.replace("-", "_"), default_val)
+    if args.frame_rate is None:
+        args.frame_rate = float(args.fps)
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
     # Cache-dit config (Wan2.2 only)
@@ -333,6 +346,8 @@ def main():
         guidance_scale=args.guidance_scale,
         num_inference_steps=args.num_inference_steps,
         num_frames=args.num_frames,
+        fps=args.fps,
+        frame_rate=args.frame_rate,
     )
     if args.guidance_scale_high is not None:
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high

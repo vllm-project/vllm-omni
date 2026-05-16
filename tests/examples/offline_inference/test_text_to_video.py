@@ -38,6 +38,10 @@ README_SNIPPETS = ReadmeSnippet.extract_readme_snippets(
     README_PATH,
     skipif=_skip_readme_snippet,
 )
+assert any(not snippet.skip[0] for snippet in README_SNIPPETS), (
+    "Expected at least one runnable text-to-video README snippet. "
+    "Update _skip_readme_snippet if the Quick Test example changes."
+)
 
 
 @pytest.mark.parametrize("snippet", README_SNIPPETS, ids=lambda snippet: snippet.test_id)
