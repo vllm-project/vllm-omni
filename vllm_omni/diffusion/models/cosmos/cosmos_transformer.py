@@ -237,20 +237,19 @@ class CosmosSelfAttention(nn.Module):
         key = key.unflatten(2, (self.num_heads, -1)).transpose(1, 2)
         value = value.unflatten(2, (self.num_heads, -1)).transpose(1, 2)
 
-        # Apply QK normalization
-        query = self.norm_q(query)
-        key = self.norm_k(key)
+        # QK normalization
+        q_shape, k_shape = query.shape, key.shape
+        query = self.norm_q(query.reshape(-1, self.head_dim)).view(q_shape)
+        key = self.norm_k(key.reshape(-1, self.head_dim)).view(k_shape)
 
-        # Apply rotary embeddings
+        # Apply RoPE
         if image_rotary_emb is not None:
             from diffusers.models.embeddings import apply_rotary_emb
-
             query = apply_rotary_emb(query, image_rotary_emb, use_real=True, use_real_unbind_dim=-2)
             key = apply_rotary_emb(key, image_rotary_emb, use_real=True, use_real_unbind_dim=-2)
 
         # Attention
         hidden_states = self.attn(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2))
-
         hidden_states = hidden_states.flatten(2, 3).type_as(query)
 
         # Output projection
@@ -269,9 +268,9 @@ class CosmosCrossAttention(nn.Module):
         self,
         query_dim: int,
         cross_attention_dim: int,
-        heads: int = 16,
+        num_heads: int = 16,
         kv_heads: int | None = None,
-        dim_head: int = 128,
+        head_dim: int = 128,
         dropout: float = 0.0,
         bias: bool = False,
         eps: float = 1e-5,
@@ -279,16 +278,16 @@ class CosmosCrossAttention(nn.Module):
     ):
         super().__init__()
 
-        self.inner_dim = out_dim if out_dim is not None else dim_head * heads
-        self.inner_kv_dim = self.inner_dim if kv_heads is None else dim_head * kv_heads
+        self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
+        self.inner_kv_dim = self.inner_dim if kv_heads is None else head_dim * kv_heads
         self.out_dim = out_dim if out_dim is not None else query_dim
-        self.heads = heads
-        self.dim_head = dim_head
+        self.num_heads = num_heads
+        self.head_dim = head_dim
         self.cross_attention_dim = cross_attention_dim
 
         # QK normalization
-        self.norm_q = RMSNorm(self.dim_head, eps=eps)
-        self.norm_k = RMSNorm(self.dim_head, eps=eps)
+        self.norm_q = RMSNorm(self.head_dim, eps=eps)
+        self.norm_k = RMSNorm(self.head_dim, eps=eps)
 
         # Query projection
         self.to_q = ReplicatedLinear(query_dim, self.inner_dim, bias=bias)
@@ -306,9 +305,9 @@ class CosmosCrossAttention(nn.Module):
         )
 
         self.attn = Attention(
-             num_heads=heads,
-             head_size=dim_head,
-             softmax_scale=1.0 / (dim_head**0.5),
+             num_heads=num_heads,
+             head_size=head_dim,
+             softmax_scale=1.0 / (head_dim**0.5),
              causal=False,
         )
 
@@ -326,19 +325,22 @@ class CosmosCrossAttention(nn.Module):
         key, _ = self.to_k(encoder_hidden_states)
         value, _ = self.to_v(encoder_hidden_states)
 
-        query = query.unflatten(2, (self.heads, -1)).transpose(1, 2)
-        key = key.unflatten(2, (self.heads, -1)).transpose(1, 2)
-        value = value.unflatten(2, (self.heads, -1)).transpose(1, 2)
+        query = query.unflatten(2, (self.num_heads, -1)).transpose(1, 2)
+        key = key.unflatten(2, (self.num_heads, -1)).transpose(1, 2)
+        value = value.unflatten(2, (self.num_heads, -1)).transpose(1, 2)
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
+        # QK normalization
+        q_shape, k_shape = query.shape, key.shape
+        query = self.norm_q(query.reshape(-1, self.head_dim)).view(q_shape)
+        key = self.norm_k(key.reshape(-1, self.head_dim)).view(k_shape)
 
+        # Apply RoPE
         if image_rotary_emb is not None:
             from diffusers.models.embeddings import apply_rotary_emb
-
             query = apply_rotary_emb(query, image_rotary_emb, use_real=True, use_real_unbind_dim=-2)
             key = apply_rotary_emb(key, image_rotary_emb, use_real=True, use_real_unbind_dim=-2)
 
+        # Attention
         hidden_states = self.attn(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2))
         hidden_states = hidden_states.flatten(2, 3).type_as(query)
 
@@ -380,8 +382,8 @@ class CosmosTransformerBlock(nn.Module):
         self.attn2 = CosmosCrossAttention(
             query_dim=hidden_size,
             cross_attention_dim=cross_attention_dim,
-            heads=num_attention_heads,
-            dim_head=attention_head_dim,            
+            num_heads=num_attention_heads,
+            head_dim=attention_head_dim,            
             dropout=0.0,
             bias=False,
             eps=1e-5,

@@ -146,23 +146,12 @@ class CosmosPredict25Pipeline(nn.Module):
 
         self.vae_scale_factor_temporal = 2 ** sum(self.vae.temperal_downsample) if getattr(self, "vae", None) else 4
         self.vae_scale_factor_spatial = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
-        self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
+        self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial, resample="bilinear")
 
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean).view(1, self.vae.config.z_dim, 1, 1, 1).float()
-            if getattr(self.vae.config, "latents_mean", None) is not None
-            else None
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).float()
-            if getattr(self.vae.config, "latents_std", None) is not None
-            else None
-        )
+        latents_mean = torch.tensor(self.vae.config.latents_mean).view(1, self.vae.config.z_dim, 1, 1, 1).float()
+        latents_std = torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).float()
         self.latents_mean = latents_mean
-        self.latents_std = latents_std
-
-        if self.latents_mean is None or self.latents_std is None:
-            raise ValueError("VAE configuration must define both `latents_mean` and `latents_std`.")
+        self.latents_std = 1.0 / latents_std
 
         transformer_config = load_transformer_config(
             model,
@@ -208,6 +197,21 @@ class CosmosPredict25Pipeline(nn.Module):
     def current_timestep(self):
         return self._current_timestep
 
+    def create_condition_mask(
+        self,
+        latent_shape: tuple,
+        device: torch.device,
+        dtype: torch.dtype,
+        num_cond_latent_frames: int | list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        bsz, C, T, H, W = latent_shape
+        cond_indicator = torch.zeros(bsz, 1, T, 1, 1, dtype=dtype, device=device)
+        if isinstance(num_cond_latent_frames, int):
+            num_cond_latent_frames = [num_cond_latent_frames] * bsz
+        for idx in range(bsz):
+            cond_indicator[idx, :, : num_cond_latent_frames[idx], :, :] = 1.0
+        cond_mask = cond_indicator.expand(-1, -1, -1, H, W)
+        return cond_indicator, cond_mask
 
     def _get_prompt_embeds(
         self,
@@ -344,59 +348,48 @@ class CosmosPredict25Pipeline(nn.Module):
                 latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
             else:
                 latents = latents.to(device=device, dtype=dtype)
-                
-            cond_mask = torch.zeros((B, 1, T, H, W), dtype=latents.dtype, device=latents.device)
-            cond_indicator = torch.zeros((B, 1, T, 1, 1), dtype=latents.dtype, device=latents.device)
 
+            cond_indicator, cond_mask = self.create_condition_mask(shape, device, dtype, 0)
             cond_latents = torch.zeros_like(latents)
 
-            return (
-                latents,
-                cond_latents,
-                cond_mask,
-                cond_indicator,
-            )
+            return latents, cond_latents, cond_mask, cond_indicator
+
         else:
             if video is None:
-                raise ValueError("`video` must be provided when `num_frames_in` is greater than 0.")            
+                raise ValueError("`video` must be provided when `num_frames_in` is greater than 0.")
             needs_preprocessing = not (isinstance(video, torch.Tensor) and video.ndim == 5 and video.shape[1] == 3)
             if needs_preprocessing:
                 video = self.video_processor.preprocess_video(video, height, width)
             video = video.to(device=device, dtype=self.vae.dtype)
+
             if isinstance(generator, list):
                 cond_latents = [
-                    retrieve_latents(self.vae.encode(video[i].unsqueeze(0)), generator=generator[i])
+                    retrieve_latents(
+                        self.vae.encode(video[i].unsqueeze(0)), generator=generator[i], sample_mode="argmax"
+                    )
                     for i in range(batch_size)
                 ]
             else:
-                cond_latents = [retrieve_latents(self.vae.encode(vid.unsqueeze(0)), generator) for vid in video]
+                cond_latents = [
+                    retrieve_latents(self.vae.encode(vid.unsqueeze(0)), generator, sample_mode="argmax")
+                    for vid in video
+                ]
 
             cond_latents = torch.cat(cond_latents, dim=0).to(dtype)
 
             latents_mean = self.latents_mean.to(device=device, dtype=dtype)
             latents_std = self.latents_std.to(device=device, dtype=dtype)
-            cond_latents = (cond_latents - latents_mean) / latents_std
+            cond_latents = (cond_latents - latents_mean) * latents_std
 
             if latents is None:
                 latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
             else:
                 latents = latents.to(device=device, dtype=dtype)
 
-            padding_shape = (B, 1, T, H, W)
-            ones_padding = latents.new_ones(padding_shape)
-            zeros_padding = latents.new_zeros(padding_shape)
-
             num_cond_latent_frames = (num_frames_in - 1) // self.vae_scale_factor_temporal + 1
-            cond_indicator = latents.new_zeros(1, 1, latents.size(2), 1, 1)
-            cond_indicator[:, :, 0:num_cond_latent_frames] = 1.0
-            cond_mask = cond_indicator * ones_padding + (1 - cond_indicator) * zeros_padding
+            cond_indicator, cond_mask = self.create_condition_mask(shape, device, dtype, num_cond_latent_frames)
 
-            return (
-                latents,
-                cond_latents,
-                cond_mask,
-                cond_indicator,
-            )
+            return latents, cond_latents, cond_mask, cond_indicator
 
     def check_inputs(
         self,
@@ -451,10 +444,9 @@ class CosmosPredict25Pipeline(nn.Module):
         image: torch.Tensor | None = None,
         video: torch.Tensor | None = None,
         num_latent_conditional_frames: int = 2,
-        conditional_frame_timestep: float = 0.1,                
+        conditional_frame_timestep: float = 0.0001,
         **kwargs,
     ) -> DiffusionOutput:
-        # Enforce safety checker requirement (NVIDIA Open Model License Agreement)
         if self.safety_checker is None:
             raise ValueError(
                 f"You have disabled the safety checker for {self.__class__}. This is in violation of the "
@@ -464,7 +456,9 @@ class CosmosPredict25Pipeline(nn.Module):
 
         extra = getattr(req.sampling_params, "extra_args", {}) or {}
         image = extra.get("image", image)
-        video = extra.get("video", video)        
+        video = extra.get("video", video)
+        num_latent_conditional_frames = extra.get("num_latent_conditional_frames", num_latent_conditional_frames)
+        conditional_frame_timestep = extra.get("conditional_frame_timestep", conditional_frame_timestep)        
 
         if image is not None and video is not None:
             raise ValueError("image and video cannot be provided simultaneously")
@@ -476,10 +470,10 @@ class CosmosPredict25Pipeline(nn.Module):
             raise ValueError("Prompt or prompt_embeds is required for Cosmos Predict 2.5 generation.")
 
         device = self.device
+        dtype = self.transformer.dtype if self.transformer is not None else self.text_encoder.dtype
 
-        # Check text safety before generation (required by NVIDIA Open Model License Agreement)
-        if self.safety_checker is not None:
-            self.safety_checker.to(device, dtype=torch.float32)
+        if isinstance(self.safety_checker, CosmosSafetyChecker):
+            self.safety_checker.to(device, dtype=dtype)
             if prompt is not None:
                 prompt_list = [prompt] if isinstance(prompt, str) else prompt
                 for p in prompt_list:
@@ -516,10 +510,6 @@ class CosmosPredict25Pipeline(nn.Module):
             negative_prompt_embeds=negative_prompt_embeds,
         )
 
-        transformer_dtype = self.transformer.dtype
-        vae_dtype = self.vae.dtype
-        dtype = self.transformer.dtype if self.transformer is not None else self.text_encoder.dtype
-
         if num_frames % self.vae_scale_factor_temporal != 1:
             num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
         num_frames = max(num_frames, 1)
@@ -551,19 +541,17 @@ class CosmosPredict25Pipeline(nn.Module):
 
         batch_size = prompt_embeds.shape[0]
 
-        num_frames_in = None
-        if image is not None:
-            if batch_size != 1:
-                raise ValueError(f"batch_size must be 1 for image input (given {batch_size})")
+        is_image = image is not None
+        is_video = video is not None
 
+        if is_image:
             image = torchvision.transforms.functional.to_tensor(image).unsqueeze(0)
             video = torch.cat([image, torch.zeros_like(image).repeat(num_frames - 1, 1, 1, 1)], dim=0)
             video = video.unsqueeze(0)
+            video = self.video_processor.preprocess_video(video, height, width)
             num_frames_in = 1
-        elif video is None:
-            video = torch.zeros(batch_size, num_frames, 3, height, width, dtype=torch.uint8)
-            num_frames_in = 0
-        else:
+
+        elif is_video:
             if batch_size != 1:
                 raise ValueError(f"batch_size must be 1 for video input (given {batch_size})")
 
@@ -572,36 +560,34 @@ class CosmosPredict25Pipeline(nn.Module):
                     f"num_latent_conditional_frames must be 1 or 2, but got {num_latent_conditional_frames}"
                 )
 
+            needs_preprocessing = not (isinstance(video, torch.Tensor) and video.ndim == 5 and video.shape[1] == 3)
+            if needs_preprocessing:
+                video = self.video_processor.preprocess_video(video, height, width)
+
             frames_to_extract = 4 * (num_latent_conditional_frames - 1) + 1
-
-            total_input_frames = len(video)
-
+            total_input_frames = video.shape[2]
             if total_input_frames < frames_to_extract:
                 raise ValueError(
                     f"Input video has only {total_input_frames} frames but Video2World requires at least "
                     f"{frames_to_extract} frames for conditioning."
                 )
 
+            video = video[:, :, -frames_to_extract:, :, :]
+            if video.shape[2] < num_frames:
+                n_pad_frames = num_frames - video.shape[2]
+                last_frame = video[:, :, -1:, :, :]
+                pad_frames = last_frame.repeat(1, 1, n_pad_frames, 1, 1)
+                video = torch.cat((video, pad_frames), dim=2)
+
             num_frames_in = frames_to_extract
 
-        assert video is not None
-        video = self.video_processor.preprocess_video(video, height, width)
-
-        # For Video2World: extract last frames_to_extract frames from input, then pad
-        if image is None and num_frames_in > 0 and num_frames_in < video.shape[2]:
-            video = video[:, :, -num_frames_in:, :, :]
+        else:
+            video = torch.zeros(batch_size, 3, num_frames, height, width, dtype=torch.uint8)
+            num_frames_in = 0
 
         num_frames_out = num_frames
-
-        if video.shape[2] < num_frames_out:
-            n_pad_frames = num_frames_out - video.shape[2]
-            last_frame = video[:, :, -1:, :, :]  # [B, C, T==1, H, W]
-            pad_frames = last_frame.repeat(1, 1, n_pad_frames, 1, 1)  # [B, C, T, H, W]
-            video = torch.cat((video, pad_frames), dim=2)
-
         assert num_frames_in <= num_frames_out, f"expected ({num_frames_in=}) <= ({num_frames_out=})"
-
-        video = video.to(device=device, dtype=vae_dtype)
+        video = video.to(device=device, dtype=self.vae.dtype)
                            
         num_channels_latents = self.transformer.config.in_channels - 1
         latents, cond_latent, cond_mask, cond_indicator = self.prepare_latents(
@@ -618,10 +604,8 @@ class CosmosPredict25Pipeline(nn.Module):
             latents=req.sampling_params.latents,
         )
 
-        cond_timestep = torch.ones_like(cond_indicator) * conditional_frame_timestep
-        cond_mask = cond_mask.to(transformer_dtype)
-
-        padding_mask = latents.new_zeros(1, 1, height, width, dtype=transformer_dtype)
+        padding_mask = latents.new_zeros(1, 1, height, width, dtype=dtype)
+        cond_mask = cond_mask.to(dtype)
 
         # Timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -633,15 +617,18 @@ class CosmosPredict25Pipeline(nn.Module):
         for i, t in enumerate(timesteps):
             self._current_timestep = t
 
-            sigma_t = (
-                torch.tensor(self.scheduler.sigmas[i].item())
-                .unsqueeze(0)
-                .to(device=self.device, dtype=transformer_dtype)
-            )
+            sigma_t = self.scheduler.sigmas[i].expand(batch_size).to(device=device, dtype=torch.float32)
 
+            if conditional_frame_timestep >= 0:
+                in_timestep = cond_indicator * conditional_frame_timestep + (1 - cond_indicator) * sigma_t.view(
+                    batch_size, 1, 1, 1, 1
+                )
+            else:
+                in_timestep = sigma_t
+            
             in_latents = cond_mask * cond_latent + (1 - cond_mask) * latents
-            in_latents = in_latents.to(transformer_dtype)
-            in_timestep = cond_indicator * cond_timestep + (1 - cond_indicator) * sigma_t
+            in_latents = in_latents.to(dtype)
+
             noise_pred = self.transformer(
                 hidden_states=in_latents,
                 condition_mask=cond_mask,
@@ -679,22 +666,19 @@ class CosmosPredict25Pipeline(nn.Module):
         else:
             latents_mean = self.latents_mean.to(latents.device, latents.dtype)
             latents_std = self.latents_std.to(latents.device, latents.dtype)
-            latents = latents * latents_std + latents_mean
+            latents = latents / latents_std + latents_mean
             video = self.vae.decode(latents.to(self.vae.dtype), return_dict=False)[0]
 
-            # Check video safety after decode (required by NVIDIA Open Model License Agreement)
-            assert self.safety_checker is not None
-
-            self.safety_checker.to(device)
-            video_np = self.video_processor.postprocess_video(video, output_type="np")
-            video_np = (video_np * 255).astype(np.uint8)
-            video_batch = []
-            for vid in video_np:
-                vid = self.safety_checker.check_video_safety(vid)
-                video_batch.append(vid)
-
-            video = np.stack(video_batch).astype(np.float32) / 255.0 * 2 - 1
-            video = torch.from_numpy(video).permute(0, 4, 1, 2, 3).to(device)
+            if isinstance(self.safety_checker, CosmosSafetyChecker):
+                self.safety_checker.to(device, dtype=torch.float32)
+                video_np = self.video_processor.postprocess_video(video, output_type="np")
+                video_np = (video_np * 255).astype(np.uint8)
+                video_batch = []
+                for vid in video_np:
+                    vid = self.safety_checker.check_video_safety(vid)
+                    video_batch.append(vid)
+                video = np.stack(video_batch).astype(np.float32) / 255.0 * 2 - 1
+                video = torch.from_numpy(video).permute(0, 4, 1, 2, 3).to(device)
 
         return DiffusionOutput(output=video)
 
