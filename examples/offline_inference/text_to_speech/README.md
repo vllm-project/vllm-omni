@@ -73,13 +73,15 @@ python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
 ```
 
 ### Voice cloning
-Pass a reference audio. Note that CosyVoice3's `--prompt-text` is a system-style prompt for the GPT stage, not a reference transcript:
+If `--ref-audio` is omitted, the script downloads the upstream
+[`zero_shot_prompt.wav`](https://github.com/FunAudioLLM/CosyVoice/blob/main/asset/zero_shot_prompt.wav) from the CosyVoice repo into the current directory.
+To use your own clip, pass `--ref-audio /path/to/reference.wav`, and modify `--prompt-text` correspondingly.
 ```bash
 python examples/offline_inference/text_to_speech/cosyvoice3/end2end.py \
     --model pretrained_models/Fun-CosyVoice3-0.5B \
     --tokenizer pretrained_models/Fun-CosyVoice3-0.5B/CosyVoice-BlankEN \
-    --ref-audio prompt.wav \
-    --prompt-text "You are a helpful assistant.<|endofprompt|>Testing my voices. Why should I not?"
+    --ref-audio /path/to/reference.wav \
+    --prompt-text "You are a helpful assistant.<|endofprompt|>Trascript in your ref audio clip"
 ```
 
 ### Streaming
@@ -317,44 +319,39 @@ pip install voxcpm soundfile
 export VLLM_OMNI_VOXCPM_CODE_PATH=/path/to/VoxCPM/src
 ```
 
-If the native VoxCPM `config.json` does not contain HF metadata such as `model_type`, prepare a persistent HF-compatible config directory and point the stage configs to it via `VLLM_OMNI_VOXCPM_HF_CONFIG_PATH`:
-
-```bash
-export VOXCPM_MODEL=/path/to/voxcpm-model
-export VLLM_OMNI_VOXCPM_HF_CONFIG_PATH=/tmp/voxcpm_hf_config
-mkdir -p "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH"
-cp "$VOXCPM_MODEL/config.json" "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH/config.json"
-cp "$VOXCPM_MODEL/generation_config.json" "$VLLM_OMNI_VOXCPM_HF_CONFIG_PATH/generation_config.json" 2>/dev/null || true
-python3 -c 'import json, os; p=os.path.join(os.environ["VLLM_OMNI_VOXCPM_HF_CONFIG_PATH"], "config.json"); cfg=json.load(open(p, "r", encoding="utf-8")); cfg["model_type"]="voxcpm"; cfg.setdefault("architectures", ["VoxCPMForConditionalGeneration"]); json.dump(cfg, open(p, "w", encoding="utf-8"), indent=2, ensure_ascii=False)'
-```
-
 ### Quick start
 ```bash
 python examples/offline_inference/text_to_speech/voxcpm/end2end.py \
-    --model "$VOXCPM_MODEL" \
+    --model openbmb/VoxCPM-0.5B \
     --text "This is a split-stage VoxCPM synthesis example running on vLLM Omni."
 ```
 
 ### Voice cloning
 ```bash
 python examples/offline_inference/text_to_speech/voxcpm/end2end.py \
-    --model "$VOXCPM_MODEL" \
+    --model openbmb/VoxCPM-0.5B \
     --text "This sentence is synthesized with a cloned voice." \
     --ref-audio /path/to/reference.wav \
     --ref-text  "The exact transcript spoken in reference.wav."
 ```
 
 ### Streaming
-Pass the async-chunk stage config:
+Pass `--streaming` together with the legacy async-chunk stage config:
 ```bash
 python examples/offline_inference/text_to_speech/voxcpm/end2end.py \
-    --model "$VOXCPM_MODEL" \
+    --model openbmb/VoxCPM-0.5B \
+    --streaming \
     --stage-configs-path vllm_omni/model_executor/stage_configs/voxcpm_async_chunk.yaml \
     --text "This is a split-stage VoxCPM streaming example running on vLLM Omni."
 ```
 
+### Persistent HF config (optional)
+The engine auto-patches a missing `model_type` in the checkpoint's `config.json` in-memory at startup (see `vllm_omni/engine/arg_utils.py`), so no manual setup is required.
+
+If you'd rather maintain a persistent patched config dir (e.g. to share across runs or to add fields the auto-patcher doesn't set), export `VLLM_OMNI_VOXCPM_HF_CONFIG_PATH` to its location — both the bundled deploy and async-chunk yamls read it via `${oc.env:VLLM_OMNI_VOXCPM_HF_CONFIG_PATH,}`.
+
 ### Notes
-- `voxcpm.yaml` is the default non-streaming stage config; `voxcpm_async_chunk.yaml` enables streaming.
+- Non-streaming auto-loads `vllm_omni/deploy/voxcpm.yaml` from the model directory name / HF `model_type`. Streaming uses the legacy `voxcpm_async_chunk.yaml` passed via `--stage-configs-path`.
 - Streaming is currently single-request oriented.
 - `--ref-text` must be the real transcript of `--ref-audio`; mismatched text degrades quality.
 - For online serving, see the [VoxCPM section in the online hub](../../online_serving/text_to_speech/README.md#voxcpm). For benchmark reporting, see [`benchmarks/voxcpm`](../../../benchmarks/voxcpm/README.md).
