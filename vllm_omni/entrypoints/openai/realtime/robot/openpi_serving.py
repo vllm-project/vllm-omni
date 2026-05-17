@@ -3,8 +3,8 @@
 
 """Serving layer for robot policy inference via `/v1/realtime/robot/openpi`.
 
-Flow: raw obs → `DiffusionEngine.step()` → actions.
-DreamZero owns dataset transforms inside the diffusion pipeline.
+Flow: raw obs → engine request → actions.
+The loaded policy model owns dataset transforms inside its pipeline.
 """
 
 from __future__ import annotations
@@ -117,7 +117,7 @@ class ServingRealtimeRobotOpenPI:
     def reset(self, obs: dict) -> None:
         """Reset serving state.
 
-        Engine-side DreamZero state is reset on the next inference request via
+        Engine-side policy state is reset on the next inference request via
         `extra_args["reset"]`, not by an immediate websocket-side RPC.
         """
         self._call_count = 0
@@ -162,7 +162,7 @@ class ServingRealtimeRobotOpenPI:
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
         # `_call_count` is reset by websocket reset/session switches, then
-        # incremented before this request is built. DreamZero pipeline consumes
+        # incremented before this request is built. The policy pipeline consumes
         # this flag and clears its frame buffer / KV cache before accumulation.
         extra_args = {
             "reset": self._call_count <= 1,

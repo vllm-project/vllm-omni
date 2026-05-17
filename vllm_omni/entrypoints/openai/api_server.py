@@ -1415,7 +1415,7 @@ async def realtime_websocket(websocket: WebSocket):
 async def realtime_robot_openpi(websocket: WebSocket):
     """WebSocket endpoint for robot policy inference (OpenPI protocol).
 
-    Binary frames: msgpack observation/action (DreamZero/OpenPI compatible).
+    Binary frames: msgpack observation/action (OpenPI compatible).
     Text frames: JSON control events (session.update, etc.).
     See realtime.robot.openpi_connection.py for protocol details.
     """

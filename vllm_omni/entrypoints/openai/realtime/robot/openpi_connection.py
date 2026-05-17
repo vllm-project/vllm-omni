@@ -3,7 +3,7 @@
 
 """WebSocket connection for robot policy inference (OpenPI protocol).
 
-Protocol (compatible with DreamZero test_client_AR.py):
+Protocol (compatible with OpenPI policy clients):
     Connect  -> server sends msgpack(PolicyServerConfig fields)
     Infer    -> client sends msgpack(obs), server sends msgpack(ndarray)
     Reset    -> client sends msgpack({endpoint:reset}), server sends "reset successful"
@@ -69,7 +69,7 @@ class RobotRealtimeConnection:
         return obs
 
     async def handle_connection(self) -> None:
-        """Main loop. Matches DreamZero policy_server.py._handler."""
+        """Main loop for OpenPI-compatible policy serving."""
         await self.websocket.accept()
 
         try:
