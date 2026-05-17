@@ -123,6 +123,29 @@ def test_handle_connection_returns_structured_error_for_invalid_payload(monkeypa
     serving.reset.assert_not_called()
 
 
+def test_handle_connection_rejects_oversized_payload_before_unpack(monkeypatch):
+    unpack_mock = MagicMock(side_effect=AssertionError("_unpack should not be called"))
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    monkeypatch.setattr(openpi_connection, "_unpack", unpack_mock)
+    monkeypatch.setattr(openpi_connection, "MAX_OPENPI_PAYLOAD_BYTES", 4)
+
+    websocket = FakeWebSocket(
+        [
+            {"type": "websocket.receive", "bytes": b"too-large"},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+    serving = MagicMock()
+    connection = openpi_connection.RobotRealtimeConnection(websocket, serving)
+
+    asyncio.run(connection.handle_connection())
+
+    assert websocket.sent_bytes[1] == {"type": "error", "message": "Invalid request payload"}
+    unpack_mock.assert_not_called()
+    serving.infer.assert_not_called()
+    serving.reset.assert_not_called()
+
+
 def test_handle_connection_returns_structured_error_for_infer_exception(monkeypatch):
     monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
     monkeypatch.setattr(

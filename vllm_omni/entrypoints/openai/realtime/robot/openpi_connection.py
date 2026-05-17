@@ -24,6 +24,7 @@ from vllm_omni.entrypoints.openai.realtime.robot.openpi_serving import (
 
 logger = init_logger(__name__)
 _DEFAULT_IDLE_TIMEOUT = 30.0
+MAX_OPENPI_PAYLOAD_BYTES = 64 * 1024 * 1024
 
 
 def _get_msgpack_numpy() -> Any:
@@ -69,6 +70,8 @@ class RobotRealtimeConnection:
         await self.websocket.send_bytes(_pack({"type": "error", "message": message}))
 
     def _unpack_request(self, data: bytes) -> dict[str, Any]:
+        if len(data) > MAX_OPENPI_PAYLOAD_BYTES:
+            raise ValueError("OpenPI request payload too large")
         obs = _unpack(data)
         if not isinstance(obs, dict):
             raise ValueError("Invalid request payload")
