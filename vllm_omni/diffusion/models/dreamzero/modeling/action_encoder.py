@@ -35,7 +35,7 @@ class SinusoidalPositionalEncoding(nn.Module):
 class CategorySpecificLinear(nn.Module):
     """Per-category linear: W[cat_id] @ x + b[cat_id]
 
-    Params:
+    Attributes:
         W: (num_categories, input_dim, hidden_dim)  — note: 0.02 * randn init
         b: (num_categories, hidden_dim)              — zero init
     """
