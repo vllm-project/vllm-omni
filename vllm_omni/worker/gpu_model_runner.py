@@ -1,3 +1,5 @@
+import contextlib
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -17,6 +19,11 @@ from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
+from vllm.v1.spec_decode.ngram_proposer_gpu import (
+    update_ngram_gpu_tensors_incremental,
+    update_scheduler_for_invalid_drafts,
+)
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
@@ -249,7 +256,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 mrope_pos_ptr += completion_part_len
 
-    def _update_states(self, scheduler_output: "SchedulerOutput"):
+    def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler
         output.
 
@@ -264,6 +271,14 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.omni_prefix_cache.reset_prefix_cached_new_req_ids()
 
         # Remove finished requests from the cached states.
+        # cleanup_finished_request lives on OmniConnectorModelRunnerMixin and
+        # is only safe to call once init_omni_connectors() has populated the
+        # mixin state. Archs that inherit the method via MRO without running
+        # that init must be skipped, so probe a mixin-owned attribute as the
+        # "state initialized" gate.
+        cleanup_finished_request = (
+            getattr(self, "cleanup_finished_request", None) if hasattr(self, "_request_ids_mapping") else None
+        )
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.model_intermediate_buffer.pop(req_id, None)
@@ -272,9 +287,10 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self._downstream_payload_cache.pop(req_id, None)
             if hasattr(self, "_talker_mtp_generators"):
                 self._talker_mtp_generators.pop(req_id, None)
+            if cleanup_finished_request is not None:
+                cleanup_finished_request(req_id)
 
-        if hasattr(self, "late_interaction_runner"):
-            self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
+        self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -315,8 +331,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         for req_id in unscheduled_req_ids:
             self.input_batch.remove_request(req_id)
 
-        if self.use_async_spec_decode:
-            self.prev_num_draft_tokens.np.fill(0)
+        is_ngram_gpu = self.speculative_config is not None and self.speculative_config.use_ngram_gpu()
+        if is_ngram_gpu:
+            ngram_gpu_new_reqs: list[CachedRequestState] = []
 
         reqs_to_add: list[CachedRequestState] = []
         deferred_spec_decode_corrections = []
@@ -368,8 +385,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
-            if hasattr(self, "late_interaction_runner"):
-                self.late_interaction_runner.register_request(req_id, pooling_params)
+            self.late_interaction_runner.register_request(req_id, pooling_params)
 
             # If prompt embeddings are provided, decode and attach to inter_data
             try:
@@ -418,11 +434,29 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self._init_xdrope_positions(req_state)
 
             reqs_to_add.append(self.requests[req_id])
+            # Track new requests for ngram_gpu full tensor copy
+            if is_ngram_gpu:
+                ngram_gpu_new_reqs.append(req_state)
 
         # Update the states of the running/resumed requests.
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+
+        # Save scheduler-allocated spec lengths before trimming so
+        # prev_num_draft_len keeps the optimistic count for rejection correction.
+        original_num_spec_per_req: dict[str, int] = {}
+        if self.speculative_config is not None and self.speculative_config.use_ngram_gpu():
+            for req_id, toks in scheduled_spec_tokens.items():
+                original_num_spec_per_req[req_id] = len(toks)
+            update_scheduler_for_invalid_drafts(
+                self._num_valid_draft_tokens_event,
+                self._num_valid_draft_tokens_cpu,
+                scheduler_output,
+                self.input_batch.req_id_to_index,
+            )
+        if self.use_async_spec_decode:
+            self.prev_num_draft_tokens.np.fill(0)
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
@@ -461,6 +495,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                     )
                     if prev_req_index is not None:
                         self.prev_num_draft_tokens.np[prev_req_index] = optimistic_num_accepted
+
+                    if is_ngram_gpu and optimistic_num_accepted > 0:
+                        self.input_batch.num_tokens_no_spec[req_index] += optimistic_num_accepted
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
@@ -510,6 +547,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                     req_state.output_token_ids = resumed_token_ids[-num_output_tokens:]
 
                 reqs_to_add.append(req_state)
+                # Track resumed requests for ngram_gpu full tensor copy
+                if is_ngram_gpu:
+                    ngram_gpu_new_reqs.append(req_state)
                 continue
 
             # Update the persistent batch.
@@ -528,6 +568,11 @@ class OmniGPUModelRunner(GPUModelRunner):
 
             # Add spec_token_ids to token_ids_cpu.
             self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)
+            # Restore scheduler-side draft count after ngram trimming.
+            if original_num_spec_per_req:
+                orig = original_num_spec_per_req.get(req_id, 0)
+                if orig != req_state.prev_num_draft_len:
+                    req_state.prev_num_draft_len = orig
 
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
@@ -541,6 +586,18 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
+
+        # Incrementally update ngram_gpu tensors after batch is stable
+        if is_ngram_gpu:
+            update_ngram_gpu_tensors_incremental(
+                self.input_batch,
+                self.token_ids_gpu_tensor,
+                self.num_tokens_no_spec_gpu,
+                ngram_gpu_new_reqs,
+                self.device,
+                _pinned_idx_buf=self._ngram_pinned_idx_buf,
+                _pinned_val_buf=self._ngram_pinned_val_buf,
+            )
 
         if deferred_spec_decode_corrections:
 
@@ -566,6 +623,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                     if cur_req_index is None:
                         continue
                     self.input_batch.num_computed_tokens_cpu[cur_req_index] -= correction
+                    if is_ngram_gpu and correction > 0:
+                        self.input_batch.num_tokens_no_spec[cur_req_index] -= correction
+                        self.num_tokens_no_spec_gpu[cur_req_index] -= correction
 
             return correct_spec_decode_token_counts
         else:
@@ -835,7 +895,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                         device=self.device,
                     )
 
-                intermediate_tensors = self.sync_and_slice_intermediate_tensors(num_tokens_padded, None, False)
+                intermediate_tensors = self.sync_and_gather_intermediate_tensors(num_tokens_padded, None, False)
 
             if ubatch_slices_padded is not None:
                 # Adjust values to reflect a single ubatch.
@@ -889,7 +949,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             ):
                 assert isinstance(
                     self.drafter,
-                    EagleProposer | DFlashProposer | DraftModelProposer | ExtractHiddenStatesProposer,
+                    EagleProposer | DFlashProposer | DraftModelProposer | ExtractHiddenStatesProposer | Gemma4Proposer,
                 )
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.
@@ -1033,8 +1093,31 @@ class OmniGPUModelRunner(GPUModelRunner):
             req_token_spans.append((start_offset, start_offset + sched_tokens))
         return req_token_spans
 
+    def _sync_local_stage_payloads(self) -> None:
+        """Move received full-payload stage inputs into model_intermediate_buffer."""
+        cache = getattr(self, "_local_stage_payload_cache", None)
+        if not cache:
+            return
+        lock = getattr(self, "_lock", None)
+        ctx = lock if lock is not None else contextlib.nullcontext()
+        with ctx:
+            if not cache:
+                return
+            active_req_ids = set(getattr(self, "requests", {}))
+            pending = set(getattr(self, "_full_payload_pending_broadcast_req_ids", set()))
+            staged = {
+                req_id: payload
+                for req_id, payload in cache.items()
+                if req_id not in pending and req_id in active_req_ids and isinstance(payload, dict)
+            }
+            for req_id in staged:
+                cache.pop(req_id, None)
+        for req_id, payload in staged.items():
+            self._update_intermediate_buffer(req_id, payload)
+
     def _build_model_kwargs_extra(self) -> dict:
         """Build extra keyword arguments passed to the model for this step."""
+        self._sync_local_stage_payloads()
         model_kwargs_extra: dict[str, object] = {}
         try:
             buffer_map = self._gather_runtime_additional_information()
@@ -1266,7 +1349,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             intermediate_tensors = None
         else:
             assert intermediate_tensors is not None
-            intermediate_tensors = self.sync_and_slice_intermediate_tensors(
+            intermediate_tensors = self.sync_and_gather_intermediate_tensors(
                 num_input_tokens, intermediate_tensors, True
             )
 
@@ -1299,6 +1382,13 @@ class OmniGPUModelRunner(GPUModelRunner):
         if hasattr(self.model, "has_preprocess") or hasattr(self.model, "enable_update_additional_information"):
             if self.vllm_config.model_config.async_chunk:
                 self._update_additional_information(scheduler_output)
+            else:
+                # In full-payload (non-async-chunk) mode, connector-delivered
+                # stage payloads must override any earlier engine-level
+                # additional_information written by the legacy
+                # custom_process_input_func codec, so talker_preprocess reads
+                # the full thinker payload.
+                self._sync_local_stage_payloads()
 
         if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
             # Overlay custom prompt_embeds per request for the prompt portion;

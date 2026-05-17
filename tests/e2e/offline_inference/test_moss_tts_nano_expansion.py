@@ -106,18 +106,21 @@ def _build_request(
 
 def _collect_audio(omni: Omni, request: dict) -> tuple[torch.Tensor, int]:
     """Run a single request and return (waveform, sample_rate)."""
-    # Omni.generate returns list[OmniRequestOutput] by default (py_generator=False).
-    for omni_out in omni.generate(request, DEFAULT_SAMPLING):
-        mm = omni_out.multimodal_output
-        assert mm is not None, "Expected multimodal_output to be non-None"
-        audio = mm.get("audio")
-        sr = mm.get("sr")
-        assert audio is not None, "Expected 'audio' key in multimodal_output"
-        assert isinstance(audio, torch.Tensor), f"audio should be Tensor, got {type(audio)}"
-        return audio.cpu(), int(sr.item()) if sr is not None else SAMPLE_RATE
+    for stage_outputs in omni.generate(request, DEFAULT_SAMPLING):
+        req_output = stage_outputs.request_output
+        if req_output is not None:
+            mm = req_output.outputs[0].multimodal_output
+            assert mm is not None, "Expected multimodal_output to be non-None"
+            audio = mm.get("audio")
+            sr = mm.get("sr")
+            assert audio is not None, "Expected 'audio' key in multimodal_output"
+            assert isinstance(audio, torch.Tensor), f"audio should be Tensor, got {type(audio)}"
+            return audio.cpu(), int(sr.item()) if sr is not None else SAMPLE_RATE
     raise AssertionError("No stage outputs received")
 
 
+@pytest.mark.advanced_model
+@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"})
 def test_moss_tts_nano_english(omni_runner: OmniRunner, ref_audio_path) -> None:
     """English TTS produces non-empty 48 kHz stereo audio."""
@@ -129,6 +132,8 @@ def test_moss_tts_nano_english(omni_runner: OmniRunner, ref_audio_path) -> None:
     assert not torch.all(audio == 0), "Audio should not be all-zeros (silence)"
 
 
+@pytest.mark.advanced_model
+@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"})
 def test_moss_tts_nano_chinese(omni_runner: OmniRunner, ref_audio_path) -> None:
     """Chinese TTS produces non-empty audio."""
@@ -140,6 +145,8 @@ def test_moss_tts_nano_chinese(omni_runner: OmniRunner, ref_audio_path) -> None:
     assert not torch.all(audio == 0)
 
 
+@pytest.mark.advanced_model
+@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"})
 def test_moss_tts_nano_deterministic(omni_runner: OmniRunner, ref_audio_path) -> None:
     """Same seed produces identical waveforms."""
@@ -151,6 +158,8 @@ def test_moss_tts_nano_deterministic(omni_runner: OmniRunner, ref_audio_path) ->
     assert torch.allclose(audio1, audio2, atol=1e-4), "Waveforms should match with same seed"
 
 
+@pytest.mark.advanced_model
+@pytest.mark.omni
 @hardware_test(res={"cuda": "L4"})
 def test_moss_tts_nano_batch(omni_runner: OmniRunner, ref_audio_path) -> None:
     """Batch of two requests returns audio for each."""
@@ -159,11 +168,13 @@ def test_moss_tts_nano_batch(omni_runner: OmniRunner, ref_audio_path) -> None:
         _build_request("Second request.", ref_audio_path),
     ]
     results = []
-    # Single-stage pipeline: one SamplingParams object is broadcast to all prompts.
-    for omni_out in omni_runner.omni.generate(requests, DEFAULT_SAMPLING):
-        mm = omni_out.multimodal_output
-        assert mm is not None
-        results.append(mm["audio"].cpu())
+    # Single-stage model (num_stages=1): one sampling param for all requests.
+    for stage_outputs in omni_runner.omni.generate(requests, [DEFAULT_SAMPLING]):
+        req_output = stage_outputs.request_output
+        if req_output is not None:
+            mm = req_output.outputs[0].multimodal_output
+            assert mm is not None
+            results.append(mm["audio"].cpu())
 
     assert len(results) == 2, f"Expected 2 outputs, got {len(results)}"
     for i, audio in enumerate(results):

@@ -24,6 +24,17 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.messages import (
+    AbortRequestMessage,
+    AddCompanionRequestMessage,
+    CollectiveRPCRequestMessage,
+    CollectiveRPCResultMessage,
+    EngineQueueMessage,
+    ErrorMessage,
+    OutputMessage,
+    StageMetricsMessage,
+    StageSubmissionMessage,
+)
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.outputs import OmniRequestOutput
@@ -115,7 +126,7 @@ class Orchestrator:
 
     def __init__(
         self,
-        request_async_queue: janus.AsyncQueue[dict[str, Any]],
+        request_async_queue: janus.AsyncQueue[EngineQueueMessage],
         output_async_queue: janus.AsyncQueue[dict[str, Any]],
         rpc_async_queue: janus.AsyncQueue[dict[str, Any]],
         stage_pools: list[StagePool],
@@ -162,6 +173,13 @@ class Orchestrator:
             await asyncio.gather(request_task, output_task)
         except asyncio.CancelledError:
             raise
+        except EngineDeadError as e:
+            # EngineDeadError from _orchestration_loop means the diffusion
+            # engine died.  All pending requests were already notified and
+            # _shutdown_event was already set by the loop's handler.
+            # During teardown this is expected; the finally block handles
+            # proper cleanup.  Do not re-raise.
+            logger.info("[Orchestrator] Engine dead during shutdown: %s", e)
         except Exception:
             logger.exception("[Orchestrator] Fatal error in orchestrator tasks")
             raise
@@ -196,7 +214,7 @@ class Orchestrator:
         """Read messages from the main thread via request_async_queue."""
         while True:
             msg = await self.request_async_queue.get()
-            msg_type = msg.get("type")
+            msg_type = msg.type
 
             if msg_type == "add_request":
                 await self._handle_add_request(msg)
@@ -211,21 +229,28 @@ class Orchestrator:
             elif msg_type == "shutdown":
                 logger.info("[Orchestrator] Received shutdown signal")
                 self._shutdown_event.set()
+                # Pre-mark stage clients as shutting down to prevent
+                # proc_monitor daemon threads from flagging normal
+                # process exit as EngineDeadError during teardown.
+                for pool in self.stage_pools:
+                    for client in pool.clients:
+                        if hasattr(client, "_shutting_down"):
+                            client._shutting_down = True
                 self._shutdown_stages()
                 break
             else:
                 logger.warning("[Orchestrator] Unknown message type: %s", msg_type)
 
-    async def _handle_add_request(self, msg: dict[str, Any]) -> None:
+    async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
         stage_id = 0
-        request_id = msg["request_id"]
-        prompt = msg["prompt"]
-        original_prompt = msg.get("original_prompt", prompt)
-        sampling_params_list = msg["sampling_params_list"]
+        request_id = msg.request_id
+        prompt = msg.prompt
+        original_prompt = msg.original_prompt
+        sampling_params_list = msg.sampling_params_list
         if not sampling_params_list:
             raise ValueError(f"Missing sampling params for stage 0. Got {len(sampling_params_list)} stage params.")
-        final_stage_id = msg["final_stage_id"]
+        final_stage_id = msg.final_stage_id
 
         logger.debug(
             "[Orchestrator] _handle_add_request: stage=%s req=%s "
@@ -249,27 +274,27 @@ class Orchestrator:
         self.request_states[request_id] = req_state
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         req_state.stage_submit_ts[stage_id] = _time.time()
-        enqueue_ts = msg.get("enqueue_ts", 0.0)
+        enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
             req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
-        preprocess_ms = msg.get("preprocess_ms", 0.0)
+        preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
         await self.stage_pools[stage_id].submit_initial(
             request_id,
             req_state,
             prompt,
-            prompt_text=msg.get("output_prompt_text"),
+            prompt_text=msg.output_prompt_text,
         )
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
 
-    async def _handle_streaming_update(self, msg: dict[str, Any]) -> None:
+    async def _handle_streaming_update(self, msg: StageSubmissionMessage) -> None:
         """Handle a streaming_update message for an existing request."""
         stage_id = 0
-        request_id = msg["request_id"]
-        request = msg["prompt"]
+        request_id = msg.request_id
+        request = msg.prompt
 
         req_state = self.request_states.get(request_id)
         if req_state is None:
@@ -277,13 +302,22 @@ class Orchestrator:
                 "[Orchestrator] streaming_update for unknown req=%s, falling back to add_request",
                 request_id,
             )
-            fallback_msg = dict(msg)
-            fallback_msg["type"] = "add_request"
+            fallback_msg = StageSubmissionMessage(
+                type="add_request",
+                request_id=msg.request_id,
+                prompt=msg.prompt,
+                original_prompt=msg.original_prompt,
+                output_prompt_text=msg.output_prompt_text,
+                sampling_params_list=msg.sampling_params_list,
+                final_stage_id=msg.final_stage_id,
+                preprocess_ms=msg.preprocess_ms,
+                enqueue_ts=msg.enqueue_ts,
+            )
             await self._handle_add_request(fallback_msg)
             return
 
-        if "sampling_params_list" in msg and msg["sampling_params_list"]:
-            req_state.sampling_params_list = msg["sampling_params_list"]
+        if msg.sampling_params_list:
+            req_state.sampling_params_list = msg.sampling_params_list
 
         req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()
@@ -291,16 +325,16 @@ class Orchestrator:
             request_id,
             req_state,
             request,
-            prompt_text=msg.get("output_prompt_text"),
+            prompt_text=msg.output_prompt_text,
         )
 
-    async def _handle_add_companion(self, msg: dict[str, Any]) -> None:
+    async def _handle_add_companion(self, msg: AddCompanionRequestMessage) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
-        companion_id = msg["companion_id"]
-        parent_id = msg["parent_id"]
-        role = msg["role"]
-        companion_prompt = msg["prompt"]
-        sampling_params_list = msg["sampling_params_list"]
+        companion_id = msg.companion_id
+        parent_id = msg.parent_id
+        role = msg.role
+        companion_prompt = msg.prompt
+        sampling_params_list = msg.sampling_params_list
 
         parent_state = self.request_states.get(parent_id)
         if parent_state is None:
@@ -326,7 +360,7 @@ class Orchestrator:
             companion_id,
             companion_state,
             companion_prompt,
-            prompt_text=msg.get("companion_prompt_text"),
+            prompt_text=msg.companion_prompt_text,
             affinity_request_id=parent_id,
         )
 
@@ -338,9 +372,9 @@ class Orchestrator:
             companion_replica_id,
         )
 
-    async def _handle_abort(self, msg: dict[str, Any]) -> None:
+    async def _handle_abort(self, msg: AbortRequestMessage) -> None:
         """Handle an abort message from the main thread."""
-        request_ids = msg["request_ids"]
+        request_ids = msg.request_ids
         await self._cleanup_request_ids(
             self._cfg_tracker.abort_parents(request_ids),
             abort=True,
@@ -359,14 +393,14 @@ class Orchestrator:
         for pool in self.stage_pools:
             pool.release_bindings(request_ids)
 
-    async def _handle_collective_rpc(self, msg: dict[str, Any]) -> None:
+    async def _handle_collective_rpc(self, msg: CollectiveRPCRequestMessage) -> None:
         """Handle a control-plane RPC request from the main thread."""
-        rpc_id = msg["rpc_id"]
-        method = msg["method"]
-        timeout = msg.get("timeout")
-        args = tuple(msg.get("args", ()))
-        kwargs = dict(msg.get("kwargs") or {})
-        requested_stage_ids = msg.get("stage_ids")
+        rpc_id = msg.rpc_id
+        method = msg.method
+        timeout = msg.timeout
+        args = tuple(msg.args)
+        kwargs = dict(msg.kwargs or {})
+        requested_stage_ids = msg.stage_ids
 
         target_pools: list[StagePool] = []
         if requested_stage_ids is None:
@@ -393,13 +427,12 @@ class Orchestrator:
                 results.append(stage_result)
 
         await self.rpc_async_queue.put(
-            {
-                "type": "collective_rpc_result",
-                "rpc_id": rpc_id,
-                "method": method,
-                "stage_ids": stage_ids,
-                "results": results,
-            }
+            CollectiveRPCResultMessage(
+                rpc_id=rpc_id,
+                method=method,
+                stage_ids=stage_ids,
+                results=results,
+            )
         )
 
     # ---- Orchestration loop ----
@@ -469,13 +502,12 @@ class Orchestrator:
                             for req_id, req_state in list(self.request_states.items()):
                                 if stage_id in req_state.stage_submit_ts:
                                     await self.output_async_queue.put(
-                                        {
-                                            "type": "error",
-                                            "error": str(e),
-                                            "fatal": True,
-                                            "request_id": req_id,
-                                            "stage_id": stage_id,
-                                        }
+                                        ErrorMessage(
+                                            error=str(e),
+                                            fatal=True,
+                                            request_id=req_id,
+                                            stage_id=stage_id,
+                                        )
                                     )
                                     self.request_states.pop(req_id, None)
                             self._shutdown_event.set()
@@ -534,12 +566,11 @@ class Orchestrator:
         else:
             parent_id = output.request_id
         await self.output_async_queue.put(
-            {
-                "type": "error",
-                "request_id": parent_id,
-                "stage_id": stage_id,
-                "error": output.error,
-            }
+            ErrorMessage(
+                request_id=parent_id,
+                stage_id=stage_id,
+                error=output.error,
+            )
         )
         await self._cleanup_request_ids(
             [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)],
@@ -596,25 +627,23 @@ class Orchestrator:
 
         if self.stage_pools[stage_id].final_output:
             await self.output_async_queue.put(
-                {
-                    "type": "output",
-                    "request_id": req_id,
-                    "stage_id": stage_id,
-                    "engine_outputs": output,
-                    "metrics": stage_metrics,
-                    "finished": finished and stage_id == req_state.final_stage_id,
-                    "stage_submit_ts": submit_ts,
-                }
+                OutputMessage(
+                    request_id=req_id,
+                    stage_id=stage_id,
+                    engine_outputs=output,
+                    metrics=stage_metrics,
+                    finished=finished and stage_id == req_state.final_stage_id,
+                    stage_submit_ts=submit_ts,
+                )
             )
         elif stage_metrics is not None:
             await self.output_async_queue.put(
-                {
-                    "type": "stage_metrics",
-                    "request_id": req_id,
-                    "stage_id": stage_id,
-                    "metrics": stage_metrics,
-                    "stage_submit_ts": submit_ts,
-                }
+                StageMetricsMessage(
+                    request_id=req_id,
+                    stage_id=stage_id,
+                    metrics=stage_metrics,
+                    stage_submit_ts=submit_ts,
+                )
             )
 
         if self._pd_pair is not None and finished and stage_id == self._pd_pair[0]:
@@ -813,14 +842,13 @@ class Orchestrator:
                             next_logical,
                         )
                         await self.output_async_queue.put(
-                            {
-                                "type": "output",
-                                "request_id": req_id,
-                                "stage_id": next_logical,
-                                "engine_outputs": error_output,
-                                "metrics": None,
-                                "finished": True,
-                            }
+                            OutputMessage(
+                                request_id=req_id,
+                                stage_id=next_logical,
+                                engine_outputs=error_output,
+                                metrics=None,
+                                finished=True,
+                            )
                         )
                         await self._cleanup_request_ids(
                             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
@@ -1050,16 +1078,15 @@ class Orchestrator:
                 msg = self.request_async_queue.get_nowait()
             except Exception:
                 break
-            if msg.get("type") == "add_request":
-                req_id = msg["request_id"]
+            if msg.type == "add_request":
+                req_id = msg.request_id
                 await self.output_async_queue.put(
-                    {
-                        "type": "error",
-                        "error": self._fatal_error,
-                        "fatal": True,
-                        "request_id": req_id,
-                        "stage_id": self._fatal_error_stage_id,
-                    }
+                    ErrorMessage(
+                        error=self._fatal_error,
+                        fatal=True,
+                        request_id=req_id,
+                        stage_id=self._fatal_error_stage_id,
+                    )
                 )
                 notified.add(req_id)
 
@@ -1069,13 +1096,12 @@ class Orchestrator:
         for req_id in list(self.request_states):
             if req_id not in notified:
                 await self.output_async_queue.put(
-                    {
-                        "type": "error",
-                        "error": self._fatal_error,
-                        "fatal": True,
-                        "request_id": req_id,
-                        "stage_id": self._fatal_error_stage_id,
-                    }
+                    ErrorMessage(
+                        error=self._fatal_error,
+                        fatal=True,
+                        request_id=req_id,
+                        stage_id=self._fatal_error_stage_id,
+                    )
                 )
             self.request_states.pop(req_id, None)
 

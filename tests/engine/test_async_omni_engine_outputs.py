@@ -10,6 +10,8 @@ import pytest
 from pytest_mock import MockerFixture
 
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.engine.messages import ErrorMessage, OutputMessage
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -30,14 +32,19 @@ def test_try_get_output_raises_after_orchestrator_dies(mocker: MockerFixture):
     mock_queue = mocker.MagicMock()
     # First call succeeds; second call finds the queue empty.
     mock_queue.sync_q.get.side_effect = [
-        {"type": "output", "request_id": "r1"},
+        OutputMessage(
+            request_id="r1",
+            stage_id=0,
+            engine_outputs=OmniRequestOutput(request_id="r1"),
+            finished=False,
+        ),
         queue.Empty,
     ]
 
     engine = _make_engine(mock_queue, mocker, thread_alive=True)
 
     # Collect the one buffered result.
-    assert engine.try_get_output()["request_id"] == "r1"
+    assert engine.try_get_output().request_id == "r1"
 
     # Orchestrator thread crashes between polls.
     engine.orchestrator_thread.is_alive.return_value = False
@@ -51,13 +58,18 @@ async def test_try_get_output_async_raises_after_orchestrator_dies(mocker: Mocke
     """Same scenario as above but for the async variant."""
     mock_queue = mocker.MagicMock()
     mock_queue.sync_q.get_nowait.side_effect = [
-        {"type": "output", "request_id": "r1"},
+        OutputMessage(
+            request_id="r1",
+            stage_id=0,
+            engine_outputs=OmniRequestOutput(request_id="r1"),
+            finished=False,
+        ),
         queue.Empty,
     ]
 
     engine = _make_engine(mock_queue, mocker, thread_alive=True)
 
-    assert (await engine.try_get_output_async())["request_id"] == "r1"
+    assert (await engine.try_get_output_async()).request_id == "r1"
 
     engine.orchestrator_thread.is_alive.return_value = False
 
@@ -71,7 +83,7 @@ def test_fatal_error_message_surfaces_through_try_get_output(mocker: MockerFixtu
     ``try_get_output`` must return this message so the caller
     (``OmniBase._handle_output_message``) can detect the fatal flag.
     """
-    fatal_msg = {"type": "error", "error": "Orchestrator thread crashed", "fatal": True}
+    fatal_msg = ErrorMessage(error="Orchestrator thread crashed", fatal=True)
 
     mock_queue = mocker.MagicMock()
     mock_queue.sync_q.get.return_value = fatal_msg
@@ -80,15 +92,15 @@ def test_fatal_error_message_surfaces_through_try_get_output(mocker: MockerFixtu
 
     msg = engine.try_get_output()
     assert msg is not None
-    assert msg["type"] == "error"
-    assert msg["fatal"] is True
-    assert "crashed" in msg["error"]
+    assert msg.type == "error"
+    assert msg.fatal is True
+    assert "crashed" in msg.error
 
 
 @pytest.mark.asyncio
 async def test_fatal_error_message_surfaces_through_try_get_output_async(mocker: MockerFixture):
     """Async variant of the fatal error message test."""
-    fatal_msg = {"type": "error", "error": "Orchestrator thread crashed", "fatal": True}
+    fatal_msg = ErrorMessage(error="Orchestrator thread crashed", fatal=True)
 
     mock_queue = mocker.MagicMock()
     mock_queue.sync_q.get_nowait.return_value = fatal_msg
@@ -97,5 +109,5 @@ async def test_fatal_error_message_surfaces_through_try_get_output_async(mocker:
 
     msg = await engine.try_get_output_async()
     assert msg is not None
-    assert msg["type"] == "error"
-    assert msg["fatal"] is True
+    assert msg.type == "error"
+    assert msg.fatal is True

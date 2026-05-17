@@ -473,7 +473,7 @@ class DeployConfig:
     pipeline_parallel_size: int | None = None
 
 
-_STAGE_NON_ENGINE_KEYS = frozenset(
+_STAGE_RESERVED_KEYS = frozenset(
     {
         "stage_id",
         "devices",
@@ -482,24 +482,31 @@ _STAGE_NON_ENGINE_KEYS = frozenset(
         "input_connectors",
         "default_sampling_params",
         "engine_extras",
+        "engine_args",
+        "runtime",
     }
 )
 
 # Fields on StageDeployConfig that are populated from engine_args dict
-_STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name not in _STAGE_NON_ENGINE_KEYS}
+_STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name not in _STAGE_RESERVED_KEYS}
 
 
 def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     """Parse a single stage entry from deploy YAML into StageDeployConfig."""
+    # Get the non-reserved keys for this stage
+    flat_args = {k: v for k, v in stage_data.items() if k not in _STAGE_RESERVED_KEYS}
+    runtime_cfg = dict(stage_data.get("runtime", {}))
+    devices = runtime_cfg.get("devices", stage_data.get("devices"))
+    num_replicas = runtime_cfg.get("num_replicas", stage_data.get("num_replicas", 1))
+
     if "engine_args" in stage_data:
-        runtime_cfg = dict(stage_data.get("runtime", {}))
-        engine_args = dict(stage_data["engine_args"])
-        devices = stage_data.get("runtime", {}).get("devices", stage_data.get("devices"))
-        num_replicas = runtime_cfg.get("num_replicas", stage_data.get("num_replicas", 1))
-    else:
-        engine_args = {k: v for k, v in stage_data.items() if k not in _STAGE_NON_ENGINE_KEYS and k != "stage_id"}
-        devices = stage_data.get("devices")
-        num_replicas = stage_data.get("num_replicas", stage_data.get("runtime", {}).get("num_replicas", 1))
+        for k, v in stage_data["engine_args"].items():
+            existing = flat_args.get(k)
+            # If we have multiple dictionaries, merge recursively.
+            if isinstance(v, dict) and isinstance(existing, dict):
+                flat_args[k] = _get_recursively_merged_dict(existing, v)
+            else:
+                flat_args[k] = v
 
     kwargs: dict[str, Any] = {
         "stage_id": stage_data["stage_id"],
@@ -507,13 +514,13 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
         "num_replicas": int(num_replicas),
     }
     for name, f in _STAGE_DEPLOY_FIELDS.items():
-        if name in engine_args:
-            kwargs[name] = engine_args.pop(name)
+        if name in flat_args:
+            kwargs[name] = flat_args.pop(name)
 
     kwargs["output_connectors"] = stage_data.get("output_connectors")
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
-    kwargs["engine_extras"] = engine_args
+    kwargs["engine_extras"] = flat_args
     return StageDeployConfig(**kwargs)
 
 
@@ -522,24 +529,34 @@ _DEEP_MERGE_KEYS = frozenset({"default_sampling_params", "subtalker_sampling_par
 
 def _deep_merge_stage(base: dict, overlay: dict) -> dict:
     """Deep-merge ``_DEEP_MERGE_KEYS`` so thin overlays don't drop base keys."""
-    merged = dict(base)
-    for k, v in overlay.items():
-        if k in _DEEP_MERGE_KEYS:
-            base_val = merged.get(k)
-            if isinstance(v, dict) and isinstance(base_val, dict):
-                merged[k] = {**base_val, **v}
-                continue
-            # Deep-merge key but at least one side isn't a dict: surface the
-            # silent clobber so mismatched YAML types don't get past review.
-            if base_val is not None:
+    # Deep merge _DEEP_MERGE_KEYS recursively
+    base_merge_dict = {k: v for k, v in base.items() if k in _DEEP_MERGE_KEYS}
+    overlay_merge_dict = {k: v for k, v in overlay.items() if k in _DEEP_MERGE_KEYS}
+
+    # Get the merge dict; priority is base < overlay < merged sub
+    merged_subdict = _get_recursively_merged_dict(original=base_merge_dict, update=overlay_merge_dict)
+    merged_dict = {**base, **overlay, **merged_subdict}
+    return merged_dict
+
+
+def _get_recursively_merged_dict(original: dict, update: dict) -> dict:
+    """Recursively merge two dicts, returning a new dict."""
+    merged = original.copy()
+    for k, update_v in update.items():
+        orig_v = merged.get(k)
+        if isinstance(orig_v, dict) and isinstance(update_v, dict):
+            merged[k] = _get_recursively_merged_dict(orig_v, update_v)
+        else:
+            if orig_v is not None and (isinstance(orig_v, dict) != isinstance(update_v, dict)):
                 logger.warning(
                     "Deep-merge key %r has non-dict value (base=%s, overlay=%s); "
                     "overlay will fully replace base instead of merging.",
                     k,
-                    type(base_val).__name__,
-                    type(v).__name__,
+                    type(orig_v).__name__,
+                    type(update_v).__name__,
                 )
-        merged[k] = v
+
+            merged[k] = update_v
     return merged
 
 
@@ -779,7 +796,7 @@ def _build_engine_args(
     # Per-stage StageDeployConfig values override pipeline-wide settings.
     if ds is not None:
         for k, v in asdict(ds).items():
-            if k in _STAGE_NON_ENGINE_KEYS or v is None:
+            if k in _STAGE_RESERVED_KEYS or v is None:
                 continue
             engine_args[k] = v
         engine_args.update(ds.engine_extras)
