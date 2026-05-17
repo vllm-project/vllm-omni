@@ -133,9 +133,12 @@ class OpenPIWebsocketClient:
         payload["endpoint"] = "reset"
         self._ws.send(self._packer.pack(payload))
         response = self._ws.recv()
-        if not isinstance(response, str):
-            raise RuntimeError(f"Unexpected reset response: {type(response)!r}")
-        return response
+        if isinstance(response, str):
+            return response
+        decoded = msgpack_numpy.unpackb(response)
+        if not isinstance(decoded, dict) or decoded.get("status") != "reset successful":
+            raise RuntimeError(f"Unexpected reset response: {decoded!r}")
+        return str(decoded["status"])
 
     def close(self) -> None:
         self._ws.close()
