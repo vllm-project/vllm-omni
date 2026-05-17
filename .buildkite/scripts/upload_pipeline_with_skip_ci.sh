@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
-# Evaluate docs-only skip-ci and upload continuation steps from the same `.buildkite/pipeline.yml`
+# Evaluate docs-only skip-ci and upload continuation steps from the given pipeline YAML
 # (YAML document after the first `---`). Buildkite `if` is evaluated at upload time.
+#
+# Usage: upload_pipeline_with_skip_ci.sh [pipeline_yaml]
+#   pipeline_yaml: path relative to repo root or absolute (default: .buildkite/pipeline.yml)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PIPELINE_YML="${ROOT}/.buildkite/pipeline.yml"
+PIPELINE_ARG="${1:-.buildkite/pipeline.yml}"
+if [[ "${PIPELINE_ARG}" = /* ]]; then
+  PIPELINE_YML="${PIPELINE_ARG}"
+else
+  PIPELINE_YML="${ROOT}/${PIPELINE_ARG}"
+fi
 
 # Prints a single digit to stdout: 1 = skip image CI, 0 = run. Logs go to stderr.
 is_docs_only_change() {
@@ -21,7 +29,7 @@ is_docs_only_change() {
     if [[ "${file_path}" == *.md ]]; then
       continue
     fi
-    if [[ "${file_path}" == "mkdocs.yaml" ]]; then
+    if [[ "${file_path}" == "mkdocs.yml" ]]; then
       continue
     fi
     return 1
@@ -104,12 +112,13 @@ import pathlib
 path = pathlib.Path(os.environ["PIPELINE_YML"])
 text = path.read_text(encoding="utf-8")
 sep = "\n---\n"
-if sep not in text:
-    raise SystemExit(
-        "upload_pipeline_with_skip_ci: .buildkite/pipeline.yml must contain a '\\n---\\n' separator "
-        "(document 1 = bootstrap, document 2 = uploaded steps)"
-    )
-_, continuation = text.split(sep, 1)
+# Two supported layouts:
+#   - multi-doc: doc 1 = bootstrap (loaded by Buildkite), doc 2 (after `---`) = uploaded steps.
+#   - single-doc: whole file is the uploaded steps; caller (UI init step) is the bootstrap.
+if sep in text:
+    _, continuation = text.split(sep, 1)
+else:
+    continuation = text
 
 skip = os.environ.get("SKIP_CI") == "1"
 # When docs-only skip-ci: skip default CI image, but still build for L4 nightly (PR label nightly-test or
@@ -126,7 +135,7 @@ if skip:
 else:
     rep = "'true'"
     ready_rep = "'build.branch != \"main\" && build.pull_request.labels includes \"ready\"'"
-    merge_rep = "'(build.branch == \"main\" && build.env(\"NIGHTLY\") != \"1\") || (build.branch != \"main\" && build.pull_request.labels includes \"merge-test\")'"
+    merge_rep = "'(build.branch == \"main\" && build.env(\"NIGHTLY\") != \"1\" && build.env(\"WEEKLY\") != \"1\") || (build.branch != \"main\" && build.pull_request.labels includes \"merge-test\")'"
 rendered = (
     continuation
     .replace("__IMAGE_BUILD_IF__", rep)

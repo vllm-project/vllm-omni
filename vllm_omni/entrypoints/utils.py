@@ -8,12 +8,14 @@ from typing import Any, get_args, get_origin
 
 import yaml
 from vllm.logger import init_logger
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 
 from vllm_omni.config.stage_config import StageConfigFactory
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
 from vllm_omni.entrypoints.stage_utils import _to_dict
+from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
 # Get the project root directory (2 levels up from this file)
@@ -850,3 +852,40 @@ def detect_pid_host() -> bool:
         return True
 
     return has_pid_host()
+
+
+### Helpers for handling delta messages
+def coerce_param_message_types(params: list[OmniSamplingParams], is_streaming: bool):
+    """Iterate over the sampling params and convert to the message types
+    to DELTA messages, if streaming is enabled, or FINAL_ONLY if
+    it's disabled, while respecting `.skip_clone` on the params.
+
+    This is needed to avoid emitting redundant multimodal data.
+    """
+    # Coerce vLLM's default output kinds as needed to handle streaming
+    # (i.e., DELTA output kind). Note that this is only applied to non
+    # Diffusion sampling params.
+    #
+    # NOTE: Hidden states will still be passed between stages.
+    for idx, sp in enumerate(params):
+        # For OmniDiffusionParams don't set output kind
+        if isinstance(sp, SamplingParams):
+            params[idx] = maybe_coerce_to_message_type(sp, is_streaming)
+    return params
+
+
+def maybe_coerce_to_message_type(params: SamplingParams, is_streaming: bool):
+    """If this is a CUMULATIVE message, coerce it to DELTA if streaming, otherwise FINAL_ONLY."""
+    target_type = RequestOutputKind.DELTA if is_streaming else RequestOutputKind.FINAL_ONLY
+    if params.output_kind == target_type:
+        return params
+    elif is_streaming and params.output_kind == RequestOutputKind.FINAL_ONLY:
+        logger.warning("Request appears to be streaming, but got request type final only!")
+    elif not is_streaming and params.output_kind == RequestOutputKind.DELTA:
+        logger.warning("Request appears to not be streaming, but got request type delta!")
+
+    if not params.skip_clone:
+        params = params.clone()
+        params.skip_clone = True
+    params.output_kind = target_type
+    return params

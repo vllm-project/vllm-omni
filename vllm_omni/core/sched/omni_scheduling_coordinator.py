@@ -22,6 +22,15 @@ from vllm.v1.request import Request, RequestStatus
 logger = init_logger(__name__)
 
 
+def uses_qwen3_omni_full_payload_input_coordinator(model_config: Any) -> bool:
+    return (
+        getattr(model_config, "stage_id", 0) > 0
+        and not getattr(model_config, "async_chunk", False)
+        and getattr(model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration"
+        and getattr(model_config, "model_stage", None) in {"talker", "code2wav"}
+    )
+
+
 class OmniSchedulingCoordinator:
     """Pure-scheduling coordinator for chunk and full_payload input waiting.
 
@@ -166,8 +175,10 @@ class OmniSchedulingCoordinator:
                         to_remove.append(request)
                         self._waiting_for_input.append(request)
                         self.pending_input_registrations.append(request)
-            for request in to_remove:
-                waiting_queue.remove(request)
+            if to_remove:
+                # Use the bulk-remove helper: one O(N) sweep instead of N
+                # repeated O(N) removes from a list-backed queue.
+                waiting_queue.remove_requests(to_remove)
 
     def process_pending_full_payload_inputs_legacy(
         self,
@@ -255,6 +266,30 @@ class OmniSchedulingCoordinator:
             waiting_queue.add_request(request)
         self._waiting_for_input = deque()
 
+    @staticmethod
+    def _flatten_prompt_token_ids(value: Any) -> list[int]:
+        """Normalize connector metadata into flat prompt token ids."""
+        if value is None:
+            return []
+        if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "tolist"):
+            value = value.detach().cpu().tolist()
+        elif hasattr(value, "tolist") and not isinstance(value, (list, tuple)):
+            value = value.tolist()
+
+        if isinstance(value, (list, tuple)):
+            flattened: list[int] = []
+            for item in value:
+                if hasattr(item, "detach") and hasattr(item, "cpu") and hasattr(item, "tolist"):
+                    item = item.detach().cpu().tolist()
+                elif hasattr(item, "tolist") and not isinstance(item, (list, tuple)):
+                    item = item.tolist()
+                if isinstance(item, (list, tuple)):
+                    flattened.extend(int(token_id) for token_id in item)
+                else:
+                    flattened.append(int(item))
+            return flattened
+        return [int(value)]
+
     def update_request_metadata(
         self,
         requests: dict[str, Request],
@@ -310,7 +345,7 @@ class OmniSchedulingCoordinator:
                             )
 
             if model_mode != "ar":
-                new_ids = metadata.get("code_predictor_codes", [])
+                new_ids = self._flatten_prompt_token_ids(metadata.get("code_predictor_codes"))
                 runtime_seed = None
                 if "left_context_size" in metadata:
                     runtime_seed = {
@@ -319,6 +354,10 @@ class OmniSchedulingCoordinator:
                 request._omni_initial_model_buffer = runtime_seed
                 if new_ids:
                     request.prompt_token_ids = new_ids
+                    request.num_prompt_tokens = len(new_ids)
+                    request._all_token_ids.clear()
+                    request._all_token_ids.extend(new_ids)
+                    request._output_token_ids.clear()
                     request.num_computed_tokens = 0
 
     def postprocess_scheduler_output(
@@ -374,7 +413,3 @@ class OmniSchedulingCoordinator:
         if scheduler_output.scheduled_cached_reqs:
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
                 self.requests_with_ready_chunks.discard(req_id)
-
-
-# Backward-compatible alias
-ChunkSchedulingCoordinator = OmniSchedulingCoordinator

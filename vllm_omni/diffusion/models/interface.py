@@ -59,8 +59,12 @@ class SupportsStepExecution(Protocol):
 
 
 @runtime_checkable
-class SupportsModuleOffload(Protocol):
-    """Declares which submodules participate in CPU offload.
+class SupportsComponentDiscovery(Protocol):
+    """Declares which submodules serve as pipeline components.
+
+    Used by the framework to locate DiT, encoder, and VAE modules for
+    CPU offload, HSDP sharding, and other operations that need to know
+    the pipeline's internal structure.
 
     All attribute names support dotted paths for nested submodules
     (e.g. ``"pipe.transformer"``).

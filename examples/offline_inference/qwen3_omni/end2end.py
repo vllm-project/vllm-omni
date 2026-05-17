@@ -295,7 +295,10 @@ def main(args):
     else:
         query_result = query_func()
 
-    omni = Omni.from_cli_args(args, model=model_name)
+    omni_kwargs = vars(args).copy()
+    # Override CLI --model with the derived model_name.
+    omni_kwargs["model"] = model_name
+    omni = Omni(**omni_kwargs)
 
     thinker_sampling_params = SamplingParams(
         temperature=0.9,
@@ -389,6 +392,13 @@ def main(args):
             output_wav = os.path.join(output_dir, f"output_{request_id}.wav")
 
             # Convert to numpy array and ensure correct format
+            # In async_chunk mode, audio may arrive as a list of chunks
+            if isinstance(audio_tensor, list):
+                import torch
+
+                audio_tensor = torch.cat(
+                    [(t if isinstance(t, torch.Tensor) else torch.tensor(t)).flatten() for t in audio_tensor]
+                )
             audio_numpy = audio_tensor.float().detach().cpu().numpy()
 
             # Ensure audio is 1D (flatten if needed)

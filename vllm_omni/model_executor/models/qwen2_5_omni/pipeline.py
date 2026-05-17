@@ -51,6 +51,7 @@ QWEN2_5_OMNI_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="audio",
             engine_output_type="audio",
+            custom_process_input_func=f"{_PROC}.talker2code2wav",
             sampling_constraints={"detokenize": True},
         ),
     ),

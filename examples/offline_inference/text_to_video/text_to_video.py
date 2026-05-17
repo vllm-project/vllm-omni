@@ -206,8 +206,8 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "gguf"],
-        help="Quantization method for the transformer (fp8 for online FP8 quantization).",
+        choices=["fp8", "mxfp8", "int8", "gguf"],
+        help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 online quant (NPU). fp8: online FP8 (GPU).",
     )
     parser.add_argument(
         "--use-hsdp",
@@ -226,9 +226,6 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of HSDP replica groups.",
     )
-    from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
-
-    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

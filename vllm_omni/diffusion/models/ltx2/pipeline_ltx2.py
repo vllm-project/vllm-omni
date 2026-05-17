@@ -34,7 +34,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
-from vllm_omni.diffusion.models.interface import SupportsModuleOffload
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.lora.request import LoRARequest
@@ -265,44 +265,6 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         self._num_timesteps = None
         self._current_timestep = None
 
-    @staticmethod
-    def _pack_text_embeds(
-        text_hidden_states: torch.Tensor,
-        sequence_lengths: torch.Tensor,
-        device: str | torch.device,
-        padding_side: str = "left",
-        scale_factor: int = 8,
-        eps: float = 1e-6,
-    ) -> torch.Tensor:
-        batch_size, seq_len, hidden_dim, num_layers = text_hidden_states.shape
-        original_dtype = text_hidden_states.dtype
-
-        token_indices = torch.arange(seq_len, device=device).unsqueeze(0)
-        if padding_side == "right":
-            mask = token_indices < sequence_lengths[:, None]
-        elif padding_side == "left":
-            start_indices = seq_len - sequence_lengths[:, None]
-            mask = token_indices >= start_indices
-        else:
-            raise ValueError(f"padding_side must be 'left' or 'right', got {padding_side}")
-        mask = mask[:, :, None, None]
-
-        masked_text_hidden_states = text_hidden_states.masked_fill(~mask, 0.0)
-        num_valid_positions = (sequence_lengths * hidden_dim).view(batch_size, 1, 1, 1)
-        masked_mean = masked_text_hidden_states.sum(dim=(1, 2), keepdim=True) / (num_valid_positions + eps)
-
-        x_min = text_hidden_states.masked_fill(~mask, float("inf")).amin(dim=(1, 2), keepdim=True)
-        x_max = text_hidden_states.masked_fill(~mask, float("-inf")).amax(dim=(1, 2), keepdim=True)
-
-        normalized_hidden_states = (text_hidden_states - masked_mean) / (x_max - x_min + eps)
-        normalized_hidden_states = normalized_hidden_states * scale_factor
-
-        normalized_hidden_states = normalized_hidden_states.flatten(2)
-        mask_flat = mask.squeeze(-1).expand(-1, -1, hidden_dim * num_layers)
-        normalized_hidden_states = normalized_hidden_states.masked_fill(~mask_flat, 0.0)
-        normalized_hidden_states = normalized_hidden_states.to(dtype=original_dtype)
-        return normalized_hidden_states
-
     def _get_gemma_prompt_embeds(
         self,
         prompt: str | list[str],
@@ -342,16 +304,9 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         )
         text_encoder_hidden_states = text_encoder_outputs.hidden_states
         text_encoder_hidden_states = torch.stack(text_encoder_hidden_states, dim=-1)
-        sequence_lengths = prompt_attention_mask.sum(dim=-1)
-
-        prompt_embeds = self._pack_text_embeds(
-            text_encoder_hidden_states,
-            sequence_lengths,
-            device=device,
-            padding_side=self.tokenizer.padding_side,
-            scale_factor=scale_factor,
-        )
-        prompt_embeds = prompt_embeds.to(dtype=dtype)
+        # `diffusers>=0.38` moved per_layer_masked_mean_norm inside the connector,
+        # so pack to 3D here and let the connector handle normalization.
+        prompt_embeds = text_encoder_hidden_states.flatten(2, 3).to(dtype=dtype)
 
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
@@ -893,9 +848,9 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             device=device,
         )
         # Compute positive prompt connectors
-        additive_attention_mask = (1 - prompt_attention_mask.to(prompt_embeds.dtype)) * -1000000.0
+        tokenizer_padding_side = getattr(self.tokenizer, "padding_side", "left")
         connector_prompt_embeds, connector_audio_prompt_embeds, connector_attention_mask = self.connectors(
-            prompt_embeds, additive_attention_mask, additive_mask=True
+            prompt_embeds, prompt_attention_mask, padding_side=tokenizer_padding_side
         )
 
         # Compute negative prompt connectors when CFG is enabled
@@ -903,17 +858,14 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         negative_connector_audio_prompt_embeds = None
         negative_connector_attention_mask = None
         if self.do_classifier_free_guidance:
-            negative_additive_attention_mask = (
-                1 - negative_prompt_attention_mask.to(negative_prompt_embeds.dtype)
-            ) * -1000000.0
             (
                 negative_connector_prompt_embeds,
                 negative_connector_audio_prompt_embeds,
                 negative_connector_attention_mask,
             ) = self.connectors(
                 negative_prompt_embeds,
-                negative_additive_attention_mask,
-                additive_mask=True,
+                negative_prompt_attention_mask,
+                padding_side=tokenizer_padding_side,
             )
 
         latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
@@ -1153,7 +1105,7 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         return loader.load_weights(weights)
 
 
-class LTX2TwoStagesPipeline(nn.Module, SupportsModuleOffload):
+class LTX2TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
     """LTX2TwoStagesPipeline is for two stages image to video generation"""
 
     _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]

@@ -271,6 +271,22 @@ class DiffusionLoRAManager:
 
         self._activate_adapters(adapter_ids, active_scales)
 
+    def set_active_adapter(
+        self,
+        lora_request: LoRARequest | None,
+        lora_scale: float = 1.0,
+    ) -> None:
+        """Singular compatibility wrapper around set_active_adapters().
+
+        Equivalent to set_active_adapters([lora_request], [lora_scale]).
+        Passing lora_request=None deactivates all adapters. Like the plural
+        form, each call fully replaces the active adapter set (not append).
+        """
+        if lora_request is None:
+            self.set_active_adapters([], [])
+        else:
+            self.set_active_adapters([lora_request], [lora_scale])
+
     def _touch_adapter_info(self, adapter_id):
         """Update the current caching ordering info."""
         self._adapter_access_order[adapter_id] = time.time()

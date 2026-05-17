@@ -5,6 +5,7 @@
 
 import json
 import sys
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -403,7 +404,16 @@ def build_stage_connectors(
     connectors_config: dict[str, Any],
     purpose: str = "request_forwarding",
 ) -> dict[tuple[str, str], Any] | None:
-    """Instantiate OmniConnectors for a stage based on config."""
+    """Instantiate OmniConnectors for a stage based on config.
+
+    Deprecated: prefer ``get_stage_connector_config`` plus the unified
+    connector factory. Kept as a thin shim so legacy callers keep working.
+    """
+    warnings.warn(
+        "build_stage_connectors is deprecated; use get_stage_connector_config and OmniConnectorFactory instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if not connectors_config:
         return {}
 

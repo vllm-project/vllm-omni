@@ -20,6 +20,7 @@ from vllm.multimodal.media.audio import load_audio
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 import vllm_omni
+from vllm_omni.engine.arg_utils import nullify_stage_engine_defaults
 from vllm_omni.entrypoints.omni import Omni
 
 # Imports the processor also registers itself
@@ -302,14 +303,10 @@ def main(args):
     else:
         query_result = query_func(processor)
 
-    # Initialize Omni (with thinker-only stage config)
-    omni = Omni(
-        model=MODEL_NAME,
-        stage_configs_path=args.stage_configs_path,
-        log_stats=args.log_stats,
-        init_timeout=args.init_timeout,
-        stage_init_timeout=args.stage_init_timeout,
-    )
+    omni_kwargs = vars(args).copy()
+    # override CLI --model with derived model_name
+    omni_kwargs["model"] = MODEL_NAME
+    omni = Omni(**omni_kwargs)
 
     # Thinker sampling params
     thinker_sampling_params = SamplingParams(
@@ -410,10 +407,10 @@ def parse_args():
         help="Query type.",
     )
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         type=str,
         default=None,
-        help="Path to a stage configs YAML file.",
+        help="Path to a deploy YAML; leave unset to auto-load full thinker+talker. Pass custom for text-only",
     )
     parser.add_argument(
         "--log-stats",
@@ -499,6 +496,7 @@ def parse_args():
         help="Output directory for results.",
     )
 
+    nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
 

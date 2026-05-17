@@ -496,6 +496,33 @@ def generate_synthetic_image(
     }
 
 
+_TEST_ASSETS_ROOT = Path(__file__).resolve().parents[1] / "assets"
+
+_AUDIO_MIME_BY_SUFFIX = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+}
+
+
+def get_asset_path(relative_path: str | os.PathLike) -> Path:
+    """Resolve a path under ``tests/assets/`` to its absolute on-disk location."""
+    return _TEST_ASSETS_ROOT / Path(relative_path)
+
+
+def load_test_audio_data_url(relative_path: str | os.PathLike) -> str:
+    """Load a vendored test audio file under ``tests/assets/`` as a base64 data URL.
+
+    Used by tests that need real reference audio (e.g. voice cloning) without
+    relying on the server's ability to fetch external URLs at request time.
+    """
+    path = get_asset_path(relative_path)
+    mime = _AUDIO_MIME_BY_SUFFIX.get(path.suffix.lower(), "application/octet-stream")
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
 def decode_b64_image(b64: str):
     img = Image.open(io.BytesIO(base64.b64decode(b64)))
     img.load()
@@ -653,5 +680,7 @@ __all__ = [
     "generate_synthetic_audio",
     "generate_synthetic_image",
     "generate_synthetic_video",
+    "get_asset_path",
+    "load_test_audio_data_url",
     "preprocess_text",
 ]
