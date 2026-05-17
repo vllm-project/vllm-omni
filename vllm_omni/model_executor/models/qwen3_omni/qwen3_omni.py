@@ -149,6 +149,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 dtype=torch.long,
             )
         elif self.model_stage == "talker":
+            multimodal_config.skip_mm_profiling = True
             self.has_preprocess = True
             self.has_postprocess = True
             self.set_custom_preprocess(self.talker_preprocess)
@@ -166,7 +167,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                 hf_config=talker_config,
                 architectures=["Qwen3OmniMoeTalkerForConditionalGeneration"],
             )
-            self.talker.init_multi_modal(thinker_config)
             self.model = self.talker
             self.code2wav = None
 
@@ -188,6 +188,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             }
 
         elif self.model_stage == "code2wav":
+            multimodal_config.skip_mm_profiling = True
             self.enable_update_additional_information = True
             self.thinker = None
             self.talker = None
@@ -236,14 +237,22 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         prompt_token_ids = tokenizer.encode(prompt_template)
 
+        # In non-async-chunk (full-payload) mode the engine treats each
+        # streaming TokensPrompt as a fresh decode, so mid-stream segment
+        # yields cause the thinker to emit duplicate responses and the
+        # talker to emit duplicate audio. Defer all audio to the final
+        # flush so the thinker sees one complete prompt.
+        async_chunk = getattr(model_config, "async_chunk", False)
+
         async for audio_chunk in audio_stream:
             buffer.write_audio(audio_chunk)
 
-            while (segment := buffer.read_audio()) is not None:
-                yield TokensPrompt(
-                    prompt_token_ids=prompt_token_ids,
-                    multi_modal_data={"audio": segment},
-                )
+            if async_chunk:
+                while (segment := buffer.read_audio()) is not None:
+                    yield TokensPrompt(
+                        prompt_token_ids=prompt_token_ids,
+                        multi_modal_data={"audio": segment},
+                    )
 
         remaining = buffer.flush()
         if remaining is not None and len(remaining) > 0:
@@ -280,6 +289,8 @@ class Qwen3OmniMoeForConditionalGeneration(
     ) -> torch.Tensor:
         if self.model_stage == "code2wav":
             return torch.zeros_like(input_ids).reshape(-1, 1).repeat(1, self.vllm_config.model_config.get_hidden_size())
+        if self.model_stage == "talker":
+            return self.model.embed_input_ids(input_ids)
         return self.model.embed_input_ids(
             input_ids=input_ids, multimodal_embeddings=multimodal_embeddings, is_multimodal=is_multimodal
         )
@@ -979,19 +990,10 @@ class Qwen3OmniMoeForConditionalGeneration(
         """
         embed = payload.get("embed", {})
         meta = payload.get("meta", {})
-        ids = payload.get("ids", {})
 
         cached_thinker_decode_embeds = embed.get("cached_decode", None)
         thinker_decode_embed = embed.get("decode", None)
         start_index = meta.get("num_processed_tokens", 0)
-        thinker_output_token_ids = ids.get("output", [])
-        if start_index >= len(thinker_output_token_ids) - 1:
-            # When the tokens output by the thinker are exhausted, an EOS token needs to be appended.
-            # Use the finished_flag to mark that all tokens output by thinker have been consumed.
-            if meta.get("eos_emitted", False):
-                return self.tts_pad_embed.to(device)
-            update_dict.setdefault("meta", {})["eos_emitted"] = True
-            return self.tts_eos_embed.to(device)
 
         if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
             cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(device)
@@ -1000,10 +1002,20 @@ class Qwen3OmniMoeForConditionalGeneration(
                 thinker_decode_embed = thinker_decode_embed.to(device)
                 cached_thinker_decode_embeds = torch.cat([cached_thinker_decode_embeds, thinker_decode_embed], dim=0)
                 update_dict.setdefault("embed", {})["cached_decode"] = cached_thinker_decode_embeds
-        else:
+
+        elif thinker_decode_embed is not None:
             thinker_embed = thinker_decode_embed
             if thinker_embed.device != device:
                 thinker_embed = thinker_embed.to(device)
+
+        else:
+            # When the tokens output by the thinker are exhausted, an EOS token needs to be appended.
+            # Use the finished_flag to mark that all tokens output by thinker have been consumed.
+            if meta.get("eos_emitted", False):
+                return self.tts_pad_embed.to(device)
+            update_dict.setdefault("meta", {})["eos_emitted"] = True
+            return self.tts_eos_embed.to(device)
+
         update_dict.setdefault("embed", {})["decode"] = None
         return self.talker.text_projection(thinker_embed).to(device)
 

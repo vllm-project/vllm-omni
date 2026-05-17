@@ -11,7 +11,9 @@
 ## When to use this recipe
 
 Use this recipe when you want to deploy the Wan2.2 14B image-to-video model
-with vLLM-Omni using multi-card parallelism. Two configurations are provided:
+with vLLM-Omni using multi-card parallelism. The recommended parallel strategy
+depends on the hardware backend and whether the checkpoint needs
+classifier-free guidance.
 
 1. **Distilled model (no negative-prompt / CFG computation)** — higher
    throughput, recommended when using a distilled checkpoint that does not
@@ -24,6 +26,66 @@ with vLLM-Omni using multi-card parallelism. Two configurations are provided:
 - Upstream model card: <https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B-Diffusers>
 
 ## Hardware Support
+
+## GPU
+
+### 8x NVIDIA H20 / H100 / A100
+
+#### Environment
+
+- OS: Linux
+- Python: 3.10+
+- Driver / runtime: NVIDIA driver with CUDA runtime supported by your PyTorch
+  build
+- Recommended operator library: Triton, installed through the vLLM/vLLM-Omni
+  Python environment
+- vLLM version: Match the repository requirements for your checkout
+- vLLM-Omni version or commit: Use the commit you are deploying from
+
+#### Command
+
+**Distilled model (no CFG, recommended for distilled checkpoints):**
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+vllm serve Wan-AI/Wan2.2-I2V-A14B-Diffusers \
+  --omni \
+  --use-hsdp \
+  --usp 8 \
+  --vae-patch-parallel-size 8 \
+  --vae-use-tiling
+```
+
+**Official open-source model (with CFG):**
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+vllm serve Wan-AI/Wan2.2-I2V-A14B-Diffusers \
+  --omni \
+  --use-hsdp \
+  --cfg-parallel-size 2 \
+  --usp 4 \
+  --vae-patch-parallel-size 8 \
+  --vae-use-tiling
+```
+
+The official model benefits from splitting the positive and negative CFG
+branches with `--cfg-parallel-size 2`, while keeping Ulysses sequence
+parallelism at `--usp 4` so the two CFG branches cover all 8 GPUs.
+
+#### Performance Notes
+
+- `--use-hsdp` is recommended for memory efficiency on the 14B DiT backbone.
+- `--vae-patch-parallel-size 8` is recommended for the standard 8-card setup;
+  disabling VAE patch parallelism can significantly increase VAE latency.
+- The CUDA Triton fused AdaLayerNorm path is not available in the current
+  release. The `VLLM_OMNI_ENABLE_TRITON_ADALN` toggle is reserved for that
+  future implementation and should not be used until the kernel lands.
+- In an 8x NVIDIA H20 test with the official model, `num_inference_steps=4`,
+  `flow_shift=12.0`, `--use-hsdp`, `--cfg-parallel-size 2`, `--usp 4`, and
+  `--vae-patch-parallel-size 8`, an internal Triton AdaLayerNorm prototype
+  reduced the measured diffusion stage by about `65 ms` at
+  `832x480, 81 frames` and about `741 ms` at `1280x720, 121 frames`.
 
 ## NPU
 

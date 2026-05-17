@@ -70,6 +70,27 @@ def get_supported_speakers_from_hf_config(hf_config: Any) -> set[str]:
     return set()
 
 
+def resolve_diffusion_od_config(engine_client: Any, diffusion_engine: Any = None) -> Any:
+    """Resolve the OmniDiffusionConfig from the engine or diffusion engine."""
+    od_config = None
+    if hasattr(engine_client, "get_diffusion_od_config"):
+        od_config = engine_client.get_diffusion_od_config()
+    if od_config is None and diffusion_engine is not None:
+        if hasattr(diffusion_engine, "get_diffusion_od_config"):
+            od_config = diffusion_engine.get_diffusion_od_config()
+        else:
+            od_config = getattr(diffusion_engine, "od_config", None)
+    return od_config
+
+
+def is_single_stage_diffusion(engine_client: Any) -> bool:
+    """Return True if the engine is a single-stage diffusion pipeline."""
+    stage_configs = getattr(engine_client, "stage_configs", None) or []
+    if len(stage_configs) != 1:
+        return False
+    return getattr(stage_configs[0], "stage_type", None) in ("diffusion", "DIFFUSION")
+
+
 def validate_requested_speaker(speaker: str | None, supported_speakers: set[str]) -> str | None:
     """Normalize and validate an optional speaker value.
 

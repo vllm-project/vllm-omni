@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.engine.messages import EngineQueueMessage, ErrorMessage, ShutdownRequestMessage
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -37,7 +38,7 @@ def _sampling_params(max_tokens: int = 4):
     return SamplingParams(max_tokens=max_tokens)
 
 
-async def _get_any_output_message(fixture: OrchestratorFixture, *, timeout: float = 2.0) -> dict:
+async def _get_any_output_message(fixture: OrchestratorFixture, *, timeout: float = 2.0) -> EngineQueueMessage:
     """Like _get_output_message but returns any message type (including errors)."""
     deadline = time.monotonic() + timeout
     while True:
@@ -62,7 +63,7 @@ def orchestrator_factory():
 
     for fixture in fixtures:
         if fixture.thread.is_alive():
-            fixture.request_sync_q.put_nowait({"type": "shutdown"})
+            fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
             fixture.thread.join(timeout=5)
         for q in fixture.queues:
             q.close()
@@ -101,10 +102,11 @@ async def test_engine_dead_error_broadcasts_fatal_and_shuts_down(orchestrator_fa
         # Collect the fatal error message.
         msg = await _get_any_output_message(orchestrator_fixture)
 
-        assert msg["type"] == "error"
-        assert msg["fatal"] is True
-        assert msg["request_id"] == "req-dead"
-        assert "Stage-0 engine core is dead" in msg["error"]
+        assert isinstance(msg, ErrorMessage)
+        assert msg.type == "error"
+        assert msg.fatal is True
+        assert msg.request_id == "req-dead"
+        assert "Stage-0 engine core is dead" in msg.error
 
         # The orchestrator thread should exit after the fatal error.
         orchestrator_fixture.thread.join(timeout=5)
@@ -114,7 +116,7 @@ async def test_engine_dead_error_broadcasts_fatal_and_shuts_down(orchestrator_fa
         assert "req-dead" not in orchestrator_fixture.orchestrator.request_states
     finally:
         if orchestrator_fixture.thread.is_alive():
-            orchestrator_fixture.request_sync_q.put_nowait({"type": "shutdown"})
+            orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
             orchestrator_fixture.thread.join(timeout=5)
 
 
@@ -148,13 +150,14 @@ async def test_diffusion_error_output_routed_as_finished(orchestrator_factory) -
 
         msg = await _get_any_output_message(orchestrator_fixture)
 
-        assert msg["type"] == "error"
-        assert msg["request_id"] == "req-err"
-        assert msg["stage_id"] == 0
-        assert msg["error"] == "gpu fault"
+        assert isinstance(msg, ErrorMessage)
+        assert msg.type == "error"
+        assert msg.request_id == "req-err"
+        assert msg.stage_id == 0
+        assert msg.error == "gpu fault"
 
         # Request state should be cleaned up.
         await _wait_for(lambda: "req-err" not in orchestrator_fixture.orchestrator.request_states)
     finally:
-        orchestrator_fixture.request_sync_q.put_nowait({"type": "shutdown"})
+        orchestrator_fixture.request_sync_q.put_nowait(ShutdownRequestMessage())
         orchestrator_fixture.thread.join(timeout=5)

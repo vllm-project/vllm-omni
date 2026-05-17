@@ -27,8 +27,16 @@ def _set_forward_context_num_tokens(num_tokens: int) -> None:
 
 class HunyuanFusedMoEDefault(FusedMoE):
     def __init__(self, *, prefix: str = "", **kwargs: Any) -> None:
+        # Current vLLM FusedMoE handles output reduction internally.
+        kwargs.pop("reduce_results", None)
         super().__init__(prefix=prefix, **kwargs)
         self._prefix = prefix
+        self._init_hook_handle = self.register_forward_pre_hook(self._initialize_kernel_hook, with_kwargs=True)
+
+    def _initialize_kernel_hook(self, module: Any, args: Any, kwargs: Any) -> None:
+        if self.quant_method and getattr(self.quant_method, "moe_kernel", None) is None:
+            self.quant_method.process_weights_after_loading(self)
+        self._init_hook_handle.remove()
 
     def forward(self, hidden_states: Any, router_logits: Any) -> Any:
         _set_forward_context_num_tokens(hidden_states.shape[0])

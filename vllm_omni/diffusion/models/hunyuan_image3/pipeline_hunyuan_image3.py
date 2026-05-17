@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
-import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -284,11 +283,13 @@ def get_hunyuan_image_3_pre_process_func(od_config: OmniDiffusionConfig):
                 cond_image_infos = [_build_cond_joint_image(image) for image in image_list]
                 prompt["additional_information"]["batch_cond_image_info"] = cond_image_infos
 
+                bridge_h = prompt.get("height") if isinstance(prompt, dict) else None
+                bridge_w = prompt.get("width") if isinstance(prompt, dict) else None
                 first_image_w, first_image_h = _to_pil_image(image_list[0]).size
                 if request.sampling_params.width is None:
-                    request.sampling_params.width = int(first_image_w)
+                    request.sampling_params.width = int(bridge_w or first_image_w)
                 if request.sampling_params.height is None:
-                    request.sampling_params.height = int(first_image_h)
+                    request.sampling_params.height = int(bridge_h or first_image_h)
 
             request.prompts[i] = prompt
 
@@ -340,11 +341,6 @@ class HunyuanImage3Pipeline(
             )
         ]
         quant_config = od_config.quantization_config
-        os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
-        logger.info(
-            "Setting attention backend to TORCH_SDPA. "
-            "HunyuanImage3Pipeline only supports TORCH_SDPA to handle mixed causal and full attention."
-        )
         self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
         self.transformer = self.model
         self.vae = AutoencoderKLConv3D.from_config(self.hf_config.vae)
@@ -545,7 +541,12 @@ class HunyuanImage3Pipeline(
         timestep_scatter_index: BatchRaggedTensor,
     ):
         batch_size, seq_len, n_embd = x.shape
-        # batch_size x n x n_embd
+        # `_encode_cond_image` returns `t` as list[Tensor] for the
+        # multi-image branch (outer length = batch_size, currently fixed
+        # at 1 by the stage runtime `max_batch_size`); flatten to a Tensor
+        # before reshape.
+        if isinstance(t, list):
+            t = torch.cat([ti.reshape(-1) for ti in t], dim=0)
         timestep_scatter_src = self.timestep_emb(t.reshape(-1)).reshape(batch_size, -1, n_embd)
         x.scatter_(
             dim=1,
@@ -633,7 +634,11 @@ class HunyuanImage3Pipeline(
             if isinstance(vae_encode_result, torch.Tensor):
                 latents = vae_encode_result
             else:
-                latents = vae_encode_result.latent_dist.sample()
+                # Match HunyuanImage-3's cond encode path: sample the
+                # posterior, but use a fixed generator so repeated online
+                # requests are deterministic.
+                _cond_vae_gen = torch.Generator(device=image.device).manual_seed(0)
+                latents = vae_encode_result.latent_dist.sample(_cond_vae_gen)
             if hasattr(config, "shift_factor") and config.shift_factor:
                 latents.sub_(config.shift_factor)
             if hasattr(config, "scaling_factor") and config.scaling_factor:
@@ -962,10 +967,18 @@ class HunyuanImage3Pipeline(
             tokenizer_output.joint_image_slices[i] + tokenizer_output.gen_image_slices[i] for i in range(bsz)
         ]
         attention_mask = torch.ones(seq_len, seq_len, dtype=torch.bool).tril(diagonal=0).repeat(bsz, 1, 1)
+        full_attn_spans: list[list[tuple[int, int]]] = [[] for _ in range(bsz)]
         for i in range(bsz):
             for j, image_slice in enumerate(batch_image_slices[i]):
                 attention_mask[i, image_slice, image_slice] = True
+                start = image_slice.start if image_slice.start is not None else 0
+                stop = image_slice.stop if image_slice.stop is not None else seq_len
+                assert start < stop, f"Invalid image slice: {image_slice}"
+                full_attn_spans[i].append((int(start), int(stop)))
+            if full_attn_spans[i]:
+                full_attn_spans[i].sort(key=lambda x: x[0])
         attention_mask = attention_mask.unsqueeze(1)
+        model_kwargs["full_attn_spans"] = full_attn_spans
         return attention_mask
 
     def prepare_inputs_for_generation(
@@ -1009,6 +1022,8 @@ class HunyuanImage3Pipeline(
                 "query_lens": kwargs.get("query_lens"),
                 "seq_lens": kwargs.get("seq_lens"),
                 "num_image_tokens": kwargs.get("num_image_tokens"),
+                "ar_kv_reuse_len": kwargs.get("ar_kv_reuse_len", 0),
+                "full_attn_spans": kwargs.get("full_attn_spans"),
             }
         )
         return model_inputs
@@ -1027,6 +1042,8 @@ class HunyuanImage3Pipeline(
             "custom_pos_emb": model_kwargs["custom_pos_emb"],
             "num_image_tokens": model_kwargs["num_image_tokens"],
         }
+        if "full_attn_spans" in model_kwargs:
+            updated_model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"]
 
         # update past_key_values keeping its naming used in model code
         for possible_cache_name in ALL_CACHE_NAMES:
@@ -1057,6 +1074,7 @@ class HunyuanImage3Pipeline(
                     torch.arange(bsz), model_kwargs["gen_timestep_scatter_index"][:, -1]
                 ].unsqueeze(-1)
                 updated_model_kwargs["position_ids"] = torch.cat([timestep_position_ids, position_ids], dim=1)
+
                 # attention mask
                 mask_list = []
                 for attention_mask_i, position_ids_i in zip(
@@ -1156,6 +1174,8 @@ class HunyuanImage3Pipeline(
         seq_lens: list[int] | None = None,
         num_image_tokens: int | None = None,
         uncond_cfg_prefill: bool = False,
+        ar_kv_reuse_len: int = 0,
+        full_attn_spans: list[list[tuple[int, int]]] | None = None,
     ) -> tuple | CausalMMOutputWithPast:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # Sanity Check of Inputs
@@ -1251,6 +1271,8 @@ class HunyuanImage3Pipeline(
                 num_image_tokens=num_image_tokens,
                 gen_timestep_scatter_index=gen_timestep_scatter_index,
                 uncond_cfg_prefill=uncond_cfg_prefill,
+                ar_kv_reuse_len=ar_kv_reuse_len,
+                full_attn_spans=full_attn_spans,
             )
         hidden_states = outputs[0]
 
@@ -1342,25 +1364,21 @@ class HunyuanImage3Pipeline(
         use_system_prompt = extra_args.get("use_system_prompt")
         system_prompt = extra_args.get("system_prompt")
         # Fall back to per-prompt use_system_prompt forwarded by ar2diffusion
-        if use_system_prompt is None and req.prompts:
+        if req.prompts:
             first_prompt = req.prompts[0]
             if isinstance(first_prompt, dict):
-                use_system_prompt = first_prompt.get("use_system_prompt")
+                if use_system_prompt is None:
+                    use_system_prompt = first_prompt.get("use_system_prompt")
+                if system_prompt is None:
+                    system_prompt = first_prompt.get("system_prompt")
         if use_system_prompt is not None:
             system_prompt = get_system_prompt(use_system_prompt, "image", system_prompt)
             system_prompt = system_prompt.strip() if system_prompt is not None else ""
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
 
-        # Extract AR-generated CoT/recaption text from each prompt's extra dict.
-        # The AR-side stage input processor (``ar2diffusion``) already prepends
-        # the trigger tag (e.g. ``<think>``) when the AR used the KV-reuse
-        # pretrain format, so ``ar_generated_text`` is a self-contained string
-        # and ``get_cot_sections()`` can parse the think/recaption structure
-        # directly.
-        cot_text_list = []
-        for p in req.prompts:
-            extra = p.get("extra", {}) if isinstance(p, dict) else {}
-            cot_text_list.append(extra.get("ar_generated_text") or None)
+        cot_text_list = [
+            (p.get("extra", {}).get("ar_generated_text") if isinstance(p, dict) else None) or None for p in req.prompts
+        ]
         cot_text = (
             [self._normalize_cot_text(t) for t in cot_text_list] if any(t is not None for t in cot_text_list) else None
         )
@@ -1416,7 +1434,11 @@ class HunyuanImage3Pipeline(
         model_inputs.update(ar_kv_kwargs)
 
         outputs = self._generate(**model_inputs, **kwargs)
+        custom_output = {}
+        if any(t is not None for t in cot_text_list):
+            custom_output["ar_generated_text"] = cot_text_list[0] if len(cot_text_list) == 1 else cot_text_list
         return DiffusionOutput(
             output=outputs[0],
+            custom_output=custom_output,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )

@@ -10,7 +10,6 @@ via pre-computed ECAPA-TDNN embeddings, bypassing ref_audio extraction.
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import struct
 

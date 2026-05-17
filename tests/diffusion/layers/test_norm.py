@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+from pytest_mock import MockerFixture
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -296,6 +297,55 @@ def test_rmsnorm_numerical_correctness():
     out = norm(x)
 
     torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+
+
+# ── RMSNorm compile-path regression tests ──
+
+
+def test_rmsnorm_forward_cuda_does_not_call_fused_during_compile(mocker: MockerFixture) -> None:
+    """Regression: _forward_fused must not be called during torch.compile tracing.
+
+    Under HSDP, RMSNorm.weight is a DTensor. Accessing .data on a DTensor inside
+    _forward_fused during tracing produces an orphan all-gather node outside the
+    compile boundary, causing inductor's compute_ancestors to raise KeyError.
+    The is_compiling() guard in forward_cuda/forward_hip prevents this by routing
+    to forward_native during tracing.
+
+    If someone removes the guard, this test will catch the regression by asserting
+    that _forward_fused was not called while is_compiling() returns True.
+    """
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    norm = RMSNorm(hidden_size=64)
+    x = torch.randn(2, 4, 64)
+
+    mock_fused = mocker.patch.object(norm, "_forward_fused", wraps=norm._forward_fused)
+    mocker.patch("torch.compiler.is_compiling", return_value=True)
+
+    out = norm.forward_cuda(x)
+
+    mock_fused.assert_not_called()
+    assert out.shape == x.shape
+
+
+def test_rmsnorm_forward_hip_does_not_call_fused_during_compile(mocker: MockerFixture) -> None:
+    """Regression: same guard must be present in forward_hip.
+
+    forward_hip is the entry point on ROCm (AMD GPU). It must behave identically
+    to forward_cuda with respect to the is_compiling() guard.
+    """
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    norm = RMSNorm(hidden_size=64)
+    x = torch.randn(2, 4, 64)
+
+    mock_fused = mocker.patch.object(norm, "_forward_fused", wraps=norm._forward_fused)
+    mocker.patch("torch.compiler.is_compiling", return_value=True)
+
+    out = norm.forward_hip(x)
+
+    mock_fused.assert_not_called()
+    assert out.shape == x.shape
 
 
 def test_rmsnorm_matches_reference_implementation():

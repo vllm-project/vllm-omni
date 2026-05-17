@@ -61,6 +61,7 @@ class SelfAttentionBlock(nn.Module):
             softmax_scale=1.0 / (self.head_dim ** 0.5),
             causal=False,
             num_kv_heads=num_heads,
+            role="self",
         )
 
     def forward(self, x, attn_mask=None):
@@ -73,6 +74,24 @@ class SelfAttentionBlock(nn.Module):
         out = self.attn(q, k, v, attn_metadata=attn_metadata)
         out = out.reshape(B, S, -1)
         return self.to_out(out)
+```
+
+**Declaring the attention role.** Always pass a `role` string to `Attention(...)`. It is the lookup key users target with `--diffusion-attention-config.per_role.<role>.backend` to swap kernels per site without touching model code.
+
+| Convention | When to use |
+|---|---|
+| `role="self"` | Q/K/V come from the same hidden state |
+| `role="cross"` | K/V come from a separate `encoder_hidden_states`; pair with `skip_sequence_parallel=True` if K/V is replicated across SP ranks |
+
+For multi-modal sites that don't fit `self` / `cross`, use a dot-namespaced role and provide `role_category` so user config can fall back to the generic category:
+
+```python
+self.audio_to_video_attn = Attention(
+    num_heads=num_heads, head_size=self.head_dim,
+    softmax_scale=1.0 / (self.head_dim ** 0.5), causal=False,
+    role="mymodel.audio_to_video",
+    role_category="cross",
+)
 ```
 
 #### Fused QKV with TP (Advanced)
@@ -104,6 +123,7 @@ class TPSelfAttention(nn.Module):
             softmax_scale=1.0 / (self.head_dim ** 0.5),
             causal=False,
             num_kv_heads=num_heads,
+            role="self",
         )
 ```
 

@@ -215,11 +215,27 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             if self._closed:
                 return
 
-            dead = [p.name for p in self._processes if p.sentinel in finished]
+            dead = [p for p in self._processes if p.sentinel in finished]
             if dead:
+                details = []
+                for p in dead:
+                    code = p.exitcode
+                    # Negative exitcode == killed by signal N (-9 = SIGKILL/OOM,
+                    # -11 = SIGSEGV). Surface this so callers don't only see
+                    # "died unexpectedly" with no root cause.
+                    if code is not None and code < 0:
+                        try:
+                            import signal as _signal
+
+                            sig = _signal.Signals(-code).name
+                        except (ValueError, ImportError):
+                            sig = f"signal {-code}"
+                        details.append(f"{p.name}(exitcode={code}, {sig})")
+                    else:
+                        details.append(f"{p.name}(exitcode={code})")
                 logger.error(
                     "Diffusion worker(s) died unexpectedly: %s",
-                    dead,
+                    details,
                 )
                 self.is_failed = True
 

@@ -13,7 +13,6 @@ from tests.helpers.stage_config import get_deploy_config_path, modify_stage_conf
 from vllm_omni.platforms import current_omni_platform
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
