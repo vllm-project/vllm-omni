@@ -973,23 +973,9 @@ class OmniDiffusionConfig:
                     self.tf_model_config = TransformerConfig()
                     self.update_multimodal_support()
                 elif model_type == "vla":
-                    action_head_cfg = cfg.get("action_head_cfg") or {}
-                    looks_like_dreamzero = False
-                    if isinstance(action_head_cfg, Mapping):
-                        action_head_cfg_config = action_head_cfg.get("config") or {}
-                        diffusion_model_cfg = {}
-                        if isinstance(action_head_cfg_config, Mapping):
-                            diffusion_model_cfg = action_head_cfg_config.get("diffusion_model_cfg") or {}
-                        if isinstance(diffusion_model_cfg, Mapping):
-                            looks_like_dreamzero = (
-                                action_head_cfg.get("_target_")
-                                == "groot.vla.model.dreamzero.action_head.wan_flow_matching_action_tf.WANPolicyHead"
-                                and diffusion_model_cfg.get("_target_")
-                                == (
-                                    "groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk.CausalWanModel"
-                                )
-                            )
-                    if looks_like_dreamzero or self.model_class_name == "DreamZeroPipeline":
+                    from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
+
+                    if _looks_like_dreamzero(self.model):
                         self.model_class_name = "DreamZeroPipeline"
                         self.set_tf_model_config(TransformerConfig())
                         self.update_multimodal_support()
