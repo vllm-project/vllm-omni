@@ -21,10 +21,11 @@ WORKER_EXTENSION = "vllm_omni.diffusion.models.dreamzero.video_export_worker.Dre
 DEFAULT_MODEL = "GEAR-Dreams/DreamZero-DROID"
 DEFAULT_PROMPT = "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan"
 REPO_ROOT = Path(__file__).resolve().parents[3]
+ASSET_REPO_ID = "YangshenDeng/vllm-omni-dreamzero-assets"
+DEFAULT_VIDEO_DIR = REPO_ROOT / "outputs" / "dreamzero" / "assets"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "dreamzero" / "generated_predictions"
 DEFAULT_OUTPUT_STEM = "dreamzero_prediction"
 DEFAULT_SESSION_PREFIX = "dreamzero-export"
-ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 RELATIVE_OFFSETS = [-23, -16, -8, 0]
 ACTION_HORIZON = 24
 CAMERA_FILES = {
@@ -35,10 +36,12 @@ CAMERA_FILES = {
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export DreamZero prediction video from bundled example inputs.")
+    parser = argparse.ArgumentParser(description="Export DreamZero prediction video from downloaded example inputs.")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--deploy-config", type=Path, required=True)
-    parser.add_argument("--video-dir", type=Path, default=ASSETS_DIR)
+    parser.add_argument(
+        "--video-dir", type=Path, default=DEFAULT_VIDEO_DIR, help="Directory containing the three camera MP4 files."
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--output-stem", default=DEFAULT_OUTPUT_STEM)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
@@ -69,7 +72,11 @@ def _load_camera_frames(video_dir: Path) -> dict[str, np.ndarray]:
     for camera_key, file_name in CAMERA_FILES.items():
         video_path = video_dir / file_name
         if not video_path.exists():
-            raise FileNotFoundError(f"Missing DreamZero example asset: {video_path}")
+            raise FileNotFoundError(
+                f"Missing DreamZero example asset: {video_path}. "
+                "Download the example videos with: "
+                f"`hf download {ASSET_REPO_ID} --repo-type dataset --local-dir {video_dir}`"
+            )
         camera_frames[camera_key] = _load_all_frames(video_path)
     return camera_frames
 

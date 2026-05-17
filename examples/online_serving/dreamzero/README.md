@@ -1,7 +1,8 @@
 # DreamZero OpenPI Example
 
 This example shows how to serve DreamZero with `vllm serve --omni` and connect a
-compatible OpenPI websocket client using bundled real camera videos.
+compatible OpenPI websocket client using real camera videos downloaded from
+Hugging Face.
 
 ## Files
 
@@ -9,7 +10,6 @@ compatible OpenPI websocket client using bundled real camera videos.
 - `openpi_client.py`: websocket client that sends real observations
 - `export_prediction_video.py`: offline helper that runs vLLM once and decodes DreamZero `video_pred` latents to MP4
 - `droid_sim_eval_client.py`: DROID `sim-evals` rollout client for the vLLM OpenPI server
-- `assets/`: minimal real camera videos used by the example
 
 ## Environment requirements
 
@@ -19,7 +19,7 @@ compatible OpenPI websocket client using bundled real camera videos.
 - `openpi_client.py` extra deps:
 
 ```bash
-pip install openpi-client websockets opencv-python
+pip install openpi-client websockets opencv-python huggingface-hub
 ```
 
 - video export helper extra deps:
@@ -78,6 +78,26 @@ The websocket endpoint is:
 
 - `ws://127.0.0.1:8000/v1/realtime/robot/openpi`
 
+## Download example videos
+
+The real camera videos are hosted outside this repository:
+
+- <https://huggingface.co/datasets/YangshenDeng/vllm-omni-dreamzero-assets>
+
+Download them into the default example location:
+
+```bash
+hf download YangshenDeng/vllm-omni-dreamzero-assets \
+  --repo-type dataset \
+  --local-dir outputs/dreamzero/assets
+```
+
+The expected files are:
+
+- `outputs/dreamzero/assets/exterior_image_1_left.mp4`
+- `outputs/dreamzero/assets/exterior_image_2_left.mp4`
+- `outputs/dreamzero/assets/wrist_image_left.mp4`
+
 ## Run the client
 
 From the repository root:
@@ -92,6 +112,8 @@ python examples/online_serving/dreamzero/openpi_client.py \
   --host 127.0.0.1 \
   --port 8000
 ```
+
+If you keep the videos elsewhere, pass `--video-dir`.
 
 The client sends:
 
@@ -115,7 +137,7 @@ server path. Use the offline helper below when you want visual debug videos.
 
 This script:
 
-1. loads the bundled camera videos from `assets/`
+1. loads the downloaded camera videos from `outputs/dreamzero/assets/`
 2. builds the same DreamZero/OpenPI observations as the client
 3. runs vLLM locally through `Omni`
 4. collects `video_pred` latents from `OmniRequestOutput.images`
