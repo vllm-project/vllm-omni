@@ -37,7 +37,7 @@ CAMERA_FILES = {
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export DreamZero prediction video from bundled example inputs.")
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--stage-configs-path", type=Path, required=True)
+    parser.add_argument("--deploy-config", type=Path, required=True)
     parser.add_argument("--video-dir", type=Path, default=ASSETS_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--output-stem", default=DEFAULT_OUTPUT_STEM)
@@ -194,11 +194,11 @@ def _stitch_input_frames(camera_frames: dict[str, np.ndarray]) -> np.ndarray:
 
 
 def _run_generation(
-    model: str, stage_configs_path: Path, observations: list[dict]
+    model: str, deploy_config_path: Path, observations: list[dict]
 ) -> tuple[Omni, list[OmniRequestOutput]]:
     omni = Omni(
         model=model,
-        stage_configs_path=str(stage_configs_path),
+        deploy_config=str(deploy_config_path),
         enforce_eager=True,
         worker_extension_cls=WORKER_EXTENSION,
     )
@@ -260,7 +260,7 @@ def main() -> None:
     try:
         omni, outputs = _run_generation(
             model=args.model,
-            stage_configs_path=args.stage_configs_path,
+            deploy_config_path=args.deploy_config,
             observations=observations,
         )
         latent_steps = [_extract_latents(output) for output in outputs]
