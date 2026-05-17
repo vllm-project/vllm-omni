@@ -820,9 +820,11 @@ class CausalWanModel(nn.Module):
         F_t = timestep.shape[1]
 
         if action is not None:
-            embodiment_id = torch.tensor([0], device=x.device).repeat(B)
-            action_features = self.action_encoder(action, timestep_action, embodiment_id)
-            state_features = self.state_encoder(state, embodiment_id)
+            # Current DreamZero checkpoints have one local action/state adapter.
+            # Global embodiment IDs are used by transforms and normalization.
+            adapter_category_id = torch.zeros(B, dtype=torch.long, device=x.device)
+            action_features = self.action_encoder(action, timestep_action, adapter_category_id)
+            state_features = self.state_encoder(state, adapter_category_id)
             action_register = torch.cat([action_features, state_features], dim=1)
             action_length = action_features.shape[1]
             action_register_length = action_register.shape[1]
@@ -834,7 +836,7 @@ class CausalWanModel(nn.Module):
         timestep = timestep.unsqueeze(-1).expand(B, F_t, seq_len // F_t).reshape(B, -1)
         if action is not None:
             assert timestep_action is not None and state is not None
-            state_features_t = self.state_encoder(state, embodiment_id)
+            state_features_t = self.state_encoder(state, adapter_category_id)
             stride = timestep_action.shape[1] // state_features_t.shape[1]
             timestep_state = timestep_action[:, ::stride]
             timestep = torch.cat([timestep, timestep_action, timestep_state], dim=1)
@@ -866,7 +868,7 @@ class CausalWanModel(nn.Module):
 
         if action is not None:
             action_noise_pred = x[:, seq_len : seq_len + action_length]
-            action_noise_pred = self.action_decoder(action_noise_pred, embodiment_id)
+            action_noise_pred = self.action_decoder(action_noise_pred, adapter_category_id)
         else:
             action_noise_pred = None
 
