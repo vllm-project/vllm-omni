@@ -49,10 +49,13 @@ import cv2
 import numpy as np
 from openpi_client import msgpack_numpy
 
-DREAMZERO_REPO = Path(os.environ.get("DREAMZERO_REPO", "~/code/dreamzero")).expanduser()
+_DREAMZERO_REPO_ENV = os.environ.get("DREAMZERO_REPO")
+DREAMZERO_REPO = Path(_DREAMZERO_REPO_ENV).expanduser() if _DREAMZERO_REPO_ENV else None
 
 
 def _import_upstream_policy_modules():
+    if DREAMZERO_REPO is None:
+        raise ImportError("Set DREAMZERO_REPO to an upstream DreamZero checkout before using this helper.")
     if DREAMZERO_REPO.exists() and str(DREAMZERO_REPO) not in sys.path:
         sys.path.insert(0, str(DREAMZERO_REPO))
 
@@ -64,7 +67,10 @@ def _import_upstream_policy_modules():
 
 policy_server, WebsocketClientPolicy = _import_upstream_policy_modules()
 
-VIDEO_DIR = os.environ.get("DREAMZERO_VIDEO_DIR", str(DREAMZERO_REPO / "debug_image"))
+VIDEO_DIR = os.environ.get(
+    "DREAMZERO_VIDEO_DIR",
+    str(DREAMZERO_REPO / "debug_image") if DREAMZERO_REPO is not None else "debug_image",
+)
 
 # roboarena key -> video filename
 CAMERA_FILES = {

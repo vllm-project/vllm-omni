@@ -52,7 +52,10 @@ torch.compile = _identity_compile
 
 os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 
-DREAMZERO_REPO = Path(os.environ.get("DREAMZERO_REPO", "~/code/dreamzero")).expanduser()
+DREAMZERO_REPO_ENV = os.environ.get("DREAMZERO_REPO")
+if not DREAMZERO_REPO_ENV:
+    raise RuntimeError("Set DREAMZERO_REPO to an upstream DreamZero checkout before launching this helper.")
+DREAMZERO_REPO = Path(DREAMZERO_REPO_ENV).expanduser()
 if str(DREAMZERO_REPO) not in sys.path:
     sys.path.insert(0, str(DREAMZERO_REPO))
 
