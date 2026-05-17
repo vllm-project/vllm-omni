@@ -69,8 +69,8 @@ THRESHOLDS = {
 
 QUANT_PROMPT = "A brown and white dog is running on the grass."
 QUANT_HEIGHT, QUANT_WIDTH = 1024, 1024
-QUANT_PSNR_THRESHOLD = 0.0
-QUANT_SSIM_THRESHOLD = 0.0
+QUANT_PSNR_THRESHOLD = 10.0
+QUANT_SSIM_THRESHOLD = 0.20
 QUANT_CLIP_SCORE_THRESHOLD = 20.0
 QUANT_CLIP_SCORE_DROP_THRESHOLD = float(os.environ.get("HUNYUAN_IMAGE3_QUANT_CLIP_SCORE_DROP_THRESHOLD", "5.0"))
 QUANT_BF16_ENV = "HUNYUAN_IMAGE3_BF16_MODEL"
@@ -415,6 +415,10 @@ def test_quantized_dit_matches_bf16_accuracy(
             nvfp4_backend=case.nvfp4_backend,
         )
 
+    ssim_score, psnr_score = compute_image_ssim_psnr(
+        prediction=quant_image,
+        reference=bf16_image,
+    )
     assert_similarity(
         model_name=f"{MODEL_NAME} {case.name} vs bf16",
         vllm_image=quant_image,
@@ -442,6 +446,8 @@ def test_quantized_dit_matches_bf16_accuracy(
         "guidance_scale": 4.0,
         "bf16_elapsed_s": bf16_time,
         "quant_elapsed_s": quant_time,
+        "ssim": ssim_score,
+        "psnr": psnr_score,
         "bf16_clip_score": bf16_clip_score,
         "quant_clip_score": quant_clip_score,
         "clip_score_drop": clip_score_drop,
