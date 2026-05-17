@@ -19,7 +19,7 @@
                 "backend": "v1/videos",
                 "duration_sec": 86400,
                 "max_concurrency": 1,
-                "num_prompts_per_batch": 20,
+                "num_prompts_per_batch": 50,
                 "enable_negative_prompt": true,
                 "random_request_config": [
                     {"width": 832, "height": 480, "num_inference_steps": 4, "num_frames": 81, "fps": 16, "weight": 0.5},

@@ -371,7 +371,7 @@ class TestCustomPipelineWorkerExtension:
 
     def test_re_init_pipeline_basic(self, mocker: MockerFixture, mock_od_config):
         """Test basic re_init_pipeline functionality."""
-        mocker.patch("torch.cuda.empty_cache")
+        mocker.patch("torch.accelerator.empty_cache")
         mocker.patch("gc.collect")
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
 
@@ -405,7 +405,7 @@ class TestCustomPipelineWorkerExtension:
     def test_re_init_pipeline_cleanup(self, mocker: MockerFixture, mock_od_config):
         """Test that re_init_pipeline properly cleans up old pipeline."""
         mock_gc_collect = mocker.patch("gc.collect")
-        mock_empty_cache = mocker.patch("torch.cuda.empty_cache")
+        mock_empty_cache = mocker.patch("torch.accelerator.empty_cache")
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
 
         wrapper = WorkerWrapperBase(
@@ -434,7 +434,7 @@ class TestCustomPipelineWorkerExtension:
 
     def test_re_init_pipeline_none_pipeline(self, mocker: MockerFixture, mock_od_config):
         """Test re_init_pipeline when pipeline is None."""
-        mocker.patch("torch.cuda.empty_cache")
+        mocker.patch("torch.accelerator.empty_cache")
         mocker.patch("gc.collect")
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
 
@@ -510,7 +510,7 @@ class TestCustomPipelineWorkerExtension:
 
     def test_re_init_pipeline_multiple_calls(self, mocker: MockerFixture, mock_od_config):
         """Test calling re_init_pipeline multiple times."""
-        mocker.patch("torch.cuda.empty_cache")
+        mocker.patch("torch.accelerator.empty_cache")
         mocker.patch("gc.collect")
         mocker.patch.object(DiffusionWorker, "__init__", return_value=None)
 

@@ -14,7 +14,7 @@ import zmq
 from omegaconf import OmegaConf
 from vllm.config import CacheConfig, VllmConfig
 from vllm.logger import init_logger
-from vllm.utils.network_utils import get_open_port, zmq_socket_ctx
+from vllm.utils.network_utils import get_open_ports_list, zmq_socket_ctx
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.utils import (
     STARTUP_POLL_PERIOD_MS,
@@ -28,6 +28,8 @@ from vllm.v1.engine.utils import (
 from vllm.v1.executor import Executor
 
 logger = init_logger(__name__)
+
+StageRoute = tuple[int, int]
 
 # Poll period (ms) used by the registration/handshake loop.
 _POLL_PERIOD_MS = 5_000
@@ -107,30 +109,33 @@ class OmniMasterServer:
         master_address: str,
         master_port: int,
         stage_ids: list[int],
+        stage_replica_counts: dict[int, int] | None = None,
     ) -> None:
         self._address = master_address
         self._port = master_port
-        self._allocations: dict[int, StageAllocation] = {}
-        self._stage_configs: dict[int, Any] = {}
-        self._stage_coordinator_addresses: dict[int, StageCoordinatorAddresses] = {}
-        self._stage_config_events: dict[int, threading.Event] = {}
+        self._stage_routes: dict[StageRoute, StageAllocation] = {}
+        self._stage_configs: dict[StageRoute, Any] = {}
+        self._stage_coordinator_addresses: dict[StageRoute, StageCoordinatorAddresses] = {}
+        self._stage_config_events: dict[StageRoute, threading.Event] = {}
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        stage_replica_counts = dict(stage_replica_counts or {})
 
         for sid in stage_ids:
-            self._stage_config_events[sid] = threading.Event()
-            self._stage_coordinator_addresses[sid] = StageCoordinatorAddresses()
-            hs_port = get_open_port()
-            inp_port = get_open_port()
-            out_port = get_open_port()
-            self._allocations[sid] = StageAllocation(
-                handshake_bind_address=f"tcp://{master_address}:{hs_port}",
-                handshake_connect_address=f"tcp://{master_address}:{hs_port}",
-                input_bind_address=f"tcp://{master_address}:{inp_port}",
-                input_connect_address=f"tcp://{master_address}:{inp_port}",
-                output_bind_address=f"tcp://{master_address}:{out_port}",
-                output_connect_address=f"tcp://{master_address}:{out_port}",
-            )
+            replica_count = max(1, int(stage_replica_counts.get(sid, 1)))
+            for replica_id in range(replica_count):
+                route = (sid, replica_id)
+                self._stage_config_events[route] = threading.Event()
+                self._stage_coordinator_addresses[route] = StageCoordinatorAddresses()
+                hs_port, inp_port, out_port = get_open_ports_list(count=3)
+                self._stage_routes[route] = StageAllocation(
+                    handshake_bind_address=f"tcp://{master_address}:{hs_port}",
+                    handshake_connect_address=f"tcp://{master_address}:{hs_port}",
+                    input_bind_address=f"tcp://{master_address}:{inp_port}",
+                    input_connect_address=f"tcp://{master_address}:{inp_port}",
+                    output_bind_address=f"tcp://{master_address}:{out_port}",
+                    output_connect_address=f"tcp://{master_address}:{out_port}",
+                )
 
         logger.info(
             "[OmniMasterServer] Pre-allocated addresses for stages %s (master=%s:%d)",
@@ -152,71 +157,78 @@ class OmniMasterServer:
         """Return the registration port exposed to stage launchers."""
         return self._port
 
-    def get_allocation(self, stage_id: int) -> StageAllocation:
+    def get_allocation(self, stage_id: int, replica_id: int = 0) -> StageAllocation:
         """Return the full address allocation for *stage_id*."""
-        return self._allocations[stage_id]
+        return self._stage_routes[(stage_id, replica_id)]
 
     def register_stage_config(
         self,
         stage_id: int,
         stage_config: Any,
         coordinator_addresses: StageCoordinatorAddresses | None = None,
+        replica_id: int = 0,
     ) -> None:
         """Store the latest stage registration payload for *stage_id*."""
-        if stage_id not in self._allocations:
-            raise KeyError(stage_id)
-        self._stage_configs[stage_id] = stage_config
+        key = (stage_id, replica_id)
+        if key not in self._stage_routes:
+            raise KeyError(key)
+        self._stage_configs[key] = stage_config
         if coordinator_addresses is not None:
-            self._stage_coordinator_addresses[stage_id] = coordinator_addresses
-        self._stage_config_events[stage_id].set()
+            self._stage_coordinator_addresses[key] = coordinator_addresses
+        self._stage_config_events[key].set()
 
-    def get_stage_config(self, stage_id: int, timeout_s: float | None = None) -> Any:
+    def get_stage_config(self, stage_id: int, timeout_s: float | None = None, replica_id: int = 0) -> Any:
         """Return the stage config for *stage_id*, waiting if necessary."""
-        if stage_id not in self._allocations:
-            raise KeyError(stage_id)
+        key = (stage_id, replica_id)
+        if key not in self._stage_routes:
+            raise KeyError(key)
 
-        if stage_id in self._stage_configs:
-            return self._stage_configs[stage_id]
+        if key in self._stage_configs:
+            return self._stage_configs[key]
 
-        if not self._stage_config_events[stage_id].wait(timeout=timeout_s):
-            raise TimeoutError(f"Timed out waiting for stage config for stage {stage_id}.")
+        if not self._stage_config_events[key].wait(timeout=timeout_s):
+            raise TimeoutError(f"Timed out waiting for stage config for stage {stage_id} replica {replica_id}.")
 
-        return self._stage_configs[stage_id]
+        return self._stage_configs[key]
 
     def get_stage_coordinator_addresses(
         self,
         stage_id: int,
         timeout_s: float | None = None,
+        replica_id: int = 0,
     ) -> StageCoordinatorAddresses:
         """Return the registered coordinator addresses for *stage_id*."""
-        if stage_id not in self._allocations:
-            raise KeyError(stage_id)
+        key = (stage_id, replica_id)
+        if key not in self._stage_routes:
+            raise KeyError(key)
 
-        if not self._stage_config_events[stage_id].is_set():
-            if not self._stage_config_events[stage_id].wait(timeout=timeout_s):
-                raise TimeoutError(f"Timed out waiting for stage registration for stage {stage_id}.")
+        if not self._stage_config_events[key].is_set():
+            if not self._stage_config_events[key].wait(timeout=timeout_s):
+                raise TimeoutError(
+                    f"Timed out waiting for stage registration for stage {stage_id} replica {replica_id}."
+                )
 
-        return self._stage_coordinator_addresses[stage_id]
+        return self._stage_coordinator_addresses[key]
 
-    def get_client_addresses(self, stage_id: int) -> dict[str, str]:
+    def get_client_addresses(self, stage_id: int, replica_id: int = 0) -> dict[str, str]:
         """Return the addresses the client-side sockets should *bind* to."""
-        alloc = self._allocations[stage_id]
+        alloc = self.get_allocation(stage_id, replica_id)
         return {
             "input_address": alloc.input_bind_address,
             "output_address": alloc.output_bind_address,
         }
 
-    def get_zmq_addresses(self, stage_id: int) -> EngineZmqAddresses:
+    def get_zmq_addresses(self, stage_id: int, replica_id: int = 0) -> EngineZmqAddresses:
         """Return EngineZmqAddresses using the *bind* (client) side addresses."""
-        alloc = self._allocations[stage_id]
+        alloc = self.get_allocation(stage_id, replica_id)
         return EngineZmqAddresses(
             inputs=[alloc.input_bind_address],
             outputs=[alloc.output_bind_address],
         )
 
-    def get_engine_zmq_addresses(self, stage_id: int) -> EngineZmqAddresses:
+    def get_engine_zmq_addresses(self, stage_id: int, replica_id: int = 0) -> EngineZmqAddresses:
         """Return EngineZmqAddresses using the *connect* (engine) addresses."""
-        alloc = self._allocations[stage_id]
+        alloc = self.get_allocation(stage_id, replica_id)
         return EngineZmqAddresses(
             inputs=[alloc.input_connect_address],
             outputs=[alloc.output_connect_address],
@@ -268,7 +280,7 @@ class OmniMasterServer:
         poller = zmq.Poller()
         poller.register(reg_socket, zmq.POLLIN)
 
-        pending: set[int] = set(self._allocations.keys())
+        pending: set[StageRoute] = set(self._stage_routes.keys())
 
         while pending and not self._stop_event.is_set():
             events: list[tuple[zmq.Socket, int]] = poller.poll(_POLL_PERIOD_MS)  # type: ignore[assignment]
@@ -278,15 +290,15 @@ class OmniMasterServer:
 
             for sock, _ in events:
                 if sock is reg_socket:
-                    sid = self._handle_registration(reg_socket)
-                    if sid is not None:
-                        pending.discard(sid)
+                    route = self._handle_registration(reg_socket)
+                    if route is not None:
+                        pending.discard(route)
 
         # Cleanup
         reg_socket.close(linger=0)
         logger.info("[OmniMasterServer] All stages registered; server thread exiting.")
 
-    def _handle_registration(self, reg_socket: zmq.Socket) -> int | None:  # type: ignore[type-arg]
+    def _handle_registration(self, reg_socket: zmq.Socket) -> StageRoute | None:  # type: ignore[type-arg]
         """Receive a stage registration and reply with the handshake address.
 
         Returns the registered stage_id on success, or None on failure.
@@ -307,10 +319,13 @@ class OmniMasterServer:
             return None
 
         stage_id: int | None = msg.get("stage_id")
-        if stage_id not in self._allocations:
+        replica_id = int(msg.get("replica_id", 0) or 0)
+        key = (stage_id, replica_id)
+        if key not in self._stage_routes:
             logger.warning(
-                "[OmniMasterServer] Received registration for unknown stage_id=%s",
+                "[OmniMasterServer] Received registration for unknown stage_id=%s replica_id=%s",
                 stage_id,
+                replica_id,
             )
             return None
 
@@ -322,9 +337,10 @@ class OmniMasterServer:
                 coordinator_output=msg.get("coordinator_output"),
                 frontend_stats_publish_address=msg.get("frontend_stats_publish_address"),
             ),
+            replica_id=replica_id,
         )
 
-        alloc = self._allocations[stage_id]
+        alloc = self._stage_routes[key]
         response = msgspec.msgpack.encode(
             {
                 "handshake_address": alloc.handshake_connect_address,
@@ -335,11 +351,12 @@ class OmniMasterServer:
         # ROUTER-DEALER: reply is [identity, payload] (no empty delimiter).
         reg_socket.send_multipart([identity, response])
         logger.info(
-            "[OmniMasterServer] Stage %d registered; assigned handshake=%s",
+            "[OmniMasterServer] Stage %d replica %d registered; assigned handshake=%s",
             stage_id,
+            replica_id,
             alloc.handshake_connect_address,
         )
-        return stage_id
+        return key
 
 
 def register_stage_with_omni_master(
@@ -350,6 +367,7 @@ def register_stage_with_omni_master(
     omni_stage_config: Any = None,
     coordinator: DPCoordinator | None = None,
     return_addresses: bool = False,
+    replica_id: int = 0,
 ) -> str | tuple[str, str, str]:
     """Register a stage with the omni master server.
 
@@ -365,6 +383,7 @@ def register_stage_with_omni_master(
             reg_sock.connect(f"tcp://{omni_master_address}:{omni_master_port}")
             payload = {
                 "stage_id": omni_stage_id,
+                "replica_id": replica_id,
                 "stage_config": _serialize_stage_config(omni_stage_config),
             }
             if coordinator is not None:
@@ -471,9 +490,10 @@ def connect_remote_engine_cores(
     vllm_config: VllmConfig,
     omni_master_server: OmniMasterServer,
     stage_id: int,
+    replica_id: int = 0,
 ) -> Iterator[tuple[None, DPCoordinator | None, EngineZmqAddresses, None]]:
     """Wait for remote engine cores to connect through the omni handshake."""
-    addresses = omni_master_server.get_zmq_addresses(stage_id)
+    addresses = omni_master_server.get_zmq_addresses(stage_id, replica_id=replica_id)
     parallel_config = vllm_config.parallel_config
     # Mirror the engine-count logic from launch_omni_core_engines.
     remote_engine_count = (
@@ -484,7 +504,10 @@ def connect_remote_engine_cores(
     start_index = parallel_config.data_parallel_rank if parallel_config.data_parallel_rank is not None else 0
     coordinator = None
 
-    registered_coordinator_addresses = omni_master_server.get_stage_coordinator_addresses(stage_id)
+    registered_coordinator_addresses = omni_master_server.get_stage_coordinator_addresses(
+        stage_id,
+        replica_id=replica_id,
+    )
     addresses.coordinator_input = registered_coordinator_addresses.coordinator_input
     addresses.coordinator_output = registered_coordinator_addresses.coordinator_output
     addresses.frontend_stats_publish_address = registered_coordinator_addresses.frontend_stats_publish_address
@@ -492,12 +515,13 @@ def connect_remote_engine_cores(
     engines_to_handshake = [CoreEngine(index=start_index + i, local=False) for i in range(remote_engine_count)]
 
     logger.info(
-        "Waiting for %d remote engine(s) for stage %d",
+        "Waiting for %d remote engine(s) for stage %d replica %d",
         remote_engine_count,
         stage_id,
+        replica_id,
     )
 
-    handshake_bind_address = omni_master_server.get_allocation(stage_id).handshake_bind_address
+    handshake_bind_address = omni_master_server.get_allocation(stage_id, replica_id=replica_id).handshake_bind_address
 
     with zmq_socket_ctx(handshake_bind_address, zmq.ROUTER, bind=True) as handshake_socket:
         yield None, coordinator, addresses, None
@@ -518,9 +542,10 @@ def launch_omni_core_engines(
     omni_master_server: OmniMasterServer,
     stage_id: int,
     stage_config: Any = None,
+    replica_id: int = 0,
 ) -> Iterator[tuple[CoreEngineProcManager, DPCoordinator | None, EngineZmqAddresses]]:
     """Launch local engine cores using the omni registration flow."""
-    addresses = omni_master_server.get_zmq_addresses(stage_id)
+    addresses = omni_master_server.get_zmq_addresses(stage_id, replica_id=replica_id)
     parallel_config = vllm_config.parallel_config
     # Determine the number of local engines and their ranks.
     local_engine_count = (
@@ -548,17 +573,19 @@ def launch_omni_core_engines(
         addresses.frontend_stats_publish_address = coordinator.get_stats_publish_address()
 
         logger.info(
-            "[omni] Started DP Coordinator process for stage %d (PID: %d)",
+            "[omni] Started DP Coordinator process for stage %d replica %d (PID: %d)",
             stage_id,
+            replica_id,
             coordinator.proc.pid,
         )
     else:
         coordinator = None
 
     logger.info(
-        "Starting %d local engine(s) for stage %d (dp_rank=%d)",
+        "Starting %d local engine(s) for stage %d replica %d (dp_rank=%d)",
         local_engine_count,
         stage_id,
+        replica_id,
         dp_rank,
     )
 
@@ -570,6 +597,7 @@ def launch_omni_core_engines(
         omni_stage_id=stage_id,
         omni_stage_config=stage_config,
         coordinator=coordinator,
+        replica_id=replica_id,
     )
 
     # One CoreEngine entry per local engine so wait_for_engine_startup can
@@ -577,7 +605,7 @@ def launch_omni_core_engines(
     engines_to_handshake = [CoreEngine(index=start_index + i, local=True) for i in range(local_engine_count)]
 
     # Bind the pre-allocated handshake socket for this stage.
-    handshake_bind_address = omni_master_server.get_allocation(stage_id).handshake_bind_address
+    handshake_bind_address = omni_master_server.get_allocation(stage_id, replica_id=replica_id).handshake_bind_address
 
     with zmq_socket_ctx(handshake_bind_address, zmq.ROUTER, bind=True) as handshake_socket:
         local_engine_manager = CoreEngineProcManager(

@@ -57,8 +57,8 @@ def test_latent2vae_async_chunk_serializes_latent_payload():
     )
 
     assert payload is not None
-    assert torch.equal(payload["finished"], torch.tensor(False, dtype=torch.bool))
-    recovered = _decode_serialized_latent(payload["code_predictor_codes"])
+    assert torch.equal(payload.meta.finished, torch.tensor(False, dtype=torch.bool))
+    recovered = _decode_serialized_latent(payload.codes.audio.tolist())
     torch.testing.assert_close(recovered, latent.to(torch.bfloat16).to(torch.float32).unsqueeze(0))
 
 
@@ -70,10 +70,8 @@ def test_latent2vae_async_chunk_returns_terminal_marker_without_latent():
         is_finished=False,
     )
 
-    assert payload == {
-        "code_predictor_codes": [],
-        "finished": torch.tensor(True, dtype=torch.bool),
-    }
+    assert payload.codes.audio.tolist() == []
+    assert torch.equal(payload.meta.finished, torch.tensor(True, dtype=torch.bool))
 
 
 def test_latent2vae_async_chunk_returns_none_for_nonterminal_empty_chunk():

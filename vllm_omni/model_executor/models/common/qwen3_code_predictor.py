@@ -351,8 +351,10 @@ class CodePredictorBaseModel(nn.Module):
         # native bf16 support (Turing, Volta).  The RMSNorm and RoPE
         # layers already upcast internally; this extends the same
         # treatment to attention and MLP.
+        # autocast to float32 is unsupported on CPU; skip fp32 upcast there
+        # (CPU uses full-precision intermediates internally).
         input_dtype = inputs_embeds.dtype
-        use_fp32 = input_dtype == torch.float16
+        use_fp32 = input_dtype == torch.float16 and inputs_embeds.device.type != "cpu"
         if use_fp32:
             inputs_embeds = inputs_embeds.float()
         hidden_states = inputs_embeds
@@ -619,6 +621,7 @@ class CodePredictorWrapper(nn.Module):
         temperature: float = 0.9,
         top_k: int = 50,
         top_p: float = 1.0,
+        generator: torch.Generator | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Predict residual codebooks 1..G-1 autoregressively via re-prefill."""
         bsz = int(layer0_code.shape[0])
@@ -703,7 +706,7 @@ class CodePredictorWrapper(nn.Module):
                     sorted_logits[remove_mask] = float("-inf")
                     logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
                 probs = F.softmax(logits, dim=-1, dtype=torch.float32)
-                code = torch.multinomial(probs, num_samples=1)
+                code = torch.multinomial(probs, num_samples=1, generator=generator)
             else:
                 # "per_call" mode: temperature-scaled + top-k
                 if use_sampling:
@@ -712,7 +715,7 @@ class CodePredictorWrapper(nn.Module):
                         topk_vals, _ = scaled.topk(top_k, dim=-1)
                         scaled = scaled.masked_fill(scaled < topk_vals[:, -1:], float("-inf"))
                     probs = F.softmax(scaled, dim=-1, dtype=torch.float32)
-                    code = torch.multinomial(probs, num_samples=1)
+                    code = torch.multinomial(probs, num_samples=1, generator=generator)
                 else:
                     code = logits.argmax(dim=-1, keepdim=True)
 

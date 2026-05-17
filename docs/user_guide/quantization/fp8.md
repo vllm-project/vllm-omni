@@ -2,11 +2,11 @@
 
 ## Overview
 
-FP8 quantization converts BF16/FP16 weights to FP8 at model load time, or loads
-a checkpoint whose target stage already declares an FP8 quantization config.
-Online activation scaling is the default and does not require calibration.
-Static activation scaling is supported when calibrated scale information is
-available.
+FP8 quantization converts BF16/FP16 weights to FP8 at model load time. Online
+activation scaling is the default and does not require calibration. Static
+activation scaling is supported when calibrated scale information is available.
+For ModelOpt-produced pre-quantized checkpoints, see
+[ModelOpt Quantization](modelopt.md).
 
 Some architectures can quantize all linear layers. Others have
 quality-sensitive layers that should stay in BF16 through `ignored_layers`.
@@ -32,21 +32,21 @@ guide. FP8 on Ampere may use a weight-only path where available.
 
 ### Diffusion Model (Qwen-Image, Wan2.2)
 
-| Model | HF models | Online | Pre-calibrated | Recommendation | `ignored_layers` |
-|-------|-----------|:-------:|:------:|----------------|------------------|
-| Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes | Yes | Skip sensitive image-stream MLPs when quality regresses | `img_mlp` |
-| Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Not validated | Validate against BF16 before documenting as supported | TBD |
-| Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Yes | All layers | None |
-| FLUX.1 | `black-forest-labs/FLUX.1-dev`, `black-forest-labs/FLUX.1-schnell` | Yes | Yes | All layers | None |
-| FLUX.2-klein | `black-forest-labs/FLUX.2-klein-4B` | Yes | Yes | All layers | None |
-| HunyuanImage-3.0 | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` | Yes | Yes | All layers; use the Hunyuan stage config for multi-stage runs | None |
-| HunyuanVideo-1.5 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v`, `720p_t2v`, `480p_i2v` | Yes | Yes | All layers | None |
+| Model | HF models | Online | Pre-calibrated | Recommendation | `ignored_layers` | Text-Encoder quantization |
+|-------|-----------|:-------:|:------:|----------------|------------------|------------------|
+| Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes | Yes | Skip sensitive image-stream MLPs when quality regresses | `img_mlp` | |
+| Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Not validated | Validate against BF16 before documenting as supported | TBD | |
+| Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Yes | All layers | None | ✅︎ |
+| FLUX.1 | `black-forest-labs/FLUX.1-dev`, `black-forest-labs/FLUX.1-schnell` | Yes | Yes | All layers | None | |
+| FLUX.2-klein | `black-forest-labs/FLUX.2-klein-4B` | Yes | Yes | All layers | None | |
+| HunyuanImage-3.0 | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` | Yes | Yes | All layers; use the Hunyuan stage config for multi-stage runs | None | |
+| HunyuanVideo-1.5 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v`, `720p_t2v`, `480p_i2v` | Yes | Yes | All layers | None | |
 
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
 | Model | Scope | Format | Status |
 |-------|-------|--------|--------|
-| Qwen3-Omni | Thinker language-model stage | ModelOpt `quant_algo=FP8` | Tested for thinker memory reduction |
+| Qwen3-Omni | Thinker language-model stage | [ModelOpt](modelopt.md) `quant_algo=FP8` | Tested for thinker memory reduction |
 | Qwen3-TTS | TTS language-model stage | Checkpoint config | Not validated |
 
 Audio encoder, vision encoder, talker, and code2wav stay in BF16 unless a

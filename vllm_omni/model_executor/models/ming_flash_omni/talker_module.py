@@ -963,7 +963,7 @@ class MingAudioGenerator:
                     )
 
             if step > min_new_token and stop_prob > 0.5:
-                logger.info("Stopping at step %d with stop_prob=%.4f", step, stop_prob)
+                logger.debug("Stopping at step %d with stop_prob=%.4f", step, stop_prob)
                 break
 
         return all_latents

@@ -22,6 +22,7 @@ def serving_chat():
 
     instance = object.__new__(OmniOpenAIServingChat)
     instance._supported_speakers = None
+    instance.has_kv_connector = False
     return instance
 
 

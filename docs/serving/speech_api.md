@@ -358,6 +358,31 @@ curl -X POST http://localhost:8091/v1/audio/speech \
     }' --output cloned.wav
 ```
 
+### Voice Storage & Caching
+
+Uploaded voices are persisted to disk as a single `.safetensors` file per voice
+(audio samples + metadata — name, consent, ref_text, sample_rate, created_at —
+in the file header). On server restart the directory is scanned and all
+previously uploaded voices are restored automatically, so uploads survive
+process restarts.
+
+Uploading an existing name overwrites the previous entry (a warning is logged).
+
+Feature extraction artifacts (ref_code, speaker_embedding, DAC codes, etc.)
+are cached in-process with a shared LRU so repeated requests with the same
+`voice=...` skip the extraction pipeline. The cache is a true singleton across
+all TTS model types; deleting a voice invalidates every model-type slot at
+once.
+
+**Configuration (environment variables):**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SPEAKER_SAMPLES_DIR` | `~/.cache/vllm-omni/speakers` | Directory for persisted uploaded speakers (`.safetensors` files). |
+| `SPEAKER_MAX_UPLOADED` | `1000` | Maximum number of uploaded speakers kept on disk. Upload requests past the cap return 400. |
+
+The in-memory LRU has a fixed 512 MiB byte budget.
+
 ## Batch Speech Generation
 
 The batch endpoint synthesizes multiple texts in a single request, returning all results as JSON with base64-encoded audio.
@@ -506,16 +531,18 @@ for result in response.json()["results"]:
 
 All items are fanned out to `generate()` concurrently. The engine's stage worker automatically batches them up to the configured `max_batch_size` and queues the rest — no client-side throttling needed.
 
-For best throughput, set both stages' `max_num_seqs` to ≥4 via `--stage-overrides`:
+For best throughput, set both stages' `max_num_seqs` above 1 via `--stage-overrides`. On the current Qwen3-TTS CustomVoice benchmark, stage 1 performed best at `max_num_seqs: 10`:
 
 ```bash
 vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
     --omni --port 8091 --trust-remote-code --enforce-eager \
-    --stage-overrides '{"0":{"max_num_seqs":4,"gpu_memory_utilization":0.2},
-                        "1":{"max_num_seqs":4,"gpu_memory_utilization":0.2}}'
+    --stage-overrides '{"0":{"max_num_seqs":10,"gpu_memory_utilization":0.2},
+                        "1":{"max_num_seqs":10,"gpu_memory_utilization":0.2}}'
 ```
 
-The bundled `qwen3_tts.yaml` uses `max_num_seqs: 1` (single request) on both stages. Bumping to 4 yields roughly 4× throughput on the talker and lets stage 1 batch chunks across in-flight requests.
+The bundled `qwen3_tts.yaml` uses a multi-request default and lets stage 1 batch chunks across in-flight requests. For latency-sensitive deployments, avoid forcing stage 1 back to `max_num_seqs: 1`; benchmark before reducing it below `10`.
+
+The bundled config also sets `initial_codec_chunk_frames: 1`. This emits only the first audio chunk early for lower TTFA, then returns to the normal `codec_chunk_frames` window so Code2Wav does not repeatedly decode tiny overlapping chunks.
 
 ## Supported Models
 
@@ -535,13 +562,37 @@ The bundled `qwen3_tts.yaml` uses `max_num_seqs: 1` (single request) on both sta
 |-------|-------------|
 | `fishaudio/s2-pro` | 4B dual-AR TTS with DAC codec (44.1 kHz). Supports text-to-speech and voice cloning. |
 
-Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` needed). The `voice` field should be set to `"default"`. See the [Fish Speech online serving example](../user_guide/examples/online_serving/fish_speech.md) for details.
+Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` needed). The `voice` field should be set to `"default"`. See the [Fish Speech section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#fish-speech-s2-pro) for details.
 
 ### Voxtral TTS
 
 | Model | Description |
 |-------|-------------|
 | `mistralai/Voxtral-4B-TTS-2603` | 3B AR + FlowMatching TTS. Supports text-to-speech with preset voices. |
+
+### CosyVoice3
+
+| Model | Description |
+|-------|-------------|
+| `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | Voice cloning from `ref_audio` + `ref_text`. No built-in voice presets — upload a voice or pass `ref_audio`/`ref_text` per request. |
+
+### OmniVoice
+
+| Model | Description |
+|-------|-------------|
+| `k2-fsa/OmniVoice` | Pure-diffusion TTS. Supports voice cloning via `ref_audio` (with optional `ref_text`); no built-in voice presets. |
+
+### VoxCPM2
+
+| Model | Description |
+|-------|-------------|
+| `openbmb/VoxCPM2` | TTS + voice cloning with built-in speaker presets and uploaded-voice support. Accepts `voice` (preset or uploaded) or `ref_audio` + optional `ref_text`. |
+
+### MOSS-TTS-Nano
+
+| Model | Description |
+|-------|-------------|
+| `OpenMOSS-Team/MOSS-TTS-Nano` | Voice cloning only. Requires `ref_audio` (or an uploaded `voice`); no built-in voice presets. `ref_text` is accepted but ignored — upstream's `voice_clone` mode does not consume a transcript. |
 
 ## Error Responses
 

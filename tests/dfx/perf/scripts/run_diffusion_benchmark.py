@@ -36,7 +36,6 @@ import pytest
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 os.environ.setdefault("DIFFUSION_ATTENTION_BACKEND", "FLASH_ATTN")
 
 # ---------------------------------------------------------------------------
@@ -507,7 +506,7 @@ def run_benchmark(
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", prefix="diffusion_bench_tmp_", delete=False) as tmp:
         tmp_result_file = Path(tmp.name)
 
-    exclude_keys = {"baseline", "dataset", "task", "name"}
+    exclude_keys = {"baseline", "dataset", "task", "name", "skip-performance-assertion"}
 
     cmd = [
         sys.executable,
@@ -656,6 +655,10 @@ def assert_result(result: dict[str, Any], params: dict[str, Any]) -> None:
     num_prompts = params.get("num-prompts", 10)
     completed = result.get("completed_requests", result.get("completed", 0))
     assert completed == num_prompts, f"Expected {num_prompts} completed requests, got {completed}"
+
+    if params.get("skip-performance-assertion", False):
+        print("Skipping performance assertions.")
+        return
 
     for metric, threshold in params.get("baseline", {}).items():
         current = result.get(metric)

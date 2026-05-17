@@ -49,6 +49,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.qwen3_tts.pipeline",
         "QWEN3_TTS_PIPELINE",
     ),
+    "covo_audio": (
+        "vllm_omni.model_executor.models.covo_audio.pipeline",
+        "COVO_AUDIO_PIPELINE",
+    ),
     "bagel": (
         "vllm_omni.model_executor.models.bagel.pipeline",
         "BAGEL_PIPELINE",
@@ -64,6 +68,18 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
     "glm_image": (
         "vllm_omni.model_executor.models.glm_image.pipeline",
         "GLM_IMAGE_PIPELINE",
+    ),
+    "hunyuan_image_3_moe": (
+        "vllm_omni.model_executor.models.hunyuan_image3.pipeline",
+        "HUNYUAN_IMAGE3_PIPELINE",
+    ),
+    "hunyuan_image3_ar": (
+        "vllm_omni.model_executor.models.hunyuan_image3.pipeline",
+        "HUNYUAN_IMAGE3_AR_PIPELINE",
+    ),
+    "hunyuan_image3_dit": (
+        "vllm_omni.model_executor.models.hunyuan_image3.pipeline",
+        "HUNYUAN_IMAGE3_DIT_PIPELINE",
     ),
     "voxcpm2": (
         "vllm_omni.model_executor.models.voxcpm2.pipeline",
@@ -84,6 +100,18 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
     "fish_qwen3_omni": (
         "vllm_omni.model_executor.models.fish_speech.pipeline",
         "FISH_SPEECH_PIPELINE",
+    ),
+    "ming_flash_omni": (
+        "vllm_omni.model_executor.models.ming_flash_omni.pipeline",
+        "MING_FLASH_OMNI_PIPELINE",
+    ),
+    "ming_flash_omni_tts": (
+        "vllm_omni.model_executor.models.ming_flash_omni.pipeline",
+        "MING_FLASH_OMNI_TTS_PIPELINE",
+    ),
+    "ming_flash_omni_thinker_only": (
+        "vllm_omni.model_executor.models.ming_flash_omni.pipeline",
+        "MING_FLASH_OMNI_THINKER_ONLY_PIPELINE",
     ),
     "moss_tts_nano": (
         "vllm_omni.model_executor.models.moss_tts_nano.pipeline",

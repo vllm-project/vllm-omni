@@ -11,7 +11,7 @@ def default_env():
     previous = {key: os.environ.get(key) for key in keys}
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = previous["VLLM_WORKER_MULTIPROC_METHOD"] or "spawn"
     os.environ["VLLM_TARGET_DEVICE"] = previous["VLLM_TARGET_DEVICE"] or (
-        "cuda" if torch.cuda.is_available() and torch.cuda.device_count() > 0 else "cpu"
+        "cuda" if torch.cuda.is_available() and torch.accelerator.device_count() > 0 else "cpu"
     )
     yield
     for key, value in previous.items():
@@ -27,10 +27,12 @@ def model_prefix() -> str:
     return f"{prefix.rstrip('/')}/" if prefix else ""
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def clean_gpu_memory_between_tests():
-    # Import here so ``tests.helpers.env`` (and vLLM platform modules) load only
-    # after session autouse fixtures like ``default_env`` have run (RFC #2299).
+    """Opt-in GPU pre/post hooks for a test (no environment-variable gate).
+
+    Use as a test parameter or ``@pytest.mark.usefixtures("clean_gpu_memory_between_tests")``.
+    """
     from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 
     print("\n=== PRE-TEST GPU CLEANUP ===")
@@ -51,7 +53,7 @@ def default_vllm_config():
     from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 
     # Use CPU device if no GPU is available (e.g., in CI environments)
-    has_gpu = torch.cuda.is_available() and torch.cuda.device_count() > 0
+    has_gpu = torch.cuda.is_available() and torch.accelerator.device_count() > 0
     device = "cuda" if has_gpu else "cpu"
     device_config = DeviceConfig(device=device)
 
