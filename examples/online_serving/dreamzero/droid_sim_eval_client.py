@@ -52,7 +52,7 @@ import torch
 try:
     import mediapy
 except ImportError as exc:  # pragma: no cover - runtime dependency guard
-    raise ImportError("DreamZero sim-eval client requires `mediapy`.") from exc
+    raise ImportError("Optional DROID sim-eval client requires `mediapy`.") from exc
 
 try:
     from typing import override
@@ -60,12 +60,12 @@ except ImportError:
     try:
         from typing_extensions import override
     except ImportError as exc:  # pragma: no cover - runtime dependency guard
-        raise ImportError("DreamZero sim-eval client requires `typing-extensions` on Python < 3.12.") from exc
+        raise ImportError("Optional DROID sim-eval client requires `typing-extensions` on Python < 3.12.") from exc
 
 try:
     import websockets.sync.client
 except ImportError as exc:  # pragma: no cover - runtime dependency guard
-    raise ImportError("DreamZero sim-eval client requires `websockets`.") from exc
+    raise ImportError("Optional DROID sim-eval client requires `websockets`.") from exc
 
 # NOTE:
 # This directory already contains a local file named `openpi_client.py`.
@@ -87,7 +87,7 @@ try:
     from openpi_client import image_tools, msgpack_numpy
     from openpi_client.base_policy import BasePolicy
 except ImportError as exc:  # pragma: no cover - runtime dependency guard
-    raise ImportError("DreamZero sim-eval client requires the optional `openpi-client` package.") from exc
+    raise ImportError("Optional DROID sim-eval client requires the `openpi-client` package.") from exc
 finally:
     if removed_path:
         sys.path.insert(0, example_dir)
@@ -553,7 +553,7 @@ def main() -> None:
         from isaaclab.app import AppLauncher
     except ImportError as exc:  # pragma: no cover - runtime dependency guard
         raise ImportError(
-            "DreamZero sim-eval client requires Isaac Lab (`isaaclab`). "
+            "Optional DROID sim-eval client requires Isaac Lab (`isaaclab`). "
             "Launch it from an Isaac Lab environment, e.g. via `isaaclab.sh -p`."
         ) from exc
 
@@ -576,19 +576,19 @@ def main() -> None:
     try:
         import gymnasium as gym
     except ImportError as exc:  # pragma: no cover - runtime dependency guard
-        raise ImportError("DreamZero sim-eval client requires `gymnasium`.") from exc
+        raise ImportError("Optional DROID sim-eval client requires `gymnasium`.") from exc
 
     try:
         import sim_evals.environments  # noqa: F401
     except ImportError as exc:  # pragma: no cover - runtime dependency guard
         raise ImportError(
-            "DreamZero sim-eval client requires the external `sim-evals` package or checkout to be importable."
+            "Optional DROID sim-eval client requires the external `sim-evals` package or checkout to be importable."
         ) from exc
 
     try:
         from isaaclab_tasks.utils import parse_env_cfg
     except ImportError as exc:  # pragma: no cover - runtime dependency guard
-        raise ImportError("DreamZero sim-eval client requires `isaaclab_tasks`.") from exc
+        raise ImportError("Optional DROID sim-eval client requires `isaaclab_tasks`.") from exc
 
     # Resolve output location and scene prompt.
     output_dir = _make_output_dir(args.output_root.expanduser().resolve(), args.scene)

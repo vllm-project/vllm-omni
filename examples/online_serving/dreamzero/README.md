@@ -28,18 +28,23 @@ pip install openpi-client websockets opencv-python
 pip install opencv-python pillow
 ```
 
+Optional DROID sim-eval dependencies:
+
+- Plain serving, `openpi_client.py`, and standard e2e tests do **not** require
+  Isaac Lab or `sim-evals`.
 - `droid_sim_eval_client.py` must run in an external Isaac Lab / `sim-evals`
-  environment, and also needs:
+  environment where these imports already work:
+  - `isaaclab`
+  - `isaaclab_tasks`
+  - `sim_evals`
+  - `gymnasium`
+- In that simulator environment, also install the OpenPI/client-side helpers:
 
 ```bash
-pip install openpi-client websockets opencv-python mediapy
+pip install openpi-client websockets opencv-python mediapy typing-extensions
 ```
 
-- On Python `< 3.12`, also install:
-
-```bash
-pip install typing-extensions
-```
+- `typing-extensions` is only needed on Python `< 3.12`.
 
 - Optional `tests/dreamzero/upstream/*` parity tests also require:
   - `DREAMZERO_REPO` pointing to an upstream DreamZero checkout
@@ -161,22 +166,11 @@ vllm serve \
 
 ### 2. Start the DROID simulation client
 
-Run this from an environment where `isaaclab`, `isaaclab_tasks`,
-`sim_evals`, and `gymnasium` are already importable.
-
 Environment:
 
 - do **not** run this from the plain `vllm-omni` env unless it already has Isaac Lab and `sim_evals`
 - launch it from the Isaac Lab / `sim-evals` environment
-- make sure the following imports work there:
-  - `isaaclab`
-  - `isaaclab_tasks`
-  - `sim_evals`
-  - `gymnasium`
-  - `openpi_client`
-  - `websockets`
-  - `cv2`
-  - `mediapy`
+- see the optional DROID sim-eval dependencies above
 
 From the `vllm-omni` repository root, invoke the client through an external
 Isaac Lab launcher, for example:
