@@ -126,13 +126,16 @@ def test_policy_server_config_reads_engine_model_config():
     assert serving.policy_server_config.to_dict() == policy_config
 
 
-def test_reset_marks_next_request_for_engine_state_reset():
+def test_build_request_forwards_connection_session_state():
     serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=_engine_with_policy_config())
-    serving._call_count = 3
 
-    serving.reset({})
-    serving._call_count += 1
-    request = serving._build_request({"prompt": "pick up the object"})
+    request = serving._build_request(
+        {"prompt": "pick up the object"},
+        session_id="session-a",
+        reset=True,
+    )
 
     assert request.sampling_params.extra_args["reset"] is True
+    assert request.sampling_params.extra_args["session_id"] == "session-a"
     assert request.sampling_params.extra_args["robot_obs"]["prompt"] == "pick up the object"
+    assert request.request_ids == ["robot-session-a"]

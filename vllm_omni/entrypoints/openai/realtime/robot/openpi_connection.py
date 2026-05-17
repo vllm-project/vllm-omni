@@ -58,6 +58,12 @@ class RobotRealtimeConnection:
         self.websocket = websocket
         self.serving = serving
         self._idle_timeout = idle_timeout
+        self._current_session_id: str | None = None
+        self._call_count = 0
+
+    def reset(self) -> None:
+        self._current_session_id = None
+        self._call_count = 0
 
     async def _send_error(self, message: str) -> None:
         await self.websocket.send_bytes(_pack({"type": "error", "message": message}))
@@ -112,10 +118,27 @@ class RobotRealtimeConnection:
                     endpoint = obs.pop("endpoint", "infer")
 
                     if endpoint == "reset":
+                        self.reset()
                         self.serving.reset(obs)
                         await self.websocket.send_text("reset successful")
                     else:
-                        actions = await self.serving.infer(obs)
+                        session_id = str(obs.get("session_id") or self._current_session_id or "default")
+                        if session_id != self._current_session_id:
+                            if self._current_session_id is not None:
+                                logger.info(
+                                    "Robot OpenPI session changed %s -> %s",
+                                    self._current_session_id,
+                                    session_id,
+                                )
+                            self._current_session_id = session_id
+                            self._call_count = 0
+
+                        self._call_count += 1
+                        actions = await self.serving.infer(
+                            obs,
+                            session_id=session_id,
+                            reset=self._call_count <= 1,
+                        )
                         await self.websocket.send_bytes(_pack(actions))
                 except Exception:
                     logger.exception("Error handling request")

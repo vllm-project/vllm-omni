@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re as re_module
+from collections import OrderedDict
 from collections.abc import Iterable
 
 import numpy as np
@@ -50,6 +51,7 @@ from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep impor
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = logging.getLogger(__name__)
+MAX_DREAMZERO_SESSIONS = 64
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +200,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             use_dynamic_shifting=False,
         )
 
-        self.state = DreamZeroState()
+        self._states: OrderedDict[str, DreamZeroState] = OrderedDict()
+        self._max_session_states = MAX_DREAMZERO_SESSIONS
+        self.state = self._get_or_create_state("default")
 
         # Keep runtime inference settings separate from the training-time config.
         self.num_inference_steps: int = model_config.get(
@@ -260,6 +264,19 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             ),
         ]
 
+    def _get_or_create_state(self, session_id: str | None) -> DreamZeroState:
+        session_key = str(session_id or "default")
+        state = self._states.get(session_key)
+        if state is None:
+            state = DreamZeroState()
+            self._states[session_key] = state
+            max_states = getattr(self, "_max_session_states", MAX_DREAMZERO_SESSIONS)
+            while len(self._states) > max_states:
+                self._states.popitem(last=False)
+        else:
+            self._states.move_to_end(session_key)
+        return state
+
     # -----------------------------------------------------------------------
     # Root config loading
     # -----------------------------------------------------------------------
@@ -304,9 +321,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             embodiment_id=kwargs.get("embodiment_id"),
         )
         if kwargs.get("update_kv_cache", False) and updated_kv_caches:
+            state = kwargs.get("dreamzero_state", self.state)
             is_neg = kwargs.get("is_negative", False)
             for i, kv in enumerate(updated_kv_caches):
-                self.state.update_kv_cache(i, kv, is_negative=is_neg)
+                state.update_kv_cache(i, kv, is_negative=is_neg)
 
         video_pred = video_pred.clone()
         if action_pred is not None:
@@ -466,6 +484,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         frame_seqlen: int,
         seq_len: int,
         do_true_cfg: bool,
+        state: DreamZeroState,
     ) -> None:
         """Prefill KV cache with first frame and/or current observation.
 
@@ -479,8 +498,8 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         num_heads = getattr(self.transformer.blocks[0].self_attn, "tp_num_heads", self.transformer.num_heads)
         head_dim = self.transformer.dim // self.transformer.num_heads
 
-        if self.state.current_start_frame == 0:
-            self.state.create_kv_caches(
+        if state.current_start_frame == 0:
+            state.create_kv_caches(
                 batch_size,
                 dtype,
                 device,
@@ -490,7 +509,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             )
 
             zero_t = torch.zeros([batch_size, 1], device=device, dtype=torch.long)
-            y_first = self.state.ys[:, :, 0:1] if self.state.ys is not None else None
+            y_first = state.ys[:, :, 0:1] if state.ys is not None else None
 
             # KV cache update is a side effect in predict_noise()
             common = dict(
@@ -499,21 +518,22 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 seq_len=frame_seqlen,
                 current_start_frame=0,
                 y=y_first,
-                clip_feature=self.state.clip_feas,
+                clip_feature=state.clip_feas,
                 update_kv_cache=True,
+                dreamzero_state=state,
             )
             positive_kwargs = dict(
                 encoder_hidden_states=prompt_embeds,
-                kv_cache=self.state.get_kv_caches(False),
-                crossattn_cache=self.state.get_crossattn_caches(False),
+                kv_cache=state.get_kv_caches(False),
+                crossattn_cache=state.get_crossattn_caches(False),
                 is_negative=False,
                 **common,
             )
             negative_kwargs = (
                 dict(
                     encoder_hidden_states=negative_prompt_embeds,
-                    kv_cache=self.state.get_kv_caches(True),
-                    crossattn_cache=self.state.get_crossattn_caches(True),
+                    kv_cache=state.get_kv_caches(True),
+                    crossattn_cache=state.get_crossattn_caches(True),
                     is_negative=True,
                     **common,
                 )
@@ -528,16 +548,16 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 true_cfg_scale=self.cfg_scale,
                 cfg_normalize=False,
             )
-            self.state.current_start_frame = 1
+            state.current_start_frame = 1
 
-        if self.state.current_start_frame != 1:
-            csf = self.state.current_start_frame
+        if state.current_start_frame != 1:
+            csf = state.current_start_frame
             nfpb = self.num_frame_per_block
             current_ref = image_latents[:, -nfpb:]
-            if self.state.ys is not None and csf <= self.state.ys.shape[2]:
-                y = self.state.ys[:, :, csf - nfpb : csf]
-            elif self.state.ys is not None:
-                y = self.state.ys[:, :, -nfpb:]
+            if state.ys is not None and csf <= state.ys.shape[2]:
+                y = state.ys[:, :, csf - nfpb : csf]
+            elif state.ys is not None:
+                y = state.ys[:, :, -nfpb:]
             else:
                 y = None
 
@@ -548,21 +568,22 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 seq_len=seq_len,
                 current_start_frame=csf - nfpb,
                 y=y,
-                clip_feature=self.state.clip_feas,
+                clip_feature=state.clip_feas,
                 update_kv_cache=True,
+                dreamzero_state=state,
             )
             positive_kwargs = dict(
                 encoder_hidden_states=prompt_embeds,
-                kv_cache=self.state.get_kv_caches(False),
-                crossattn_cache=self.state.get_crossattn_caches(False),
+                kv_cache=state.get_kv_caches(False),
+                crossattn_cache=state.get_crossattn_caches(False),
                 is_negative=False,
                 **common,
             )
             negative_kwargs = (
                 dict(
                     encoder_hidden_states=negative_prompt_embeds,
-                    kv_cache=self.state.get_kv_caches(True),
-                    crossattn_cache=self.state.get_crossattn_caches(True),
+                    kv_cache=state.get_kv_caches(True),
+                    crossattn_cache=state.get_crossattn_caches(True),
                     is_negative=True,
                     **common,
                 )
@@ -588,6 +609,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         negative_prompt_embeds: torch.Tensor | None,
         video_action_scheduler: VideoActionScheduler,
         do_true_cfg: bool,
+        state: DreamZeroState,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Denoising loop with CFG parallel support.
@@ -605,10 +627,11 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # Shared kwargs for predict_noise (both cond & uncond branches)
         common_kwargs = dict(
             seq_len=seq_len,
-            current_start_frame=self.state.current_start_frame,
+            current_start_frame=state.current_start_frame,
             state_features=state_features,
             embodiment_id=embodiment_id,
             update_kv_cache=False,
+            dreamzero_state=state,
         )
 
         noisy_input = video_latents
@@ -635,20 +658,20 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                 * action_timestep
             )
 
-            csf = self.state.current_start_frame
-            if csf + self.num_frame_per_block <= self.state.ys.shape[2]:
-                y = self.state.ys[:, :, csf : csf + self.num_frame_per_block]
+            csf = state.current_start_frame
+            if csf + self.num_frame_per_block <= state.ys.shape[2]:
+                y = state.ys[:, :, csf : csf + self.num_frame_per_block]
             else:
-                y = self.state.ys[:, :, -self.num_frame_per_block :]
+                y = state.ys[:, :, -self.num_frame_per_block :]
 
             positive_kwargs = dict(
                 hidden_states=noisy_input.transpose(1, 2),
                 timestep_video=timestep,
                 encoder_hidden_states=prompt_embeds,
-                kv_cache=self.state.get_kv_caches(False),
-                crossattn_cache=self.state.get_crossattn_caches(False),
+                kv_cache=state.get_kv_caches(False),
+                crossattn_cache=state.get_crossattn_caches(False),
                 y=y,
-                clip_feature=self.state.clip_feas,
+                clip_feature=state.clip_feas,
                 action=noisy_input_action,
                 timestep_action=timestep_action,
                 is_negative=False,
@@ -661,10 +684,10 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                     hidden_states=noisy_input.transpose(1, 2),
                     timestep_video=timestep,
                     encoder_hidden_states=negative_prompt_embeds,
-                    kv_cache=self.state.get_kv_caches(True),
-                    crossattn_cache=self.state.get_crossattn_caches(True),
+                    kv_cache=state.get_kv_caches(True),
+                    crossattn_cache=state.get_crossattn_caches(True),
                     y=y,
-                    clip_feature=self.state.clip_feas,
+                    clip_feature=state.clip_feas,
                     action=noisy_input_action,
                     timestep_action=timestep_action,
                     is_negative=True,
@@ -730,6 +753,9 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
                     },
                 )
             raise KeyError("robot_obs")
+        session_id = str(extra_args.get("session_id") or "default")
+        state = self._get_or_create_state(session_id)
+        self.state = state
         transform, unified_obs = self._transform_robot_obs(robot_obs)
         device = get_local_device()
 
@@ -785,14 +811,14 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         # Explicit reset from OpenPI serving is carried by `extra_args["reset"]`
         # on the next inference request after websocket reset/session switch.
         if extra_args.get("reset", False):
-            self.state.reset()
+            state.reset()
         # Auto-reset based on model state (before accumulation)
-        if self.state.should_reset(text_tokens, 0, self.transformer.local_attn_size):
-            self.state.reset()
-        self.state.language = text_tokens
+        if state.should_reset(text_tokens, 0, self.transformer.local_attn_size):
+            state.reset()
+        state.language = text_tokens
 
         # Frame accumulation: stitched single frame → multi-frame video
-        video_frames = self.state.accumulate_frames(stitched)  # (T, H, W, C)
+        video_frames = state.accumulate_frames(stitched)  # (T, H, W, C)
         videos = torch.from_numpy(video_frames).unsqueeze(0).to(device)  # (B=1, T, H, W, C)
 
         videos = self._preprocess_video(videos)  # → [B,C,T,H,W] bf16
@@ -821,17 +847,17 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
         else:
             image = videos[:, :, :1].transpose(1, 2)
 
-        if self.state.current_start_frame == 0:
+        if state.current_start_frame == 0:
             clip_feas, ys, image = self._encode_image(
                 image,
                 self.num_frames,
                 height,
                 width,
             )
-            self.state.clip_feas = clip_feas.to(dtype=image.dtype)
-            self.state.ys = ys.to(dtype=image.dtype)
+            state.clip_feas = clip_feas.to(dtype=image.dtype)
+            state.ys = ys.to(dtype=image.dtype)
 
-        if self.state.current_start_frame != 0:
+        if state.current_start_frame != 0:
             # Subsequent calls: encode current observation via VAE
             if (num_frames_raw - 1) // 4 == self.num_frame_per_block:
                 pass
@@ -886,6 +912,7 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             frame_seqlen,
             seq_len,
             do_true_cfg,
+            state,
         )
 
         sample_scheduler = copy.deepcopy(self.scheduler)
@@ -923,14 +950,15 @@ class DreamZeroPipeline(nn.Module, CFGParallelMixin):
             negative_prompt_embeds=negative_prompt_embeds,
             video_action_scheduler=video_action_scheduler,
             do_true_cfg=do_true_cfg,
+            state=state,
             seq_len=seq_len,
             state_features=state_features,
             embodiment_id=embodiment_id,
         )
 
-        if self.state.current_start_frame == 1:
+        if state.current_start_frame == 1:
             video_out = torch.cat([image, video_out], dim=1)
-        self.state.current_start_frame += self.num_frame_per_block
+        state.current_start_frame += self.num_frame_per_block
 
         # q99 denorm: [-1,1] → real values
         action_out = self._denormalize_action(action_out.float(), embodiment_name)

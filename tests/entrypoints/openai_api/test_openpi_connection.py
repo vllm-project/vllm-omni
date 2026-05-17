@@ -36,6 +36,22 @@ class FakeWebSocket:
         self.closed = True
 
 
+def _serving_mock():
+    serving = MagicMock()
+    serving.policy_server_config = PolicyServerConfig(
+        {
+            "image_resolution": (180, 320),
+            "n_external_cameras": 2,
+            "needs_wrist_camera": True,
+            "needs_stereo_camera": False,
+            "needs_session_id": True,
+            "action_space": "joint_position",
+        }
+    )
+    serving.infer = AsyncMock(return_value=[0.0])
+    return serving
+
+
 def test_pack_reports_clear_error_when_openpi_client_is_missing(monkeypatch):
     real_import = builtins.__import__
 
@@ -130,7 +146,11 @@ def test_handle_connection_returns_structured_error_for_infer_exception(monkeypa
     assert websocket.sent_bytes[1] == {"type": "error", "message": "Internal inference error"}
     assert "secret traceback text" not in str(websocket.sent_bytes[1])
     assert websocket.sent_texts == []
-    serving.infer.assert_awaited_once_with({"prompt": "pick up the object"})
+    serving.infer.assert_awaited_once_with(
+        {"prompt": "pick up the object"},
+        session_id="default",
+        reset=True,
+    )
 
 
 def test_handle_connection_closes_websocket_on_idle_timeout(monkeypatch):
@@ -166,3 +186,61 @@ def test_handle_connection_closes_websocket_on_idle_timeout(monkeypatch):
     assert websocket.closed is True
     assert websocket.sent_texts == []
     serving.infer.assert_not_called()
+
+
+def test_handle_connection_keeps_session_state_per_websocket(monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    requests = {
+        b"a1": {"prompt": "first", "session_id": "session-a"},
+        b"a2": {"prompt": "second", "session_id": "session-a"},
+        b"b1": {"prompt": "other", "session_id": "session-b"},
+    }
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda data: dict(requests[data]))
+    serving = _serving_mock()
+
+    websocket_a = FakeWebSocket(
+        [
+            {"type": "websocket.receive", "bytes": b"a1"},
+            {"type": "websocket.receive", "bytes": b"a2"},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+    websocket_b = FakeWebSocket(
+        [
+            {"type": "websocket.receive", "bytes": b"b1"},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+
+    asyncio.run(openpi_connection.RobotRealtimeConnection(websocket_a, serving).handle_connection())
+    asyncio.run(openpi_connection.RobotRealtimeConnection(websocket_b, serving).handle_connection())
+
+    calls = serving.infer.await_args_list
+    assert calls[0].kwargs == {"session_id": "session-a", "reset": True}
+    assert calls[1].kwargs == {"session_id": "session-a", "reset": False}
+    assert calls[2].kwargs == {"session_id": "session-b", "reset": True}
+
+
+def test_handle_connection_reset_endpoint_resets_next_infer(monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    requests = {
+        b"a1": {"prompt": "first", "session_id": "session-a"},
+        b"reset": {"endpoint": "reset"},
+        b"a2": {"prompt": "second", "session_id": "session-a"},
+    }
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda data: dict(requests[data]))
+    serving = _serving_mock()
+    websocket = FakeWebSocket(
+        [
+            {"type": "websocket.receive", "bytes": b"a1"},
+            {"type": "websocket.receive", "bytes": b"reset"},
+            {"type": "websocket.receive", "bytes": b"a2"},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+
+    asyncio.run(openpi_connection.RobotRealtimeConnection(websocket, serving).handle_connection())
+
+    assert [call.kwargs["reset"] for call in serving.infer.await_args_list] == [True, True]
+    serving.reset.assert_called_once_with({})
+    assert websocket.sent_texts == ["reset successful"]

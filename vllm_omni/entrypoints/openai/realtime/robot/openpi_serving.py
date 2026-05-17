@@ -71,8 +71,6 @@ class ServingRealtimeRobotOpenPI:
     ) -> None:
         self.engine_client = engine_client
         self.model_name = model_name
-        self._current_session_id: str | None = None
-        self._call_count = 0
         self.policy_server_config = self._get_policy_server_config(engine_client)
 
     @classmethod
@@ -115,28 +113,12 @@ class ServingRealtimeRobotOpenPI:
         return PolicyServerConfig.from_model_config(model_config)
 
     def reset(self, obs: dict) -> None:
-        """Reset serving state.
+        """Compatibility hook; per-connection state lives in RobotRealtimeConnection."""
 
-        Engine-side policy state is reset on the next inference request via
-        `extra_args["reset"]`, not by an immediate websocket-side RPC.
-        """
-        self._call_count = 0
-        self._current_session_id = None
-
-    async def infer(self, obs: dict) -> np.ndarray:
+    async def infer(self, obs: dict, *, session_id: str, reset: bool) -> np.ndarray:
         """raw obs → engine → actions."""
-        # Session tracking
-        session_id = obs.get("session_id")
-        if session_id is not None and session_id != self._current_session_id:
-            if self._current_session_id is not None:
-                logger.info("Session changed %s → %s", self._current_session_id, session_id)
-                self.reset({})
-            self._current_session_id = session_id
-
-        self._call_count += 1
-
         # Build request, run inference through AsyncOmni
-        request = self._build_request(obs)
+        request = self._build_request(obs, session_id=session_id, reset=reset)
         result = None
         # OpenPI policy serving is one request -> one action reply. AsyncOmni
         # exposes an async iterator, so consume it to completion and use the
@@ -152,7 +134,7 @@ class ServingRealtimeRobotOpenPI:
 
         return self._extract_actions(result)
 
-    def _build_request(self, obs: dict) -> Any:
+    def _build_request(self, obs: dict, *, session_id: str, reset: bool) -> Any:
         """Build engine request from raw robot obs.
 
         Returns an `OmniDiffusionRequest` payload consumed by
@@ -161,12 +143,9 @@ class ServingRealtimeRobotOpenPI:
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-        # `_call_count` is reset by websocket reset/session switches, then
-        # incremented before this request is built. The policy pipeline consumes
-        # this flag and clears its frame buffer / KV cache before accumulation.
         extra_args = {
-            "reset": self._call_count <= 1,
-            "session_id": self._current_session_id or "default",
+            "reset": reset,
+            "session_id": session_id,
             "robot_obs": obs,
         }
 
@@ -175,7 +154,7 @@ class ServingRealtimeRobotOpenPI:
         return OmniDiffusionRequest(
             prompts=[prompt],
             sampling_params=sampling_params,
-            request_ids=[f"robot-{self._current_session_id or 'default'}"],
+            request_ids=[f"robot-{session_id}"],
         )
 
     def _extract_actions(self, result: Any) -> np.ndarray:
