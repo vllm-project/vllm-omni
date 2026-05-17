@@ -266,4 +266,5 @@ def test_handle_connection_reset_endpoint_resets_next_infer(monkeypatch):
 
     assert [call.kwargs["reset"] for call in serving.infer.await_args_list] == [True, True]
     serving.reset.assert_called_once_with({})
-    assert websocket.sent_texts == ["reset successful"]
+    assert websocket.sent_bytes[2] == {"status": "reset successful"}
+    assert websocket.sent_texts == []

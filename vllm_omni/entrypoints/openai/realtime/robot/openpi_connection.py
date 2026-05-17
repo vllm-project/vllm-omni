@@ -6,7 +6,7 @@
 Protocol (compatible with OpenPI policy clients):
     Connect  -> server sends msgpack(PolicyServerConfig fields)
     Infer    -> client sends msgpack(obs), server sends msgpack(ndarray)
-    Reset    -> client sends msgpack({endpoint:reset}), server sends "reset successful"
+    Reset    -> client sends msgpack({endpoint:reset}), server sends msgpack(status)
 """
 
 from __future__ import annotations
@@ -123,7 +123,7 @@ class RobotRealtimeConnection:
                     if endpoint == "reset":
                         self.reset()
                         self.serving.reset(obs)
-                        await self.websocket.send_text("reset successful")
+                        await self.websocket.send_bytes(_pack({"status": "reset successful"}))
                     else:
                         session_id = str(obs.get("session_id") or self._current_session_id or "default")
                         if session_id != self._current_session_id:
