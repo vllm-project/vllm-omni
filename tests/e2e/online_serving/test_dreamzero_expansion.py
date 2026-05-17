@@ -5,15 +5,14 @@
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from tests.dreamzero import openpi_client_helper as openpi_client
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams, get_open_port
 
@@ -21,8 +20,6 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "GEAR-Dreams/DreamZero-DROID"
-EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "online_serving" / "dreamzero"
-CLIENT_SCRIPT = EXAMPLE_DIR / "openpi_client.py"
 
 
 def _pick_test_gpus() -> str:
@@ -71,19 +68,6 @@ test_params = [
 ]
 
 
-def _load_client_module():
-    spec = importlib.util.spec_from_file_location("dreamzero_openpi_example_client", CLIENT_SCRIPT)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    try:
-        spec.loader.exec_module(module)
-    except ModuleNotFoundError as exc:
-        pytest.skip(f"DreamZero OpenPI example dependency is missing: {exc.name}")
-    return module
-
-
 def _write_synthetic_video(path: Path, cv2_module, *, channel: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     height, width, num_frames = 180, 320, 24
@@ -111,17 +95,21 @@ def _write_synthetic_dreamzero_videos(client_mod, video_dir: Path) -> None:
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_dreamzero_openpi_online(omni_server, tmp_path: Path) -> None:
-    client_mod = _load_client_module()
+    try:
+        openpi_client.require_dependencies()
+    except ModuleNotFoundError as exc:
+        pytest.skip(str(exc))
+
     video_dir = tmp_path / "dreamzero_videos"
-    _write_synthetic_dreamzero_videos(client_mod, video_dir)
-    result = client_mod.run_policy_session(
+    _write_synthetic_dreamzero_videos(openpi_client, video_dir)
+    result = openpi_client.run_policy_session(
         host=omni_server.host,
         port=omni_server.port,
         video_dir=video_dir,
         session_id="dreamzero-online-e2e",
     )
 
-    client_mod.validate_session_result(result)
+    openpi_client.validate_session_result(result)
 
     metadata = result["metadata"]
     assert metadata["needs_session_id"] is True
