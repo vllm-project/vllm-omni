@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -16,7 +15,7 @@ import numpy as np
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServerParams
+from tests.helpers.runtime import OmniServerParams, get_open_port
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
@@ -24,12 +23,6 @@ os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 MODEL = "GEAR-Dreams/DreamZero-DROID"
 EXAMPLE_DIR = Path(__file__).resolve().parents[3] / "examples" / "online_serving" / "dreamzero"
 CLIENT_SCRIPT = EXAMPLE_DIR / "openpi_client.py"
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _pick_test_gpus() -> str:
@@ -72,7 +65,7 @@ test_params = [
             "DIFFUSION_ATTENTION_BACKEND": "TORCH_SDPA",
             "VLLM_DISABLE_COMPILE_CACHE": "1",
             "CUDA_VISIBLE_DEVICES": _pick_test_gpus(),
-            "MASTER_PORT": str(_find_free_port()),
+            "MASTER_PORT": str(get_open_port()),
         },
     )
 ]

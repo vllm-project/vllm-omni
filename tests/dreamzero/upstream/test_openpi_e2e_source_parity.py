@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -36,6 +35,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+
+from tests.helpers.runtime import get_open_port
 
 msgpack_numpy = pytest.importorskip("openpi_client.msgpack_numpy")
 
@@ -86,12 +87,6 @@ class OpenPIWebsocketClientPolicy(_BaseWebsocketClientPolicy):
         self._uri = f"ws://{host}:{port}{path}"
         self._packer = msgpack_numpy.Packer()
         self._ws, self._server_metadata = self._wait_for_server()
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _vllm_executable() -> str:
@@ -193,7 +188,7 @@ def _run_vllm_service(port: int, log_path: Path) -> subprocess.Popen[str]:
     env["CUDA_VISIBLE_DEVICES"] = ",".join(gpus[:cfg_parallel_size])
     env.setdefault("ATTENTION_BACKEND", "torch")
     env.setdefault("DIFFUSION_ATTENTION_BACKEND", "TORCH_SDPA")
-    env.setdefault("MASTER_PORT", str(_find_free_port()))
+    env.setdefault("MASTER_PORT", str(get_open_port()))
     argv = [
         _vllm_executable(),
         "serve",
@@ -307,7 +302,7 @@ def test_openpi_service_matches_upstream_server_noncompile(tmp_path: Path) -> No
         "action_space": "joint_position",
     }
 
-    upstream_port = _find_free_port()
+    upstream_port = get_open_port()
     upstream_log = tmp_path / "dreamzero_upstream.log"
     upstream_proc = _run_upstream_service(upstream_port, upstream_log)
     try:
@@ -323,7 +318,7 @@ def test_openpi_service_matches_upstream_server_noncompile(tmp_path: Path) -> No
     _assert_logs_clean(upstream_log)
     _assert_upstream_log_matches_vllm_baseline(upstream_log)
 
-    vllm_port = _find_free_port()
+    vllm_port = get_open_port()
     vllm_log = tmp_path / "vllm_openpi.log"
     vllm_proc = _run_vllm_service(vllm_port, vllm_log)
     try:
