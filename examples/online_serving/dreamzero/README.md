@@ -183,7 +183,7 @@ Isaac Lab launcher, for example:
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 \
-/path/to/isaaclab.sh -p \
+"${ISAACLAB_LAUNCHER}" -p \
   examples/online_serving/dreamzero/droid_sim_eval_client.py \
   --host 127.0.0.1 \
   --port 8000 \
@@ -342,6 +342,9 @@ From the repository root:
 
 ```bash
 python examples/online_serving/dreamzero/molmospace_dreamzero_eval_demo.py \
-  --benchmark_dir /path/to/molmospaces/assets/benchmarks/molmospaces-bench-v2/benchmarks/20260327/ithor/FrankaCloseHardBench/FrankaCloseHardBench_20260206_json_benchmark \
-  --output_dir /path/to/eval_output --max_episodes 1 --task_horizon_steps 240 --episode_idx 1
+  --benchmark_dir "${MOLMOSPACES_BENCHMARK_DIR}/20260327/ithor/FrankaCloseHardBench/FrankaCloseHardBench_20260206_json_benchmark" \
+  --output_dir outputs/dreamzero/molmospaces \
+  --max_episodes 1 \
+  --task_horizon_steps 240 \
+  --episode_idx 1
 ```

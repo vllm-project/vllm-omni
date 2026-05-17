@@ -22,10 +22,10 @@ optional deps, this wrapper reproduces upstream `main()` but pins attention to
 PyTorch SDPA (`ATTENTION_BACKEND=torch`) for this subprocess only.
 
 Usage:
-    PYTHONPATH=/home/yangshen/code/dreamzero \\
+    PYTHONPATH="${DREAMZERO_REPO}" \\
       .venv/bin/python -m torch.distributed.run --standalone --nproc_per_node=1 \\
       tests/dreamzero/upstream/upstream_socket_server_no_compile.py --port 18081 \\
-      --model_path /home/yangshen/code/dreamzero/checkpoints/dreamzero
+      --model_path "${DREAMZERO_REPO}/checkpoints/dreamzero"
 """
 
 from __future__ import annotations
