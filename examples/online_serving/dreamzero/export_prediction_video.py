@@ -20,7 +20,8 @@ from vllm_omni.outputs import OmniRequestOutput
 WORKER_EXTENSION = "vllm_omni.diffusion.models.dreamzero.video_export_worker.DreamZeroVideoExportWorkerExtension"
 DEFAULT_MODEL = "GEAR-Dreams/DreamZero-DROID"
 DEFAULT_PROMPT = "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan"
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "generated_predictions"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "dreamzero" / "generated_predictions"
 DEFAULT_OUTPUT_STEM = "dreamzero_prediction"
 DEFAULT_SESSION_PREFIX = "dreamzero-export"
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"

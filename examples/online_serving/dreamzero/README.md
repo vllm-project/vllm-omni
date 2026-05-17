@@ -11,7 +11,6 @@ compatible OpenPI websocket client using bundled real camera videos.
 - `generate_comparison_videos.py`: batch helper for TP/CFG comparison videos
 - `droid_sim_eval_client.py`: DROID `sim-evals` rollout client for the vLLM OpenPI server
 - `assets/`: minimal real camera videos used by the example
-- `generated_predictions/`: ignored local debug/video outputs; do not upload or rely on this directory for serving
 
 ## Environment requirements
 
@@ -117,7 +116,7 @@ This script:
 3. runs vLLM locally through `Omni`
 4. collects `video_pred` latents from `OmniRequestOutput.images`
 5. decodes them on the DreamZero worker through `DreamZeroVideoExportWorkerExtension`
-6. writes an MP4 under `generated_predictions/`
+6. writes an MP4 under `outputs/dreamzero/generated_predictions/`
 
 Single-config export:
 
@@ -125,7 +124,7 @@ Single-config export:
 python examples/online_serving/dreamzero/export_prediction_video.py \
   --model GEAR-Dreams/DreamZero-DROID \
   --stage-configs-path vllm_omni/model_executor/stage_configs/dreamzero.yaml \
-  --output-dir examples/online_serving/dreamzero/generated_predictions/comparison_videos \
+  --output-dir outputs/dreamzero/comparison_videos \
   --output-stem tp1_cfg1_vllm_example
 ```
 
@@ -161,7 +160,7 @@ Notes:
 
 Current cleaned comparison outputs are under:
 
-- `examples/online_serving/dreamzero/generated_predictions/comparison_videos/`
+- `outputs/dreamzero/comparison_videos/`
 
 The useful files are:
 

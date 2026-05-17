@@ -249,7 +249,6 @@ outputs/
 results/
 generated/
 output_*/
-/examples/online_serving/dreamzero/generated_predictions/
 
 # Configuration overrides
 configs/local.yaml
