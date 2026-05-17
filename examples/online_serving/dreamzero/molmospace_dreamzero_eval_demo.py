@@ -38,9 +38,9 @@ def main() -> int:
         "--benchmark_dir",
         required=True,
         help=(
-            "Path to benchmark directory, e.g. "
-            "/path/to/molmospaces/assets/benchmarks/molmospaces-bench-v2/benchmarks/"
-            "20260327/ithor/FrankaCloseHardBench/FrankaCloseHardBench_20260206_json_benchmark"
+            "Path to a MolmoSpaces benchmark directory, for example "
+            "$MOLMOSPACES_BENCHMARK_DIR/20260327/ithor/FrankaCloseHardBench/"
+            "FrankaCloseHardBench_20260206_json_benchmark"
         ),
     )
     parser.add_argument("--max_episodes", type=int, default=1)

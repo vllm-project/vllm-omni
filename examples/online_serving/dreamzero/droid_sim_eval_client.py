@@ -20,12 +20,11 @@ Unlike upstream DreamZero, vLLM serves the compatible websocket policy endpoint
 at `/v1/realtime/robot/openpi`, so this script includes the path suffix in the
 client URI.
 
-Run this script through Isaac Lab's launcher from the external `sim-evals`
-checkout, for example:
+Run this script through Isaac Lab's launcher from the vLLM-Omni repository
+root, for example:
 
-    cd /path/to/sim-evals
-    ./submodules/IsaacLab/isaaclab.sh -p \
-      /path/to/vllm-omni-wm/examples/online_serving/dreamzero/droid_sim_eval_client.py \
+    "${ISAACLAB_LAUNCHER}" -p \
+      examples/online_serving/dreamzero/droid_sim_eval_client.py \
       --host 127.0.0.1 \
       --port 8000 \
       --scene 1 \
