@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 
 import numpy as np
 import torch
@@ -53,13 +54,13 @@ class DreamZeroState:
 
         num_frames = 1 if self.call_count == 0 else FRAMES_PER_CHUNK
 
-        if len(self.stitched_buffer) >= num_frames:
-            frames = self.stitched_buffer[-num_frames:]
+        buffer_frames = list(self.stitched_buffer)
+        if len(buffer_frames) >= num_frames:
+            frames = buffer_frames[-num_frames:]
         else:
-            # Pad by repeating first frame
-            frames = list(self.stitched_buffer)
+            frames = buffer_frames
             while len(frames) < num_frames:
-                frames.insert(0, self.stitched_buffer[0])
+                frames.insert(0, buffer_frames[0])
 
         self.call_count += 1
         return np.stack(frames, axis=0)  # (T, H, W, C)
@@ -70,8 +71,7 @@ class DreamZeroState:
 
     def reset(self) -> None:
         """Clear all state."""
-        # Frame buffer — single stitched buffer
-        self.stitched_buffer: list[np.ndarray] = []
+        self.stitched_buffer: deque[np.ndarray] = deque(maxlen=FRAMES_PER_CHUNK)
         self.call_count: int = 0
 
         # KV cache once robot-policy diffusion supports that integration.
