@@ -48,7 +48,9 @@ DEFAULT_PROMPT = "Move the pan forward and use the brush in the middle of the pl
 ACTION_HORIZON = 24
 DEFAULT_ACTION_DIM = 8
 RELATIVE_OFFSETS = [-23, -16, -8, 0]
-ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+ASSET_REPO_ID = "YangshenDeng/vllm-omni-dreamzero-assets"
+DEFAULT_VIDEO_DIR = REPO_ROOT / "outputs" / "dreamzero" / "assets"
 CAMERA_FILES = {
     "observation/exterior_image_0_left": "exterior_image_1_left.mp4",
     "observation/exterior_image_1_left": "exterior_image_2_left.mp4",
@@ -163,7 +165,11 @@ def load_camera_frames(video_dir: Path) -> dict[str, np.ndarray]:
     for camera_key, file_name in CAMERA_FILES.items():
         video_path = video_dir / file_name
         if not video_path.exists():
-            raise FileNotFoundError(f"Missing DreamZero example asset: {video_path}")
+            raise FileNotFoundError(
+                f"Missing DreamZero example asset: {video_path}. "
+                "Download the example videos with: "
+                f"`hf download {ASSET_REPO_ID} --repo-type dataset --local-dir {video_dir}`"
+            )
         camera_frames[camera_key] = load_all_frames(video_path)
     return camera_frames
 
@@ -268,7 +274,7 @@ def run_policy_session(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     path: str = DEFAULT_PATH,
-    video_dir: Path = ASSETS_DIR,
+    video_dir: Path = DEFAULT_VIDEO_DIR,
     prompt: str = DEFAULT_PROMPT,
     session_id: str | None = None,
     num_chunks: int = 2,
@@ -306,11 +312,13 @@ def format_action_summary(index: int, action: np.ndarray) -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="DreamZero OpenPI client example with bundled real videos.")
+    parser = argparse.ArgumentParser(description="DreamZero OpenPI client example with downloaded real videos.")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--path", default=DEFAULT_PATH)
-    parser.add_argument("--video-dir", type=Path, default=ASSETS_DIR)
+    parser.add_argument(
+        "--video-dir", type=Path, default=DEFAULT_VIDEO_DIR, help="Directory containing the three camera MP4 files."
+    )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--session-id", default=None)
     parser.add_argument("--num-chunks", type=int, default=2)
