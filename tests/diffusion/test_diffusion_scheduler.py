@@ -4,7 +4,6 @@
 import queue
 import threading
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -551,8 +550,8 @@ class TestDiffusionEngine:
             request_ids=["req-0", "req-1"],
         )
 
-        with patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False):
-            outputs = await engine.step(request)
+        mocker.patch("vllm_omni.diffusion.diffusion_engine.supports_audio_output", return_value=False)
+        outputs = await engine.step(request)
 
         assert len(outputs) == 2
         assert outputs[0].images == ["frame-0"]
