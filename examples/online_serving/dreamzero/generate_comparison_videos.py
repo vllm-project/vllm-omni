@@ -17,7 +17,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[3]
 EXAMPLE_DIR = Path(__file__).resolve().parent
 EXPORT_SCRIPT = EXAMPLE_DIR / "export_prediction_video.py"
-DEFAULT_OUTPUT_DIR = EXAMPLE_DIR / "generated_predictions" / "comparison_videos"
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "dreamzero" / "comparison_videos"
 DEFAULT_MODEL = "GEAR-Dreams/DreamZero-DROID"
 ASSETS_DIR = EXAMPLE_DIR / "assets"
 
