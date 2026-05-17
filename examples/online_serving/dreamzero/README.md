@@ -8,14 +8,13 @@ compatible OpenPI websocket client using bundled real camera videos.
 - `run_server.sh`: launch DreamZero OpenPI serving
 - `openpi_client.py`: websocket client that sends real observations
 - `export_prediction_video.py`: offline helper that runs vLLM once and decodes DreamZero `video_pred` latents to MP4
-- `generate_comparison_videos.py`: batch helper for TP/CFG comparison videos
 - `droid_sim_eval_client.py`: DROID `sim-evals` rollout client for the vLLM OpenPI server
 - `assets/`: minimal real camera videos used by the example
 
 ## Environment requirements
 
-- `run_server.sh`, `vllm serve`, `openpi_client.py`, `export_prediction_video.py`,
-  `generate_comparison_videos.py`, and the standard example/e2e tests:
+- `run_server.sh`, `vllm serve`, `openpi_client.py`,
+  `export_prediction_video.py`, and the standard example/e2e tests:
   use the local `vllm-omni` environment.
 - `openpi_client.py` extra deps:
 
@@ -124,7 +123,7 @@ Single-config export:
 python examples/online_serving/dreamzero/export_prediction_video.py \
   --model GEAR-Dreams/DreamZero-DROID \
   --deploy-config vllm_omni/deploy/dreamzero.yaml \
-  --output-dir outputs/dreamzero/comparison_videos \
+  --output-dir outputs/dreamzero/generated_predictions \
   --output-stem tp1_cfg1_vllm_example
 ```
 
@@ -133,43 +132,6 @@ Optional flags:
 - `--save-input-video`: also writes a stitched real-input camera video
 - `--save-gif`: also writes GIFs for GitHub comments
 - `--save-actions`: also writes action chunks as `.npz`
-
-Batch comparison export:
-
-```bash
-python examples/online_serving/dreamzero/generate_comparison_videos.py \
-  --skip-existing \
-  --continue-on-error
-```
-
-The batch helper tries to generate:
-
-- `dreamzero_input_reference.mp4`: stitched real input video
-- `tp1_cfg1_vllm_example.mp4`
-- `tp1_cfg2_vllm_example.mp4`
-- `tp2_cfg1_vllm_example.mp4`
-- `tp2_cfg2_vllm_example.mp4`
-- `dreamzero_upstream_reference.mp4`: copied when `--upstream-video` is provided
-
-Notes:
-
-- `tp2_cfg2` needs four free GPUs because `TP=2` and `CF_P=2`.
-- If a variant fails, `manifest.json` records the failure and keeps all successful videos.
-- The helper does not run the upstream DreamZero server. To include an upstream
-  reference video, pass `--upstream-video /path/to/video.mp4`.
-
-Current cleaned comparison outputs are under:
-
-- `outputs/dreamzero/comparison_videos/`
-
-The useful files are:
-
-- `dreamzero_input_reference.mp4`
-- `tp1_cfg1_vllm_example.mp4`
-- `tp1_cfg2_vllm_example.mp4`
-- `tp2_cfg1_vllm_example.mp4`
-- `dreamzero_upstream_reference.mp4`
-- `manifest.json`
 
 ## Run DROID sim-eval against the vLLM server
 
