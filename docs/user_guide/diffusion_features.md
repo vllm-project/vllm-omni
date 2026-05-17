@@ -171,7 +171,7 @@ The following tables show which models support each feature:
 |-------|:----------:|:-----------:|:---------------------:|:--------------:|:-----------------:|:------:|:------------------------:|:--------------------:|:--------------:|:----------------:|
 | **DreamZero-DROID** | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
-DreamZero-DROID is a robot policy / action generation pipeline served through the OpenPI-compatible websocket API. See the [DreamZero online serving example](../../examples/online_serving/dreamzero/README.md) for startup commands, client usage, and known precision notes.
+DreamZero-DROID is a robot policy / action generation pipeline served through the OpenPI-compatible websocket API. See `examples/online_serving/dreamzero/README.md` for startup commands, client usage, and known precision notes.
 
 
 ## Feature Compatibility
