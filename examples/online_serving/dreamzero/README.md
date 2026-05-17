@@ -65,7 +65,7 @@ If you only want 1 GPU:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
-CFG_PARALLEL_SIZE=1 \
+DEPLOY_CONFIG=vllm_omni/deploy/dreamzero.yaml \
 examples/online_serving/dreamzero/run_server.sh
 ```
 Please note DreamZero requires >=74GB VRAM for single-GPU serving.
@@ -123,7 +123,7 @@ Single-config export:
 ```bash
 python examples/online_serving/dreamzero/export_prediction_video.py \
   --model GEAR-Dreams/DreamZero-DROID \
-  --stage-configs-path vllm_omni/model_executor/stage_configs/dreamzero.yaml \
+  --deploy-config vllm_omni/deploy/dreamzero.yaml \
   --output-dir outputs/dreamzero/comparison_videos \
   --output-stem tp1_cfg1_vllm_example
 ```

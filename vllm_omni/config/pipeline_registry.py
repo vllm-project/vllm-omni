@@ -17,11 +17,10 @@ Adding a new pipeline:
        ``vllm_omni/.../pipeline.py``.
     2. Add one line to ``_OMNI_PIPELINES`` below.
 
-Single-stage diffusion models continue to use the
-``_create_default_diffusion_stage_cfg`` fallback in
-``async_omni_engine.py`` — they don't need a registry entry. The empty
-``_DIFFUSION_PIPELINES`` placeholder previously here (#2915) was removed
-once #2987 (which would have populated it) was deferred.
+Plain single-stage diffusion models continue to use the
+``_create_default_diffusion_stage_cfg`` fallback in ``async_omni_engine.py``.
+The empty ``_DIFFUSION_PIPELINES`` placeholder previously here (#2915) was
+removed once #2987 (which would have populated it) was deferred.
 
 ``register_pipeline(config)`` in ``stage_config`` is still supported for
 out-of-tree plugins and tests that create pipelines at runtime; those override
@@ -69,6 +68,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
     "lance": (
         "vllm_omni.model_executor.models.lance.pipeline",
         "LANCE_PIPELINE",
+    ),
+    "dreamzero": (
+        "vllm_omni.model_executor.models.dreamzero.pipeline",
+        "DREAMZERO_PIPELINE",
     ),
     "glm_image": (
         "vllm_omni.model_executor.models.glm_image.pipeline",

@@ -27,11 +27,11 @@ CAMERA_FILES = {
     "observation/wrist_image_left": "wrist_image_left.mp4",
 }
 
-STAGE_CONFIGS = {
-    "tp1_cfg1": REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "dreamzero.yaml",
-    "tp1_cfg2": REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "dreamzero_tp1_cfg2.yaml",
-    "tp2_cfg1": REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "dreamzero_tp2_cfg1.yaml",
-    "tp2_cfg2": REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "dreamzero_tp2_cfg2.yaml",
+DEPLOY_CONFIGS = {
+    "tp1_cfg1": REPO_ROOT / "vllm_omni" / "deploy" / "dreamzero.yaml",
+    "tp1_cfg2": REPO_ROOT / "vllm_omni" / "deploy" / "dreamzero_tp1_cfg2.yaml",
+    "tp2_cfg1": REPO_ROOT / "vllm_omni" / "deploy" / "dreamzero_tp2_cfg1.yaml",
+    "tp2_cfg2": REPO_ROOT / "vllm_omni" / "deploy" / "dreamzero_tp2_cfg2.yaml",
 }
 
 
@@ -98,7 +98,7 @@ def _write_input_reference(output_dir: Path) -> Path:
     return output_path
 
 
-def _run_export(args: argparse.Namespace, config_name: str, stage_config_path: Path) -> Path:
+def _run_export(args: argparse.Namespace, config_name: str, deploy_config_path: Path) -> Path:
     output_stem = f"{config_name}_vllm_example"
     output_path = args.output_dir / f"{output_stem}.mp4"
     if args.skip_existing and output_path.exists():
@@ -109,8 +109,8 @@ def _run_export(args: argparse.Namespace, config_name: str, stage_config_path: P
         str(EXPORT_SCRIPT),
         "--model",
         args.model,
-        "--stage-configs-path",
-        str(stage_config_path),
+        "--deploy-config",
+        str(deploy_config_path),
         "--output-dir",
         str(args.output_dir),
         "--output-stem",
@@ -144,9 +144,9 @@ def main() -> None:
     failures: dict[str, str] = {}
     manifest["input_reference"] = _display_path(_write_input_reference(args.output_dir))
 
-    for config_name, stage_config_path in STAGE_CONFIGS.items():
+    for config_name, deploy_config_path in DEPLOY_CONFIGS.items():
         try:
-            manifest[config_name] = _display_path(_run_export(args, config_name, stage_config_path))
+            manifest[config_name] = _display_path(_run_export(args, config_name, deploy_config_path))
         except subprocess.CalledProcessError as exc:
             if not args.continue_on_error:
                 raise

@@ -1,0 +1,25 @@
+# DreamZero-DROID deploy: TP=1, CFG parallel size=2.
+
+pipeline: dreamzero
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: DreamZeroPipeline
+    parallel_config:
+      tensor_parallel_size: 1
+      cfg_parallel_size: 2
+    model_config:
+      default_robot_embodiment: roboarena
+      policy_server_config:
+        image_resolution: [180, 320]
+        n_external_cameras: 2
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_space: joint_position

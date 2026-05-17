@@ -64,8 +64,8 @@ test_params = [
         model=MODEL,
         port=8092,
         server_args=[
-            "--cfg-parallel-size",
-            "2",
+            "--deploy-config",
+            "vllm_omni/deploy/dreamzero_tp1_cfg2.yaml",
             "--enforce-eager",
             "--disable-log-stats",
         ],
