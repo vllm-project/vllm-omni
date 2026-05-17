@@ -1,5 +1,6 @@
 """Stage input processor for Qwen3-TTS: Talker -> Code2Wav."""
 
+import os
 from typing import Any
 
 import torch
@@ -24,6 +25,20 @@ from vllm_omni.model_executor.stage_input_processors.tts_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _debug_enabled() -> bool:
+    return os.environ.get("VLLM_OMNI_QWEN3_TTS_DEBUG", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _debug_log(message: str, *args: Any) -> None:
+    if _debug_enabled():
+        logger.info("[qwen3_tts_async_chunk] " + message, *args)
 
 
 def talker2code2wav(
@@ -152,10 +167,21 @@ def talker2code2wav_async_chunk(
         if frame is not None:
             codec_codes = frame.cpu().tolist()
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+            _debug_log(
+                "request=%s appended frame; buffered_frames=%d frame_quantizers=%d finished=%s",
+                request_id,
+                len(transfer_manager.code_prompt_token_ids[request_id]),
+                len(codec_codes),
+                finished,
+            )
+        else:
+            _debug_log("request=%s received pooling output without a valid frame; finished=%s", request_id, finished)
         ref_code = pooling_output.get("codes", {}).get("ref")
         if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0 and request_payload.get(request_id) is None:
             request_payload[request_id] = ref_code.to(torch.long).cpu().contiguous()
+            _debug_log("request=%s cached ref_code shape=%s", request_id, tuple(ref_code.shape))
     elif not finished:
+        _debug_log("request=%s no pooling output and not finished; holding", request_id)
         return None
 
     connector = getattr(transfer_manager, "connector", None)
@@ -208,19 +234,37 @@ def talker2code2wav_async_chunk(
         )
         initial_chunk_size = chunk_size
     length = len(transfer_manager.code_prompt_token_ids[request_id])
+    _debug_log(
+        "request=%s evaluating length=%d chunk_size=%d left_context=%d initial_chunk=%d fixed_initial=%s finished=%s",
+        request_id,
+        length,
+        chunk_size,
+        left_context_size_config,
+        initial_chunk_size,
+        fixed_initial_chunk_size,
+        finished,
+    )
 
     if length <= 0:
         if finished:
+            _debug_log("request=%s finished without frames; emitting empty EOF payload", request_id)
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
                 meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
             )
+        _debug_log("request=%s has no frames yet; holding", request_id)
         return None
 
     use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < chunk_size
 
     if use_first_chunk and length <= initial_chunk_size:
         if not finished and length < initial_chunk_size:
+            _debug_log(
+                "request=%s holding first chunk; length=%d initial_chunk=%d",
+                request_id,
+                length,
+                initial_chunk_size,
+            )
             return None
         context_length = length if finished and length < initial_chunk_size else initial_chunk_size
     else:
@@ -229,6 +273,13 @@ def talker2code2wav_async_chunk(
         initial_coverage = initial_chunk_size if use_first_chunk else 0
         adjusted = length - initial_coverage
         if not finished and adjusted % chunk_size != 0:
+            _debug_log(
+                "request=%s holding normal chunk; length=%d adjusted=%d chunk_size=%d",
+                request_id,
+                length,
+                adjusted,
+                chunk_size,
+            )
             return None
         chunk_length = adjusted % chunk_size
         context_length = chunk_length if chunk_length != 0 else chunk_size
@@ -254,6 +305,17 @@ def talker2code2wav_async_chunk(
     code_predictor_codes = torch.tensor(
         [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)],
         dtype=torch.long,
+    )
+
+    _debug_log(
+        "request=%s emitting chunk frames=%d context_length=%d left_context=%d quantizers=%d finished=%s codes=%d",
+        request_id,
+        num_frames,
+        context_length,
+        left_context_size,
+        num_quantizers,
+        finished,
+        int(code_predictor_codes.numel()),
     )
 
     return OmniPayloadStruct(

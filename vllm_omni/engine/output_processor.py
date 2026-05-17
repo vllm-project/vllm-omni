@@ -1,11 +1,44 @@
+from inspect import signature
 from typing import Any
 
 import numpy as np
 import torch
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-    split_routed_experts,
-)
+try:
+    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+        split_routed_experts,
+    )
+except ImportError:
+
+    def split_routed_experts(
+        routed_experts: np.ndarray,
+        prompt_len: int,
+        num_gen: int | None,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Split routed expert data across old and current vLLM APIs.
+
+        Older vLLM builds returned prompt and generation routing together and
+        exposed a helper to split them. Current vLLM slices routing data in the
+        scheduler, so Omni may already receive only generation routing.
+        """
+        if routed_experts is None:
+            return None, None
+
+        routed_len = routed_experts.shape[0]
+        if num_gen is not None and routed_len <= num_gen:
+            return None, routed_experts
+
+        prompt_routed_experts = routed_experts[:prompt_len] if prompt_len else None
+        gen_routed_experts = (
+            routed_experts[prompt_len : prompt_len + num_gen]
+            if num_gen is not None
+            else routed_experts[prompt_len:]
+        )
+        if gen_routed_experts is not None and gen_routed_experts.shape[0] == 0:
+            gen_routed_experts = None
+
+        return prompt_routed_experts, gen_routed_experts
+
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
@@ -253,12 +286,20 @@ class OmniRequestState(RequestState):
                 return None
             external_req_id = self.parent_req.external_req_id
 
+        new_request_output_params = signature(self._new_request_output).parameters
+        if "routed_experts" in new_request_output_params:
+            return self._new_request_output(
+                external_req_id,
+                outputs,
+                finished,
+                kv_transfer_params,
+                prompt_routed_experts,
+            )
         return self._new_request_output(
             external_req_id,
             outputs,
             finished,
             kv_transfer_params,
-            prompt_routed_experts,
         )
 
     def _new_completion_output(

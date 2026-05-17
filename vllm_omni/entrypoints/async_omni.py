@@ -13,6 +13,7 @@ import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+import janus
 from vllm import TokensPrompt
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
@@ -687,7 +688,10 @@ class AsyncOmni(EngineClient, OmniBase):
     async def abort(self, request_id: str | Iterable[str]) -> None:
         """Abort request(s) via the Orchestrator."""
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
-        await self.engine.abort_async(request_ids)
+        try:
+            await self.engine.abort_async(request_ids)
+        except (janus.SyncQueueShutDown, janus.AsyncQueueShutDown):
+            logger.debug("[AsyncOmni] abort ignored after engine queue shutdown: %s", ",".join(request_ids))
         for req_id in request_ids:
             self.request_states.pop(req_id, None)
         if self.log_stats:

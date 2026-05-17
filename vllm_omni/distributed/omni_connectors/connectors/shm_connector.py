@@ -8,7 +8,11 @@ from contextlib import contextmanager
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
 
-from vllm_omni.entrypoints.stage_utils import shm_read_bytes, shm_write_bytes
+from vllm_omni.entrypoints.stage_utils import (
+    shm_read_bytes,
+    shm_write_bytes,
+    windows_shm_payload_path,
+)
 
 from ..utils.logging import get_connector_logger
 from .base import OmniConnectorBase
@@ -136,6 +140,19 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     def _get_by_key(self, get_key: str) -> tuple[Any, int] | None:
         """Read a SHM segment addressed purely by *get_key*."""
+        if sys.platform == "win32":
+            path = windows_shm_payload_path(get_key)
+            if not os.path.exists(path):
+                return None
+            lock_file = _get_lock_file(get_key)
+            result = self._get_data_with_lock(
+                lock_file,
+                {"name": get_key, "size": os.path.getsize(path), "win_file": path},
+            )
+            if result is not None:
+                self._pending_keys.discard(get_key)
+            return result
+
         shm = None
         try:
             shm = shm_pkg.SharedMemory(name=get_key)
@@ -208,15 +225,23 @@ class SharedMemoryConnector(OmniConnectorBase):
         ]
         for key in stale:
             self._pending_keys.discard(key)
-            try:
-                seg = shm_pkg.SharedMemory(name=key)
-                seg.close()
-                seg.unlink()
-                logger.debug("cleanup: unlinked unconsumed SHM segment %s", key)
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                logger.debug("cleanup: failed to unlink SHM segment %s: %s", key, e)
+            if sys.platform == "win32":
+                payload_path = windows_shm_payload_path(key)
+                if os.path.exists(payload_path):
+                    try:
+                        os.remove(payload_path)
+                    except OSError as e:
+                        logger.debug("cleanup: failed to remove SHM payload file %s: %s", payload_path, e)
+            else:
+                try:
+                    seg = shm_pkg.SharedMemory(name=key)
+                    seg.close()
+                    seg.unlink()
+                    logger.debug("cleanup: unlinked unconsumed SHM segment %s", key)
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    logger.debug("cleanup: failed to unlink SHM segment %s: %s", key, e)
             lock_file = _get_lock_file(key)
             if os.path.exists(lock_file):
                 try:
@@ -227,12 +252,18 @@ class SharedMemoryConnector(OmniConnectorBase):
     def close(self) -> None:
         """Unlink all remaining tracked SHM segments."""
         for key in list(self._pending_keys):
-            try:
-                seg = shm_pkg.SharedMemory(name=key)
-                seg.close()
-                seg.unlink()
-            except Exception:
-                pass
+            if sys.platform == "win32":
+                try:
+                    os.remove(windows_shm_payload_path(key))
+                except Exception:
+                    pass
+            else:
+                try:
+                    seg = shm_pkg.SharedMemory(name=key)
+                    seg.close()
+                    seg.unlink()
+                except Exception:
+                    pass
             lock_file = _get_lock_file(key)
             if os.path.exists(lock_file):
                 try:

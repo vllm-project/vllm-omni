@@ -551,6 +551,94 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
     assert args[1] == "ext-s1"
 
 
+def test_generation_scheduler_keeps_nonterminal_async_chunk_unfinished(mocker: MockerFixture):
+    """A consumed async chunk should emit output without terminal finish_reason.
+
+    The upstream stream may have more chunks, so the request must move back to
+    WAITING_FOR_CHUNK instead of being freed as FINISHED_STOPPED.
+    """
+    cleanup_calls = []
+
+    adapter_mock = mocker.MagicMock()
+    adapter_mock.finished_requests = set()
+    adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
+
+    from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+
+    scheduler = mocker.MagicMock()
+    scheduler.chunk_transfer_adapter = adapter_mock
+    scheduler.connector = None
+    scheduler.ec_connector = None
+    scheduler.perf_metrics = None
+    scheduler.log_stats = False
+    scheduler.recompute_kv_load_failures = False
+    scheduler.structured_output_manager = mocker.MagicMock()
+    scheduler.structured_output_manager.should_advance.return_value = False
+    scheduler.finished_req_ids_dict = {}
+    scheduler.kv_cache_manager.take_events.return_value = None
+    scheduler.kv_event_publisher = mocker.MagicMock()
+    scheduler._pending_finish_reqs = []
+
+    request = _HashableRequest(
+        request_id="req-chunk",
+        external_req_id="ext-chunk",
+        status=RequestStatus.RUNNING,
+        is_finished=lambda: False,
+        num_computed_tokens=16,
+        num_prompt_tokens=16,
+        prompt_token_ids=list(range(16)),
+        num_output_placeholders=0,
+        sampling_params=None,
+        pooling_params=None,
+        stop_reason=None,
+        client_index=0,
+        take_events=lambda: [],
+        trace_headers=None,
+        has_encoder_inputs=False,
+        take_prefill_stats=lambda: None,
+        num_nans_in_logits=0,
+        get_finished_reason=lambda: "stop",
+    )
+    scheduler.requests = {"req-chunk": request}
+    scheduler.running = [request]
+    scheduler.waiting = mocker.MagicMock()
+    scheduler.waiting.remove_requests = mocker.MagicMock()
+    scheduler.make_stats = mocker.MagicMock(return_value=None)
+    scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
+    scheduler._free_request = mocker.MagicMock(return_value=None)
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"req-chunk": 16},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+    )
+    model_runner_output = SimpleNamespace(
+        sampled_token_ids=None,
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[{"audio": torch.ones(4)}],
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        req_id_to_index={"req-chunk": 0},
+        routed_experts_dict=None,
+    )
+
+    result = OmniGenerationScheduler.update_from_output(scheduler, scheduler_output, model_runner_output)
+
+    assert request.status == RequestStatus.WAITING_FOR_CHUNK
+    scheduler._handle_stopped_request.assert_not_called()
+    scheduler._free_request.assert_not_called()
+    assert cleanup_calls == []
+    assert scheduler.running == [request]
+
+    eco = result[0]
+    assert len(eco.outputs) == 1
+    assert eco.outputs[0].request_id == "req-chunk"
+    assert eco.outputs[0].finish_reason is None
+    assert torch.equal(eco.outputs[0].pooling_output["audio"], torch.ones(4))
+
+
 def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerFixture):
     """OmniARScheduler should enqueue save; adapter cleanup is handled in save thread."""
     cleanup_calls = []

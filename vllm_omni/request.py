@@ -1,12 +1,13 @@
 from collections.abc import Callable
 from dataclasses import dataclass
+from inspect import signature
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sampling_params import SamplingParams
-from vllm.v1.request import Request
+from vllm.v1.request import Request as BaseRequest
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
@@ -14,7 +15,7 @@ if TYPE_CHECKING:
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreRequest, PromptEmbedsPayload
 
 
-class OmniRequest(Request):
+class OmniRequest(BaseRequest):
     """Request class for omni models, extending the base Request.
 
     This class extends the base vLLM Request with support for prompt
@@ -75,29 +76,34 @@ class OmniRequest(Request):
         Returns:
             OmniRequest instance created from the engine core request
         """
-        return cls(
-            request_id=request.request_id,
+        kwargs = {
+            "request_id": request.request_id,
             # Optional external request ID for tracking
-            external_req_id=request.external_req_id,
-            client_index=request.client_index,
-            prompt_token_ids=request.prompt_token_ids,
-            prompt_embeds=request.prompt_embeds,
-            prompt_is_token_ids=request.prompt_is_token_ids,
-            mm_features=request.mm_features,
-            sampling_params=request.sampling_params,
-            pooling_params=request.pooling_params,
-            arrival_time=request.arrival_time,
-            lora_request=request.lora_request,
-            cache_salt=request.cache_salt,
-            priority=request.priority,
-            trace_headers=request.trace_headers,
-            block_hasher=block_hasher,
-            additional_information=request.additional_information,
-            resumable=request.resumable,
-            reasoning_ended=request.reasoning_ended,
-            reasoning_parser_kwargs=request.reasoning_parser_kwargs,
-            abort_immediately=request.abort_immediately,
-        )
+            "external_req_id": request.external_req_id,
+            "client_index": request.client_index,
+            "prompt_token_ids": request.prompt_token_ids,
+            "prompt_embeds": request.prompt_embeds,
+            "prompt_is_token_ids": getattr(request, "prompt_is_token_ids", None),
+            "mm_features": request.mm_features,
+            "sampling_params": request.sampling_params,
+            "pooling_params": request.pooling_params,
+            "arrival_time": request.arrival_time,
+            "lora_request": request.lora_request,
+            "cache_salt": request.cache_salt,
+            "priority": request.priority,
+            "trace_headers": request.trace_headers,
+            "block_hasher": block_hasher,
+            "additional_information": request.additional_information,
+            "resumable": request.resumable,
+            "reasoning_ended": request.reasoning_ended,
+            "reasoning_parser_kwargs": getattr(request, "reasoning_parser_kwargs", None),
+            "abort_immediately": getattr(request, "abort_immediately", False),
+        }
+        params = set(signature(BaseRequest.__init__).parameters) | {
+            "external_req_id",
+            "additional_information",
+        }
+        return cls(**{key: value for key, value in kwargs.items() if key in params})
 
 
 @dataclass

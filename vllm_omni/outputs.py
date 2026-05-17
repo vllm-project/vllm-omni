@@ -48,6 +48,7 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     """
 
     multimodal_outputs: dict[str, torch.Tensor] | None = None
+    routed_experts_dict: dict[str, Any] | None = None
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
@@ -146,7 +147,7 @@ class OmniRequestOutput:
             stage_id=stage_id,
             final_output_type=final_output_type,
             request_output=request_output,
-            finished=True,
+            finished=bool(getattr(request_output, "finished", True)),
         )
 
     @classmethod

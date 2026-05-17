@@ -237,7 +237,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.input_coordinator.restore_queues(self.waiting, self.running)
         try:
             # Late import to avoid circulars in some launch modes
-            from .output import OmniNewRequestData
+            from .output import OmniNewRequestData, filter_new_request_data_kwargs
 
             # Rewrap base NewRequestData entries with OmniNewRequestData,
             # enriching with request-level payloads
@@ -246,21 +246,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 req_id = getattr(nr, "req_id", None)
                 request = self.requests.get(req_id) if req_id else None
                 # Build omni entry preserving all base fields
-                omni_nr = OmniNewRequestData(
-                    req_id=nr.req_id,
-                    external_req_id=(getattr(request, "external_req_id", None) if request else None),
-                    prompt_token_ids=nr.prompt_token_ids,
-                    mm_features=nr.mm_features,
-                    sampling_params=nr.sampling_params,
-                    pooling_params=nr.pooling_params,
-                    block_ids=nr.block_ids,
-                    num_computed_tokens=nr.num_computed_tokens,
-                    lora_request=nr.lora_request,
+                kwargs = {
+                    "req_id": nr.req_id,
+                    "external_req_id": (getattr(request, "external_req_id", None) if request else None),
+                    "prompt_token_ids": nr.prompt_token_ids,
+                    "mm_features": nr.mm_features,
+                    "sampling_params": nr.sampling_params,
+                    "pooling_params": nr.pooling_params,
+                    "block_ids": nr.block_ids,
+                    "num_computed_tokens": nr.num_computed_tokens,
+                    "lora_request": nr.lora_request,
                     # Enrich with omni payloads from the live request object
-                    prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
-                    prompt_is_token_ids=nr.prompt_is_token_ids,
-                    additional_information=(getattr(request, "additional_information", None) if request else None),
-                )
+                    "prompt_embeds": (getattr(request, "prompt_embeds", None) if request else None),
+                    "prompt_is_token_ids": getattr(nr, "prompt_is_token_ids", None),
+                    "additional_information": (getattr(request, "additional_information", None) if request else None),
+                }
+                omni_nr = OmniNewRequestData(**filter_new_request_data_kwargs(OmniNewRequestData, kwargs))
                 new_list.append(omni_nr)
 
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
