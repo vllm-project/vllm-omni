@@ -14,30 +14,30 @@ if [[ -z "$RELEASE_VERSION" ]]; then
 fi
 echo "Release version: $RELEASE_VERSION"
 
-# if [[ -z "$PYPI_TOKEN" ]]; then
-#   echo "[FATAL] PYPI_TOKEN is not set."
-#   exit 1
-# else
-#   export TWINE_USERNAME="__token__"
-#   export TWINE_PASSWORD="$PYPI_TOKEN"
-# fi
+if [[ -z "$PYPI_TOKEN" ]]; then
+  echo "[FATAL] PYPI_TOKEN is not set."
+  exit 1
+else
+  export TWINE_USERNAME="__token__"
+  export TWINE_PASSWORD="$PYPI_TOKEN"
+fi
 
 set -x
 
-ALL_DIR=/tmp/vllm-omni-release-all
+if ! command -v uv &> /dev/null; then
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+
+uv venv --python 3.12 /tmp/vllm-omni-release-env
+source /tmp/vllm-omni-release-env/bin/activate
+uv pip install twine
+
 DIST_DIR=/tmp/vllm-omni-release-dist
-mkdir -p "$ALL_DIR" "$DIST_DIR"
+mkdir -p "$DIST_DIR"
 
-echo "========================================"
-echo "All wheels in S3 (no filters):"
-echo "========================================"
-aws s3 cp --recursive "$S3_COMMIT_PREFIX" "$ALL_DIR"
-ls -la "$ALL_DIR"
-
-echo ""
-echo "========================================"
-echo "Filtered wheels (include: vllm_omni-${RELEASE_VERSION}*.whl, exclude: *dev*):"
-echo "========================================"
+echo "Downloading wheels from S3:"
+aws s3 ls "$S3_COMMIT_PREFIX"
 aws s3 cp --recursive --exclude "*" --include "vllm_omni-${RELEASE_VERSION}*.whl" --exclude "*dev*" "$S3_COMMIT_PREFIX" "$DIST_DIR"
 ls -la "$DIST_DIR"
 
@@ -47,12 +47,6 @@ if [[ -z "$PYPI_WHEEL_FILES" ]]; then
   exit 1
 fi
 
-echo ""
-echo "========================================"
-echo "Wheels that would be uploaded to PyPI:"
-echo "========================================"
-echo "$PYPI_WHEEL_FILES"
-
-# python3 -m twine check $PYPI_WHEEL_FILES
-# python3 -m twine upload --non-interactive --verbose $PYPI_WHEEL_FILES
-# echo "Wheels uploaded to PyPI"
+python3 -m twine check $PYPI_WHEEL_FILES
+python3 -m twine upload --non-interactive --verbose $PYPI_WHEEL_FILES
+echo "Wheels uploaded to PyPI"
