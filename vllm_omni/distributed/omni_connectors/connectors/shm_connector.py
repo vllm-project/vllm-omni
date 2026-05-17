@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import fcntl
 import os
+import sys
+import tempfile
+from contextlib import contextmanager
 from multiprocessing import shared_memory as shm_pkg
 from typing import Any
 
@@ -12,6 +14,43 @@ from ..utils.logging import get_connector_logger
 from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
+
+def _get_lock_dir() -> str:
+    if sys.platform == "win32":
+        lock_dir = os.path.join(tempfile.gettempdir(), "vllm_omni_shm")
+        os.makedirs(lock_dir, exist_ok=True)
+        return lock_dir
+    return "/dev/shm"
+
+
+def _get_lock_file(key: str) -> str:
+    return os.path.join(_get_lock_dir(), f"shm_{key}_lockfile.lock")
+
+
+@contextmanager
+def _exclusive_file_lock(lock_file: str):
+    with open(lock_file, "wb+") as lockf:
+        if sys.platform == "win32":
+            lockf.write(b"\0")
+            lockf.flush()
+            lockf.seek(0)
+            msvcrt.locking(lockf.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(lockf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if sys.platform == "win32":
+                lockf.seek(0)
+                msvcrt.locking(lockf.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lockf, fcntl.LOCK_UN)
 
 
 class SharedMemoryConnector(OmniConnectorBase):
@@ -56,11 +95,9 @@ class SharedMemoryConnector(OmniConnectorBase):
             # Currently, we always use SHM.
             if True:
                 # Use Shared Memory
-                lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
-                with open(lock_file, "wb+") as lockf:
-                    fcntl.flock(lockf, fcntl.LOCK_EX)
+                lock_file = _get_lock_file(put_key)
+                with _exclusive_file_lock(lock_file):
                     meta = shm_write_bytes(payload, name=put_key)
-                    fcntl.flock(lockf, fcntl.LOCK_UN)
 
                 # meta contains {'name': ..., 'size': ...}
                 metadata = {"shm": meta, "size": size}
@@ -85,10 +122,8 @@ class SharedMemoryConnector(OmniConnectorBase):
     def _get_data_with_lock(self, lock_file: str, shm_handle: dict):
         obj = None
         try:
-            with open(lock_file, "rb+") as lockf:
-                fcntl.flock(lockf, fcntl.LOCK_EX)
+            with _exclusive_file_lock(lock_file):
                 data_bytes = shm_read_bytes(shm_handle)
-                fcntl.flock(lockf, fcntl.LOCK_UN)
             obj = self.deserialize_obj(data_bytes)
             return obj, int(shm_handle.get("size", 0))
         except Exception as e:
@@ -106,7 +141,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             shm = shm_pkg.SharedMemory(name=get_key)
             if shm is None or shm.size == 0:
                 return None
-            lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
+            lock_file = _get_lock_file(get_key)
             shm_handle = {"name": get_key, "size": shm.size}
             result = self._get_data_with_lock(lock_file, shm_handle)
             if result is not None:
@@ -146,7 +181,7 @@ class SharedMemoryConnector(OmniConnectorBase):
 
             if "shm" in metadata:
                 shm_handle = metadata["shm"]
-                lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
+                lock_file = _get_lock_file(shm_handle["name"])
                 result = self._get_data_with_lock(lock_file, shm_handle)
                 if result is not None:
                     self._pending_keys.discard(get_key)
@@ -182,7 +217,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                 pass
             except Exception as e:
                 logger.debug("cleanup: failed to unlink SHM segment %s: %s", key, e)
-            lock_file = f"/dev/shm/shm_{key}_lockfile.lock"
+            lock_file = _get_lock_file(key)
             if os.path.exists(lock_file):
                 try:
                     os.remove(lock_file)
@@ -198,7 +233,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                 seg.unlink()
             except Exception:
                 pass
-            lock_file = f"/dev/shm/shm_{key}_lockfile.lock"
+            lock_file = _get_lock_file(key)
             if os.path.exists(lock_file):
                 try:
                     os.remove(lock_file)

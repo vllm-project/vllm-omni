@@ -8,6 +8,7 @@ busy loop in a subprocess, communicating with StageEngineCoreClient via ZMQ.
 from __future__ import annotations
 
 import signal
+import sys
 from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING, Any
 
@@ -177,7 +178,8 @@ def _perform_handshake(
     with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
         poller = zmq.Poller()
         poller.register(handshake_socket, zmq.POLLIN)
-        poller.register(proc.sentinel, zmq.POLLIN)
+        if sys.platform != "win32":
+            poller.register(proc.sentinel, zmq.POLLIN)
 
         identity, msg = _recv(poller, handshake_socket, proc, "HELLO", handshake_timeout)
         if msg.get("status") != "HELLO":
@@ -209,6 +211,8 @@ def _recv(
     while True:
         events = dict(poller.poll(timeout=timeout_ms))
         if not events:
+            if proc.exitcode is not None:
+                raise RuntimeError(f"StageEngineCoreProc died during {expected} (exit code {proc.exitcode})")
             raise TimeoutError(
                 f"Timed out waiting for {expected} from StageEngineCoreProc after {timeout_s}s. "
                 f"This typically indicates model loading or initialization is taking too long. "
