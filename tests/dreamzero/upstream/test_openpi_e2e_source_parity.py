@@ -4,8 +4,8 @@
 """Formal OpenPI end-to-end parity: upstream DreamZero server vs `vllm serve`.
 
 This test uses DreamZero's own client-side observation builders from
-`~/code/dreamzero/test_client_AR.py`, and client-side websocket protocol from
-`~/code/dreamzero/eval_utils/policy_client.py`.
+`${DREAMZERO_REPO}/test_client_AR.py`, and client-side websocket protocol from
+`${DREAMZERO_REPO}/eval_utils/policy_client.py`.
 
 The only client-side adaptation for vLLM is the websocket path:
 DreamZero's upstream server serves at `/`, while vLLM serves OpenPI at
@@ -39,8 +39,9 @@ import torch
 
 msgpack_numpy = pytest.importorskip("openpi_client.msgpack_numpy")
 
-DREAMZERO_REPO = Path(os.environ.get("DREAMZERO_REPO", "~/code/dreamzero")).expanduser()
-if str(DREAMZERO_REPO) not in sys.path:
+_DREAMZERO_REPO_ENV = os.environ.get("DREAMZERO_REPO")
+DREAMZERO_REPO = Path(_DREAMZERO_REPO_ENV).expanduser() if _DREAMZERO_REPO_ENV else None
+if DREAMZERO_REPO is not None and str(DREAMZERO_REPO) not in sys.path:
     sys.path.insert(0, str(DREAMZERO_REPO))
 
 try:
@@ -49,8 +50,9 @@ try:
 except Exception:  # pragma: no cover - guarded by pytest skip below
     dreamzero_client = None
     WebsocketClientPolicy = None
+_BaseWebsocketClientPolicy = WebsocketClientPolicy if WebsocketClientPolicy is not None else object
 
-CHECKPOINT_DIR = DREAMZERO_REPO / "checkpoints" / "dreamzero"
+CHECKPOINT_DIR = DREAMZERO_REPO / "checkpoints" / "dreamzero" if DREAMZERO_REPO is not None else None
 VLLM_MODEL = os.environ.get("VLLM_DREAMZERO_MODEL", "GEAR-Dreams/DreamZero-DROID")
 SERVICE_READY_TIMEOUT_S = int(os.environ.get("OPENPI_SERVICE_READY_TIMEOUT_S", "900"))
 PROMPT = "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan"
@@ -62,12 +64,17 @@ pytestmark = [
         dreamzero_client is None or WebsocketClientPolicy is None,
         reason="DreamZero client modules are required on PYTHONPATH",
     ),
-    pytest.mark.skipif(not DREAMZERO_REPO.exists(), reason="DreamZero source repo is required at ~/code/dreamzero"),
-    pytest.mark.skipif(not CHECKPOINT_DIR.exists(), reason="DreamZero local checkpoint is required"),
+    pytest.mark.skipif(
+        DREAMZERO_REPO is None or not DREAMZERO_REPO.exists(),
+        reason="DreamZero source repo is required at DREAMZERO_REPO",
+    ),
+    pytest.mark.skipif(
+        CHECKPOINT_DIR is None or not CHECKPOINT_DIR.exists(), reason="DreamZero local checkpoint is required"
+    ),
 ]
 
 
-class OpenPIWebsocketClientPolicy(WebsocketClientPolicy):
+class OpenPIWebsocketClientPolicy(_BaseWebsocketClientPolicy):
     """DreamZero client protocol with an OpenPI websocket path suffix."""
 
     def __init__(
