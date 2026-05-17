@@ -47,6 +47,7 @@ recipes/
 - [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md): online serving recipe for TTS on `1x A800 80GB`
 - [`audiox/AudioX.md`](./audiox/AudioX.md): offline + online recipe for AudioX
   unified text/video→audio diffusion on `1x L4 24GB`
+- [`K2-FSA/OmniVoice.md`](./K2-FSA/OmniVoice.md): online serving recipe for multilingual TTS on `1x NVIDIA L20 48GB`
 
 Within a single recipe file, include different hardware support sections such
 as `GPU`, `ROCm`, and `NPU`, and add concrete tested configurations like
