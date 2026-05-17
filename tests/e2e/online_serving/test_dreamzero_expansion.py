@@ -112,8 +112,9 @@ def _write_synthetic_dreamzero_videos(client_mod, video_dir: Path) -> None:
         _write_synthetic_video(video_dir / file_name, client_mod.cv2, channel=channel)
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @pytest.mark.diffusion
+@pytest.mark.distributed_cuda
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_dreamzero_openpi_online(omni_server, tmp_path: Path) -> None:
