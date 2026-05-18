@@ -807,14 +807,20 @@ class OmniStreamingVideoHandler:
         audio_data,
         chunks_drained: int,
     ) -> tuple[str | None, int]:
-        """Emit only tensors appended since the last call."""
-        # Single tensor: output_processor hands us one tensor before it becomes a
-        # list (see output_processor.py:89). Treat it as chunk #0.
+        # In DELTA mode the output processor pops the modality key after
+        # every emit (output_processor.py: _new_completion_output), so the
+        # single-tensor form is what we see on every step — not just the
+        # first one. We must encode every call and let chunks_drained grow
+        # monotonically; the previous `chunks_drained >= 1` guard caused
+        # all chunks after the first to be silently dropped.
         if not isinstance(audio_data, list):
-            if chunks_drained >= 1:
-                return None, chunks_drained
             tail_np = cls._tensor_to_1d_np(audio_data)
-            return cls._encode_tail(tail_np, chunks_drained, new_drained=1, is_first=True)
+            return cls._encode_tail(
+                tail_np,
+                chunks_drained,
+                new_drained=chunks_drained + 1,
+                is_first=(chunks_drained == 0),
+            )
 
         n = len(audio_data)
         if n <= chunks_drained:
