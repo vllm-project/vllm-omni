@@ -38,11 +38,13 @@ stages:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
       max_tokens: 2048
+      temperature: 1.0
       top_k: 25
       top_p: 0.8
-      # near-identity repetition penalty forces vLLM to track
-      # output_token_ids for RAS (stop-token logit logsumexp).
-      repetition_penalty: 1.0001
+      repetition_penalty: 2.0
+      stop_token_ids:
+        - 6562
+      detokenize: false
     disable_hybrid_kv_cache_manager: true
     mm_processor_cache_gb: 0
     skip_mm_profiling: true

@@ -14,6 +14,7 @@ For the full list of supported architectures across all modalities, see
 
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 |---|---|---|---|---|---|
+| CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM + WebSocket) | upload | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | — (caption-controlled) | — | caption fields (`instructions`) | — |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
@@ -22,8 +23,6 @@ For the full list of supported architectures across all modalities, see
 | VoxCPM | `openbmb/VoxCPM-0.5B` | ✓ | ✓ (PCM stream) | — | — |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
-
-CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
 
 ## Common Quick Start
 
@@ -92,6 +91,95 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 Adjust the player's sample rate to match the model (44.1 kHz for Fish Speech, 48 kHz for VoxCPM2, 24 kHz for the others).
 
 For full request-shape documentation (all parameters, response formats, error codes), see the [Speech API reference](../../../docs/serving/speech_api.md).
+
+---
+
+## CosyVoice3
+
+2-stage TTS pipeline (`talker` + `code2wav`) at 24 kHz. Online serving uses voice cloning: every request must provide `ref_audio` and `ref_text`.
+
+The upstream zero-shot prompt audio should be paired with the full prompt text shown below. Dropping the `You are a helpful assistant.<|endofprompt|>` prefix changes the conditioning prompt.
+
+### Launch
+```bash
+vllm-omni serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+    --tokenizer FunAudioLLM/Fun-CosyVoice3-0.5B-2512/CosyVoice-BlankEN \
+    --deploy-config vllm_omni/deploy/cosyvoice3.yaml \
+    --trust-remote-code \
+    --omni \
+    --port 8091
+# or:
+./cosyvoice3/run_server.sh
+```
+
+`vllm_omni/deploy/cosyvoice3.yaml` defaults to `async_chunk: true`. Pass `--no-async-chunk` or run `./cosyvoice3/run_server.sh sync` for the legacy synchronous code2wav path.
+
+Stage-0 sampling defaults intentionally match the CosyVoice3 reference setup: `temperature=1.0`, `top_p=0.8`, `top_k=25`, `repetition_penalty=2.0`, `stop_token_ids=[6562]`, with `min_tokens` and `max_tokens` set per request from the text length. No-stop stress settings are not equivalent to this baseline.
+
+### Sending requests
+```bash
+python cosyvoice3/speech_client.py \
+    --text "CosyVoice is undergoing a comprehensive upgrade." \
+    --ref-audio https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav \
+    --ref-text "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。" \
+    --output cosyvoice3_output.wav
+```
+
+Equivalent curl request:
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "CosyVoice is undergoing a comprehensive upgrade.",
+        "ref_audio": "https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav",
+        "ref_text": "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。",
+        "response_format": "wav"
+    }' --output cosyvoice3_output.wav
+```
+
+### Streaming PCM
+```bash
+python cosyvoice3/speech_client.py \
+    --text "CosyVoice can stream audio chunks over HTTP." \
+    --ref-audio https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav \
+    --ref-text "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。" \
+    --stream \
+    --output cosyvoice3_output.pcm
+```
+
+For direct playback:
+```bash
+curl -s -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "input": "CosyVoice can stream audio chunks over HTTP.",
+        "ref_audio": "https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav",
+        "ref_text": "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。",
+        "stream": true,
+        "response_format": "pcm"
+    }' --no-buffer | play -t raw -r 24000 -e signed -b 16 -c 1 -
+```
+
+### Streaming WebSocket
+The `/v1/audio/speech/stream` endpoint accepts text incrementally, splits it at sentence boundaries, and emits one audio stream per sentence:
+```bash
+python cosyvoice3/streaming_speech_client.py \
+    --text "CosyVoice streams sentence by sentence. This is the second sentence." \
+    --ref-audio https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav \
+    --ref-text "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。"
+
+python cosyvoice3/streaming_speech_client.py \
+    --text "CosyVoice streams sentence by sentence. This is the second sentence." \
+    --ref-audio https://raw.githubusercontent.com/FunAudioLLM/CosyVoice/main/asset/zero_shot_prompt.wav \
+    --ref-text "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。" \
+    --response-format pcm \
+    --stream-audio
+```
+
+### Notes
+- Output is 24 kHz mono.
+- `--stream-audio` on the WebSocket client requires `--response-format pcm`.
+- For offline reference inference and local snapshot notes, see the [offline CosyVoice3 section](../../offline_inference/text_to_speech/README.md#cosyvoice3).
 
 ---
 
