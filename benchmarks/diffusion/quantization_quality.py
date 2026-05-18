@@ -212,8 +212,17 @@ def _generate_video(omni, args, prompt, seed):
         else:
             frames = inner
     elif hasattr(first, "images") and first.images:
-        frames = first.images
+        frames = first.images[0]
     else:
+        raise ValueError("Could not extract video frames from output.")
+
+    # LTX-2 (and similar audio+video models) may surface a dict or (video, audio) tuple
+    if isinstance(frames, dict):
+        frames = frames.get("video") or frames.get("frames")
+    elif isinstance(frames, tuple) and len(frames) == 2:
+        frames = frames[0]
+
+    if frames is None:
         raise ValueError("Could not extract video frames from output.")
 
     if isinstance(frames, torch.Tensor):
@@ -233,9 +242,11 @@ def _generate_video(omni, args, prompt, seed):
     return frames_array, elapsed, peak_mem
 
 
-def _unload_omni(omni):
-    """Delete Omni instance and free GPU memory."""
-    del omni
+def _free_gpu_memory():
+    """Force GC and release cached GPU memory.
+
+    Must be called AFTER the caller has dropped (i.e., via `del`)
+    every reference to the Omni instance"""
     gc.collect()
     if torch.cuda.is_available():
         torch.accelerator.empty_cache()
@@ -275,7 +286,9 @@ def run_benchmark(args):
 
     bl_avg_time = np.mean([v[1] for v in baseline_outputs.values()])
     bl_mem = baseline_outputs[prompts[0]][2]  # use first prompt's memory
-    _unload_omni(omni_bl)
+    omni_bl.shutdown()
+    del omni_bl
+    _free_gpu_memory()
 
     # Save baseline outputs
     bl_dir = output_dir / "baseline"
@@ -315,7 +328,9 @@ def run_benchmark(args):
 
         qt_avg_time = np.mean([v[1] for v in qt_outputs.values()])
         qt_mem = qt_outputs[prompts[0]][2]
-        _unload_omni(omni_qt)
+        omni_qt.shutdown()
+        del omni_qt
+        _free_gpu_memory()
 
         # Save quantized outputs
         qt_dir = output_dir / config_label.replace(" ", "_")
