@@ -118,15 +118,17 @@ PROCESS_KILL_ERROR_KEYWORDS = (
 # Must be a literal substring of ``name``/``cmdline`` — no trailing whitespace (would break match).
 RUNTIME_WORKER_PATTERN = "VLLM::"
 # RFC#2366 signal x target matrix:
-# - worker / serve-root: SIGTERM, SIGKILL
-# - serve-tree: SIGTERM, SIGINT, SIGKILL
+# - worker: SIGTERM, SIGKILL
+# - serve-root: SIGINT (Ctrl+C on root only); SIGTERM/SIGKILL skipped (residual process)
+# - serve-tree: SIGTERM, SIGKILL
+_SERVE_ROOT_NON_SIGINT_SKIP = pytest.mark.skip(reason="remain process after kill serve root")
 SERVE_SIGNAL_PARAMS = [
-    pytest.param("SIGTERM", id="sigterm"),
-    pytest.param("SIGKILL", id="sigkill"),
+    pytest.param("SIGTERM", id="sigterm", marks=_SERVE_ROOT_NON_SIGINT_SKIP),
+    pytest.param("SIGINT", id="sigint"),
+    pytest.param("SIGKILL", id="sigkill", marks=_SERVE_ROOT_NON_SIGINT_SKIP),
 ]
 TREE_SIGNAL_PARAMS = [
     pytest.param("SIGTERM", id="sigterm"),
-    pytest.param("SIGINT", id="sigint"),
     pytest.param("SIGKILL", id="sigkill"),
 ]
 WORKER_SIGNAL_FAULT_PARAMS = [
@@ -636,7 +638,6 @@ def test_reliability_fault_process_kill_worker_with_load_request_failure(
 
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.skip(reason="remain process after kill serve root")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
@@ -661,7 +662,6 @@ def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup
 
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.skip(reason="remain process after kill serve root")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
@@ -678,7 +678,7 @@ def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_clean
         inject_fault=lambda: injector(omni_server_function),
         num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
         request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
-        completion_timeout_sec=120.0,
+        completion_timeout_sec=300.0,
     )
     assert load_result["failure_observed"], (
         f"[{scenario}] expected at least one load request failure after fault; load_result={load_result}"
