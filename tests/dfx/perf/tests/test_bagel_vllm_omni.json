@@ -1,7 +1,7 @@
 [
   {
-    "test_name": "test_bagel_single_device_single_stage",
-    "description": "Single-device baseline: single-stage BAGEL (TP=1, CFG=1), t2i + i2i",
+    "test_name": "test_bagel_single_device_single_stage_t2i",
+    "description": "Single-stage BAGEL (TP=1, CFG=1), t2i only — dedicated server",
     "server_type": "vllm-omni",
     "server_params": {
       "model": "ByteDance-Seed/BAGEL-7B-MoT",
@@ -33,7 +33,27 @@
           "peak_memory_mb_max": 32324.6,
           "peak_memory_mb_mean": 32323.5
         }
-      },
+      }
+    ]
+  },
+  {
+    "test_name": "test_bagel_single_device_single_stage_i2i",
+    "description": "Single-stage BAGEL (TP=1, CFG=1), i2i only — dedicated server",
+    "server_type": "vllm-omni",
+    "server_params": {
+      "model": "ByteDance-Seed/BAGEL-7B-MoT",
+      "serve_args": {
+        "enable-diffusion-pipeline-profiler": true,
+        "deploy-config": "../vllm_omni/deploy/bagel_single_stage.yaml",
+        "no-async-chunk": true,
+        "tensor-parallel-size": 1,
+        "cfg-parallel-size": 1,
+        "gpu-memory-utilization": 0.90,
+        "max-model-len": 8192,
+        "max-num-batched-tokens": 9216
+      }
+    },
+    "benchmark_params": [
       {
         "name": "512x512_i2i_steps20",
         "dataset": "random",
@@ -55,8 +75,8 @@
     ]
   },
   {
-    "test_name": "test_bagel_single_device_multi_stage",
-    "description": "Two-stage BAGEL (bagel.yaml), TP=1, CFG=1, t2i + i2i",
+    "test_name": "test_bagel_single_device_multi_stage_t2i",
+    "description": "Two-stage BAGEL (bagel.yaml), TP=1, CFG=1, t2i only — dedicated server",
     "server_type": "vllm-omni",
     "server_params": {
       "model": "ByteDance-Seed/BAGEL-7B-MoT",
@@ -88,7 +108,27 @@
           "peak_memory_mb_max": 32318.0,
           "peak_memory_mb_mean": 32318.0
         }
-      },
+      }
+    ]
+  },
+  {
+    "test_name": "test_bagel_single_device_multi_stage_i2i",
+    "description": "Two-stage BAGEL (bagel.yaml), TP=1, CFG=1, i2i only — dedicated server",
+    "server_type": "vllm-omni",
+    "server_params": {
+      "model": "ByteDance-Seed/BAGEL-7B-MoT",
+      "serve_args": {
+        "enable-diffusion-pipeline-profiler": true,
+        "deploy-config": "../vllm_omni/deploy/bagel.yaml",
+        "no-async-chunk": true,
+        "tensor-parallel-size": 1,
+        "cfg-parallel-size": 1,
+        "gpu-memory-utilization": 0.45,
+        "max-model-len": 8192,
+        "max-num-batched-tokens": 9216
+      }
+    },
+    "benchmark_params": [
       {
         "name": "512x512_i2i_steps20",
         "dataset": "random",
