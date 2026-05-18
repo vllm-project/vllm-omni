@@ -528,18 +528,19 @@ async def build_async_omni_from_stage_config(
 
     async_omni: EngineClient | None = None
 
-    # Pre-load the model config so that HuggingFace registers
-    # `transformers_modules` in this process. Stage workers use
-    # trust_remote_code via their YAML engine_args, but the API server
-    # process also needs the dynamic modules for ZMQ pickle deserialization
-    # (e.g. for trust_remote_code models like MiniCPM-o).
-    # Hide GPUs to prevent the custom config code from allocating CUDA memory.
-    if hasattr(args, "model") and args.model:
+    # Pre-load the model config so HuggingFace registers `transformers_modules`
+    # in this process — only when the user has explicitly opted in via
+    # `--trust-remote-code`. Stage workers consume the same flag through their
+    # deploy config, but the API server process also needs the dynamic modules
+    # for ZMQ pickle deserialization of stage outputs that reference them
+    # (e.g. trust_remote_code models like MiniCPM-o).
+    if getattr(args, "trust_remote_code", False) and getattr(args, "model", None):
         try:
             import os
 
             from transformers import AutoConfig
 
+            # Hide GPUs so the custom config code doesn't allocate CUDA memory.
             saved = os.environ.get("CUDA_VISIBLE_DEVICES")
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
             try:
@@ -549,8 +550,8 @@ async def build_async_omni_from_stage_config(
                     os.environ["CUDA_VISIBLE_DEVICES"] = saved
                 else:
                     os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Pre-loading transformers_modules failed: %s", e)
 
     try:
         kwargs = vars(args).copy()
