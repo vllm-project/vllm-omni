@@ -21,9 +21,11 @@ from dataclasses import replace
 import PIL.Image
 import torch
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
@@ -40,7 +42,10 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
-def create_vace_transformer_from_config(config: dict) -> WanVACETransformer3DModel:
+def create_vace_transformer_from_config(
+    config: dict,
+    quant_config: QuantizationConfig | None = None,
+) -> WanVACETransformer3DModel:
     """Create WanVACETransformer3DModel from config dict."""
     kwargs = {}
     if "patch_size" in config:
@@ -77,6 +82,8 @@ def create_vace_transformer_from_config(config: dict) -> WanVACETransformer3DMod
         kwargs["vace_layers"] = config["vace_layers"]
     if "vace_in_channels" in config:
         kwargs["vace_in_channels"] = config["vace_in_channels"]
+    if quant_config is not None:
+        kwargs["quant_config"] = quant_config
 
     return WanVACETransformer3DModel(**kwargs)
 
@@ -173,8 +180,9 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         super().__init__(od_config=od_config, prefix=prefix)
 
     def _create_transformer(self, config: dict) -> WanVACETransformer3DModel:
-        """Build VACE transformer directly from config dict."""
-        return create_vace_transformer_from_config(config)
+        """Build VACE transformer. Respects od_config.quantization_config."""
+        quant_config = getattr(self.od_config, "quantization_config", None)
+        return create_vace_transformer_from_config(config, quant_config=quant_config)
 
     def diffuse(
         self,
@@ -188,9 +196,13 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         vace_context: torch.Tensor | None,
         vace_context_scale: float,
     ) -> torch.Tensor:
+        if attention_kwargs is None:
+            attention_kwargs = {}
         with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
+            for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
+                set_forward_context_denoise_step_idx(step_idx)
+
                 latent_model_input = latents.to(dtype)
                 timestep = t.expand(latents.shape[0])
 

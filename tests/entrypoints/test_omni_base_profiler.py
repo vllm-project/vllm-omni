@@ -1,5 +1,7 @@
 """Unit tests for OmniBase and AsyncOmni profiler methods."""
 
+from types import SimpleNamespace
+
 import pytest
 from pytest_mock import MockerFixture
 
@@ -16,10 +18,10 @@ class TestOmniBaseProfiler:
         engine.num_stages = 3
         engine.is_alive.return_value = True
         engine.default_sampling_params_list = [mocker.MagicMock() for _ in range(3)]
-        engine.get_stage_metadata.side_effect = lambda i: {
-            "final_output_type": "text" if i == 0 else "audio",
-            "final_output": True,
-        }
+        engine.get_stage_metadata.side_effect = lambda i: SimpleNamespace(
+            final_output_type="text" if i == 0 else "audio",
+            final_output=True,
+        )
         engine.collective_rpc.return_value = [None, None, None]
         return engine
 

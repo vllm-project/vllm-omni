@@ -24,17 +24,16 @@ import torch
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.logger import init_logger
 
+from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.payload_span import (
-    THINKER_DECODE_EMBEDDINGS_KEY,
-    THINKER_DECODE_TOKEN_END_KEY,
-    THINKER_DECODE_TOKEN_START_KEY,
-    THINKER_OUTPUT_TOKEN_IDS_KEY,
     get_tensor_span,
     merge_tensor_spans,
 )
+
+_EMBED_SPAN_GROUPS: tuple[tuple[str, str, str], ...] = (("decode", "decode_token_start", "decode_token_end"),)
 
 if TYPE_CHECKING:
     from vllm_omni.distributed.omni_connectors.connectors.base import (
@@ -154,7 +153,7 @@ class OmniConnectorModelRunnerMixin:
 
         # -- full_payload_mode: accumulate latest pooler_output per request,
         #    send only when the request finishes (next-cycle flush) --
-        self._pending_full_payload_send: dict[str, tuple[Any, Any]] = {}
+        self._pending_full_payload_send: dict[str, tuple[Any, ...]] = {}
 
         # -- KV sent accumulator --
         self._kv_sent_req_ids: list[str] = []
@@ -207,21 +206,33 @@ class OmniConnectorModelRunnerMixin:
         """Clean up per-request state after a request is fully finished.
 
         Call this when a request is freed from the model runner to prevent
-        memory leaks in the mixin's tracking dicts/sets.  The external
-        request ID is resolved before cleaning up ``_put_req_chunk`` which
-        is keyed by external ID.
+        memory leaks in the mixin's tracking dicts/sets.
+
+        Two senders use different keys: ``send_chunk`` keys per-request
+        state under the EXTERNAL id (after mapping resolution), while
+        ``send_full_payload_outputs`` keys under the INTERNAL id. To cover
+        both modes (and forward compat with id-rename scenarios) we attempt
+        cleanup against both keys; the entry that doesn't exist for the
+        active mode is a no-op pop.  Only the key that actually has pending
+        saves is added to ``_deferred_send_cleanup`` so the bg save's
+        decrement path drains it without leaving orphans.
         """
         ext_id = self._request_ids_mapping.pop(req_id, None)
-        send_req_id = ext_id if ext_id is not None else req_id
+        keys_to_clean: list[str] = [req_id]
+        if ext_id is not None and ext_id != req_id:
+            keys_to_clean.append(ext_id)
 
         with self._lock:
-            if self._pending_save_counts.get(send_req_id, 0):
-                self._deferred_send_cleanup.add(send_req_id)
-            else:
-                self._put_req_chunk.pop(send_req_id, None)
-                self._send_side_request_payload.pop(send_req_id, None)
-                self._code_prompt_token_ids.pop(send_req_id, None)
-                self._cached_ic.pop(send_req_id, None)
+            keys_pending = [k for k in keys_to_clean if self._pending_save_counts.get(k, 0)]
+            for k in keys_pending:
+                self._deferred_send_cleanup.add(k)
+            for k in keys_to_clean:
+                if k in keys_pending:
+                    continue
+                self._put_req_chunk.pop(k, None)
+                self._send_side_request_payload.pop(k, None)
+                self._code_prompt_token_ids.pop(k, None)
+                self._cached_ic.pop(k, None)
             self._kv_pending_transfers.pop(req_id, None)
             self._kv_active_transfers.discard(req_id)
             self._kv_completed_transfers.discard(req_id)
@@ -345,15 +356,15 @@ class OmniConnectorModelRunnerMixin:
     #  Local payload cache (RFC §2.4 – Model Runner ownership)
     # ------------------------------------------------------------------ #
 
-    def put_local_stage_payload(self, req_id: str, payload: dict[str, Any]) -> None:
+    def put_local_stage_payload(self, req_id: str, payload: OmniPayload) -> None:
         """Store a full stage payload in the local cache."""
         self._local_stage_payload_cache[req_id] = payload
 
-    def get_local_stage_payload(self, req_id: str) -> dict[str, Any] | None:
+    def get_local_stage_payload(self, req_id: str) -> OmniPayload | None:
         """Read a stage payload without removing it."""
         return self._local_stage_payload_cache.get(req_id)
 
-    def pop_local_stage_payload(self, req_id: str) -> dict[str, Any] | None:
+    def pop_local_stage_payload(self, req_id: str) -> OmniPayload | None:
         """Remove and return a stage payload (consume after use)."""
         return self._local_stage_payload_cache.pop(req_id, None)
 
@@ -370,29 +381,39 @@ class OmniConnectorModelRunnerMixin:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def _extract_scheduling_metadata(cls, payload: dict[str, Any]) -> dict[str, Any]:
+    def _extract_scheduling_metadata(cls, payload: OmniPayload) -> dict[str, Any]:
         """Extract only the fields the scheduler needs from a full payload."""
         extracted: dict[str, Any] = {}
-        if "next_stage_prompt_len" in payload:
+        meta = payload.get("meta") if isinstance(payload, dict) else None
+        meta = meta if isinstance(meta, dict) else {}
+
+        if "next_stage_prompt_len" in meta:
+            extracted["next_stage_prompt_len"] = meta["next_stage_prompt_len"]
+        elif "next_stage_prompt_len" in payload:
+            logger.warning_once(
+                "legacy flat 'next_stage_prompt_len' key in payload; expected 'meta.next_stage_prompt_len'"
+            )
             extracted["next_stage_prompt_len"] = payload["next_stage_prompt_len"]
+
         audio_codes = cls._payload_audio_codes(payload)
         if audio_codes is not None:
             extracted["code_predictor_codes"] = audio_codes
-        meta = payload.get("meta")
-        if isinstance(meta, dict) and "left_context_size" in meta:
+
+        if "left_context_size" in meta:
             extracted["left_context_size"] = meta["left_context_size"]
         elif "left_context_size" in payload:
             logger.warning_once("legacy flat 'left_context_size' key in payload; expected 'meta.left_context_size'")
+
         return extracted
 
-    _NON_CONSUMABLE_PAYLOAD_KEYS = {
-        "finished",
-        "override_keys",
-        "next_stage_prompt_len",
-        "left_context_size",
-        THINKER_OUTPUT_TOKEN_IDS_KEY,
-        THINKER_DECODE_TOKEN_START_KEY,
-        THINKER_DECODE_TOKEN_END_KEY,
+    _NON_CONSUMABLE_PAYLOAD_KEYS: set[tuple[str, str]] = {
+        ("meta", "finished"),
+        ("meta", "override_keys"),
+        ("meta", "next_stage_prompt_len"),
+        ("meta", "left_context_size"),
+        ("ids", "output"),
+        ("embed", "decode_token_start"),
+        ("embed", "decode_token_end"),
     }
 
     @staticmethod
@@ -431,7 +452,7 @@ class OmniConnectorModelRunnerMixin:
         return None
 
     @classmethod
-    def _payload_is_consumable(cls, payload: dict[str, Any] | None) -> bool:
+    def _payload_is_consumable(cls, payload: OmniPayload | None) -> bool:
         """Return True when an async payload can drive a real forward step.
 
         Metadata-only wake-ups should not transition WAITING_FOR_CHUNK requests
@@ -442,23 +463,29 @@ class OmniConnectorModelRunnerMixin:
         if not isinstance(payload, dict) or not payload:
             return False
 
-        decode_embeddings = payload.get(THINKER_DECODE_EMBEDDINGS_KEY)
-        if isinstance(decode_embeddings, torch.Tensor):
-            if decode_embeddings.ndim == 0:
-                return True
-            return decode_embeddings.numel() > 0 and decode_embeddings.shape[0] > 0
+        embed = payload.get("embed")
+        if isinstance(embed, dict):
+            decode_embeddings = embed.get("decode")
+            if isinstance(decode_embeddings, torch.Tensor):
+                if decode_embeddings.ndim == 0:
+                    return True
+                return decode_embeddings.numel() > 0 and decode_embeddings.shape[0] > 0
 
         audio_codes = cls._payload_audio_codes(payload)
         if audio_codes is not None:
             if isinstance(audio_codes, torch.Tensor):
                 return audio_codes.numel() > 0
-            # Codec code 0 is valid; non-empty code payloads are consumable.
             if hasattr(audio_codes, "__len__"):
                 return len(audio_codes) > 0
             return True
 
         for key, value in payload.items():
-            if key in cls._NON_CONSUMABLE_PAYLOAD_KEYS:
+            if isinstance(value, dict):
+                for sk, sv in value.items():
+                    if (key, sk) in cls._NON_CONSUMABLE_PAYLOAD_KEYS:
+                        continue
+                    if cls._payload_value_has_content(sv):
+                        return True
                 continue
             if cls._payload_value_has_content(value):
                 return True
@@ -613,6 +640,16 @@ class OmniConnectorModelRunnerMixin:
         that has arrived, or ``None`` if nothing is ready.  Stores full
         payloads in the local cache and extracts scheduling metadata.
         """
+        # Fast path: when TP is trivial (no peer ranks waiting on a broadcast)
+        # and the bg recv thread has not staged anything, skip the lock + TP
+        # broadcast cycle entirely. _broadcast_tp_payload_packet already
+        # returns its input unchanged under the same world_size<=1 condition,
+        # so the original code path was a no-op here on every empty step.
+        tp_group = self._get_local_tp_group()
+        if (
+            tp_group is None or getattr(tp_group, "world_size", 1) <= 1
+        ) and not self._full_payload_pending_broadcast_req_ids:
+            return None
         with self._lock:
             results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
         results = self._broadcast_tp_payload_packet(results)
@@ -634,10 +671,63 @@ class OmniConnectorModelRunnerMixin:
         )
         return results
 
+    def _get_model_config(self) -> Any:
+        model_config = getattr(self, "model_config", None)
+        if model_config is not None:
+            return model_config
+        return getattr(getattr(self, "vllm_config", None), "model_config", None)
+
+    def _should_accumulate_full_payload_output(self) -> bool:
+        """Gate send-side full-payload output accumulation only.
+
+        Cached per instance: the result depends only on model_config /
+        _custom_process_func, both of which are set at init time. Avoid
+        the per-step dynamic import inside the model decode loop.
+        """
+        cached = getattr(self, "_should_accumulate_full_payload_output_cached", None)
+        if cached is not None:
+            return cached
+        model_config = self._get_model_config()
+        if model_config is None:
+            self._should_accumulate_full_payload_output_cached = False
+            return False
+        if getattr(model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration":
+            from vllm_omni.model_executor.stage_input_processors.qwen3_omni import (
+                should_accumulate_qwen3_omni_full_payload_output,
+            )
+
+            result = should_accumulate_qwen3_omni_full_payload_output(
+                model_config,
+                getattr(self, "_custom_process_func", None),
+            )
+            self._should_accumulate_full_payload_output_cached = result
+            return result
+        self._should_accumulate_full_payload_output_cached = False
+        return False
+
     @staticmethod
-    def _is_all_zero_tensor(t: Any) -> bool:
-        """Return True if *t* is a torch.Tensor whose elements are all zero."""
-        return isinstance(t, torch.Tensor) and t.numel() > 0 and not t.any()
+    def _new_full_payload_accumulator(output: dict[str, Any]):
+        chunks: dict[str, list[torch.Tensor]] = {}
+        latest: dict[str, Any] = {}
+        rows: dict[str, int] = {}
+        for k, v in output.items():
+            if isinstance(v, torch.Tensor) and v.dim() >= 2:
+                chunks[k] = [v]
+                rows[k] = int(v.shape[0])
+            else:
+                latest[k] = v
+        return chunks, latest, rows
+
+    @staticmethod
+    def _materialize_full_payload_entry(entry):
+        if len(entry) == 2:
+            return entry
+        chunks, latest, _rows, request = entry
+        output = dict(latest)
+        for k, tensors in chunks.items():
+            if tensors:
+                output[k] = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+        return output, request
 
     def accumulate_full_payload_output(
         self,
@@ -651,55 +741,45 @@ class OmniConnectorModelRunnerMixin:
         along dim-0.  Scalar / global tensors (1-D or 0-D) are replaced
         with the latest value.
 
-        All-zero tensors (e.g. ``code_predictor_codes`` emitted during
-        prefill) are dropped so that they do not pollute downstream stages
-        with garbage / noise frames.
+        Note: codec rows are NOT filtered for zero placeholders here. The
+        downstream consumer ``_extract_qwen3_full_payload_codec_rows`` crops
+        codec rows using ``output_token_ids`` as the authoritative source,
+        which makes any sender-side zero filtering redundant. Skipping the
+        sender-side ``t.any()`` scan also avoids a per-tensor GPU->CPU device
+        sync that stalled the decode pipeline.
 
         The data is actually sent when ``flush_full_payload_outputs`` is called
         with the finished request IDs from the next scheduler cycle.
         """
-        # ---- Filter out all-zero tensors from the incoming pooler_output ----
-        filtered: dict[str, Any] = {}
-        dropped_zero_keys: list[tuple[str, tuple[int, ...]]] = []
-        for k, v in pooler_output.items():
-            if self._is_all_zero_tensor(v):
-                dropped_zero_keys.append((k, tuple(v.shape)))
-                continue  # skip prefill zero-filled placeholders
-            filtered[k] = v
-        if dropped_zero_keys:
-            logger.info(
-                "[Stage-%s] accumulate_full_payload_output: req=%s dropped_zero_keys=%s",
-                self._stage_id,
-                req_id,
-                dropped_zero_keys,
-            )
-        pooler_output = filtered
-
         existing = self._pending_full_payload_send.get(req_id)
+
         if existing is None:
-            self._pending_full_payload_send[req_id] = (pooler_output, request)
+            chunks, latest, rows = self._new_full_payload_accumulator(pooler_output)
+            self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
             return
 
-        prev_output, _ = existing
-        merged: dict[str, Any] = {}
-        for k in set(prev_output) | set(pooler_output):
-            v_new = pooler_output.get(k)
-            v_old = prev_output.get(k)
-            if v_new is None:
-                merged[k] = v_old
-            elif v_old is None:
-                merged[k] = v_new
-            elif (
-                isinstance(v_new, torch.Tensor)
-                and isinstance(v_old, torch.Tensor)
-                and v_new.dim() >= 2
-                and v_old.dim() >= 2
-                and v_new.shape[1:] == v_old.shape[1:]
-            ):
-                merged[k] = torch.cat([v_old, v_new], dim=0)
+        if len(existing) == 2:
+            chunks, latest, rows = self._new_full_payload_accumulator(existing[0])
+        else:
+            chunks, latest, rows, _ = existing
+
+        for k, v in pooler_output.items():
+            if v is None:
+                continue
+            if isinstance(v, torch.Tensor) and v.dim() >= 2:
+                if k in chunks and chunks[k] and v.shape[1:] == chunks[k][0].shape[1:]:
+                    chunks[k].append(v)
+                    rows[k] += int(v.shape[0])
+                else:
+                    latest.pop(k, None)
+                    chunks[k] = [v]
+                    rows[k] = int(v.shape[0])
             else:
-                merged[k] = v_new
-        self._pending_full_payload_send[req_id] = (merged, request)
+                chunks.pop(k, None)
+                rows.pop(k, None)
+                latest[k] = v
+
+        self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
 
     def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""
@@ -713,7 +793,7 @@ class OmniConnectorModelRunnerMixin:
         for req_id in finished_req_ids:
             entry = self._pending_full_payload_send.pop(req_id, None)
             if entry is not None:
-                to_send[req_id] = entry
+                to_send[req_id] = self._materialize_full_payload_entry(entry)
         logger.info("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
         if to_send:
             self.send_full_payload_outputs(scheduler_output=None, outputs=to_send)
@@ -1461,7 +1541,7 @@ class OmniConnectorModelRunnerMixin:
                     logger.warning("Error receiving data for %s", req_id, exc_info=True)
 
             if not made_progress and not self._stop_event.is_set():
-                self._work_available.wait(timeout=0.001)
+                self._work_available.wait(timeout=0.005)
                 self._work_available.clear()
 
     _MAX_SEND_RETRIES = 3
@@ -1796,85 +1876,66 @@ class OmniConnectorModelRunnerMixin:
     #  Payload accumulation  (ported from OmniChunkTransferAdapter)
     # ------------------------------------------------------------------ #
 
-    def _accumulate_payload(self, req_id: str, payload_data: dict[str, Any]) -> dict[str, Any]:
-        """Accumulate chunk payloads (concat tensors, extend lists).
-
-        Returns a **shallow copy** of the accumulated state so callers
-        (e.g. ``_poll_single_request``) can store it in
-        ``_local_stage_payload_cache`` without aliasing the authoritative
-        ``_send_side_request_payload`` dict.
-        """
+    def _accumulate_payload(self, req_id: str, payload_data: OmniPayload) -> OmniPayload:
+        """Accumulate chunk payloads (concat tensors, extend lists)."""
         if req_id not in self._send_side_request_payload:
             self._send_side_request_payload[req_id] = dict(payload_data)
             return dict(self._send_side_request_payload[req_id])
 
         origin = self._send_side_request_payload[req_id]
         merged = dict(origin)
-        override_keys = payload_data.get("override_keys", ())
-        drop_decode_span = False
-        decode_span_handled = False
-        for key, value in payload_data.items():
-            if key == "finished":
-                merged[key] = value
-                continue
-            if key == THINKER_DECODE_EMBEDDINGS_KEY:
-                merged_span = merge_tensor_spans(
-                    get_tensor_span(
-                        origin,
-                        tensor_key=THINKER_DECODE_EMBEDDINGS_KEY,
-                        start_key=THINKER_DECODE_TOKEN_START_KEY,
-                        end_key=THINKER_DECODE_TOKEN_END_KEY,
-                    ),
-                    get_tensor_span(
-                        payload_data,
-                        tensor_key=THINKER_DECODE_EMBEDDINGS_KEY,
-                        start_key=THINKER_DECODE_TOKEN_START_KEY,
-                        end_key=THINKER_DECODE_TOKEN_END_KEY,
-                    ),
-                )
-                if merged_span is not None:
-                    merged[key], merged[THINKER_DECODE_TOKEN_START_KEY], merged[THINKER_DECODE_TOKEN_END_KEY] = (
-                        merged_span
-                    )
-                    decode_span_handled = True
-                    continue
-                if isinstance(value, torch.Tensor) and key in origin:
-                    if (
-                        THINKER_DECODE_TOKEN_START_KEY in origin
-                        or THINKER_DECODE_TOKEN_END_KEY in origin
-                        or THINKER_DECODE_TOKEN_START_KEY in payload_data
-                        or THINKER_DECODE_TOKEN_END_KEY in payload_data
-                    ):
-                        logger.warning(
-                            "[Stage-%s] req=%s falling back to legacy thinker decode "
-                            "merge due to missing/invalid/non-contiguous span "
-                            "metadata",
-                            self._stage_id,
-                            req_id,
-                        )
-                        drop_decode_span = True
-                    merged[key] = torch.cat([origin[key], value], dim=0)
-                    continue
-                merged[key] = value
-                continue
-            if key in {THINKER_DECODE_TOKEN_START_KEY, THINKER_DECODE_TOKEN_END_KEY}:
-                if decode_span_handled or drop_decode_span:
-                    continue
-                merged[key] = value
-                continue
-            if key in override_keys:
-                merged[key] = value
-                continue
-            if isinstance(value, torch.Tensor) and key in origin:
-                merged[key] = torch.cat([origin[key], value], dim=0)
-            elif isinstance(value, list) and key in origin:
-                merged[key] = origin[key] + value
-            else:
-                merged[key] = value
+        raw_ok = payload_data.get("meta", {}).get("override_keys", []) if isinstance(payload_data, dict) else []
+        override_keys = {tuple(k) if isinstance(k, list) else k for k in raw_ok}
 
-        if drop_decode_span:
-            merged.pop(THINKER_DECODE_TOKEN_START_KEY, None)
-            merged.pop(THINKER_DECODE_TOKEN_END_KEY, None)
+        for key, value in payload_data.items():
+            if isinstance(value, dict):
+                origin_sub = origin.get(key)
+                merged_sub = dict(origin_sub) if isinstance(origin_sub, dict) else {}
+                span_handled: set[str] = set()
+                if key == "embed" and isinstance(origin_sub, dict):
+                    for tk, sk, ek in _EMBED_SPAN_GROUPS:
+                        if tk not in value or (key, tk) in override_keys:
+                            continue
+                        span = merge_tensor_spans(
+                            get_tensor_span(origin_sub, tensor_key=tk, start_key=sk, end_key=ek),
+                            get_tensor_span(value, tensor_key=tk, start_key=sk, end_key=ek),
+                        )
+                        if span is None:
+                            continue
+                        t, s, e = span
+                        merged_sub[tk] = t
+                        merged_sub[sk] = s
+                        merged_sub[ek] = e
+                        span_handled |= {tk, sk, ek}
+                for qual, qval in value.items():
+                    if qual in span_handled:
+                        continue
+                    if key == "meta" and qual == "finished":
+                        merged_sub[qual] = qval
+                        continue
+                    if (key, qual) in override_keys:
+                        merged_sub[qual] = qval
+                        continue
+                    osv = merged_sub.get(qual)
+                    if isinstance(qval, torch.Tensor) and isinstance(osv, torch.Tensor):
+                        merged_sub[qual] = torch.cat([osv, qval], dim=0)
+                    elif isinstance(qval, list) and isinstance(osv, list):
+                        merged_sub[qual] = osv + qval
+                    else:
+                        merged_sub[qual] = qval
+                merged[key] = merged_sub
+            else:
+                if key in override_keys:
+                    merged[key] = value
+                    continue
+                ov = origin.get(key)
+                if isinstance(value, torch.Tensor) and isinstance(ov, torch.Tensor):
+                    merged[key] = torch.cat([ov, value], dim=0)
+                elif isinstance(value, list) and isinstance(ov, list):
+                    merged[key] = ov + value
+                else:
+                    merged[key] = value
+
         self._send_side_request_payload[req_id] = merged
         return dict(merged)
 

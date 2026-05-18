@@ -1,18 +1,16 @@
 """
-Comprehensive tests of diffusion features that are available in online serving mode
-and are supported by the following models:
+Comprehensive tests of diffusion features that are available in online serving mode.
+
+CUDA coverage (3 models × 6 features):
 - Wan-AI/Wan2.2-T2V-A14B-Diffusers
 - Wan-AI/Wan2.2-I2V-A14B-Diffusers
 - Wan-AI/Wan2.2-TI2V-5B-Diffusers
+Features: Cache-DiT, CFG-Parallel, Ulysses-SP, Tensor-Parallel + VAE-Patch-Parallel,
+HSDP, Ring-Attn.
 
-Coverage:
-- Cache-DiT
-- CFG-Parallel
-- Ulysses-SP
-- Tensor-Parallel
-- VAE-Patch-Parallel
-- HSDP
-- Ring-Attn
+NPU coverage (Wan-AI/Wan2.2-I2V-A14B-Diffusers only): 2 cases.
+- 4-card combined: cfg=2 + usp=2 + vae-patch=2 + hsdp.
+- 2-card tp_layerwise: tp=2 + enable-layerwise-offload.
 
 assert_diffusion_response validates successful generation
 """
@@ -27,14 +25,24 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 PROMPT = "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
 NEGATIVE_PROMPT = "low quality, blurry, distorted face, extra limbs, bad anatomy, watermark, logo, text, ugly, deformed, mutated, jpeg artifacts"
-SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
-PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+
+# CUDA marks (original matrix, unchanged)
+CUDA_SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100"})
+CUDA_PARALLEL_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+
+# NPU marks
+NPU_TWO_CARD_MARKS = hardware_marks(res={"npu": "A2"}, num_cards=2)
+NPU_FOUR_CARD_MARKS = hardware_marks(res={"npu": "A2"}, num_cards=4)
 
 WAN22_MODELS = [
     ("Wan-AI/Wan2.2-T2V-A14B-Diffusers", "t2v"),
     ("Wan-AI/Wan2.2-I2V-A14B-Diffusers", "i2v"),
     ("Wan-AI/Wan2.2-TI2V-5B-Diffusers", "ti2v"),
 ]
+NPU_MODELS = [("Wan-AI/Wan2.2-I2V-A14B-Diffusers", "i2v")]
+
+CACHE_DIT_ARGS = ["--cache-backend", "cache_dit", "--enable-layerwise-offload"]
+HSDP_ARGS = ["--use-hsdp", "--hsdp-shard-size", "2"]
 
 PARALLEL_CONFIGS = [
     ("cfg_parallel", ["--cfg-parallel-size", "2"]),
@@ -44,37 +52,66 @@ PARALLEL_CONFIGS = [
     ("ring_atten", ["--ring", "2"]),
 ]
 
+# NPU: 2 cases only.
+NPU_PARALLEL_CONFIGS = [
+    (
+        "combined",
+        [
+            "--cfg-parallel-size",
+            "2",
+            "--usp",
+            "2",
+            "--vae-patch-parallel-size",
+            "4",
+            "--use-hsdp",
+            "--hsdp-shard-size",
+            "4",
+        ],
+        NPU_FOUR_CARD_MARKS,
+    ),
+    (
+        "tp_layerwise_offload",
+        ["--tensor-parallel-size", "2", "--enable-layerwise-offload"],
+        NPU_TWO_CARD_MARKS,
+    ),
+]
+
 
 def _get_wan22_feature_cases():
     """
-    Generate parameterized test cases covering:
-    - All 3 Wan2.2 model variants with architecture awareness
-    - 1 single-card feature (Cache-DiT)
-    - 6 multi-card parallelism features with CORRECT PARAMETER NAMES per spec
+    Generate parameterized test cases:
+    - CUDA: 3 models × (Cache-DiT + 5 parallel features), original matrix.
+    - NPU: I2V-A14B only, 2 cases (4-card combined, 2-card tp_layerwise_offload).
     """
     cases = []
 
-    # Single-card: Cache-DiT (applies to all models)
+    # ---- CUDA cases (unchanged) ----
     for model_path, model_key in WAN22_MODELS:
         cases.append(
             pytest.param(
-                OmniServerParams(
-                    model=model_path,
-                    server_args=["--cache-backend", "cache_dit", "--enable-layerwise-offload"],
-                ),
-                id=f"{model_key}_cache_dit",
-                marks=SINGLE_CARD_FEATURE_MARKS,
+                OmniServerParams(model=model_path, server_args=CACHE_DIT_ARGS),
+                id=f"cuda_{model_key}_cache_dit",
+                marks=CUDA_SINGLE_CARD_MARKS,
             )
         )
-
-    # Multi-card features
     for model_path, model_key in WAN22_MODELS:
         for feat_id, server_args in PARALLEL_CONFIGS:
             cases.append(
                 pytest.param(
                     OmniServerParams(model=model_path, server_args=server_args),
-                    id=f"{model_key}_{feat_id}",
-                    marks=PARALLEL_FEATURE_MARKS,
+                    id=f"cuda_{model_key}_{feat_id}",
+                    marks=CUDA_PARALLEL_MARKS,
+                )
+            )
+
+    # ---- NPU cases (I2V-A14B only) ----
+    for model_path, model_key in NPU_MODELS:
+        for feat_id, server_args, marks in NPU_PARALLEL_CONFIGS:
+            cases.append(
+                pytest.param(
+                    OmniServerParams(model=model_path, server_args=server_args),
+                    id=f"npu_{model_key}_{feat_id}",
+                    marks=marks,
                 )
             )
 

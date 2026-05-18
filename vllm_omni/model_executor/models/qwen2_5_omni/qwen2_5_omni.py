@@ -91,6 +91,7 @@ class Qwen2_5OmniForConditionalGeneration(
             self.token2wav = None
 
         elif self.model_stage == "talker":
+            multimodal_config.skip_mm_profiling = True
             # register the process function for the talker stage
             self.has_preprocess = True
             self.set_custom_preprocess(self.talker_preprocess)
@@ -103,7 +104,6 @@ class Qwen2_5OmniForConditionalGeneration(
                 # Use registry architecture key
                 architectures=["Qwen2_5OmniTalkerModel"],
             )
-            self.talker.init_multi_modal(thinker_config)
             self.model = self.talker
             self.token2wav = None
             # set suppress start id according to token2wav
@@ -124,6 +124,7 @@ class Qwen2_5OmniForConditionalGeneration(
             self._init_special_tokens_embeddings()
 
         elif self.model_stage == "code2wav":
+            multimodal_config.skip_mm_profiling = True
             self.thinker = None
             self.talker = None
             # Initialize token2wav (code->mel->wav) like thinker/talker
@@ -197,6 +198,8 @@ class Qwen2_5OmniForConditionalGeneration(
     ) -> torch.Tensor:
         if self.model_stage == "code2wav":
             return torch.zeros_like(input_ids).reshape(-1, 1).repeat(1, self.vllm_config.model_config.get_hidden_size())
+        if self.model_stage == "talker":
+            return self.model.embed_input_ids(input_ids)
         return self.model.embed_input_ids(
             input_ids=input_ids, multimodal_embeddings=multimodal_embeddings, is_multimodal=is_multimodal
         )

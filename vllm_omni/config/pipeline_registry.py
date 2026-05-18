@@ -49,6 +49,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.qwen3_tts.pipeline",
         "QWEN3_TTS_PIPELINE",
     ),
+    "covo_audio": (
+        "vllm_omni.model_executor.models.covo_audio.pipeline",
+        "COVO_AUDIO_PIPELINE",
+    ),
     "bagel": (
         "vllm_omni.model_executor.models.bagel.pipeline",
         "BAGEL_PIPELINE",
@@ -65,7 +69,7 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.glm_image.pipeline",
         "GLM_IMAGE_PIPELINE",
     ),
-    "hunyuan_image3": (
+    "hunyuan_image_3_moe": (
         "vllm_omni.model_executor.models.hunyuan_image3.pipeline",
         "HUNYUAN_IMAGE3_PIPELINE",
     ),

@@ -22,6 +22,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
@@ -36,6 +37,7 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     resolve_wan_sample_solver,
     retrieve_latents,
 )
+from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -222,10 +224,10 @@ class Wan22I2VPipeline(
         # Transformers (weights loaded via load_weights)
         # Load config from model directory or HF Hub to get correct in_channels for I2V models
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
-        self.transformer = create_transformer_from_config(transformer_config)
+        self.transformer = self._create_transformer(transformer_config)
         if self.has_transformer_2:
             transformer_2_config = load_transformer_config(model, "transformer_2", local_files_only)
-            self.transformer_2 = create_transformer_from_config(transformer_2_config)
+            self.transformer_2 = self._create_transformer(transformer_2_config)
         else:
             self.transformer_2 = None
 
@@ -282,8 +284,10 @@ class Wan22I2VPipeline(
         condition: torch.Tensor,
         first_frame_mask: torch.Tensor,
     ) -> torch.Tensor:
+        if attention_kwargs is None:
+            attention_kwargs = {}
         with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
+            for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
 
                 # Select model and guidance scale based on timestep
@@ -292,6 +296,8 @@ class Wan22I2VPipeline(
                 if boundary_timestep is not None and t < boundary_timestep and self.transformer_2 is not None:
                     current_model = self.transformer_2
                     current_guidance_scale = guidance_high
+
+                set_forward_context_denoise_step_idx(step_idx)
 
                 # Prepare latent input
                 if self.expand_timesteps:
@@ -308,6 +314,7 @@ class Wan22I2VPipeline(
                     timestep = t.expand(latents.shape[0])
 
                 do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
+                # Prepare kwargs for positive and negative predictions
                 positive_kwargs = {
                     "hidden_states": latent_model_input,
                     "timestep": timestep,
@@ -330,6 +337,7 @@ class Wan22I2VPipeline(
                 else:
                     negative_kwargs = None
 
+                # Predict noise with automatic CFG parallel handling
                 noise_pred = self.predict_noise_maybe_with_cfg(
                     do_true_cfg=do_true_cfg,
                     true_cfg_scale=current_guidance_scale,
@@ -338,7 +346,9 @@ class Wan22I2VPipeline(
                     cfg_normalize=False,
                 )
 
+                # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+
                 pbar.update()
 
         return latents
@@ -357,6 +367,11 @@ class Wan22I2VPipeline(
         pixel_values = pixel_values.to(device=device, dtype=self.image_encoder.dtype)
         image_embeds = self.image_encoder(pixel_values, output_hidden_states=True)
         return image_embeds.hidden_states[-2]
+
+    def _create_transformer(self, config: dict) -> WanTransformer3DModel:
+        """Create a transformer from a config dict. Respects od_config.quantization_config."""
+        quant_config = getattr(self.od_config, "quantization_config", None)
+        return create_transformer_from_config(config, quant_config=quant_config)
 
     def forward(
         self,
