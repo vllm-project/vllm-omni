@@ -38,6 +38,7 @@ from .hunyuan_image3_transformer import (
     HunyuanImage3PreTrainedModel,
     HunyuanImage3Text2ImagePipeline,
     ImageInfo,
+    ImageKVCacheManager,
     JointImageInfo,
     LightProjector,
     TimestepEmbedder,
@@ -1150,6 +1151,59 @@ class HunyuanImage3Pipeline(
         model_kwargs["full_attn_spans"] = full_attn_spans
         return attention_mask
 
+    @staticmethod
+    def _build_mixfusion_attention_mask_buckets(
+        attention_mask: torch.Tensor,
+        full_attn_spans: list[list[tuple[int, int]]],
+        plan: MixFusionSequencePlan,
+    ) -> dict[tuple[int, int, tuple[tuple[int, int], ...]], torch.Tensor]:
+        bs, _, q_len, seq_len = attention_mask.shape
+        if bs % plan.chunk_count != 0:
+            raise ValueError(f"MixFusion mask batch size {bs} is not divisible by {plan.chunk_count}.")
+
+        cfg_factor = bs // plan.chunk_count
+        buckets: dict[tuple[int, int, tuple[tuple[int, int], ...]], list[torch.Tensor]] = {}
+        for cfg_idx in range(cfg_factor):
+            cfg_base = cfg_idx * plan.chunk_count
+            for layout in plan.layouts:
+                sample_indices = [cfg_base + layout.chunk_start + i for i in range(layout.chunk_count)]
+                first_sample = sample_indices[0]
+                if not full_attn_spans[first_sample]:
+                    raise ValueError("MixFusion requires image full-attention spans for each chunk.")
+
+                key_image_start, key_image_stop = ImageKVCacheManager._select_mixfusion_image_span(
+                    full_attn_spans[first_sample],
+                    plan.chunk_size,
+                )
+                query_image_start, query_image_stop = ImageKVCacheManager._mixfusion_query_span(
+                    (key_image_start, key_image_stop),
+                    seq_len,
+                    q_len,
+                    plan.chunk_size,
+                )
+
+                row_map = [(first_sample, idx) for idx in range(query_image_start)]
+                col_map = [(first_sample, idx) for idx in range(key_image_start)]
+                for sample_idx in sample_indices:
+                    row_map.extend((sample_idx, idx) for idx in range(query_image_start, query_image_stop))
+                    col_map.extend((sample_idx, idx) for idx in range(key_image_start, key_image_stop))
+                row_map.extend((first_sample, idx) for idx in range(query_image_stop, q_len))
+                col_map.extend((first_sample, idx) for idx in range(key_image_stop, seq_len))
+
+                recovered_spans = ImageKVCacheManager._recover_mixfusion_spans(
+                    full_attn_spans[first_sample],
+                    (key_image_start, key_image_stop),
+                    layout.seq_len,
+                )
+                recovered_q_len = query_image_start + layout.seq_len + q_len - query_image_stop
+                recovered_k_len = key_image_start + layout.seq_len + seq_len - key_image_stop
+                bucket_key = (recovered_q_len, recovered_k_len, tuple(recovered_spans))
+                buckets.setdefault(bucket_key, []).append(
+                    ImageKVCacheManager._recover_mixfusion_attention_mask(attention_mask, row_map, col_map)
+                )
+
+        return {bucket_key: torch.cat(masks, dim=0) for bucket_key, masks in buckets.items()}
+
     def prepare_inputs_for_generation(
         self,
         input_ids,
@@ -1194,6 +1248,7 @@ class HunyuanImage3Pipeline(
                 "ar_kv_reuse_len": kwargs.get("ar_kv_reuse_len", 0),
                 "full_attn_spans": kwargs.get("full_attn_spans"),
                 "mixfusion_sequence_plan": kwargs.get("mixfusion_sequence_plan"),
+                "mixfusion_attention_masks": kwargs.get("mixfusion_attention_masks"),
             }
         )
         return model_inputs
@@ -1216,6 +1271,8 @@ class HunyuanImage3Pipeline(
             updated_model_kwargs["full_attn_spans"] = model_kwargs["full_attn_spans"]
         if "mixfusion_sequence_plan" in model_kwargs:
             updated_model_kwargs["mixfusion_sequence_plan"] = model_kwargs["mixfusion_sequence_plan"]
+        if "mixfusion_attention_masks" in model_kwargs:
+            updated_model_kwargs["mixfusion_attention_masks"] = model_kwargs["mixfusion_attention_masks"]
 
         # update past_key_values keeping its naming used in model code
         for possible_cache_name in ALL_CACHE_NAMES:
@@ -1366,6 +1423,8 @@ class HunyuanImage3Pipeline(
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
         mixfusion_sequence_plan: Any | None = None,
+        mixfusion_attention_masks: dict[str, dict[tuple[int, int, tuple[tuple[int, int], ...]], torch.Tensor]]
+        | None = None,
     ) -> tuple | CausalMMOutputWithPast:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         # Sanity Check of Inputs
@@ -1493,6 +1552,7 @@ class HunyuanImage3Pipeline(
                 ar_kv_reuse_len=ar_kv_reuse_len,
                 full_attn_spans=full_attn_spans,
                 mixfusion_sequence_plan=mixfusion_sequence_plan,
+                mixfusion_attention_masks=mixfusion_attention_masks,
             )
         hidden_states = outputs[0]
 
@@ -1598,22 +1658,38 @@ class HunyuanImage3Pipeline(
             repeated.extend([items[layout.index]] * layout.chunk_count)
         return repeated
 
-    def _build_mixfusion_chunk_image_infos(self, plan: MixFusionSequencePlan) -> list[ImageInfo]:
+    def _build_mixfusion_chunk_image_infos(
+        self,
+        plan: MixFusionSequencePlan,
+        original_image_infos: list[ImageInfo],
+    ) -> list[ImageInfo]:
+        if len(original_image_infos) != len(plan.layouts):
+            raise ValueError(f"Expected {len(plan.layouts)} original image infos, got {len(original_image_infos)}.")
+
         infos: list[ImageInfo] = []
-        vae_h_factor = self.hf_config.vae_downsample_factor[0] * self.hf_config.patch_size
-        vae_w_factor = self.hf_config.vae_downsample_factor[1] * self.hf_config.patch_size
         for layout in plan.layouts:
+            original_info = original_image_infos[layout.index]
+            if (original_info.token_height, original_info.token_width) != (layout.token_height, layout.token_width):
+                raise ValueError(
+                    f"MixFusion layout {layout.index} has token shape "
+                    f"{(layout.token_height, layout.token_width)}, but original image info has "
+                    f"{(original_info.token_height, original_info.token_width)}."
+                )
             for _ in range(layout.chunk_count):
                 infos.append(
                     ImageInfo(
                         image_type="gen_image",
-                        image_width=plan.chunk_size * vae_w_factor,
-                        image_height=vae_h_factor,
+                        image_width=original_info.image_width,
+                        image_height=original_info.image_height,
                         token_width=plan.chunk_size,
                         token_height=1,
                         image_token_length=plan.chunk_size,
-                        base_size=self.hf_config.image_base_size,
-                        ratio_index=0,
+                        base_size=original_info.base_size,
+                        ratio_index=original_info.ratio_index,
+                        add_timestep_token=original_info.add_timestep_token,
+                        add_guidance_token=original_info.add_guidance_token,
+                        use_front_boi_token=original_info.use_front_boi_token,
+                        add_image_shape_token=original_info.add_image_shape_token,
                     )
                 )
         return infos
@@ -1698,12 +1774,10 @@ class HunyuanImage3Pipeline(
         model_system_prompt = system_prompt
         model_batch_cond_image_info = batch_cond_image_info
         model_batch_gen_image_info = None
-        original_image_infos = None
-        if len(batch_image_sizes) > 1 and len(set(batch_image_sizes)) > 1:
-            original_image_infos = [self.image_processor.build_image_info(size) for size in batch_image_sizes]
-            mixfusion_plan = build_mixfusion_sequence_plan(
-                [(info.token_height, info.token_width) for info in original_image_infos]
-            )
+        original_image_infos = [self.image_processor.build_image_info(size) for size in batch_image_sizes]
+        token_shapes = [(info.token_height, info.token_width) for info in original_image_infos]
+        if len(batch_image_sizes) > 1 and len(set(token_shapes)) > 1:
+            mixfusion_plan = build_mixfusion_sequence_plan(token_shapes)
             model_prompt = self._repeat_by_mixfusion_layout(prompt, mixfusion_plan.layouts)
             if isinstance(cot_text, list):
                 model_cot_text = self._repeat_by_mixfusion_layout(cot_text, mixfusion_plan.layouts)
@@ -1716,7 +1790,12 @@ class HunyuanImage3Pipeline(
             mixfusion_generator = generator
             if isinstance(generator, list):
                 generator = self._repeat_by_mixfusion_layout(generator, mixfusion_plan.layouts)
-            model_batch_gen_image_info = self._build_mixfusion_chunk_image_infos(mixfusion_plan)
+            model_batch_gen_image_info = self._build_mixfusion_chunk_image_infos(
+                mixfusion_plan,
+                original_image_infos,
+            )
+        elif len(batch_image_sizes) > 1:
+            model_batch_gen_image_info = original_image_infos
 
         # ---- AR KV Reuse: extract injected KV from request ----
         ar_kv_kwargs = self._extract_ar_kv_from_request(req)
@@ -1749,7 +1828,9 @@ class HunyuanImage3Pipeline(
             bot_task=tokenizer_bot_task or "auto",
         )
         if mixfusion_plan is not None:
-            model_inputs["mixfusion_image_sizes"] = batch_image_sizes
+            model_inputs["mixfusion_image_sizes"] = [
+                (info.image_height, info.image_width) for info in original_image_infos
+            ]
             model_inputs["mixfusion_generator"] = mixfusion_generator
             model_inputs["mixfusion_sequence_plan"] = mixfusion_plan
 

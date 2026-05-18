@@ -1147,11 +1147,25 @@ class ImageKVCacheManager:
             raise ValueError(f"MixFusion did not find chunk span {chunk_span} in full-attention spans {spans}.")
         return recovered_spans
 
+    @staticmethod
+    def _recover_mixfusion_attention_mask(
+        attention_mask: torch.Tensor,
+        row_map: list[tuple[int, int]],
+        col_map: list[tuple[int, int]],
+    ) -> torch.Tensor:
+        col_indices = [col_idx for _, col_idx in col_map]
+        rows = []
+        for sample_idx, row_idx in row_map:
+            row = attention_mask[sample_idx : sample_idx + 1, :, row_idx : row_idx + 1, :]
+            rows.append(torch.cat([row[..., col_idx : col_idx + 1] for col_idx in col_indices], dim=-1))
+        return torch.cat(rows, dim=-2)
+
     def _mixfusion_attention(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        mixfusion_attention_mask_buckets: dict[tuple[int, int, tuple[tuple[int, int], ...]], torch.Tensor],
         full_attn_spans: list[list[tuple[int, int]]],
         plan: MixFusionSequencePlan,
         seq_len: int,
@@ -1221,7 +1235,21 @@ class ImageKVCacheManager:
             q_bucket = torch.stack([item["q"] for item in bucket_items], dim=0)
             k_bucket = torch.stack([item["k"] for item in bucket_items], dim=0)
             v_bucket = torch.stack([item["v"] for item in bucket_items], dim=0)
+            bucket_key = (
+                q_bucket.shape[1],
+                k_bucket.shape[1],
+                tuple(bucket_items[0]["full_attn_spans"]),
+            )
+            attn_mask = mixfusion_attention_mask_buckets.get(bucket_key)
+            if attn_mask is None:
+                raise ValueError(f"Missing precomputed MixFusion attention mask bucket {bucket_key}.")
+            if attn_mask.shape[0] != len(bucket_items):
+                raise ValueError(
+                    f"MixFusion attention mask bucket {bucket_key} has batch {attn_mask.shape[0]}, "
+                    f"expected {len(bucket_items)}."
+                )
             attn_metadata = AttentionMetadata(
+                attn_mask=attn_mask,
                 full_attn_spans=[item["full_attn_spans"] for item in bucket_items],
             )
             attn_bucket = self.attn(q_bucket, k_bucket, v_bucket, attn_metadata)
@@ -1312,14 +1340,22 @@ class ImageKVCacheManager:
 
         full_attn_spans = kwargs.get("full_attn_spans", None)
         mixfusion_sequence_plan = kwargs.get("mixfusion_sequence_plan", None)
+        mixfusion_attention_masks = kwargs.get("mixfusion_attention_masks", None)
 
         if mixfusion_sequence_plan is not None and self.sp_size <= 1 and not uncond_cfg_prefill:
             if full_attn_spans is None:
                 raise ValueError("MixFusion requires full_attn_spans for attention sequence recovery.")
+            if mixfusion_attention_masks is None:
+                raise ValueError("MixFusion requires precomputed attention mask buckets.")
+            mask_stage = "first" if first_step else "later"
+            mixfusion_attention_mask_buckets = mixfusion_attention_masks.get(mask_stage)
+            if mixfusion_attention_mask_buckets is None:
+                raise ValueError(f"MixFusion missing precomputed {mask_stage} attention mask buckets.")
             attn_output = self._mixfusion_attention(
                 query=query,
                 key=key,
                 value=value,
+                mixfusion_attention_mask_buckets=mixfusion_attention_mask_buckets,
                 full_attn_spans=full_attn_spans,
                 plan=mixfusion_sequence_plan,
                 seq_len=seq_len,
@@ -2537,6 +2573,8 @@ class HunyuanImage3Model(nn.Module):
         ar_kv_reuse_len: int = 0,
         full_attn_spans: list[list[tuple[int, int]]] | None = None,
         mixfusion_sequence_plan: MixFusionSequencePlan | None = None,
+        mixfusion_attention_masks: dict[str, dict[tuple[int, int, tuple[tuple[int, int], ...]], torch.Tensor]]
+        | None = None,
     ) -> tuple | BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -2644,6 +2682,7 @@ class HunyuanImage3Model(nn.Module):
                 uncond_cfg_prefill=uncond_cfg_prefill,
                 full_attn_spans=full_attn_spans,
                 mixfusion_sequence_plan=mixfusion_sequence_plan,
+                mixfusion_attention_masks=mixfusion_attention_masks,
             )
 
             hidden_states = layer_outputs[0]
@@ -3289,7 +3328,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         seq_lens = [seq_len] * b
         model_kwargs["query_lens"] = query_lens
         model_kwargs["seq_lens"] = seq_lens
-        model_kwargs["attention_mask"] = attention_mask.to(latents.device)
+        model_kwargs["attention_mask"] = attention_mask.to(device)
 
         # Attempt to reuse KV cache from the AR stage.
         # Note: the reusable KV length may differ between positive and negative prompts.
@@ -3299,6 +3338,14 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         # Store ar_kv_reuse_len in model_kwargs for use in forward method (SP mode)
         model_kwargs["ar_kv_reuse_len"] = ar_kv_reuse_len
+        if model_kwargs.get("mixfusion_sequence_plan") is not None:
+            model_kwargs["mixfusion_attention_masks"] = {
+                "first": self.model._build_mixfusion_attention_mask_buckets(
+                    model_kwargs["attention_mask"],
+                    model_kwargs["full_attn_spans"],
+                    model_kwargs["mixfusion_sequence_plan"],
+                )
+            }
 
         # Sampling loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -3421,6 +3468,14 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     seq_lens = [seq_len] * b
                     model_kwargs["query_lens"] = query_lens
                     model_kwargs["seq_lens"] = seq_lens
+                    if model_kwargs.get("mixfusion_sequence_plan") is not None:
+                        mask_cache = model_kwargs.setdefault("mixfusion_attention_masks", {})
+                        if "later" not in mask_cache:
+                            mask_cache["later"] = self.model._build_mixfusion_attention_mask_buckets(
+                                model_kwargs["attention_mask"],
+                                model_kwargs["full_attn_spans"],
+                                model_kwargs["mixfusion_sequence_plan"],
+                            )
 
                 if tea_cache_config is not None:
                     tc_cnt += 1
