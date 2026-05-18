@@ -73,9 +73,11 @@ QUANT_PSNR_THRESHOLD = 10.0
 QUANT_SSIM_THRESHOLD = 0.20
 QUANT_CLIP_SCORE_THRESHOLD = 20.0
 QUANT_CLIP_SCORE_DROP_THRESHOLD = float(os.environ.get("HUNYUAN_IMAGE3_QUANT_CLIP_SCORE_DROP_THRESHOLD", "5.0"))
+QUANT_RUN_ENV = "HUNYUAN_IMAGE3_RUN_QUANT_ACCURACY"
 QUANT_BF16_ENV = "HUNYUAN_IMAGE3_BF16_MODEL"
 QUANT_FP8_ENV = "HUNYUAN_IMAGE3_FP8_MODEL"
 QUANT_NVFP4_ENV = "HUNYUAN_IMAGE3_NVFP4_MODEL"
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 # fmt: off
 _BASE_CONFIG = {
     "stage_args": [
@@ -169,8 +171,13 @@ def _quant_accuracy_cases() -> list[pytest.ParameterSet]:
         _QuantAccuracyCase(name="mixed_nvfp4", model_env=QUANT_NVFP4_ENV, nvfp4_backend="cutlass"),
     ]
     params: list[pytest.ParameterSet] = []
+    run_quant_accuracy = os.environ.get(QUANT_RUN_ENV, "").lower() in _TRUE_ENV_VALUES
     for case in cases:
         marks = []
+        if not run_quant_accuracy:
+            marks.append(pytest.mark.skip(reason=f"Set {QUANT_RUN_ENV}=1 to run HunyuanImage3 quant accuracy."))
+        if not os.environ.get(QUANT_BF16_ENV):
+            marks.append(pytest.mark.skip(reason=f"Set {QUANT_BF16_ENV} to run HunyuanImage3 quant accuracy."))
         if not os.environ.get(case.model_env):
             marks.append(pytest.mark.skip(reason=f"Set {case.model_env} to run this quant accuracy case."))
         params.append(pytest.param(case, id=case.name, marks=marks))
@@ -396,7 +403,7 @@ def test_quantized_dit_matches_bf16_accuracy(
 ) -> None:
     """Quantized DiT checkpoints should preserve prompt-aligned image quality."""
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-quant")
-    bf16_model = os.environ.get(QUANT_BF16_ENV, MODEL_NAME)
+    bf16_model = os.environ[QUANT_BF16_ENV]
     quant_model = os.environ[case.model_env]
 
     with tempfile.TemporaryDirectory() as tmpdir:
