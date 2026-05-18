@@ -428,7 +428,9 @@ class _OmniVoiceCUDAGraphForward:
     (one step at a time) means pool sharing is safe.
     """
 
-    _MAX_LAZY_GRAPHS: int = 32  # LRU cap for lazy (non-bucket) captures
+    # Default bucket count is 10; 16 gives modest headroom for edge cases
+    # (seq_len > max bucket or non-CFG batch) without unbounded GPU growth.
+    _MAX_LAZY_GRAPHS: int = 16
 
     def __init__(self, generator: OmniVoiceGenerator, capture_sizes: list[int]) -> None:
         self._gen = generator
