@@ -534,6 +534,10 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         cache_position=None,
         **kwargs,
     ) -> BaseModelOutputWithPast:
+        r"""
+        cache_position (`torch.LongTensor` of shape `(sequence_length)`, *optional*):
+            Indices depicting the position of the input sequence tokens in the sequence. Used to update the cache.
+        """
         if input_ids is not None:
             raise ValueError("input_ids is not expected")
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -848,6 +852,9 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
     def enable_cudagraph(
         self,
         capture_sizes: list[int] | None = None,
+        capture_batch_sizes: list[int] | None = None,
+        extra_capture_shapes: list[tuple[int, int]] | None = None,
+        compile_shapes: list[tuple[int, int]] | None = None,
         device: torch.device | None = None,
         codec_chunk_frames: int = 0,
         codec_left_context_frames: int = 0,
@@ -865,6 +872,9 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self._cudagraph_wrapper = CUDAGraphDecoderWrapper(
             decoder=self,
             capture_sizes=capture_sizes,
+            capture_batch_sizes=capture_batch_sizes,
+            extra_capture_shapes=extra_capture_shapes,
+            compile_shapes=compile_shapes,
             num_quantizers=self.config.num_quantizers,
             enabled=True,
         )
@@ -878,8 +888,11 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         )
         self._cudagraph_enabled = True
         logger.info(
-            "CUDA Graph enabled for decoder: seq_lens=%s",
+            "CUDA Graph enabled for decoder: batch_sizes=%s seq_lens=%s extra_shapes=%s compile_shapes=%s",
+            self._cudagraph_wrapper.capture_batch_sizes,
             self._cudagraph_wrapper.capture_sizes,
+            self._cudagraph_wrapper.extra_capture_shapes,
+            self._cudagraph_wrapper.compile_shapes,
         )
 
     def disable_cudagraph(self):
@@ -920,6 +933,35 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
             wavs.append(wav_chunk[..., context_size * self.total_upsample :])
             start_index = end_index
         return torch.cat(wavs, dim=-1)
+
+    def batched_chunked_decode(
+        self,
+        codes,
+        lengths,
+        chunk_size=300,
+        left_context_size=25,
+        max_batch_size=0,
+    ):
+        if self._cudagraph_enabled and self._cudagraph_wrapper is not None:
+            return self._cudagraph_wrapper.batched_chunked_decode_with_cudagraph(
+                codes,
+                lengths,
+                chunk_size=chunk_size,
+                left_context_size=left_context_size,
+                max_batch_size=max_batch_size,
+            )
+
+        from ..cuda_graph_decoder_wrapper import _batched_chunked_decode
+
+        return _batched_chunked_decode(
+            codes,
+            lengths,
+            decode_fn=self,
+            total_upsample=self.total_upsample,
+            chunk_size=chunk_size,
+            left_context_size=left_context_size,
+            max_batch_size=max_batch_size,
+        )
 
 
 class Qwen3TTSTokenizerV2Encoder(MimiModel):
