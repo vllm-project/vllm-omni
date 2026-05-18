@@ -1,8 +1,9 @@
 # MiniCPM-o 4.5 default deploy: 2-GPU layout.
 #
-# Stage 0 (thinker): GPU 0  — multimodal understanding, ~70% mem.
-# Stage 1 (talker) : GPU 1  — MiniCPMTTS + Token2Wav, ~55% mem.
-# Stage 2 (t2w)    : GPU 1  — waveform passthrough, ~20% mem (shared with talker).
+# Stage 0 (thinker): GPU 0 — multimodal understanding, ~70% mem.
+# Stage 1 (talker) : GPU 1 — MiniCPMTTS + Token2Wav, ~75% mem
+#                            (covers both the talker LM and the in-process
+#                            Token2Wav vocoder that emits the waveform).
 #
 # Other GPU layouts: minicpmo_4_5_3gpu.yaml, minicpmo_4_5_8x4090.yaml.
 async_chunk: false
@@ -31,21 +32,7 @@ stages:
 
   - stage_id: 1
     max_num_seqs: 16
-    gpu_memory_utilization: 0.55
-    enforce_eager: true
-    max_num_batched_tokens: 8192
-    devices: "1"
-    default_sampling_params:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: -1
-      max_tokens: 1
-      seed: 42
-      detokenize: false
-
-  - stage_id: 2
-    max_num_seqs: 1
-    gpu_memory_utilization: 0.2
+    gpu_memory_utilization: 0.75
     enforce_eager: true
     max_num_batched_tokens: 8192
     devices: "1"
