@@ -1250,7 +1250,56 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         audio_token_id = int(self.config.audio_token_id)
         audio_delay_id = int(self.config.audio_delay_token_id)
         is_audio = (sampled_flat == audio_token_id) | (sampled_flat == audio_delay_id)
-        if not bool(is_audio.any()):
+
+        if not hasattr(self, "_audio_state"):
+            self._audio_state: dict[int, dict[str, Any]] = {}
+        if not hasattr(self, "_slot_output_len"):
+            self._slot_output_len: dict[int, int] = {}
+
+        # R13: skip the audio-code sampling for rows that just transitioned
+        # OUT of audio_out_bos. The hidden state at this prefill-end step is
+        # at the audio_out_bos position, where upstream's audio_out_mask is
+        # False and no audio_logits are computed. The LM bias above already
+        # forced ``audio_token_id`` at this step, and the next forward will
+        # produce a hidden at the new audio_token_id position — that is what
+        # upstream samples its first audio frame from. Also reset any stale
+        # ``_audio_state`` and ``_slot_output_len`` for the slot, so a fresh
+        # request reusing a finished slot starts clean.
+        first_after_bos = getattr(self, "_last_first_audio_after_bos", None)
+        self._last_first_audio_after_bos = None
+        num_codebooks_local = int(self.config.num_codebooks)
+        bos_local = int(self.config.audio_stream_bos_id)
+        seeded_rows: list[int] = []
+        seeded_frame: torch.Tensor | None = None
+        if isinstance(first_after_bos, torch.Tensor) and first_after_bos.numel() == is_audio.shape[0]:
+            first_after_bos = first_after_bos.to(is_audio.device)
+            skip_rows = first_after_bos & is_audio
+            if bool(skip_rows.any()):
+                # R13: upstream's AUDIO_INIT step seeds ``audio_out_ids`` with
+                # a single all-``audio_stream_bos_id`` frame and the NEXT
+                # forward feeds ``embed_audio_codes(all_bos)`` at the new
+                # audio_out_token_idx position. Without this, our audio MLP
+                # receives a text embedding at the audio_token_id position
+                # and produces NaN logits. Seed per-slot state with the
+                # all-BOS frame here, AND emit it as the first output frame
+                # so the downstream delay-pattern revert sees the leading
+                # BOS-only frame upstream emits.
+                seeded_frame = torch.full(
+                    (num_codebooks_local,), bos_local, dtype=torch.long, device=hidden.device
+                )
+                for bi in torch.nonzero(skip_rows, as_tuple=False).reshape(-1).tolist():
+                    bi = int(bi)
+                    # Reset stale state from a finished prior request.
+                    self._slot_output_len[bi] = 0
+                    self._audio_state[bi] = {
+                        "num_delay": 0,
+                        "num_remaining_delays": None,
+                        "audio_out_ids": seeded_frame.unsqueeze(-1).clone(),  # [Q, 1]
+                    }
+                    seeded_rows.append(bi)
+                is_audio = is_audio & ~first_after_bos
+
+        if not bool(is_audio.any()) and not seeded_rows:
             self._last_audio_codes = None
             return sampler_output
 
@@ -1259,8 +1308,6 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         # state lookup; the RAS check between the head sample and the
         # delay-pattern apply also reads it.
         audio_row_indices = torch.nonzero(is_audio, as_tuple=False).reshape(-1).tolist()
-        if not hasattr(self, "_audio_state"):
-            self._audio_state: dict[int, dict[str, Any]] = {}
 
         # Per-codebook logits at audio positions only.
         cb_logits = self.audio_codebook_logits(hidden, is_audio)  # [N_audio, Q, V]
@@ -1416,6 +1463,16 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         if new_codes_flat:
             stacked = torch.stack(new_codes_flat, dim=0).to(hidden.device)
             codes_full[is_audio] = stacked
+        # R13: emit the seeded all-BOS frame at the prefill-end (AUDIO_INIT)
+        # rows so the talker output has the leading delay-pattern frame the
+        # downstream revert helper expects.
+        if seeded_rows and seeded_frame is not None:
+            seeded_rows_idx = torch.tensor(seeded_rows, dtype=torch.long, device=hidden.device)
+            codes_full.index_copy_(
+                0,
+                seeded_rows_idx,
+                seeded_frame.unsqueeze(0).expand(len(seeded_rows), -1).to(hidden.device),
+            )
 
         self._last_audio_codes = codes_full
         self._postprocess_cursor = 0
@@ -1563,6 +1620,14 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         stash_tail: list[int] | None = None
         if isinstance(stash_ids, torch.Tensor) and stash_ids.numel() >= num_rows:
             stash_tail = stash_ids[-num_rows:].detach().to("cpu").tolist()
+        # R13: also stash a per-row "is this the first audio-mode step right
+        # after audio_out_bos" flag. Upstream NEVER samples audio codes at
+        # the audio_out_bos position (its audio_out_mask is False there);
+        # the first audio frame is sampled one step later, at the new
+        # audio_out_token_idx position. ``sample()`` reads this flag to
+        # suppress the audio-code sampling at the prefill-end step so the
+        # first audio frame is sampled from the correct hidden state.
+        first_after_bos = torch.zeros(num_rows, dtype=torch.bool, device=logits.device)
         for i in range(num_rows):
             prev: int | None = None
             if output_ids is not None and i < len(output_ids):
@@ -1585,6 +1650,8 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                 continue
             if prev not in (audio_bos, audio_id):
                 continue
+            if prev == audio_bos:
+                first_after_bos[i] = True
             # Always force ``audio_token_id`` — upstream mirror.
             allowed: set[int] = {audio_id, *allowed_extra}
             row = logits[i]
@@ -1594,6 +1661,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                     mask[tok] = row[tok]
             logits[i].copy_(mask)
             biased += 1
+        self._last_first_audio_after_bos = first_after_bos
         return biased
 
     has_postprocess: bool = True
