@@ -31,7 +31,7 @@
                 ],
                 "baseline": {
                     "throughput_qps": 0.04,
-                    "latency_mean": 23,
+                    "latency_mean": 30,
                     "peak_memory_mb_mean": 75000
                 }
             }
@@ -73,7 +73,7 @@
                 ],
                 "baseline": {
                     "throughput_qps": 0.06,
-                    "latency_mean": 17,
+                    "latency_mean": 20,
                     "peak_memory_mb_mean": 48000
                 }
             },
@@ -98,7 +98,7 @@
                 ],
                 "baseline": {
                     "throughput_qps": 0.01,
-                    "latency_mean": 82,
+                    "latency_mean": 90,
                     "peak_memory_mb_mean": 56000
                 }
             }

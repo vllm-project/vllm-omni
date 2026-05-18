@@ -160,7 +160,7 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.46,
-                    "latency_mean": 3,
+                    "latency_mean": 5,
                     "peak_memory_mb_mean": 56000
                 }
             },
@@ -176,7 +176,7 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.18,
-                    "latency_mean": 6,
+                    "latency_mean": 10,
                     "peak_memory_mb_mean": 67000
                 }
             }

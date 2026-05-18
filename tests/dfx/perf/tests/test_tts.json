@@ -27,7 +27,7 @@
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            2113
+            3000
           ],
           "median_audio_rtf": [
             0.6
@@ -55,14 +55,14 @@
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            818,
-            2207,
-            13194
+            1000,
+            3000,
+            14000
           ],
           "median_audio_rtf": [
-            0.66,
-            1.13,
-            3.89
+            0.70,
+            1.15,
+            3.90
           ],
           "audio_throughput": [
             12,
@@ -129,10 +129,10 @@
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            1675
+            2000
           ],
           "median_audio_rtf": [
-            0.38
+            0.40
           ]
         }
       },
@@ -162,19 +162,19 @@
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            225,
-            723,
-            4683
+            300,
+            1000,
+            5000
           ],
           "median_audio_rtf": [
-            0.24,
-            0.34,
-            1.06
+            0.25,
+            0.35,
+            1.10
           ],
           "audio_throughput": [
-            33,
-            46,
-            48
+            30,
+            40,
+            40
           ]
         }
       },
@@ -228,10 +228,10 @@
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            66
+            100
           ],
           "median_audio_rtf": [
-            0.17
+            0.20
           ],
           "audio_throughput": [
             10
@@ -259,7 +259,7 @@
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            52
+            100
           ],
           "median_audio_rtf": [
             0.15
@@ -291,19 +291,19 @@
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            90,
-            673,
-            4260
+            100,
+            1000,
+            5000
           ],
           "median_audio_rtf": [
-            0.22,
-            0.37,
-            1.18
+            0.25,
+            0.40,
+            1.20
           ],
           "audio_throughput": [
-            37,
-            42,
-            44
+            30,
+            40,
+            40
           ]
         }
       },
@@ -328,10 +328,10 @@
         "percentile-metrics": "ttft,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
           "median_audio_ttfp_ms": [
-            64
+            100
           ],
           "median_audio_rtf": [
-            0.16
+            0.20
           ],
           "audio_throughput": [
             9

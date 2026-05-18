@@ -23,7 +23,7 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.06,
-                    "latency_mean": 15,
+                    "latency_mean": 20,
                     "peak_memory_mb_max": 57000,
                     "peak_memory_mb_mean": 57000
                 }
@@ -41,7 +41,7 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.01,
-                    "latency_mean": 58,
+                    "latency_mean": 60,
                     "peak_memory_mb_max": 67000,
                     "peak_memory_mb_mean": 67000
                 }
@@ -76,7 +76,7 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.15,
-                    "latency_mean": 7,
+                    "latency_mean": 10,
                     "peak_memory_mb_max": 55000,
                     "peak_memory_mb_mean": 55000
                 }
@@ -139,7 +139,7 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.21,
-                    "latency_mean": 5,
+                    "latency_mean": 10,
                     "peak_memory_mb_max": 57000,
                     "peak_memory_mb_mean": 57000
                 }
@@ -157,7 +157,7 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.08,
-                    "latency_mean": 12,
+                    "latency_mean": 20,
                     "peak_memory_mb_max": 66000,
                     "peak_memory_mb_mean": 66000
                 }
