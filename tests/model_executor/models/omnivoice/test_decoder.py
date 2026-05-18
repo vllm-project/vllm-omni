@@ -18,9 +18,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-# TODO: update to vllm_omni.transformers_utils.configs.omnivoice once OmniVoiceConfig
-# is relocated there (following the pattern of FishSpeechConfig, VoxCPMConfig, etc.)
-from vllm_omni.model_executor.models.omnivoice.config import OmniVoiceConfig
+from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 from vllm_omni.model_executor.models.omnivoice.omnivoice_decoder import (
     HiggsAudioRVQ,
     OmniVoiceDecoder,

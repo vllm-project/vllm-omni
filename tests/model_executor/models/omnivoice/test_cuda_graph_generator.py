@@ -226,9 +226,7 @@ def test_cuda_graph_disabled_matches_eager_generator():
 
     Uses a 2-layer config so warmup completes quickly without loading weights.
     """
-    # TODO: update to vllm_omni.transformers_utils.configs.omnivoice once OmniVoiceConfig
-    # is relocated there (following the pattern of FishSpeechConfig, VoxCPMConfig, etc.)
-    from vllm_omni.model_executor.models.omnivoice.config import OmniVoiceConfig
+    from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
     from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import OmniVoiceGenerator
 
     cfg = OmniVoiceConfig()
