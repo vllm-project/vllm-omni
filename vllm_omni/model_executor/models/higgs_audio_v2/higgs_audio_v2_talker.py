@@ -459,12 +459,8 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         # Audio frames are embedded by summing per-codebook lookups; the LM
         # input_ids stream uses ``audio_token_id`` / ``audio_delay_token_id``
         # placeholders at the corresponding positions, and the talker
-        # substitutes the audio embedding via ``masked_scatter`` before
-        # entering the decoder stack.
-        self.embed_audio_tokens = nn.Embedding(
-            self.config.num_codebooks * self.config.codebook_size,
-            self.config.hidden_size,
-        )
+        # substitutes the audio embedding via the audio_codebook_embeddings
+        # table declared further below (R12).
         self.register_buffer(
             "audio_tokens_offsets",
             torch.arange(self.config.num_codebooks) * self.config.codebook_size,
@@ -481,27 +477,29 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             prefix=f"{prefix}.lm_head",
         )
 
-        # Audio side: codebook-0 head emits 1026 logits; codebooks 1..7 come
-        # from the fast-AR ``HiggsAudioCodePredictor`` below.
-        self.audio_codebook0_head = nn.Linear(
-            self.config.hidden_size, self.config.codebook_size, bias=False
+        # Audio side: the upstream ``audio_decoder_proj.audio_lm_head`` is a
+        # single fused ``Linear(hidden, num_codebooks * (codebook_size + 2))``.
+        # In our v2 config ``codebook_size = 1026`` ALREADY includes the two
+        # stream specials, so the fused head is shape ``(8 * 1026, 3072) =
+        # (8208, 3072)``. At sample time we run it once and reshape
+        # ``[N, 8208] -> [N, 8, 1026]`` to read each codebook's logits. The
+        # round-7 split into ``audio_codebook0_head`` + per-codebook residual
+        # heads doesn't reflect the actual architecture and is removed.
+        self.audio_lm_head = nn.Linear(
+            self.config.hidden_size,
+            self.config.num_codebooks * self.config.codebook_size,
+            bias=False,
         )
-        self.code_predictor = HiggsAudioCodePredictor(
-            self.config, prefix=f"{prefix}.code_predictor"
+        # Multi-codebook input embedding used both for prompt-side audio frame
+        # substitution and for next-step audio-input-embedding feedback during
+        # decode. Mirrors upstream ``HiggsAudioModel.audio_codebook_embeddings``.
+        self.audio_codebook_embeddings = nn.Embedding(
+            self.config.num_codebooks * self.config.codebook_size,
+            self.config.hidden_size,
         )
 
         # vLLM's logits processor wires sampling metadata into the lm_head.
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
-
-        # Round 7: share the audio embedding table with the code predictor's
-        # per-codebook lookup. Upstream ships a single
-        # ``model.embed_audio_tokens.embed_audio_tokens.weight`` tensor that
-        # services both the prompt-side audio-frame substitution and the
-        # residual-codebook-embedding path in the fast-AR predictor. Tying the
-        # weights here means load_weights only needs to write the single
-        # ``embed_audio_tokens.weight`` slot and the code predictor
-        # automatically picks up the same tensor.
-        self.code_predictor.embed_codebooks.weight = self.embed_audio_tokens.weight
 
     # ----------------------------------------------------------------- masks
     @torch.inference_mode()
@@ -752,31 +750,32 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
     def _consume_fused_audio_head(
         self, fused: torch.Tensor, loaded: set[str]
     ) -> None:
-        """Split the fused ``audio_lm_head[num_codebooks*codebook_size, hidden]``
-        into ``audio_codebook0_head`` + the code predictor's residual heads.
+        """Load the fused ``audio_lm_head[num_codebooks*codebook_size, hidden]``
+        directly into ``self.audio_lm_head.weight``.
+
+        Upstream uses a single big head — the round-7 split into a separate
+        codebook-0 head + residual predictor was not faithful to the model
+        architecture and is removed in R12.
         """
         own_params = dict(self.named_parameters())
         num_codebooks = int(self.config.num_codebooks)
         codebook_size = int(self.config.codebook_size)
         hidden = int(self.config.hidden_size)
-        if tuple(fused.shape) != (num_codebooks * codebook_size, hidden):
+        target = own_params.get("audio_lm_head.weight")
+        if target is None:
+            logger.warning("higgs_audio_v2: no audio_lm_head.weight slot to load into")
+            return
+        expected = (num_codebooks * codebook_size, hidden)
+        if tuple(fused.shape) != expected:
             logger.warning(
                 "higgs_audio_v2: unexpected audio_lm_head shape %s; expected %s",
                 tuple(fused.shape),
-                (num_codebooks * codebook_size, hidden),
+                expected,
             )
             return
-        chunks = fused.split(codebook_size, dim=0)
-        if "audio_codebook0_head.weight" in own_params:
-            with torch.no_grad():
-                own_params["audio_codebook0_head.weight"].copy_(chunks[0])
-            loaded.add("audio_codebook0_head.weight")
-        for k, chunk in enumerate(chunks[1:], start=1):
-            name = f"code_predictor.residual_heads.{k - 1}.weight"
-            if name in own_params:
-                with torch.no_grad():
-                    own_params[name].copy_(chunk)
-                loaded.add(name)
+        with torch.no_grad():
+            target.copy_(fused)
+        loaded.add("audio_lm_head.weight")
 
     # --------------------------------------------------------------- helpers
     def _map_simple_name(self, hf_name: str) -> str | None:
@@ -784,6 +783,11 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         # Upstream nests the audio embedding as
         # ``model.embed_audio_tokens.embed_audio_tokens.weight``; the boson-ai
         # checkpoint also uses this exact key. Accept both nested and flat.
+        # R12: the upstream multi-codebook embedding is ``audio_codebook_embeddings``
+        # (a flat ``Embedding(8 * codebook_size, hidden)``). R7 also had a separate
+        # ``embed_audio_tokens`` (used in prefill-time DualFFN routing helpers);
+        # we keep that slot so the existing prompt-side embedding logic stays
+        # functional. Both slots are loaded from the same upstream tensor.
         if hf_name in (
             "embed_audio_tokens.weight",
             "embed_audio_tokens.embed_audio_tokens.weight",  # stripped form
@@ -793,7 +797,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             "audio_codebook_embeddings.weight",
             "model.audio_codebook_embeddings.weight",
         ):
-            return "embed_audio_tokens.weight"
+            return "audio_codebook_embeddings.weight"
         if hf_name in (
             "lm_head.weight",
             "text_lm_head.weight",
@@ -891,6 +895,17 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         if input_ids is not None:
             self._last_step_input_ids = input_ids
 
+        # R12 audio-feedback substitution: vLLM's AR runner calls forward()
+        # with ``inputs_embeds=None`` and lets the model embed its own
+        # input_ids inline. ``embed_input_ids`` is only invoked via the
+        # supports_mm_inputs/prompt_embeds branches, neither of which fires
+        # for the talker. So we apply the substitution directly here: at
+        # decode positions where input_ids == audio_token_id, swap the text
+        # embedding with embed_audio_codes(last audio frame stashed in
+        # ``self._audio_state[req_id]`` by :meth:`sample`).
+        if input_ids is not None and inputs_embeds is None:
+            hidden_states = self._maybe_apply_audio_feedback(hidden_states, input_ids)
+
         audio_mask = self.audio_token_mask(input_ids) if input_ids is not None else None
 
         residual: torch.Tensor | None = None
@@ -945,80 +960,156 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         self._last_logits_hidden = hidden_states
         return self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
 
-    def audio_codebook0_logits(
+    def audio_codebook_logits(
         self,
         hidden_states: torch.Tensor,
         audio_token_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Codebook-0 logits at audio positions, ``[N_audio, codebook_size]``.
+        """Per-codebook logits at audio positions, ``[N_audio, num_codebooks, codebook_size]``.
 
-        Separated from :meth:`compute_logits` so the AR runner can pipe a
-        tensor through the stock sampler while a dedicated codebook-0
-        sampling adapter consumes this tensor in parallel. Returns an
-        empty tensor when ``audio_token_mask`` selects no positions.
+        Runs the single fused ``audio_lm_head: Linear(hidden, num_codebooks *
+        codebook_size)`` and reshapes the output. This mirrors upstream's
+        ``HiggsAudioDecoderProjector.audio_lm_head`` + the
+        ``view(-1, num_codebooks, codebook_size)`` reshape in
+        ``HiggsAudioModel.forward``.
+
+        Returns an empty tensor with the correct trailing shape when the mask
+        selects no positions.
         """
+        num_codebooks = int(self.config.num_codebooks)
+        codebook_size = int(self.config.codebook_size)
         mask = audio_token_mask.reshape(-1).to(hidden_states.device)
         hidden_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
         if not mask.any():
             return torch.empty(
-                (0, int(self.config.codebook_size)),
+                (0, num_codebooks, codebook_size),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
-        return self.audio_codebook0_head(hidden_flat[mask])
+        flat = self.audio_lm_head(hidden_flat[mask])
+        return flat.view(-1, num_codebooks, codebook_size)
 
-    def predict_audio_residual_codebooks(
-        self,
-        hidden_states: torch.Tensor,
-        codebook0_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Emit codebooks 1..N-1 for audio positions via the fast-AR predictor.
+    def embed_audio_codes(self, audio_ids: torch.Tensor) -> torch.Tensor:
+        """Embed a ``[num_codebooks, T]`` audio-ids slice into a ``[T, hidden]`` tensor.
 
-        Inputs:
-            hidden_states: ``[N_audio, hidden]`` -- last hidden state at each audio position.
-            codebook0_ids: ``[N_audio]`` -- the sampled codebook-0 token id for each position.
+        Mirrors upstream ``HiggsAudioModel._embed_audio_ids``:
 
-        Returns:
-            ``[N_audio, num_codebooks - 1]`` int64 tensor of predicted codes.
+            shift = arange(num_codebooks) * codebook_size  # 1026 per slot
+            audio_embed = sum_over_codebooks(audio_codebook_embeddings(audio_ids + shift))
+
+        The 8 codebooks share a single ``Embedding(8 * codebook_size, hidden)``
+        table; each codebook indexes into its own per-codebook slot via the
+        shift. The output is the per-frame mixture of 8 codebook embeddings
+        and is what the model re-feeds at the next AR step's
+        ``<|AUDIO_OUT|>`` placeholder position.
         """
-        if hidden_states.ndim != 2:
-            raise ValueError(f"hidden_states must be [N, hidden]; got shape {tuple(hidden_states.shape)}")
-        n_audio = int(hidden_states.shape[0])
-        out = torch.empty(
-            (n_audio, self.config.num_codebooks - 1), dtype=torch.long, device=hidden_states.device
-        )
-        num_real = int(getattr(self.config, "num_real_codes", self.config.codebook_size))
-        running_hidden = hidden_states
-        prev_codes = codebook0_ids
-        for k in range(1, self.config.num_codebooks):
-            # Inject the previous codebook embedding as a residual into the
-            # running hidden state, then predict the next codebook's logits.
-            cb_embed = self.code_predictor.embed_codebook(k - 1, prev_codes)  # [N, hidden]
-            running_hidden = running_hidden + cb_embed
-            logits = self.code_predictor.predict_residual(running_hidden, k)  # [N, codebook_size]
-            # Mask stream specials so argmax stays in the real-code range.
-            if logits.shape[-1] > num_real:
-                logits = logits.clone()
-                logits[:, num_real:] = float("-inf")
-            next_codes = torch.argmax(logits, dim=-1)
-            out[:, k - 1] = next_codes
-            prev_codes = next_codes
-        return out
+        if audio_ids.ndim != 2:
+            raise ValueError(
+                f"audio_ids must be [num_codebooks, T]; got shape {tuple(audio_ids.shape)}"
+            )
+        codebook_size = int(self.config.codebook_size)
+        num_codebooks = int(self.config.num_codebooks)
+        shift = torch.arange(num_codebooks, device=audio_ids.device) * codebook_size
+        shifted = audio_ids + shift.unsqueeze(-1)  # [num_codebooks, T]
+        embed = self.audio_codebook_embeddings(shifted)  # [num_codebooks, T, hidden]
+        return embed.sum(dim=0)  # [T, hidden]
+
+    def _maybe_apply_audio_feedback(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """Return ``hidden_states`` with audio-token positions replaced by the
+        multi-codebook embedding of the LAST audio frame stashed by
+        :meth:`sample`.
+
+        Called from :meth:`forward` when ``inputs_embeds`` is ``None`` (vLLM's
+        AR runner path) — the equivalent of upstream's
+        ``_embed_audio_ids(audio_out_ids)`` injection at audio positions.
+        We use ``index_copy`` (out-of-place) instead of mutating the original
+        ``hidden_states`` because the embed-tokens output may be a view of a
+        compiled buffer that doesn't tolerate in-place writes.
+        """
+        audio_token_id = int(self.config.audio_token_id)
+        flat_ids = input_ids.reshape(-1)
+        audio_positions = (flat_ids == audio_token_id).nonzero(as_tuple=False).reshape(-1)
+        if audio_positions.numel() == 0:
+            return hidden_states
+        state = getattr(self, "_audio_state", None)
+        if not state:
+            return hidden_states
+        # Build a list of (pos, audio_emb) overrides and apply via index_copy
+        # on a cloned hidden_states.
+        rep_positions: list[int] = []
+        rep_embeds: list[torch.Tensor] = []
+        for pos in audio_positions.tolist():
+            req_state = state.get(int(pos))
+            if req_state is None:
+                continue
+            audio_out_ids = req_state.get("audio_out_ids")
+            if not isinstance(audio_out_ids, torch.Tensor) or audio_out_ids.numel() == 0:
+                continue
+            last_frame = audio_out_ids[:, -1:].to(hidden_states.device)
+            audio_emb = self.embed_audio_codes(last_frame)  # [1, hidden]
+            rep_positions.append(int(pos))
+            rep_embeds.append(audio_emb[0].to(dtype=hidden_states.dtype))
+        if not rep_positions:
+            return hidden_states
+        new_hidden = hidden_states.clone()
+        flat_hidden = new_hidden.reshape(-1, new_hidden.shape[-1])
+        idx = torch.tensor(rep_positions, dtype=torch.long, device=new_hidden.device)
+        rep = torch.stack(rep_embeds, dim=0)
+        flat_hidden.index_copy_(0, idx, rep)
+        return new_hidden
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         """Embed the LM token stream, swapping in audio embeddings at placeholders.
 
-        The vLLM runner calls this before forward(); the embedding produced
-        here is what the decoder stack consumes. For text positions we use
-        the standard ``embed_tokens`` lookup; for audio positions (input id
-        equals ``audio_token_id`` or ``audio_delay_token_id``) we leave the
-        text embedding in place -- the actual audio embedding lookup is
-        deferred to the engine path that has ``audio_input_ids`` in scope.
-        Until the live engine wires audio_input_ids through, the text
-        embedding at placeholder positions acts as a deterministic dummy
-        that the DualFFN audio expert still routes correctly.
+        Text positions use the standard ``embed_tokens`` lookup. At audio
+        positions (input id equals ``audio_token_id``) we substitute the
+        text embedding with the multi-codebook embedding of the LAST audio
+        frame stashed by :meth:`sample` in ``self._audio_state[req_id]``.
+        This mirrors upstream's ``HiggsAudioModel.forward`` flow where
+        ``_embed_audio_ids(audio_out_ids)`` is plugged into the input at
+        ``<|AUDIO_OUT|>`` placeholder positions.
+
+        Without this feedback the model receives the SAME embedding (just
+        the text ``<|AUDIO_OUT|>`` embedding) at every audio step and has no
+        way to attend to its own audio history — the resulting codes
+        collapse to a fixed loop and the ASR cannot recover the original
+        prompt.
         """
-        return self.embed_tokens(input_ids)
+        text_embed = self.embed_tokens(input_ids)
+        audio_token_id = int(self.config.audio_token_id)
+        flat_ids = input_ids.reshape(-1)
+        audio_positions = (flat_ids == audio_token_id).nonzero(as_tuple=False).reshape(-1)
+        if audio_positions.numel() == 0:
+            return text_embed
+        state = getattr(self, "_audio_state", None)
+        if not state:
+            return text_embed
+        # We expect one audio position per active request per decode step.
+        # Match rows by walking through the per-request audio_out_ids buffers.
+        # The runner concatenates requests in batch order; ``audio_positions``
+        # lists their indices into the flat ``input_ids``. For each position we
+        # look up the corresponding request's last audio frame.
+        # NOTE: this O(N_audio) loop is small (N_audio == active requests in a
+        # decode step) and runs once per step.
+        flat_embed = text_embed.reshape(-1, text_embed.shape[-1])
+        for pos in audio_positions.tolist():
+            # ``state`` keys are the absolute batch row indices the sampler
+            # saw, which match the positions in flat ``input_ids`` during a
+            # decode step (one token per active request). For a prefill
+            # step's prompt-side audio_token_id positions, no state entry
+            # exists yet — that's fine, we leave the text embed in place.
+            req_state = state.get(int(pos))
+            if req_state is None:
+                continue
+            audio_out_ids = req_state.get("audio_out_ids")
+            if not isinstance(audio_out_ids, torch.Tensor) or audio_out_ids.numel() == 0:
+                continue
+            last_frame = audio_out_ids[:, -1:].to(text_embed.device)  # [Q, 1]
+            audio_emb = self.embed_audio_codes(last_frame)  # [1, hidden]
+            flat_embed[pos] = audio_emb[0].to(dtype=text_embed.dtype)
+        return text_embed
 
     def make_omni_output(
         self,
@@ -1101,19 +1192,31 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
     have_multimodal_outputs: bool = True
 
     def sample(self, logits: torch.Tensor, sampling_metadata: Any) -> Any:
-        """Model-owned sampler with audio-codebook-0 dispatch.
+        """Model-owned sampler with delay-pattern audio dispatch (R12).
 
-        - Run the stock vLLM sampler against the text-vocab logits to produce
-          per-position token ids. These already cover the standard text path.
-        - Detect positions where the *sampled* token is an audio placeholder
-          (``audio_token_id`` or ``audio_delay_token_id``). At those positions
-          we sample codebook 0 from :meth:`audio_codebook0_logits` and run
-          :meth:`predict_audio_residual_codebooks` for codebooks 1..7. The
-          resulting ``[N_audio, 8]`` tensor is stashed on the talker so the
-          per-request ``postprocess`` hook can publish it under
-          ``model_intermediate_buffer[req_id]["codes"]["audio"]``.
+        Each generation step the model emits one LM token. At audio positions
+        (where the previous LM token was ``audio_bos_token_id`` or
+        ``audio_token_id``), the same hidden state also drives the fused
+        ``audio_lm_head`` to produce ``[num_codebooks, codebook_size]``
+        per-codebook logits. We argmax those per-codebook, then APPLY THE
+        UPSTREAM DELAY PATTERN:
 
-        Hidden states are the ones cached by :meth:`compute_logits`.
+          - For the first ``num_codebooks - 1`` audio steps, force codebooks
+            ``[num_delay + 1 :]`` to ``audio_stream_bos_id``; only codebooks
+            up to ``num_delay`` are real.
+          - When ``audio_stream_eos_id`` first appears in a codebook k, force
+            all earlier codebooks to ``eos`` too and start the trailing
+            ``num_codebooks - k - 1`` "ramp-down" steps where successive
+            codebooks also get ``eos``.
+          - When all 8 codebooks have ramped down, switch the LM next-token
+            from ``audio_token_id`` to ``audio_eos_token_id`` so the engine
+            sees a stop signal at the right place.
+
+        Per-request state (``num_delay``, ``num_remaining_delays``,
+        cumulative ``audio_out_ids: [num_codebooks, T_so_far]``) lives in
+        ``self._audio_state[req_id]``; ``embed_input_ids`` reads it on the
+        next step to substitute the audio-token embedding via
+        :meth:`embed_audio_codes`.
         """
         sampler = getattr(self, "_stock_sampler", None)
         if sampler is None:
@@ -1122,11 +1225,10 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             sampler = Sampler()
             self._stock_sampler = sampler
 
-        # Audio-mode logits bias: when the previous token (last in
-        # output_token_ids[i] if non-empty, else last in prompt_token_ids[i])
-        # is ``audio_out_bos`` (=audio_bos_token_id) or ``audio_token_id``, the
-        # next emitted token must be either another ``audio_token_id`` (audio
-        # frame placeholder) or ``audio_eos`` (stop). Mask everything else.
+        # Bias the text-vocab logits so the LM stays on the audio path. This
+        # forces ``audio_token_id`` at audio positions; the delay-pattern
+        # logic below later overrides the LM token to ``audio_eos_token_id``
+        # when the ramp-down completes.
         self._apply_audio_mode_bias(logits, sampling_metadata)
         sampler_output = sampler(logits=logits, sampling_metadata=sampling_metadata)
 
@@ -1142,7 +1244,6 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             return sampler_output
         sampled_flat = sampled.reshape(-1)
         if int(sampled_flat.numel()) != int(hidden.shape[0]):
-            # Shape mismatch (e.g. spec-decode draft path); skip audio dispatch.
             self._last_audio_codes = None
             return sampler_output
 
@@ -1153,36 +1254,159 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             self._last_audio_codes = None
             return sampler_output
 
-        audio_hidden = hidden[is_audio]
-        cb0_logits = self.audio_codebook0_head(audio_hidden)
-        # Mask stream-special positions so argmax stays in the real-code range
-        # ``[0, num_real_codes)``. Without this the per-codebook argmax can
-        # land on ``audio_stream_bos_id`` (1024) or ``audio_stream_eos_id``
-        # (1025), and the stage-input adapter's :func:`_extract_last_frame`
-        # filter drops those frames entirely.
-        num_real = int(getattr(self.config, "num_real_codes", cb0_logits.shape[-1]))
-        if cb0_logits.shape[-1] > num_real:
-            cb0_logits = cb0_logits.clone()
-            cb0_logits[:, num_real:] = float("-inf")
-        cb0 = torch.argmax(cb0_logits, dim=-1)
-        residual = self.predict_audio_residual_codebooks(audio_hidden, cb0)
-        # Defensive clamp on residual codebooks too.
-        residual = residual.clamp_(max=num_real - 1).clamp_(min=0)
-        codes_flat = torch.cat([cb0.unsqueeze(1), residual], dim=1).to(torch.long)
+        # Per-codebook logits at audio positions only.
+        cb_logits = self.audio_codebook_logits(hidden, is_audio)  # [N_audio, Q, V]
+        # Mask the two stream-special tokens (``audio_stream_bos_id``,
+        # ``audio_stream_eos_id``) in the codebook vocab so the sampled code
+        # stays in the real-code range. The delay-pattern logic below writes
+        # BOS into leading codebooks deliberately; without this mask the
+        # model frequently picks the specials and the downstream clamp folds
+        # them to ``num_real_codes - 1``, producing fixed-amplitude output.
+        num_real = int(getattr(self.config, "num_real_codes", cb_logits.shape[-1]))
+        if cb_logits.shape[-1] > num_real:
+            cb_logits = cb_logits.clone()
+            cb_logits[..., num_real:] = float("-inf")
 
-        # Scatter [N_audio, 8] back to a [N, 8] tensor (-1 at non-audio rows)
-        # so postprocess can slice per-request.
+        # R12: sample with the same diversity knobs the upstream
+        # ``HiggsAudioServeEngine`` uses (temperature, top-k, top-p). Greedy
+        # argmax collapses the codebook output to a fixed pattern after a few
+        # steps; sampling gives the natural-sounding variety the model was
+        # trained to produce. Hard-coded to the boson reference defaults; a
+        # future iteration can plumb these through stage-config.
+        cb_logits_2d = cb_logits.reshape(-1, cb_logits.shape[-1])
+        codes_2d = self._sample_audio_codes(
+            cb_logits_2d, temperature=1.0, top_k=50, top_p=0.95
+        )
+        codes_flat = codes_2d.view(cb_logits.shape[0], cb_logits.shape[1]).to(torch.long)
+
+        # Apply the upstream delay pattern + EOS ramp-down per request.
         num_codebooks = int(self.config.num_codebooks)
+        bos = int(self.config.audio_stream_bos_id)
+        eos_stream = int(self.config.audio_stream_eos_id)
+        audio_eos_vocab = int(getattr(self.config, "audio_eos_token_id", -1))
+
+        # Identify per-request indices for the audio rows in this step. The
+        # AR runner produces one row per active request; row i in `logits`
+        # corresponds to request batch index i. We map audio rows back to
+        # request batch indices via the original is_audio mask.
+        audio_row_indices = torch.nonzero(is_audio, as_tuple=False).reshape(-1).tolist()
+        if not hasattr(self, "_audio_state"):
+            self._audio_state: dict[int, dict[str, Any]] = {}
+
+        # R12 simplification: we DON'T override ``sampler_output.sampled_token_ids``
+        # back to ``audio_eos_token_id`` at ramp-down completion. The vLLM
+        # ``SamplerOutput.sampled_token_ids`` is plumbed through several
+        # downstream structures that may have already cached the GPU pointer;
+        # an in-place mutation here was crashing the worker with exit code
+        # None (silent CUDA error). Instead, ``max_tokens`` (set in the deploy
+        # yaml) is the stop bound while the audio span ramps down naturally.
+        new_codes_flat: list[torch.Tensor] = []
+        for local_i, batch_i in enumerate(audio_row_indices):
+            state = self._audio_state.setdefault(
+                int(batch_i),
+                {"num_delay": 0, "num_remaining_delays": None, "audio_out_ids": None},
+            )
+            num_delay: int = state["num_delay"]
+            num_remaining_delays: int | None = state["num_remaining_delays"]
+            this_codes = codes_flat[local_i].clone()  # [Q]
+
+            # Leading delay-pattern BOS pad.
+            if num_delay + 1 < num_codebooks:
+                this_codes[num_delay + 1 :] = bos
+                num_delay += 1
+
+            # Trailing eos ramp-down.
+            if num_remaining_delays is not None:
+                this_codes[: num_codebooks - num_remaining_delays] = eos_stream
+                num_remaining_delays -= 1
+            else:
+                eos_positions = (this_codes == eos_stream).nonzero(as_tuple=False).reshape(-1)
+                if eos_positions.numel() > 0:
+                    last_eos_idx = int(eos_positions[-1].item())
+                    this_codes[: last_eos_idx + 1] = eos_stream
+                    num_remaining_delays = num_codebooks - last_eos_idx - 1
+
+            if num_remaining_delays is not None and num_remaining_delays <= 0:
+                # Audio ramp-down finished. We DON'T override the LM
+                # sampled token (see comment above); the audio_eos vocab id
+                # is unused in this simplified path.
+                _ = audio_eos_vocab
+                num_delay = 0
+                num_remaining_delays = None
+                state["num_delay"] = num_delay
+                state["num_remaining_delays"] = num_remaining_delays
+                new_codes_flat.append(torch.full_like(this_codes, -1))
+                continue
+
+            state["num_delay"] = num_delay
+            state["num_remaining_delays"] = num_remaining_delays
+            # Append to the per-request audio_out_ids buffer.
+            if state["audio_out_ids"] is None:
+                state["audio_out_ids"] = this_codes.unsqueeze(-1).clone()
+            else:
+                state["audio_out_ids"] = torch.cat(
+                    [state["audio_out_ids"], this_codes.unsqueeze(-1)], dim=-1
+                )
+            new_codes_flat.append(this_codes)
+
+        # Reassemble the per-position codes tensor with the post-delay-pattern
+        # values; `-1` rows mark "no audio code at this position".
         codes_full = torch.full(
             (int(sampled_flat.numel()), num_codebooks),
             -1,
             dtype=torch.long,
             device=hidden.device,
         )
-        codes_full[is_audio] = codes_flat
+        if new_codes_flat:
+            stacked = torch.stack(new_codes_flat, dim=0).to(hidden.device)
+            codes_full[is_audio] = stacked
+
         self._last_audio_codes = codes_full
         self._postprocess_cursor = 0
         return sampler_output
+
+    @staticmethod
+    def _sample_audio_codes(
+        logits: torch.Tensor,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+    ) -> torch.Tensor:
+        """Top-k / top-p / temperature sample from per-codebook logits.
+
+        ``logits`` shape: ``[N, V]``. Returns ``[N]`` of int sampled indices.
+        Falls back to argmax for ``temperature <= 0``.
+        """
+        if temperature <= 0.0:
+            return torch.argmax(logits, dim=-1)
+        x = logits.float() / max(float(temperature), 1e-5)
+        if top_k is not None and top_k > 0 and top_k < x.shape[-1]:
+            kth = x.topk(top_k, dim=-1).values[..., -1:]
+            x = x.masked_fill(x < kth, float("-inf"))
+        if top_p is not None and 0.0 < top_p < 1.0:
+            sorted_logits, sorted_idx = x.sort(dim=-1, descending=True)
+            cumprobs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+            keep_mask = cumprobs <= top_p
+            # Always keep at least one token (the top-1).
+            keep_mask[..., 0] = True
+            shifted = torch.zeros_like(keep_mask)
+            shifted[..., 1:] = keep_mask[..., :-1]
+            keep_mask = shifted
+            # Scatter back to original order.
+            restore = torch.zeros_like(x, dtype=torch.bool)
+            restore.scatter_(-1, sorted_idx, keep_mask)
+            x = x.masked_fill(~restore, float("-inf"))
+        probs = x.softmax(dim=-1)
+        # Multinomial sampling expects probs to be valid; handle rows where
+        # all entries are -inf (e.g. all-masked) by falling back to argmax of
+        # original logits.
+        valid = probs.sum(dim=-1) > 0
+        sampled = torch.empty(x.shape[0], dtype=torch.long, device=x.device)
+        if valid.any():
+            sampled[valid] = torch.multinomial(probs[valid], num_samples=1).squeeze(-1)
+        if (~valid).any():
+            sampled[~valid] = torch.argmax(logits[~valid].float(), dim=-1)
+        return sampled
 
     def _apply_audio_mode_bias(self, logits: torch.Tensor, sampling_metadata: Any) -> int:
         """Mask non-audio tokens at audio-mode positions, in-place on ``logits``.
@@ -1205,12 +1429,13 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             return 0
         audio_bos = int(self.config.audio_bos_token_id)
         audio_id = int(self.config.audio_token_id)
-        # Force ``audio_token_id`` only — including ``audio_eos`` in the allow
-        # set lets greedy decode pick the EOS at step 1 (the model's unbiased
-        # logit for the audio placeholder is weak relative to neighbouring
-        # special tokens). The framework's ``max_tokens`` is the stop bound
-        # while the codebook-emission contract stabilises (R8). When the
-        # upstream sampler is faithful we'll add ``audio_eos`` back here.
+        # R12 audio-mode bias: force ONLY ``audio_token_id``. The
+        # delay-pattern ramp-down in :meth:`sample` directly writes
+        # ``audio_eos_token_id`` back into ``sampler_output.sampled_token_ids``
+        # when it decides the audio span is done; allowing ``audio_eos`` in
+        # the bias would let greedy decode pick it at step 1 and stop with
+        # zero frames (the unbiased ``audio_eos`` logit dominates ``audio_token_id``
+        # at the model's natural distribution).
         allowed_extra: list[int] = []
         # Walk per-request to decide which rows to mask.
         prompt_ids = getattr(sampling_metadata, "prompt_token_ids", None)

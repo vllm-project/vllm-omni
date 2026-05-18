@@ -446,10 +446,14 @@ def test_fused_weight_loader_maps_qkv_and_mlp() -> None:
     talker.config = cfg
 
     # ---- simple names ----
-    assert talker._map_simple_name("model.embed_audio_tokens.embed_audio_tokens.weight") == "embed_audio_tokens.weight"
+    # R12: the multi-codebook embedding lives at ``audio_codebook_embeddings``
+    # (one ``Embedding(8 * codebook_size, hidden)``), and the fused audio head
+    # at ``audio_lm_head`` (one ``Linear(hidden, 8 * codebook_size)``). The
+    # per-codebook split into ``audio_codebook0_head`` + residual heads was
+    # not faithful to the upstream architecture and has been removed.
+    assert talker._map_simple_name("model.embed_audio_tokens.embed_audio_tokens.weight") == "audio_codebook_embeddings.weight"
+    assert talker._map_simple_name("audio_codebook_embeddings.weight") == "audio_codebook_embeddings.weight"
     assert talker._map_simple_name("text_lm_head.weight") == "lm_head.weight"
-    assert talker._map_simple_name("codebook_head_0.weight") == "audio_codebook0_head.weight"
-    assert talker._map_simple_name("codebook_head_3.weight") == "code_predictor.residual_heads.2.weight"
     assert talker._map_simple_name("model.layers.5.input_layernorm.weight") == "layers.5.base.input_layernorm.weight"
     assert (
         talker._map_simple_name("model.layers.5.audio_post_attention_layernorm.weight")
@@ -507,11 +511,9 @@ def _make_stub_talker():
         params[f"layers.{li}.base.post_attention_layernorm.weight"] = torch.nn.Parameter(torch.zeros(hidden))
         params[f"layers.{li}.audio_input_layernorm.weight"] = torch.nn.Parameter(torch.zeros(hidden))
         params[f"layers.{li}.audio_post_attention_layernorm.weight"] = torch.nn.Parameter(torch.zeros(hidden))
-    params["embed_audio_tokens.weight"] = torch.nn.Parameter(torch.zeros(num_codebooks * codebook_size, hidden))
+    params["audio_codebook_embeddings.weight"] = torch.nn.Parameter(torch.zeros(num_codebooks * codebook_size, hidden))
     params["lm_head.weight"] = torch.nn.Parameter(torch.zeros(vocab, hidden))
-    params["audio_codebook0_head.weight"] = torch.nn.Parameter(torch.zeros(codebook_size, hidden))
-    for k in range(num_codebooks - 1):
-        params[f"code_predictor.residual_heads.{k}.weight"] = torch.nn.Parameter(torch.zeros(codebook_size, hidden))
+    params["audio_lm_head.weight"] = torch.nn.Parameter(torch.zeros(num_codebooks * codebook_size, hidden))
 
     # Monkey-patch named_parameters to return our stub registry.
     talker._stub_params = params
@@ -569,10 +571,8 @@ def test_load_weights_fuses_qkv_and_mlp_end_to_end() -> None:
         assert f"layers.{li}.audio_mlp.gate_up_proj.weight" in loaded
         assert f"layers.{li}.base.input_layernorm.weight" in loaded
         assert f"layers.{li}.audio_input_layernorm.weight" in loaded
-    assert "audio_codebook0_head.weight" in loaded
-    for k in range(1, num_codebooks):
-        assert f"code_predictor.residual_heads.{k - 1}.weight" in loaded
-    assert "embed_audio_tokens.weight" in loaded
+    assert "audio_lm_head.weight" in loaded
+    assert "audio_codebook_embeddings.weight" in loaded
     assert "lm_head.weight" in loaded
 
     # Validate the QKV fusion slabs for layer 0.
@@ -586,11 +586,14 @@ def test_load_weights_fuses_qkv_and_mlp_end_to_end() -> None:
     assert torch.equal(gate_up1[:inter], torch.full((inter, hidden), 14.0))
     assert torch.equal(gate_up1[inter:], torch.full((inter, hidden), 15.0))
 
-    # Validate audio_lm_head split.
-    assert torch.equal(params["audio_codebook0_head.weight"], torch.full((codebook_size, hidden), 1.0))
-    for k in range(1, num_codebooks):
+    # Validate audio_lm_head is the fused tensor as-is. Each per-codebook
+    # slab carries its distinct constant; the load_weights path no longer
+    # splits the tensor, it loads the full ``[num_codebooks * codebook_size, hidden]``
+    # weight into ``audio_lm_head.weight`` directly.
+    head = params["audio_lm_head.weight"]
+    for k in range(num_codebooks):
         assert torch.equal(
-            params[f"code_predictor.residual_heads.{k - 1}.weight"],
+            head[k * codebook_size : (k + 1) * codebook_size],
             torch.full((codebook_size, hidden), float(k + 1)),
         )
 
@@ -778,11 +781,14 @@ def test_talker_compute_logits_returns_tensor_and_audio_helper_runs_separately()
     talker.config = cfg
 
     hidden = int(cfg.hidden_size)
+    num_codebooks = int(cfg.num_codebooks)
+    codebook_size = int(cfg.codebook_size)
     torch.manual_seed(0)
-    audio_head = torch.nn.Linear(hidden, int(cfg.codebook_size), bias=False)
+    # R12: replace per-codebook split with the single fused audio_lm_head.
+    audio_head = torch.nn.Linear(hidden, num_codebooks * codebook_size, bias=False)
     with torch.no_grad():
         audio_head.weight.mul_(0.01)
-    talker.audio_codebook0_head = audio_head
+    talker.audio_lm_head = audio_head
 
     class _StubLP:
         def __call__(self, head, hidden_states, sampling_metadata):
@@ -800,16 +806,16 @@ def test_talker_compute_logits_returns_tensor_and_audio_helper_runs_separately()
     assert out.shape == (4, int(cfg.vocab_size))
     _ = out.contiguous()  # smoke-test the runner-side call site
 
-    # 2. audio_codebook0_logits returns the 1026-wide codebook-0 logits at
-    # masked positions only.
-    cb0 = talker.audio_codebook0_logits(h, mask)
-    assert isinstance(cb0, torch.Tensor)
-    assert cb0.shape == (2, int(cfg.codebook_size))
+    # 2. audio_codebook_logits returns [N_audio, num_codebooks, codebook_size]
+    # at masked positions only — one call to the fused head reshaped.
+    cb_all = talker.audio_codebook_logits(h, mask)
+    assert isinstance(cb_all, torch.Tensor)
+    assert cb_all.shape == (2, num_codebooks, codebook_size)
 
     # 3. Empty mask -> empty audio logits, runner-safe.
     empty_mask = torch.zeros(4, dtype=torch.bool)
-    cb0_empty = talker.audio_codebook0_logits(h, empty_mask)
-    assert cb0_empty.shape == (0, int(cfg.codebook_size))
+    cb_empty = talker.audio_codebook_logits(h, empty_mask)
+    assert cb_empty.shape == (0, num_codebooks, codebook_size)
 
 
 def test_make_omni_output_reads_audio_codes_from_runner_kwargs() -> None:
@@ -934,13 +940,14 @@ def test_talker_opts_into_model_sampler() -> None:
     assert callable(getattr(HiggsAudioV2TalkerForConditionalGeneration, "sample", None))
 
 
-def test_talker_residual_codebook_predictor_emits_seven_codebooks() -> None:
-    """predict_audio_residual_codebooks must return shape [N_audio, num_codebooks - 1]."""
+def test_talker_audio_codebook_logits_emits_all_codebooks() -> None:
+    """R12: ``audio_codebook_logits`` returns the per-codebook logits for all 8
+    codebooks at audio positions in one shot, via the fused
+    ``audio_lm_head: Linear(hidden, num_codebooks * codebook_size)``."""
     from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import (
         HiggsAudioV2Config,
     )
     from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_talker import (
-        HiggsAudioCodePredictor,
         HiggsAudioV2TalkerForConditionalGeneration,
     )
 
@@ -950,17 +957,23 @@ def test_talker_residual_codebook_predictor_emits_seven_codebooks() -> None:
     )
     torch.nn.Module.__init__(talker)
     talker.config = cfg
-    talker.code_predictor = HiggsAudioCodePredictor(cfg)
 
-    n_audio = 4
+    num_codebooks = int(cfg.num_codebooks)
+    codebook_size = int(cfg.codebook_size)
     hidden = int(cfg.hidden_size)
-    h = torch.randn(n_audio, hidden)
-    cb0 = torch.zeros(n_audio, dtype=torch.long)
-    out = talker.predict_audio_residual_codebooks(h, cb0)
-    assert out.shape == (n_audio, int(cfg.num_codebooks) - 1)
-    # Codes are valid codebook indices (less than codebook_size).
-    assert int(out.max()) < int(cfg.codebook_size)
-    assert int(out.min()) >= 0
+    talker.audio_lm_head = torch.nn.Linear(hidden, num_codebooks * codebook_size, bias=False)
+
+    n_total = 4
+    n_audio = 2
+    h = torch.randn(n_total, hidden)
+    mask = torch.tensor([True, False, True, False])
+    out = talker.audio_codebook_logits(h, mask)
+    assert out.shape == (n_audio, num_codebooks, codebook_size)
+    # The fused-head argmax over the codebook vocab axis stays in-range.
+    codes = torch.argmax(out, dim=-1)
+    assert codes.shape == (n_audio, num_codebooks)
+    assert int(codes.max()) < codebook_size
+    assert int(codes.min()) >= 0
 
 
 def test_stage1_rms_threshold_is_meaningful_with_corrupted_codebook() -> None:

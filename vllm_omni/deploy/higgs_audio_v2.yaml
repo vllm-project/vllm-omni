@@ -46,9 +46,13 @@ stages:
     output_connectors:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: -1
+      # R12: upstream serve_engine defaults (temperature=1.0, top_p=0.95,
+      # top_k=50). Greedy (temperature=0) collapses the audio codebook
+      # argmax to a fixed value after a few steps; sampling with diversity
+      # is required for natural-sounding speech.
+      temperature: 1.0
+      top_p: 0.95
+      top_k: 50
       # Cap Stage-0 to 250 audio frames (~10 s at 25 fps) while the audio-EOS
       # stop policy is not yet in the bias allow-list. Without a cap a single
       # request rides to max_model_len, which overflows Stage-1's prefill at

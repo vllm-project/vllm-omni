@@ -67,6 +67,32 @@ def _filter_real_code_frames(audio_codes: torch.Tensor) -> torch.Tensor:
     return audio_codes[valid]
 
 
+def _revert_delay_pattern(audio_codes_qt: torch.Tensor) -> torch.Tensor:
+    """Reverse the delay-pattern shift, mirroring upstream's
+    ``boson_multimodal.model.higgs_audio.utils.revert_delay_pattern``.
+
+    Input shape: ``[num_codebooks, seq_len + num_codebooks - 1]``.
+    Output shape: ``[num_codebooks, seq_len]``.
+
+    For each codebook ``i``, slice rows ``[i:i+1]`` from columns
+    ``[i : seq_len + i]`` to remove ``i`` leading BOS pads and ``Q-1-i``
+    trailing PAD entries.
+    """
+    if audio_codes_qt.ndim != 2:
+        raise ValueError(
+            f"_revert_delay_pattern expects [Q, T] input; got {tuple(audio_codes_qt.shape)}"
+        )
+    q, t = audio_codes_qt.shape
+    if t < q:
+        # Not enough frames to revert delay pattern; return as-is.
+        return audio_codes_qt
+    seq_len = t - q + 1
+    out_l = []
+    for i in range(q):
+        out_l.append(audio_codes_qt[i : i + 1, i : seq_len + i])
+    return torch.cat(out_l, dim=0)
+
+
 def talker2code2wav(
     source_outputs: list[Any],
     prompt: Any = None,
@@ -111,9 +137,19 @@ def talker2code2wav(
                 f"audio_codes must be 1D or 2D; got shape {tuple(audio_codes.shape)}"
             )
 
-        audio_codes = _filter_real_code_frames(audio_codes)
+        # R12: audio_codes from Stage-0 are emitted in DELAY-PATTERN layout.
+        # Revert the shift to recover the canonical ``[Q, seq_len]`` form,
+        # then clip to the real-code range and trim the first/last frame
+        # (the codec doesn't consume the BOS/EOS edge frames). This mirrors
+        # the upstream ``HiggsAudioServeEngine.generate`` decode line:
+        #     vq_code = revert_delay_pattern(out).clip(0, real-1)[:, 1:-1]
+        codes_qt = audio_codes.transpose(0, 1).contiguous().cpu()
+        codes_qt = _revert_delay_pattern(codes_qt)
+        codes_qt = codes_qt.clamp_(min=0, max=_NUM_REAL_CODES - 1)
+        if codes_qt.shape[-1] >= 3:
+            codes_qt = codes_qt[:, 1:-1]
         # Code2Wav expects codebook-major flat: [Q * num_frames].
-        codec_codes = audio_codes.transpose(0, 1).cpu().reshape(-1).tolist()
+        codec_codes = codes_qt.reshape(-1).tolist()
 
         code2wav_inputs.append(
             OmniTokensPrompt(
