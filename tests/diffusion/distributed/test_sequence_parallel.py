@@ -291,8 +291,7 @@ def test_sp_correctness(model_name: str):
     print("=" * 70)
 
 
-# TODO: After PR#1272 is merged, add markers
-# @pytest.mark.advanced_model
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards={"cuda": 4, "rocm": 2})

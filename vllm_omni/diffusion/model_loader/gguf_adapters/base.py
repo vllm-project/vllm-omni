@@ -54,7 +54,7 @@ class GGUFAdapter(ABC):
         raise NotImplementedError
 
 
-# FIXME(Isotr0py): Sync implemnentation with upstream vLLM?
+# FIXME(Isotr0py): Sync implementation with upstream vLLM?
 def gguf_quant_weights_iterator(gguf_file: str) -> Generator[tuple[str, torch.Tensor]]:
     """
     Iterate over the quant weights in the model gguf files and convert
