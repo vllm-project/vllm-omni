@@ -1701,16 +1701,10 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             return {}
         new_codes = slice_codes[audio_rows].to(torch.int32)
 
-        # Append to any existing codes.audio in the runner buffer (req_infos)
-        # so that codes accumulate across decode steps; without this, each
-        # postprocess overwrite drops earlier frames.
-        existing = req_infos.get("codes")
-        prior = None
-        if isinstance(existing, dict):
-            cand = existing.get("audio")
-            if isinstance(cand, torch.Tensor) and cand.numel() > 0:
-                prior = cand.to(device=new_codes.device, dtype=new_codes.dtype)
-        codes_out = (
-            torch.cat([prior, new_codes], dim=0) if prior is not None else new_codes
-        )
-        return {"codes": {"audio": codes_out}}
+        # R15: return ONLY this step's frames. The engine's
+        # MultimodalOutputProcessor.add_multimodal_tensor accumulates per-step
+        # OmniOutput.multimodal_outputs across all steps and consolidates at
+        # request finish via torch.cat(dim=0). Returning cumulative codes here
+        # caused N(N+1)/2 duplication (R15 found 811 frames from 41 LM steps
+        # because each step contributed an ever-growing cumulative tensor).
+        return {"codes": {"audio": new_codes}}

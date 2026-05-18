@@ -98,15 +98,24 @@ def validate_plain_text_request(request_payload: dict[str, Any]) -> None:
 def build_plain_text_conversation(text: str) -> list[dict[str, Any]]:
     """Build the canonical single-speaker plain-text conversation.
 
-    Mirrors the upstream ``examples/generation.py`` smart_voice branch (no
-    explicit scene prompt). The fixtures committed under
-    ``tests/fixtures/higgs_audio_v2/`` were captured with this exact prompt.
+    Mirrors upstream's ``zero_shot`` input sample under
+    ``examples/serve_engine/input_samples.py``: the system prompt contains
+    a ``<|scene_desc_start|>SPEAKER0: ...<|scene_desc_end|>`` block, which
+    is what conditions the model to produce coherent natural speech. The
+    earlier no-scene-block variant produced repetitive babbling once the
+    vLLM attention-backend NaN was unblocked (R14 / FLEX_ATTENTION).
     """
     validate_plain_text_input(text)
+    system_prompt = (
+        "Generate audio following instruction.\n\n"
+        "<|scene_desc_start|>\n"
+        "SPEAKER0: british accent\n"
+        "<|scene_desc_end|>"
+    )
     return [
         {
             "role": "system",
-            "content": [{"type": "text", "text": "Generate audio following instruction."}],
+            "content": [{"type": "text", "text": system_prompt}],
         },
         {
             "role": "user",
