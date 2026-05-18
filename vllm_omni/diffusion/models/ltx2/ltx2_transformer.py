@@ -1434,10 +1434,6 @@ class LTX2VideoTransformer3DModel(nn.Module):
     _layerwise_offload_blocks_attrs = ["transformer_blocks"]
     _hsdp_shard_conditions = [is_transformer_block_module]
     _sp_plan: dict[str, Any] | None = None
-    # vLLM's quant weight loader uses this to know which separate checkpoint
-    # tensors get fused into a single QKVParallelLinear param (scales included).
-    # LTX-2 self-attention uses fused QKV (attn1, audio_attn1); cross-attention
-    # variants keep separate to_q/k/v and are not packed.
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
     }
@@ -1699,6 +1695,8 @@ class LTX2VideoTransformer3DModel(nn.Module):
             rope_type=rope_type,
             num_attention_heads=audio_num_attention_heads,
         )
+
+        print(" >>> LTX2VideoTransformer3DModel.__init__: quant_config: \n", quant_config)
 
         # 5. Transformer Blocks
         self.transformer_blocks = nn.ModuleList(

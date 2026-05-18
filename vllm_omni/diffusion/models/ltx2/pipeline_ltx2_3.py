@@ -173,9 +173,6 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
             )
 
         # --- Transformer: created empty, weights loaded via AutoWeightsLoader ---
-        # As in LTX2Pipeline, only the DiT participates in quantization; the
-        # VAE / audio VAE / text encoder / connectors / vocoder are loaded
-        # directly from pretrained and stay in their native dtype.
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
         quant_config = getattr(self.od_config, "quantization_config", None)
         self.transformer = create_transformer_from_config(transformer_config, quant_config=quant_config)

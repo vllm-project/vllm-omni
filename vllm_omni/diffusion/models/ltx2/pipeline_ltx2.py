@@ -74,14 +74,7 @@ def create_transformer_from_config(
     config: dict,
     quant_config: QuantizationConfig | None = None,
 ) -> LTX2VideoTransformer3DModel:
-    """Create LTX2VideoTransformer3DModel from config dict.
-
-    `quant_config` is forwarded to the transformer constructor. The
-    `quantization_config` field that offline-quantization tooling (e.g.
-    Wan2.2's merge_mxfp8_checkpoint.py) injects into transformer/config.json
-    is not auto-detected here — no such tooling targets LTX-2 yet. Users pass
-    quantization explicitly via OmniDiffusionConfig.quantization_config.
-    """
+    """Create LTX2VideoTransformer3DModel from config dict."""
     if not config and quant_config is None:
         return LTX2VideoTransformer3DModel()
 
@@ -229,15 +222,9 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             local_files_only=local_files_only,
         ).to(self.device)
 
-        # Only the DiT transformer participates in quantization. VAE, audio
-        # VAE, vocoder, text encoder, and connectors stay in their native dtype
-        # because (a) they are perceptually sensitive (VAE) or already small
-        # (vocoder, connectors), and (b) we have no per-component plumbing on
-        # those direct-from-pretrained loads. Users wanting fine-grained routing
-        # within the transformer can pass a `ComponentQuantizationConfig` whose
-        # keys are prefixes under the transformer (e.g. "transformer_blocks").
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
         quant_config = getattr(self.od_config, "quantization_config", None)
+        print(" >>> LTX2Pipeline.__init__: quant_config: \n", quant_config)
         self.transformer = create_transformer_from_config(transformer_config, quant_config=quant_config)
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
