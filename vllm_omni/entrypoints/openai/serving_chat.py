@@ -148,6 +148,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         instance._diffusion_mode = True
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
+        instance.engine_client = None
+        instance.has_kv_connector = False
         return instance
 
     def _get_diffusion_extra_body_params(self) -> frozenset[str]:
@@ -216,6 +218,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         For diffusion models, this generates images and returns them
         in a chat completion response format.
         """
+        return await self._with_kv_transfer_rejection_cleanup(
+            self._create_chat_completion(request, raw_request), request, raw_request
+        )
+
+    async def _create_chat_completion(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request | None = None,
+    ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
         # Handle diffusion mode
         if self._diffusion_mode:
             return await self._create_diffusion_chat_completion(request, raw_request)
@@ -419,7 +430,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     # consistency.  After the multimodal processor consumes
                     # the image data, the uuids remain as a stable reference.
                     tprompt["multi_modal_uuids"] = {
-                        k: [f"{request_id}-{k}-{i}"] for i, k in enumerate(engine_prompt_image)
+                        k: [f"{request_id}-{k}-{i}" for i in range(len(v))]
+                        if isinstance(v, list)
+                        else [f"{request_id}-{k}-0"]
+                        for k, v in engine_prompt_image.items()
                     }
 
                 engine_prompts = [tprompt]
@@ -993,6 +1007,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # when handling audio/image responses
                 role = self.get_chat_request_role(request)
 
+                # Compute prompt_text once at first iteration (upstream #42052)
+                prompt_text = getattr(res, "prompt", None) if getattr(request, "return_prompt_text", None) else None
+
                 # We need to do it here, because if there are exceptions in
                 # the result_generator, it needs to be sent as the FIRST
                 # response (by the try...catch).
@@ -1019,6 +1036,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             choices=[choice_data],
                             model=model_name,
                             prompt_token_ids=(res.prompt_token_ids if request.return_token_ids else None),
+                            prompt_text=prompt_text,
                             modality=final_output_type,
                         )
 
@@ -1737,6 +1755,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     response_metrics.update(extra)
             choices.extend(choices_data)
 
+        # Compute prompt_text for non-streaming response (upstream #42052)
+        prompt_text = (
+            getattr(final_res, "prompt", None)
+            if final_res is not None and getattr(request, "return_prompt_text", None)
+            else None
+        )
+
         response = OmniChatCompletionResponse(
             id=request_id,
             created=created_time,
@@ -1745,6 +1770,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             usage=usage,
             prompt_logprobs=prompt_logprobs,
             prompt_token_ids=prompt_token_ids,
+            prompt_text=prompt_text,
             kv_transfer_params=kv_transfer_params,
             metrics=response_metrics,
         )
@@ -2031,13 +2057,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         mm_output = final_res.outputs[0].multimodal_output
         audio_data = mm_output.get("audio")
         if isinstance(audio_data, list):
-            if stream:
+            if not audio_data:
+                audio_tensor = None
+            elif stream:
                 audio_tensor = audio_data[-1]
             else:
                 audio_tensor = torch.cat(audio_data, dim=-1)
         else:
             audio_tensor = audio_data
-        audio_tensor = audio_tensor.float().detach().cpu().numpy()
+        if audio_tensor is None:
+            return self._create_error_response("Audio generation completed but no audio was produced.")
+        audio_tensor = audio_tensor.detach().cpu().float().numpy()
 
         # Ensure audio is 1D (flatten if needed)
         if audio_tensor.ndim > 1:
@@ -2086,7 +2116,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     index=output.index,
                     delta=DeltaMessage(role=role, content=audio_base64),
                     logprobs=None,
-                    finish_reason="stop",
+                    finish_reason=output.finish_reason,
                     stop_reason=output.stop_reason,
                     token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
                 )
@@ -2096,7 +2126,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     message=ChatMessage(role=role, audio=audio_obj),
                     logprobs=None,
                     finish_reason="stop",
-                    stop_reason=None,
+                    stop_reason=output.stop_reason,
                 )
             choices.append(choice_data)
         return choices
@@ -2245,6 +2275,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         layers = extra_body.get("layers")
         resolution = extra_body.get("resolution")
         bot_task = extra_body.get("bot_task")
+        sys_type = extra_body.get("sys_type")
+        custom_system_prompt = extra_body.get("system_prompt")
 
         engine_prompt_data: dict[str, Any] | None = None
         modalities = ["image"]
@@ -2255,31 +2287,48 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 engine_prompt_data = {"image": reference_images}
 
-        engine_prompt: OmniTextPrompt = {"prompt": prompt}
-        if bot_task:
+        prompt_token_ids: list[int] | None = None
+        system_prompt_type: str | None = None
+        if bot_task is not None or sys_type is not None or custom_system_prompt is not None:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
                 build_prompt,
                 build_prompt_tokens,
             )
 
-            prompt_token_ids: list[int] | None = None
-            system_prompt_type: str | None = None
+            build_kwargs: dict[str, Any] = {
+                "task": "it2i" if reference_images else "t2i",
+                "sys_type": sys_type,
+                "custom_system_prompt": custom_system_prompt,
+                "num_images": len(reference_images) if reference_images else 1,
+            }
+            if bot_task is not None:
+                build_kwargs["bot_task"] = bot_task
+            elif "bot_task" in extra_body:
+                # Explicit None from the caller is plain-mode; omitted lets
+                # each task fall back to its default trigger.
+                build_kwargs["bot_task"] = None
             if tokenizer is not None:
-                result = build_prompt_tokens(prompt, tokenizer, task=bot_task)
+                # Feed segment-tokenized prompt_token_ids so AR matches HF
+                # apply_chat_template byte-for-byte (engine BPE would merge
+                # across template boundaries, e.g. "。\n\n" -> single id).
+                result = build_prompt_tokens(prompt, tokenizer, **build_kwargs)
                 prompt_token_ids = result.token_ids
                 system_prompt_type = result.system_prompt_type
             else:
-                prompt = build_prompt(prompt, task=bot_task)
-                engine_prompt["prompt"] = prompt
-
+                prompt = build_prompt(prompt, **build_kwargs)
             if reference_images and len(reference_images) == 1:
                 engine_prompt_data = {"image": reference_images[0]}
                 modalities = ["image"]
-            if prompt_token_ids is not None:
-                engine_prompt["prompt_token_ids"] = prompt_token_ids
-            if system_prompt_type is not None:
-                engine_prompt["use_system_prompt"] = system_prompt_type
 
+        engine_prompt: OmniTextPrompt = {"prompt": prompt}
+        if prompt_token_ids is not None:
+            engine_prompt["prompt_token_ids"] = prompt_token_ids
+        if system_prompt_type is not None:
+            engine_prompt["use_system_prompt"] = system_prompt_type
+        # DiT's get_system_prompt(use_system_prompt, "image", system_prompt) reads
+        # this; omitting it makes sys_type=custom yield an empty DiT prefix.
+        if custom_system_prompt is not None:
+            engine_prompt["system_prompt"] = custom_system_prompt
         engine_prompt["modalities"] = modalities
         if negative_prompt is not None:
             engine_prompt["negative_prompt"] = negative_prompt
@@ -2295,7 +2344,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             engine_prompt["multi_modal_data"] = engine_prompt_data
             # Provide multi_modal_uuids so that newer vLLM versions can
             # validate multi_modal_data / multi_modal_uuids consistency.
-            engine_prompt["multi_modal_uuids"] = {k: [f"img-{k}-{i}"] for i, k in enumerate(engine_prompt_data)}
+            # Generate one uuid per image when the value is a list (multi-image inputs).
+            engine_prompt["multi_modal_uuids"] = {
+                k: [f"img-{k}-{i}" for i in range(len(v))] if isinstance(v, list) else [f"img-{k}-0"]
+                for k, v in engine_prompt_data.items()
+            }
 
         comprehension_idx = None
         for idx, stage in enumerate(stage_configs):
@@ -2320,10 +2373,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             ):
                 default_stage_params.seed = seed
 
-            # Inject target_h/w into comprehension (AR) stage sampling params
-            # for models that need M-RoPE position pre-computation (e.g.
-            # GLM-Image).  max_tokens is handled via the deploy YAML default
-            # (upper-bound ceiling) rather than computed dynamically here.
+            # Inject target_h/w into AR stage for M-RoPE position pre-computation
+            # (e.g. GLM-Image). max_tokens comes from deploy YAML.
             if comprehension_idx is not None and idx == comprehension_idx and height is not None and width is not None:
                 extra_args = getattr(default_stage_params, "extra_args", None)
                 if extra_args is None:
@@ -2449,13 +2500,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             diffusion_engine = cast(AsyncOmni, engine)
             stage_configs = getattr(diffusion_engine, "stage_configs", None) or []
             if len(stage_configs) > 1:
+                # Pull tokenizer from the comprehension (AR) stage so we can
+                # build HF byte-for-byte prompt_token_ids in the helper. If
+                # the engine doesn"t expose one, fall back to the legacy
+                # string-prompt path (engine re-tokenizes).
                 tokenizer = None
                 get_tok = getattr(diffusion_engine, "get_tokenizer", None)
                 if get_tok is not None:
                     try:
                         tokenizer = await get_tok()
                     except Exception as exc:
-                        logger.warning("get_tokenizer failed: %s", exc)
+                        logger.warning("get_tokenizer failed; falling back to string prompt path: %s", exc)
                 engine_prompt, sampling_params_list = self._build_multistage_generation_inputs(
                     engine=diffusion_engine,
                     prompt=prompt,

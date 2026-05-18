@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """OmniVoice configuration for vLLM-Omni two-stage pipeline."""
 
+from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 
 
@@ -79,3 +80,8 @@ class OmniVoiceConfig(PretrainedConfig):
 
         # Serving
         self.speculative_config = None
+
+
+AutoConfig.register("omnivoice", OmniVoiceConfig)
+
+__all__ = ["OmniVoiceConfig"]

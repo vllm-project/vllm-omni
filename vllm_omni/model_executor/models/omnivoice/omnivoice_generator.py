@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
-from vllm_omni.model_executor.models.omnivoice.config import OmniVoiceConfig
+from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
 logger = init_logger(__name__)
 

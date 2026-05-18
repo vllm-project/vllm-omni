@@ -3,6 +3,10 @@ import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
+from tests.diffusion.offloader.test_diffusion_cpu_offload import (
+    _GATED_MODELS,
+    _skip_if_gated_repo_inaccessible,
+)
 from tests.helpers.env import DeviceMemoryMonitor
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -96,6 +100,8 @@ def test_layerwise_offload_diffusion_model(model_name: str):
     offloader keeps only a single transformer block on GPU at a time, with
     prefetching for compute-memory overlap.
     """
+    if model_name in _GATED_MODELS:
+        _skip_if_gated_repo_inaccessible(model_name)
     try:
         # Run without layerwise offloading (baseline)
         no_offload_peak_memory, output_no_offload = run_inference(model_name, layerwise_offload=False)
@@ -104,6 +110,17 @@ def test_layerwise_offload_diffusion_model(model_name: str):
         # Run with layerwise offloading (1 layer on device)
         layerwise_offload_peak_memory, output_offload = run_inference(model_name, layerwise_offload=True)
         cleanup_dist_env_and_memory()
+    except ValueError as exc:
+        # omni_snapshot_download wraps GatedRepoError in a ValueError.
+        # If the pre-flight guard above did not catch it (e.g. partial
+        # HF_TOKEN where config.json is accessible but weight shards are
+        # blocked), skip instead of failing.
+        if "Access to model" in str(exc) and "is restricted" in str(exc):
+            pytest.skip(
+                f"Skipping: gated HF repo {model_name!r} inaccessible "
+                f"({exc}). See docs/contributing/ci/hf_credentials.md."
+            )
+        pytest.fail(f"Inference failed: {exc}")
     except Exception:
         pytest.fail("Inference failed")
 

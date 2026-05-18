@@ -164,6 +164,7 @@ def talker2code2wav_async_chunk(
     chunk_size = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
     configured_initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
+    ref_code_context_frames = int(cfg.get("ref_code_context_frames") or left_context_size_config)
 
     # Per-request override takes priority over dynamic IC.
     fixed_initial_chunk_size = configured_initial_chunk_size > 0
@@ -193,11 +194,18 @@ def talker2code2wav_async_chunk(
             _ic_cache[request_id] = compute_dynamic_initial_chunk_size(active, capacity, max_ic)
         initial_chunk_size = _ic_cache[request_id]
 
-    if chunk_size <= 0 or left_context_size_config < 0 or configured_initial_chunk_size < 0 or initial_chunk_size < 0:
+    if (
+        chunk_size <= 0
+        or left_context_size_config < 0
+        or configured_initial_chunk_size < 0
+        or initial_chunk_size < 0
+        or ref_code_context_frames < 0
+    ):
         raise ValueError(
             f"Invalid codec chunk config: codec_chunk_frames={chunk_size}, "
             f"codec_left_context_frames={left_context_size_config}, "
-            f"initial_codec_chunk_frames={initial_chunk_size}"
+            f"initial_codec_chunk_frames={initial_chunk_size}, "
+            f"ref_code_context_frames={ref_code_context_frames}"
         )
 
     if initial_chunk_size > chunk_size:
@@ -237,15 +245,22 @@ def talker2code2wav_async_chunk(
     left_context_size = max(0, end_index - context_length)
     window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
 
-    # Prepend ref_code as decoder context for every chunk so the vocoder
-    # maintains voice-clone speaker identity throughout the stream.  The HF
-    # reference decodes ref_code + all_codes in one pass; without ref_code
-    # context on later chunks the decoder loses speaker identity and produces
-    # distorted audio.  Use `.get()` (not `.pop()`) to keep ref_code for
-    # subsequent chunks.
+    # Prepend a bounded ref_code tail as decoder context for every chunk so the
+    # vocoder keeps voice-clone speaker identity without making Stage1 shapes
+    # depend on full reference-audio length. The decoder is causal with sliding
+    # attention, so frames older than this context window cannot affect the
+    # emitted chunk. Use `.get()` (not `.pop()`) to keep ref_code for later chunks.
     ref_code = request_payload.get(request_id)
     if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-        ref_frames = ref_code.tolist()
+        ref_context = ref_code
+        if ref_code_context_frames > 0 and int(ref_context.shape[0]) > ref_code_context_frames:
+            logger.info_once(
+                "Qwen3-TTS async chunk uses the last %d/%d ref_code frames as bounded Code2Wav context.",
+                ref_code_context_frames,
+                int(ref_context.shape[0]),
+            )
+            ref_context = ref_context[-ref_code_context_frames:]
+        ref_frames = ref_context.tolist()
         window_frames = ref_frames + window_frames
         left_context_size += len(ref_frames)
 

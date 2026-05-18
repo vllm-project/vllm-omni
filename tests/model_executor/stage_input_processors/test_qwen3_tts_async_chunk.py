@@ -294,6 +294,36 @@ def test_ref_code_context_applies_to_all_streaming_chunks():
     assert len(payload.codes.audio) == _Q * (35 + 2)
 
 
+def test_streaming_ref_code_context_is_bounded_for_batchable_shapes():
+    tm = _tm(chunk_frames=4, left_context=3, initial_chunk_frames=4)
+    rid = "r-ref-bounded"
+    tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(8)]
+    ref_code = torch.tensor(
+        [
+            [1, 1, 1, 1],
+            [2, 2, 2, 2],
+            [3, 3, 3, 3],
+            [4, 4, 4, 4],
+            [5, 5, 5, 5],
+        ],
+        dtype=torch.long,
+    )
+    tm.request_payload[rid] = ref_code
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        pooling_output={"codes": {"audio": torch.zeros((0,)), "ref": ref_code}},
+        request=_req(rid, finished=False),
+        is_finished=False,
+    )
+
+    assert payload is not None
+    assert payload.meta.left_context_size == 3 + 3
+    assert len(payload.codes.audio) == _Q * (3 + 3 + 4)
+    frames = payload.codes.audio.reshape(_Q, -1).transpose(0, 1)
+    torch.testing.assert_close(frames[:3], ref_code[-3:])
+
+
 def test_ref_code_context_can_be_buffered_before_first_emit():
     tm = _tm()
     rid = "r-ref-buffered"

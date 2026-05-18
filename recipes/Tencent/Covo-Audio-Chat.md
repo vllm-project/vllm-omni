@@ -1,4 +1,6 @@
-# Covo-Audio-Chat for audio chat on 1x A100 80GB
+# Covo-Audio-Chat
+
+> Online serving for audio chat
 
 ## Summary
 
