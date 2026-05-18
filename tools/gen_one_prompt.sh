@@ -23,7 +23,7 @@ setsid env PATH="$ROOT/.venv/bin:$PATH" \
   HF_HOME=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/.cache/huggingface \
   vllm-omni serve "bosonai/higgs-audio-v2-generation-3B-base" \
     --deploy-config vllm_omni/deploy/higgs_audio_v2.yaml \
-    --attention-backend FLASHINFER \
+    --attention-backend FLEX_ATTENTION \
     --host 0.0.0.0 --port 8094 --gpu-memory-utilization 0.4 \
     --trust-remote-code --omni < /dev/null > "$LOG" 2>&1 &
 SVPID=$!
