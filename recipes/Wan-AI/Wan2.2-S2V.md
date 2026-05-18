@@ -1,4 +1,6 @@
-# Wan2.2 Speech To Video
+# Wan2.2 Speech-to-Video
+
+> Speech-to-video serving (Wan2.2 14B)
 
 ## Summary
 

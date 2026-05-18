@@ -80,7 +80,8 @@ class StageEngineCoreClientBase(StageClientBase):
     def make_async_mp_client(
         vllm_config: Any,
         executor_class: type,
-        metadata: StageMetadata,
+        log_stats: bool = False,
+        metadata: StageMetadata | None = None,
         client_addresses: dict[str, str] | None = None,
         proc: Any = None,
         engine_manager: Any = None,
@@ -93,6 +94,7 @@ class StageEngineCoreClientBase(StageClientBase):
         client_args = dict(
             vllm_config=vllm_config,
             executor_class=executor_class,
+            log_stats=log_stats,
             metadata=metadata,
             client_addresses=client_addresses,
             proc=proc,
@@ -441,7 +443,7 @@ class StageEngineCoreClientBase(StageClientBase):
             kwargs=kwargs,
         )
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown managed resources and any externally spawned subprocess."""
         child_procs: list[psutil.Process] = []
         if self._proc is not None and self._proc.pid is not None:
@@ -451,7 +453,7 @@ class StageEngineCoreClientBase(StageClientBase):
                 child_procs = []
 
         try:
-            super().shutdown()
+            super().shutdown(timeout=timeout)
         finally:
             if self._proc is not None and self._proc.is_alive():
                 self._proc.terminate()

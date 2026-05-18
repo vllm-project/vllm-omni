@@ -97,7 +97,7 @@ def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _Diffus
 
 @contextmanager
 def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[None]:
-    from vllm.model_executor.layers.quantization import modelopt as vllm_modelopt
+    import vllm.model_executor.layers.quantization.modelopt as vllm_modelopt
 
     linear_method_cls = getattr(quant_config, "LinearMethodCls", None)
     if linear_method_cls in {
@@ -795,6 +795,14 @@ class WorkerProc:
     ) -> None:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
+
+        # Set process title for visibility in nvidia-smi / htop (optional, non-fatal)
+        try:
+            import setproctitle
+
+            setproctitle.setproctitle(f"vLLM-Omni::StageDiffusionProc-{rank}")
+        except ImportError:
+            pass  # setproctitle not installed, skip process title setting
 
         load_omni_general_plugins()
         worker_proc = WorkerProc(

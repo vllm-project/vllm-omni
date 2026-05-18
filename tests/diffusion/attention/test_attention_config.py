@@ -394,6 +394,9 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
                 per_role={"cross": AttentionSpec(backend="TORCH_SDPA", extra={"block_size": 128})},
             ),
             parallel_config=SimpleNamespace(ring_degree=2),
+            diffusion_kv_cache_dtype=None,
+            diffusion_kv_cache_skip_step_indices=None,
+            diffusion_kv_cache_skip_layer_indices=None,
         )
 
         with set_current_diffusion_config(od_config):

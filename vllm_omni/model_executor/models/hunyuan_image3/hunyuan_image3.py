@@ -27,17 +27,8 @@ from vllm.distributed import (
 )
 from vllm.inputs import MultiModalDataDict
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import FusedMoE as SharedFusedMoE
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
-
-try:
-    from vllm.model_executor.layers.fused_moe.shared_fused_moe import SharedFusedMoE
-except ImportError:
-    # PyPI vllm 0.20.x neither exports `SharedFusedMoE` from the package top-level
-    # nor ships a `shared_fused_moe.py` submodule. The functionality lives on
-    # `FusedMoE` directly (which gained a `shared_experts` parameter), so alias
-    # the symbol — call sites only use the classmethod `make_expert_params_mapping`
-    # and `__init__(shared_experts=..., ...)` which are present on `FusedMoE`.
-    from vllm.model_executor.layers.fused_moe import FusedMoE as SharedFusedMoE
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -105,7 +96,16 @@ from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import LightProjecto
 logger = init_logger(__name__)
 
 
-@support_torch_compile
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        # positions is (3, num_tokens) for mRoPE, so the token dimension is
+        # the last dimension rather than dim 0.
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    }
+)
 class HunyuanModel(HunYuanModel):
     def _split_qkv_weight(self, qkv: torch.Tensor):
         num_attention_heads = self.config.num_attention_heads

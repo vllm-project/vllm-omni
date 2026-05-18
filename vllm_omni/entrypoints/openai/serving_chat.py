@@ -148,6 +148,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         instance._diffusion_mode = True
         instance._diffusion_engine = diffusion_engine
         instance._diffusion_model_name = model_name
+        instance.engine_client = None
+        instance.has_kv_connector = False
         return instance
 
     def _get_diffusion_extra_body_params(self) -> frozenset[str]:
@@ -216,6 +218,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         For diffusion models, this generates images and returns them
         in a chat completion response format.
         """
+        return await self._with_kv_transfer_rejection_cleanup(
+            self._create_chat_completion(request, raw_request), request, raw_request
+        )
+
+    async def _create_chat_completion(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request | None = None,
+    ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:
         # Handle diffusion mode
         if self._diffusion_mode:
             return await self._create_diffusion_chat_completion(request, raw_request)
@@ -996,6 +1007,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # when handling audio/image responses
                 role = self.get_chat_request_role(request)
 
+                # Compute prompt_text once at first iteration (upstream #42052)
+                prompt_text = getattr(res, "prompt", None) if getattr(request, "return_prompt_text", None) else None
+
                 # We need to do it here, because if there are exceptions in
                 # the result_generator, it needs to be sent as the FIRST
                 # response (by the try...catch).
@@ -1022,6 +1036,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             choices=[choice_data],
                             model=model_name,
                             prompt_token_ids=(res.prompt_token_ids if request.return_token_ids else None),
+                            prompt_text=prompt_text,
                             modality=final_output_type,
                         )
 
@@ -1740,6 +1755,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     response_metrics.update(extra)
             choices.extend(choices_data)
 
+        # Compute prompt_text for non-streaming response (upstream #42052)
+        prompt_text = (
+            getattr(final_res, "prompt", None)
+            if final_res is not None and getattr(request, "return_prompt_text", None)
+            else None
+        )
+
         response = OmniChatCompletionResponse(
             id=request_id,
             created=created_time,
@@ -1748,6 +1770,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             usage=usage,
             prompt_logprobs=prompt_logprobs,
             prompt_token_ids=prompt_token_ids,
+            prompt_text=prompt_text,
             kv_transfer_params=kv_transfer_params,
             metrics=response_metrics,
         )
@@ -2034,13 +2057,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         mm_output = final_res.outputs[0].multimodal_output
         audio_data = mm_output.get("audio")
         if isinstance(audio_data, list):
-            if stream:
+            if not audio_data:
+                audio_tensor = None
+            elif stream:
                 audio_tensor = audio_data[-1]
             else:
                 audio_tensor = torch.cat(audio_data, dim=-1)
         else:
             audio_tensor = audio_data
-        audio_tensor = audio_tensor.float().detach().cpu().numpy()
+        if audio_tensor is None:
+            return self._create_error_response("Audio generation completed but no audio was produced.")
+        audio_tensor = audio_tensor.detach().cpu().float().numpy()
 
         # Ensure audio is 1D (flatten if needed)
         if audio_tensor.ndim > 1:
@@ -2089,7 +2116,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     index=output.index,
                     delta=DeltaMessage(role=role, content=audio_base64),
                     logprobs=None,
-                    finish_reason="stop",
+                    finish_reason=output.finish_reason,
                     stop_reason=output.stop_reason,
                     token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
                 )
@@ -2099,7 +2126,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     message=ChatMessage(role=role, audio=audio_obj),
                     logprobs=None,
                     finish_reason="stop",
-                    stop_reason=None,
+                    stop_reason=output.stop_reason,
                 )
             choices.append(choice_data)
         return choices
