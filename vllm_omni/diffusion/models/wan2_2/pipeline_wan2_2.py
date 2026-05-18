@@ -802,10 +802,6 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
             first_frame_mask=first_frame_mask,
         )
 
-        # Wan2.2 is prone to out of memory errors when predicting large videos
-        # so we empty the cache here to avoid OOM before vae decoding.
-        if current_omni_platform.is_available():
-            current_omni_platform.empty_cache()
         self._current_timestep = None
         if DEBUG_PERF:
             current_omni_platform.synchronize()
