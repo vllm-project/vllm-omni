@@ -631,8 +631,6 @@ class Wan22I2VPipeline(
             _t_decode_start = time.perf_counter()
 
         if output_type == "latent":
-            if isinstance(latents, AsyncLatents):
-                latents = torch.as_tensor(latents)  # avoid copying
             output = latents
         else:
             latents = latents.to(self.vae.dtype)
@@ -693,7 +691,7 @@ class Wan22I2VPipeline(
         if current_model is None:
             current_model = self.transformer
         result = current_model(**kwargs)
-        return result[0] if isinstance(result, tuple) else result
+        return result if isinstance(result, IntermediateTensors) else result[0]
 
     def encode_prompt(
         self,

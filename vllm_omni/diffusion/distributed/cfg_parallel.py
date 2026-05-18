@@ -382,10 +382,11 @@ class CFGParallelMixin(metaclass=ABCMeta):
             multi-output models (e.g., video + audio). Multi-output models
             must also override combine_cfg_noise() and set self.scheduler
             to a composite scheduler that handles tuples.
-            Non-last Pipeline Parallel stages return IntermediateTensors instead of final noise tensors.
+            Non-last Pipeline Parallel stages return `IntermediateTensors`
+            instead of final noise tensors wrapped in a tuple.
         """
         result = self.transformer(*args, **kwargs)
-        return result[0] if isinstance(result, tuple) else result
+        return result if isinstance(result, IntermediateTensors) else result[0]
 
     def diffuse(
         self,

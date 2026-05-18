@@ -127,19 +127,21 @@ class PipelineParallelMixin:
             @wraps(diffuse)
             def wrapped_diffuse(self, *args: Any, **kwargs: Any) -> Any:
                 try:
-                    return diffuse(self, *args, **kwargs)
+                    latents = diffuse(self, *args, **kwargs)
+                    if isinstance(latents, AsyncLatents):
+                        latents = torch.as_tensor(latents)  # avoid copying
+                    return latents
                 finally:
                     self._sync_pp_send()
 
             cls.diffuse = wrapped_diffuse
 
     def _wrapped_vae_decode(self) -> None:
-        orig_decode = self.vae.decode
-        vae_distributed = hasattr(self.vae, "is_distributed_enabled") and self.vae.is_distributed_enabled()
+        vae, orig_decode = self.vae, self.vae.decode
 
         @wraps(orig_decode)
         def wrapped_decode(z: torch.Tensor, *args: Any, **kwargs: Any):
-            if vae_distributed:
+            if hasattr(vae, "is_distributed_enabled") and vae.is_distributed_enabled():
                 # Middle ranks (world size 3 or more) hold stale latents after the denoising loop.
                 # Broadcast from rank 0 so every rank splits identical tiles.
                 if get_pipeline_parallel_world_size() > 2:
@@ -188,6 +190,7 @@ class PipelineParallelMixin:
 
         Supports three modes:
           - PP only, sequential CFG: both branches (cond and uncond) run through this PP pipeline.
+            This doubles communication volume per denoising step compared to PP + CFG-parallel.
           - PP + CFG-parallel: each PP pipeline carries one branch. The last PP
             rank all-gathers across the CFG group and combines, mirroring
             CFGParallelMixin.predict_noise_maybe_with_cfg exactly.

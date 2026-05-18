@@ -31,7 +31,11 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.distributed.parallel_state import is_pipeline_first_stage, is_pipeline_last_stage
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_pipeline_parallel_world_size,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+)
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -878,6 +882,11 @@ class WanTransformer3DModel(nn.Module):
 
         inner_dim = num_attention_heads * attention_head_dim
         out_channels = out_channels or in_channels
+
+        if get_pipeline_parallel_world_size() == 0 and not is_pipeline_first_stage():
+            raise RuntimeError(
+                "`initialize_model_parallel()` must be called before constructing `WanTransformer3DModel`"
+            )
 
         # 1. Patch & position embedding
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size, rope_max_seq_len)

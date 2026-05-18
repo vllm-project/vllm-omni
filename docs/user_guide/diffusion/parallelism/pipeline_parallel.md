@@ -120,6 +120,20 @@ In `DiffusionParallelConfig`
 > Total GPU count is the product of all enabled distributed dimensions, for example
 `pipeline_parallel_size * cfg_parallel_size * tensor_parallel_size * ulysses_degree * ring_degree`.
 
+### Manual Layer Partitioning
+
+By default, transformer layers are distributed evenly across PP ranks. You can override this with the
+`VLLM_PP_LAYER_PARTITION` environment variable to assign a specific number of layers to each rank:
+
+```bash
+# Example: 40 layers across 4 PP ranks, assigning 8 / 12 / 12 / 8 layers
+export VLLM_PP_LAYER_PARTITION=8,12,12,8
+```
+
+The value must be a comma-separated list of integers whose length equals `pipeline_parallel_size` and whose sum equals
+the total number of transformer layers. This is useful when you want to balance memory or compute asymmetrically across
+ranks.
+
 
 ---
 

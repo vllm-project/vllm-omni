@@ -332,7 +332,7 @@ class TestVaeDecodeGuard:
         output = pipeline.vae.decode(z)
 
         assert pipeline.vae.calls == 0
-        assert output is None
+        assert output == (None,)
 
     def test_calls_original_decode_when_distributed_vae_enabled(self, monkeypatch):
         self._set_rank(monkeypatch, world_size=2, first_stage=False)

@@ -67,6 +67,9 @@ defines how a local stage executes.
     - Rank 0 starts with the input latents
     - Middle ranks receive `intermediate_tensors`, run their local layer range, and asynchronously send downstream
     - The last rank returns the final noise prediction
+    - When CFG is enabled in this mode (sequential CFG), both the positive and negative branches run through the same
+      PP pipeline, doubling the communication volume per denoising step. Prefer PP + CFG-Parallel when
+      `cfg_parallel_size > 1` is available to avoid this overhead.
 - **PP + CFG-Parallel** (`pipeline_parallel_size > 1`, `cfg_parallel_size > 1`):
     - Each PP pipeline carries one CFG branch
     - The last PP rank all-gathers across the CFG group
@@ -173,6 +176,18 @@ The goal is:
 - every PP rank knows its `[start_layer, end_layer)` range
 - non-local layers do not execute on this rank
 - the forward can resume from incoming `intermediate_tensors`
+
+By default, layers are distributed evenly across PP ranks using `get_pp_indices()`. When the number of layers is not
+divisible by the PP size, remaining layers are assigned to middle partitions to balance compute and memory. You can
+override this with the `VLLM_PP_LAYER_PARTITION` environment variable to specify an exact per-rank layer count:
+
+```bash
+# Example: 40 layers across 4 PP ranks, assigning 8 / 12 / 12 / 8 layers
+export VLLM_PP_LAYER_PARTITION=8,12,12,8
+```
+
+The value must be a comma-separated list of integers whose length equals `pipeline_parallel_size` and whose sum equals
+the total number of transformer layers.
 
 #### 3.2 Expose `make_empty_intermediate_tensors`
 
