@@ -153,7 +153,7 @@ class OmniConnectorModelRunnerMixin:
 
         # -- full_payload_mode: accumulate latest pooler_output per request,
         #    send only when the request finishes (next-cycle flush) --
-        self._pending_full_payload_send: dict[str, tuple[Any, Any]] = {}
+        self._pending_full_payload_send: dict[str, tuple[Any, ...]] = {}
 
         # -- KV sent accumulator --
         self._kv_sent_req_ids: list[str] = []
@@ -206,21 +206,33 @@ class OmniConnectorModelRunnerMixin:
         """Clean up per-request state after a request is fully finished.
 
         Call this when a request is freed from the model runner to prevent
-        memory leaks in the mixin's tracking dicts/sets.  The external
-        request ID is resolved before cleaning up ``_put_req_chunk`` which
-        is keyed by external ID.
+        memory leaks in the mixin's tracking dicts/sets.
+
+        Two senders use different keys: ``send_chunk`` keys per-request
+        state under the EXTERNAL id (after mapping resolution), while
+        ``send_full_payload_outputs`` keys under the INTERNAL id. To cover
+        both modes (and forward compat with id-rename scenarios) we attempt
+        cleanup against both keys; the entry that doesn't exist for the
+        active mode is a no-op pop.  Only the key that actually has pending
+        saves is added to ``_deferred_send_cleanup`` so the bg save's
+        decrement path drains it without leaving orphans.
         """
         ext_id = self._request_ids_mapping.pop(req_id, None)
-        send_req_id = ext_id if ext_id is not None else req_id
+        keys_to_clean: list[str] = [req_id]
+        if ext_id is not None and ext_id != req_id:
+            keys_to_clean.append(ext_id)
 
         with self._lock:
-            if self._pending_save_counts.get(send_req_id, 0):
-                self._deferred_send_cleanup.add(send_req_id)
-            else:
-                self._put_req_chunk.pop(send_req_id, None)
-                self._send_side_request_payload.pop(send_req_id, None)
-                self._code_prompt_token_ids.pop(send_req_id, None)
-                self._cached_ic.pop(send_req_id, None)
+            keys_pending = [k for k in keys_to_clean if self._pending_save_counts.get(k, 0)]
+            for k in keys_pending:
+                self._deferred_send_cleanup.add(k)
+            for k in keys_to_clean:
+                if k in keys_pending:
+                    continue
+                self._put_req_chunk.pop(k, None)
+                self._send_side_request_payload.pop(k, None)
+                self._code_prompt_token_ids.pop(k, None)
+                self._cached_ic.pop(k, None)
             self._kv_pending_transfers.pop(req_id, None)
             self._kv_active_transfers.discard(req_id)
             self._kv_completed_transfers.discard(req_id)
@@ -628,6 +640,16 @@ class OmniConnectorModelRunnerMixin:
         that has arrived, or ``None`` if nothing is ready.  Stores full
         payloads in the local cache and extracts scheduling metadata.
         """
+        # Fast path: when TP is trivial (no peer ranks waiting on a broadcast)
+        # and the bg recv thread has not staged anything, skip the lock + TP
+        # broadcast cycle entirely. _broadcast_tp_payload_packet already
+        # returns its input unchanged under the same world_size<=1 condition,
+        # so the original code path was a no-op here on every empty step.
+        tp_group = self._get_local_tp_group()
+        if (
+            tp_group is None or getattr(tp_group, "world_size", 1) <= 1
+        ) and not self._full_payload_pending_broadcast_req_ids:
+            return None
         with self._lock:
             results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
         results = self._broadcast_tp_payload_packet(results)
@@ -649,10 +671,63 @@ class OmniConnectorModelRunnerMixin:
         )
         return results
 
+    def _get_model_config(self) -> Any:
+        model_config = getattr(self, "model_config", None)
+        if model_config is not None:
+            return model_config
+        return getattr(getattr(self, "vllm_config", None), "model_config", None)
+
+    def _should_accumulate_full_payload_output(self) -> bool:
+        """Gate send-side full-payload output accumulation only.
+
+        Cached per instance: the result depends only on model_config /
+        _custom_process_func, both of which are set at init time. Avoid
+        the per-step dynamic import inside the model decode loop.
+        """
+        cached = getattr(self, "_should_accumulate_full_payload_output_cached", None)
+        if cached is not None:
+            return cached
+        model_config = self._get_model_config()
+        if model_config is None:
+            self._should_accumulate_full_payload_output_cached = False
+            return False
+        if getattr(model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration":
+            from vllm_omni.model_executor.stage_input_processors.qwen3_omni import (
+                should_accumulate_qwen3_omni_full_payload_output,
+            )
+
+            result = should_accumulate_qwen3_omni_full_payload_output(
+                model_config,
+                getattr(self, "_custom_process_func", None),
+            )
+            self._should_accumulate_full_payload_output_cached = result
+            return result
+        self._should_accumulate_full_payload_output_cached = False
+        return False
+
     @staticmethod
-    def _is_all_zero_tensor(t: Any) -> bool:
-        """Return True if *t* is a torch.Tensor whose elements are all zero."""
-        return isinstance(t, torch.Tensor) and t.numel() > 0 and not t.any()
+    def _new_full_payload_accumulator(output: dict[str, Any]):
+        chunks: dict[str, list[torch.Tensor]] = {}
+        latest: dict[str, Any] = {}
+        rows: dict[str, int] = {}
+        for k, v in output.items():
+            if isinstance(v, torch.Tensor) and v.dim() >= 2:
+                chunks[k] = [v]
+                rows[k] = int(v.shape[0])
+            else:
+                latest[k] = v
+        return chunks, latest, rows
+
+    @staticmethod
+    def _materialize_full_payload_entry(entry):
+        if len(entry) == 2:
+            return entry
+        chunks, latest, _rows, request = entry
+        output = dict(latest)
+        for k, tensors in chunks.items():
+            if tensors:
+                output[k] = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+        return output, request
 
     def accumulate_full_payload_output(
         self,
@@ -666,55 +741,45 @@ class OmniConnectorModelRunnerMixin:
         along dim-0.  Scalar / global tensors (1-D or 0-D) are replaced
         with the latest value.
 
-        All-zero tensors (e.g. ``code_predictor_codes`` emitted during
-        prefill) are dropped so that they do not pollute downstream stages
-        with garbage / noise frames.
+        Note: codec rows are NOT filtered for zero placeholders here. The
+        downstream consumer ``_extract_qwen3_full_payload_codec_rows`` crops
+        codec rows using ``output_token_ids`` as the authoritative source,
+        which makes any sender-side zero filtering redundant. Skipping the
+        sender-side ``t.any()`` scan also avoids a per-tensor GPU->CPU device
+        sync that stalled the decode pipeline.
 
         The data is actually sent when ``flush_full_payload_outputs`` is called
         with the finished request IDs from the next scheduler cycle.
         """
-        # ---- Filter out all-zero tensors from the incoming pooler_output ----
-        filtered: dict[str, Any] = {}
-        dropped_zero_keys: list[tuple[str, tuple[int, ...]]] = []
-        for k, v in pooler_output.items():
-            if self._is_all_zero_tensor(v):
-                dropped_zero_keys.append((k, tuple(v.shape)))
-                continue  # skip prefill zero-filled placeholders
-            filtered[k] = v
-        if dropped_zero_keys:
-            logger.info(
-                "[Stage-%s] accumulate_full_payload_output: req=%s dropped_zero_keys=%s",
-                self._stage_id,
-                req_id,
-                dropped_zero_keys,
-            )
-        pooler_output = filtered
-
         existing = self._pending_full_payload_send.get(req_id)
+
         if existing is None:
-            self._pending_full_payload_send[req_id] = (pooler_output, request)
+            chunks, latest, rows = self._new_full_payload_accumulator(pooler_output)
+            self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
             return
 
-        prev_output, _ = existing
-        merged: dict[str, Any] = {}
-        for k in set(prev_output) | set(pooler_output):
-            v_new = pooler_output.get(k)
-            v_old = prev_output.get(k)
-            if v_new is None:
-                merged[k] = v_old
-            elif v_old is None:
-                merged[k] = v_new
-            elif (
-                isinstance(v_new, torch.Tensor)
-                and isinstance(v_old, torch.Tensor)
-                and v_new.dim() >= 2
-                and v_old.dim() >= 2
-                and v_new.shape[1:] == v_old.shape[1:]
-            ):
-                merged[k] = torch.cat([v_old, v_new], dim=0)
+        if len(existing) == 2:
+            chunks, latest, rows = self._new_full_payload_accumulator(existing[0])
+        else:
+            chunks, latest, rows, _ = existing
+
+        for k, v in pooler_output.items():
+            if v is None:
+                continue
+            if isinstance(v, torch.Tensor) and v.dim() >= 2:
+                if k in chunks and chunks[k] and v.shape[1:] == chunks[k][0].shape[1:]:
+                    chunks[k].append(v)
+                    rows[k] += int(v.shape[0])
+                else:
+                    latest.pop(k, None)
+                    chunks[k] = [v]
+                    rows[k] = int(v.shape[0])
             else:
-                merged[k] = v_new
-        self._pending_full_payload_send[req_id] = (merged, request)
+                chunks.pop(k, None)
+                rows.pop(k, None)
+                latest[k] = v
+
+        self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
 
     def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""
@@ -728,7 +793,7 @@ class OmniConnectorModelRunnerMixin:
         for req_id in finished_req_ids:
             entry = self._pending_full_payload_send.pop(req_id, None)
             if entry is not None:
-                to_send[req_id] = entry
+                to_send[req_id] = self._materialize_full_payload_entry(entry)
         logger.info("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
         if to_send:
             self.send_full_payload_outputs(scheduler_output=None, outputs=to_send)
@@ -1476,7 +1541,7 @@ class OmniConnectorModelRunnerMixin:
                     logger.warning("Error receiving data for %s", req_id, exc_info=True)
 
             if not made_progress and not self._stop_event.is_set():
-                self._work_available.wait(timeout=0.001)
+                self._work_available.wait(timeout=0.005)
                 self._work_available.clear()
 
     _MAX_SEND_RETRIES = 3

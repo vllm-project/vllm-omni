@@ -305,17 +305,55 @@ class TestRequestScheduler:
             prompts=["prompt_map_a", "prompt_map_b"],
             sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
             request_ids=["map-a", "map-b"],
+            request_id="map-parent",
         )
 
         sched_req_id = self.scheduler.add_request(request)
 
         assert self.scheduler.get_sched_req_id("map-a") == sched_req_id
         assert self.scheduler.get_sched_req_id("map-b") == sched_req_id
+        assert self.scheduler.get_sched_req_id("map-parent") == sched_req_id
 
         self.scheduler.pop_request_state(sched_req_id)
 
         assert self.scheduler.get_sched_req_id("map-a") is None
         assert self.scheduler.get_sched_req_id("map-b") is None
+        assert self.scheduler.get_sched_req_id("map-parent") is None
+
+    def test_parent_request_id_registration_failure_rolls_back_child_ids(self) -> None:
+        self.scheduler.add_request(
+            OmniDiffusionRequest(
+                prompts=["prompt_existing"],
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+                request_ids=["existing-child"],
+                request_id="duplicate-parent",
+            )
+        )
+
+        colliding_request = OmniDiffusionRequest(
+            prompts=["prompt_unique"],
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+            request_ids=["unique-child"],
+            request_id="duplicate-parent",
+        )
+
+        with pytest.raises(ValueError, match="duplicate-parent"):
+            self.scheduler.add_request(colliding_request)
+
+        assert self.scheduler.get_request_state("unique-child") is None
+        assert self.scheduler.get_sched_req_id("unique-child") is None
+
+        valid_request = OmniDiffusionRequest(
+            prompts=["prompt_unique"],
+            sampling_params=OmniDiffusionSamplingParams(num_inference_steps=1),
+            request_ids=["unique-child"],
+            request_id="unique-parent",
+        )
+        sched_req_id = self.scheduler.add_request(valid_request)
+
+        assert sched_req_id == "unique-child"
+        assert self.scheduler.get_sched_req_id("unique-child") == sched_req_id
+        assert self.scheduler.get_sched_req_id("unique-parent") == sched_req_id
 
 
 class TestDiffusionEngine:
@@ -324,6 +362,8 @@ class TestDiffusionEngine:
         engine.scheduler = RequestScheduler()
         engine.scheduler.initialize(SimpleNamespace())
         engine._rpc_lock = threading.RLock()
+        engine._cv = threading.Condition(engine._rpc_lock)
+        engine._closed = False
         engine.abort_queue = queue.Queue()
 
         request = _make_request("engine")
@@ -343,6 +383,8 @@ class TestDiffusionEngine:
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine.scheduler = scheduler
         engine._rpc_lock = threading.RLock()
+        engine._cv = threading.Condition(engine._rpc_lock)
+        engine._closed = False
         engine.abort_queue = queue.Queue()
         engine.execute_fn = mocker.Mock(return_value=runner_output)
 
@@ -394,7 +436,8 @@ class TestDiffusionEngine:
     @pytest.mark.asyncio
     async def test_step_raises_aborted_error(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
-        engine._loop_started = False
+        engine._closed = False
+        engine._loop_started = True
         engine._init_lock = asyncio.Lock()
         engine.main_loop = asyncio.get_running_loop()
         engine.stop_event = threading.Event()
@@ -410,6 +453,7 @@ class TestDiffusionEngine:
         engine = DiffusionEngine.__new__(DiffusionEngine)
         engine._rpc_lock = threading.RLock()
         engine._cv = threading.Condition(engine._rpc_lock)
+        engine._closed = False
         engine.scheduler = RequestScheduler()
         engine.scheduler.initialize(SimpleNamespace())
         engine.abort_queue = queue.Queue()

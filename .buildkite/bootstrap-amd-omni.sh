@@ -173,8 +173,24 @@ upload_pipeline() {
 
     cd .buildkite
 
-    # Select test definition file: merge suite for main, ready suite for PRs
-    if [[ $BUILDKITE_BRANCH == "main" ]]; then
+    # Select test definition file: merge suite for main, ready suite for PRs.
+    # For debugging, DEBUG_TEST_YAML can override the selection — accepts
+    # "merge" or "ready" (case-insensitive).
+    if [[ -n "${DEBUG_TEST_YAML:-}" ]]; then
+        case "${DEBUG_TEST_YAML,,}" in
+            merge)
+                TEST_YAML="test-amd-merge.yml"
+                ;;
+            ready)
+                TEST_YAML="test-amd-ready.yaml"
+                ;;
+            *)
+                echo "ERROR: DEBUG_TEST_YAML must be 'merge' or 'ready', got '$DEBUG_TEST_YAML'" >&2
+                exit 1
+                ;;
+        esac
+        echo "DEBUG_TEST_YAML override: using $TEST_YAML"
+    elif [[ $BUILDKITE_BRANCH == "main" ]]; then
         TEST_YAML="test-amd-merge.yml"
     else
         TEST_YAML="test-amd-ready.yaml"

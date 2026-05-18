@@ -7,7 +7,7 @@ import types
 import pytest
 
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
-from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
 from vllm_omni.engine.stage_init_utils import (
     LogicalStageInitPlan,
     ReplicaInitPlan,
@@ -332,8 +332,8 @@ def test_initialize_stages_exposes_logical_stage_views_and_builds_top_level_inpu
         stage1_client_r0.default_sampling_params,
     ]
     assert engine.stage_metadata == [
-        {"final_output": False, "final_output_type": None, "stage_type": "llm"},
-        {"final_output": True, "final_output_type": None, "stage_type": "llm"},
+        StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm"),
+        StageRuntimeInfo(final_output=True, final_output_type=None, stage_type="llm"),
     ]
 
 

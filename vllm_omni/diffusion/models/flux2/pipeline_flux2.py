@@ -21,7 +21,7 @@ from diffusers.pipelines.flux2.system_messages import (
 )
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
-from transformers import AutoProcessor, Mistral3ForConditionalGeneration, PixtralProcessor
+from transformers import AutoConfig, AutoProcessor, PixtralProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -31,6 +31,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux2 import Flux2Transformer2DModel
 from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.mistral_encoder import MistralEncoderModel
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -350,6 +351,7 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
     ):
         super().__init__()
         self.od_config = od_config
+
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -368,11 +370,29 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
-        self.text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
+        self.weights_sources.append(
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="text_encoder",
+                revision=None,
+                prefix="text_encoder.",
+                fall_back_to_pt=True,
+            ),
+        )
+        text_encoder_config = AutoConfig.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
+        )
+        self.text_encoder = MistralEncoderModel(
+            text_encoder_config,
+            prefix="text_encoder",
         ).to(self._execution_device)
         self.tokenizer = PixtralProcessor.from_pretrained(
             model, subfolder="tokenizer", local_files_only=local_files_only
+        )
+        self.text_encoder.set_processor(
+            self.tokenizer,
+            system_message_t2i=SYSTEM_MESSAGE_UPSAMPLING_T2I,
+            system_message_i2i=SYSTEM_MESSAGE_UPSAMPLING_I2I,
         )
         self.vae = AutoencoderKLFlux2.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
             self._execution_device
@@ -402,7 +422,7 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
 
     @staticmethod
     def _get_mistral_3_small_prompt_embeds(
-        text_encoder: Mistral3ForConditionalGeneration,
+        text_encoder: MistralEncoderModel,
         tokenizer: AutoProcessor,
         prompt: str | list[str],
         dtype: torch.dtype | None = None,
@@ -613,7 +633,6 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
 
         return torch.stack(x_list, dim=0)
 
-    # Copied from diffusers.pipelines.flux2.pipeline_flux2.Flux2Pipeline.upsample_prompt
     def upsample_prompt(
         self,
         prompt: str | list[str],
@@ -621,60 +640,14 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
         temperature: float = 0.15,
         device: torch.device = None,
     ) -> list[str]:
-        prompt = [prompt] if isinstance(prompt, str) else prompt
-        device = self.text_encoder.device if device is None else device
-
-        # Set system message based on whether images are provided
-        if images is None or len(images) == 0 or images[0] is None:
-            system_message = SYSTEM_MESSAGE_UPSAMPLING_T2I
-        else:
-            system_message = SYSTEM_MESSAGE_UPSAMPLING_I2I
-
-        # Validate and process the input images
         if images:
             images = _validate_and_process_images(images, self.image_processor, self.upsampling_max_image_size)
-
-        # Format input messages
-        messages_batch = format_input(prompts=prompt, system_message=system_message, images=images)
-
-        # Process all messages at once
-        # with image processing a too short max length can throw an error in here.
-        inputs = self.tokenizer.apply_chat_template(
-            messages_batch,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=2048,
-        )
-
-        # Move to device
-        inputs["input_ids"] = inputs["input_ids"].to(device)
-        inputs["attention_mask"] = inputs["attention_mask"].to(device)
-
-        if "pixel_values" in inputs:
-            inputs["pixel_values"] = inputs["pixel_values"].to(device, self.text_encoder.dtype)
-
-        # Generate text using the model's generate method
-        generated_ids = self.text_encoder.generate(
-            **inputs,
-            max_new_tokens=512,
-            do_sample=True,
+        return self.text_encoder.upsample_prompt(
+            prompt,
+            images=images,
             temperature=temperature,
-            use_cache=True,
+            device=device,
         )
-
-        # Decode only the newly generated tokens (skip input tokens)
-        # Extract only the generated portion
-        input_length = inputs["input_ids"].shape[1]
-        generated_tokens = generated_ids[:, input_length:]
-
-        upsampled_prompt = self.tokenizer.tokenizer.batch_decode(
-            generated_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=True
-        )
-        return upsampled_prompt
 
     def encode_prompt(
         self,
@@ -929,6 +902,9 @@ class Flux2Pipeline(nn.Module, CFGParallelMixin, SupportImageInput, ProgressBarM
         )
         max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
         text_encoder_out_layers = req.sampling_params.extra_args.get("text_encoder_out_layers", text_encoder_out_layers)
+        caption_upsample_temperature = req.sampling_params.extra_args.get(
+            "caption_upsample_temperature", caption_upsample_temperature
+        )
 
         req_prompt_embeds = [p.get("prompt_embeds") if not isinstance(p, str) else None for p in req.prompts]
         if any(p is not None for p in req_prompt_embeds):

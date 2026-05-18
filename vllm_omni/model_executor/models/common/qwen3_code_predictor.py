@@ -351,8 +351,10 @@ class CodePredictorBaseModel(nn.Module):
         # native bf16 support (Turing, Volta).  The RMSNorm and RoPE
         # layers already upcast internally; this extends the same
         # treatment to attention and MLP.
+        # autocast to float32 is unsupported on CPU; skip fp32 upcast there
+        # (CPU uses full-precision intermediates internally).
         input_dtype = inputs_embeds.dtype
-        use_fp32 = input_dtype == torch.float16
+        use_fp32 = input_dtype == torch.float16 and inputs_embeds.device.type != "cpu"
         if use_fp32:
             inputs_embeds = inputs_embeds.float()
         hidden_states = inputs_embeds
@@ -465,10 +467,26 @@ class CodePredictorWrapper(nn.Module):
         self._model_dtype: torch.dtype | None = None
         self._compiled_model_fwd = None
         self._bucket_sizes: list[int] = []
-        self._bucket_pos_ids: dict[int, torch.Tensor] = {}
+        self._bucket_pos_ids: dict[int | tuple[int, int], torch.Tensor] = {}
         self._lm_heads_list: list[nn.Module] | None = None
         self._codec_embeds_list: list[nn.Module] | None = None
-        self._device_graphs: dict[int, tuple] = {}  # (graph, static_output) per bucket
+        self._device_graphs: dict[int | tuple[int, int], tuple] = {}  # (graph, static_output) per bucket
+        prefix_graph_cfg = self._stage_connector_extra_config(vllm_config)
+        prefix_graphs_requested = self._parse_bool_config(prefix_graph_cfg.get("code_predictor_prefix_graphs"))
+        is_npu = current_omni_platform.is_npu()
+        self._prefix_graphs_enabled = prefix_graphs_requested and wrapper_config.use_cuda_graphs and not is_npu
+        if prefix_graphs_requested and not self._prefix_graphs_enabled:
+            logger.info_once(
+                "code_predictor: prefix CUDA graphs requested but disabled because use_cuda_graphs=%s is_npu=%s",
+                wrapper_config.use_cuda_graphs,
+                is_npu,
+            )
+        self._prefix_graph_buckets = self._parse_positive_int_set(
+            prefix_graph_cfg.get("code_predictor_prefix_graph_buckets")
+        )
+        self._prefix_graph_seq_lens = self._parse_positive_int_set(
+            prefix_graph_cfg.get("code_predictor_prefix_graph_seq_lens")
+        )
 
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
@@ -544,6 +562,56 @@ class CodePredictorWrapper(nn.Module):
                 return bucket
         return bsz
 
+    @staticmethod
+    def _stage_connector_extra_config(vllm_config: VllmConfig) -> dict:
+        model_cfg = getattr(vllm_config, "model_config", None)
+        connector_cfg = getattr(model_cfg, "stage_connector_config", None)
+        if isinstance(connector_cfg, dict):
+            extra_cfg = connector_cfg.get("extra", connector_cfg)
+        else:
+            extra_cfg = getattr(connector_cfg, "extra", None)
+        return extra_cfg if isinstance(extra_cfg, dict) else {}
+
+    @staticmethod
+    def _parse_bool_config(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        if isinstance(value, int):
+            return bool(value)
+        return False
+
+    @staticmethod
+    def _parse_positive_int_set(value: object) -> set[int]:
+        if value is None:
+            return set()
+        if isinstance(value, str):
+            raw_values = [item.strip() for item in value.replace(";", ",").split(",") if item.strip()]
+        elif isinstance(value, int):
+            raw_values = [value]
+        else:
+            try:
+                raw_values = list(value)
+            except TypeError as exc:
+                raise ValueError(f"Invalid positive int config value {value!r}") from exc
+        values: set[int] = set()
+        for item in raw_values:
+            try:
+                parsed = int(item)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid positive int config value {item!r}") from exc
+            if parsed > 0:
+                values.add(parsed)
+        return values
+
+    def _prefix_seq_lens(self, max_seq: int) -> list[int]:
+        all_seq_lens = list(range(2, max_seq))
+        if not self._prefix_graph_seq_lens:
+            return all_seq_lens
+        allowed = set(all_seq_lens)
+        return sorted(seq_len for seq_len in self._prefix_graph_seq_lens if seq_len in allowed)
+
     def _warmup_buckets(self) -> None:
         """Warmup power-of-2 batch-size buckets to front-load Inductor compilation."""
         max_bsz = self._vllm_config.scheduler_config.max_num_seqs
@@ -560,12 +628,44 @@ class CodePredictorWrapper(nn.Module):
         self._ensure_buffers(device, self._model_dtype, max(self._bucket_sizes))
         proj_buf = self._proj_buf
 
-        for bsz in self._bucket_sizes:
-            pos_ids = torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1).contiguous()
-            self._bucket_pos_ids[bsz] = pos_ids
-            for _ in range(3):
-                self._compiled_model_fwd(proj_buf[:bsz, :max_seq, :], pos_ids)
-        logger.info("code_predictor: warmup done for buckets %s", self._bucket_sizes)
+        if self._prefix_graphs_enabled:
+            prefix_seq_lens = self._prefix_seq_lens(max_seq)
+            needs_full_graph = set(prefix_seq_lens) != set(range(2, max_seq))
+            for bsz in self._bucket_sizes:
+                capture_prefixes = not self._prefix_graph_buckets or bsz in self._prefix_graph_buckets
+                if not capture_prefixes or needs_full_graph:
+                    pos_ids = (
+                        torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1).contiguous()
+                    )
+                    self._bucket_pos_ids[bsz] = pos_ids
+                    for _ in range(3):
+                        self._compiled_model_fwd(proj_buf[:bsz, :max_seq, :], pos_ids)
+                if capture_prefixes:
+                    for seq_len in prefix_seq_lens:
+                        pos_ids = (
+                            torch.arange(seq_len, device=device, dtype=torch.long)
+                            .unsqueeze(0)
+                            .expand(bsz, -1)
+                            .contiguous()
+                        )
+                        self._bucket_pos_ids[(bsz, seq_len)] = pos_ids
+                        for _ in range(2):
+                            self._compiled_model_fwd(proj_buf[:bsz, :seq_len, :], pos_ids)
+            logger.info(
+                "code_predictor: prefix warmup done for buckets %s prefix_buckets=%s seq_lens=%s",
+                self._bucket_sizes,
+                sorted(self._prefix_graph_buckets) if self._prefix_graph_buckets else "all",
+                prefix_seq_lens,
+            )
+        else:
+            for bsz in self._bucket_sizes:
+                pos_ids = (
+                    torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, -1).contiguous()
+                )
+                self._bucket_pos_ids[bsz] = pos_ids
+                for _ in range(3):
+                    self._compiled_model_fwd(proj_buf[:bsz, :max_seq, :], pos_ids)
+            logger.info("code_predictor: warmup done for buckets %s", self._bucket_sizes)
 
     def _capture_cuda_graphs(self) -> None:
         """Capture a CUDA graph per bucket using vLLM's global graph pool."""
@@ -575,17 +675,50 @@ class CodePredictorWrapper(nn.Module):
         max_seq = self._num_groups + 1
         proj_buf = self._proj_buf
 
-        for bsz in self._bucket_sizes:
-            static_input = proj_buf[:bsz, :max_seq, :]
-            pos_ids = self._bucket_pos_ids[bsz]
+        if self._prefix_graphs_enabled:
+            prefix_seq_lens = self._prefix_seq_lens(max_seq)
+            needs_full_graph = set(prefix_seq_lens) != set(range(2, max_seq))
+            for bsz in self._bucket_sizes:
+                capture_prefixes = not self._prefix_graph_buckets or bsz in self._prefix_graph_buckets
+                if not capture_prefixes or needs_full_graph:
+                    static_input = proj_buf[:bsz, :max_seq, :]
+                    pos_ids = self._bucket_pos_ids[bsz]
 
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, pool=pool):
-                static_output = self._compiled_model_fwd(static_input, pos_ids)
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, pool=pool):
+                        static_output = self._compiled_model_fwd(static_input, pos_ids)
 
-            self._device_graphs[bsz] = (g, static_output)
+                    self._device_graphs[bsz] = (g, static_output)
 
-        logger.info("code_predictor: captured CUDA graphs for buckets %s", self._bucket_sizes)
+                if capture_prefixes:
+                    for seq_len in prefix_seq_lens:
+                        static_input = proj_buf[:bsz, :seq_len, :]
+                        pos_ids = self._bucket_pos_ids[(bsz, seq_len)]
+
+                        g = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(g, pool=pool):
+                            static_output = self._compiled_model_fwd(static_input, pos_ids)
+
+                        self._device_graphs[(bsz, seq_len)] = (g, static_output)
+
+            logger.info(
+                "code_predictor: captured prefix CUDA graphs for buckets %s prefix_buckets=%s seq_lens=%s",
+                self._bucket_sizes,
+                sorted(self._prefix_graph_buckets) if self._prefix_graph_buckets else "all",
+                prefix_seq_lens,
+            )
+        else:
+            for bsz in self._bucket_sizes:
+                static_input = proj_buf[:bsz, :max_seq, :]
+                pos_ids = self._bucket_pos_ids[bsz]
+
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, pool=pool):
+                    static_output = self._compiled_model_fwd(static_input, pos_ids)
+
+                self._device_graphs[bsz] = (g, static_output)
+
+            logger.info("code_predictor: captured CUDA graphs for buckets %s", self._bucket_sizes)
 
     def _capture_npu_graphs(self) -> None:
         """Capture an NPU graph per bucket using torch_npu's NPUGraph."""
@@ -648,16 +781,6 @@ class CodePredictorWrapper(nn.Module):
         proj_buf[:bsz, 0, :] = projection(last_talker_hidden.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
         proj_buf[:bsz, 1, :] = projection(layer0_embed.reshape(bsz, 1, -1).to(dtype)).reshape(bsz, -1)
 
-        # Get pre-computed pos_ids for this bucket
-        full_pos_ids = self._bucket_pos_ids.get(padded_bsz)
-        if full_pos_ids is None:
-            full_pos_ids = (
-                torch.arange(max_seq, device=device, dtype=torch.long).unsqueeze(0).expand(padded_bsz, -1).contiguous()
-            )
-
-        # Use captured device graph if available, otherwise call compiled fn.
-        device_graph_entry = self._device_graphs.get(padded_bsz)
-
         # Prepare sampling parameters
         stored_mode = self._wrapper_config.sampling_mode == "stored"
         if stored_mode:
@@ -681,12 +804,31 @@ class CodePredictorWrapper(nn.Module):
 
         # Autoregressive loop: predict layers 1..G-1
         for step in range(1, num_groups):
+            graph_key: int | tuple[int, int] = padded_bsz
+            seq_len = max_seq
+            if self._prefix_graphs_enabled:
+                prefix_key = (padded_bsz, step + 1)
+                if prefix_key in self._device_graphs:
+                    graph_key = prefix_key
+                    seq_len = step + 1
+            pos_ids = self._bucket_pos_ids.get(graph_key)
+            if pos_ids is None:
+                pos_ids = (
+                    torch.arange(seq_len, device=device, dtype=torch.long)
+                    .unsqueeze(0)
+                    .expand(padded_bsz, -1)
+                    .contiguous()
+                )
+
+            # Use captured device graph if available, otherwise call compiled fn.
+            device_graph_entry = self._device_graphs.get(graph_key)
+
             # Run transformer (device graph replay or compiled forward)
             if device_graph_entry is not None:
                 device_graph_entry[0].replay()
                 hidden_out = device_graph_entry[1]
             else:
-                hidden_out = model_fwd(proj_buf[:padded_bsz, :max_seq, :], full_pos_ids)
+                hidden_out = model_fwd(proj_buf[:padded_bsz, :seq_len, :], pos_ids)
 
             logits = lm_heads[step - 1](hidden_out[:bsz, step, :])
 
