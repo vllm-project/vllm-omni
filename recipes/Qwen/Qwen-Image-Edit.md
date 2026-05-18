@@ -143,3 +143,29 @@ TP=2 reduces single-request warm latency from `17.78 s` to `11.09 s` (≈ **1.60
 - TP=2 shards model weights across both cards, which is what produces both the latency reduction and the per-GPU VRAM drop above.
 - CFG-Parallel (`--cfg-parallel-size 2`) is supported on the Qwen-Image family but only when `cfg_scale > 1`. The verification command above uses `guidance_scale=1.0` to match the public example image, so it does not exercise CFG-parallel; a separate run with `cfg_scale > 1` is needed if you want to benchmark that path.
 - For deeper acceleration knobs (Cache-DiT, sequence parallel, HSDP) see [`docs/user_guide/diffusion/parallelism/overview.md`](../../docs/user_guide/diffusion/parallelism/overview.md); this recipe intentionally documents only the validated TP=2 baseline.
+
+#### Profiling
+
+The numbers below are from a warm request at 1024×1024, 50 steps, and `guidance_scale=1.0`, measured with `--enable-diffusion-pipeline-profiler` and a 250 ms `nvidia-smi --query-gpu=memory.used` sampler. For TP=2, latency uses rank max, and VRAM is per GPU.
+
+Per-stage latency:
+
+| Stage | TP=1 | TP=2 | Notes |
+| --- | ---: | ---: | --- |
+| `text_encoder.forward` | 0.132 s | 0.135 s | ~1.0× |
+| `vae.encode` | 0.040 s | 0.041 s | ~1.0× |
+| `diffuse` | 17.105 s | 10.382 s | **1.65×** speedup |
+| `vae.decode` | 0.064 s | 0.066 s | ~1.0× |
+| `forward` | 17.372 s | 10.652 s | 1.63× speedup |
+
+Per-GPU VRAM:
+
+| Snapshot | TP=1 | TP=2 | Notes |
+| --- | ---: | ---: | --- |
+| Static VRAM | 58,777 MiB | 47,065 MiB | after model load, before request |
+| Peak VRAM | 61,091 MiB | 49,377 MiB | during inference |
+| Request-time increment | 2,314 MiB | 2,312 MiB | peak minus static |
+
+The latency gain mainly comes from the DiT denoising stage (`diffuse` in the table above). The other measured stages, such as text encoder and VAE encode/decode, stay essentially unchanged between TP=1 and TP=2, which is consistent with them not benefiting meaningfully from TP in this pipeline. The `forward` row's 1.63× speedup tracks `diffuse`, since `diffuse` accounts for about 98% of total pipeline time.
+
+For memory, TP=2 saves about 11.4 GiB per GPU, mostly from static model-state memory, likely dominated by tensor-parallel sharding of the DiT weights. The request-time increment is almost unchanged, so TP=2 does not materially reduce transient inference-time memory for this single-image, batch-1 workload.
