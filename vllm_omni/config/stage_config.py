@@ -501,7 +501,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     devices = runtime_cfg.get("devices", stage_data.get("devices"))
     num_replicas = runtime_cfg.get("num_replicas", stage_data.get("num_replicas", 1))
     env = runtime_cfg.get("env", stage_data.get("env"))
-    
+
     if "engine_args" in stage_data:
         for k, v in stage_data["engine_args"].items():
             existing = flat_args.get(k)
