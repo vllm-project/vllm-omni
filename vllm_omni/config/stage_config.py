@@ -500,18 +500,9 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     runtime_cfg = dict(stage_data.get("runtime", {}))
     devices = runtime_cfg.get("devices", stage_data.get("devices"))
     num_replicas = runtime_cfg.get("num_replicas", stage_data.get("num_replicas", 1))
-
+    env = runtime_cfg.get("env", stage_data.get("env"))
+    
     if "engine_args" in stage_data:
-        runtime_cfg = dict(stage_data.get("runtime", {}))
-        engine_args = dict(stage_data["engine_args"])
-        devices = stage_data.get("runtime", {}).get("devices", stage_data.get("devices"))
-        num_replicas = runtime_cfg.get("num_replicas", stage_data.get("num_replicas", 1))
-        env = runtime_cfg.get("env", stage_data.get("env"))
-    else:
-        engine_args = {k: v for k, v in stage_data.items() if k not in _STAGE_NON_ENGINE_KEYS and k != "stage_id"}
-        devices = stage_data.get("devices")
-        num_replicas = stage_data.get("num_replicas", stage_data.get("runtime", {}).get("num_replicas", 1))
-        env = stage_data.get("env", stage_data.get("runtime", {}).get("env"))
         for k, v in stage_data["engine_args"].items():
             existing = flat_args.get(k)
             # If we have multiple dictionaries, merge recursively.
@@ -535,6 +526,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
     kwargs["engine_extras"] = flat_args
     return StageDeployConfig(**kwargs)
+      
 
 
 _DEEP_MERGE_KEYS = frozenset({"default_sampling_params", "subtalker_sampling_params", "engine_extras", "engine_args"})
