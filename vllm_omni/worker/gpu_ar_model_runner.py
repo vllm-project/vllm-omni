@@ -708,6 +708,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     ):
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
+            self.input_batch.update_async_output_token_ids()
             model_sample = getattr(self.model, "sample", None)
             if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):
                 # Apply logit bias (min_tokens, allowed_token_ids) before
@@ -726,7 +727,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 )
                 if sampler_output is not None:
                     return sampler_output
-            self.input_batch.update_async_output_token_ids()
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,

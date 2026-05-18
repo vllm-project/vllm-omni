@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import replace
 from functools import partial
 from threading import Lock
 
@@ -378,7 +377,10 @@ class CosyVoice3Model(
         qwen_hf_config = Qwen2Config.from_pretrained(qwen_config_path)
 
         # Use parent's cache config - critical for PagedAttention to work correctly
-        return parent_config.with_hf_config(qwen_hf_config, architectures=["Qwen2Model"])
+        llm_vllm_config = parent_config.with_hf_config(qwen_hf_config, architectures=["Qwen2Model"])
+        llm_vllm_config.model_config.hf_text_config = llm_vllm_config.model_config.hf_config
+        llm_vllm_config.model_config.model_arch_config = llm_vllm_config.model_config.get_model_arch_config()
+        return llm_vllm_config
 
     @staticmethod
     def _cross_fade_audio(audio: torch.Tensor, prev_tail: torch.Tensor) -> torch.Tensor:
@@ -612,8 +614,7 @@ class CosyVoice3Model(
             return sampler(logits=logits, sampling_metadata=sampling_metadata)
 
         logits = logits.to(torch.float32)
-        sampling_for_processors = replace(sampling_metadata, no_penalties=True)
-        logits = sampler.apply_logits_processors(logits, sampling_for_processors, predict_bonus_token=False)
+        logits = sampler.apply_logits_processors(logits, sampling_metadata, predict_bonus_token=False)
 
         sampling_cfg = dict(self.config.llm.get("sampling", {}))
         default_top_p = float(sampling_cfg.get("top_p", 0.8))

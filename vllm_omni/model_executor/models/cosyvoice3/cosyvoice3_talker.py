@@ -6,6 +6,7 @@ from collections.abc import Callable
 import torch
 from torch import nn
 from vllm.config import VllmConfig
+from vllm.config.vllm import set_current_vllm_config
 from vllm.model_executor.models.qwen2 import Qwen2Model
 
 
@@ -18,7 +19,8 @@ class VLLMQwen2Encoder(torch.nn.Module):
 
     def __init__(self, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        self.model = Qwen2Model(vllm_config=vllm_config, prefix=prefix)
+        with set_current_vllm_config(vllm_config, prefix=prefix):
+            self.model = Qwen2Model(vllm_config=vllm_config, prefix=prefix)
         self.hidden_size = vllm_config.model_config.hf_config.hidden_size
 
     def forward(self, inputs_embeds: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:

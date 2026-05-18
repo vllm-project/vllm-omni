@@ -127,7 +127,7 @@ def _make_sampling_metadata(
         generators={},
         max_num_logprobs=None,
         no_penalties=False,
-        prompt_token_ids=None,
+        prompt_token_ids=torch.empty((1, 0), dtype=torch.long),
         frequency_penalties=torch.zeros(1, dtype=torch.float32),
         presence_penalties=torch.zeros(1, dtype=torch.float32),
         repetition_penalties=torch.tensor([repetition_penalty], dtype=torch.float32),
@@ -397,6 +397,17 @@ def test_sample_tolerates_ras_fallback_with_no_valid_candidates():
     assert out.sampled_token_ids.tolist() == [[0]]
 
 
+def test_sample_applies_repetition_penalty_before_ras():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[1]])
+    logits = torch.tensor([[-1e9, 8.0, 5.0]], dtype=torch.float32)
+
+    out = model.sample(logits, metadata)
+
+    assert out is not None
+    assert out.sampled_token_ids.tolist() == [[2]]
+
+
 def test_sample_maps_any_cosyvoice3_stop_token_to_canonical_eos():
     model = _make_talker_model()
     metadata = _make_sampling_metadata(output_token_ids=[[1] * 10])
@@ -477,7 +488,7 @@ def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
     out = runner._sample(torch.tensor([[0.1, 0.2]], dtype=torch.float32), spec_decode_metadata=None)
 
     assert out is expected
-    assert runner.input_batch.updated is False
+    assert runner.input_batch.updated is True
     assert len(calls) == 1
 
 
@@ -493,9 +504,10 @@ def test_gpu_ar_model_runner_supplies_req_output_history_to_model_sampler():
             self.sampled_token_ids_cpu = None
             self.async_copy_ready_event = None
             self.prev_req_id_to_index = None
+            self.updated = False
 
         def update_async_output_token_ids(self):
-            raise AssertionError("fallback async repair should not run for model sampler path")
+            self.updated = True
 
     _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
@@ -511,6 +523,7 @@ def test_gpu_ar_model_runner_supplies_req_output_history_to_model_sampler():
 
     runner._sample(torch.tensor([[0.1, 0.2]], dtype=torch.float32), spec_decode_metadata=None)
 
+    assert runner.input_batch.updated is True
     assert seen_histories == [[[1, 2, 3]]]
 
 
@@ -535,7 +548,11 @@ def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
             self.prev_req_id_to_index = {"rid-1": 0}
 
         def update_async_output_token_ids(self):
-            raise AssertionError("fallback async repair should not run for model sampler path")
+            output_token_ids = self.sampling_metadata.output_token_ids
+            if self.sampled_token_ids_cpu is None or not output_token_ids:
+                return
+            self.async_copy_ready_event.synchronize()
+            output_token_ids[0][output_token_ids[0].index(-1)] = int(self.sampled_token_ids_cpu[0, 0])
 
     _, GPUARModelRunner = _cosyvoice3_model_and_runner()
     runner = object.__new__(GPUARModelRunner)
