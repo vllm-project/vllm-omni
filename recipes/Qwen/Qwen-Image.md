@@ -1,4 +1,6 @@
-# Qwen-Image for text-to-image serving with optional continuous batching on 1x A100 80GB
+# Qwen-Image
+
+> Text-to-image serving with optional step-wise continuous batching
 
 ## Summary
 

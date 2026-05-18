@@ -1,8 +1,8 @@
-# HunyuanImage-3.0-Instruct DiT Image Generation on GPU
+# HunyuanImage-3.0-Instruct
 
-> DiT-only text-to-image recipe for HunyuanImage-3.0-Instruct with FP8,
-> tensor parallelism, sequence parallelism, CFG parallelism, and ModelOpt
-> mixed FP8/NVFP4 checkpoints.
+> DiT-only text-to-image serving and benchmark with FP8, tensor parallelism,
+> sequence parallelism, CFG parallelism, and ModelOpt mixed FP8/NVFP4
+> checkpoints.
 
 ## Summary
 

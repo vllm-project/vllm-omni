@@ -26,10 +26,10 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import SupportAudioOutput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.model_executor.models.omnivoice.config import OmniVoiceConfig
 from vllm_omni.model_executor.models.omnivoice.duration import RuleDurationEstimator
 from vllm_omni.model_executor.models.omnivoice.omnivoice_decoder import OmniVoiceDecoder
 from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import OmniVoiceGenerator
+from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 try:
