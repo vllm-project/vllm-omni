@@ -110,16 +110,13 @@ class HiggsAudioV2Code2Wav(nn.Module):
         self.acoustic_decoder: nn.Module | None = None
         self._loaded: bool = False
 
-        # When constructed via the engine path, eagerly load weights from the
-        # model directory so the runner sees a fully-initialized module after
-        # construction (matches the eager-init pattern that
-        # ``Qwen3TTSCode2Wav`` follows for its decoder).
+        # When constructed via the engine path, eagerly load codec weights from
+        # the model directory. The engine's subsequent ``load_weights(weights)``
+        # call (with the Stage-0 safetensors iterator) is then a cheap no-op.
         if self._model_path is not None:
             try:
-                self.load_weights(self._model_path)
+                self.load_codec_from_disk(self._model_path)
             except FileNotFoundError as exc:
-                # Allow construction-time deferral when the checkpoint hasn't
-                # been downloaded yet (the engine's loader will retry later).
                 logger.warning(
                     "HiggsAudioV2Code2Wav: eager codec load deferred (%s)", exc
                 )
@@ -135,18 +132,51 @@ class HiggsAudioV2Code2Wav(nn.Module):
         return None
 
     # ------------------------------------------------------------------ load
-    def load_weights(self, model_dir: str, device: torch.device | None = None) -> None:
-        """Load codec weights for Stage 1.
+    def load_weights(self, weights_or_model_dir, device: torch.device | None = None):
+        """Dual-signature load:
 
-        ``model_dir`` may be either the standalone tokenizer repo (containing
-        ``config.json`` + ``model.safetensors`` at the root) or the OmniVoice-
-        style bundle that nests the codec under ``<model_dir>/audio_tokenizer/``.
-        Controlled by :attr:`HiggsAudioV2Config.audio_tokenizer_subdir`.
+        - ``load_weights(weights_iterator)`` -- the vLLM engine path. The iterator
+          yields ``(name, tensor)`` pairs from the Stage-0 safetensors which DO NOT
+          contain codec weights, so we ignore them and eagerly load the codec from
+          ``self._model_path``. Returns the set of all our params as "initialized"
+          so the engine's loader passes its sanity check.
+        - ``load_weights(model_dir: str)`` -- the legacy file-based call used by
+          offline unit tests and ``end2end.py --mode stage1_only``. Returns ``None``.
+        """
+        if not isinstance(weights_or_model_dir, (str, bytes, os.PathLike)):
+            # Engine call: consume the iterator (we don't need it) and eagerly
+            # load the codec from disk.
+            try:
+                for _ in weights_or_model_dir:
+                    pass
+            except TypeError:
+                pass
+            if self._model_path is None:
+                raise RuntimeError(
+                    "HiggsAudioV2Code2Wav.load_weights called via the engine path but "
+                    "no model directory is known. Construct with vllm_config so the "
+                    "constructor caches vllm_config.model_config.model."
+                )
+            self.load_codec_from_disk(self._model_path, device=device)
+            return {name for name, _ in self.named_parameters()}
+
+        # Legacy file-based call.
+        self.load_codec_from_disk(weights_or_model_dir, device=device)
+        return None
+
+    def load_codec_from_disk(self, model_dir: str, device: torch.device | None = None) -> None:
+        """Load codec weights from disk (RVQ + fc2 + DAC decoder).
+
+        Resolution order for the codec directory:
+        1. If :attr:`HiggsAudioV2Config.audio_tokenizer_id` is set, treat it as
+           either a local path (if it exists on disk) or an HF repo id that we
+           resolve via ``huggingface_hub.snapshot_download``. This is the
+           default for the boson-ai release (codec in a separate repo).
+        2. Otherwise fall back to ``<model_dir>/<audio_tokenizer_subdir>``.
         """
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        subdir = self.config.audio_tokenizer_subdir or ""
-        audio_tokenizer_path = os.path.join(model_dir, subdir) if subdir else model_dir
+        audio_tokenizer_path = self._resolve_audio_tokenizer_path(model_dir)
         quantizer, fc2, acoustic_decoder, _tokenizer_config = load_higgs_audio_codec(
             audio_tokenizer_path, device
         )
@@ -166,6 +196,48 @@ class HiggsAudioV2Code2Wav(nn.Module):
             self.sample_rate,
         )
 
+    def _resolve_audio_tokenizer_path(self, model_dir: str) -> str:
+        """Return a local filesystem path containing ``config.json`` + codec
+        weights. See :meth:`load_codec_from_disk` for the resolution rules."""
+        tokenizer_id = getattr(self.config, "audio_tokenizer_id", None)
+        if tokenizer_id:
+            if os.path.isdir(tokenizer_id):
+                return tokenizer_id
+            return self._resolve_hf_id_to_local(tokenizer_id)
+        subdir = self.config.audio_tokenizer_subdir or ""
+        if os.path.isdir(model_dir):
+            return os.path.join(model_dir, subdir) if subdir else model_dir
+        local = self._resolve_hf_id_to_local(model_dir)
+        return os.path.join(local, subdir) if subdir else local
+
+    @staticmethod
+    def _resolve_hf_id_to_local(repo_id: str) -> str:
+        """Resolve a HF repo id to a local snapshot directory.
+
+        Prefers a read-only cache lookup (no write locks) so a quota-constrained
+        Lustre cache can still serve already-downloaded weights. Falls back to
+        ``snapshot_download`` only when nothing is cached locally.
+        """
+        from huggingface_hub import try_to_load_from_cache
+
+        cached = try_to_load_from_cache(repo_id=repo_id, filename="config.json")
+        if isinstance(cached, str) and os.path.isfile(cached):
+            return os.path.dirname(cached)
+
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        safe = repo_id.replace("/", "--")
+        snapshots_dir = os.path.join(HF_HUB_CACHE, f"models--{safe}", "snapshots")
+        if os.path.isdir(snapshots_dir):
+            for rev in os.listdir(snapshots_dir):
+                candidate = os.path.join(snapshots_dir, rev)
+                if os.path.isfile(os.path.join(candidate, "config.json")):
+                    return candidate
+
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(repo_id=repo_id)
+
     # ------------------------------------------------------ direct decode API
     @torch.inference_mode()
     def decode_codes(self, audio_codes: torch.Tensor) -> torch.Tensor:
@@ -178,7 +250,17 @@ class HiggsAudioV2Code2Wav(nn.Module):
 
         rvq_codes = codes.transpose(0, 1).long()  # [num_codebooks, B, T]
         quantized = self.quantizer.decode(rvq_codes)  # [B, hidden, T]
+        # Match fc2's parameter dtype — vLLM may auto-cast the codec to the
+        # stage's model dtype (e.g. bf16), while the quantizer's RVQ codebooks
+        # often stay in float32 because they're embedded lookups. A defensive
+        # cast keeps the matmul homogeneous.
+        quantized = quantized.to(dtype=self.fc2.weight.dtype)
         quantized = self.fc2(quantized.transpose(1, 2)).transpose(1, 2)
+        # Acoustic decoder may have parameters in yet another dtype — match
+        # its first parameter so the linear/conv ops stay consistent.
+        first_param = next(self.acoustic_decoder.parameters(), None)
+        if first_param is not None and quantized.dtype != first_param.dtype:
+            quantized = quantized.to(dtype=first_param.dtype)
         audio = self.acoustic_decoder(quantized)
         if audio.dim() == 2:
             audio = audio.unsqueeze(1)

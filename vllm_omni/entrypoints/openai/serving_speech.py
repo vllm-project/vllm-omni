@@ -1549,6 +1549,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if model_path:
                 break
         if model_path is None:
+            # Fallback: the orchestrator stores the served model id on the engine
+            # itself (set by AsyncOmniEngine.__init__). Stage-level engine_args
+            # may not surface ``model`` when the deploy yaml doesn't set it per
+            # stage (the CLI-passed model id is the single source of truth).
+            model_path = getattr(self.engine_client, "model", None)
+        if model_path is None:
             raise RuntimeError(
                 "higgs_audio_v2 serving could not resolve the model path from the engine stage configs"
             )

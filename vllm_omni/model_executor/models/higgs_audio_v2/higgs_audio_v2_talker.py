@@ -49,12 +49,13 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaMLP, LlamaModel
+from vllm.model_executor.models.llama import LlamaDecoderLayer, LlamaMLP
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -427,12 +428,20 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             # every attribute via PretrainedConfig.
             self.config = HiggsAudioV2Config(**hf_config.to_dict())
 
-        # ------------------------------------------------------------------ embedding + norm
-        # vLLM's LlamaModel exposes ``embed_tokens`` (text vocab embedding) and
-        # ``norm`` (final RMSNorm). We use it for those two pieces only; the
-        # decoder layers below are our own DualFFN-aware layers, not the
-        # canonical LlamaDecoderLayer stack.
-        self.text_model = LlamaModel(vllm_config=vllm_config, prefix=f"{prefix}.model")
+        # ------------------------------------------------------------------ embedding + final norm
+        # Round 7: directly instantiate the text-side embedding and final norm
+        # so we don't pull in a full LlamaModel.layers list that the engine's
+        # weight loader would require initialized. Each HiggsAudioV2DecoderLayer
+        # below already owns its own LlamaDecoderLayer for the attention path;
+        # duplicating those via a parallel LlamaModel made the loader fail.
+        self.embed_tokens = VocabParallelEmbedding(
+            num_embeddings=self.config.vocab_size,
+            embedding_dim=self.config.hidden_size,
+            org_num_embeddings=self.config.vocab_size,
+            quant_config=None,
+            prefix=f"{prefix}.embed_tokens",
+        )
+        self.norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
 
         # ------------------------------------------------------------------ DualFFN-aware layer stack
         self.layers = nn.ModuleList(
@@ -483,6 +492,16 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
 
         # vLLM's logits processor wires sampling metadata into the lm_head.
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+
+        # Round 7: share the audio embedding table with the code predictor's
+        # per-codebook lookup. Upstream ships a single
+        # ``model.embed_audio_tokens.embed_audio_tokens.weight`` tensor that
+        # services both the prompt-side audio-frame substitution and the
+        # residual-codebook-embedding path in the fast-AR predictor. Tying the
+        # weights here means load_weights only needs to write the single
+        # ``embed_audio_tokens.weight`` slot and the code predictor
+        # automatically picks up the same tensor.
+        self.code_predictor.embed_codebooks.weight = self.embed_audio_tokens.weight
 
     # ----------------------------------------------------------------- masks
     @torch.inference_mode()
@@ -540,14 +559,92 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         """
         loaded: set[str] = set()
         own_params = dict(self.named_parameters())
+        # R7 debug: log the first few HF keys we receive so we can verify the
+        # mapper hits them. Also log our own param-name shape so missing
+        # mappings are obvious.
+        logger.info(
+            "higgs_audio_v2 load_weights: %d own params (sample: %s)",
+            len(own_params),
+            sorted(list(own_params.keys()))[:5],
+        )
+        debug_seen: list[str] = []
 
         # First pass: collect tensors that need fusing (q/k/v, gate/up for each
         # MLP slot). We accumulate into per-(layer, slot, kind) buckets and
         # commit the fused tensor once all parts have arrived.
         fuse_buckets: dict[tuple[int, str, str], dict[str, torch.Tensor]] = {}
 
+        def _strip_model_prefix(name: str) -> str:
+            """vLLM's DefaultModelLoader strips the leading ``model.`` from HF
+            state-dict keys before invoking ``load_weights``, but we also want
+            to accept raw HF names (for unit tests that pass the state dict
+            directly). Normalize by stripping at most one ``model.`` prefix.
+            """
+            if name.startswith("model."):
+                return name[len("model.") :]
+            return name
+
         def _try_simple(name: str, tensor: torch.Tensor) -> bool:
+            normalized = _strip_model_prefix(name)
+            # Direct match: many keys (embed_tokens.weight, norm.weight,
+            # layers.<L>.{audio_,}input_layernorm.weight, layers.<L>.{audio_,}post_attention_layernorm.weight,
+            # layers.<L>.self_attn.o_proj.weight, layers.<L>.{,audio_}mlp.down_proj.weight) already match
+            # our named_parameters() keys after the model-prefix strip.
+            if normalized in own_params:
+                target = own_params[normalized]
+                if tuple(target.shape) == tuple(tensor.shape):
+                    with torch.no_grad():
+                        target.copy_(tensor)
+                    loaded.add(normalized)
+                    return True
+                logger.warning(
+                    "higgs_audio_v2 load_weights: shape mismatch %s -> %s: %s vs %s",
+                    name,
+                    normalized,
+                    tuple(tensor.shape),
+                    tuple(target.shape),
+                )
+                return False
+
+            # Per-layer text-side params currently live one level deeper in our
+            # HiggsAudioV2DecoderLayer (under ``.base``). Map ``layers.<L>.<tail>``
+            # -> ``layers.<L>.base.<tail>`` when the tail belongs to the wrapped
+            # LlamaDecoderLayer (input_layernorm / post_attention_layernorm /
+            # self_attn.o_proj / mlp.down_proj).
+            parts = normalized.split(".")
+            if len(parts) >= 3 and parts[0] == "layers":
+                tail = ".".join(parts[2:])
+                if tail in (
+                    "input_layernorm.weight",
+                    "post_attention_layernorm.weight",
+                    "self_attn.o_proj.weight",
+                    "mlp.down_proj.weight",
+                ):
+                    base_name = f"layers.{parts[1]}.base.{tail}"
+                    if base_name in own_params:
+                        target = own_params[base_name]
+                        if tuple(target.shape) == tuple(tensor.shape):
+                            with torch.no_grad():
+                                target.copy_(tensor)
+                            loaded.add(base_name)
+                            return True
+                # audio_mlp.down_proj lives at our top-level audio_mlp slot.
+                if tail == "audio_mlp.down_proj.weight":
+                    audio_name = f"layers.{parts[1]}.audio_mlp.down_proj.weight"
+                    if audio_name in own_params:
+                        target = own_params[audio_name]
+                        if tuple(target.shape) == tuple(tensor.shape):
+                            with torch.no_grad():
+                                target.copy_(tensor)
+                            loaded.add(audio_name)
+                            return True
+
+            # Special simple cases (nested audio embedding, text_lm_head alias, etc.)
             mapped = self._map_simple_name(name)
+            if mapped is None:
+                # Also try after stripping the model. prefix so the _map_simple_name
+                # branches written for un-stripped names continue to work.
+                mapped = self._map_simple_name("model." + normalized)
             if mapped is None or mapped not in own_params:
                 return False
             target = own_params[mapped]
@@ -566,14 +663,15 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             return True
 
         def _stash_fusion(name: str, tensor: torch.Tensor) -> bool:
-            parts = name.split(".")
-            if len(parts) < 5 or parts[0] != "model" or parts[1] != "layers":
+            normalized = _strip_model_prefix(name)
+            parts = normalized.split(".")
+            if len(parts) < 4 or parts[0] != "layers":
                 return False
             try:
-                layer_idx = int(parts[2])
+                layer_idx = int(parts[1])
             except ValueError:
                 return False
-            tail = ".".join(parts[3:])
+            tail = ".".join(parts[2:])
             for slot in ("mlp", "audio_mlp"):
                 for kind in ("gate_proj", "up_proj"):
                     if tail == f"{slot}.{kind}.weight":
@@ -585,16 +683,26 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                     return True
             return False
 
+        unhandled: list[str] = []
         for name, tensor in weights:
+            if len(debug_seen) < 30:
+                debug_seen.append(name)
             if _try_simple(name, tensor):
                 continue
             if _stash_fusion(name, tensor):
                 continue
             # audio code head: upstream has a fused [num_codebooks*codebook_size, hidden]
-            # head; split into codebook-0 head + residual heads.
-            if name in ("audio_lm_head.weight",):
+            # head; split into codebook-0 head + residual heads. Accept both
+            # ``audio_lm_head.weight`` and ``model.audio_lm_head.weight``.
+            if name in (
+                "audio_lm_head.weight",
+                "model.audio_lm_head.weight",
+                "audio_decoder_proj.audio_lm_head.weight",
+                "model.audio_decoder_proj.audio_lm_head.weight",
+            ):
                 self._consume_fused_audio_head(tensor, loaded)
                 continue
+            unhandled.append(name)
 
         # Second pass: emit fused tensors. Targets are the per-layer slots on
         # our HiggsAudioV2DecoderLayer stack (``layers.<L>.base...`` for text-
@@ -631,6 +739,14 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                     tuple(fused.shape),
                     tuple(own_params[target_name].shape) if target_name in own_params else "<missing>",
                 )
+        logger.info(
+            "higgs_audio_v2 load_weights: %d/%d params initialized (sample seen: %s; unhandled count=%d, sample unhandled=%s)",
+            len(loaded),
+            len(own_params),
+            debug_seen[:10],
+            len(unhandled),
+            unhandled[:20],
+        )
         return loaded
 
     def _consume_fused_audio_head(
@@ -670,12 +786,29 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         # checkpoint also uses this exact key. Accept both nested and flat.
         if hf_name in (
             "embed_audio_tokens.weight",
-            "model.embed_audio_tokens.embed_audio_tokens.weight",
+            "embed_audio_tokens.embed_audio_tokens.weight",  # stripped form
+            "model.embed_audio_tokens.embed_audio_tokens.weight",  # raw HF form
             "model.embed_audio_tokens.weight",
+            # Actual key used in the boson-ai checkpoint:
+            "audio_codebook_embeddings.weight",
+            "model.audio_codebook_embeddings.weight",
         ):
             return "embed_audio_tokens.weight"
-        if hf_name in ("lm_head.weight", "text_lm_head.weight"):
+        if hf_name in (
+            "lm_head.weight",
+            "text_lm_head.weight",
+            "model.text_lm_head.weight",
+            # Actual key used in the boson-ai checkpoint:
+            "audio_decoder_proj.text_lm_head.weight",
+            "model.audio_decoder_proj.text_lm_head.weight",
+        ):
             return "lm_head.weight"
+        # Round 7: dropped LlamaModel wrapper; text embedding + final norm now
+        # live directly on the talker (self.embed_tokens / self.norm).
+        if hf_name == "model.embed_tokens.weight":
+            return "embed_tokens.weight"
+        if hf_name == "model.norm.weight":
+            return "norm.weight"
         # Per-codebook head, when the upstream exports it un-fused.
         if hf_name == "codebook_head_0.weight":
             return "audio_codebook0_head.weight"
@@ -708,6 +841,25 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         ):
             layer_idx = hf_name.split(".")[2]
             return f"layers.{layer_idx}.base.post_attention_layernorm.weight"
+        # Per-layer non-fused projections (Round 7 fix): o_proj for attention
+        # and the down_proj of both MLP experts pass through unchanged in
+        # shape, so they map directly to the corresponding slot on our
+        # HiggsAudioV2DecoderLayer.
+        if hf_name.startswith("model.layers.") and hf_name.endswith(
+            ".self_attn.o_proj.weight"
+        ):
+            layer_idx = hf_name.split(".")[2]
+            return f"layers.{layer_idx}.base.self_attn.o_proj.weight"
+        if hf_name.startswith("model.layers.") and hf_name.endswith(
+            ".mlp.down_proj.weight"
+        ):
+            layer_idx = hf_name.split(".")[2]
+            return f"layers.{layer_idx}.base.mlp.down_proj.weight"
+        if hf_name.startswith("model.layers.") and hf_name.endswith(
+            ".audio_mlp.down_proj.weight"
+        ):
+            layer_idx = hf_name.split(".")[2]
+            return f"layers.{layer_idx}.audio_mlp.down_proj.weight"
         return None
 
     # ----------------------------------------------------------------- forward
@@ -728,9 +880,16 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         composes the embedding and final-norm steps around the layer loop.
         """
         if inputs_embeds is None:
-            hidden_states = self.text_model.embed_tokens(input_ids)
+            hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = inputs_embeds
+
+        # Stash the step's input_ids for :meth:`_apply_audio_mode_bias` to read
+        # in :meth:`sample`. ``sampling_metadata.prompt_token_ids`` is only
+        # populated when penalties or token-id-aware logits processors are
+        # active, so for our use case we have to keep our own copy.
+        if input_ids is not None:
+            self._last_step_input_ids = input_ids
 
         audio_mask = self.audio_token_mask(input_ids) if input_ids is not None else None
 
@@ -746,7 +905,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         # Final norm. vLLM's compiled RMSNorm returns ``(hidden, residual)`` when
         # called with the fused signature; we call it with the single-tensor
         # signature since our layers already baked residual into hidden_states.
-        norm_out = self.text_model.norm(hidden_states)
+        norm_out = self.norm(hidden_states)
         if isinstance(norm_out, tuple):
             norm_out = norm_out[0]
         return norm_out
@@ -780,6 +939,10 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         sampler dispatch.
         """
         _ = audio_token_mask  # The mask is consumed by audio_codebook0_logits, not here.
+        # Stash for the audio-sampler dispatch in :meth:`sample` (round-7+).
+        # Limited to a single step at a time; cleared in :meth:`sample` after
+        # consumption so a missed call doesn't leak stale tensors.
+        self._last_logits_hidden = hidden_states
         return self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
 
     def audio_codebook0_logits(
@@ -824,6 +987,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         out = torch.empty(
             (n_audio, self.config.num_codebooks - 1), dtype=torch.long, device=hidden_states.device
         )
+        num_real = int(getattr(self.config, "num_real_codes", self.config.codebook_size))
         running_hidden = hidden_states
         prev_codes = codebook0_ids
         for k in range(1, self.config.num_codebooks):
@@ -832,6 +996,10 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             cb_embed = self.code_predictor.embed_codebook(k - 1, prev_codes)  # [N, hidden]
             running_hidden = running_hidden + cb_embed
             logits = self.code_predictor.predict_residual(running_hidden, k)  # [N, codebook_size]
+            # Mask stream specials so argmax stays in the real-code range.
+            if logits.shape[-1] > num_real:
+                logits = logits.clone()
+                logits[:, num_real:] = float("-inf")
             next_codes = torch.argmax(logits, dim=-1)
             out[:, k - 1] = next_codes
             prev_codes = next_codes
@@ -850,7 +1018,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         embedding at placeholder positions acts as a deterministic dummy
         that the DualFFN audio expert still routes correctly.
         """
-        return self.text_model.embed_tokens(input_ids)
+        return self.embed_tokens(input_ids)
 
     def make_omni_output(
         self,
@@ -926,21 +1094,218 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
     # final audio-side sampler without touching the runner.
     prefer_model_sampler: bool = True
 
-    def sample(self, logits: torch.Tensor, sampling_metadata: Any) -> Any:
-        """Model-owned sampler entry point.
+    # Tell the runner's :func:`extract_multimodal_outputs` to forward the OmniOutput
+    # produced by :meth:`make_omni_output`. Without this flag the multimodal
+    # payload (audio codes) is dropped and the downstream stage receives only
+    # text hidden states.
+    have_multimodal_outputs: bool = True
 
-        Round-6 contract: emit text-vocab tokens via the stock sampler. The
-        per-position audio-codebook-0 dispatch (sample codebook 0 at audio
-        positions from ``audio_codebook0_logits``, persist codebooks 1..7 from
-        ``predict_audio_residual_codebooks``, then write the
-        ``[num_frames, 8]`` tensor into ``model_intermediate_buffer[req_id]
-        ["codes"]["audio"]``) is the immediate follow-up. The runner hook is
-        in place so the integration can land without touching the engine.
+    def sample(self, logits: torch.Tensor, sampling_metadata: Any) -> Any:
+        """Model-owned sampler with audio-codebook-0 dispatch.
+
+        - Run the stock vLLM sampler against the text-vocab logits to produce
+          per-position token ids. These already cover the standard text path.
+        - Detect positions where the *sampled* token is an audio placeholder
+          (``audio_token_id`` or ``audio_delay_token_id``). At those positions
+          we sample codebook 0 from :meth:`audio_codebook0_logits` and run
+          :meth:`predict_audio_residual_codebooks` for codebooks 1..7. The
+          resulting ``[N_audio, 8]`` tensor is stashed on the talker so the
+          per-request ``postprocess`` hook can publish it under
+          ``model_intermediate_buffer[req_id]["codes"]["audio"]``.
+
+        Hidden states are the ones cached by :meth:`compute_logits`.
         """
         sampler = getattr(self, "_stock_sampler", None)
         if sampler is None:
-            from vllm.model_executor.layers.sampler import Sampler
+            from vllm.v1.sample.sampler import Sampler
 
             sampler = Sampler()
             self._stock_sampler = sampler
-        return sampler(logits=logits, sampling_metadata=sampling_metadata)
+
+        # Audio-mode logits bias: when the previous token (last in
+        # output_token_ids[i] if non-empty, else last in prompt_token_ids[i])
+        # is ``audio_out_bos`` (=audio_bos_token_id) or ``audio_token_id``, the
+        # next emitted token must be either another ``audio_token_id`` (audio
+        # frame placeholder) or ``audio_eos`` (stop). Mask everything else.
+        self._apply_audio_mode_bias(logits, sampling_metadata)
+        sampler_output = sampler(logits=logits, sampling_metadata=sampling_metadata)
+
+        hidden = getattr(self, "_last_logits_hidden", None)
+        self._last_logits_hidden = None
+        if hidden is None:
+            self._last_audio_codes = None
+            return sampler_output
+
+        sampled = getattr(sampler_output, "sampled_token_ids", None)
+        if sampled is None:
+            self._last_audio_codes = None
+            return sampler_output
+        sampled_flat = sampled.reshape(-1)
+        if int(sampled_flat.numel()) != int(hidden.shape[0]):
+            # Shape mismatch (e.g. spec-decode draft path); skip audio dispatch.
+            self._last_audio_codes = None
+            return sampler_output
+
+        audio_token_id = int(self.config.audio_token_id)
+        audio_delay_id = int(self.config.audio_delay_token_id)
+        is_audio = (sampled_flat == audio_token_id) | (sampled_flat == audio_delay_id)
+        if not bool(is_audio.any()):
+            self._last_audio_codes = None
+            return sampler_output
+
+        audio_hidden = hidden[is_audio]
+        cb0_logits = self.audio_codebook0_head(audio_hidden)
+        # Mask stream-special positions so argmax stays in the real-code range
+        # ``[0, num_real_codes)``. Without this the per-codebook argmax can
+        # land on ``audio_stream_bos_id`` (1024) or ``audio_stream_eos_id``
+        # (1025), and the stage-input adapter's :func:`_extract_last_frame`
+        # filter drops those frames entirely.
+        num_real = int(getattr(self.config, "num_real_codes", cb0_logits.shape[-1]))
+        if cb0_logits.shape[-1] > num_real:
+            cb0_logits = cb0_logits.clone()
+            cb0_logits[:, num_real:] = float("-inf")
+        cb0 = torch.argmax(cb0_logits, dim=-1)
+        residual = self.predict_audio_residual_codebooks(audio_hidden, cb0)
+        # Defensive clamp on residual codebooks too.
+        residual = residual.clamp_(max=num_real - 1).clamp_(min=0)
+        codes_flat = torch.cat([cb0.unsqueeze(1), residual], dim=1).to(torch.long)
+
+        # Scatter [N_audio, 8] back to a [N, 8] tensor (-1 at non-audio rows)
+        # so postprocess can slice per-request.
+        num_codebooks = int(self.config.num_codebooks)
+        codes_full = torch.full(
+            (int(sampled_flat.numel()), num_codebooks),
+            -1,
+            dtype=torch.long,
+            device=hidden.device,
+        )
+        codes_full[is_audio] = codes_flat
+        self._last_audio_codes = codes_full
+        self._postprocess_cursor = 0
+        return sampler_output
+
+    def _apply_audio_mode_bias(self, logits: torch.Tensor, sampling_metadata: Any) -> int:
+        """Mask non-audio tokens at audio-mode positions, in-place on ``logits``.
+
+        Heuristic: per-request, find the last token seen so far (last of
+        ``output_token_ids[i]`` if non-empty, else last of
+        ``prompt_token_ids[i]``). If that token is ``audio_bos_token_id`` or
+        ``audio_token_id``, force the next emit to be one of
+        ``{audio_token_id, audio_eos_token_id}``. This unblocks live audio
+        generation since the un-biased argmax over the 128k vocab favours
+        text-token-id ranges (in particular the global ``eos_token_id``).
+
+        We deliberately do NOT include the standard ``eos_token_id`` in the
+        allowed set — letting it through would end the whole sequence at the
+        first step. Stopping inside the audio span is the ``audio_eos`` token's
+        job; once it fires we drop the bias and the next call falls back to
+        the stock sampler.
+        """
+        if logits is None or logits.ndim != 2:
+            return 0
+        audio_bos = int(self.config.audio_bos_token_id)
+        audio_id = int(self.config.audio_token_id)
+        # Force ``audio_token_id`` only — including ``audio_eos`` in the allow
+        # set lets greedy decode pick the EOS at step 1 (the model's unbiased
+        # logit for the audio placeholder is weak relative to neighbouring
+        # special tokens). The framework's ``max_tokens`` is the stop bound
+        # while the codebook-emission contract stabilises (R8). When the
+        # upstream sampler is faithful we'll add ``audio_eos`` back here.
+        allowed_extra: list[int] = []
+        # Walk per-request to decide which rows to mask.
+        prompt_ids = getattr(sampling_metadata, "prompt_token_ids", None)
+        output_ids = getattr(sampling_metadata, "output_token_ids", None)
+        num_rows = int(logits.shape[0])
+        biased = 0
+        # Fallback "previous token" source: input_ids stashed by :meth:`forward`.
+        # The runner concatenates per-request input_ids; ``logits`` rows are
+        # produced from logits_indices which (for the common AR case) are the
+        # last position of each request slice. So input_ids' tail matches the
+        # logits' rows in order.
+        stash_ids = getattr(self, "_last_step_input_ids", None)
+        stash_tail: list[int] | None = None
+        if isinstance(stash_ids, torch.Tensor) and stash_ids.numel() >= num_rows:
+            stash_tail = stash_ids[-num_rows:].detach().to("cpu").tolist()
+        for i in range(num_rows):
+            prev: int | None = None
+            if output_ids is not None and i < len(output_ids):
+                hist = output_ids[i]
+                if hist:
+                    prev = int(hist[-1])
+            if prev is None and prompt_ids is not None:
+                # prompt_token_ids may be a tensor or a list-of-lists
+                try:
+                    p_i = prompt_ids[i]
+                    if hasattr(p_i, "tolist"):
+                        p_i = p_i.tolist()
+                    if p_i:
+                        prev = int(p_i[-1])
+                except (IndexError, TypeError):
+                    prev = None
+            if prev is None and stash_tail is not None and i < len(stash_tail):
+                prev = int(stash_tail[i])
+            if prev is None:
+                continue
+            if prev not in (audio_bos, audio_id):
+                continue
+            # Mask all logits at this row except the audio + EOS tokens.
+            allowed = {audio_id, *allowed_extra}
+            row = logits[i]
+            mask = torch.full_like(row, float("-inf"))
+            for tok in allowed:
+                if 0 <= tok < row.shape[-1]:
+                    mask[tok] = row[tok]
+            logits[i].copy_(mask)
+            biased += 1
+        return biased
+
+    has_postprocess: bool = True
+
+    def postprocess(
+        self,
+        hidden_states_slice: torch.Tensor,
+        multimodal_outputs: Any = None,
+        **req_infos: Any,
+    ) -> dict[str, Any]:
+        """Publish per-request audio codes into model_intermediate_buffer.
+
+        The runner calls this once per request, passing the request's slice of
+        hidden states. We use the slice's length to pick out the matching rows
+        from ``self._last_audio_codes`` (a per-batch [N_total, num_codebooks]
+        tensor scattered by :meth:`sample`). The returned dict is merged into
+        ``model_intermediate_buffer[req_id]`` for downstream Stage-1 use.
+        """
+        _ = multimodal_outputs  # consumed by the runner directly
+        codes_full = getattr(self, "_last_audio_codes", None)
+        if codes_full is None:
+            return {}
+
+        # The runner walks requests in batch order; pop from the cursor as we go.
+        cursor = int(getattr(self, "_postprocess_cursor", 0))
+        n = int(hidden_states_slice.shape[0])
+        end = cursor + n
+        if end > int(codes_full.shape[0]):
+            # Defensive: shape drift between forward and postprocess.
+            self._postprocess_cursor = 0
+            return {}
+        slice_codes = codes_full[cursor:end]
+        self._postprocess_cursor = end
+        # Drop placeholder rows (-1) — only emit codes for actual audio positions.
+        audio_rows = slice_codes[:, 0] >= 0
+        if not bool(audio_rows.any()):
+            return {}
+        new_codes = slice_codes[audio_rows].to(torch.int32)
+
+        # Append to any existing codes.audio in the runner buffer (req_infos)
+        # so that codes accumulate across decode steps; without this, each
+        # postprocess overwrite drops earlier frames.
+        existing = req_infos.get("codes")
+        prior = None
+        if isinstance(existing, dict):
+            cand = existing.get("audio")
+            if isinstance(cand, torch.Tensor) and cand.numel() > 0:
+                prior = cand.to(device=new_codes.device, dtype=new_codes.dtype)
+        codes_out = (
+            torch.cat([prior, new_codes], dim=0) if prior is not None else new_codes
+        )
+        return {"codes": {"audio": codes_out}}

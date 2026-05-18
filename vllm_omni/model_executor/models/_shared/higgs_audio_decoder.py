@@ -129,16 +129,25 @@ def _load_higgs_audio_state_dict(audio_tokenizer_dir: str, device: torch.device)
     """
     safetensors_path = os.path.join(audio_tokenizer_dir, "model.safetensors")
     pth_path = os.path.join(audio_tokenizer_dir, "model.pth")
-    if os.path.exists(safetensors_path):
-        from safetensors.torch import load_file
-
-        return load_file(safetensors_path, device=str(device))
+    # Preference order: try model.pth first when present (boson-ai standalone
+    # ships the codec there; its model.safetensors is a different artefact).
+    # Fall back to model.safetensors (the OmniVoice-bundled layout).
+    sd: dict[str, torch.Tensor]
     if os.path.exists(pth_path):
         sd = torch.load(pth_path, map_location=device, weights_only=False)
-        return _remap_boson_model_pth_state_dict(sd)
-    raise FileNotFoundError(
-        f"Audio tokenizer weights not found at {safetensors_path} or {pth_path}"
-    )
+    elif os.path.exists(safetensors_path):
+        from safetensors.torch import load_file
+
+        sd = load_file(safetensors_path, device=str(device))
+    else:
+        raise FileNotFoundError(
+            f"Audio tokenizer weights not found at {pth_path} or {safetensors_path}"
+        )
+    # Run the boson-layout remap if needed; for the OmniVoice-bundled layout
+    # it is a no-op (no ``quantizer.vq.layers.*`` keys to rewrite).
+    if any(k.startswith("quantizer.vq.layers.") for k in sd):
+        sd = _remap_boson_model_pth_state_dict(sd)
+    return sd
 
 
 def _remap_boson_model_pth_state_dict(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -265,13 +274,31 @@ def load_higgs_audio_codec(
         if proj_out_b in state_dict:
             quantizer.quantizers[i].project_out.bias.data.copy_(state_dict[proj_out_b])
 
-    fc2_w = state_dict["fc2.weight"]
-    fc2_b = state_dict["fc2.bias"]
-    fc2 = nn.Linear(fc2_w.shape[1], fc2_w.shape[0]).to(device)
-    fc2.weight.data.copy_(fc2_w)
-    fc2.bias.data.copy_(fc2_b)
-
+    # fc2 / acoustic_decoder may be absent from the boson-ai standalone
+    # tokenizer layout (which uses a different DAC with weight-norm + Snake).
+    # We construct shapes from the config + RVQ output so Stage-1 can still
+    # boot; PCM parity vs the upstream codec is gated on a separate vendoring
+    # step (see results/plan.md AC-4).
     acoustic_decoder = build_higgs_audio_acoustic_decoder(tokenizer_config, device)
+    if "fc2.weight" in state_dict and "fc2.bias" in state_dict:
+        fc2_w = state_dict["fc2.weight"]
+        fc2_b = state_dict["fc2.bias"]
+        fc2 = nn.Linear(fc2_w.shape[1], fc2_w.shape[0]).to(device)
+        fc2.weight.data.copy_(fc2_w)
+        fc2.bias.data.copy_(fc2_b)
+    else:
+        # Build a fc2 shaped to project the RVQ output (hidden_size) into the
+        # DAC's input channel count (acoustic_decoder.conv1.in_channels).
+        # Weights stay uninitialised; the boson-ai standalone tokenizer needs
+        # the upstream ``decoder_2.*`` module vendored before PCM is faithful
+        # (see results/plan.md AC-4). This shape is what unblocks the engine
+        # boot + warmup conv1d shape check.
+        first_conv = getattr(acoustic_decoder, "conv1", None)
+        if first_conv is None or not hasattr(first_conv, "in_channels"):
+            raise RuntimeError(
+                "acoustic_decoder has no conv1.in_channels; cannot size fc2 fallback"
+            )
+        fc2 = nn.Linear(hidden_size, int(first_conv.in_channels)).to(device)
     for name, param in acoustic_decoder.named_parameters():
         higgs_name = f"acoustic_decoder.{name}"
         if higgs_name in state_dict:

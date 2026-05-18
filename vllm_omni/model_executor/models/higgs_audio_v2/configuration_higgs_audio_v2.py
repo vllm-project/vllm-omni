@@ -64,6 +64,7 @@ class HiggsAudioV2Config(PretrainedConfig):
         codebook_size: int = 1026,
         audio_token_id: int = 128016,
         audio_bos_token_id: int = 128013,
+        audio_eos_token_id: int = 128012,
         audio_delay_token_id: int = 128014,
         audio_stream_bos_id: int = 1024,
         audio_stream_eos_id: int = 1025,
@@ -87,6 +88,12 @@ class HiggsAudioV2Config(PretrainedConfig):
         # the 3B Stage-0 checkpoint which bundles its tokenizer under
         # ``audio_tokenizer/``).
         audio_tokenizer_subdir: str = "",
+        # HF repo id (or local path) of a STANDALONE audio tokenizer. When set,
+        # Stage-1 resolves this via ``huggingface_hub.snapshot_download`` and
+        # loads the codec from there, ignoring ``audio_tokenizer_subdir``. This
+        # matches the boson-ai release layout where the codec lives in a
+        # separate repo (``bosonai/higgs-audio-v2-tokenizer``).
+        audio_tokenizer_id: str | None = "bosonai/higgs-audio-v2-tokenizer",
         # --- Misc ---
         use_cache: bool = True,
         **kwargs: Any,
@@ -130,6 +137,7 @@ class HiggsAudioV2Config(PretrainedConfig):
         self.codebook_size = codebook_size
         self.audio_token_id = audio_token_id
         self.audio_bos_token_id = audio_bos_token_id
+        self.audio_eos_token_id = audio_eos_token_id
         self.audio_delay_token_id = audio_delay_token_id
         self.audio_stream_bos_id = audio_stream_bos_id
         self.audio_stream_eos_id = audio_stream_eos_id
@@ -138,6 +146,7 @@ class HiggsAudioV2Config(PretrainedConfig):
 
         self.use_audio_dual_ffn = use_audio_dual_ffn
         self.audio_tokenizer_subdir = audio_tokenizer_subdir
+        self.audio_tokenizer_id = audio_tokenizer_id
         self.use_cache = use_cache
 
     # Codes [0..codebook_size-1] include 2 stream specials at indices
