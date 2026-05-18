@@ -111,7 +111,6 @@ def _daily_omni_hub_inline_media(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(_acc_bench, "daily_omni_bench_argv", _wrapped)
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-    monkeypatch.setenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0")
 
 
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)

@@ -607,6 +607,7 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         host._get_req_chunk[req_id] = 3
         host._send_side_request_payload[ext_id] = {"some": "data"}
         host._code_prompt_token_ids[ext_id] = [[1, 2, 3]]
+        host._cached_ic[ext_id] = 16
         host._chunk_stream_completed.add(req_id)
         host._stage_recv_req_ids.add(req_id)
         host._local_stage_payload_cache[req_id] = {"engine_inputs": {}}
@@ -621,6 +622,7 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         self.assertNotIn(req_id, host._get_req_chunk)
         self.assertNotIn(ext_id, host._send_side_request_payload)
         self.assertNotIn(ext_id, host._code_prompt_token_ids)
+        self.assertNotIn(ext_id, host._cached_ic)
         self.assertNotIn(req_id, host._chunk_stream_completed)
         self.assertNotIn(req_id, host._stage_recv_req_ids)
         self.assertNotIn(req_id, host._local_stage_payload_cache)
@@ -656,11 +658,34 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         # Stage-0 uses req_id directly (no ext_id mapping)
         host._put_req_chunk[req_id] = 3
         host._get_req_chunk[req_id] = 0
+        host._cached_ic[req_id] = 4
 
         host.cleanup_finished_request(req_id)
 
         self.assertNotIn(req_id, host._put_req_chunk)
         self.assertNotIn(req_id, host._get_req_chunk)
+        self.assertNotIn(req_id, host._cached_ic)
+
+        host.shutdown_omni_connectors()
+
+    def test_deferred_cleanup_removes_cached_ic(self):
+        host = self._make_host(stage_id=1)
+        req_id = "req-1"
+        ext_id = "ext-req-1"
+
+        host._request_ids_mapping[req_id] = ext_id
+        host._pending_save_counts[ext_id] = 1
+        host._cached_ic[ext_id] = 8
+
+        host.cleanup_finished_request(req_id)
+
+        self.assertIn(ext_id, host._deferred_send_cleanup)
+        self.assertIn(ext_id, host._cached_ic)
+
+        host._decrement_pending_save_count(ext_id)
+
+        self.assertNotIn(ext_id, host._deferred_send_cleanup)
+        self.assertNotIn(ext_id, host._cached_ic)
 
         host.shutdown_omni_connectors()
 
@@ -1019,10 +1044,12 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         )
         host._request_ids_mapping["r1"] = "r1"
         payload = {
-            "thinker_decode_embeddings": torch.ones(1, 2),
-            "thinker_output_token_ids": [1],
-            "override_keys": ["thinker_decode_embeddings", "thinker_output_token_ids"],
-            "finished": torch.tensor(False),
+            "embed": {"decode": torch.ones(1, 2)},
+            "ids": {"output": [1]},
+            "meta": {
+                "finished": torch.tensor(False),
+                "override_keys": [["embed", "decode"], ["ids", "output"]],
+            },
         }
 
         host._accumulate_payload("r1", dict(payload))
@@ -1040,15 +1067,16 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
             model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
         )
         payload = {
-            "thinker_output_token_ids": [1, 2, 3],
-            "finished": torch.tensor(False),
-            "override_keys": [
-                "thinker_output_token_ids",
-                "thinker_decode_embeddings_token_start",
-                "thinker_decode_embeddings_token_end",
-            ],
-            "thinker_decode_embeddings_token_start": 2,
-            "thinker_decode_embeddings_token_end": 3,
+            "ids": {"output": [1, 2, 3]},
+            "embed": {"decode_token_start": 2, "decode_token_end": 3},
+            "meta": {
+                "finished": torch.tensor(False),
+                "override_keys": [
+                    ["ids", "output"],
+                    ["embed", "decode_token_start"],
+                    ["embed", "decode_token_end"],
+                ],
+            },
         }
         self.assertFalse(host._payload_is_consumable(payload))
         host.shutdown_omni_connectors()
@@ -1060,9 +1088,9 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
             model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
         )
         payload = {
-            "thinker_output_token_ids": [1, 2, 3],
-            "thinker_decode_embeddings": torch.ones(1, 2),
-            "finished": torch.tensor(False),
+            "ids": {"output": [1, 2, 3]},
+            "embed": {"decode": torch.ones(1, 2)},
+            "meta": {"finished": torch.tensor(False)},
         }
         self.assertTrue(host._payload_is_consumable(payload))
         host.shutdown_omni_connectors()
@@ -1083,15 +1111,14 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         host._omni_connector.get.side_effect = [
             (
                 {
-                    "thinker_decode_embeddings": torch.ones(1, 2),
-                    "finished": torch.tensor(False),
+                    "embed": {"decode": torch.ones(1, 2)},
+                    "meta": {"finished": torch.tensor(False)},
                 },
                 1,
             ),
             (
                 {
-                    "next_stage_prompt_len": 7,
-                    "finished": torch.tensor(False),
+                    "meta": {"next_stage_prompt_len": 7, "finished": torch.tensor(False)},
                 },
                 1,
             ),

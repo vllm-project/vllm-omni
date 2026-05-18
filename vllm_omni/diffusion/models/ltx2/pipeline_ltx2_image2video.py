@@ -460,9 +460,9 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
             device=device,
         )
         # Compute positive prompt connectors
-        additive_attention_mask = (1 - prompt_attention_mask.to(prompt_embeds.dtype)) * -1000000.0
+        tokenizer_padding_side = getattr(self.tokenizer, "padding_side", "left")
         connector_prompt_embeds, connector_audio_prompt_embeds, connector_attention_mask = self.connectors(
-            prompt_embeds, additive_attention_mask, additive_mask=True
+            prompt_embeds, prompt_attention_mask, padding_side=tokenizer_padding_side
         )
 
         # Compute negative prompt connectors when CFG is enabled
@@ -470,17 +470,14 @@ class LTX2ImageToVideoPipeline(LTX2Pipeline):
         negative_connector_audio_prompt_embeds = None
         negative_connector_attention_mask = None
         if self.do_classifier_free_guidance:
-            negative_additive_attention_mask = (
-                1 - negative_prompt_attention_mask.to(negative_prompt_embeds.dtype)
-            ) * -1000000.0
             (
                 negative_connector_prompt_embeds,
                 negative_connector_audio_prompt_embeds,
                 negative_connector_attention_mask,
             ) = self.connectors(
                 negative_prompt_embeds,
-                negative_additive_attention_mask,
-                additive_mask=True,
+                negative_prompt_attention_mask,
+                padding_side=tokenizer_padding_side,
             )
 
         latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1

@@ -318,7 +318,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     engine_args = stage_config.engine_args
 
     if current_omni_platform.is_rocm():
-        if engine_args.get("attention_backend") is None:
+        if stage_type != "diffusion" and engine_args.get("attention_backend") is None:
             from vllm._aiter_ops import rocm_aiter_ops
 
             if rocm_aiter_ops.is_enabled():
@@ -574,6 +574,14 @@ def build_engine_args_dict(
     if engine_args_dict.get("async_chunk", False):
         engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
 
+    if stage_type == "diffusion":
+        from vllm_omni.diffusion.data import parse_attention_config
+
+        if engine_args_dict.get("diffusion_attention_config") is not None:
+            engine_args_dict["diffusion_attention_config"] = parse_attention_config(
+                engine_args_dict.get("diffusion_attention_config"),
+            )
+
     if stage_type != "diffusion":
         resolve_worker_cls(engine_args_dict)
 
@@ -611,6 +619,19 @@ def build_vllm_config(
         )
 
     filtered_engine_args_dict = filter_dataclass_kwargs(OmniEngineArgs, engine_args_dict)
+
+    # _to_dict serializes dataclass fields (e.g. StructuredOutputsConfig) into
+    # plain dicts.  When OmniEngineArgs is instantiated with the dict, these
+    # fields remain dicts instead of being reconstructed as dataclass objects.
+    # Later, EngineArgs.create_engine_config() does
+    #   self.structured_outputs_config.reasoning_parser = ...
+    # which fails on a plain dict.  Reconstruct the dataclass here.
+    soc = filtered_engine_args_dict.get("structured_outputs_config")
+    if isinstance(soc, dict):
+        from vllm.config import StructuredOutputsConfig
+
+        filtered_engine_args_dict["structured_outputs_config"] = StructuredOutputsConfig(**soc)
+
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
 
     # Multi-stage pipelines (qwen3_tts code2wav, etc.) set max_model_len

@@ -1,5 +1,7 @@
 # Qwen3-Omni
 
+> Online serving for multimodal chat
+
 ## Summary
 
 - Vendor: Qwen

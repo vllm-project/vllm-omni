@@ -50,7 +50,6 @@ def _qwen3_omni_env():
     """
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-        mp.setenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0")
         yield
 
 

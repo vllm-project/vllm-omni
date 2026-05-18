@@ -8,7 +8,27 @@ import numpy as np
 import torch
 from vllm.inputs import TextPrompt
 
+from vllm_omni.data_entry_keys import (
+    CodesStruct,
+    EmbeddingsStruct,
+    MetaStruct,
+    OmniPayloadStruct,
+)
 from vllm_omni.inputs.data import OmniTokensPrompt
+
+
+def _build_prompt_embed_struct(prompt_payload: dict[str, Any]) -> EmbeddingsStruct | None:
+    """Wrap prompt_payload's flat speech_token/speech_feat/embedding tensors into EmbeddingsStruct."""
+    speech_token = prompt_payload.get("speech_token")
+    speech_feat = prompt_payload.get("speech_feat")
+    embedding = prompt_payload.get("embedding")
+    if speech_token is None and speech_feat is None and embedding is None:
+        return None
+    return EmbeddingsStruct(
+        speech_token=speech_token,
+        speech_feat=speech_feat,
+        embedding=embedding,
+    )
 
 
 def _ensure_list(x: Any) -> list[Any]:
@@ -88,7 +108,7 @@ def talker2code2wav_async_chunk(
     pooling_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
-) -> dict[str, Any] | None:
+) -> OmniPayloadStruct | None:
     """CosyVoice3 async_chunk processor: talker token stream -> code2wav chunks."""
     with nullcontext():
         request_id = request.external_req_id
@@ -114,16 +134,18 @@ def talker2code2wav_async_chunk(
         if not isinstance(request_state, dict) or "_cosyvoice3_async_state" not in request_state:
             with nullcontext():
                 info = _decode_additional_information(getattr(request, "additional_information", None))
+                info_embed = info.get("embed", {}) if isinstance(info, dict) else {}
                 prompt_payload = {}
                 for key in ("speech_token", "speech_feat", "embedding"):
-                    value = _to_cpu_tensor(info.get(key))
+                    value = _to_cpu_tensor(info_embed.get(key))
                     if value is not None:
                         prompt_payload[key] = value
                 if isinstance(pooling_output, dict):
+                    po_embed = pooling_output.get("embed", {}) if isinstance(pooling_output.get("embed"), dict) else {}
                     for key in ("speech_token", "speech_feat", "embedding"):
                         if key in prompt_payload:
                             continue
-                        value = _to_cpu_tensor(pooling_output.get(key))
+                        value = _to_cpu_tensor(po_embed.get(key))
                         if value is not None:
                             prompt_payload[key] = value
                 prompt_token = prompt_payload.get("speech_token")
@@ -176,27 +198,29 @@ def talker2code2wav_async_chunk(
         if length <= 0:
             if not finished:
                 return None
-            payload: dict[str, Any] = {
-                "codes": {"audio": []},
-                "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
-            }
+            embed_struct = None
             if not state.get("sent_prompt", False):
-                payload.update(state.get("prompt_payload", {}))
+                embed_struct = _build_prompt_embed_struct(state.get("prompt_payload", {}))
                 state["sent_prompt"] = True
             state["terminal_sent"] = True
-            return payload
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+                embed=embed_struct,
+            )
 
         emitted_token_len = int(state.get("emitted_token_len", 0))
         if finished and length <= emitted_token_len:
-            payload = {
-                "codes": {"audio": []},
-                "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
-            }
+            embed_struct = None
             if not state.get("sent_prompt", False):
-                payload.update(state.get("prompt_payload", {}))
+                embed_struct = _build_prompt_embed_struct(state.get("prompt_payload", {}))
                 state["sent_prompt"] = True
             state["terminal_sent"] = True
-            return payload
+            return OmniPayloadStruct(
+                codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+                meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+                embed=embed_struct,
+            )
 
         with nullcontext():
             token_hop_len = max(1, int(state.get("token_hop_len", chunk_size)))
@@ -220,17 +244,21 @@ def talker2code2wav_async_chunk(
         with nullcontext():
             code_predictor_codes = [int(frame[0]) for frame in token_frames[:prefix_len]]
 
-        payload = {
-            "codes": {"audio": code_predictor_codes},
-            "meta": {"finished": torch.tensor(finished, dtype=torch.bool)},
-            "token_offset": token_offset,
-            "left_context_size": token_offset,
-            "req_id": [request_id],
-            "stream_finished": torch.tensor(finished, dtype=torch.bool),
-        }
+        embed_struct = None
         if not state.get("sent_prompt", False):
-            payload.update(state.get("prompt_payload", {}))
+            embed_struct = _build_prompt_embed_struct(state.get("prompt_payload", {}))
             state["sent_prompt"] = True
+
+        payload = OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor(code_predictor_codes, dtype=torch.long)),
+            meta=MetaStruct(
+                finished=torch.tensor(finished, dtype=torch.bool),
+                stream_finished=torch.tensor(finished, dtype=torch.bool),
+                req_id=[request_id],
+                left_context_size=token_offset,
+            ),
+            embed=embed_struct,
+        )
 
         if not finished:
             state["emitted_token_len"] = emitted_token_len + this_token_hop_len

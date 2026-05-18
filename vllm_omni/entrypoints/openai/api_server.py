@@ -1164,6 +1164,8 @@ async def create_audio_generate(request: OpenAICreateAudioGenerateRequest, raw_r
                 status_code=result.error.code if result.error else 400,
             )
         return result
+    except (EngineGenerateError, EngineDeadError) as exc:
+        return _create_engine_error_json_response(raw_request, exc)
     except Exception as e:
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
 
@@ -1606,7 +1608,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         request_id = f"img_gen-{random_uuid()}"
         raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
 
-        logger.info(f"Generating {request.n} image(s) {size_str}")
+        logger.debug(f"Generating {request.n} image(s) {size_str}")
 
         # Generate images using AsyncOmni (multi-stage mode)
         result = await _generate_with_async_omni(
@@ -1626,7 +1628,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         # Extract images from result
         images = _extract_images_from_result(result)
 
-        logger.info(f"Successfully generated {len(images)} image(s)")
+        logger.debug(f"Successfully generated {len(images)} image(s)")
 
         # Determine output format (default to png)
         output_format = _choose_output_format(request.output_format or "png", None)
@@ -1700,7 +1702,10 @@ async def edit_images(
     # vllm-omni extension for layered models (e.g., Qwen-Image-Layered)
     layers: int | None = Form(None),
     resolution: int | None = Form(None),  # See SUPPORTED_LAYERED_RESOLUTIONS
+    # /v1/images/edits is always IT2I; only the prompting knobs are exposed.
     bot_task: str | None = Form(None),
+    sys_type: str | None = Form(None),
+    system_prompt: str | None = Form(None),
 ) -> ImageGenerationResponse:
     """
     OpenAI-compatible image edit endpoint.
@@ -1751,16 +1756,20 @@ async def edit_images(
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail=detail,
             )
-        pil_images = await _load_input_images(input_images_list)
+        # Match the offline path: RGB normalize when the caller opts into
+        # Hunyuan-aware behavior. RGBA/P uploads otherwise diverge from offline.
+        normalize_edit_images_rgb = bot_task is not None or sys_type is not None
+        pil_images = await _load_input_images(input_images_list, normalize_rgb=normalize_edit_images_rgb)
         prompt["multi_modal_data"] = {}
         prompt["multi_modal_data"]["image"] = pil_images
 
         if mask_image is not None:
-            loaded = await _load_input_images([mask_image])
+            # Mask role is different (alpha channel matters); never normalize.
+            loaded = await _load_input_images([mask_image], normalize_rgb=False)
             prompt["multi_modal_data"]["mask_image"] = loaded[0]
 
         if reference_image is not None:
-            loaded = await _load_input_images([reference_image])
+            loaded = await _load_input_images([reference_image], normalize_rgb=normalize_edit_images_rgb)
             prompt["multi_modal_data"]["reference_image"] = loaded[0]
 
         # 3 Build sample params
@@ -1811,7 +1820,8 @@ async def edit_images(
 
         # 3.3 Parse and add size if provided
         width, height = None, None
-        if size.lower() == "auto":
+        size_was_auto = size.lower() == "auto"
+        if size_was_auto:
             if resolution is None:
                 # No resolution specified, use input image size
                 width, height = pil_images[0].size
@@ -1854,7 +1864,7 @@ async def edit_images(
         # 4. Generate images
         request_id = f"img_edit-{random_uuid()}"
         raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
-        logger.info(f"Generating {n} image(s) {size_str}")
+        logger.debug(f"Generating {n} image(s) {size_str}")
 
         if len(stage_configs) > 1:
             # Multi-stage pipeline (e.g. GLM-Image AR+Diffusion): route through
@@ -1882,10 +1892,13 @@ async def edit_images(
                 "seed": effective_seed,
                 "num_outputs_per_prompt": n,
             }
-            if width is not None:
-                extra_body["width"] = width
-            if height is not None:
-                extra_body["height"] = height
+            # size="auto" resolves width/height from input image; forwarding
+            # those would override AR-driven `<img_ratio_*>` token selection.
+            if not size_was_auto:
+                if width is not None:
+                    extra_body["width"] = width
+                if height is not None:
+                    extra_body["height"] = height
             if negative_prompt is not None:
                 extra_body["negative_prompt"] = negative_prompt
             if num_inference_steps is not None:
@@ -1907,6 +1920,10 @@ async def edit_images(
                 extra_body["lora"] = lora_dict
             if bot_task is not None:
                 extra_body["bot_task"] = bot_task
+            if sys_type is not None:
+                extra_body["sys_type"] = sys_type
+            if system_prompt is not None:
+                extra_body["system_prompt"] = system_prompt
 
             prompt_text = prompt.get("prompt", "")
             generation_result = await chat_handler.generate_diffusion_images(
@@ -1932,7 +1949,7 @@ async def edit_images(
             )
             images = _extract_images_from_result(result)
 
-        logger.info(f"Successfully generated {len(images)} image(s)")
+        logger.debug(f"Successfully generated {len(images)} image(s)")
 
         # Encode images to base64
         image_data = [
@@ -2187,6 +2204,8 @@ def _extract_images_from_result(result: Any) -> list[Any]:
 
 async def _load_input_images(
     inputs: list[str],
+    *,
+    normalize_rgb: bool = True,
 ) -> list[Image.Image]:
     """
     convert to PIL.Image.Image list
@@ -2233,7 +2252,18 @@ async def _load_input_images(
     if not images:
         raise ValueError("No valid input images found")
 
-    return images
+    if not normalize_rgb:
+        return images
+
+    # Match the offline HunyuanImage3 image-edit example path, which eagerly
+    # normalizes input files with ``Image.open(...).convert("RGB")`` before
+    # they reach the AR stage. Keeping uploads as RGBA/P PIL objects makes
+    # online IT2I observe a different visual input than offline (for example
+    # transparent-logo uploads alpha-composited over white instead of black),
+    # which is enough for HunyuanImage3 AR recaption to diverge before DiT
+    # sees the request -- root cause of the "online 3 magnets vs offline 1
+    # magnet" systematic semantic mismatch.
+    return [img.convert("RGB") for img in images]
 
 
 def _choose_output_format(output_format: str | None, background: str | None) -> str:

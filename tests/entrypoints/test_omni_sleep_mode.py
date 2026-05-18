@@ -18,7 +18,10 @@ from vllm_omni.platforms import current_omni_platform
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("OmniTest")
-pytestmark = [pytest.mark.advanced_model]
+pytestmark = [
+    pytest.mark.advanced_model,
+    pytest.mark.usefixtures("clean_gpu_memory_between_tests"),
+]
 
 
 def clean_gpu_envs():

@@ -23,7 +23,7 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 1
-    gpu_memory_utilization: 0.3
+    gpu_memory_utilization: 0.5
     enforce_eager: true
     trust_remote_code: true
     enable_prefix_caching: false
@@ -42,7 +42,7 @@ stages:
 
   - stage_id: 1
     max_num_seqs: 1
-    gpu_memory_utilization: 0.2
+    gpu_memory_utilization: 0.3
     enforce_eager: true
     trust_remote_code: true
     enable_prefix_caching: false
