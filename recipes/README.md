@@ -27,6 +27,7 @@ recipes/
 
 - [`Qwen/Qwen-Image.md`](./Qwen/Qwen-Image.md): text-to-image serving recipe for
   Qwen-Image on `1x A100 80GB`, including optional step-wise continuous batching replay
+  and ModelOpt mixed FP8/NVFP4 Qwen-Image-2512 on `2x B200`
 - [`Qwen/Qwen3-Omni.md`](./Qwen/Qwen3-Omni.md): online serving recipe for
   multimodal chat on `1x A100 80GB`
 - [`Tencent/Covo-Audio-Chat.md`](./Tencent/Covo-Audio-Chat.md): online
@@ -39,7 +40,7 @@ recipes/
   recipe for Wan2.2 14B on `8x Ascend NPU (A2/A3)`
 - [`Tencent-Hunyuan/HunyuanImage-3.0-Instruct.md`](./Tencent-Hunyuan/HunyuanImage-3.0-Instruct.md):
   DiT-only text-to-image serving and benchmark recipe for HunyuanImage-3.0-Instruct
-  on `4x H100/H800 80GB`
+  on `4x H100/H800 80GB`, plus ModelOpt mixed FP8/NVFP4 on `2x B200`
 - [`inclusionAI/Ming-flash-omni-2.0.md`](./inclusionAI/Ming-flash-omni-2.0.md):
   online serving recipe for multimodal chat (`4x H100 80GB`) and standalone TTS (`1x H100 80GB`)
 - [`Baidu/ERNIE-Image.md`](./Baidu/ERNIE-Image.md): text-to-image serving
