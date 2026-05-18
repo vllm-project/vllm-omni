@@ -226,8 +226,8 @@ def test_cuda_graph_disabled_matches_eager_generator():
 
     Uses a 2-layer config so warmup completes quickly without loading weights.
     """
-    from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
     from vllm_omni.model_executor.models.omnivoice.omnivoice_generator import OmniVoiceGenerator
+    from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
     cfg = OmniVoiceConfig()
     cfg.llm_num_hidden_layers = 2
