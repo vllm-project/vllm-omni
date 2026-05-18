@@ -93,7 +93,7 @@ steps:
       - label: "Invalid parameters Test · H100"
         timeout_in_minutes: 120
         commands:
-          - pytest -s -v tests/dfx/reliability/http_invalid/ -m "slow and H100"
+          - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and H100"
         agents:
           queue: "mithril-h100-pool"
         plugins:
@@ -132,7 +132,7 @@ steps:
       - label: "Invalid parameters Test · L4"
         timeout_in_minutes: 120
         commands:
-          - pytest -s -v tests/dfx/reliability/http_invalid/ -m "slow and L4"
+          - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and L4"
         agents:
           queue: "gpu_1_queue"
         plugins:
