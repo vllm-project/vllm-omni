@@ -19,6 +19,9 @@ from tests.helpers.runtime import OmniServer
 
 pytestmark = [pytest.mark.full_model]
 
+# Compare metrics to each test JSON ``baseline`` block only when pytest is run with ``--assert-baseline``
+# (registered in ``tests/dfx/conftest.py``; default is off).
+
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -114,8 +117,10 @@ def run_benchmark(
 ) -> Any:
     """Run a single benchmark iteration and return the parsed result JSON.
 
-    After ``vllm bench`` writes the JSON, ``result["baseline"]`` holds the same
-    per-metric resolved thresholds as ``assert_result`` (via ``_baseline_thresholds_for_step``).
+    After ``vllm bench`` writes the JSON, ``result["baseline"]`` holds the resolved per-metric thresholds
+    (when ``baseline_config`` is provided), matching the same resolution as ``assert_result`` when
+    ``--assert-baseline`` is enabled.
+
     When ``random_input_len`` / ``random_output_len`` are set, they are also written into the result JSON;
     omitted keys when not configured.
     """
@@ -273,11 +278,14 @@ def assert_result(
     params,
     num_prompt,
     *,
+    assert_baseline: bool,
     sweep_index: int | None = None,
-    max_concurrency: Any = None,
-    request_rate: Any = None,
+    max_concurrency: Any | None = None,
+    request_rate: Any | None = None,
 ) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
+    if not assert_baseline:
+        return
     baseline_data = params.get("baseline", {})
     for metric_name, baseline_raw in baseline_data.items():
         current_value = result[metric_name]
@@ -300,7 +308,7 @@ def assert_result(
 @pytest.mark.benchmark
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 @pytest.mark.parametrize("benchmark_params", benchmark_indices, indirect=True)
-def test_performance_benchmark(omni_server, benchmark_params):
+def test_performance_benchmark(omni_server, benchmark_params, request):
     test_name = benchmark_params["test_name"]
     params = benchmark_params["params"]
     dataset_name = params.get("dataset_name", "")
@@ -311,6 +319,8 @@ def test_performance_benchmark(omni_server, benchmark_params):
 
     print(f"Running benchmark for model: {model}")
     print(f"Benchmark parameters: {benchmark_params}")
+
+    assert_baseline = request.config.getoption("--assert-baseline", default=False)
 
     def to_list(value, default=None):
         if value is None:
@@ -350,7 +360,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         elif not isinstance(value, bool):
             args.extend([arg_name, str(value)])
 
-    # QPS test (sweep_index aligns with qps_list / num_prompt_list for this loop)
+    # QPS / request-rate sweep
     for i, (qps, num_prompt) in enumerate(zip(qps_list, num_prompt_list)):
         args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
         result = run_benchmark(
@@ -369,12 +379,13 @@ def test_performance_benchmark(omni_server, benchmark_params):
         assert_result(
             result,
             params,
-            num_prompt=num_prompt,
+            num_prompt,
+            assert_baseline=assert_baseline,
             sweep_index=i,
             request_rate=qps,
         )
 
-    # concurrency test (sweep_index aligns with max_concurrency_list for separate thresholds per concurrency)
+    # concurrency test
     for i, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
         args = args + ["--max-concurrency", str(concurrency), "--num-prompts", str(num_prompt), "--request-rate", "inf"]
         result = run_benchmark(
@@ -393,7 +404,8 @@ def test_performance_benchmark(omni_server, benchmark_params):
         assert_result(
             result,
             params,
-            num_prompt=num_prompt,
+            num_prompt,
+            assert_baseline=assert_baseline,
             sweep_index=i,
             max_concurrency=concurrency,
         )
