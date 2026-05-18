@@ -10,19 +10,30 @@ The UI supports:
 
 ## 1. Start the backend server
 
-Pick a stage config that matches your GPU layout:
+The deploy config auto-loads via `--omni`; the default
+`vllm_omni/deploy/minicpmo_4_5.yaml` targets a 2-GPU layout (thinker on
+GPU 0, talker + t2w sharing GPU 1).  For other hardware layouts pick
+one of the deploy variants below.
 
-| config | GPUs | TP | Notes |
-|---|---|---|---|
-| `minicpmo45_2gpu.yaml` | 2 | 1 | Thinker on GPU0, talker+t2w on GPU1. |
-| `minicpmo45_3gpu.yaml` | 3 | 2 | Thinker 2-way TP on GPU0/1, talker+t2w share GPU2. |
-| `minicpmo45_8x4090.yaml` | 8 | - | Full 8x4090 layout. |
+| deploy config | GPUs | Notes |
+|---|---|---|
+| `minicpmo_4_5.yaml` (default) | 2 | Thinker on GPU0, talker+t2w on GPU1. |
+| `minicpmo_4_5_3gpu.yaml` | 3 | Thinker 2-way TP on GPU0/1, talker+t2w share GPU2. |
+| `minicpmo_4_5_8x4090.yaml` | 8 | Full 8x4090 layout. |
 
-Then:
+Default (2-GPU):
 
 ```bash
-vllm-omni serve openbmb/MiniCPM-o-4_5 \
-    --stage-configs-path vllm_omni/model_executor/stage_configs/minicpmo45_2gpu.yaml \
+vllm serve openbmb/MiniCPM-o-4_5 --omni \
+    --trust-remote-code \
+    --host 0.0.0.0 --port 8099
+```
+
+Other layouts via `--deploy-config`:
+
+```bash
+vllm serve openbmb/MiniCPM-o-4_5 --omni \
+    --deploy-config vllm_omni/deploy/minicpmo_4_5_8x4090.yaml \
     --trust-remote-code \
     --host 0.0.0.0 --port 8099
 ```

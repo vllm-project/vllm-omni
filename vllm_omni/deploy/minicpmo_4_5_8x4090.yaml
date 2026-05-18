@@ -1,0 +1,59 @@
+# MiniCPM-o 4.5 deploy: 8x4090 layout (24GB cards).
+#
+# Stage 0 (thinker): GPU 0,1,2,3 — 4-way TP, ~40% mem (≈9.6 GB / card).
+# Stage 1 (talker) : GPU 4       — MiniCPMTTS + Token2Wav, ~80% mem.
+# Stage 2 (t2w)    : GPU 4       — waveform passthrough, ~20% mem (shared with talker).
+pipeline: minicpmo_4_5
+async_chunk: false
+
+trust_remote_code: true
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.4
+    enforce_eager: true
+    tensor_parallel_size: 4
+    max_num_batched_tokens: 16384
+    devices: "0,1,2,3"
+    limit_mm_per_prompt:
+      video: 1
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.1
+
+  - stage_id: 1
+    max_num_seqs: 16
+    gpu_memory_utilization: 0.8
+    enforce_eager: true
+    max_num_batched_tokens: 8192
+    devices: "4"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: false
+
+  - stage_id: 2
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.2
+    enforce_eager: true
+    max_num_batched_tokens: 8192
+    devices: "4"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+      detokenize: false
+
+platforms: {}
