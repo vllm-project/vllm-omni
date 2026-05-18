@@ -893,11 +893,15 @@ def test_boson_model_pth_remap_rewrites_quantizer_keys() -> None:
         "quantizer.vq.layers.0._codebook.cluster_size": torch.zeros(1024),
         "quantizer.vq.layers.0._codebook.embed_avg": torch.zeros(1024, 64),
         "quantizer.vq.layers.0._codebook.inited": torch.tensor([1.0]),
-        # Acoustic-decoder keys (boson uses decoder_2.* with weight-norm; left untouched here).
+        # Acoustic-decoder keys: boson uses decoder_2.* with weight-norm; the
+        # remapper translates these into the vendored BosonDacDecoder layout
+        # (acoustic_decoder.model.*).
         "decoder_2.model.0.weight_g": torch.zeros(1024, 1, 1),
-        # Non-codec keys should pass through.
-        "fc2.weight": torch.zeros(256, 1024),
-        "fc2.bias": torch.zeros(256),
+        # fc_post2 in boson is what our shared kernel calls fc2.
+        "fc_post2.weight": torch.zeros(256, 1024),
+        "fc_post2.bias": torch.zeros(256),
+        # An already-OmniVoice-style key passes through unchanged.
+        "fc.weight": torch.zeros(32, 16),
     }
     remapped = _remap_boson_model_pth_state_dict(boson_sd)
     # The codebook-decode-essential keys are present under the new names.
@@ -908,10 +912,15 @@ def test_boson_model_pth_remap_rewrites_quantizer_keys() -> None:
     assert all("project_in" not in k for k in remapped)
     assert all("cluster_size" not in k for k in remapped)
     assert all("embed_avg" not in k for k in remapped)
-    # Non-quantizer keys pass through unchanged.
-    assert "decoder_2.model.0.weight_g" in remapped
+    # decoder_2 -> acoustic_decoder remap.
+    assert "decoder_2.model.0.weight_g" not in remapped
+    assert "acoustic_decoder.model.0.weight_g" in remapped
+    # fc_post2 -> fc2 remap.
+    assert "fc_post2.weight" not in remapped
     assert "fc2.weight" in remapped
     assert "fc2.bias" in remapped
+    # Unrelated keys pass through unchanged.
+    assert "fc.weight" in remapped
 
 
 def test_talker_opts_into_model_sampler() -> None:
