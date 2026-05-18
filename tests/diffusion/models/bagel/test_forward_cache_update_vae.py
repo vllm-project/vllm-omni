@@ -97,10 +97,16 @@ def bagel_and_vae_input():
     )
 
     vae_model = MagicMock()
+    patch_shapes = gen_input["patchified_vae_latent_shapes"]
+    p = bagel.latent_patch_size
+    c = bagel.latent_channel
 
     def encode(padded_images: torch.Tensor) -> torch.Tensor:
-        _batch, channels, height, width = padded_images.shape
-        return torch.randn(_batch, channels, height, width)
+        # Match AutoEncoder.encode layout: [B, z_channels, h*p, w*p] per image.
+        batch = padded_images.shape[0]
+        assert batch == len(patch_shapes)
+        latents = [torch.randn(c, h * p, w * p) for h, w in patch_shapes]
+        return torch.stack(latents, dim=0)
 
     vae_model.encode = encode
 
