@@ -182,34 +182,37 @@ Adopt a task-diagnostic approach:
 
 def get_system_prompt(sys_type, bot_task, system_prompt=None):
     # No system prompt, return None directly
+    result = None
     if sys_type == "None":
-        return None
+        result = None
     # Use the unified English system prompt (combined T2I and TI2I guidelines)
     elif sys_type == "en_unified":
-        return unified_system_prompt_en
+        result = unified_system_prompt_en
     # Use predefined English system prompts: vanilla (basic), recaption, think_recaption
     elif sys_type in ["en_vanilla", "en_recaption", "en_think_recaption"]:
-        return t2i_system_prompts[sys_type][0]
+        result = t2i_system_prompts[sys_type][0]
     # Dynamic mode: automatically select system prompt based on bot_task type
     elif sys_type == "dynamic":
         # Think task: use chain-of-thought recaption prompt
         if bot_task == "think":
-            return t2i_system_prompts["en_think_recaption"][0]
+            result = t2i_system_prompts["en_think_recaption"][0]
         # Recaption task: use recaption prompt
         elif bot_task == "recaption":
-            return t2i_system_prompts["en_recaption"][0]
+            result = t2i_system_prompts["en_recaption"][0]
         # Image generation task: use vanilla prompt
         elif bot_task == "image":
-            return t2i_system_prompts["en_vanilla"][0].strip("\n")
+            result = t2i_system_prompts["en_vanilla"][0].strip("\n")
         # Other tasks: use user-provided custom prompt
         else:
-            return system_prompt
+            result = system_prompt
     # Custom mode: use the user-provided system_prompt parameter directly
     elif sys_type == "custom":
-        return system_prompt
+        result = system_prompt
     # Unsupported type: raise NotImplementedError
     else:
         raise NotImplementedError(f"Unsupported system prompt type: {sys_type}")
+
+    return result.strip() if result is not None else ""
 
 
 __all__ = ["get_system_prompt"]

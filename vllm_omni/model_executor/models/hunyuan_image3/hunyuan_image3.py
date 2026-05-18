@@ -66,7 +66,6 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.image import rgba_to_rgb
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalFieldConfig,
@@ -887,8 +886,10 @@ class HunyuanImage3Processor:
         for image in images:
             current_info = {}
 
-            if self.hf_config.vit["num_channels"] == 3 and image.mode == "RGBA":
-                image = rgba_to_rgb(image, (255, 255, 255))
+            # Convert to RGB to match DiT stage preprocessing.
+            # PIL's .convert("RGB") uses black background for RGBA transparency.
+            if image.mode != "RGB":
+                image = image.convert("RGB")
 
             # VIT processing
             vit_pixel_values = self.vision_encoder_processor(image)
@@ -912,7 +913,7 @@ class HunyuanImage3Processor:
             # Keep fp32 — the VAE encoder casts to model dtype at its
             # boundary (see `_vae_encode`).
             image_width, image_height = self.reso_group.get_target_size(image.width, image.height)
-            resized_image = self._resize_and_crop(image, (image_width, image_height))
+            resized_image = self._resize_and_crop(image, (image_width, image_height), crop_type="center")
             vae_pixel_values = self.vae_processor(resized_image).squeeze(0)
             token_height = image_height // (self.hf_config.vae_downsample_factor[0] * self.hf_config.patch_size)
             token_width = image_width // (self.hf_config.vae_downsample_factor[1] * self.hf_config.patch_size)
@@ -957,16 +958,18 @@ class HunyuanImage3Processor:
         self,
         image: Image.Image,
         target_size: tuple[int, int],
-        crop_type: str = "resize",
+        crop_type: str = "center",
     ) -> Image.Image:
-        # Default mode mirrors the official `infer_align_image_size=True`
-        # path (image_processor.py:355 → crop_type="resize") used by the
-        # IT2I demo: stretch the cond image to the bucket dims so its
-        # `<img_ratio_*>` tag and ViT/VAE features stay aligned with the
-        # bucket, instead of dropping content via center crop.
+        # Default mode uses center crop to match DiT stage preprocessing.
+        # This ensures AR and DiT stages process condition images identically,
+        # which is critical for KV cache reuse consistency.
+        #
+        # crop_type="resize" (IT2I demo path with infer_align_image_size=True)
+        # stretches the image, but causes AR/DiT mismatch when DiT uses center crop.
         tw, th = target_size
         if crop_type == "resize":
             return image.resize((tw, th), resample=Image.Resampling.LANCZOS)
+        # Center crop: preserve aspect ratio, then crop from center
         w, h = image.size
         tr = th / tw
         r = h / w

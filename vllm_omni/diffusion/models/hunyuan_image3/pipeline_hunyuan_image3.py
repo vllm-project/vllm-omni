@@ -1373,7 +1373,6 @@ class HunyuanImage3Pipeline(
                     system_prompt = first_prompt.get("system_prompt")
         if use_system_prompt is not None:
             system_prompt = get_system_prompt(use_system_prompt, "image", system_prompt)
-            system_prompt = system_prompt.strip() if system_prompt is not None else ""
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
 
         cot_text_list = [

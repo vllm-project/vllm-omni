@@ -60,7 +60,7 @@ THRESHOLDS = {
     "cot_semantic_sim": 0.9,  # Full CoT semantic similarity
     # Image comparison
     "clip_score": 85,  # CLIP image semantic similarity
-    "ssim": 0.20,  # Structural similarity
+    "ssim": 0.4,  # Structural similarity
     "psnr": 11.0,  # Peak signal-to-noise ratio (dB)
 }
 # fmt: off
@@ -231,7 +231,7 @@ def test_image_to_image_alignment(accuracy_artifact_root: Path, accuracy_assets_
         ["COT similarity to reference", f"{cot_results['cot_semantic_sim']:.4f}", 0.9644],
         ["COT prefix match", f"{cot_results['text_prefix_match_count']:.4f}", 29],
         ["Image-Image similarity", f"{image_clip_score:.4f}", 94.5538],
-        ["SSIM", f"{ssim_value:.4f}", 0.242],
+        ["SSIM", f"{ssim_value:.4f}", 0.4904],
         ["PSNR (dB)", f"{psnr_value:.2f}", 14.1],
     ]
 
