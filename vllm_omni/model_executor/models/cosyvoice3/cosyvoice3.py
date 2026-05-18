@@ -455,6 +455,56 @@ class CosyVoice3Model(
     def _multinomial_sample(probs: torch.Tensor, generator: torch.Generator | None = None) -> torch.Tensor:
         return torch.multinomial(probs, 1, replacement=True, generator=generator).reshape(())
 
+    @staticmethod
+    def _valid_probs(probs: torch.Tensor) -> bool:
+        return bool(torch.isfinite(probs).all().item() and torch.all(probs >= 0).item() and probs.sum().item() > 0)
+
+    @staticmethod
+    def _sanitize_sampling_scores(scores: torch.Tensor) -> torch.Tensor:
+        posinf_mask = scores == float("inf")
+        if bool(posinf_mask.any().item()):
+            return torch.where(
+                posinf_mask,
+                torch.zeros_like(scores),
+                torch.full_like(scores, float("-inf")),
+            )
+        return torch.where(
+            torch.isfinite(scores),
+            scores,
+            torch.full_like(scores, float("-inf")),
+        )
+
+    def _canonical_stop_token_id(self) -> int:
+        return int(self.config.llm["eos_token_id"])
+
+    def _stop_token_slice(self) -> slice:
+        speech_token_size = int(self.config.llm["speech_token_size"])
+        return slice(speech_token_size, speech_token_size + 200)
+
+    def _is_cosyvoice3_stop_token_id(self, token_id: int) -> bool:
+        speech_token_size = int(self.config.llm["speech_token_size"])
+        return speech_token_size <= int(token_id) < speech_token_size + 200
+
+    @staticmethod
+    def _under_min_tokens(sampling_metadata: SamplingMetadata, req_idx: int) -> bool:
+        current_len = len(sampling_metadata.output_token_ids[req_idx]) if req_idx < len(
+            sampling_metadata.output_token_ids
+        ) else 0
+        for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
+            min_toks = getattr(processor, "min_toks", None)
+            if not isinstance(min_toks, dict) or req_idx not in min_toks:
+                continue
+            min_tok_entry = min_toks[req_idx]
+            if isinstance(min_tok_entry, (tuple, list)) and min_tok_entry:
+                min_tokens = min_tok_entry[0]
+            else:
+                min_tokens = min_tok_entry
+            try:
+                return current_len < int(min_tokens)
+            except (TypeError, ValueError):
+                return True
+        return False
+
     @classmethod
     def _nucleus_sample_one(
         cls,
@@ -464,7 +514,12 @@ class CosyVoice3Model(
         top_k: int,
         generator: torch.Generator | None,
     ) -> int:
+        weighted_scores = cls._sanitize_sampling_scores(weighted_scores)
+        if not torch.isfinite(weighted_scores).any().item():
+            return 0
         probs = weighted_scores.softmax(dim=0)
+        if not cls._valid_probs(probs):
+            return int(torch.argmax(weighted_scores).item())
         sorted_prob, sorted_idx = probs.sort(descending=True, stable=True)
         kept_probs: list[torch.Tensor] = []
         kept_indices: list[torch.Tensor] = []
@@ -482,6 +537,8 @@ class CosyVoice3Model(
             return int(sorted_idx[0].item())
 
         sample_probs = torch.stack(kept_probs)
+        if not cls._valid_probs(sample_probs):
+            return int(torch.stack(kept_indices)[0].item())
         sample_idx = cls._multinomial_sample(sample_probs, generator=generator)
         return int(torch.stack(kept_indices)[int(sample_idx.item())].item())
 
@@ -513,8 +570,12 @@ class CosyVoice3Model(
             if rep_num >= win_size * tau_r:
                 weighted_scores = weighted_scores.clone()
                 weighted_scores[top_id] = float("-inf")
-                fallback_probs = weighted_scores.softmax(dim=0)
-                top_id = int(cls._multinomial_sample(fallback_probs, generator=generator).item())
+                top_id = cls._nucleus_sample_one(
+                    weighted_scores,
+                    top_p=top_p,
+                    top_k=top_k,
+                    generator=generator,
+                )
         return top_id
 
     def _cosyvoice3_ras_enabled(self, sampling_metadata: SamplingMetadata) -> bool:
@@ -563,30 +624,36 @@ class CosyVoice3Model(
         sampled_ids: list[int] = []
         for req_idx in range(int(logits.shape[0])):
             row_logits = logits[req_idx]
+            if self._under_min_tokens(sampling_metadata, req_idx):
+                row_logits = row_logits.clone()
+                row_logits[self._stop_token_slice()] = float("-inf")
 
             temperature = float(self._req_scalar(sampling_metadata.temperature, req_idx, 1.0))
             if temperature < self._sampling_eps:
                 sampled_ids.append(int(torch.argmax(row_logits).item()))
+                if self._is_cosyvoice3_stop_token_id(sampled_ids[-1]):
+                    sampled_ids[-1] = self._canonical_stop_token_id()
                 continue
 
             top_p = float(self._req_scalar(sampling_metadata.top_p, req_idx, default_top_p))
             top_k = int(self._req_scalar(sampling_metadata.top_k, req_idx, default_top_k))
             generator = sampling_metadata.generators.get(req_idx)
-            weighted_scores = torch.log_softmax(row_logits / max(temperature, self._sampling_eps), dim=0)
+            weighted_scores = row_logits / max(temperature, self._sampling_eps)
             decoded_tokens = (
                 sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
             )
-            sampled_ids.append(
-                self._ras_sample_one(
-                    weighted_scores,
-                    decoded_tokens,
-                    top_p=top_p,
-                    top_k=top_k,
-                    win_size=win_size,
-                    tau_r=tau_r,
-                    generator=generator,
-                )
+            sampled_id = self._ras_sample_one(
+                weighted_scores,
+                decoded_tokens,
+                top_p=top_p,
+                top_k=top_k,
+                win_size=win_size,
+                tau_r=tau_r,
+                generator=generator,
             )
+            if self._is_cosyvoice3_stop_token_id(sampled_id):
+                sampled_id = self._canonical_stop_token_id()
+            sampled_ids.append(sampled_id)
 
         sampled = torch.tensor(sampled_ids, device=logits.device, dtype=torch.int32)
         return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
@@ -604,6 +671,11 @@ class CosyVoice3Model(
             speech_token_size = self.config.llm["speech_token_size"]
             eos_idx = self.config.llm["eos_token_id"]
             stop_logits = logits[..., speech_token_size:]  # last 200
+            stop_logits = torch.where(
+                torch.isfinite(stop_logits),
+                stop_logits,
+                torch.full_like(stop_logits, float("-inf")),
+            )
             merged_stop = torch.logsumexp(stop_logits, dim=-1, keepdim=True)
             logits[..., speech_token_size:] = float("-inf")  # mask all
             logits[..., eos_idx] = merged_stop.squeeze(-1)  # restore merged

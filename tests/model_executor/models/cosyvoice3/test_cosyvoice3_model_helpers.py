@@ -375,6 +375,63 @@ def test_sample_uses_ras_rejection_for_recent_repetition():
     assert out.sampled_token_ids.tolist() == [[2]]
 
 
+def test_sample_tolerates_invalid_probabilities_after_processors():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[1] * 10])
+    logits = torch.tensor([[float("nan"), 10.0, 0.0]], dtype=torch.float32)
+
+    out = model.sample(logits, metadata)
+
+    assert out is not None
+    assert out.sampled_token_ids.tolist() == [[2]]
+
+
+def test_sample_tolerates_ras_fallback_with_no_valid_candidates():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[1] * 10])
+    logits = torch.tensor([[float("-inf"), 10.0, float("-inf")]], dtype=torch.float32)
+
+    out = model.sample(logits, metadata)
+
+    assert out is not None
+    assert out.sampled_token_ids.tolist() == [[0]]
+
+
+def test_sample_maps_any_cosyvoice3_stop_token_to_canonical_eos():
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[1] * 10])
+    logits = torch.full((1, 6761), -1e9, dtype=torch.float32)
+    logits[0, 6599] = 10.0
+
+    out = model.sample(logits, metadata)
+
+    assert out is not None
+    assert out.sampled_token_ids.tolist() == [[6562]]
+
+
+def test_sample_rejects_cosyvoice3_stop_tokens_before_min_tokens():
+    class _FakeMinTokensProcessor:
+        min_toks = {0: (5, [], {6562})}
+
+        def is_argmax_invariant(self):
+            return False
+
+        def apply(self, logits):
+            return logits
+
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[42, 43, 44]])
+    metadata.logitsprocs = LogitsProcessors([_FakeMinTokensProcessor()])
+    logits = torch.full((1, 6761), -1e9, dtype=torch.float32)
+    logits[0, 2] = 9.0
+    logits[0, 6599] = 10.0
+
+    out = model.sample(logits, metadata)
+
+    assert out is not None
+    assert out.sampled_token_ids.tolist() == [[2]]
+
+
 def test_sample_tolerates_padded_rows_without_history():
     model = _make_talker_model()
     metadata = _make_sampling_metadata(output_token_ids=[[1] * 10])
