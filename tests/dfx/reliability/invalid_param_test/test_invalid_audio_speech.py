@@ -116,16 +116,6 @@ def test_speech_missing_required_fields(omni_server: OmniServer, openai_client: 
         pytest.param({"input": "   "}, ("input", "empty"), id="input_whitespace_only"),
         pytest.param({"voice": ""}, "Invalid voice", id="voice_empty", marks=_SKIP_ISSUE_3649),
         pytest.param(
-            {
-                "voice": "nonexistent_voice_xyz",
-                "task_type": "CustomVoice",
-                "ref_audio": None,
-                "ref_text": None,
-            },
-            "Invalid voice",
-            id="voice_unknown_preset",
-        ),
-        pytest.param(
             {"instructions": 123}, ("instructions", "string_type", "valid string"), id="instructions_wrong_type"
         ),
         pytest.param(
@@ -136,6 +126,16 @@ def test_speech_missing_required_fields(omni_server: OmniServer, openai_client: 
             {"stream_format": "sse"}, ("stream_format", "value_error", "audio"), id="stream_format_sse_blocked"
         ),
         pytest.param({"stream": "wrong_type"}, ("stream", "bool_parsing", "validation error"), id="stream_wrong_type"),
+        pytest.param(
+            {
+                "voice": "vivian",
+                "task_type": "CustomVoice",
+                "ref_audio": None,
+                "ref_text": None,
+            },
+            ("CustomVoice", "does not support"),
+            id="customvoice_task_not_supported",
+        ),
         pytest.param(
             {"task_type": "InvalidEnum"}, ("task_type", "literal_error", "CustomVoice"), id="task_type_invalid"
         ),
