@@ -525,7 +525,7 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     kwargs["input_connectors"] = stage_data.get("input_connectors")
     kwargs["default_sampling_params"] = stage_data.get("default_sampling_params")
     kwargs["engine_extras"] = flat_args
-    return StageDeployConfig(**kwargs)      
+    return StageDeployConfig(**kwargs)
 
 
 _DEEP_MERGE_KEYS = frozenset({"default_sampling_params", "subtalker_sampling_params", "engine_extras", "engine_args"})
