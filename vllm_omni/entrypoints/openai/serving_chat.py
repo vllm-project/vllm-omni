@@ -2274,6 +2274,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 "custom_system_prompt": custom_system_prompt,
                 "num_images": len(reference_images) if reference_images else 1,
             }
+
             if bot_task is not None:
                 build_kwargs["bot_task"] = bot_task
             elif "bot_task" in extra_body:
@@ -2391,7 +2392,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         extra_body: dict[str, Any] | None = None,
         reference_images: list[str] | None = None,
         request_id: str | None = None,
-    ) -> tuple[list[Image.Image], dict[str, Any], float] | ErrorResponse:
+    ) -> tuple[list[Image.Image], dict[str, Any], float, str | None] | ErrorResponse:
         """Generate diffusion images and return raw images plus generation stats."""
         if request_id is None:
             request_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
@@ -2497,11 +2498,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 sampling_params_list = [gen_params]
 
             result = None
+            all_outputs = []
             async for output in diffusion_engine.generate(
                 prompt=engine_prompt,
                 sampling_params_list=sampling_params_list,
                 request_id=request_id,
             ):
+                all_outputs.append(output)
                 result = output
             if result is None:
                 return self._create_error_response("No output generated from AsyncOmni", status_code=500)
@@ -2515,6 +2518,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         images = getattr(result.request_output, "images", [])
         stage_durations = result.stage_durations
         peak_memory_mb = result.peak_memory_mb
+        cot_output = None
+
+        for output in all_outputs:
+            req_out = getattr(output, "request_output", None)
+            if req_out:
+                prompt = getattr(req_out, "prompt", None)
+                if isinstance(prompt, dict):
+                    extra = prompt.get("extra", {})
+                    if isinstance(extra, dict):
+                        ar_text = extra.get("ar_generated_text")
+                        if isinstance(ar_text, str) and ar_text.strip():
+                            cot_output = ar_text
+                            break
 
         flat_images: list[Image.Image] = []
         for item in images:
@@ -2523,7 +2539,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 flat_images.append(item)
 
-        return flat_images, stage_durations, peak_memory_mb
+        return flat_images, stage_durations, peak_memory_mb, cot_output
 
     async def _create_diffusion_chat_completion(
         self,

@@ -99,6 +99,26 @@ class ImageGenerationRequest(BaseModel):
             raise ValueError(f"Invalid use_system_prompt type: {v}. Must be one of: {valid_types[1:] + [None]}")
         return v
 
+    bot_task: str | None = Field(
+        default=None,
+        description=(
+            "Bot task type. Options: t2i_think, t2i_recaption, t2i_vanilla, "
+            "it2i_think, it2i_recaption, t2t, i2t, "
+            "or simplified: think, recaption, vanilla"
+        ),
+    )
+
+    @field_validator("bot_task")
+    @classmethod
+    def validate_bot_task(cls, v):
+        if v is None:
+            return None
+        valid_tasks_full = ["t2i_think", "t2i_recaption", "t2i_vanilla", "it2i_think", "it2i_recaption", "t2t", "i2t"]
+        valid_tasks_simple = ["think", "recaption", "vanilla"]
+        if v not in valid_tasks_full and v not in valid_tasks_simple:
+            raise ValueError(f"Invalid bot_task: {v}. Must be one of: {valid_tasks_full + valid_tasks_simple}")
+        return v
+
     num_inference_steps: int | None = Field(
         default=None,
         ge=1,
@@ -165,3 +185,4 @@ class ImageGenerationResponse(BaseModel):
     data: list[ImageData] = Field(..., description="Array of generated images")
     output_format: str = Field(None, description="The output format of the image generation")
     size: str = Field(None, description="The size of the image generated")
+    cot_output: str | None = Field(None, description="Chain-of-Thought output from the model")
