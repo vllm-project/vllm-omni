@@ -13,7 +13,8 @@ import importlib
 import multiprocessing as mp
 import os
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
@@ -539,19 +540,21 @@ def setup_stage_devices(stage_id: int, runtime_cfg: Any) -> None:
         )
 
 
-def apply_stage_runtime_env(stage_id: int, runtime_cfg: Any) -> dict[str, str | None]:
-    """Apply per-stage runtime.env vars and return previous values for restore."""
-    runtime_env = runtime_cfg.get("env") if hasattr(runtime_cfg, "get") else None
+@contextmanager
+def stage_runtime_env(stage_id: int, runtime_cfg: dict[str, Any]) -> Generator[None, None, None]:
+    """Apply per-stage ``runtime.env`` for the duration of the context."""
+    runtime_env = runtime_cfg.get("env")
     if runtime_env is None:
-        return {}
-    runtime_env = _to_dict(runtime_env)
+        yield
+        return
     if not isinstance(runtime_env, dict):
         logger.warning(
             "[stage_init] Stage-%s ignored runtime.env with unsupported type %s",
             stage_id,
             type(runtime_env).__name__,
         )
-        return {}
+        yield
+        return
 
     previous_env: dict[str, str | None] = {}
     for key, value in runtime_env.items():
@@ -561,16 +564,14 @@ def apply_stage_runtime_env(stage_id: int, runtime_cfg: Any) -> dict[str, str | 
 
     if previous_env:
         logger.info("[stage_init] Stage-%s applied runtime env keys: %s", stage_id, sorted(previous_env))
-    return previous_env
-
-
-def restore_stage_runtime_env(previous_env: dict[str, str | None]) -> None:
-    """Restore env vars changed by apply_stage_runtime_env()."""
-    for key, old_value in previous_env.items():
-        if old_value is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = old_value
+    try:
+        yield
+    finally:
+        for key, old_value in previous_env.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
 
 
 def build_engine_args_dict(

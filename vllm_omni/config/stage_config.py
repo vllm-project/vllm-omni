@@ -10,7 +10,7 @@ import warnings
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
@@ -655,8 +655,14 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     return DeployConfig(**kwargs)
 
 
-def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str | None, dict[str, Any] | None]:
-    """Return ``(overrides, devices, env)`` from a platform stage entry.
+class PlatformOverrides(NamedTuple):
+    overrides: dict[str, Any]
+    devices: str | None
+    env: dict[str, Any] | None
+
+
+def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
+    """Return overrides, devices, and env from a platform stage entry.
 
     Handles both the nested layout (``engine_args:`` / ``runtime.devices``) and
     the flat layout. ``devices`` is ``None`` when no override is set.
@@ -666,9 +672,9 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str
         runtime_cfg = ps.get("runtime", {})
         if "num_replicas" in runtime_cfg:
             overrides["num_replicas"] = runtime_cfg["num_replicas"]
-        return overrides, runtime_cfg.get("devices"), runtime_cfg.get("env")
+        return PlatformOverrides(overrides, runtime_cfg.get("devices"), runtime_cfg.get("env"))
     overrides = {k: v for k, v in ps.items() if k not in ("stage_id", "devices", "env")}
-    return overrides, ps.get("devices"), ps.get("env")
+    return PlatformOverrides(overrides, ps.get("devices"), ps.get("env"))
 
 
 def _apply_platform_overrides(
@@ -693,15 +699,21 @@ def _apply_platform_overrides(
         base = base_by_id.get(ps["stage_id"])
         if base is None:
             continue
-        overrides, devices, env = _extract_platform_overrides(ps)
-        if devices is not None:
-            base.devices = devices
-        if env is not None:
-            if isinstance(base.env, dict) and isinstance(env, dict):
-                base.env = {**base.env, **env}
+        po = _extract_platform_overrides(ps)
+        if po.devices is not None:
+            base.devices = po.devices
+        if po.env is not None:
+            if isinstance(base.env, dict) and isinstance(po.env, dict):
+                base.env = {**base.env, **po.env}
             else:
-                base.env = env
-        for key, val in overrides.items():
+                logger.warning(
+                    "Stage %s env override replaces base env entirely (base type=%s, override type=%s)",
+                    ps["stage_id"],
+                    type(base.env).__name__,
+                    type(po.env).__name__,
+                )
+                base.env = po.env
+        for key, val in po.overrides.items():
             if hasattr(base, key):
                 # Deep-merge dict-valued fields listed in _DEEP_MERGE_KEYS so
                 # platform overlays don't silently clobber sibling keys (e.g.
