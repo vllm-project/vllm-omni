@@ -15,11 +15,12 @@
 #   Repeat the flag and/or use comma-separated values, e.g.
 #     --test-type perf,acc   OR   --test-type perf --test-type function
 #   If any selected value is all, YAML steps are unconstrained except that perf/acc/function tokens
-#   are ignored; all,stability still runs stability jobs in addition to all YAML kinds.
+#   are ignored; all,stability / all,local / all,stability,local still run those extra bundles.
 #   perf     — label contains "Perf Test" (throughput / benchmark jobs)
 #   acc      — label contains "Accuracy Test" (incl. GEBench / GEdit-Bench style)
 #   function — label has neither "Perf Test" nor "Accuracy Test" (incl. Doc, Multi-Replica, etc.)
 #   stability— fixed dfx stability scripts under tests/dfx/stability/scripts/ (see below)
+#   local    — pytest -sv -m "<MODEL_TYPE markers> and local_model" from repo root (no YAML step extract)
 #   all      — no test-kind filter for YAML steps (any leaf step with pytest in test-nightly.yml)
 #
 # Model area (--model-type / MODEL_TYPE), multiple allowed (OR semantics):
@@ -29,8 +30,12 @@
 #   diffusion— label contains "Diffusion"
 #   all      — no model filter (e.g. Quantization-only steps match only when test-type allows)
 #
-#   Combining stability with perf/acc/function/all runs both script bundles; each enabled mode
-#   must match at least one job or the script exits with status 2.
+#   Combining stability and/or local with perf/acc/function/all runs each enabled bundle; each enabled
+#   mode must match at least one job or the script exits with status 2.
+#
+#   local (when included in TEST_TYPE):
+#     From repo root: pytest -sv -m "<markers> and local_model" (markers from MODEL_TYPE: omni, tts,
+#     diffusion; all → "(omni or tts or diffusion) and local_model"). Not filtered by nightly YAML.
 #
 #   stability (when included in TEST_TYPE):
 #     From repo root: pytest -s -v tests/dfx/stability/scripts/test_stability_*.py
@@ -74,7 +79,7 @@ DRY_RUN="${DRY_RUN:-0}"
 # REPO_ROOT / YML / LOG_DIR resolved after CLI (do not assume script path vs repo root)
 
 usage() {
-  sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,66p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 # Append comma-separated tokens from $2 into array named $1 (lowercased, trimmed).
@@ -99,7 +104,7 @@ _finalize_test_type_csv() {
       echo "--test-type requires a non-empty value" >&2
       exit 2
     fi
-    local _has_all=0 _has_stability=0
+    local _has_all=0 _has_stability=0 _has_local=0
     local _x
     for _x in "${TEST_TYPE_CLI_PARTS[@]}"; do
       if [[ "${_x}" == all ]]; then
@@ -108,13 +113,19 @@ _finalize_test_type_csv() {
       if [[ "${_x}" == stability ]]; then
         _has_stability=1
       fi
+      if [[ "${_x}" == local ]]; then
+        _has_local=1
+      fi
     done
     if [[ "${_has_all}" -eq 1 ]]; then
+      local _out="all"
       if [[ "${_has_stability}" -eq 1 ]]; then
-        printf '%s' "all,stability"
-        return 0
+        _out="${_out},stability"
       fi
-      printf '%s' "all"
+      if [[ "${_has_local}" -eq 1 ]]; then
+        _out="${_out},local"
+      fi
+      printf '%s' "${_out}"
       return 0
     fi
     local -A _seen=()
@@ -325,7 +336,7 @@ YML = Path(os.environ["YML"]).resolve()
 LABEL_SUBSTR = (os.environ.get("LABEL_SUBSTR") or "").strip()
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 
-ALLOWED_TEST_TYPES = frozenset({"all", "perf", "acc", "function", "stability"})
+ALLOWED_TEST_TYPES = frozenset({"all", "perf", "acc", "function", "stability", "local"})
 ALLOWED_MODEL_TYPES = frozenset({"all", "omni", "tts", "diffusion"})
 
 
@@ -353,7 +364,7 @@ def parse_model_types(raw: str) -> list[str]:
 
 
 def parse_test_types(raw: str) -> list[str]:
-    """If 'all' appears, YAML dimension is unconstrained; 'all,stability' keeps both."""
+    """If 'all' appears, YAML dimension is unconstrained; extras like stability/local are kept."""
     parts = [p.strip().lower() for p in (raw or "").split(",") if p.strip()]
     if not parts:
         parts = ["all"]
@@ -366,9 +377,12 @@ def parse_test_types(raw: str) -> list[str]:
         )
         sys.exit(2)
     if "all" in parts:
+        out: list[str] = ["all"]
         if "stability" in parts:
-            return ["all", "stability"]
-        return ["all"]
+            out.append("stability")
+        if "local" in parts:
+            out.append("local")
+        return out
     out: list[str] = []
     seen: set[str] = set()
     for p in parts:
@@ -444,7 +458,7 @@ def label_matches_test_type(label: str, test_types: list[str]) -> bool:
     has_acc = "Accuracy Test" in label
     is_function = not has_perf and not has_acc
     for t in test_types:
-        if t == "stability":
+        if t in ("stability", "local"):
             continue
         if t == "perf" and has_perf:
             return True
@@ -508,6 +522,33 @@ def _write_job_script(key: str, script_lines: list[str], jobs_dir: Path) -> None
     print(f"generated {job_path}", file=sys.stderr)
 
 
+def local_pytest_marker_expr(model_types: list[str]) -> str:
+    """Build -m expression: (omni|tts|diffusion) markers combined with local_model."""
+    if "all" in model_types:
+        families: tuple[str, ...] = ("omni", "tts", "diffusion")
+    else:
+        families = tuple(model_types)
+    if len(families) == 1:
+        return f"{families[0]} and local_model"
+    return f"({' or '.join(families)}) and local_model"
+
+
+def run_local_mode(jobs_dir: Path, model_types: list[str]) -> int:
+    """Single job: pytest -sv -m '<model markers> and local_model' (testpaths from pytest config)."""
+    marker_expr = local_pytest_marker_expr(model_types)
+    key = "local_pytest"
+    pytest_line = f'pytest -sv -m "{marker_expr}"'
+    script_lines = [
+        "#!/usr/bin/env bash",
+        f"# Local marker tests — MODEL_TYPE={','.join(model_types)}",
+        "set -euo pipefail",
+        f'cd "{REPO_ROOT}"',
+        pytest_line,
+    ]
+    _write_job_script(key, script_lines, jobs_dir)
+    return 1
+
+
 def run_stability_mode(jobs_dir: Path, model_types: list[str]) -> int:
     matched = 0
     for key, rel_posix, families in STABILITY_CASES:
@@ -543,7 +584,8 @@ def main() -> None:
     model_types = parse_model_types(os.environ.get("MODEL_TYPE", "all"))
 
     want_stability = "stability" in test_types
-    yaml_test_types = [t for t in test_types if t != "stability"]
+    want_local = "local" in test_types
+    yaml_test_types = [t for t in test_types if t not in ("stability", "local")]
     needs_yaml = bool(yaml_test_types)
 
     jobs_dir = LOG_DIR / "jobs"
@@ -556,6 +598,9 @@ def main() -> None:
 
     if want_stability:
         matched_stability = run_stability_mode(jobs_dir, model_types)
+
+    if want_local:
+        run_local_mode(jobs_dir, model_types)
 
     if needs_yaml:
         if not YML.is_file():
