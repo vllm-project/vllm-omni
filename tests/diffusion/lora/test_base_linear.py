@@ -71,6 +71,7 @@ def test_diffusion_base_linear_apply_multi_slice():
     layer.lora_a_stacked = (a0, a1)
     layer.lora_b_stacked = (b0, b1)
     layer.output_slices = out_slices
+    layer._n_active_adapters = 1
 
     x = torch.tensor([[1.0, 2.0, 3.0]])
     out = layer.apply(x)
@@ -112,7 +113,8 @@ def test_diffusion_base_linear_reset_lora_disables_fast_path(monkeypatch):
     layer.lora_a_stacked = (a,)
     layer.lora_b_stacked = (b,)
     layer.output_slices = (out_dim,)
-    layer._diffusion_lora_active_slices = (True,)
+    layer._diffusion_lora_active_slices = [(True,)]
+    layer._n_active_adapters = 1
 
     x = torch.tensor([[1.0, 2.0]])
     out_active = layer.apply(x)
@@ -121,7 +123,7 @@ def test_diffusion_base_linear_reset_lora_disables_fast_path(monkeypatch):
     monkeypatch.setattr(BaseLinearLayerWithLoRA, "reset_lora", lambda self, index: None)
     layer.reset_lora(0)
 
-    assert layer._diffusion_lora_active_slices == (False,)
+    assert layer._diffusion_lora_active_slices == [(False,)]
     out_inactive = layer.apply(x)
     assert torch.allclose(out_inactive, x)
 
@@ -164,7 +166,8 @@ def test_diffusion_base_linear_apply_respects_inactive_slices():
     layer.lora_a_stacked = (a0, a1)
     layer.lora_b_stacked = (b0, b1)
     layer.output_slices = out_slices
-    layer._diffusion_lora_active_slices = (True, False)
+    layer._diffusion_lora_active_slices = [(True, False)]
+    layer._n_active_adapters = 1
 
     x = torch.tensor([[1.0, 2.0, 3.0]])
     out = layer.apply(x)
