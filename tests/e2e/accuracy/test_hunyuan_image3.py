@@ -7,10 +7,9 @@ import copy
 import gc
 import importlib
 import os
+import tempfile
 import time
-from collections.abc import Generator
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -25,7 +24,6 @@ from tests.e2e.accuracy.helpers import (
     model_output_dir,
 )
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniRunner
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt_tokens, resolve_stop_token_ids
 
 os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
@@ -133,25 +131,10 @@ def _make_config(enable_kv_reuse: bool, path: Path) -> None:
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
 
 
-@pytest.fixture(scope="module")
-def omni_runner(
-    model_prefix: str,
-    run_level: str,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Generator[OmniRunner, None, None]:
-    """Same lifecycle as ``tests.helpers.fixtures.runtime.omni_runner``; stage YAML under pytest temp dir."""
-    from tests.helpers.fixtures.runtime import omni_fixture_lock
-    from tests.helpers.runtime import iter_omni_runner
-
-    stage_config_path = tmp_path_factory.mktemp("hunyuan_image3_accuracy") / "on.yaml"
-    _make_config(True, stage_config_path)
-    request = SimpleNamespace(param=(MODEL_PATH, str(stage_config_path)))
-    yield from iter_omni_runner(request, model_prefix, run_level, omni_fixture_lock)
-
-
-def _run_offline(runner: OmniRunner, output_path: Path) -> tuple[Image.Image, str, float]:
+def _run_offline(stage_configs_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
     from transformers import AutoTokenizer
 
+    from tests.helpers.runtime import OmniRunner
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
     from vllm_omni.platforms import current_omni_platform
 
@@ -167,30 +150,30 @@ def _run_offline(runner: OmniRunner, output_path: Path) -> tuple[Image.Image, st
     system_prompt_type = result.system_prompt_type
 
     ar_stop_token_ids = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=tokenizer)
+    with OmniRunner(MODEL_PATH, stage_configs_path=stage_configs_path) as runner:
+        params_list = list(runner.omni.default_sampling_params_list)
+        for sp in params_list:
+            if isinstance(sp, OmniDiffusionSamplingParams):
+                sp.num_inference_steps = NUM_INFERENCE_STEPS
+                sp.guidance_scale = GUIDANCE_SCALE
+                sp.seed = SEED
+                sp.generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
+            elif hasattr(sp, "stop_token_ids"):
+                sp.stop_token_ids = ar_stop_token_ids
 
-    params_list = list(runner.omni.default_sampling_params_list)
-    for sp in params_list:
-        if isinstance(sp, OmniDiffusionSamplingParams):
-            sp.num_inference_steps = NUM_INFERENCE_STEPS
-            sp.guidance_scale = GUIDANCE_SCALE
-            sp.seed = SEED
-            sp.generator = torch.Generator(device=current_omni_platform.device_type or "cuda").manual_seed(SEED)
-        elif hasattr(sp, "stop_token_ids"):
-            sp.stop_token_ids = ar_stop_token_ids
-
-    images = download_images(TEST_IMAGE_URLS)
-    prompts: list[OmniPromptType] = [
-        {
-            "prompt_token_ids": token_ids,
-            "prompt": PROMPT,
-            "use_system_prompt": system_prompt_type,
-            "modalities": ["image"],
-            "multi_modal_data": {"image": images},
-        }
-    ]
-    t0 = time.perf_counter()
-    outputs = list(runner.omni.generate(prompts=prompts, sampling_params_list=params_list))
-    elapsed = time.perf_counter() - t0
+        images = download_images(TEST_IMAGE_URLS)
+        prompts: list[OmniPromptType] = [
+            {
+                "prompt_token_ids": token_ids,
+                "prompt": PROMPT,
+                "use_system_prompt": system_prompt_type,
+                "modalities": ["image"],
+                "multi_modal_data": {"image": images},
+            }
+        ]
+        t0 = time.perf_counter()
+        outputs = list(runner.omni.generate(prompts=prompts, sampling_params_list=params_list))
+        elapsed = time.perf_counter() - t0
 
     assert outputs, "Pipeline produced no outputs"
     images = None
@@ -225,11 +208,7 @@ def _run_offline(runner: OmniRunner, output_path: Path) -> tuple[Image.Image, st
 
 
 @pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="Needs 4+ GPUs (2 AR + 2 DiT)")
-def test_image_to_image_alignment(
-    omni_runner: OmniRunner,
-    accuracy_artifact_root: Path,
-    accuracy_assets_root: Path,
-) -> None:
+def test_image_to_image_alignment(accuracy_artifact_root: Path, accuracy_assets_root: Path) -> None:
     if importlib.util.find_spec("FlagEmbedding") is None:
         raise ImportError("Missing dependency: FlagEmbedding\nInstall with: pip install FlagEmbedding")
     from tabulate import tabulate  # lazy import
@@ -237,7 +216,10 @@ def test_image_to_image_alignment(
     """KV reuse ON vs OFF: same pipeline, same seed → PSNR >= 10 dB."""
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_NAME + "-offline-kv-reuse")
 
-    omni_image, omni_cot, _time_reuse = _run_offline(omni_runner, output_dir)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        _make_config(True, tmp / "on.yaml")
+        omni_image, omni_cot, time_reuse = _run_offline(str(tmp / "on.yaml"), output_dir)
 
     scorer = SemanticSimilarityScorer()
     clip_scorer = CLIPScorer()
