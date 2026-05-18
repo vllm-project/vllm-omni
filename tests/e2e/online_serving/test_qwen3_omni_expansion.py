@@ -61,7 +61,7 @@ def get_default_config(default_path):
     return modify_stage_config(
         default_path,
         updates={
-            "stages": {0: {"default_sampling_params.max_tokens": 2048}},
+            "stages": {0: {"default_sampling_params.max_tokens": 2048}, 1: {"default_sampling_params.max_tokens": 32768}, 2: {"default_sampling_params.max_tokens": 65535}},
         },
     )
 
