@@ -98,9 +98,9 @@ def validate_plain_text_request(request_payload: dict[str, Any]) -> None:
 def build_plain_text_conversation(text: str) -> list[dict[str, Any]]:
     """Build the canonical single-speaker plain-text conversation.
 
-    Mirrors the upstream "Single-speaker smart voice" usage example: a fixed
-    system role plus the user text. No scene block, no audio role, no
-    reference audio.
+    Mirrors the upstream ``examples/generation.py`` smart_voice branch (no
+    explicit scene prompt). The fixtures committed under
+    ``tests/fixtures/higgs_audio_v2/`` were captured with this exact prompt.
     """
     validate_plain_text_input(text)
     return [

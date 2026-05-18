@@ -1254,30 +1254,65 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             self._last_audio_codes = None
             return sampler_output
 
+        # Map audio-position rows to their absolute batch indices. The
+        # delay-pattern + state-update loop below uses this for per-request
+        # state lookup; the RAS check between the head sample and the
+        # delay-pattern apply also reads it.
+        audio_row_indices = torch.nonzero(is_audio, as_tuple=False).reshape(-1).tolist()
+        if not hasattr(self, "_audio_state"):
+            self._audio_state: dict[int, dict[str, Any]] = {}
+
         # Per-codebook logits at audio positions only.
         cb_logits = self.audio_codebook_logits(hidden, is_audio)  # [N_audio, Q, V]
-        # Mask the two stream-special tokens (``audio_stream_bos_id``,
-        # ``audio_stream_eos_id``) in the codebook vocab so the sampled code
-        # stays in the real-code range. The delay-pattern logic below writes
-        # BOS into leading codebooks deliberately; without this mask the
-        # model frequently picks the specials and the downstream clamp folds
-        # them to ``num_real_codes - 1``, producing fixed-amplitude output.
-        num_real = int(getattr(self.config, "num_real_codes", cb_logits.shape[-1]))
-        if cb_logits.shape[-1] > num_real:
-            cb_logits = cb_logits.clone()
-            cb_logits[..., num_real:] = float("-inf")
+        # R12 (PyTorch align): do NOT mask stream specials before sampling —
+        # upstream lets the model emit ``audio_stream_bos_id`` (1024) and
+        # ``audio_stream_eos_id`` (1025) freely; the delay-pattern logic
+        # downstream interprets them (leading BOS pad / trailing EOS ramp).
 
-        # R12: sample with the same diversity knobs the upstream
-        # ``HiggsAudioServeEngine`` uses (temperature, top-k, top-p). Greedy
-        # argmax collapses the codebook output to a fixed pattern after a few
-        # steps; sampling gives the natural-sounding variety the model was
-        # trained to produce. Hard-coded to the boson reference defaults; a
-        # future iteration can plumb these through stage-config.
+        # Sample per-codebook, following the upstream
+        # ``HiggsAudioModel._sample_audio_tokens`` pipeline byte-for-byte.
         cb_logits_2d = cb_logits.reshape(-1, cb_logits.shape[-1])
-        codes_2d = self._sample_audio_codes(
-            cb_logits_2d, temperature=1.0, top_k=50, top_p=0.95
+        codes_2d = self._sample_audio_codes_upstream(
+            cb_logits_2d,
+            temperature=1.0,
+            top_k=50,
+            top_p=0.95,
         )
         codes_flat = codes_2d.view(cb_logits.shape[0], cb_logits.shape[1]).to(torch.long)
+
+        # R12 (PyTorch align): Repetition-Aware Sampling (RAS). Upstream
+        # ``HiggsAudioModel._sample_audio_tokens`` re-samples any codebook
+        # that just emitted the same token >= ras_win_max_num_repeat times
+        # in the last ras_win_len steps. This breaks codebook collapse loops
+        # — a 3B model with greedy/low-temp sampling often locks into one
+        # value otherwise.
+        ras_win_len = 7
+        ras_win_max_num_repeat = 2
+        # codes_flat is [N_audio, Q]; we re-sample PER (audio_position, codebook)
+        # row that hits the repeat threshold over the last ras_win_len audio
+        # frames of that codebook's history (from state.audio_out_ids).
+        if codes_flat.shape[0] > 0:
+            audio_idx_to_batch = audio_row_indices  # already a list[int]
+            for local_i in range(codes_flat.shape[0]):
+                bi = int(audio_idx_to_batch[local_i])
+                req_state = self._audio_state.get(bi)
+                if req_state is None:
+                    continue
+                aoi = req_state.get("audio_out_ids")
+                if not isinstance(aoi, torch.Tensor) or aoi.shape[-1] < ras_win_len:
+                    continue
+                window = aoi[:, -ras_win_len:].to(codes_flat.device)  # [Q, W]
+                this_codes = codes_flat[local_i]  # [Q]
+                rep_count = (window == this_codes.unsqueeze(-1)).sum(dim=-1)  # [Q]
+                row_indices = torch.nonzero(rep_count >= ras_win_max_num_repeat, as_tuple=False).reshape(-1)
+                if row_indices.numel() == 0:
+                    continue
+                # Re-sample those codebooks from cb_logits directly (no top-k/top-p
+                # in RAS resample per upstream — pure softmax + multinomial).
+                resample_logits = cb_logits[local_i, row_indices].float()
+                resample_probs = resample_logits.softmax(dim=-1)
+                resampled = torch.multinomial(resample_probs, num_samples=1).squeeze(-1)
+                codes_flat[local_i, row_indices] = resampled.to(codes_flat.dtype)
 
         # Apply the upstream delay pattern + EOS ramp-down per request.
         num_codebooks = int(self.config.num_codebooks)
@@ -1285,13 +1320,34 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         eos_stream = int(self.config.audio_stream_eos_id)
         audio_eos_vocab = int(getattr(self.config, "audio_eos_token_id", -1))
 
-        # Identify per-request indices for the audio rows in this step. The
-        # AR runner produces one row per active request; row i in `logits`
-        # corresponds to request batch index i. We map audio rows back to
-        # request batch indices via the original is_audio mask.
-        audio_row_indices = torch.nonzero(is_audio, as_tuple=False).reshape(-1).tolist()
-        if not hasattr(self, "_audio_state"):
-            self._audio_state: dict[int, dict[str, Any]] = {}
+        # ``audio_row_indices`` and ``self._audio_state`` were initialised
+        # earlier (right after ``is_audio`` was computed) so the RAS check
+        # can reference them.
+
+        # Per-request reset: detect "new request occupied this slot" by
+        # tracking the per-slot output_token_ids length across sample()
+        # calls. Within a request the length monotonically grows; when it
+        # resets to 0 (or goes BELOW the previously-seen high-water mark),
+        # the previous occupant has finished and a new request now owns
+        # the slot. Drop the stale ``_audio_state`` for that slot.
+        if not hasattr(self, "_slot_output_len"):
+            self._slot_output_len: dict[int, int] = {}
+        output_ids = getattr(sampling_metadata, "output_token_ids", None)
+        for batch_i in audio_row_indices:
+            bi = int(batch_i)
+            current_len = (
+                len(output_ids[bi])
+                if output_ids is not None and bi < len(output_ids)
+                else 0
+            )
+            prior_len = self._slot_output_len.get(bi, -1)
+            # A fresh request has either never been seen (prior_len == -1
+            # and we're at step 0) or has length less than the prior
+            # high-water mark.
+            is_new_request = (prior_len > current_len) or (prior_len == -1 and current_len == 0)
+            if is_new_request and bi in self._audio_state:
+                self._audio_state.pop(bi, None)
+            self._slot_output_len[bi] = current_len
 
         # R12 simplification: we DON'T override ``sampler_output.sampled_token_ids``
         # back to ``audio_eos_token_id`` at ramp-down completion. The vLLM
@@ -1366,6 +1422,59 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         return sampler_output
 
     @staticmethod
+    def _sample_audio_codes_upstream(
+        logits: torch.Tensor,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+    ) -> torch.Tensor:
+        """Replicate the upstream HF ``LogitsProcessorList`` pipeline that
+        ``HiggsAudioModel._sample_audio_tokens`` calls via
+        ``logits_processor(None, next_audio_token_logits)``.
+
+        Order (matching transformers' standard ``TemperatureLogitsWarper``,
+        ``TopKLogitsWarper``, ``TopPLogitsWarper``):
+
+        1. Divide by temperature.
+        2. Top-k: keep the K largest, set others to -inf.
+        3. Top-p (nucleus): keep the smallest prefix whose cumulative
+           softmax probability is <= top_p; mask the rest. Always keep at
+           least the top-1.
+        4. Softmax → multinomial sample.
+
+        ``logits`` shape: ``[N, V]``. Returns ``[N]`` of int sampled indices.
+        """
+        x = logits.float()
+        if temperature is not None and temperature > 0.0 and temperature != 1.0:
+            x = x / temperature
+        if top_k is not None and 0 < top_k < x.shape[-1]:
+            kth = x.topk(top_k, dim=-1).values[..., -1:]
+            x = x.masked_fill(x < kth, float("-inf"))
+        if top_p is not None and 0.0 < top_p < 1.0:
+            sorted_logits, sorted_idx = x.sort(dim=-1, descending=True)
+            cumprobs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+            sorted_mask = cumprobs > top_p
+            # Shift right by one so we always keep at least the top-1 token.
+            sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+            sorted_mask[..., 0] = False
+            # Scatter back to original index space and apply.
+            mask = torch.zeros_like(x, dtype=torch.bool)
+            mask.scatter_(-1, sorted_idx, sorted_mask)
+            x = x.masked_fill(mask, float("-inf"))
+        if temperature is None or temperature <= 0.0:
+            return torch.argmax(x, dim=-1)
+        probs = x.softmax(dim=-1)
+        # Guard against any all-masked rows (shouldn't happen with the shift
+        # above) — fall back to argmax of original logits.
+        valid = probs.sum(dim=-1) > 0
+        sampled = torch.empty(x.shape[0], dtype=torch.long, device=x.device)
+        if valid.any():
+            sampled[valid] = torch.multinomial(probs[valid], num_samples=1).squeeze(-1)
+        if (~valid).any():
+            sampled[~valid] = torch.argmax(logits[~valid].float(), dim=-1)
+        return sampled
+
+    @staticmethod
     def _sample_audio_codes(
         logits: torch.Tensor,
         temperature: float = 1.0,
@@ -1429,13 +1538,16 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             return 0
         audio_bos = int(self.config.audio_bos_token_id)
         audio_id = int(self.config.audio_token_id)
-        # R12 audio-mode bias: force ONLY ``audio_token_id``. The
-        # delay-pattern ramp-down in :meth:`sample` directly writes
-        # ``audio_eos_token_id`` back into ``sampler_output.sampled_token_ids``
-        # when it decides the audio span is done; allowing ``audio_eos`` in
-        # the bias would let greedy decode pick it at step 1 and stop with
-        # zero frames (the unbiased ``audio_eos`` logit dominates ``audio_token_id``
-        # at the model's natural distribution).
+        # R12 (PyTorch align, corrected): upstream NEVER lets the model
+        # naturally emit ``audio_eos_token_id`` in the LM stream. The LM
+        # next-token is force-set to ``audio_out_token_idx`` every step;
+        # the audio span only ends when the delay-pattern ramp-down completes
+        # (driven by ``audio_stream_eos_id`` appearing in a codebook), at
+        # which point upstream OVERRIDES the LM token to ``audio_eos``.
+        # Our diag showed the model's ``audio_eos`` logit is very high right
+        # after the first audio step; allowing it via sampling stops the
+        # audio span with 1 frame and the rest of the LM stream goes off-rails.
+        # Force ONLY ``audio_token_id``.
         allowed_extra: list[int] = []
         # Walk per-request to decide which rows to mask.
         prompt_ids = getattr(sampling_metadata, "prompt_token_ids", None)
@@ -1473,8 +1585,8 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                 continue
             if prev not in (audio_bos, audio_id):
                 continue
-            # Mask all logits at this row except the audio + EOS tokens.
-            allowed = {audio_id, *allowed_extra}
+            # Always force ``audio_token_id`` — upstream mirror.
+            allowed: set[int] = {audio_id, *allowed_extra}
             row = logits[i]
             mask = torch.full_like(row, float("-inf"))
             for tok in allowed:
