@@ -1430,14 +1430,16 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                     num_remaining_delays = num_codebooks - last_eos_idx - 1
 
             if num_remaining_delays is not None and num_remaining_delays <= 0:
-                # Audio ramp-down finished. We DON'T override the LM
-                # sampled token (see comment above); the audio_eos vocab id
-                # is unused in this simplified path.
+                # Audio ramp-down finished. Set a per-slot termination flag
+                # so the NEXT step's bias forces audio_eos_token_id (upstream's
+                # ``next_tokens[...] = audio_eos_token_id`` override at the
+                # ramp-completion point — see modeling_higgs_audio.py:1564).
                 _ = audio_eos_vocab
                 num_delay = 0
                 num_remaining_delays = None
                 state["num_delay"] = num_delay
                 state["num_remaining_delays"] = num_remaining_delays
+                state["should_terminate"] = True
                 new_codes_flat.append(torch.full_like(this_codes, -1))
                 continue
 
@@ -1652,6 +1654,25 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                 continue
             if prev == audio_bos:
                 first_after_bos[i] = True
+            # R16: if this slot's audio ramp finished last step, force LM token
+            # to audio_eos so the engine stops naturally. Matches upstream's
+            # ``next_tokens[...] = audio_eos_token_id`` override.
+            audio_state = getattr(self, "_audio_state", {}) or {}
+            slot_state = audio_state.get(i)
+            should_terminate = bool(
+                isinstance(slot_state, dict) and slot_state.get("should_terminate")
+            )
+            audio_eos_vocab = int(getattr(self.config, "audio_eos_token_id", -1))
+            if should_terminate and 0 <= audio_eos_vocab < int(logits.shape[-1]):
+                # Force audio_eos at this position; upstream override at
+                # ramp-down completion (modeling_higgs_audio.py:1564).
+                row = logits[i]
+                mask = torch.full_like(row, float("-inf"))
+                mask[audio_eos_vocab] = row[audio_eos_vocab]
+                logits[i].copy_(mask)
+                slot_state["should_terminate"] = False
+                biased += 1
+                continue
             # Always force ``audio_token_id`` — upstream mirror.
             allowed: set[int] = {audio_id, *allowed_extra}
             row = logits[i]

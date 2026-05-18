@@ -27,9 +27,12 @@ HIGGS_AUDIO_V2_PIPELINE = PipelineConfig(
             ),
             sampling_constraints={
                 "detokenize": False,
-                # Stage-0 emits the LM's eos_token_id (128009) when the audio
-                # stream closes; the talker uses that as its stop signal.
-                "stop_token_ids": [128009],
+                # Two stop signals for Stage-0:
+                #   * 128009 = standard LM eos_token_id (sequence-level stop)
+                #   * 128012 = audio_eos_token_id (forced by the talker's
+                #     _apply_audio_mode_bias at audio-ramp completion; matches
+                #     upstream HiggsAudioModel._sample_audio_tokens override).
+                "stop_token_ids": [128009, 128012],
             },
         ),
         StagePipelineConfig(
