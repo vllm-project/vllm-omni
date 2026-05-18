@@ -985,6 +985,14 @@ class AsyncOmni(EngineClient, OmniBase):
         """Check engine health by verifying the Orchestrator process is alive."""
         OmniBase.check_health(self)
 
+    async def notify_kv_transfer_request_rejected(self, request_id: str) -> None:
+        """EngineClient interface: called when a KV-transfer prefill is rejected.
+
+        OmniVoice does not participate in disaggregated prefill, so we simply
+        abort the request to release any partial state.
+        """
+        await self.abort(request_id)
+
     # ==================== Shutdown ====================
 
     def shutdown(self, timeout: float | None = None) -> None:
