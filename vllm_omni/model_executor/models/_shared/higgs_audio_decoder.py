@@ -328,7 +328,13 @@ def _remap_boson_model_pth_state_dict(sd: dict[str, torch.Tensor]) -> dict[str, 
             if len(parts) >= 5:
                 idx = parts[3]
                 tail = ".".join(parts[4:])
-                if tail.startswith("_codebook.embed"):
+                # The actual codebook centroids the decode path uses live at
+                # ``_codebook.embed`` (a [codebook_size, codebook_dim] buffer).
+                # ``_codebook.embed_avg`` is the un-normalised EMA accumulator
+                # used during training (~cluster_size x bigger); MATCHING IT
+                # HERE produces a 4-5x amplified codebook and unintelligible
+                # PCM downstream. Use an EXACT-match check, not startswith.
+                if tail == "_codebook.embed":
                     new_key = f"quantizer.quantizers.{idx}.codebook.embed"
                     remapped[new_key] = tensor
                     continue
