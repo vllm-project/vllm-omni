@@ -13,12 +13,13 @@ via FlashAttention/SageAttention/SDPA backends.
 from __future__ import annotations
 
 import math
+import threading
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 
 from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
@@ -422,21 +423,24 @@ def _apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor)
 class _OmniVoiceCUDAGraphForward:
     """Pre-captures CUDA graphs for predefined sequence-length buckets.
 
-    During warmup(), captures one graph per bucket size (B=1 with CFG → two_b=2).
-    At call time, pads input to the nearest bucket >= actual_S and replays the
-    graph, eliminating kernel-launch overhead across all 32 unmasking steps.
-
-    Falls back to lazy per-shape capture for sequences exceeding the largest
-    bucket or batch sizes other than 1.
-
-    RoPE tensors are pre-cast to the model dtype before capture so no
-    dtype-conversion allocation occurs inside the captured region.
+    Memory layout: all graphs share a single per-instance pool handle, which
+    isolates OmniVoice CUDA memory from other vllm modules.  Sequential replay
+    (one step at a time) means pool sharing is safe.
     """
+
+    _MAX_LAZY_GRAPHS: int = 32  # LRU cap for lazy (non-bucket) captures
 
     def __init__(self, generator: OmniVoiceGenerator, capture_sizes: list[int]) -> None:
         self._gen = generator
         self._capture_sizes = sorted(capture_sizes)
+        # Pre-warmed graphs keyed by (two_b, bucket); fixed set, never evicted.
         self._graphs: dict[tuple[int, int], dict] = {}
+        # Lazy-captured graphs for oversized / non-CFG shapes; capped via LRU.
+        self._lazy_graphs: OrderedDict[tuple[int, int], dict] = OrderedDict()
+        self._lock = threading.Lock()
+        # Per-instance pool handle: isolates OmniVoice CUDA memory from other
+        # vllm modules while still allowing safe re-use across sequential replays.
+        self._pool_handle: int | None = None
 
     def _find_bucket(self, seq_len: int) -> int | None:
         for bucket in self._capture_sizes:
@@ -508,9 +512,16 @@ class _OmniVoiceCUDAGraphForward:
             )
         torch.accelerator.synchronize(device)
 
+        # Lazy-init per-instance pool handle: isolates OmniVoice CUDA Graph
+        # memory from other vllm modules (unlike get_global_graph_pool which
+        # shares a single pool across all captured graphs and can cause memory
+        # aliasing when two graphs replay concurrently).
+        if self._pool_handle is None:
+            self._pool_handle = torch.cuda.graph_pool_handle()
+
         graph = torch.cuda.CUDAGraph()
         with torch.no_grad():
-            with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+            with torch.cuda.graph(graph, pool=self._pool_handle):
                 static_output = self._gen._step_forward(
                     static_input_ids,
                     static_audio_mask,
@@ -528,7 +539,6 @@ class _OmniVoiceCUDAGraphForward:
             "static_sin": static_sin,
             "static_output": static_output,
         }
-        self._graphs[key] = entry
         logger.info("OmniVoice CUDA Graph captured for key %s", key)
         return entry
 
@@ -548,7 +558,7 @@ class _OmniVoiceCUDAGraphForward:
             dummy_ids = torch.zeros(two_b, num_cb, bucket, dtype=torch.long, device=device)
             dummy_mask = torch.zeros(two_b, bucket, dtype=torch.bool, device=device)
             dummy_attn = torch.ones(two_b, 1, bucket, bucket, dtype=torch.bool, device=device)
-            self._capture_for_key(key, dummy_ids, dummy_mask, dummy_attn)
+            self._graphs[key] = self._capture_for_key(key, dummy_ids, dummy_mask, dummy_attn)
         logger.info("OmniVoice CUDA Graph warmup complete (%d graphs)", len(self._graphs))
 
     def __call__(
@@ -570,16 +580,28 @@ class _OmniVoiceCUDAGraphForward:
         bucket = self._find_bucket(seq_len) if two_b == 2 else None
 
         if bucket is None:
-            # Lazy capture for oversized sequences or non-unit batch
+            # Lazy capture: oversized sequence or non-unit batch (no pre-warmed bucket).
+            # Lock prevents concurrent threads from double-capturing the same key.
+            # _lazy_graphs is capped at _MAX_LAZY_GRAPHS with LRU eviction to
+            # prevent unbounded GPU memory growth when seq_len varies widely.
             key = (two_b, seq_len)
             ids_in, mask_in, attn_in = input_ids, audio_mask, attention_mask
-            entry = self._graphs.get(key) or self._capture_for_key(key, ids_in, mask_in, attn_in)
+            with self._lock:
+                entry = self._lazy_graphs.get(key)
+                if entry is None:
+                    entry = self._capture_for_key(key, ids_in, mask_in, attn_in)
+                    if len(self._lazy_graphs) >= self._MAX_LAZY_GRAPHS:
+                        evicted_key, _ = self._lazy_graphs.popitem(last=False)
+                        logger.warning("OmniVoice CUDA Graph lazy cache full; evicted key %s", evicted_key)
+                    self._lazy_graphs[key] = entry
         else:
             key = (two_b, bucket)
             ids_in, mask_in, attn_in = self._pad_inputs(input_ids, audio_mask, attention_mask, bucket)
-            entry = self._graphs.get(key)
-            if entry is None:
-                entry = self._capture_for_key(key, ids_in, mask_in, attn_in)
+            with self._lock:
+                entry = self._graphs.get(key)
+                if entry is None:
+                    entry = self._capture_for_key(key, ids_in, mask_in, attn_in)
+                    self._graphs[key] = entry
 
         entry["static_input_ids"].copy_(ids_in)
         entry["static_audio_mask"].copy_(mask_in)
@@ -594,7 +616,9 @@ class _OmniVoiceCUDAGraphForward:
         return output
 
     def clear(self) -> None:
-        self._graphs.clear()
+        with self._lock:
+            self._graphs.clear()
+            self._lazy_graphs.clear()
 
 
 # ---------------------------------------------------------------------------
