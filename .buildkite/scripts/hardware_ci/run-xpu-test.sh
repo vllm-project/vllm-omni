@@ -52,5 +52,6 @@ time timeout -k 30 30m docker run \
     pip install tblib==3.1.0
     cd /workspace/vllm-omni
     pytest -v -s -m "core_model and xpu and B60"
-    pytest -v -s -m "advanced_model and xpu and B60" -k "not omni_expansion"
+    export VLLM_XPU_USE_SAMPLER_KERNEL=0    # NOTE: Remove this after vLLM v0.21.1 is merged. Fixes Qwen2-5 omni-expansion tests.
+    pytest -v -s -m "advanced_model and xpu and B60"
 '
