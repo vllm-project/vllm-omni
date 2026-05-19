@@ -64,6 +64,9 @@ from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2
 )
 
 
+_logger = init_logger("higgs_audio_v2.kv_patch")
+
+
 def _install_kv_cache_write_fallback() -> None:
     """R21: monkey-patch FlexAttentionImpl.do_kv_cache_update with a pure-Python
     fallback because ``torch.ops._C_cache_ops.reshape_and_cache_flash`` is a
@@ -72,12 +75,15 @@ def _install_kv_cache_write_fallback() -> None:
     constantly zero (R17/R20 root cause: empty KV cache), and the talker can
     only emit a few real codes before falling back to stream-specials.
     """
+    import sys as _sys_kv
     try:
         from vllm.v1.attention.backends.flex_attention import FlexAttentionImpl
-        from vllm.attention.backends.abstract import AttentionType
-    except ImportError:
+        from vllm.v1.attention.backend import AttentionType
+    except ImportError as _e:
+        print(f"[higgs R21 KV patch] ImportError: {_e}", file=_sys_kv.stderr, flush=True)
         return
     if getattr(FlexAttentionImpl, "_higgs_kv_patched", False):
+        print("[higgs R21 KV patch] already installed; skipping", file=_sys_kv.stderr, flush=True)
         return
 
     def _patched_do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
@@ -97,6 +103,11 @@ def _install_kv_cache_write_fallback() -> None:
 
     FlexAttentionImpl.do_kv_cache_update = _patched_do_kv_cache_update
     FlexAttentionImpl._higgs_kv_patched = True
+    print(
+        "[higgs R21 KV patch] installed pure-Python KV-cache write fallback "
+        "on FlexAttentionImpl",
+        file=_sys_kv.stderr, flush=True,
+    )
 
 
 # Install the KV-cache write fallback ASAP — before any model loads.

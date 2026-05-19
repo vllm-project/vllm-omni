@@ -57,7 +57,7 @@ stages:
       # natural stop (128012, forced by the talker's _apply_audio_mode_bias
       # at ramp-completion) typically fires earlier and trims this.
       max_tokens: 1024
-      seed: 0
+      seed: 42
       repetition_penalty: 1.0
 
   - stage_id: 1
