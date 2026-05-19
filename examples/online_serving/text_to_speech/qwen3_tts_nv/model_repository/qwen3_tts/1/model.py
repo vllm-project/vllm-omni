@@ -150,19 +150,19 @@ class TritonPythonModel:
                     "stage_type": "llm",
                     "is_comprehension": True,
                     "final_output": True,
-                    "final_output_type": "latent",
+                    "final_output_type": "audio",
                     "runtime": {"devices": "0"},
                     "engine_args": {
                         "model_stage": "qwen3_tts",
                         "max_num_seqs": self.max_num_seqs,
                         "model_arch": "Qwen3TTSTalkerForConditionalGenerationNv",
                         "worker_type": "ar",
-                        "scheduler_cls": "vllm_omni.core.sched.async_omni_ar_scheduler.AsyncOmniARScheduler",
+                        "scheduler_cls": "vllm_omni.core.sched.omni_ar_scheduler.OmniARAsyncScheduler",
                         "enforce_eager": False,
                         "trust_remote_code": True,
                         "async_scheduling": True,
                         "enable_prefix_caching": False,
-                        "engine_output_type": "latent",
+                        "engine_output_type": "audio",
                         "gpu_memory_utilization": self.gpu_memory_utilization,
                         # uni runs the worker in-process for TP=PP=1; avoids the
                         # shm_broadcast IPC round-trip that the mp executor pays

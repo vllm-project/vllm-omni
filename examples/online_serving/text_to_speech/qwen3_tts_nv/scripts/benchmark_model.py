@@ -105,12 +105,12 @@ def _build_talker_only_stage_config(
         "max_num_seqs": max_num_seqs,
         "model_arch": "Qwen3TTSTalkerForConditionalGenerationNv",
         "worker_type": "ar",
-        "scheduler_cls": "vllm_omni.core.sched.async_omni_ar_scheduler.AsyncOmniARScheduler",
+        "scheduler_cls": "vllm_omni.core.sched.omni_ar_scheduler.OmniARAsyncScheduler",
         "enforce_eager": enforce_eager,
         "trust_remote_code": True,
         "async_scheduling": True,
         "enable_prefix_caching": False,
-        "engine_output_type": "latent",
+        "engine_output_type": "audio",
         "gpu_memory_utilization": gpu_memory_utilization,
         # "uni" runs the worker in-process (no shm_broadcast IPC); use "mp"
         # only when TP/PP > 1 or you actually need a separate worker process.
@@ -134,7 +134,7 @@ def _build_talker_only_stage_config(
                 "stage_type": "llm",
                 "is_comprehension": True,
                 "final_output": True,
-                "final_output_type": "latent",
+                "final_output_type": "audio",
                 "runtime": {"devices": "0"},
                 "engine_args": engine_args,
                 "default_sampling_params": {
