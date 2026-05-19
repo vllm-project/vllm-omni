@@ -32,22 +32,36 @@ async def run_offline_inference(model_path: str, output_path: Path) -> tuple[Ima
     import subprocess
     import sys
 
-    script_path = Path(__file__).resolve().parents[3] / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
+    script_path = (
+        Path(__file__).resolve().parents[3] / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
+    )
     cmd = [
         sys.executable,
         str(script_path),
-        "--modality", "text2img",
-        "--model", model_path,
-        "--prompts", PROMPT,
-        "--bot-task", "think",
-        "--sys-type", "en_unified",
-        "--seed", str(SEED),
-        "--steps", str(NUM_INFERENCE_STEPS),
-        "--output", str(output_path),
-        "--deploy-config", "vllm_omni/deploy/hunyuan_image3_dit.yaml",
-        "--height", str(HEIGHT),
-        "--width", str(WIDTH),
-        "--guidance-scale", str(GUIDANCE_SCALE),
+        "--modality",
+        "text2img",
+        "--model",
+        model_path,
+        "--prompts",
+        PROMPT,
+        "--bot-task",
+        "think",
+        "--sys-type",
+        "en_unified",
+        "--seed",
+        str(SEED),
+        "--steps",
+        str(NUM_INFERENCE_STEPS),
+        "--output",
+        str(output_path),
+        "--deploy-config",
+        "vllm_omni/deploy/hunyuan_image3_dit.yaml",
+        "--height",
+        str(HEIGHT),
+        "--width",
+        str(WIDTH),
+        "--guidance-scale",
+        str(GUIDANCE_SCALE),
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -61,7 +75,9 @@ async def run_offline_inference(model_path: str, output_path: Path) -> tuple[Ima
     cot_output = ""
     for line in result.stdout.split("\n"):
         if "[Output] Text:" in line:
-            cot_output = "\n".join(result.stdout.split("[Output] Text:\n")[1].split("[Output] Saved image")[0].strip().split("\n"))
+            cot_output = "\n".join(
+                result.stdout.split("[Output] Text:\n")[1].split("[Output] Saved image")[0].strip().split("\n")
+            )
             break
 
     return image, cot_output
@@ -69,18 +85,23 @@ async def run_offline_inference(model_path: str, output_path: Path) -> tuple[Ima
 
 async def run_online_inference(model_path: str) -> tuple[Image.Image, str]:
     """Run online inference using the OpenAI-compatible API."""
-    import httpx
     import subprocess
     import sys
     import time
 
+    import httpx
+
     server_cmd = [
-        "vllm", "serve",
+        "vllm",
+        "serve",
         model_path,
         "--omni",
-        "--host", "localhost",
-        "--port", "8091",
-        "--deploy-config", "vllm_omni/deploy/hunyuan_image3_dit.yaml",
+        "--host",
+        "localhost",
+        "--port",
+        "8091",
+        "--deploy-config",
+        "vllm_omni/deploy/hunyuan_image3_dit.yaml",
         "--enforce-eager",
     ]
 
