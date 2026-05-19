@@ -84,3 +84,65 @@ steps:
                 hostPath:
                   path: /mnt/hf-cache
                   type: DirectoryOrCreate
+
+  # Invalid HTTP / WS payloads vs live Omni servers (Issue #3649 tracks known skips).
+  - group: "Reliability Test - Invalid parameters Test"
+    depends_on: upload-weekly-pipeline
+    if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
+    steps:
+      - label: "Invalid parameters Test · H100"
+        timeout_in_minutes: 120
+        commands:
+          - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and H100"
+        agents:
+          queue: "mithril-h100-pool"
+        plugins:
+          - kubernetes:
+              podSpec:
+                containers:
+                  - image: 936637512419.dkr.ecr.us-west-2.amazonaws.com/vllm-ci-pull-through-cache/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+                    resources:
+                      limits:
+                        nvidia.com/gpu: 2
+                    volumeMounts:
+                      - name: devshm
+                        mountPath: /dev/shm
+                      - name: hf-cache
+                        mountPath: /root/.cache/huggingface
+                    env:
+                      - name: HF_HOME
+                        value: /root/.cache/huggingface
+                      - name: HF_TOKEN
+                        valueFrom:
+                          secretKeyRef:
+                            name: hf-token-secret
+                            key: token
+                nodeSelector:
+                  node.kubernetes.io/instance-type: gpu-h100-sxm
+                volumes:
+                  - name: devshm
+                    emptyDir:
+                      medium: Memory
+                  - name: hf-cache
+                    hostPath:
+                      path: /mnt/hf-cache
+                      type: DirectoryOrCreate
+
+      # Stable Audio Open, Qwen3-TTS speech/batch/voices paths marked ``L4``.
+      - label: "Invalid parameters Test · L4"
+        timeout_in_minutes: 120
+        commands:
+          - pytest -s -v tests/dfx/reliability/invalid_param_test/ -m "slow and L4"
+        agents:
+          queue: "gpu_1_queue"
+        plugins:
+          - docker#v5.2.0:
+              image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo:$BUILDKITE_COMMIT
+              always-pull: true
+              propagate-environment: true
+              shm-size: "8gb"
+              environment:
+                - "HF_HOME=/fsx/hf_cache"
+                - "HF_TOKEN"
+              volumes:
+                - "/fsx/hf_cache:/fsx/hf_cache"

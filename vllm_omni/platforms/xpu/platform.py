@@ -36,11 +36,19 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         selected_backend: str | None,
         head_size: int,
     ) -> str:
+        compute_capability = torch.xpu.get_device_capability()
+        # Intel Max 1100 and 1550 will not support flash_attn currently
+        flash_attn_supported = compute_capability["architecture"] not in [13136561920]
+
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
             backend = DiffusionAttentionBackendEnum[backend_upper]
             logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()
+
+        if flash_attn_supported:
+            logger.debug("Defaulting to diffusion attention backend FLASH_ATTN")
+            return DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
 
         logger.debug("Defaulting to diffusion attention backend SDPA")
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()

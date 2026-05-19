@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from collections import Counter
 from collections.abc import Iterable
 from typing import Any
 
@@ -43,7 +45,25 @@ class Qwen3TTSCode2Wav(nn.Module):
 
         self._decode_chunk_frames = 300
         self._decode_left_context_frames = 25
+        self._decode_batch_bucket_frames: list[int] = []
+        self._decode_batch_max_size = 0
+        self._decode_variable_chunk_batch_min_frames = self._decode_chunk_frames + self._decode_left_context_frames + 1
         self._logged_codec_stats = False
+        self._logged_malformed_codec_lengths: set[tuple[int, int]] = set()
+        self._batch_stats_enabled = os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS", "").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._batch_stats_log_every = int(os.environ.get("VLLM_OMNI_QWEN3_CODE2WAV_BATCH_STATS_LOG_EVERY", "0") or 0)
+        self._batch_stats_forwards = 0
+        self._batch_stats_groups = 0
+        self._batch_stats_requests = 0
+        self._batch_stats_padded_frames = 0
+        self._batch_stats_decoded_frames = 0
+        self._batch_stats_actual_frames: Counter[int] = Counter()
+        self._batch_stats_bucket_groups: Counter[tuple[int, int]] = Counter()
 
         # Construct decoder from config so it is visible to vLLM's
         # memory profiler at startup.  Weights are loaded later in
@@ -91,6 +111,50 @@ class Qwen3TTSCode2Wav(nn.Module):
                 return [ids[boundaries[i] : boundaries[i + 1]] for i in range(len(boundaries) - 1)]
         return [ids]
 
+    def _get_decode_batch_bucket_frames(self, actual_frames: int) -> int:
+        for bucket_frames in self._decode_batch_bucket_frames:
+            if actual_frames <= bucket_frames:
+                return bucket_frames
+        return actual_frames
+
+    def _record_decode_batch_stats(
+        self,
+        *,
+        group_size: int,
+        bucket_frames: int,
+        actual_frames: list[int],
+    ) -> None:
+        if not self._batch_stats_enabled:
+            return
+
+        self._batch_stats_groups += 1
+        self._batch_stats_requests += group_size
+        self._batch_stats_decoded_frames += group_size * bucket_frames
+        self._batch_stats_padded_frames += sum(bucket_frames - frames for frames in actual_frames)
+        self._batch_stats_actual_frames.update(actual_frames)
+        self._batch_stats_bucket_groups[(group_size, bucket_frames)] += 1
+
+    def log_decode_batch_stats(self) -> None:
+        if not self._batch_stats_enabled or self._batch_stats_requests == 0:
+            return
+
+        avg_group_size = self._batch_stats_requests / max(1, self._batch_stats_groups)
+        pad_ratio = self._batch_stats_padded_frames / max(1, self._batch_stats_decoded_frames)
+        logger.info(
+            "Code2Wav batch stats: forwards=%d groups=%d requests=%d "
+            "avg_group_size=%.2f padded_frames=%d decoded_frames=%d pad_ratio=%.2f%% "
+            "top_actual_frames=%s top_bucket_groups=%s",
+            self._batch_stats_forwards,
+            self._batch_stats_groups,
+            self._batch_stats_requests,
+            avg_group_size,
+            self._batch_stats_padded_frames,
+            self._batch_stats_decoded_frames,
+            100.0 * pad_ratio,
+            self._batch_stats_actual_frames.most_common(12),
+            self._batch_stats_bucket_groups.most_common(12),
+        )
+
     @torch.no_grad()
     def forward(
         self,
@@ -111,6 +175,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         Length management is done here instead of relying on HF's padding=-1
         sentinel logic.
         """
+        self._batch_stats_forwards += 1
         decoder = self.decoder
         q = int(self._num_quantizers)
         upsample = int(self._total_upsample)
@@ -147,11 +212,15 @@ class Qwen3TTSCode2Wav(nn.Module):
             n = flat.numel()
             if n == 0 or n % q != 0:
                 if n > 0:
-                    logger.warning(
-                        "Code2Wav input_ids length %d not divisible by num_quantizers %d; skipping malformed request.",
-                        n,
-                        q,
-                    )
+                    key = (int(n), q)
+                    if key not in self._logged_malformed_codec_lengths:
+                        self._logged_malformed_codec_lengths.add(key)
+                        logger.warning(
+                            "Code2Wav input_ids length %d not divisible by num_quantizers %d; "
+                            "skipping malformed request and suppressing repeats for this length.",
+                            n,
+                            q,
+                        )
                 parsed.append((0, 0))
                 continue
             frames = n // q
@@ -187,22 +256,95 @@ class Qwen3TTSCode2Wav(nn.Module):
             except Exception:
                 pass
 
-        # Decode directly via decoder.chunked_decode(), staying entirely on GPU.
-        # Each request decoded individually with CUDA graph replay at bs=1.
-        wav_tensors: list[torch.Tensor] = []
-        for codes_qf in valid_codes_qf:
-            codes_bqf = codes_qf.unsqueeze(0)  # [1, Q, F]
-            try:
-                wav = decoder.chunked_decode(
-                    codes_bqf,
-                    chunk_size=self._decode_chunk_frames,
-                    left_context_size=self._decode_left_context_frames,
-                )  # [1, 1, wav_len]
-            except TypeError:
-                # Unit-test fakes and older decoder shims may not accept the
-                # explicit chunk kwargs; production Qwen3-TTS decoders do.
-                wav = decoder.chunked_decode(codes_bqf)  # [1, 1, wav_len]
-            wav_tensors.append(wav.squeeze(0).squeeze(0))  # [wav_len]
+        wav_tensors: list[torch.Tensor | None] = [None] * len(valid_codes_qf)
+
+        def _decode_group_chunks(group_chunks: list[list[tuple[int, torch.Tensor]]]) -> None:
+            for group_chunk in group_chunks:
+                actual_frames = [int(codes_qf.shape[1]) for _, codes_qf in group_chunk]
+                target_frames = max(actual_frames)
+                is_equal_length_batch = all(frames == target_frames for frames in actual_frames)
+                use_variable_length_batch = (
+                    len(group_chunk) > 1
+                    and not is_equal_length_batch
+                    and target_frames >= self._decode_variable_chunk_batch_min_frames
+                    and hasattr(decoder, "batched_chunked_decode")
+                )
+                if len(group_chunk) == 1:
+                    codes_bqf = group_chunk[0][1].unsqueeze(0)
+                elif is_equal_length_batch:
+                    codes_bqf = torch.stack([codes_qf for _, codes_qf in group_chunk], dim=0)
+                else:
+                    first = group_chunk[0][1]
+                    codes_bqf = first.new_zeros((len(group_chunk), q, target_frames))
+                    for row, (_, codes_qf) in enumerate(group_chunk):
+                        codes_bqf[row, :, : codes_qf.shape[1]] = codes_qf
+                self._record_decode_batch_stats(
+                    group_size=len(group_chunk),
+                    bucket_frames=target_frames,
+                    actual_frames=actual_frames,
+                )
+                try:
+                    if use_variable_length_batch:
+                        wav_batch = decoder.batched_chunked_decode(
+                            codes_bqf,
+                            actual_frames,
+                            chunk_size=self._decode_chunk_frames,
+                            left_context_size=self._decode_left_context_frames,
+                            max_batch_size=self._decode_batch_max_size,
+                        )  # [B, 1, wav_len]
+                    else:
+                        wav_batch = decoder.chunked_decode(
+                            codes_bqf,
+                            chunk_size=self._decode_chunk_frames,
+                            left_context_size=self._decode_left_context_frames,
+                        )  # [B, 1, wav_len]
+                except TypeError:
+                    # Unit-test fakes and older decoder shims may not accept the
+                    # explicit chunk kwargs; production Qwen3-TTS decoders do.
+                    wav_batch = decoder.chunked_decode(codes_bqf)  # [B, 1, wav_len]
+
+                if wav_batch.dim() == 3 and wav_batch.shape[1] == 1:
+                    wav_rows = wav_batch[:, 0, :]
+                elif wav_batch.dim() == 2:
+                    wav_rows = wav_batch
+                else:
+                    raise ValueError(
+                        "Code2Wav decoder returned unexpected shape "
+                        f"{tuple(wav_batch.shape)} for batch size {len(group_chunk)}"
+                    )
+                if wav_rows.shape[0] != len(group_chunk):
+                    raise ValueError(
+                        f"Code2Wav decoder returned batch size {wav_rows.shape[0]} "
+                        f"for input batch size {len(group_chunk)}"
+                    )
+                for row, (j, _) in enumerate(group_chunk):
+                    wav_tensors[j] = wav_rows[row]
+
+        # Group by configured frame buckets instead of only exact lengths.
+        # For ordinary async streaming windows this is the real batching
+        # opportunity; decoder-internal variable chunk batching is gated to
+        # longer inputs where repeated full chunks can amortize its overhead.
+        grouped_codes: dict[int, list[tuple[int, torch.Tensor]]] = {}
+        for j, codes_qf in enumerate(valid_codes_qf):
+            frames = int(codes_qf.shape[1])
+            grouped_codes.setdefault(self._get_decode_batch_bucket_frames(frames), []).append((j, codes_qf))
+
+        for _bucket_frames, group in grouped_codes.items():
+            if self._decode_batch_max_size > 0 and len(group) > self._decode_batch_max_size:
+                # Keep each decoder call inside the configured CUDA graph batch
+                # envelope. Sorting by length lowers right-padding within each
+                # split while outputs are restored by original request index.
+                group = sorted(group, key=lambda item: int(item[1].shape[1]))
+                group_chunks = [
+                    group[start : start + self._decode_batch_max_size]
+                    for start in range(0, len(group), self._decode_batch_max_size)
+                ]
+            else:
+                group_chunks = [group]
+            _decode_group_chunks(group_chunks)
+
+        if self._batch_stats_log_every > 0 and self._batch_stats_forwards % self._batch_stats_log_every == 0:
+            self.log_decode_batch_stats()
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
@@ -210,6 +352,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         for j, idx in enumerate(valid_indices):
             ctx_frames, actual_frames = parsed[idx]
             wav = wav_tensors[j]
+            assert wav is not None
             # Slice on exact codec-frame boundaries instead of proportionally.
             start = max(0, ctx_frames * upsample)
             end = max(start, actual_frames * upsample)
@@ -302,6 +445,80 @@ class Qwen3TTSCode2Wav(nn.Module):
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
 
+        def _get_bool_config(name: str, default: bool) -> bool:
+            value = extra_cfg.get(name, default)
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in ("1", "true", "yes", "on"):
+                    return True
+                if lowered in ("0", "false", "no", "off"):
+                    return False
+            if isinstance(value, int):
+                return bool(value)
+            raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}")
+
+        def _get_int_list_config(name: str) -> list[int] | None:
+            value = extra_cfg.get(name)
+            if value is None:
+                return None
+            if isinstance(value, str):
+                raw_values = [item.strip() for item in value.split(",") if item.strip()]
+            elif isinstance(value, int):
+                raw_values = [value]
+            else:
+                try:
+                    raw_values = list(value)
+                except TypeError as exc:
+                    raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
+            values: set[int] = set()
+            for item in raw_values:
+                try:
+                    parsed = int(item)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
+                if parsed > 0:
+                    values.add(parsed)
+            return sorted(values)
+
+        def _get_int_pair_list_config(name: str) -> list[tuple[int, int]] | None:
+            value = extra_cfg.get(name)
+            if value is None:
+                return None
+            if isinstance(value, str):
+                raw_values = [item.strip() for item in value.split(",") if item.strip()]
+            else:
+                try:
+                    raw_values = list(value)
+                except TypeError as exc:
+                    raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
+
+            pairs: set[tuple[int, int]] = set()
+            for item in raw_values:
+                if isinstance(item, str):
+                    if ":" not in item:
+                        raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}")
+                    left, right = item.split(":", 1)
+                    raw_pair = (left.strip(), right.strip())
+                else:
+                    try:
+                        raw_pair = tuple(item)
+                    except TypeError as exc:
+                        raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
+                    if len(raw_pair) != 2:
+                        raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}")
+                try:
+                    batch_size = int(raw_pair[0])
+                    seq_len = int(raw_pair[1])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid Qwen3-TTS Code2Wav config {name}={value!r}") from exc
+                if batch_size > 0 and seq_len > 0:
+                    pairs.add((batch_size, seq_len))
+            return sorted(pairs)
+
         if isinstance(extra_cfg, dict):
             codec_chunk_frames = int(extra_cfg.get("codec_chunk_frames") or 0)
             codec_left_context_frames = int(extra_cfg.get("codec_left_context_frames") or 0)
@@ -318,6 +535,49 @@ class Qwen3TTSCode2Wav(nn.Module):
                 )
             self._decode_chunk_frames = decode_chunk_frames
             self._decode_left_context_frames = decode_left_context_frames
+            decode_cudagraph_capture_sizes = _get_int_list_config("decode_cudagraph_capture_sizes")
+            decode_cudagraph_batch_sizes = _get_int_list_config("decode_cudagraph_batch_sizes")
+            decode_cudagraph_extra_capture_shapes = _get_int_pair_list_config("decode_cudagraph_extra_capture_shapes")
+            decode_compile_shapes = _get_int_pair_list_config("decode_compile_shapes")
+            decode_batch_bucket_frames = _get_int_list_config("decode_batch_bucket_frames")
+            if decode_batch_bucket_frames is not None:
+                self._decode_batch_bucket_frames = decode_batch_bucket_frames
+            decode_batch_max_size = _get_int_config("decode_batch_max_size", self._decode_batch_max_size)
+            if decode_batch_max_size < 0:
+                raise ValueError(f"Invalid Qwen3-TTS Code2Wav config decode_batch_max_size={decode_batch_max_size}")
+            self._decode_batch_max_size = decode_batch_max_size
+            decode_variable_chunk_batch_min_frames = _get_int_config(
+                "decode_variable_chunk_batch_min_frames",
+                self._decode_variable_chunk_batch_min_frames,
+            )
+            if decode_variable_chunk_batch_min_frames < 0:
+                raise ValueError(
+                    "Invalid Qwen3-TTS Code2Wav config "
+                    f"decode_variable_chunk_batch_min_frames={decode_variable_chunk_batch_min_frames}"
+                )
+            self._decode_variable_chunk_batch_min_frames = decode_variable_chunk_batch_min_frames
+            decode_enable_tf32 = _get_bool_config("decode_enable_tf32", False)
+        else:
+            decode_cudagraph_capture_sizes = None
+            decode_cudagraph_batch_sizes = None
+            decode_cudagraph_extra_capture_shapes = None
+            decode_compile_shapes = None
+            decode_enable_tf32 = False
+
+        if decode_enable_tf32 and device.type == "cuda":
+            # PyTorch exposes TF32 controls as process-wide CUDA backend
+            # switches. This opt-in is intended for deployments where
+            # Code2Wav runs in its own Stage1 worker process.
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+            logger.info(
+                "Qwen3-TTS Code2Wav TF32 enabled process-wide: "
+                "matmul.allow_tf32=%s cudnn.allow_tf32=%s float32_matmul_precision=%s",
+                torch.backends.cuda.matmul.allow_tf32,
+                torch.backends.cudnn.allow_tf32,
+                torch.get_float32_matmul_precision(),
+            )
 
         if hasattr(self.decoder, "enable_cudagraph") and device.type == "cuda":
             try:
@@ -339,6 +599,10 @@ class Qwen3TTSCode2Wav(nn.Module):
                     )
 
                 self.decoder.enable_cudagraph(
+                    capture_sizes=decode_cudagraph_capture_sizes,
+                    capture_batch_sizes=decode_cudagraph_batch_sizes,
+                    extra_capture_shapes=decode_cudagraph_extra_capture_shapes,
+                    compile_shapes=decode_compile_shapes,
                     device=device,
                     codec_chunk_frames=codec_chunk_frames,
                     codec_left_context_frames=codec_left_context_frames,
