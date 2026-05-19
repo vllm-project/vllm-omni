@@ -803,7 +803,10 @@ def run_headless(args: argparse.Namespace) -> None:
         metadata = extract_stage_metadata(stage_cfg)
         if omni_conn_cfg:
             inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
-        inject_kv_stage_info(stage_cfg, stage_id)
+        # Headless single-stage launch must still infer cross-stage TP topology
+        # from the loaded deploy config so heterogeneous KV routing keys match
+        # the head process (e.g. from_tp=2, to_tp=1).
+        inject_kv_stage_info(stage_cfg, stage_id, stage_configs)
         od_config = build_diffusion_config(model, stage_cfg, metadata)
 
         logger.info(
