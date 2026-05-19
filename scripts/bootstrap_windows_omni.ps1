@@ -104,9 +104,9 @@ function Resolve-CudaToolkitPath {
     param([string]$PreferredPath)
     $candidates = @(
         $PreferredPath,
+        "C:\tmp\cuda13_system",
         $env:CUDA_PATH,
         $env:CUDA_HOME,
-        "C:\tmp\cuda13_system",
         "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0"
     ) | Where-Object { $_ } | Select-Object -Unique
 
