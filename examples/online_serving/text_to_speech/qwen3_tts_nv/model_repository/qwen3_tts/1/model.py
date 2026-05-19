@@ -47,7 +47,6 @@ import tempfile
 import threading
 import time
 import uuid
-from typing import Any
 
 import numpy as np
 import torch
@@ -74,7 +73,6 @@ def _require_param(parameters: dict, key: str) -> str:
 
 
 class TritonPythonModel:
-
     def initialize(self, args):
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
@@ -86,10 +84,7 @@ class TritonPythonModel:
         self.default_language = _require_param(params, "default_language")
         self.task_type = _require_param(params, "task_type")
         if self.task_type != "CustomVoice":
-            raise ValueError(
-                f"Qwen3-TTS NV talker only supports task_type='CustomVoice', "
-                f"got {self.task_type!r}."
-            )
+            raise ValueError(f"Qwen3-TTS NV talker only supports task_type='CustomVoice', got {self.task_type!r}.")
 
         self.max_model_len = int(_require_param(params, "max_model_len"))
         self.max_num_seqs = int(_require_param(params, "max_num_seqs"))
@@ -132,6 +127,7 @@ class TritonPythonModel:
 
     def _load_prompt_builders(self):
         from transformers import AutoTokenizer
+
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
@@ -140,7 +136,9 @@ class TritonPythonModel:
         )
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.vllm_model_path, trust_remote_code=True, padding_side="left",
+            self.vllm_model_path,
+            trust_remote_code=True,
+            padding_side="left",
         )
         hf_cfg = Qwen3TTSConfig.from_pretrained(self.vllm_model_path, trust_remote_code=True)
         talker_cfg = getattr(hf_cfg, "talker_config", None)
@@ -192,7 +190,10 @@ class TritonPythonModel:
             ],
         }
         tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", prefix="qwen3_tts_triton_", delete=False,
+            mode="w",
+            suffix=".yaml",
+            prefix="qwen3_tts_triton_",
+            delete=False,
         )
         yaml.dump(stage_cfg, tmp, sort_keys=False)
         tmp.close()
@@ -235,9 +236,9 @@ class TritonPythonModel:
         )
         if prompt_len > self.max_num_batched_tokens:
             logger.warning(
-                "prompt_len=%d exceeds max_num_batched_tokens=%d; "
-                "prefill will be chunked which hurts TTFT.",
-                prompt_len, self.max_num_batched_tokens,
+                "prompt_len=%d exceeds max_num_batched_tokens=%d; prefill will be chunked which hurts TTFT.",
+                prompt_len,
+                self.max_num_batched_tokens,
             )
         return {
             "prompt_token_ids": [0] * prompt_len,
@@ -259,8 +260,11 @@ class TritonPythonModel:
             raise RuntimeError(f"Codec decode failed: {response.error().message()}")
 
         audio_tensor = pb_utils.get_output_tensor_by_name(response, "audio_values")
-        audio = (audio_tensor.as_numpy() if audio_tensor.is_cpu()
-                 else torch.from_dlpack(audio_tensor.to_dlpack()).cpu().numpy())
+        audio = (
+            audio_tensor.as_numpy()
+            if audio_tensor.is_cpu()
+            else torch.from_dlpack(audio_tensor.to_dlpack()).cpu().numpy()
+        )
         if audio.ndim > 1:
             audio = audio[0]
 
@@ -270,8 +274,7 @@ class TritonPythonModel:
 
     def _send_audio(self, response_sender, audio: np.ndarray, final: bool):
         response_sender.send(
-            pb_utils.InferenceResponse(
-                output_tensors=[pb_utils.Tensor("audio", audio.astype(np.float32))]),
+            pb_utils.InferenceResponse(output_tensors=[pb_utils.Tensor("audio", audio.astype(np.float32))]),
             flags=pb_utils.TRITONSERVER_RESPONSE_COMPLETE_FINAL if final else 0,
         )
 
@@ -284,7 +287,7 @@ class TritonPythonModel:
         except Exception:
             pass
 
-    def _codec_worker(self, codec_q: "queue.Queue", response_sender, state: dict) -> None:
+    def _codec_worker(self, codec_q: queue.Queue, response_sender, state: dict) -> None:
         """Per-request worker. Pops (chunk, ctx, is_final) tuples; ``None`` is a
         sentinel meaning "send empty final response and exit". Runs on a thread
         from ``self._codec_pool`` so codec decode + sender.send don't block the
@@ -296,7 +299,9 @@ class TritonPythonModel:
                 item = codec_q.get()
                 if item is None:
                     self._send_audio(
-                        response_sender, np.array([], dtype=np.float32), final=True,
+                        response_sender,
+                        np.array([], dtype=np.float32),
+                        final=True,
                     )
                     finalized = True
                     return
@@ -321,7 +326,10 @@ class TritonPythonModel:
         codec_q: queue.Queue = queue.Queue()
         state: dict = {"t_first_audio": None, "error": None}
         codec_future = self._codec_pool.submit(
-            self._codec_worker, codec_q, response_sender, state,
+            self._codec_worker,
+            codec_q,
+            response_sender,
+            state,
         )
 
         # ``mm_codes`` holds the latest list-typed ``audio_codes`` payload
@@ -348,8 +356,9 @@ class TritonPythonModel:
                 mm_codes = payload
 
                 decode_count = len(mm_codes) - 1
-                threshold = (self.first_chunk_frames if sent_frames == 0
-                             else self.codec_chunk_size - self.codec_left_context)
+                threshold = (
+                    self.first_chunk_frames if sent_frames == 0 else self.codec_chunk_size - self.codec_left_context
+                )
                 while decode_count - sent_frames >= threshold:
                     ctx = min(sent_frames, self.codec_left_context)
                     start = 1 + sent_frames - ctx
@@ -383,8 +392,12 @@ class TritonPythonModel:
             ttfa_ms = ((state["t_first_audio"] or t_end) - t_start) * 1000
             logger.info(
                 "rid=%s ttfa=%.1fms total=%.1fms frames=%d speaker=%s text=%r",
-                request_id, ttfa_ms, (t_end - t_start) * 1000,
-                sent_frames, speaker, text[:120],
+                request_id,
+                ttfa_ms,
+                (t_end - t_start) * 1000,
+                sent_frames,
+                speaker,
+                text[:120],
             )
         except Exception as e:
             logger.error("rid=%s failed: %s", request_id, e, exc_info=True)
@@ -407,13 +420,20 @@ class TritonPythonModel:
             try:
                 text = pb_utils.get_input_tensor_by_name(request, "text").as_numpy().flatten()[0].decode("utf-8")
                 lang_tensor = pb_utils.get_input_tensor_by_name(request, "language")
-                language = (lang_tensor.as_numpy().flatten()[0].decode("utf-8")
-                            if lang_tensor is not None else self.default_language)
+                language = (
+                    lang_tensor.as_numpy().flatten()[0].decode("utf-8")
+                    if lang_tensor is not None
+                    else self.default_language
+                )
                 spk_tensor = pb_utils.get_input_tensor_by_name(request, "speaker")
-                speaker = (spk_tensor.as_numpy().flatten()[0].decode("utf-8")
-                           if spk_tensor is not None else self.default_speaker).lower()
+                speaker = (
+                    spk_tensor.as_numpy().flatten()[0].decode("utf-8")
+                    if spk_tensor is not None
+                    else self.default_speaker
+                ).lower()
                 asyncio.run_coroutine_threadsafe(
-                    self._synthesize(text, language, speaker, response_sender), self._loop,
+                    self._synthesize(text, language, speaker, response_sender),
+                    self._loop,
                 )
             except Exception as e:
                 logger.error("Request parse failed: %s", e, exc_info=True)

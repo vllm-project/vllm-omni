@@ -134,31 +134,37 @@ def worker(
                 task_idx = task_queue.pop()
 
             uttid, text = random.choice(items)
-            audio, ttfa, elapsed, error = synthesize(
-                client, result_q, text, chunk_timeout
-            )
+            audio, ttfa, elapsed, error = synthesize(client, result_q, text, chunk_timeout)
 
             if error is not None:
                 # Reset the stream so late chunks don't bleed into the next
                 # request.
                 client.stop_stream()
                 client.start_stream(callback=lambda result, error: result_q.put((result, error)))
-                stats.add(RequestResult(
-                    uttid=uttid, num_samples=0,
-                    duration_s=elapsed, ttfa_s=ttfa, error=error,
-                ))
-                print(f"[worker {worker_id:02d}] request {task_idx} ({uttid}) "
-                      f"FAILED ({elapsed:.1f}s) — {error}")
+                stats.add(
+                    RequestResult(
+                        uttid=uttid,
+                        num_samples=0,
+                        duration_s=elapsed,
+                        ttfa_s=ttfa,
+                        error=error,
+                    )
+                )
+                print(f"[worker {worker_id:02d}] request {task_idx} ({uttid}) FAILED ({elapsed:.1f}s) — {error}")
                 continue
 
             num_samples = len(audio)
             if output_dir is not None and num_samples > 0:
                 _save_wav(output_dir / f"{uttid}.wav", audio)
 
-            stats.add(RequestResult(
-                uttid=uttid, num_samples=num_samples,
-                duration_s=elapsed, ttfa_s=ttfa,
-            ))
+            stats.add(
+                RequestResult(
+                    uttid=uttid,
+                    num_samples=num_samples,
+                    duration_s=elapsed,
+                    ttfa_s=ttfa,
+                )
+            )
             print(
                 f"[worker {worker_id:02d}] request {task_idx} ({uttid}) done — "
                 f"{num_samples / SAMPLE_RATE:.2f}s audio in {elapsed:.2f}s "
@@ -177,9 +183,7 @@ def _load_items(text_file: str) -> list[tuple[str, str]]:
                 continue
             parts = line.split("\t", 1)
             if len(parts) != 2:
-                raise ValueError(
-                    f"Expected '<uttid>\\t<text>' per line, got: {line!r}"
-                )
+                raise ValueError(f"Expected '<uttid>\\t<text>' per line, got: {line!r}")
             uttid, text = parts[0].strip(), parts[1].strip()
             if not uttid or not text:
                 raise ValueError(f"Empty uttid or text in line: {line!r}")
@@ -202,8 +206,7 @@ def _run_workers(
     threads = [
         threading.Thread(
             target=worker,
-            args=(i, triton_url, items, task_queue, queue_lock,
-                  stats, chunk_timeout, output_dir),
+            args=(i, triton_url, items, task_queue, queue_lock, stats, chunk_timeout, output_dir),
         )
         for i in range(num_workers)
     ]
@@ -217,21 +220,17 @@ def _run_workers(
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Qwen3-TTS Triton server")
-    parser.add_argument("--text-file", required=True,
-                        help="Path to file with '<uttid>\\t<text>' per line")
-    parser.add_argument("--num-requests", type=int, required=True,
-                        help="Total number of requests to send")
-    parser.add_argument("--num-workers", type=int, default=4,
-                        help="Number of concurrent workers (default: 4)")
-    parser.add_argument("--triton-url", default="localhost:8001",
-                        help="Triton gRPC endpoint (default: localhost:8001)")
-    parser.add_argument("--no-warmup", action="store_true",
-                        help="Skip warmup phase (3 requests per worker)")
-    parser.add_argument("--chunk-timeout", type=float, default=60,
-                        help="Per-chunk receive timeout in seconds (default: 60)")
-    parser.add_argument("--output-dir", default=None,
-                        help="If set, write each generated waveform to "
-                             "<output-dir>/<uttid>.wav")
+    parser.add_argument("--text-file", required=True, help="Path to file with '<uttid>\\t<text>' per line")
+    parser.add_argument("--num-requests", type=int, required=True, help="Total number of requests to send")
+    parser.add_argument("--num-workers", type=int, default=4, help="Number of concurrent workers (default: 4)")
+    parser.add_argument("--triton-url", default="localhost:8001", help="Triton gRPC endpoint (default: localhost:8001)")
+    parser.add_argument("--no-warmup", action="store_true", help="Skip warmup phase (3 requests per worker)")
+    parser.add_argument(
+        "--chunk-timeout", type=float, default=60, help="Per-chunk receive timeout in seconds (default: 60)"
+    )
+    parser.add_argument(
+        "--output-dir", default=None, help="If set, write each generated waveform to <output-dir>/<uttid>.wav"
+    )
     args = parser.parse_args()
 
     items = _load_items(args.text_file)
@@ -245,8 +244,7 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loaded {len(items)} utterances from {args.text_file}")
-    print(f"Sending {args.num_requests} requests with {args.num_workers} "
-          f"workers to {args.triton_url}")
+    print(f"Sending {args.num_requests} requests with {args.num_workers} workers to {args.triton_url}")
     if output_dir is not None:
         print(f"Writing WAVs to {output_dir.resolve()}")
     print("-" * 70)
@@ -255,15 +253,23 @@ def main():
         total_warmup = args.num_workers * 3
         print(f"Warmup: {total_warmup} requests (3 per worker) ...")
         _run_workers(
-            args.num_workers, args.triton_url, items, total_warmup,
-            args.chunk_timeout, output_dir=None,
+            args.num_workers,
+            args.triton_url,
+            items,
+            total_warmup,
+            args.chunk_timeout,
+            output_dir=None,
         )
         print("Warmup complete.")
         print("-" * 70)
 
     stats, wall_elapsed = _run_workers(
-        args.num_workers, args.triton_url, items, args.num_requests,
-        args.chunk_timeout, output_dir,
+        args.num_workers,
+        args.triton_url,
+        items,
+        args.num_requests,
+        args.chunk_timeout,
+        output_dir,
     )
 
     successes = [r for r in stats.results if r.error is None]

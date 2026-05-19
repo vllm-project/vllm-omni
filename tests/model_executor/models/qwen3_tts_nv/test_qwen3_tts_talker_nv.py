@@ -59,9 +59,7 @@ class _FakeCodePredictor(nn.Module):
         super().__init__()
         self.num_code_groups = NUM_CODE_GROUPS
         # Per-group embedding tables for groups 1..N-1.
-        self._group_embeddings = nn.ModuleList(
-            [nn.Embedding(VOCAB_SIZE, HIDDEN) for _ in range(NUM_CODE_GROUPS - 1)]
-        )
+        self._group_embeddings = nn.ModuleList([nn.Embedding(VOCAB_SIZE, HIDDEN) for _ in range(NUM_CODE_GROUPS - 1)])
         # Group-0 codec embedding.
         self.codec_embedding = nn.Embedding(VOCAB_SIZE, HIDDEN)
         self.generate_calls: list[dict[str, torch.Tensor]] = []
@@ -83,10 +81,7 @@ class _FakeCodePredictor(nn.Module):
         )
         seq_len = group0_tokens.shape[0]
         # Deterministic codes derived from group0 so we can assert later.
-        codes = (
-            group0_tokens.view(-1, 1).expand(seq_len, NUM_CODE_GROUPS - 1)
-            % VOCAB_SIZE
-        )
+        codes = group0_tokens.view(-1, 1).expand(seq_len, NUM_CODE_GROUPS - 1) % VOCAB_SIZE
         return codes.contiguous()
 
 
@@ -112,9 +107,7 @@ class _FakeBackbone(nn.Module):
         return inputs_embeds.clone()
 
 
-def _make_fake_attn_metadata(
-    query_lens: list[int], device: torch.device = torch.device("cpu")
-) -> SimpleNamespace:
+def _make_fake_attn_metadata(query_lens: list[int], device: torch.device = torch.device("cpu")) -> SimpleNamespace:
     """Build a fake attn_metadata mimicking the runner's contract."""
     start_loc = torch.tensor(
         [0] + list(torch.cumsum(torch.tensor(query_lens), 0).tolist()),
@@ -142,9 +135,7 @@ def _make_talker_instance() -> Qwen3TTSTalkerForConditionalGenerationNv:
 
     # Persistent scratch buffers.
     model._combined_embeddings = torch.zeros(MAX_NUM_TOKENS, HIDDEN)
-    model._out_codes = torch.zeros(
-        MAX_NUM_TOKENS, NUM_CODE_GROUPS, dtype=torch.long
-    )
+    model._out_codes = torch.zeros(MAX_NUM_TOKENS, NUM_CODE_GROUPS, dtype=torch.long)
     model._prev_hidden_buffer = torch.zeros(MAX_NUM_TOKENS, HIDDEN)
     # tts_pad text embedding (a fixed constant, populated from weights at
     # load time; here we set a recognisable bias so we can verify it lands
@@ -169,9 +160,7 @@ def _make_talker_instance() -> Qwen3TTSTalkerForConditionalGenerationNv:
 
     # ``compute_logits`` reads these.
     model.codec_head = nn.Linear(HIDDEN, VOCAB_SIZE, bias=False)
-    model.suppress_mask = nn.Parameter(
-        torch.zeros(VOCAB_SIZE, dtype=torch.bool), requires_grad=False
-    )
+    model.suppress_mask = nn.Parameter(torch.zeros(VOCAB_SIZE, dtype=torch.bool), requires_grad=False)
     model.logits_processor = lambda head, hs: head(hs)
 
     return model
@@ -185,9 +174,7 @@ def _make_talker_instance() -> Qwen3TTSTalkerForConditionalGenerationNv:
 def test_get_decode_idxs_returns_none_when_no_attn_metadata(monkeypatch):
     """Profile / dummy run: code predictor must run on every position."""
     model = _make_talker_instance()
-    monkeypatch.setattr(
-        nv, "get_forward_context", lambda: _make_fake_forward_context(None)
-    )
+    monkeypatch.setattr(nv, "get_forward_context", lambda: _make_fake_forward_context(None))
 
     decode_idx, num_req = model._get_decode_idxs()
 
@@ -199,9 +186,7 @@ def test_get_decode_idxs_returns_none_for_decode_only_batch(monkeypatch):
     """Decode-only batch (``max_query_len == 1``): apply everywhere."""
     model = _make_talker_instance()
     attn_md = _make_fake_attn_metadata([1, 1, 1, 1])
-    monkeypatch.setattr(
-        nv, "get_forward_context", lambda: _make_fake_forward_context(attn_md)
-    )
+    monkeypatch.setattr(nv, "get_forward_context", lambda: _make_fake_forward_context(attn_md))
 
     decode_idx, num_req = model._get_decode_idxs()
 
@@ -214,9 +199,7 @@ def test_get_decode_idxs_picks_decode_indices_in_mixed_batch(monkeypatch):
     (req#2=1 tok). Req#1 is prefill (4 tokens at positions 1..4)."""
     model = _make_talker_instance()
     attn_md = _make_fake_attn_metadata([1, 4, 1])
-    monkeypatch.setattr(
-        nv, "get_forward_context", lambda: _make_fake_forward_context(attn_md)
-    )
+    monkeypatch.setattr(nv, "get_forward_context", lambda: _make_fake_forward_context(attn_md))
 
     decode_idx, num_req = model._get_decode_idxs()
 
@@ -228,9 +211,7 @@ def test_get_decode_idxs_returns_empty_for_all_prefill_batch(monkeypatch):
     """All-prefill batch (no req with query_len == 1)."""
     model = _make_talker_instance()
     attn_md = _make_fake_attn_metadata([3, 4])
-    monkeypatch.setattr(
-        nv, "get_forward_context", lambda: _make_fake_forward_context(attn_md)
-    )
+    monkeypatch.setattr(nv, "get_forward_context", lambda: _make_fake_forward_context(attn_md))
 
     decode_idx, num_req = model._get_decode_idxs()
 
@@ -244,9 +225,7 @@ def test_forward_decode_only_runs_code_predictor_everywhere(monkeypatch):
     tts_pad + sum(group_embs)) must be written to every position.
     """
     model = _make_talker_instance()
-    monkeypatch.setattr(
-        nv, "get_forward_context", lambda: _make_fake_forward_context(None)
-    )
+    monkeypatch.setattr(nv, "get_forward_context", lambda: _make_fake_forward_context(None))
 
     num_tokens = 3
     input_ids = torch.tensor([1, 2, 3], dtype=torch.long)
@@ -269,29 +248,18 @@ def test_forward_decode_only_runs_code_predictor_everywhere(monkeypatch):
     torch.testing.assert_close(call["prev_hidden"], prev_hidden_slot)
 
     # Output codes: column 0 == input_ids, columns 1..N-1 == fake codes.
-    expected_codes_1_15 = (
-        input_ids.view(-1, 1).expand(num_tokens, NUM_CODE_GROUPS - 1) % VOCAB_SIZE
-    )
-    torch.testing.assert_close(
-        model._out_codes[:num_tokens, 0], input_ids
-    )
-    torch.testing.assert_close(
-        model._out_codes[:num_tokens, 1:], expected_codes_1_15
-    )
+    expected_codes_1_15 = input_ids.view(-1, 1).expand(num_tokens, NUM_CODE_GROUPS - 1) % VOCAB_SIZE
+    torch.testing.assert_close(model._out_codes[:num_tokens, 0], input_ids)
+    torch.testing.assert_close(model._out_codes[:num_tokens, 1:], expected_codes_1_15)
 
     # Backbone was fed an embedding equal to the analytical decode assembly.
     cp = model.code_predictor
-    expected_emb = (
-        cp.codec_embedding(input_ids)
-        + model._tts_pad_text_embed
-    )
+    expected_emb = cp.codec_embedding(input_ids) + model._tts_pad_text_embed
     for i, emb in enumerate(cp.get_group_embeddings()):
         expected_emb = expected_emb + emb(expected_codes_1_15[:, i])
 
     assert model.model.last_call is not None
-    torch.testing.assert_close(
-        model.model.last_call["inputs_embeds"], expected_emb
-    )
+    torch.testing.assert_close(model.model.last_call["inputs_embeds"], expected_emb)
     # And forward returned that hidden states (FakeBackbone is identity).
     torch.testing.assert_close(out, expected_emb)
 
@@ -306,9 +274,7 @@ def test_forward_mixed_batch_only_runs_code_predictor_on_decode(monkeypatch):
     query_lens = [1, 3, 1]
     num_tokens = sum(query_lens)
     attn_md = _make_fake_attn_metadata(query_lens)
-    monkeypatch.setattr(
-        nv, "get_forward_context", lambda: _make_fake_forward_context(attn_md)
-    )
+    monkeypatch.setattr(nv, "get_forward_context", lambda: _make_fake_forward_context(attn_md))
 
     input_ids = torch.tensor([7, 0, 0, 0, 5], dtype=torch.long)
     positions = torch.arange(num_tokens, dtype=torch.long)
@@ -332,16 +298,12 @@ def test_forward_mixed_batch_only_runs_code_predictor_on_decode(monkeypatch):
     # Code predictor called exactly once on the decode slice [0, 4].
     assert len(model.code_predictor.generate_calls) == 1
     call = model.code_predictor.generate_calls[0]
-    torch.testing.assert_close(
-        call["group0_tokens"], torch.tensor([7, 5], dtype=torch.long)
-    )
+    torch.testing.assert_close(call["group0_tokens"], torch.tensor([7, 5], dtype=torch.long))
     torch.testing.assert_close(call["prev_hidden"], prev_hidden[[0, 4]])
 
     # ``_out_codes`` only has groups 1..N-1 written at the decode rows.
     decode_rows = model._out_codes[[0, 4], 1:]
-    expected_decode_codes = torch.tensor(
-        [[7, 7, 7], [5, 5, 5]], dtype=torch.long
-    )
+    expected_decode_codes = torch.tensor([[7, 7, 7], [5, 5, 5]], dtype=torch.long)
     torch.testing.assert_close(decode_rows, expected_decode_codes)
 
     # Prefill rows for groups 1..N-1 must remain untouched (zero).
@@ -362,13 +324,9 @@ def test_forward_mixed_batch_only_runs_code_predictor_on_decode(monkeypatch):
 
     cp = model.code_predictor
     decode_ids = torch.tensor([7, 5], dtype=torch.long)
-    expected_decode_emb = (
-        cp.codec_embedding(decode_ids) + model._tts_pad_text_embed
-    )
+    expected_decode_emb = cp.codec_embedding(decode_ids) + model._tts_pad_text_embed
     for i, emb in enumerate(cp.get_group_embeddings()):
-        expected_decode_emb = expected_decode_emb + emb(
-            expected_decode_codes[:, i]
-        )
+        expected_decode_emb = expected_decode_emb + emb(expected_decode_codes[:, i])
     torch.testing.assert_close(fed[[0, 4]], expected_decode_emb)
 
 
@@ -378,9 +336,7 @@ def test_forward_all_prefill_skips_code_predictor(monkeypatch):
     query_lens = [3, 4]
     num_tokens = sum(query_lens)
     attn_md = _make_fake_attn_metadata(query_lens)
-    monkeypatch.setattr(
-        nv, "get_forward_context", lambda: _make_fake_forward_context(attn_md)
-    )
+    monkeypatch.setattr(nv, "get_forward_context", lambda: _make_fake_forward_context(attn_md))
 
     input_ids = torch.zeros(num_tokens, dtype=torch.long)
     inputs_embeds = torch.randn(num_tokens, HIDDEN)
@@ -396,9 +352,7 @@ def test_forward_all_prefill_skips_code_predictor(monkeypatch):
     # No code predictor call.
     assert model.code_predictor.generate_calls == []
     # Backbone was fed exactly the prefill embeddings.
-    torch.testing.assert_close(
-        model.model.last_call["inputs_embeds"], expected_passthrough
-    )
+    torch.testing.assert_close(model.model.last_call["inputs_embeds"], expected_passthrough)
     # Groups 1..N-1 must remain zero (they're never produced for prefill).
     torch.testing.assert_close(
         model._out_codes[:num_tokens, 1:],
@@ -417,9 +371,9 @@ def test_make_omni_output_wraps_hidden_and_codes():
     num_tokens = 5
     hidden = torch.randn(num_tokens, HIDDEN)
     # Pre-populate _out_codes with a recognisable pattern.
-    model._out_codes[:num_tokens] = torch.arange(
-        num_tokens * NUM_CODE_GROUPS, dtype=torch.long
-    ).view(num_tokens, NUM_CODE_GROUPS)
+    model._out_codes[:num_tokens] = torch.arange(num_tokens * NUM_CODE_GROUPS, dtype=torch.long).view(
+        num_tokens, NUM_CODE_GROUPS
+    )
 
     out = model.make_omni_output(hidden)
 
@@ -457,9 +411,7 @@ def test_compute_logits_applies_suppress_mask():
     model = _make_talker_instance()
     # Set deterministic codec_head weights so we know what logits to expect.
     with torch.no_grad():
-        model.codec_head.weight.copy_(
-            torch.eye(VOCAB_SIZE, HIDDEN)[:VOCAB_SIZE, :HIDDEN]
-        )
+        model.codec_head.weight.copy_(torch.eye(VOCAB_SIZE, HIDDEN)[:VOCAB_SIZE, :HIDDEN])
         # Suppress two tokens.
         mask = torch.zeros(VOCAB_SIZE, dtype=torch.bool)
         mask[3] = True
@@ -540,15 +492,12 @@ def test_estimate_prompt_len_requires_text_and_speaker():
 def test_estimate_prompt_len_no_language_id_uses_prefill_3():
     """No language_id -> prefill_len=3, total = 3 + assistant_len - 1."""
     assistant_len = 12
-    out = (
-        Qwen3TTSTalkerForConditionalGenerationNv
-        .estimate_prompt_len_from_additional_information(
-            {"text": "hi", "speaker": "alice", "language": "Auto"},
-            task_type="CustomVoice",
-            tokenize_prompt=_make_tokenizer(assistant_len),
-            codec_language_id={"english": 1},
-            spk_is_dialect=None,
-        )
+    out = Qwen3TTSTalkerForConditionalGenerationNv.estimate_prompt_len_from_additional_information(
+        {"text": "hi", "speaker": "alice", "language": "Auto"},
+        task_type="CustomVoice",
+        tokenize_prompt=_make_tokenizer(assistant_len),
+        codec_language_id={"english": 1},
+        spk_is_dialect=None,
     )
     assert out == 3 + assistant_len - 1
 
@@ -556,14 +505,11 @@ def test_estimate_prompt_len_no_language_id_uses_prefill_3():
 def test_estimate_prompt_len_with_language_id_uses_prefill_4():
     """Resolved language_id -> prefill_len=4."""
     assistant_len = 12
-    out = (
-        Qwen3TTSTalkerForConditionalGenerationNv
-        .estimate_prompt_len_from_additional_information(
-            {"text": "hi", "speaker": "alice", "language": "English"},
-            task_type="CustomVoice",
-            tokenize_prompt=_make_tokenizer(assistant_len),
-            codec_language_id={"english": 1},
-        )
+    out = Qwen3TTSTalkerForConditionalGenerationNv.estimate_prompt_len_from_additional_information(
+        {"text": "hi", "speaker": "alice", "language": "English"},
+        task_type="CustomVoice",
+        tokenize_prompt=_make_tokenizer(assistant_len),
+        codec_language_id={"english": 1},
     )
     assert out == 4 + assistant_len - 1
 
@@ -571,33 +517,27 @@ def test_estimate_prompt_len_with_language_id_uses_prefill_4():
 def test_estimate_prompt_len_dialect_fallback_promotes_to_4():
     """Auto language + speaker registered as a dialect resolves a language_id."""
     assistant_len = 12
-    out = (
-        Qwen3TTSTalkerForConditionalGenerationNv
-        .estimate_prompt_len_from_additional_information(
-            {"text": "hi", "speaker": "shanghainese_voice", "language": "Auto"},
-            task_type="CustomVoice",
-            tokenize_prompt=_make_tokenizer(assistant_len),
-            codec_language_id={"shanghainese": 7},
-            spk_is_dialect={"shanghainese_voice": "shanghainese"},
-        )
+    out = Qwen3TTSTalkerForConditionalGenerationNv.estimate_prompt_len_from_additional_information(
+        {"text": "hi", "speaker": "shanghainese_voice", "language": "Auto"},
+        task_type="CustomVoice",
+        tokenize_prompt=_make_tokenizer(assistant_len),
+        codec_language_id={"shanghainese": 7},
+        spk_is_dialect={"shanghainese_voice": "shanghainese"},
     )
     assert out == 4 + assistant_len - 1
 
 
 def test_estimate_prompt_len_unwraps_list_values():
     assistant_len = 12
-    out = (
-        Qwen3TTSTalkerForConditionalGenerationNv
-        .estimate_prompt_len_from_additional_information(
-            {
-                "text": ["hi"],
-                "speaker": ["alice"],
-                "language": ["Auto"],
-            },
-            task_type="CustomVoice",
-            tokenize_prompt=_make_tokenizer(assistant_len),
-            codec_language_id={"english": 1},
-        )
+    out = Qwen3TTSTalkerForConditionalGenerationNv.estimate_prompt_len_from_additional_information(
+        {
+            "text": ["hi"],
+            "speaker": ["alice"],
+            "language": ["Auto"],
+        },
+        task_type="CustomVoice",
+        tokenize_prompt=_make_tokenizer(assistant_len),
+        codec_language_id={"english": 1},
     )
     assert out == 3 + assistant_len - 1
 

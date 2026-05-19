@@ -47,7 +47,6 @@ import argparse
 import asyncio
 import json
 import logging
-import random
 import tempfile
 import time
 import uuid
@@ -57,7 +56,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
 import yaml
 
 logging.basicConfig(
@@ -85,6 +83,7 @@ DEFAULT_PROMPTS = [
 # ---------------------------------------------------------------------------
 #  Stage config generation
 # ---------------------------------------------------------------------------
+
 
 def _build_talker_only_stage_config(
     max_num_seqs: int = 1,
@@ -155,7 +154,10 @@ def _build_talker_only_stage_config(
 def _write_temp_stage_config(cfg: dict) -> str:
     """Write stage config dict to a temp YAML file, return its path."""
     tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yaml", prefix="talker_nv_bench_", delete=False,
+        mode="w",
+        suffix=".yaml",
+        prefix="talker_nv_bench_",
+        delete=False,
     )
     yaml.dump(cfg, tmp, default_flow_style=False, sort_keys=False)
     tmp.close()
@@ -166,6 +168,7 @@ def _write_temp_stage_config(cfg: dict) -> str:
 # ---------------------------------------------------------------------------
 #  Prompt construction
 # ---------------------------------------------------------------------------
+
 
 def _estimate_prompt_len(
     additional_information: dict[str, Any],
@@ -185,10 +188,13 @@ def _estimate_prompt_len(
             from transformers import AutoTokenizer
 
             tok = AutoTokenizer.from_pretrained(
-                model_name, trust_remote_code=True, padding_side="left",
+                model_name,
+                trust_remote_code=True,
+                padding_side="left",
             )
             hf_cfg = Qwen3TTSConfig.from_pretrained(
-                model_name, trust_remote_code=True,
+                model_name,
+                trust_remote_code=True,
             )
             _cache[model_name] = (tok, getattr(hf_cfg, "talker_config", None))
 
@@ -230,6 +236,7 @@ def build_input(
 # ---------------------------------------------------------------------------
 #  Result dataclasses
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class RequestResult:
@@ -278,6 +285,7 @@ class BenchmarkResult:
 # ---------------------------------------------------------------------------
 #  Inference
 # ---------------------------------------------------------------------------
+
 
 async def run_one_request(omni, prompt: dict, request_id: str) -> RequestResult:
     """Submit one TTS request and collect outputs with per-token timing.
@@ -338,6 +346,7 @@ async def run_one_request(omni, prompt: dict, request_id: str) -> RequestResult:
 #  Worker / concurrency
 # ---------------------------------------------------------------------------
 
+
 async def worker(
     worker_id: int,
     omni,
@@ -383,6 +392,7 @@ async def worker(
 # ---------------------------------------------------------------------------
 #  Metrics
 # ---------------------------------------------------------------------------
+
 
 def _pct(arr, p):
     return float(np.percentile(arr, p)) if len(arr) > 0 else 0.0
@@ -445,7 +455,8 @@ def compute_and_print_metrics(
             "steps": r.steps,
             "prompt_len": r.prompt_len,
             "mean_itl_ms": float(np.mean([t * 1000 for t in r.inter_token_latencies]))
-            if r.inter_token_latencies else 0.0,
+            if r.inter_token_latencies
+            else 0.0,
             "text": r.text,
         }
         for r in successful
@@ -508,6 +519,7 @@ def compute_and_print_metrics(
 #  Main
 # ---------------------------------------------------------------------------
 
+
 async def main(args):
     from vllm_omni import AsyncOmni
 
@@ -569,14 +581,14 @@ async def main(args):
         for concurrency in args.concurrency:
             logger.info(
                 "═══ concurrency=%d  requests=%d ═══",
-                concurrency, args.num_requests,
+                concurrency,
+                args.num_requests,
             )
 
             # ── Warmup ────────────────────────────────────────────────────
             warmup_count = 0 if args.no_warmup else args.num_warmups * concurrency
             if warmup_count > 0:
-                logger.info("Warming up with %d requests (concurrency=%d)...",
-                            warmup_count, concurrency)
+                logger.info("Warming up with %d requests (concurrency=%d)...", warmup_count, concurrency)
                 warmup_results: list[RequestResult] = []
                 warmup_counter = {
                     "remaining": warmup_count,
@@ -585,17 +597,19 @@ async def main(args):
                 }
                 warmup_lock = asyncio.Lock()
                 warmup_tasks = [
-                    asyncio.create_task(worker(
-                        worker_id=i,
-                        omni=omni,
-                        texts=texts,
-                        model_name=model_name,
-                        speaker=args.speaker,
-                        language=args.language,
-                        results=warmup_results,
-                        counter=warmup_counter,
-                        lock=warmup_lock,
-                    ))
+                    asyncio.create_task(
+                        worker(
+                            worker_id=i,
+                            omni=omni,
+                            texts=texts,
+                            model_name=model_name,
+                            speaker=args.speaker,
+                            language=args.language,
+                            results=warmup_results,
+                            counter=warmup_counter,
+                            lock=warmup_lock,
+                        )
+                    )
                     for i in range(concurrency)
                 ]
                 await asyncio.gather(*warmup_tasks)
@@ -603,8 +617,7 @@ async def main(args):
                 logger.info("Warmup done: %d / %d succeeded.", warmup_ok, warmup_count)
 
             # ── Benchmark run ─────────────────────────────────────────────
-            logger.info("Starting benchmark run (%d requests, concurrency=%d)...",
-                        args.num_requests, concurrency)
+            logger.info("Starting benchmark run (%d requests, concurrency=%d)...", args.num_requests, concurrency)
 
             bench_results: list[RequestResult] = []
             counter = {
@@ -624,17 +637,19 @@ async def main(args):
             start_time = time.perf_counter()
             try:
                 tasks = [
-                    asyncio.create_task(worker(
-                        worker_id=i,
-                        omni=omni,
-                        texts=texts,
-                        model_name=model_name,
-                        speaker=args.speaker,
-                        language=args.language,
-                        results=bench_results,
-                        counter=counter,
-                        lock=lock,
-                    ))
+                    asyncio.create_task(
+                        worker(
+                            worker_id=i,
+                            omni=omni,
+                            texts=texts,
+                            model_name=model_name,
+                            speaker=args.speaker,
+                            language=args.language,
+                            results=bench_results,
+                            counter=counter,
+                            lock=lock,
+                        )
+                    )
                     for i in range(concurrency)
                 ]
                 await asyncio.gather(*tasks)
@@ -646,7 +661,10 @@ async def main(args):
             duration = time.perf_counter() - start_time
 
             bench = compute_and_print_metrics(
-                bench_results, duration, concurrency, args.num_requests,
+                bench_results,
+                duration,
+                concurrency,
+                args.num_requests,
             )
             bench.config_name = args.config_name
             all_bench_results.append(asdict(bench))
@@ -677,43 +695,59 @@ def parse_args():
 
     model = parser.add_argument_group("model / input")
     model.add_argument(
-        "--model", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        "--model",
+        type=str,
+        default="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
         help="Model name or path",
     )
     model.add_argument(
-        "--text-file", type=str, default=None,
-        help="Path to text file (one utterance per line, optionally "
-             "tab-separated with text in 2nd column)",
+        "--text-file",
+        type=str,
+        default=None,
+        help="Path to text file (one utterance per line, optionally tab-separated with text in 2nd column)",
     )
     model.add_argument("--speaker", type=str, default="aiden")
     model.add_argument("--language", type=str, default="English")
     model.add_argument(
-        "--max-new-tokens", type=int, default=2048,
-        help="Max sampling tokens per request (passed via "
-             "default_sampling_params.max_tokens)",
+        "--max-new-tokens",
+        type=int,
+        default=2048,
+        help="Max sampling tokens per request (passed via default_sampling_params.max_tokens)",
     )
 
     bench = parser.add_argument_group("benchmark")
     bench.add_argument(
-        "-c", "--concurrency", type=int, nargs="+", default=[1],
+        "-c",
+        "--concurrency",
+        type=int,
+        nargs="+",
+        default=[1],
         help="Concurrency levels to test (space-separated, default: 1)",
     )
     bench.add_argument(
-        "-n", "--num-requests", type=int, default=50,
+        "-n",
+        "--num-requests",
+        type=int,
+        default=50,
         help="Total number of requests per concurrency level (default: 50)",
     )
     bench.add_argument(
-        "--num-warmups", type=int, default=3,
-        help="Warmup rounds per concurrency level "
-             "(total warmup = concurrency * this, default: 3)",
+        "--num-warmups",
+        type=int,
+        default=3,
+        help="Warmup rounds per concurrency level (total warmup = concurrency * this, default: 3)",
     )
     bench.add_argument("--no-warmup", action="store_true", help="Skip warmup")
     bench.add_argument(
-        "--config-name", type=str, default="talker_nv",
+        "--config-name",
+        type=str,
+        default="talker_nv",
         help="Label for this run (used in result filenames)",
     )
     bench.add_argument(
-        "--result-dir", type=str, default=None,
+        "--result-dir",
+        type=str,
+        default=None,
         help="Directory to save JSON results",
     )
 
@@ -725,27 +759,28 @@ def parse_args():
     engine.add_argument("--stage-init-timeout", type=int, default=300)
     engine.add_argument("--log-stats", action="store_true", default=False)
     engine.add_argument(
-        "--distributed-executor-backend", type=str, default="uni",
+        "--distributed-executor-backend",
+        type=str,
+        default="uni",
         choices=["uni", "mp", "ray"],
         help="vLLM executor backend. 'uni' runs the worker in-process and "
-             "avoids the shm_broadcast IPC round-trips on every "
-             "execute_model/sample_tokens call (recommended for TP=1, "
-             "single GPU). Default: uni.",
+        "avoids the shm_broadcast IPC round-trips on every "
+        "execute_model/sample_tokens call (recommended for TP=1, "
+        "single GPU). Default: uni.",
     )
 
     prof = parser.add_argument_group("profiling")
     prof.add_argument(
-        "--profile", action="store_true",
+        "--profile",
+        action="store_true",
         help="Enable torch profiler during the benchmark run",
     )
-    prof.add_argument("--profile-prefix", type=str, default=None,
-                      help="Prefix for profiler trace filenames")
-    prof.add_argument("--torch-profiler-dir", type=str, default="./profiler_traces",
-                      help="Directory for torch profiler traces")
-    prof.add_argument("--with-stack", action="store_true",
-                      help="Record Python call stacks in profiler")
-    prof.add_argument("--record-shapes", action="store_true",
-                      help="Record tensor shapes in profiler")
+    prof.add_argument("--profile-prefix", type=str, default=None, help="Prefix for profiler trace filenames")
+    prof.add_argument(
+        "--torch-profiler-dir", type=str, default="./profiler_traces", help="Directory for torch profiler traces"
+    )
+    prof.add_argument("--with-stack", action="store_true", help="Record Python call stacks in profiler")
+    prof.add_argument("--record-shapes", action="store_true", help="Record tensor shapes in profiler")
 
     return parser.parse_args()
 

@@ -18,6 +18,7 @@ torch.backends.cudnn.allow_tf32 = False
 # Bypass torch.vmap-based mask builders (untraceable by ONNX export).
 try:
     import transformers.masking_utils as _mu
+
     for _name in ("create_causal_mask", "create_sliding_window_causal_mask"):
         if hasattr(_mu, _name):
             setattr(_mu, _name, lambda *a, **kw: None)
@@ -40,16 +41,14 @@ try:
     import onnx
 except ImportError as exc:
     raise ImportError(
-        "`onnx` is required on top of the Qwen3-TTS environment. "
-        "Install with: pip install onnx onnxruntime"
+        "`onnx` is required on top of the Qwen3-TTS environment. Install with: pip install onnx onnxruntime"
     ) from exc
 
 try:
     from qwen_tts import Qwen3TTSTokenizer
 except ImportError as exc:
     raise ImportError(
-        "`qwen_tts` not importable; install Qwen3-TTS per "
-        "https://github.com/QwenLM/Qwen3-TTS#quickstart."
+        "`qwen_tts` not importable; install Qwen3-TTS per https://github.com/QwenLM/Qwen3-TTS#quickstart."
     ) from exc
 
 
@@ -80,9 +79,11 @@ def check_onnx_parity(wrapper, onnx_path, audio_codes, device, atol=1e-3):
     ort_out = sess.run(None, {"audio_codes": audio_codes.cpu().numpy()})[0]
     max_diff = float(np.abs(ref - ort_out).max())
     ok = max_diff <= atol
-    print(f"ONNX parity ({sess.get_providers()[0]}): "
-          f"max_abs_diff={max_diff:.6f}  atol={atol}  "
-          f"{'PASSED' if ok else 'FAILED'}")
+    print(
+        f"ONNX parity ({sess.get_providers()[0]}): "
+        f"max_abs_diff={max_diff:.6f}  atol={atol}  "
+        f"{'PASSED' if ok else 'FAILED'}"
+    )
     return ok
 
 
@@ -112,9 +113,11 @@ def main():
 
     nq = int(decoder.config.num_quantizers)
     dummy = torch.randint(
-        0, int(decoder.config.codebook_size),
+        0,
+        int(decoder.config.codebook_size),
         (args.batch_size, args.frames, nq),
-        dtype=torch.long, device=device,
+        dtype=torch.long,
+        device=device,
     )
 
     onnx_path = Path(args.onnx_path)
@@ -122,7 +125,9 @@ def main():
 
     with torch.inference_mode():
         torch.onnx.export(
-            wrapper, (dummy,), str(onnx_path),
+            wrapper,
+            (dummy,),
+            str(onnx_path),
             dynamo=False,
             export_params=True,
             opset_version=args.opset,
