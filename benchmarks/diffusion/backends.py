@@ -151,7 +151,7 @@ async def async_request_chat_completions(
     return output
 
 
-async def async_request_openai_images(
+async def async_request_openai_image_generations(
     input: RequestFuncInput,
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
@@ -348,12 +348,38 @@ async def async_request_v1_videos(
     return output
 
 
+LEGACY_BACKEND_ENDPOINT_ALIASES = {
+    "vllm-omni": "/v1/chat/completions",
+    "openai": "/v1/images/generations",
+}
+
+
+def normalize_endpoint(value: str) -> str:
+    endpoint = str(value).strip()
+    if not endpoint:
+        raise ValueError("endpoint must not be empty.")
+    endpoint = LEGACY_BACKEND_ENDPOINT_ALIASES.get(
+        endpoint,
+        LEGACY_BACKEND_ENDPOINT_ALIASES.get(endpoint.lstrip("/"), endpoint),
+    )
+    if not endpoint.startswith("/"):
+        endpoint = f"/{endpoint}"
+    return endpoint
+
+
+def endpoint_filename_token(value: str) -> str:
+    token = normalize_endpoint(value).lstrip("/")
+    for bad in ("/", "\\", ":", "*", "?", '"', "<", ">", "|"):
+        token = token.replace(bad, "_")
+    return token or "endpoint"
+
+
 backends_function_mapping = {
     "2i": {
-        "vllm-omni": (async_request_chat_completions, "/v1/chat/completions"),
-        "openai": (async_request_openai_images, "/v1/images/generations"),
+        "/v1/chat/completions": (async_request_chat_completions, "/v1/chat/completions"),
+        "/v1/images/generations": (async_request_openai_image_generations, "/v1/images/generations"),
     },
     "2v": {
-        "v1/videos": (async_request_v1_videos, "/v1/videos"),
+        "/v1/videos": (async_request_v1_videos, "/v1/videos"),
     },
 }

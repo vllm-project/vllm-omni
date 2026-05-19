@@ -1,12 +1,13 @@
 """Assertion and response validation helpers for tests."""
 
 import io
+import json
 import tempfile
 import threading
 import wave
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from tests.helpers.runtime import DiffusionResponse
@@ -495,62 +496,12 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
                 )
 
 
-def _speech_combined_error_text_for_assert(response: Any) -> str:
-    """Join ``error_message`` and UTF-8 body (e.g. HTTP 200 + JSON) for substring checks."""
-    parts: list[str] = []
-    em = getattr(response, "error_message", None)
-    if em:
-        parts.append(str(em))
-    ab = getattr(response, "audio_bytes", None)
-    if ab:
-        parts.append(ab.decode("utf-8", errors="replace"))
-    return "\n".join(parts)
-
-
-def _assert_speech_error_substrings(haystack: str, err_expected: Any) -> None:
-    if isinstance(err_expected, (list, tuple)):
-        assert any(str(s) in haystack for s in err_expected), (
-            f"Expected error text to contain one of {err_expected!r}, got: {haystack!r}"
-        )
-    else:
-        assert str(err_expected) in haystack, f"Expected error text to contain {str(err_expected)!r}, got: {haystack!r}"
-
-
 def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str) -> None:
-    """Validate speech API results.
+    """Validate speech API results from :class:`~tests.helpers.runtime.OmniResponse`.
 
-    If ``status_code`` is set: assert HTTP status, then optional ``err_message`` (4xx: ``error_message`` only;
-    HTTP 200: ``error_message`` and/or body, e.g. JSON with HTTP 200).
-
-    If only ``err_message`` is set: assert substring(s) on combined error text. Otherwise success/min_audio/etc.
+    Success path only. Use :meth:`OpenAIClientHandler.send_audio_speech_http_request` with ``err_code`` /
+    ``err_message`` for expected HTTP errors.
     """
-    # When present, only compare HTTP status and skip all other checks (e.g. expected 4xx).
-    # ``status_code`` may be a single int or a collection of allowed codes (e.g. ``(400, 422)``).
-    expected_status = request_config.get("status_code")
-    err_expected = request_config.get("err_message")
-    if expected_status is not None:
-        actual = getattr(response, "status_code", None)
-        assert actual is not None, (
-            "request_config has status_code but response has no .status_code "
-            "(set OmniResponse.status_code or pass a response object with status_code)"
-        )
-        if isinstance(expected_status, (list, tuple, set, frozenset)):
-            assert actual in expected_status, f"Expected HTTP status in {expected_status!r}, got {actual}"
-        else:
-            assert actual == int(expected_status), f"Expected HTTP status {int(expected_status)}, got {actual}"
-
-        if err_expected is not None:
-            if actual is not None and actual != 200:
-                msg = (getattr(response, "error_message", None) or "") + ""
-                _assert_speech_error_substrings(msg, err_expected)
-            else:
-                _assert_speech_error_substrings(_speech_combined_error_text_for_assert(response), err_expected)
-        return
-
-    if err_expected is not None:
-        _assert_speech_error_substrings(_speech_combined_error_text_for_assert(response), err_expected)
-        return
-
     assert response.success, "The request failed."
 
     # Optional floor on decoded audio size (models with very short clips may use a lower value).
@@ -599,10 +550,128 @@ def assert_diffusion_response(response: "DiffusionResponse", request_config: dic
         assert_audio_diffusion_response(response=response, request_config=request_config, run_level=run_level)
 
 
+def _http_response_body_materialize(resp: Any) -> tuple[bytes, dict[str, Any] | None]:
+    """Serialize ``HttpResponse``-like body to UTF-8 bytes and parse a JSON object when possible."""
+    jb = getattr(resp, "json_body", None)
+    if jb is not None:
+        raw = json.dumps(jb, ensure_ascii=False).encode("utf-8")
+        if isinstance(jb, dict):
+            return raw, jb
+        try:
+            parsed = json.loads(raw.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            return raw, None
+        return raw, parsed if isinstance(parsed, dict) else None
+    err = getattr(resp, "error_message", None)
+    raw = (err or "").encode("utf-8", errors="replace")
+    try:
+        parsed = json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return raw, None
+    return raw, parsed if isinstance(parsed, dict) else None
+
+
+def assert_err_message_in_text(
+    haystack: str,
+    err_message: str | tuple[str, ...] | list[str] | set[str] | frozenset[str],
+    *,
+    sequence_match: Literal["all", "any"] = "all",
+) -> None:
+    """Assert ``err_message`` appears in ``haystack`` (case-insensitive).
+
+    For non-string sequences: ``sequence_match='all'`` requires every substring (HTTP-style);
+    ``sequence_match='any'`` requires at least one (WebSocket first-frame JSON helpers).
+    """
+    hl = haystack.lower()
+    if isinstance(err_message, (list, tuple, set, frozenset)):
+        if sequence_match == "all":
+            missing = [s for s in err_message if str(s).lower() not in hl]
+            assert not missing, (
+                f"Expected error text to contain all of {err_message!r}; missing {missing!r}. haystack={haystack!r}"
+            )
+        else:
+            assert any(str(s).lower() in hl for s in err_message), (
+                f"Expected error text to contain one of {err_message!r}. haystack={haystack!r}"
+            )
+    else:
+        assert str(err_message).lower() in hl, f"Expected error text to contain {str(err_message)!r}, got: {haystack!r}"
+
+
+def assert_http_error(
+    resp: Any,
+    *,
+    err_code: int | tuple[int, ...] | list[int] | None = None,
+    err_message: str | tuple[str, ...] | list[str] | None = None,
+    websocket_json_message: bool = False,
+) -> dict[str, Any] | None:
+    """Validate a raw-HTTP :class:`~tests.helpers.runtime.HttpResponse`-like object.
+
+    Used by :class:`~tests.helpers.runtime.OpenAIClientHandler` ``send_*_http_request`` helpers when
+    ``request_config`` contains optional ``err_code`` and/or ``err_message``.
+
+    When ``websocket_json_message=True``, only ``json_body`` is checked (first JSON WebSocket text frame).
+    Tuple/list ``err_message`` then uses **any** substring match; HTTP mode still requires **all** pieces.
+
+    - ``err_code``: exact HTTP ``int``, or membership if a non-string sequence (e.g. ``(400, 422)``).
+      When ``err_code`` is set and the actual status is a client error in ``400..499`` other than ``404``,
+      the JSON body must include FastAPI ``detail`` and/or OpenAI-style ``error`` (2xx skips this).
+    - ``err_message``: substring match (case-insensitive) against serialized ``json_body`` and ``error_message``.
+      If ``err_message`` is a non-string sequence (``list`` / ``tuple`` / ``set`` / ``frozenset``), **every**
+      element must appear as a substring; a plain ``str`` still requires that single substring.
+    """
+    if websocket_json_message:
+        if err_code is not None:
+            raise ValueError("assert_http_error: err_code is incompatible with websocket_json_message=True")
+        jb_ws = getattr(resp, "json_body", None)
+        assert jb_ws is not None, resp
+        if err_message is None:
+            return jb_ws if isinstance(jb_ws, dict) else None
+        assert_err_message_in_text(
+            json.dumps(jb_ws, ensure_ascii=False),
+            err_message,
+            sequence_match="any",
+        )
+        return jb_ws if isinstance(jb_ws, dict) else None
+
+    if err_code is None and err_message is None:
+        return None
+
+    actual = getattr(resp, "status_code", None)
+    assert actual is not None, "response missing status_code"
+
+    if err_code is not None:
+        if isinstance(err_code, int):
+            assert actual == err_code, (resp, err_code)
+        else:
+            allowed = tuple(err_code)
+            assert actual in allowed, (resp, allowed)
+
+    body_bytes, payload = _http_response_body_materialize(resp)
+
+    if err_code is not None and actual is not None and 400 <= actual < 500 and actual != 404:
+        assert payload is not None, getattr(resp, "error_message", resp)
+        assert "detail" in payload or "error" in payload, payload
+
+    if err_message is not None:
+        pieces: list[str] = []
+        jb = getattr(resp, "json_body", None)
+        if jb is not None:
+            pieces.append(json.dumps(jb, ensure_ascii=False))
+        em = getattr(resp, "error_message", None)
+        if em:
+            pieces.append(str(em))
+        haystack = "\n".join(pieces) if pieces else body_bytes.decode("utf-8", errors="replace")
+        assert_err_message_in_text(haystack, err_message, sequence_match="all")
+
+    return payload
+
+
 __all__ = [
     "assert_audio_diffusion_response",
     "assert_audio_speech_response",
     "assert_diffusion_response",
+    "assert_err_message_in_text",
+    "assert_http_error",
     "assert_image_diffusion_response",
     "assert_image_valid",
     "assert_omni_response",

@@ -143,6 +143,42 @@ def parse_args() -> argparse.Namespace:
         help="Enable layerwise (blockwise) offloading on DiT modules.",
     )
     parser.add_argument(
+        "--enforce-eager",
+        action="store_true",
+        help="Disable torch.compile and force eager execution.",
+    )
+    parser.add_argument(
+        "--audio-sample-rate",
+        type=int,
+        default=24000,
+        help="Sample rate for audio output when saved (default: 24000).",
+    )
+    parser.add_argument(
+        "--cache-backend",
+        type=str,
+        default=None,
+        choices=["cache_dit", "tea_cache"],
+        help=(
+            "Cache backend to use for acceleration. "
+            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache). "
+            "Default: None (no cache acceleration)."
+        ),
+    )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
+    )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default=None,
+        choices=["fp8", "mxfp8", "int8", "gguf"],
+        help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 online quant (NPU). fp8: online FP8 (GPU).",
+    )
+
+    # Distributed and parallel execution
+    parser.add_argument(
         "--ulysses-degree",
         type=int,
         default=1,
@@ -174,28 +210,6 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for VAE patch/tile parallelism (decode).",
     )
     parser.add_argument(
-        "--enforce-eager",
-        action="store_true",
-        help="Disable torch.compile and force eager execution.",
-    )
-    parser.add_argument(
-        "--audio-sample-rate",
-        type=int,
-        default=24000,
-        help="Sample rate for audio output when saved (default: 24000).",
-    )
-    parser.add_argument(
-        "--cache-backend",
-        type=str,
-        default=None,
-        choices=["cache_dit", "tea_cache"],
-        help=(
-            "Cache backend to use for acceleration. "
-            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (Timestep Embedding Aware Cache). "
-            "Default: None (no cache acceleration)."
-        ),
-    )
-    parser.add_argument(
         "--use-hsdp",
         action="store_true",
         help=("Enable Hybrid Sharded Data Parallel to shard model weights across GPUs. "),
@@ -219,16 +233,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--quantization",
-        type=str,
-        default=None,
-        choices=["fp8", "mxfp8", "int8", "gguf"],
-        help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 online quant (NPU). fp8: online FP8 (GPU).",
-    )
-    parser.add_argument(
-        "--enable-diffusion-pipeline-profiler",
-        action="store_true",
-        help="Enable diffusion pipeline profiler to display stage durations.",
+        "--pipeline-parallel-size",
+        type=int,
+        default=1,
+        help="Number of pipeline parallel stages.",
     )
     parser.add_argument(
         "--profiler-config",
@@ -326,6 +334,7 @@ def main():
         use_hsdp=args.use_hsdp,
         hsdp_shard_size=args.hsdp_shard_size,
         hsdp_replicate_size=args.hsdp_replicate_size,
+        pipeline_parallel_size=args.pipeline_parallel_size,
     )
     omni_kwargs = dict(
         model=args.model,
@@ -366,7 +375,8 @@ def main():
     print(f"  diffusion_kv_cache_skip_layers(config): {args.diffusion_kv_cache_skip_layers}")
     print(
         f"  Parallel configuration: cfg_parallel_size={args.cfg_parallel_size},"
-        f" tensor_parallel_size={args.tensor_parallel_size}, vae_patch_parallel_size={args.vae_patch_parallel_size}"
+        f" tensor_parallel_size={args.tensor_parallel_size}, vae_patch_parallel_size={args.vae_patch_parallel_size},"
+        f" pipeline_parallel_size={args.pipeline_parallel_size}"
     )
     print(f"  Video size: {args.width}x{args.height}")
     print(f"{'=' * 60}\n")
