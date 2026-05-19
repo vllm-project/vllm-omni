@@ -1478,10 +1478,55 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                         f"[R23logits] sample#{self._r23_n} q={q} top5_idx={idxs} top5_val={['%.3f' % v for v in vals]} hidden_norm={_hn:.3f}",
                         file=_sys_r23.stderr, flush=True,
                     )
-        # R12 (PyTorch align): do NOT mask stream specials before sampling —
-        # upstream lets the model emit ``audio_stream_bos_id`` (1024) and
-        # ``audio_stream_eos_id`` (1025) freely; the delay-pattern logic
-        # downstream interprets them (leading BOS pad / trailing EOS ramp).
+        # R26: emulate upstream's ``HiggsAudioV2DelayPatternLogitsProcessor``.
+        # The raw audio_lm_head has very large weights at index 1025
+        # (audio_stream_eos): cb1 |w[1025]|=9.25 vs mean content 1.53 (6x).
+        # Without masking, the model naturally fires 1025 at codebook 1..6
+        # with huge confidence (logit 32 vs runner-up 6) and triggers
+        # premature ramp-down at frame 2. Upstream's processor MASKS
+        # forbidden vocab BEFORE sampling so each codebook k is bound to:
+        #   - emit ``audio_stream_bos_id`` (1024) for k leading frames,
+        #   - emit content tokens [0..1023] thereafter,
+        #   - emit ``audio_stream_eos_id`` (1025) only during ramp-down.
+        bos_pre = int(self.config.audio_stream_bos_id)
+        eos_pre = int(self.config.audio_stream_eos_id)
+        cb_size_pre = int(self.config.codebook_size)
+        for local_i, batch_i in enumerate(audio_row_indices):
+            state_pre = self._audio_state.get(int(batch_i))
+            num_delay_pre = int(state_pre.get("num_delay", 0)) if state_pre else 0
+            num_rem_pre = state_pre.get("num_remaining_delays") if state_pre else None
+            if num_rem_pre is not None:
+                # Ramp-down: mask all but EOS for the EOS-locked codebooks; the
+                # remaining ones still emit content. Locked range: codebooks
+                # [0 : num_codebooks - num_rem_pre].
+                lock_until = int(self.config.num_codebooks) - int(num_rem_pre)
+                for q in range(int(self.config.num_codebooks)):
+                    row = cb_logits[local_i, q]
+                    if q < lock_until:
+                        mask = torch.full_like(row, float("-inf"))
+                        mask[eos_pre] = row[eos_pre]
+                        cb_logits[local_i, q] = mask
+                    else:
+                        # disallow stream specials during ramp-down content frames
+                        cb_logits[local_i, q, bos_pre] = float("-inf")
+                        cb_logits[local_i, q, eos_pre] = float("-inf")
+            else:
+                # Leading delay phase. Codebook k starts emitting real content
+                # at step k (delay = k). Steps with k > num_delay_pre are still
+                # in BOS phase — force 1024. Steps with k <= num_delay_pre are
+                # content — disallow 1024 (BOS) and 1025 (EOS).
+                for q in range(int(self.config.num_codebooks)):
+                    row = cb_logits[local_i, q]
+                    if q > num_delay_pre:
+                        mask = torch.full_like(row, float("-inf"))
+                        mask[bos_pre] = row[bos_pre]
+                        cb_logits[local_i, q] = mask
+                    else:
+                        cb_logits[local_i, q, bos_pre] = float("-inf")
+                        # Allow EOS at codebook 0 only (it gates ramp-down).
+                        # Disallow at all other content codebooks.
+                        if q != 0:
+                            cb_logits[local_i, q, eos_pre] = float("-inf")
 
         # Sample per-codebook, following the upstream
         # ``HiggsAudioModel._sample_audio_tokens`` pipeline byte-for-byte.
