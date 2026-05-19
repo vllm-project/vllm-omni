@@ -1,64 +1,32 @@
-# higgs-audio v2 offline example
+# higgs-audio v2 offline tools
 
-This directory contains the higgs-audio v2 offline inference scaffolding for vllm-omni:
+This directory contains offline helpers for the vllm-omni `higgs_audio_v2` model.
 
-- `reference_hf.py` — runs the upstream HF model (`bosonai/higgs-audio-v2-generation-3B-base` + `bosonai/higgs-audio-v2-tokenizer`) on a pinned prompt with greedy decode and saves the per-prompt fixture set (`tests/fixtures/higgs_audio_v2/reference_*.pt`) plus a human-readable upstream trace memo (`vllm_omni/model_executor/models/higgs_audio_v2/UPSTREAM_TRACE.md`). The captured `audio_codes` / `input_ids` / `audio_token_mask` are authoritative; the `reference_pcm` is NOT (the HF AutoProcessor's audio_tokenizer was loaded with random weights). Use `reference_serve_engine.py` for an authoritative upstream PCM reference.
-- `reference_serve_engine.py` — recipe for capturing an authoritative upstream PCM reference via boson-ai's own `HiggsAudioServeEngine`. Requires the upstream `boson_multimodal` package; the script bails out with a clear install hint when that's not available.
-- `end2end.py` — exercises the vllm-omni higgs_audio_v2 path in two modes:
-  - `--mode hf_reference` runs the upstream HF reference and saves a 24 kHz WAV (downloads the boson-ai checkpoints if not cached).
-  - `--mode stage1_only` replays a saved fixture's `[8, T]` code tensor through vllm-omni's Stage-1 decoder (`HiggsAudioV2Code2Wav`) to validate AC-4 (Stage-1 decode parity) without invoking the 3B Stage-0 talker.
+- `recog_wav.py` — ASR-based sanity check: loads an English offline transducer
+  (sherpa-onnx-nemo-fast-conformer) and transcribes one or more synthesized
+  WAV files, optionally comparing against an expected prompt with a simple
+  word-level WER.
 
-## Prerequisites
+The online-serving entry points live under
+`examples/online_serving/text_to_speech/higgs_audio_v2/` (Gradio demo,
+batch speech client, `run_server.sh`). The Stage-0 talker + Stage-1 codec
+implementation is under
+`vllm_omni/model_executor/models/higgs_audio_v2/`; the upstream architecture
+contract is documented in `UPSTREAM_TRACE.md` in that directory.
 
-- A CUDA-capable GPU. The defaults target H100/A100 80GB (see DEC-3 in `results/plan.md`).
-- A vllm-omni environment with `transformers >= 5.3.0` and the boson-ai checkpoints accessible via HF cache.
-- A project-local `.venv`:
-
-  ```bash
-  source /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/tts/vllm-omni/.venv/bin/activate
-  ```
-
-## Capture the reference fixtures (run once)
+## Usage
 
 ```bash
-CUDA_VISIBLE_DEVICES=6,7 \
-HF_HOME=/path/to/hf-cache \
-python examples/offline_inference/text_to_speech/higgs_audio_v2/reference_hf.py \
-    --prompts "Hello world." \
-    --max-new-tokens 50 \
-    --output-dir tests/fixtures/higgs_audio_v2 \
-    --write-trace
+python examples/offline_inference/text_to_speech/higgs_audio_v2/recog_wav.py \
+    --wav /tmp/hello_world.wav \
+          /tmp/the_quick_brown_fox.wav \
+    --expected "Hello world." \
+               "The quick brown fox jumps over the lazy dog."
 ```
-
-Outputs:
-- `tests/fixtures/higgs_audio_v2/reference_hello_world.pt`
-- `vllm_omni/model_executor/models/higgs_audio_v2/UPSTREAM_TRACE.md`
-
-## Validate Stage-1 decode parity
-
-```bash
-python examples/offline_inference/text_to_speech/higgs_audio_v2/end2end.py \
-    --mode stage1_only \
-    --fixture tests/fixtures/higgs_audio_v2/reference_hello_world.pt \
-    --audio-tokenizer-dir ~/.cache/huggingface/hub/models--bosonai--higgs-audio-v2-tokenizer/snapshots/<rev>/audio_tokenizer \
-    --output-wav stage1_replay.wav \
-    --compare-with-reference
-```
-
-The `--compare-with-reference` flag prints the normalized-float PCM RMS between the vllm-omni Stage-1 output and the upstream HF decode; AC-4 requires RMS <= 1e-4.
-
-## Run the HF reference end-to-end
-
-```bash
-CUDA_VISIBLE_DEVICES=6,7 \
-python examples/offline_inference/text_to_speech/higgs_audio_v2/end2end.py \
-    --mode hf_reference \
-    --text "Hello world." \
-    --output-wav hello_hf_reference.wav
-```
-
-This is the upstream smoke path; useful when validating a fresh install. The vllm-omni Stage-0 talker is registered with a full DualFFN-routed forward and HF→vLLM-native weight loader, but the sampler-side dispatch that emits codebook-0 IDs at audio positions still lands in a follow-up; until that ships, the live `/v1/audio/speech` smoke path requires the upstream-traced sampler-codebook adapter described in `vllm_omni/model_executor/models/higgs_audio_v2/UPSTREAM_TRACE.md` and at the model-package `__init__.py` / talker docstring.
 
 ## Scope (v1)
 
-Plain text -> 24 kHz speech only. Voice cloning, multi-speaker dialogue, ChatML rich content, and reference audio are rejected with explicit 4xx by the request validator in `vllm_omni/entrypoints/openai/serving_speech.py`. See `results/plan.md` AC-5 for the full rejection list.
+Plain text -> 24 kHz speech only. Voice cloning, multi-speaker dialogue,
+ChatML rich content, language overrides, `task_type`, `speed != 1.0`, and
+reference audio are rejected with explicit 4xx by the request validator in
+`vllm_omni/entrypoints/openai/serving_speech.py`.

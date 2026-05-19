@@ -137,7 +137,7 @@ def talker2code2wav(
                 f"audio_codes must be 1D or 2D; got shape {tuple(audio_codes.shape)}"
             )
 
-        # R12: audio_codes from Stage-0 are emitted in DELAY-PATTERN layout.
+        # Audio_codes from Stage-0 are emitted in DELAY-PATTERN layout.
         # Revert the shift to recover the canonical ``[Q, seq_len]`` form,
         # then clip to the real-code range and trim the first/last frame
         # (the codec doesn't consume the BOS/EOS edge frames). This mirrors

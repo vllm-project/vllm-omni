@@ -7,11 +7,9 @@ DualFFN-aware decoder layers.  Capture is performed at fixed batch sizes
 (default ``{1, 2, 4}``); on replay failure or any RuntimeError the wrapper
 falls back to eager execution and emits a ``higgs_audio_v2``-named warning.
 
-The talker forward path itself is gated on the upstream-trace memo + reference
-fixtures and is not exercised in Round 2 (see goal-tracker Open Issues).
-Capturing a NotImplementedError-raising forward is not useful, so this wrapper
-returns ``WrapperState.NOT_CAPTURED`` when the underlying module has not been
-warmed up; callers should treat that as eager-fallback and proceed.
+If the underlying module has not been warmed up yet (e.g. before its first
+forward call), the wrapper returns ``WrapperState.NOT_CAPTURED`` so callers
+can treat that as eager-fallback and proceed.
 """
 
 from __future__ import annotations

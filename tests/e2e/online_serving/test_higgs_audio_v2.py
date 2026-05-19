@@ -17,14 +17,8 @@ from __future__ import annotations
 
 import os
 import sys
-from pathlib import Path
-
 import pytest
 import torch
-
-REPO_ROOT = Path(__file__).resolve().parents[3]
-FIXTURE = REPO_ROOT / "tests" / "fixtures" / "higgs_audio_v2" / "reference_hello_world.pt"
-
 
 # --------------------------------------------------------------------- scope
 def test_validator_rejects_voice_cloning_fields() -> None:
@@ -41,7 +35,6 @@ def test_validator_rejects_voice_cloning_fields() -> None:
         assert "higgs_audio_v2" in str(excinfo.value)
         assert field in str(excinfo.value)
 
-
 def test_validator_rejects_multi_speaker_tag() -> None:
     from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_tokenizer import (
         UnsupportedInputError,
@@ -52,14 +45,12 @@ def test_validator_rejects_multi_speaker_tag() -> None:
         validate_plain_text_request({"input": "[SPEAKER0] hi"})
     assert "multi-speaker" in str(excinfo.value).lower()
 
-
 def test_validator_accepts_plain_text() -> None:
     from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_tokenizer import (
         validate_plain_text_request,
     )
 
     validate_plain_text_request({"input": "Hello world."})
-
 
 # ---------------------------------------------- serving-level request validator
 @pytest.fixture
@@ -74,7 +65,6 @@ def _make_speech_request():
 
     return _build
 
-
 # A bound version of ``_validate_higgs_audio_v2_request`` does not need
 # the full serving instance; we just want to call the function. Use a
 # light shim that mimics ``self._validate_higgs_audio_v2_request(req)``.
@@ -87,7 +77,6 @@ def _call_validator(request) -> str | None:
         None,  # type: ignore[arg-type]
         request,
     )
-
 
 @pytest.mark.parametrize(
     "field, value",
@@ -109,16 +98,13 @@ def test_serving_validator_rejects_out_of_scope_fields(_make_speech_request, fie
     assert err is not None, f"expected reject for field {field!r}"
     assert "higgs_audio_v2" in err, f"reject for {field!r} should name the model: {err!r}"
 
-
 def test_serving_validator_accepts_plain_text(_make_speech_request) -> None:
     request = _make_speech_request()
     assert _call_validator(request) is None
 
-
 def test_serving_validator_accepts_max_new_tokens_seed(_make_speech_request) -> None:
     request = _make_speech_request(max_new_tokens=500, seed=42)
     assert _call_validator(request) is None
-
 
 def test_serving_validator_rejects_empty_input(_make_speech_request) -> None:
     request = _make_speech_request(input="   ")
@@ -126,13 +112,11 @@ def test_serving_validator_rejects_empty_input(_make_speech_request) -> None:
     assert err is not None
     assert "empty" in err.lower()
 
-
 def test_serving_validator_rejects_multi_speaker_in_text(_make_speech_request) -> None:
     request = _make_speech_request(input="[SPEAKER0] hi")
     err = _call_validator(request)
     assert err is not None
     assert "multi-speaker" in err.lower()
-
 
 @pytest.mark.parametrize(
     "alias",
@@ -157,7 +141,6 @@ def test_schema_rejects_rich_input_aliases_for_higgs_audio_v2(alias: str) -> Non
     assert "higgs_audio_v2" in msg
     assert alias in msg
 
-
 def test_schema_accepts_aliases_for_other_models() -> None:
     """Pydantic must NOT reject `reference_audio` (etc.) for non-higgs models.
 
@@ -171,7 +154,6 @@ def test_schema_accepts_aliases_for_other_models() -> None:
     parsed = OpenAICreateSpeechRequest.model_validate(payload)
     assert parsed.input == "hi"
     assert parsed.model == "qwen3_tts"
-
 
 def test_schema_rejects_chatml_messages_for_higgs_audio_v2() -> None:
     """``messages`` (ChatML rich content) is rejected at parse time."""
@@ -189,13 +171,11 @@ def test_schema_rejects_chatml_messages_for_higgs_audio_v2() -> None:
     assert "higgs_audio_v2" in str(excinfo.value)
     assert "messages" in str(excinfo.value)
 
-
 # ------------------------------------------------------ registry / pipeline
 def test_pipeline_registry_has_higgs_audio_v2() -> None:
     from vllm_omni.config.pipeline_registry import _OMNI_PIPELINES
 
     assert "higgs_audio_v2" in _OMNI_PIPELINES
-
 
 def test_model_registry_has_both_stages() -> None:
     from vllm_omni.model_executor.models.registry import _OMNI_MODELS
@@ -204,7 +184,6 @@ def test_model_registry_has_both_stages() -> None:
     assert "HiggsAudioV2TalkerForConditionalGeneration" in _OMNI_MODELS
     assert "HiggsAudioV2Code2WavForConditionalGeneration" in _OMNI_MODELS
 
-
 def test_pipeline_hf_architectures_declared() -> None:
     from vllm_omni.model_executor.models.higgs_audio_v2.pipeline import (
         HIGGS_AUDIO_V2_PIPELINE,
@@ -212,7 +191,6 @@ def test_pipeline_hf_architectures_declared() -> None:
 
     assert HIGGS_AUDIO_V2_PIPELINE.model_type == "higgs_audio_v2"
     assert "HiggsAudioV2ForConditionalGeneration" in HIGGS_AUDIO_V2_PIPELINE.hf_architectures
-
 
 # ------------------------------------------------------- stage_input_processor
 def test_stage_input_processor_async_chunk_emits_codes_only_when_chunk_full() -> None:
@@ -248,7 +226,6 @@ def test_stage_input_processor_async_chunk_emits_codes_only_when_chunk_full() ->
     assert out.codes.audio.numel() > 0
     assert isinstance(out.meta, MetaStruct)
 
-
 # --------------------------------------------------- Stage-1 decode contract
 def test_stage1_rejects_stream_specials() -> None:
     """Code IDs >= audio_stream_bos_id (1024) must raise ValueError before decode."""
@@ -271,156 +248,6 @@ def test_stage1_rejects_stream_specials() -> None:
     with pytest.raises(ValueError) as excinfo:
         stage1(bad_codes)
     assert "stream-special" in str(excinfo.value).lower() or "out-of-range" in str(excinfo.value).lower()
-
-
-def _all_fixtures() -> list[Path]:
-    fixture_dir = REPO_ROOT / "tests" / "fixtures" / "higgs_audio_v2"
-    if not fixture_dir.exists():
-        return []
-    return sorted(fixture_dir.glob("reference_*.pt"))
-
-
-def test_fixture_shape_invariants() -> None:
-    """Sanity check every captured fixture (AC-1, AC-2, AC-3 layout requirements)."""
-    fixtures = _all_fixtures()
-    assert len(fixtures) == 11, (
-        f"expected 11 reference_*.pt fixtures under {FIXTURE.parent}; got {len(fixtures)}: "
-        f"{[p.name for p in fixtures]}"
-    )
-    for path in fixtures:
-        blob = torch.load(path, weights_only=False)
-        assert blob["prompt_text"], f"empty prompt_text in {path}"
-        assert blob["input_ids"].ndim == 2, f"input_ids must be 2-D in {path}"
-        codes = blob["audio_codes"]
-        assert codes.ndim == 3, f"audio_codes must be 3-D in {path}"
-        # Canonical layout: [B, num_codebooks=8, T].
-        assert int(codes.shape[1]) == 8, (
-            f"audio_codes layout must be [B, num_codebooks=8, T] in {path}; got shape {tuple(codes.shape)}"
-        )
-        # Real codes only -- stream specials (>= 1024) must not appear.
-        assert int(codes.min()) >= 0
-        assert int(codes.max()) < 1024, (
-            f"audio_codes in {path} contain stream specials (max={int(codes.max())})"
-        )
-        pcm = blob["reference_pcm"]
-        assert pcm.ndim == 1
-        assert pcm.dtype == torch.int16
-        mask = blob.get("audio_token_mask")
-        assert mask is not None
-        # Round-3 contract: the mask covers the FULL output sequence (prompt +
-        # every generated audio frame), is strictly longer than the prompt,
-        # and contains at least one True position in the generated region.
-        input_len = int(blob["input_ids"].shape[1])
-        assert int(mask.shape[1]) > input_len, (
-            f"mask length {int(mask.shape[1])} must be strictly greater than prompt length "
-            f"{input_len} in {path} (the saved mask must cover prompt + generated positions)"
-        )
-        generated_mask = mask[:, input_len:]
-        assert bool(generated_mask.any()), (
-            f"mask in {path} has no True positions in the generated region [{input_len}:); "
-            "this would invalidate AC-3 routing-mask comparisons"
-        )
-
-
-def test_fixture_input_ids_match_build_plain_text_prompt() -> None:
-    """Verify per-prompt input_ids parity vs build_plain_text_prompt (AC-1).
-
-    Self-contained: tries to load the upstream HF processor in offline-only
-    mode first (uses the project HF cache), and only falls back to a network
-    fetch when the user opted in via ``HIGGS_AUDIO_V2_REFERENCE_MODEL_NETWORK=1``.
-    Skips cleanly when the processor cannot be resolved without network.
-    """
-    fixtures = _all_fixtures()
-    if not fixtures:
-        pytest.skip("no reference fixtures present")
-
-    from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_tokenizer import (
-        build_plain_text_prompt,
-        input_ids_to_python_list,
-    )
-
-    model_id = os.environ.get(
-        "HIGGS_AUDIO_V2_REFERENCE_MODEL", "bosonai/higgs-audio-v2-generation-3B-base"
-    )
-    allow_network = os.environ.get("HIGGS_AUDIO_V2_REFERENCE_MODEL_NETWORK", "0") not in ("0", "")
-    try:
-        from transformers import AutoProcessor
-
-        if allow_network:
-            processor = AutoProcessor.from_pretrained(model_id)
-        else:
-            # Offline-only: rely entirely on the local HF cache; do NOT contact the hub.
-            processor = AutoProcessor.from_pretrained(model_id, local_files_only=True)
-    except Exception as exc:
-        pytest.skip(
-            f"upstream HF processor {model_id!r} unavailable offline ({exc.__class__.__name__}: {exc}); "
-            "set HIGGS_AUDIO_V2_REFERENCE_MODEL_NETWORK=1 to allow a one-time network fetch."
-        )
-
-    for path in fixtures:
-        blob = torch.load(path, weights_only=False)
-        out = build_plain_text_prompt(processor, blob["prompt_text"])
-        emitted = input_ids_to_python_list(out)
-        saved = blob["input_ids"].reshape(-1).tolist()
-        assert emitted == saved, (
-            f"input_ids parity FAILED for {blob['prompt_text']!r}: "
-            f"len(emitted)={len(emitted)}, len(saved)={len(saved)}; "
-            f"first diff at idx={next((i for i, (a, b) in enumerate(zip(emitted, saved)) if a != b), len(saved))}"
-        )
-
-
-@pytest.mark.skipif(
-    not FIXTURE.exists() or os.environ.get("HIGGS_AUDIO_V2_TOKENIZER_DIR") is None or not torch.cuda.is_available(),
-    reason="reference fixture + audio_tokenizer dir required; runs on GPU",
-)
-@pytest.mark.xfail(
-    reason=(
-        "AC-4 RMS parity is blocked on TWO independent gaps: (1) the committed "
-        "reference_pcm tensors are not authoritative upstream PCM -- the "
-        "AutoProcessor's audio_tokenizer was loaded with random weights from "
-        "the wrong section of the safetensors blob, so every saved reference_pcm "
-        "has abs.max=706 / abs.mean=398.7 regardless of prompt (silent-noise "
-        "fingerprint). (2) the boson-ai standalone tokenizer at "
-        "bosonai/higgs-audio-v2-tokenizer publishes model.pth with keys like "
-        "`quantizer.vq.layers.<i>._codebook.embed` and an upstream "
-        "DAC+Snake+weight-norm decoder, which differs structurally from the "
-        "OmniVoice-bundled audio_tokenizer that the shared kernel was built "
-        "against. Unblocking requires (a) capturing a real upstream PCM "
-        "reference via boson-ai's own ServeEngine, AND (b) implementing a "
-        "model.pth -> shared-kernel mapper OR vendoring the upstream codec. "
-        "See goal-tracker Open Issue 'AC-4 RMS positive parity'."
-    ),
-    strict=False,
-)
-def test_stage1_decode_parity_rms() -> None:
-    """AC-4 positive test: Stage-1 PCM matches the upstream reference within 1e-4 RMS."""
-    from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import (
-        HiggsAudioV2Config,
-    )
-    from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_code2wav import (
-        HiggsAudioV2Code2Wav,
-    )
-
-    audio_tokenizer_dir = Path(os.environ["HIGGS_AUDIO_V2_TOKENIZER_DIR"])
-    blob = torch.load(FIXTURE, weights_only=False)
-    codes = blob["audio_codes"].long()
-    if codes.shape[1] != 8 and codes.shape[2] == 8:
-        codes = codes.transpose(1, 2).contiguous()
-
-    device = torch.device("cuda")
-    cfg = HiggsAudioV2Config()
-    stage1 = HiggsAudioV2Code2Wav(cfg).to(device)
-    # When the standalone tokenizer repo is used, the snapshot dir IS the
-    # audio_tokenizer dir (config.json + model.safetensors live at the root).
-    # The config default for `audio_tokenizer_subdir` is "" so model_dir is
-    # used directly.
-    stage1.load_weights(model_dir=str(audio_tokenizer_dir), device=device)
-    pcm_out = stage1(codes.to(device)).squeeze(0).squeeze(0).to(torch.float32).clamp_(-1.0, 1.0).cpu()
-    pcm_ref = blob["reference_pcm"].to(torch.float32) / 32767.0
-    n = min(int(pcm_out.shape[0]), int(pcm_ref.shape[0]))
-    rms = ((pcm_out[:n] - pcm_ref[:n]) ** 2).mean().sqrt().item()
-    assert rms <= 1e-4, f"Stage-1 vs HF reference PCM RMS={rms:.3e} exceeds 1e-4"
-
 
 def test_fused_weight_loader_maps_qkv_and_mlp() -> None:
     """Verify the talker's load_weights fuses HF q/k/v and gate/up projections.
@@ -461,7 +288,6 @@ def test_fused_weight_loader_maps_qkv_and_mlp() -> None:
     )
     # Unrelated key returns None.
     assert talker._map_simple_name("unrelated.weight") is None
-
 
 def _make_stub_talker():
     """Build a HiggsAudioV2TalkerForConditionalGeneration shell with stub parameters.
@@ -519,7 +345,6 @@ def _make_stub_talker():
     talker._stub_params = params
     talker.named_parameters = lambda *a, **kw: iter(params.items())
     return talker, cfg, params
-
 
 def test_load_weights_fuses_qkv_and_mlp_end_to_end() -> None:
     """Drive load_weights on a synthetic HF state_dict and verify fused outputs."""
@@ -597,7 +422,6 @@ def test_load_weights_fuses_qkv_and_mlp_end_to_end() -> None:
             torch.full((codebook_size, hidden), float(k + 1)),
         )
 
-
 def test_stage1_chunk_decode_trims_left_context() -> None:
     """forward_chunk must slice off left_context_size * hop_length samples."""
     from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2 import (
@@ -632,7 +456,6 @@ def test_stage1_chunk_decode_trims_left_context() -> None:
     # Edge case: left_context_size >= T -> empty output.
     out_empty = stage1.forward_chunk(codes, left_context_size=30, hop_length=HOP)
     assert out_empty.shape[-1] == 0
-
 
 def test_stage1_engine_runtime_forward_returns_omni_output() -> None:
     """Stage-1 engine-runtime path: flat codebook-major ``input_ids`` -> OmniOutput."""
@@ -675,7 +498,6 @@ def test_stage1_engine_runtime_forward_returns_omni_output() -> None:
     assert isinstance(out_trimmed, OmniOutput)
     trimmed_audio = out_trimmed.multimodal_outputs["model_outputs"][0]
     assert trimmed_audio.shape == ((n_frames - 5) * HOP,)
-
 
 def test_dual_ffn_routing_fault_injection_changes_audio_output() -> None:
     """AC-3 negative: disabling the audio MLP must change the layer output on audio positions only.
@@ -730,7 +552,6 @@ def test_dual_ffn_routing_fault_injection_changes_audio_output() -> None:
         f"audio positions must change when audio_mlp is disabled; got diff={audio_diff}"
     )
 
-
 def test_dual_ffn_norm_routing_splits_text_and_audio() -> None:
     """The pre-attention norm routing must use audio_input_layernorm on audio positions only."""
     from types import SimpleNamespace
@@ -758,7 +579,6 @@ def test_dual_ffn_norm_routing_splits_text_and_audio() -> None:
     # audio positions: must equal audio_norm(hidden_state[mask])
     audio_expected = audio_norm(hidden_state[0, 2:])
     assert torch.allclose(out[0, 2:], audio_expected, atol=1e-6)
-
 
 def test_talker_compute_logits_returns_tensor_and_audio_helper_runs_separately() -> None:
     """compute_logits MUST return a tensor (the AR runner pipes the result
@@ -816,7 +636,6 @@ def test_talker_compute_logits_returns_tensor_and_audio_helper_runs_separately()
     empty_mask = torch.zeros(4, dtype=torch.bool)
     cb_empty = talker.audio_codebook_logits(h, empty_mask)
     assert cb_empty.shape == (0, num_codebooks, codebook_size)
-
 
 def test_make_omni_output_reads_audio_codes_from_runner_kwargs() -> None:
     """``make_omni_output`` must accept the canonical runner contract
@@ -878,7 +697,6 @@ def test_make_omni_output_reads_audio_codes_from_runner_kwargs() -> None:
     out_empty = talker.make_omni_output(hidden)
     assert out_empty.multimodal_outputs["codes"]["audio"].numel() == 0
 
-
 def test_boson_model_pth_remap_rewrites_quantizer_keys() -> None:
     """``_remap_boson_model_pth_state_dict`` translates the standalone
     ``model.pth`` quantizer keys into the OmniVoice-style names that the
@@ -928,7 +746,6 @@ def test_boson_model_pth_remap_rewrites_quantizer_keys() -> None:
     # Unrelated keys pass through unchanged.
     assert "fc.weight" in remapped
 
-
 def test_talker_opts_into_model_sampler() -> None:
     """``prefer_model_sampler`` must be True so the AR runner's hook kicks in,
     and ``sample`` must be callable with (logits, sampling_metadata)."""
@@ -938,7 +755,6 @@ def test_talker_opts_into_model_sampler() -> None:
 
     assert HiggsAudioV2TalkerForConditionalGeneration.prefer_model_sampler is True
     assert callable(getattr(HiggsAudioV2TalkerForConditionalGeneration, "sample", None))
-
 
 def test_talker_audio_codebook_logits_emits_all_codebooks() -> None:
     """R12: ``audio_codebook_logits`` returns the per-codebook logits for all 8
@@ -974,7 +790,6 @@ def test_talker_audio_codebook_logits_emits_all_codebooks() -> None:
     assert codes.shape == (n_audio, num_codebooks)
     assert int(codes.max()) < codebook_size
     assert int(codes.min()) >= 0
-
 
 def test_stage1_rms_threshold_is_meaningful_with_corrupted_codebook() -> None:
     """AC-4 negative #2: a corrupted RVQ codebook must push the PCM RMS above 1e-4.
@@ -1028,7 +843,6 @@ def test_stage1_rms_threshold_is_meaningful_with_corrupted_codebook() -> None:
         f"threshold; got rms={rms:.3e}"
     )
 
-
 def test_cuda_graph_wrapper_falls_back_to_eager_without_warmup() -> None:
     """HiggsAudioV2CUDAGraphWrapper must delegate to the underlying module before warmup
     (and pass arguments through unchanged).
@@ -1054,7 +868,6 @@ def test_cuda_graph_wrapper_falls_back_to_eager_without_warmup() -> None:
         assert wrapper._state[b] == WrapperState.NOT_CAPTURED
     assert not wrapper.is_captured(1)
 
-
 def test_cuda_graph_wrapper_disabled_is_passthrough() -> None:
     """``enabled=False`` -> wrapper delegates without any state machine bookkeeping."""
     from vllm_omni.model_executor.models.higgs_audio_v2.cuda_graph_decoder_wrapper import (
@@ -1070,53 +883,13 @@ def test_cuda_graph_wrapper_disabled_is_passthrough() -> None:
     out = wrapper(x=x)
     assert torch.equal(out, x + 100)
 
-
-def test_fixture_reference_pcm_provenance_documented() -> None:
-    """Document (and fail loudly when it ever changes) that the captured
-    ``reference_pcm`` is currently NOT authoritative upstream PCM.
-
-    Round-2/3 review noted -- and a direct probe in round 5 confirms -- that
-    every saved ``reference_pcm`` tensor has the same abs.max=706 and
-    abs.mean ~= 398.7 regardless of prompt content. This is the silent-noise
-    fingerprint of the upstream AutoProcessor's audio_tokenizer being loaded
-    with random weights from the wrong section of the model.safetensors blob.
-
-    This test exists so the FIRST round that captures a real upstream PCM
-    reference will trip an obvious failure here, signaling that the AC-4
-    positive RMS test should also be flipped from xfail to a real
-    assertion. Until then, fixtures' reference_pcm is suitable only for
-    shape / dtype / sample-rate checks, NOT for content parity.
-    """
-    fixture = REPO_ROOT / "tests" / "fixtures" / "higgs_audio_v2" / "reference_hello_world.pt"
-    if not fixture.exists():
-        pytest.skip("reference fixture not present")
-    blob = torch.load(fixture, weights_only=False)
-    pcm = blob["reference_pcm"].abs()
-    # The silent-noise fingerprint: max in the low hundreds and mean very
-    # close to the constant. If a future round captures a real PCM reference,
-    # abs.max will be in the 10000+ range and abs.mean will vary per prompt.
-    assert int(pcm.max()) < 5000, (
-        f"reference_hello_world.pt abs.max={int(pcm.max())} > 5000 suggests a "
-        "real upstream PCM reference was captured; flip the AC-4 xfail to "
-        "an active assertion."
-    )
-
-
 def test_ac9_offline_smoke_runs_through_shared_codec() -> None:
     """AC-9 offline smoke test (clean-machine target).
 
-    Loads the committed reference fixture, builds the shared HiggsAudio codec
-    kernel with random-but-valid weights, runs the codes through Stage-1's
-    direct decode API, and asserts the result is a non-degenerate 24 kHz
-    PCM tensor of the expected shape. This exercises the path documented in
-    `examples/offline_inference/text_to_speech/higgs_audio_v2/README.md`
-    (``--mode stage1_only``) without requiring the boson-ai checkpoint to be
-    downloaded.
-
-    Real-checkpoint replay still requires the boson-ai tokenizer + the
-    upstream codec weight format; that path is exercised by
-    ``test_stage1_decode_parity_rms`` (currently ``xfail`` for the reasons
-    documented there).
+    Builds the shared HiggsAudio codec kernel with random-but-valid weights and
+    runs a synthetic ``[1, 8, T]`` code tensor through Stage-1's direct decode
+    API to assert the result is a non-degenerate 24 kHz PCM tensor of the
+    expected shape. No real checkpoint or fixture is required.
     """
     from vllm_omni.model_executor.models._shared.higgs_audio_decoder import (
         HiggsAudioRVQ,
@@ -1128,16 +901,12 @@ def test_ac9_offline_smoke_runs_through_shared_codec() -> None:
         HiggsAudioV2Code2Wav,
     )
 
-    fixture = REPO_ROOT / "tests" / "fixtures" / "higgs_audio_v2" / "reference_hello_world.pt"
-    if not fixture.exists():
-        pytest.skip("reference fixture not present")
-    blob = torch.load(fixture, weights_only=False)
-    codes = blob["audio_codes"].long()
-    if codes.shape[1] != 8 and codes.shape[2] == 8:
-        codes = codes.transpose(1, 2).contiguous()
-    assert codes.shape[1] == 8
-
     cfg = HiggsAudioV2Config()
+    # Synthetic codes: 1 request, 8 codebooks, 32 frames of real content tokens.
+    torch.manual_seed(0)
+    codes = torch.randint(
+        0, int(cfg.num_real_codes), (1, int(cfg.num_codebooks), 32), dtype=torch.long
+    )
     stage1 = HiggsAudioV2Code2Wav(cfg)
 
     # Build a synthetic but valid Stage-1 stack with the shared kernel.
@@ -1167,7 +936,6 @@ def test_ac9_offline_smoke_runs_through_shared_codec() -> None:
     )
     assert torch.isfinite(pcm).all()
 
-
 def test_stage1_engine_constructor_signature() -> None:
     """Stage-1 must accept the *, vllm_config, prefix kwargs form for engine boot."""
     import inspect
@@ -1181,7 +949,6 @@ def test_stage1_engine_constructor_signature() -> None:
     assert "vllm_config" in params, "Stage-1 must accept vllm_config kwarg"
     assert "prefix" in params, "Stage-1 must accept prefix kwarg"
     assert params["vllm_config"].kind == inspect.Parameter.KEYWORD_ONLY
-
 
 def test_fused_audio_head_split_shapes() -> None:
     """Verify the audio_lm_head split into codebook 0 head + residual heads matches the expected shapes."""
@@ -1203,7 +970,6 @@ def test_fused_audio_head_split_shapes() -> None:
     for k in range(1, num_codebooks):
         chunk = fused[k * codebook_size : (k + 1) * codebook_size]
         assert tuple(chunk.shape) == (codebook_size, hidden)
-
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

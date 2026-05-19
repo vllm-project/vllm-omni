@@ -364,19 +364,15 @@ Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-T
 
 ## higgs-audio v2
 
-```bash
-# Capture the upstream HF reference (downloads the boson-ai checkpoints).
-python examples/offline_inference/text_to_speech/higgs_audio_v2/reference_hf.py \
-    --max-new-tokens 100 \
-    --output-dir tests/fixtures/higgs_audio_v2 \
-    --write-trace
+Launch the online server (Stage 0 talker + Stage 1 codec) and call the
+OpenAI-compatible `/v1/audio/speech` endpoint:
 
-# Replay a captured fixture through vllm-omni's Stage-1 decoder for AC-4 parity.
-python examples/offline_inference/text_to_speech/higgs_audio_v2/end2end.py \
-    --mode stage1_only \
-    --fixture tests/fixtures/higgs_audio_v2/reference_hello_world.pt \
-    --compare-with-reference \
-    --output-wav stage1_replay.wav
+```bash
+bash examples/online_serving/text_to_speech/higgs_audio_v2/run_server.sh
+python examples/online_serving/text_to_speech/higgs_audio_v2/batch_speech_client.py \
+    --prompts "Hello world." \
+              "The quick brown fox jumps over the lazy dog." \
+    --output-dir /tmp/higgs_out
 ```
 
 The Stage-0 talker uses a vLLM-native Llama-3.2-3B backbone with a DualFFN audio expert (see `docs/contributing/model/adding_tts_model.md` for the architectural appendix). Stage 1 reuses the OmniVoice HiggsAudio decoder kernel via the shared utility at `vllm_omni/model_executor/models/_shared/higgs_audio_decoder.py`.

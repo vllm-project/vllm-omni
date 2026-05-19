@@ -31,13 +31,9 @@ source and the boson-ai checkpoint config.json):
   MusicGen pattern ``[0, 1, 2, 3, 4, 5, 6, 7]``.
 
 This file delivers the structural pieces (module classes, weight mapping,
-forward-pass skeleton). The integration-test polish on the AR hot loop is
-gated on the reference fixtures produced by
-``examples/offline_inference/text_to_speech/higgs_audio_v2/reference_hf.py``
-(AC-1, AC-2, AC-3). Until that lands the talker is registered in the model
-registry but should be considered "structural scaffold" rather than
-production-ready inference; this is documented in the round summary so the
-RLCR loop tracks it as a known gap.
+forward pass, AR sampler dispatch, and the upstream delay-pattern logits
+processor). See ``UPSTREAM_TRACE.md`` in the same directory for the contract
+this implementation must reproduce.
 """
 
 from __future__ import annotations
@@ -219,7 +215,7 @@ class HiggsAudioV2DecoderLayer(LlamaDecoderLayer):
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        # R20: subclass LlamaDecoderLayer so self_attn registers at the
+        # Subclass LlamaDecoderLayer so self_attn registers at the
         # CANONICAL ``layers.{i}.self_attn.attn`` prefix (not nested under
         # ``.base``). This is the architecturally-correct registration path
         # for vLLM's compilation_config.static_forward_context.
@@ -429,7 +425,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             self.config = HiggsAudioV2Config(**hf_config.to_dict())
 
         # ------------------------------------------------------------------ embedding + final norm
-        # Round 7: directly instantiate the text-side embedding and final norm
+        # directly instantiate the text-side embedding and final norm
         # so we don't pull in a full LlamaModel.layers list that the engine's
         # weight loader would require initialized. Each HiggsAudioV2DecoderLayer
         # below already owns its own LlamaDecoderLayer for the attention path;
@@ -444,11 +440,11 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         self.norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
 
         # ------------------------------------------------------------------ DualFFN-aware layer stack
-        # R20: use vLLM's ``make_layers`` helper to register attention layers
+        # use vLLM's ``make_layers`` helper to register attention layers
         # at canonical ``layers.{i}.self_attn.attn`` paths in
         # ``compilation_config.static_forward_context``. This is what gets
         # picked up by ``bind_kv_cache`` so prefill writes K/V to the cache
-        # (R17 root cause for empty cache + zero attention output).
+        # (root cause for empty cache + zero attention output).
         from vllm.model_executor.models.utils import make_layers
 
         _, _, self.layers = make_layers(
@@ -554,14 +550,14 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             ``[num_codebooks * codebook_size, hidden]``, not one head per
             codebook; we split it into the per-codebook heads at load time.)
 
-        Round-2 status: this routine covers the simple, fused-QKV, and fused-MLP
+        this routine covers the simple, fused-QKV, and fused-MLP
         transcriptions. The remaining gap (full Stage-0 forward integration with
         vLLM's PagedAttention scheduler so the loaded weights drive a working
         greedy decode) is tracked as an Open Issue in the goal tracker.
         """
         loaded: set[str] = set()
         own_params = dict(self.named_parameters())
-        # R7 debug: log the first few HF keys we receive so we can verify the
+        # Debug: log the first few HF keys we receive so we can verify the
         # mapper hits them. Also log our own param-name shape so missing
         # mappings are obvious.
         logger.info(
@@ -608,14 +604,14 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                 )
                 return False
 
-            # R20: After making HiggsAudioV2DecoderLayer inherit from
+            # After making HiggsAudioV2DecoderLayer inherit from
             # LlamaDecoderLayer, text-side params live directly at
             # ``layers.<L>.<tail>`` (no ``.base`` indirection). audio side
             # remains at ``layers.<L>.audio_<...>``.
             parts = normalized.split(".")
             if len(parts) >= 3 and parts[0] == "layers":
                 tail = ".".join(parts[2:])
-                # audio_mlp.down_proj lives at our top-level audio_mlp slot.
+                # Audio_mlp.down_proj lives at our top-level audio_mlp slot.
                 if tail == "audio_mlp.down_proj.weight":
                     audio_name = f"layers.{parts[1]}.audio_mlp.down_proj.weight"
                     if audio_name in own_params:
@@ -678,7 +674,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                 continue
             if _stash_fusion(name, tensor):
                 continue
-            # audio code head: upstream has a fused [num_codebooks*codebook_size, hidden]
+            # Audio code head: upstream has a fused [num_codebooks*codebook_size, hidden]
             # head; split into codebook-0 head + residual heads. Accept both
             # ``audio_lm_head.weight`` and ``model.audio_lm_head.weight``.
             if name in (
@@ -692,10 +688,10 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             unhandled.append(name)
 
         # Second pass: emit fused tensors. Targets are the per-layer slots on
-        # our HiggsAudioV2DecoderLayer stack (R20: text-side params at
-        # ``layers.<L>.<tail>`` directly since HiggsAudioV2DecoderLayer now
-        # inherits from LlamaDecoderLayer; ``layers.<L>.audio_mlp...`` for the
-        # audio expert).
+        # the HiggsAudioV2DecoderLayer stack: text-side params at
+        # ``layers.<L>.<tail>`` directly (HiggsAudioV2DecoderLayer inherits
+        # from LlamaDecoderLayer); ``layers.<L>.audio_mlp...`` for the audio
+        # expert.
         for (layer_idx, slot, fused_kind), parts in fuse_buckets.items():
             if fused_kind == "gate_up_proj":
                 gate = parts.get("gate_proj")
@@ -774,8 +770,8 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         # Upstream nests the audio embedding as
         # ``model.embed_audio_tokens.embed_audio_tokens.weight``; the boson-ai
         # checkpoint also uses this exact key. Accept both nested and flat.
-        # R12: the upstream multi-codebook embedding is ``audio_codebook_embeddings``
-        # (a flat ``Embedding(8 * codebook_size, hidden)``). R7 also had a separate
+        # the upstream multi-codebook embedding is ``audio_codebook_embeddings``
+        # (a flat ``Embedding(8 * codebook_size, hidden)``). also had a separate
         # ``embed_audio_tokens`` (used in prefill-time DualFFN routing helpers);
         # we keep that slot so the existing prompt-side embedding logic stays
         # functional. Both slots are loaded from the same upstream tensor.
@@ -798,7 +794,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             "model.audio_decoder_proj.text_lm_head.weight",
         ):
             return "lm_head.weight"
-        # Round 7: dropped LlamaModel wrapper; text embedding + final norm now
+        # Dropped LlamaModel wrapper; text embedding + final norm now
         # live directly on the talker (self.embed_tokens / self.norm).
         if hf_name == "model.embed_tokens.weight":
             return "embed_tokens.weight"
@@ -825,7 +821,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         ):
             layer_idx = hf_name.split(".")[2]
             return f"layers.{layer_idx}.audio_post_attention_layernorm.weight"
-        # R20: Per-layer text-side params now live directly at
+        # Per-layer text-side params now live directly at
         # ``layers.{i}.<tail>`` (no ``.base`` indirection) since
         # HiggsAudioV2DecoderLayer inherits from LlamaDecoderLayer.
         if hf_name.startswith("model.layers.") and hf_name.endswith(
@@ -884,7 +880,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         if input_ids is not None:
             self._last_step_input_ids = input_ids
 
-        # R12 audio-feedback substitution: vLLM's AR runner calls forward()
+        # Audio-feedback substitution: vLLM's AR runner calls forward()
         # with ``inputs_embeds=None`` and lets the model embed its own
         # input_ids inline. ``embed_input_ids`` is only invoked via the
         # supports_mm_inputs/prompt_embeds branches, neither of which fires
@@ -897,7 +893,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
 
         audio_mask = self.audio_token_mask(input_ids) if input_ids is not None else None
 
-        # R20 fused-residual loop: layers return (hidden, residual)
+        # Fused-residual loop: layers return (hidden, residual)
         # where ``residual`` carries everything up to the post-MLP add.
         residual: torch.Tensor | None = None
         for layer in self.layers:
@@ -925,7 +921,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
 
         Returns a single ``[N, vocab_size]`` tensor that the stock
         vLLM AR runner pipes through ``.contiguous()`` and a generic
-        sampler. For Round-5 the contract is intentionally tensor-only:
+        sampler. The contract is intentionally tensor-only:
 
         - Text-position logits come from ``lm_head`` (128256-wide Llama vocab).
         - Audio-position logits at audio_token_id placeholders are also
@@ -1245,7 +1241,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         if not hasattr(self, "_slot_output_len"):
             self._slot_output_len: dict[int, int] = {}
 
-        # R13: skip the audio-code sampling for rows that just transitioned
+        # Skip the audio-code sampling for rows that just transitioned
         # OUT of audio_out_bos. The hidden state at this prefill-end step is
         # at the audio_out_bos position, where upstream's audio_out_mask is
         # False and no audio_logits are computed. The LM bias above already
@@ -1260,7 +1256,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         bos_local = int(self.config.audio_stream_bos_id)
         seeded_rows: list[int] = []
         seeded_frame: torch.Tensor | None = None
-        # R27: HF eager probe (tools/hf_first_audio_probe.py) confirmed that
+        # HF eager probe (tools/hf_first_audio_probe.py) confirmed that
         # HF seeds frame 0 with all-BOS at the audio_bos position and ignores
         # the model's prediction there; the first real audio frame is sampled
         # one step later at the audio_token_id position. R13's skip path is
@@ -1270,7 +1266,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             first_after_bos = first_after_bos.to(is_audio.device)
             skip_rows = first_after_bos & is_audio
             if bool(skip_rows.any()):
-                # R13: upstream's AUDIO_INIT step seeds ``audio_out_ids`` with
+                # Upstream's AUDIO_INIT step seeds ``audio_out_ids`` with
                 # a single all-``audio_stream_bos_id`` frame and the NEXT
                 # forward feeds ``embed_audio_codes(all_bos)`` at the new
                 # audio_out_token_idx position. Without this, our audio MLP
@@ -1307,7 +1303,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         # Per-codebook logits at audio positions only.
         cb_logits = self.audio_codebook_logits(hidden, is_audio)  # [N_audio, Q, V]
 
-        # R26: emulate upstream's ``HiggsAudioV2DelayPatternLogitsProcessor``.
+        # Emulate upstream's ``HiggsAudioV2DelayPatternLogitsProcessor``.
         # The raw audio_lm_head has very large weights at index 1025
         # (audio_stream_eos): cb1 |w[1025]|=9.25 vs mean content 1.53 (6x).
         # Without masking, the model naturally fires 1025 at codebook 1..6
@@ -1336,7 +1332,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                         mask[eos_pre] = row[eos_pre]
                         cb_logits[local_i, q] = mask
                     else:
-                        # disallow stream specials during ramp-down content frames
+                        # Disallow stream specials during ramp-down content frames
                         cb_logits[local_i, q, bos_pre] = float("-inf")
                         cb_logits[local_i, q, eos_pre] = float("-inf")
             else:
@@ -1368,7 +1364,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         )
         codes_flat = codes_2d.view(cb_logits.shape[0], cb_logits.shape[1]).to(torch.long)
 
-        # R12 (PyTorch align): Repetition-Aware Sampling (RAS). Upstream
+        # (PyTorch align): Repetition-Aware Sampling (RAS). Upstream
         # ``HiggsAudioModel._sample_audio_tokens`` re-samples any codebook
         # that just emitted the same token >= ras_win_max_num_repeat times
         # in the last ras_win_len steps. This breaks codebook collapse loops
@@ -1376,7 +1372,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         # value otherwise.
         ras_win_len = 7
         ras_win_max_num_repeat = 2
-        # codes_flat is [N_audio, Q]; we re-sample PER (audio_position, codebook)
+        # Codes_flat is [N_audio, Q]; we re-sample PER (audio_position, codebook)
         # row that hits the repeat threshold over the last ras_win_len audio
         # frames of that codebook's history (from state.audio_out_ids).
         if codes_flat.shape[0] > 0:
@@ -1437,7 +1433,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                 self._audio_state.pop(bi, None)
             self._slot_output_len[bi] = current_len
 
-        # R12 simplification: we DON'T override ``sampler_output.sampled_token_ids``
+        # Simplification: we DON'T override ``sampler_output.sampled_token_ids``
         # back to ``audio_eos_token_id`` at ramp-down completion. The vLLM
         # ``SamplerOutput.sampled_token_ids`` is plumbed through several
         # downstream structures that may have already cached the GPU pointer;
@@ -1506,7 +1502,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         if new_codes_flat:
             stacked = torch.stack(new_codes_flat, dim=0).to(hidden.device)
             codes_full[is_audio] = stacked
-        # R13: emit the seeded all-BOS frame at the prefill-end (AUDIO_INIT)
+        # Emit the seeded all-BOS frame at the prefill-end (AUDIO_INIT)
         # rows so the talker output has the leading delay-pattern frame the
         # downstream revert helper expects.
         if seeded_rows and seeded_frame is not None:
@@ -1638,7 +1634,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             return 0
         audio_bos = int(self.config.audio_bos_token_id)
         audio_id = int(self.config.audio_token_id)
-        # R12 (PyTorch align, corrected): upstream NEVER lets the model
+        # (PyTorch align, corrected): upstream NEVER lets the model
         # naturally emit ``audio_eos_token_id`` in the LM stream. The LM
         # next-token is force-set to ``audio_out_token_idx`` every step;
         # the audio span only ends when the delay-pattern ramp-down completes
@@ -1663,7 +1659,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         stash_tail: list[int] | None = None
         if isinstance(stash_ids, torch.Tensor) and stash_ids.numel() >= num_rows:
             stash_tail = stash_ids[-num_rows:].detach().to("cpu").tolist()
-        # R13: also stash a per-row "is this the first audio-mode step right
+        # Also stash a per-row "is this the first audio-mode step right
         # after audio_out_bos" flag. Upstream NEVER samples audio codes at
         # the audio_out_bos position (its audio_out_mask is False there);
         # the first audio frame is sampled one step later, at the new
@@ -1678,7 +1674,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                 if hist:
                     prev = int(hist[-1])
             if prev is None and prompt_ids is not None:
-                # prompt_token_ids may be a tensor or a list-of-lists
+                # Prompt_token_ids may be a tensor or a list-of-lists
                 try:
                     p_i = prompt_ids[i]
                     if hasattr(p_i, "tolist"):
@@ -1695,7 +1691,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
                 continue
             if prev == audio_bos:
                 first_after_bos[i] = True
-            # R16: if this slot's audio ramp finished last step, force LM token
+            # If this slot's audio ramp finished last step, force LM token
             # to audio_eos so the engine stops naturally. Matches upstream's
             # ``next_tokens[...] = audio_eos_token_id`` override.
             audio_state = getattr(self, "_audio_state", {}) or {}
@@ -1763,10 +1759,9 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             return {}
         new_codes = slice_codes[audio_rows].to(torch.int32)
 
-        # R15: return ONLY this step's frames. The engine's
+        # Return ONLY this step's frames. The engine's
         # MultimodalOutputProcessor.add_multimodal_tensor accumulates per-step
         # OmniOutput.multimodal_outputs across all steps and consolidates at
         # request finish via torch.cat(dim=0). Returning cumulative codes here
-        # caused N(N+1)/2 duplication (R15 found 811 frames from 41 LM steps
-        # because each step contributed an ever-growing cumulative tensor).
+        # caused N(N+1)/2 duplication (prior bug: engine internal accumulation).
         return {"codes": {"audio": new_codes}}

@@ -1,4 +1,4 @@
-# higgs-audio v2 deploy: Stage 0 (talker) -> Stage 1 (code2wav) via shared memory.
+# Higgs-audio v2 deploy: Stage 0 (talker) -> Stage 1 (code2wav) via shared memory.
 #
 # Phase-1 scope is plain text -> 24 kHz speech only; voice cloning, multi-speaker,
 # ChatML rich messages, and music/sound-event prompts are rejected by the
@@ -39,14 +39,14 @@ stages:
     enable_prefix_caching: false
     async_scheduling: false
     max_num_batched_tokens: 2048
-    # max_model_len covers prompt + max_new_tokens (default <=1500 codec
+    # Max_model_len covers prompt + max_new_tokens (default <=1500 codec
     # frames per DEC-4, so 4096 is comfortable).
     max_model_len: 4096
     devices: "0"
     output_connectors:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
-      # R12: upstream serve_engine defaults (temperature=1.0, top_p=0.95,
+      # Upstream serve_engine defaults (temperature=1.0, top_p=0.95,
       # top_k=50). Greedy (temperature=0) collapses the audio codebook
       # argmax to a fixed value after a few steps; sampling with diversity
       # is required for natural-sounding speech.

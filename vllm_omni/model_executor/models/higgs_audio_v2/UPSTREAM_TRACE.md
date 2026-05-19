@@ -93,39 +93,8 @@ processor.apply_chat_template(
 )
 ```
 
-The captured `rendered_chat_template` from the reference run is persisted under
-`text_template_*` keys in the fixture files alongside the `input_ids` tensor.
 vllm-omni's `higgs_audio_v2_tokenizer.build_plain_text_prompt(...)` must produce
-the same `input_ids` for the same `<USER TEXT>` (AC-1 positive test).
-
-## Fixture inventory
-
-Each `tests/fixtures/higgs_audio_v2/reference_<slug>.pt` holds the per-prompt
-record described at the top of `reference_hf.py`. The captured fields satisfy:
-
-- AC-1 (input-token parity): exact `input_ids` from upstream tokenizer.
-- AC-2 (per-codebook parity): `audio_codes` is the post-revert real-code tensor
-  with shape `[1, num_codebooks=8, T]` and values in `[0, 1023]`.
-- AC-3 (DualFFN routing): `audio_token_mask` is the per-position routing mask
-  recorded from the live forward pass on the first decoder layer (matches
-  `HiggsAudioV2Model.get_placeholder_mask`).
-- AC-4 (Stage-1 decode parity): `reference_pcm` is the upstream-decoded waveform
-  as int16, mono, 24 kHz. Normalized-float RMS comparison with vllm-omni Stage 1
-  must be `<= 1e-4` (see plan AC-4).
-
-## Pinned prompt list
-
-- 'Hello world.'
-- 'The quick brown fox jumps over the lazy dog.'
-- 'It was the night before my birthday.'
-- 'She sells seashells by the seashore.'
-- 'Innovation distinguishes between a leader and a follower.'
-- 'Mary had a little lamb whose fleece was white as snow.'
-- 'Time flies like an arrow; fruit flies like a banana.'
-- 'All that glitters is not gold.'
-- 'An apple a day keeps the doctor away.'
-- 'May the force be with you, always.'
-- 'To be or not to be, that is the question.'
+the same `input_ids` for the same `<USER TEXT>` as the upstream HF processor.
 
 ## Notes for the vllm-omni implementation
 

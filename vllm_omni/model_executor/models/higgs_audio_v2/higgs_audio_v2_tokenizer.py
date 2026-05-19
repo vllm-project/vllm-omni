@@ -98,17 +98,11 @@ def validate_plain_text_request(request_payload: dict[str, Any]) -> None:
 def build_plain_text_conversation(text: str) -> list[dict[str, Any]]:
     """Build the canonical single-speaker plain-text conversation.
 
-    Mirrors upstream's ``zero_shot`` input sample under
-    ``examples/serve_engine/input_samples.py``: the system prompt contains
-    a ``<|scene_desc_start|>SPEAKER0: ...<|scene_desc_end|>`` block, which
-    is what conditions the model to produce coherent natural speech. The
-    earlier no-scene-block variant produced repetitive babbling once the
-    vLLM attention-backend NaN was unblocked (R14 / FLEX_ATTENTION).
+    Uses the bare system prompt ``"Generate audio following instruction."``
+    that matches the upstream HF reference's input formatting. AC-1
+    (input-token parity) requires this exact wording.
     """
     validate_plain_text_input(text)
-    # R25: match HF reference fixture's bare system prompt (no scene_desc).
-    # R15's scene_desc block diverged the prefill state from HF reference,
-    # collapsing decode#1 codebook-0 logits to audio_stream_eos (1025).
     system_prompt = "Generate audio following instruction."
     return [
         {

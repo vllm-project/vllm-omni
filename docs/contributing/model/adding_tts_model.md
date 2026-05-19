@@ -1022,5 +1022,4 @@ When adapting a Llama+DualFFN HF checkpoint to vllm-omni:
 | `vllm_omni/model_executor/models/higgs_audio_v2/higgs_audio_v2_talker.py` | Stage 0: DualFFNLayer, HiggsAudioCodePredictor, weight mapping. |
 | `vllm_omni/model_executor/models/higgs_audio_v2/higgs_audio_v2_code2wav.py` | Stage 1 on the shared HiggsAudio decoder kernel; rejects code IDs >= 1024. |
 | `vllm_omni/model_executor/models/_shared/higgs_audio_decoder.py` | Shared kernel (RVQ + DAC) consumed by both this model and OmniVoice. |
-| `examples/offline_inference/text_to_speech/higgs_audio_v2/reference_hf.py` | Capture deterministic upstream fixtures + the trace memo. |
-| `tests/e2e/online_serving/test_higgs_audio_v2.py` | Validator scope tests + Stage-1 stream-special rejection + AC-4 RMS parity skeleton. |
+| `tests/e2e/online_serving/test_higgs_audio_v2.py` | Validator scope tests + Stage-1 stream-special rejection + DualFFN routing + weight-loader regression. |
