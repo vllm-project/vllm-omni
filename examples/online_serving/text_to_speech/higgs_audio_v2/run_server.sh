@@ -22,7 +22,12 @@ echo "  MODEL=$MODEL"
 echo "  PORT=$PORT"
 echo "  CUDA_VISIBLE_DEVICES=$GPUS"
 
+# DeepGEMM FP8 kernels are optional and trip warmup on builds without
+# the deep_gemm backend; disable them so the example works out of the box.
+# Users with deep_gemm installed can re-enable via the same env vars.
 CUDA_VISIBLE_DEVICES="$GPUS" \
+VLLM_USE_DEEP_GEMM=0 \
+VLLM_MOE_USE_DEEP_GEMM=0 \
 vllm-omni serve "$MODEL" \
     --deploy-config vllm_omni/deploy/higgs_audio_v2.yaml \
     --host 0.0.0.0 \

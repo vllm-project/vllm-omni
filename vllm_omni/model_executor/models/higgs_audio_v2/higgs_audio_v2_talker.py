@@ -886,6 +886,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
 
         audio_mask = self.audio_token_mask(input_ids) if input_ids is not None else None
 
+
         # Fused-residual loop: layers return (hidden, residual)
         # where ``residual`` carries everything up to the post-MLP add.
         residual: torch.Tensor | None = None
@@ -927,9 +928,9 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         sampler dispatch.
         """
         _ = audio_token_mask  # The mask is consumed by audio_codebook0_logits, not here.
-        # Stash for the audio-sampler dispatch in :meth:`sample` (round-7+).
-        # Limited to a single step at a time; cleared in :meth:`sample` after
-        # consumption so a missed call doesn't leak stale tensors.
+        # Stash for the audio-sampler dispatch in :meth:`sample`. Limited to a
+        # single step at a time; cleared in :meth:`sample` after consumption
+        # so a missed call doesn't leak stale tensors.
         self._last_logits_hidden = hidden_states
         return self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
 
@@ -1124,9 +1125,14 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
 
         if audio_codes_list:
             audio_codes = torch.cat(audio_codes_list, dim=0)
-            span_len = int(audio_codes.shape[0])
-            if hidden is not None and span_len <= int(hidden.shape[0]):
-                hidden = hidden[:span_len]
+            # NOTE: do not slice ``hidden`` by ``audio_codes.shape[0]`` — the
+            # talker emits one audio frame per request per decode step, so
+            # ``hidden.shape[0]`` is the BATCH dim (one row per request), not
+            # an audio-frame dim. Slicing here corrupted multi-request decode
+            # (gather assert in the runner's ``hidden_states[logits_indices]``
+            # because ``logits_indices`` then refers to rows that no longer
+            # exist). Qwen3-TTS / Fish-Speech can slice because their hidden
+            # carries multi-frame outputs; higgs-audio v2 does not.
             return OmniOutput(
                 text_hidden_states=hidden,
                 multimodal_outputs={"codes": {"audio": audio_codes}},
