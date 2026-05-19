@@ -765,7 +765,7 @@ def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
 
 
 @pytest.mark.slow
-@pytest.mark.skip(reason="issue#2327")
+@pytest.mark.skip(reason="OOM injection causes the serving instance to exit")
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_gpu_oom_state_converges_after_fault_removed(
