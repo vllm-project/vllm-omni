@@ -1,7 +1,7 @@
 [
   {
     "test_name": null,
-    "backend": null,
+    "endpoint": null,
     "timestamp": null,
     "server_params": {
       "model": null,
@@ -43,7 +43,7 @@
       "stage_durations_mean": {},
       "stage_durations_p50": {},
       "stage_durations_p99": {},
-      "backend": null,
+      "endpoint": null,
       "model": null,
       "dataset": null,
       "task": null
@@ -51,6 +51,7 @@
     "log_file": null,
     "Model": null,
     "Framework": null,
+    "API Endpoint": null,
     "Hardware": null,
     "Deployment": null,
     "Task": null,
