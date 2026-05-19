@@ -169,13 +169,28 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         prompt = req.prompts[0].get("prompt")
         multi_modal_data = req.prompts[0].get("multi_modal_data", {})
 
-        # Always reset: Lingbot Fast does not support video continuation
-        self.state.reset()
+        session_id = str(req.sampling_params.extra_args.get("session_id") or None)
+        extension = True
+
+        if self.state.session_id is None or self.state.session_id != session_id:
+            self.state.reset()
+            self.state.session_id = session_id
+            extension = False
+        else:
+            extension = True
 
         camera = multi_modal_data.get("camera", None)
         if camera is None:
             self.od_config.model
             raise ValueError("A path to camera positions must be passed to this model through action_path.")
+
+        if extension:
+            assert multi_modal_data.get("image") is None, (
+                "image must not be provided on extension calls; it is only used on the first call of a session"
+            )
+            assert self.model.config.local_attn_size == -1, (
+                "video extension requires the model to be configured with local_attn_size == -1"
+            )
 
         batch_size = 1
         num_frames = req.sampling_params.num_frames
@@ -184,41 +199,62 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         num_frames = max(25, num_frames)
 
         c2ws = camera.get("poses")
+        chunk_size = CONFIG["chunk_size"]
+        max_area = CONFIG["max_area"]
 
-        len_c2ws = ((len(c2ws) - 1) // 4) * 4 + 1
-        num_frames = ((num_frames - 1) // 4) * 4 + 1
-        num_frames = min(num_frames, len_c2ws)
+        # Fresh:     4N+1 pixel frames → N+1 latents, the first slot is the anchor.
+        # Extension: 4N   pixel frames → N regular latents, no anchor.
+        if extension:
+            len_c2ws = (len(c2ws) // 4) * 4
+            num_frames = (num_frames // 4) * 4
+            num_frames = min(num_frames, len_c2ws)
+            new_lat_f = num_frames // 4
+        else:
+            len_c2ws = ((len(c2ws) - 1) // 4) * 4 + 1
+            num_frames = ((num_frames - 1) // 4) * 4 + 1
+            num_frames = min(num_frames, len_c2ws)
+            new_lat_f = (num_frames - 1) // 4 + 1
         c2ws = c2ws[:num_frames]
 
-        # preprocess
-        img = multi_modal_data.get("image")
-        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
+        # 1. Derive spatial shape: from the input image on fresh start, from cache on extension.
+        if not extension:
+            img = multi_modal_data.get("image")
+            img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
+            h, w = img.shape[1:]
+            aspect_ratio = h / w
+            lat_h = round(
+                np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] // self.patch_size[1] * self.patch_size[1]
+            )
+            lat_w = round(
+                np.sqrt(max_area / aspect_ratio) // self.vae_stride[2] // self.patch_size[2] * self.patch_size[2]
+            )
+            h = lat_h * self.vae_stride[1]
+            w = lat_w * self.vae_stride[2]
+        else:
+            img = None
+            h, w, lat_h, lat_w = self.state.h, self.state.w, self.state.lat_h, self.state.lat_w
 
-        max_area = CONFIG["max_area"]
-        chunk_size = CONFIG["chunk_size"]
-
-        h, w = img.shape[1:]
-        aspect_ratio = h / w
-        lat_h = round(np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] // self.patch_size[1] * self.patch_size[1])
-        lat_w = round(np.sqrt(max_area / aspect_ratio) // self.vae_stride[2] // self.patch_size[2] * self.patch_size[2])
-        h = lat_h * self.vae_stride[1]
-        w = lat_w * self.vae_stride[2]
-        lat_f = (num_frames - 1) // self.vae_stride[0] + 1
-        lat_f = int(lat_f - (lat_f % chunk_size))
-        lat_f = max(lat_f, 1)
-        F = (lat_f - 1) * 4 + 1
+        new_lat_f = int(new_lat_f - (new_lat_f % chunk_size))
+        new_lat_f = max(new_lat_f, 1)
         max_seq_len = chunk_size * lat_h * lat_w // (self.patch_size[1] * self.patch_size[2])
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
         seed = random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
-        noise = torch.randn(16, lat_f, lat_h, lat_w, dtype=torch.float32, generator=seed_g, device=self.device)
+        noise = torch.randn(16, new_lat_f, lat_h, lat_w, dtype=torch.float32, generator=seed_g, device=self.device)
 
-        msk = torch.ones(1, F, lat_h, lat_w, device=self.device)
-        msk[:, 1:] = 0
-        msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
-        msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
-        msk = msk.transpose(1, 2)[0]
+        # Fresh: msk[0] = 1 (anchor) and the rest = 0, replicated into 4 channels grouped
+        # by latent frame to give shape [4, new_lat_f, lat_h, lat_w].
+        # Extension: no anchor, all zeros, already in the [4, new_lat_f, ...] layout.
+        if not extension:
+            F = (new_lat_f - 1) * 4 + 1
+            msk = torch.zeros(1, F, lat_h, lat_w, device=self.device)
+            msk[:, 0] = 1
+            msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
+            msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
+            msk = msk.transpose(1, 2)[0]
+        else:
+            msk = torch.zeros(4, new_lat_f, lat_h, lat_w, device=self.device)
 
         # 2. Prepare timesteps
         self.scheduler.set_timesteps(self.num_train_timesteps, shift=CONFIG["sample_shift"])
@@ -236,9 +272,9 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
         )
         Ks = Ks[0]
 
+        # One target pose per output latent — must match the f= in the rearrange below.
         len_c2ws = len(c2ws)
-        len_c2ws_ = int((len_c2ws - 1) // 4) + 1
-        len_c2ws_ = int(len_c2ws_ - (len_c2ws_ % chunk_size))
+        len_c2ws_ = new_lat_f
         c2ws_infer = interpolate_camera_poses(
             src_indices=np.linspace(0, len_c2ws - 1, len_c2ws),
             src_rot_mat=c2ws[:, :3, :3],
@@ -259,21 +295,30 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
             c2=int(w // lat_w),
         )
         c2ws_plucker_emb = c2ws_plucker_emb[None, ...]  # [b, f*h*w, c]
-        c2ws_plucker_emb = rearrange(c2ws_plucker_emb, "b (f h w) c -> b c f h w", f=lat_f, h=lat_h, w=lat_w).to(
+        c2ws_plucker_emb = rearrange(c2ws_plucker_emb, "b (f h w) c -> b c f h w", f=new_lat_f, h=lat_h, w=lat_w).to(
             self.target_dtype
         )
 
-        y = self.vae.encode(
-            [
-                torch.concat(
-                    [
-                        torch.nn.functional.interpolate(img[None].cpu(), size=(h, w), mode="bicubic").transpose(0, 1),
-                        torch.zeros(3, F - 1, h, w),
-                    ],
-                    dim=1,
-                ).to(self.device)
-            ]
-        )[0]
+        # Fresh:     pixels = [anchor_image, zeros...] of shape [3, 4N+1, h, w].
+        #            VAE produces N+1 latents; latent[0] is the anchor encoding.
+        # Extension: pixels = zeros [3, 4N+1, h, w]. VAE produces N+1 latents,
+        #            of which latent[0] is the special "1-frame init" encoding
+        #            (biased differently than the regular 4-frame-group latents).
+        #            Slice it off so the N conditioning slots are all regular —
+        #            this drops a CONDITIONING slot, not an output latent.
+        if not extension:
+            F = (new_lat_f - 1) * 4 + 1
+            pixels = torch.concat(
+                [
+                    torch.nn.functional.interpolate(img[None].cpu(), size=(h, w), mode="bicubic").transpose(0, 1),
+                    torch.zeros(3, F - 1, h, w),
+                ],
+                dim=1,
+            ).to(self.device)
+            y = self.vae.encode([pixels])[0]
+        else:
+            pixels = torch.zeros(3, 4 * new_lat_f + 1, h, w, device=self.device)
+            y = self.vae.encode([pixels])[0][:, 1:]
         y = torch.concat([msk, y])
 
         @contextmanager
@@ -282,17 +327,34 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
 
         no_sync_model = getattr(self.model, "no_sync", noop_no_sync)
 
-        # Initialize KV cache to all zeros
+        # Initialize (fresh) or grow (extension) the KV cache. Cross-attn cache is
+        # left untouched on extension so text-context k/v computed on the first call
+        # are reused via crossattn_cache[i]["is_init"] == True.
         model_args = self.model.config
         transformer_dtype = self.target_dtype
         frame_seqlen = int(noise.shape[-2] * noise.shape[-1] // 4)
-        kv_size = frame_seqlen * lat_f
+        extra_kv_size = frame_seqlen * new_lat_f
         head_dim = model_args.dim // model_args.num_heads
         local_num_heads = model_args.num_heads // self.sp_size
 
-        self.state.create_kv_caches(
-            batch_size, transformer_dtype, self.device, kv_size, model_args.num_layers, local_num_heads, head_dim
-        )
+        if not extension:
+            self.state.create_kv_caches(
+                batch_size,
+                transformer_dtype,
+                self.device,
+                extra_kv_size,
+                model_args.num_layers,
+                local_num_heads,
+                head_dim,
+            )
+        else:
+            self.state.extend_kv_caches(extra_kv_size)
+
+        # Total cache size after this call, used both as the per-query attention
+        # window and as the absolute-token offset base for the chunk loop.
+        prev_lat_f = self.state.current_lat_f
+        total_kv_size = frame_seqlen * (prev_lat_f + new_lat_f)
+        start_token_offset = prev_lat_f * frame_seqlen
 
         # evaluation mode
         with (
@@ -325,8 +387,8 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
                     "local_end_index": self.state.local_end_index,
                     "global_end_index": self.state.global_end_index,
                     "crossattn_cache": self.state.get_crossattn_caches(),
-                    "current_start": chunk_id * chunk_size * frame_seqlen,
-                    "max_attention_size": kv_size,
+                    "current_start": start_token_offset + chunk_id * chunk_size * frame_seqlen,
+                    "max_attention_size": total_kv_size,
                 }
 
                 for timestep_idx in range(len(timesteps)):
@@ -363,10 +425,37 @@ class LingbotWorldFastPipeline(nn.Module, SupportImageInput, SupportCameraPosInp
             pred_latent_chunks = torch.cat(pred_latent_chunks, dim=1)
 
             if self.device.index == 0:
-                videos = self.vae.decode([pred_latent_chunks])
+                # Wan VAE decode() calls clear_cache() internally, so the very
+                # first latent always runs the i==0 path (no temporal upsample,
+                # single-frame output) and leaves feat_map polluted with that
+                # bias. The decoder's stacked temporal-causal layers also need
+                # ~2 latents of streaming context before deeper feat_map slots
+                # match a true mid-stream decode. On extension, prepend the
+                # prior chunk's last 2 latents so warmup_0 absorbs the i==0
+                # bias and warmup_1 fully primes the cache. Then discard the
+                # 4*K - 3 leading pixels (re-decodes of already-shown frames).
+                if extension and self.state.last_decoded_latent is not None:
+                    warmup = self.state.last_decoded_latent.to(pred_latent_chunks.device, pred_latent_chunks.dtype)
+                    k = warmup.shape[1]
+                    drop = 4 * k - 3
+                    to_decode = torch.cat([warmup, pred_latent_chunks], dim=1)
+                    videos = self.vae.decode([to_decode])
+                    videos = [v[:, drop:] for v in videos]
+                else:
+                    videos = self.vae.decode([pred_latent_chunks])
+
+                self.state.last_decoded_latent = pred_latent_chunks[:, -2:].detach().clone()
 
         if dist.is_initialized():
             dist.barrier()
+
+        if not extension:
+            self.state.h = h
+            self.state.w = w
+            self.state.lat_h = lat_h
+            self.state.lat_w = lat_w
+            self.state.frame_seqlen = frame_seqlen
+        self.state.advance(new_lat_f)
 
         return DiffusionOutput(output=videos[0])
 

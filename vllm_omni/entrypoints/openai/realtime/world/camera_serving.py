@@ -109,7 +109,6 @@ class ServingRealtimeWorldCamera:
         Engine-side Lingbot state is reset on the next inference request via
         `extra_args["reset"]`, not by an immediate websocket-side RPC.
         """
-        self._call_count = 0
         self._current_session_id = None
 
     async def infer(self, obs: dict) -> np.ndarray:

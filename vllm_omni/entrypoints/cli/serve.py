@@ -552,7 +552,7 @@ class OmniServeCommand(CLISubcommand):
             help="Change max size of a websocket payload that is accepted by the server",
         )
         omni_config_group.add_argument(
-            "ws",
+            "--ws",
             default="auto",
             help="Set the websocket Protocol type",
         )

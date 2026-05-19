@@ -115,9 +115,9 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoListResponse,
     VideoResponse,
 )
+from vllm_omni.entrypoints.openai.realtime.world.camera_serving import ServingRealtimeWorldCamera
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
-from vllm_omni.entrypoints.openai.realtime.world.camera_serving import ServingRealtimeWorldCamera
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
@@ -1419,6 +1419,7 @@ async def realtime_websocket(websocket: WebSocket):
     connection = RealtimeConnection(websocket, serving)
     await connection.handle_connection()
 
+
 @router.websocket("/v1/realtime/world/camera")
 async def realtime_world_camera_openpi(websocket: WebSocket):
     from vllm_omni.entrypoints.openai.realtime.world.camera_connection import WorldCameraRealtimeConnection
@@ -1432,6 +1433,7 @@ async def realtime_world_camera_openpi(websocket: WebSocket):
         return
     connection = WorldCameraRealtimeConnection(websocket, serving)
     await connection.handle_connection()
+
 
 # Health and Model endpoints for diffusion mode
 

@@ -8,7 +8,6 @@ from __future__ import annotations
 import logging
 from enum import IntEnum
 
-import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
@@ -43,22 +42,29 @@ class LingbotWorldFastState:
         self.local_end_index: list[torch.Tensor] | None = None
         self.global_end_index: list[torch.Tensor] | None = None
 
-    def should_reset(self, text_tokens: torch.Tensor | None, num_video_frames: int, local_attn_size: int) -> bool:
-        """Determine if state should be reset before this forward()."""
-        # NOTE: after accumulate_frames, num_video_frames is the accumulated T
-        # (1 for first call, 4 for subsequent). Only reset on true single-frame
-        # which happens when the stitched_buffer was cleared externally.
-        if num_video_frames == 1 and self.call_count > 1:
-            logger.info("single frame input after first call, resetting")
-            return True
+        self.is_initialized: bool = False
+        self.current_lat_f: int = 0
+        self.session_id: str | None = None
 
-        if local_attn_size != -1 and self.current_start_frame >= local_attn_size:
-            logger.info(
-                "current_start_frame %d >= local_attn_size %d, resetting", self.current_start_frame, local_attn_size
-            )
-            return True
+        self.batch_size: int | None = None
+        self.num_layers: int | None = None
+        self.num_heads: int | None = None
+        self.head_dim: int | None = None
 
-        return False
+        # Shape constants captured on the first call of a session and reused
+        # on extension calls, where multi_modal_data["image"] is absent.
+        self.h: int | None = None
+        self.w: int | None = None
+        self.lat_h: int | None = None
+        self.lat_w: int | None = None
+        self.frame_seqlen: int | None = None
+
+        # Last few latents emitted by the diffusion loop on the previous call.
+        # Prepended to pred_latent_chunks on extension so the Wan VAE decoder's
+        # stacked temporal feat_maps are fully warmed before the first NEW
+        # latent is decoded. The decoder's temporal receptive field spans
+        # ~2 latents, so we cache the last 2.
+        self.last_decoded_latent: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # KV cache management
@@ -74,6 +80,11 @@ class LingbotWorldFastState:
         num_heads: int,
         head_dim: int,
     ) -> None:
+        self.batch_size = batch_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+
         """Initialize empty KV caches and cross-attention caches."""
         self.kv_cache = [
             torch.zeros(2, batch_size, kv_size, num_heads, head_dim, dtype=dtype, device=device)
@@ -84,6 +95,27 @@ class LingbotWorldFastState:
         self.global_end_index = [torch.tensor([0], dtype=torch.long, device=device) for _ in range(num_layers)]
 
         self.crossattn_cache = [{"is_init": False, "k": None, "v": None} for _ in range(num_layers)]
+
+        self.is_initialized = True
+
+    def extend_kv_caches(self, extra_kv_size: int):
+        assert self.is_initialized, "Cannot extend uninitialized kv cache"
+
+        dtype = self.kv_cache[0].dtype
+        device = self.kv_cache[0].device
+
+        self.kv_cache = [
+            torch.cat(
+                [
+                    self.kv_cache[i],
+                    torch.zeros(
+                        2, self.batch_size, extra_kv_size, self.num_heads, self.head_dim, dtype=dtype, device=device
+                    ),
+                ],
+                dim=2,
+            )
+            for i in range(self.num_layers)
+        ]
 
     def update_kv_cache(
         self,
@@ -105,3 +137,6 @@ class LingbotWorldFastState:
         """Get cross-attention caches for the specified branch."""
         assert self.crossattn_cache is not None, "Cross-attn caches not initialized"
         return self.crossattn_cache
+
+    def advance(self, delta: int):
+        self.current_lat_f += delta
