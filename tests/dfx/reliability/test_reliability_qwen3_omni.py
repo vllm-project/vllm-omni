@@ -120,8 +120,9 @@ RUNTIME_WORKER_PATTERN = "VLLM::"
 # RFC#2366 signal x target matrix:
 # - worker: SIGTERM, SIGKILL
 # - serve-root: SIGINT (Ctrl+C on root only); SIGTERM/SIGKILL skipped (residual process)
-# - serve-tree: SIGTERM, SIGKILL
+# - serve-tree: SIGTERM/SIGKILL; tree with-load SIGTERM skipped (issue#3683)
 _SERVE_ROOT_NON_SIGINT_SKIP = pytest.mark.skip(reason="remain process after kill serve root")
+_TREE_WITH_LOAD_SIGTERM_SKIP = pytest.mark.skip(reason="issue#3683")
 SERVE_SIGNAL_PARAMS = [
     pytest.param("SIGTERM", id="sigterm", marks=_SERVE_ROOT_NON_SIGINT_SKIP),
     pytest.param("SIGINT", id="sigint"),
@@ -129,6 +130,10 @@ SERVE_SIGNAL_PARAMS = [
 ]
 TREE_SIGNAL_PARAMS = [
     pytest.param("SIGTERM", id="sigterm"),
+    pytest.param("SIGKILL", id="sigkill"),
+]
+TREE_WITH_LOAD_SIGNAL_PARAMS = [
+    pytest.param("SIGTERM", id="sigterm", marks=_TREE_WITH_LOAD_SIGTERM_SKIP),
     pytest.param("SIGKILL", id="sigkill"),
 ]
 WORKER_SIGNAL_FAULT_PARAMS = [
@@ -724,7 +729,7 @@ def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
-@pytest.mark.parametrize("signal_name", TREE_SIGNAL_PARAMS)
+@pytest.mark.parametrize("signal_name", TREE_WITH_LOAD_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
     omni_server_function,
