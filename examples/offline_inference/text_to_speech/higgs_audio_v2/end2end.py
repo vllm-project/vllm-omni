@@ -76,6 +76,18 @@ def parse_args():
         default=500,
         help="Cap on Stage-0 codec frames per request.",
     )
+    parser.add_argument(
+        "--ref-audio",
+        type=str,
+        default=None,
+        help="Reference clip for voice clone (path to a WAV file). Paired with --ref-text.",
+    )
+    parser.add_argument(
+        "--ref-text",
+        type=str,
+        default=None,
+        help="Transcript of the reference clip. Required when --ref-audio is set.",
+    )
     nullify_stage_engine_defaults(parser)
     return parser.parse_args()
 
@@ -117,6 +129,8 @@ def _pcm_to_int16(pcm: torch.Tensor) -> np.ndarray:
 
 def main():
     args = parse_args()
+    if (args.ref_audio is None) != (args.ref_text is None):
+        raise SystemExit("--ref-audio and --ref-text must be supplied together")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -127,14 +141,26 @@ def main():
 
     from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_tokenizer import (
         build_plain_text_prompt,
+        build_voice_clone_prompt,
         input_ids_to_python_list,
     )
 
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
 
+    # Voice-clone path: load the reference clip once. The HF processor will
+    # encode it via the bundled HiggsAudioV2TokenizerModel each time we build
+    # a prompt below. This is cheap on CPU for a few-second clip.
+    ref_wav: np.ndarray | None = None
+    ref_sr: int | None = None
+    if args.ref_audio is not None:
+        ref_wav, ref_sr = sf.read(args.ref_audio, always_2d=False)
+        if ref_wav.ndim == 2:
+            ref_wav = ref_wav.mean(axis=1)
+
     print(f"Model       : {args.model}")
     print(f"Prompts     : {len(args.texts)}")
     print(f"Output dir  : {output_dir}")
+    print(f"Voice clone : {'yes' if ref_wav is not None else 'no'}")
 
     # Run one prompt at a time. The Stage-0 talker's per-slot audio state is
     # request-scoped; submitting multiple prompts in the same engine.generate()
@@ -143,8 +169,21 @@ def main():
     total_elapsed = 0.0
     total_dur = 0.0
     for text in args.texts:
-        inputs = build_plain_text_prompt(processor, text)
-        prompt = {"prompt_token_ids": input_ids_to_python_list(inputs)}
+        if ref_wav is not None:
+            out = build_voice_clone_prompt(processor, text, ref_wav, int(ref_sr), args.ref_text)
+            prompt = {
+                "prompt_token_ids": out["prompt_token_ids"],
+                # Bare tensors (NOT list-wrapped): the msgspec serializer in
+                # vllm_omni.data_entry_keys routes torch.Tensor → tensor_data
+                # and list[Tensor] → list_data (which silently strips tensors).
+                "additional_information": {
+                    "audio_input_ids": out["audio_input_ids"],
+                    "audio_input_ids_mask": out["audio_input_ids_mask"],
+                },
+            }
+        else:
+            inputs = build_plain_text_prompt(processor, text)
+            prompt = {"prompt_token_ids": input_ids_to_python_list(inputs)}
         t_start = time.perf_counter()
         outputs = engine.generate([prompt])
         elapsed = time.perf_counter() - t_start

@@ -507,6 +507,123 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             input_ids == self.config.audio_delay_token_id
         )
 
+    # ------------------------------------------------------------ ref-audio
+    @torch.inference_mode()
+    def _maybe_apply_ref_audio_substitution(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        info_dicts: Any,
+    ) -> torch.Tensor:
+        """Substitute reference-audio embeddings at prompt-side audio placeholders.
+
+        Voice-clone path: the serving layer threads per-request
+        ``audio_input_ids`` (shape ``[T_frames, num_codebooks]``) +
+        ``audio_input_ids_mask`` (``[T_frames]``) into
+        ``model_intermediate_buffer`` (one dict per request in batch order).
+        For each request that has those tensors, we look up its span in the
+        flat ``input_ids`` via ``query_start_loc`` from the forward context,
+        embed the codes through ``audio_codebook_embeddings`` (with the
+        per-codebook ``audio_tokens_offsets`` shift, mirroring
+        ``HiggsAudioV2Embeddings.forward`` upstream), and overwrite the
+        text-side embedding at every audio_token / audio_delay placeholder
+        position in that span.
+
+        Decode steps (span length 1) are skipped here — the audio-feedback
+        path in ``_maybe_apply_audio_feedback`` takes over from the moment
+        the talker emits its first codebook frame via ``sample()``.
+        """
+        if not info_dicts:
+            return hidden_states
+
+        # Pull the per-request (codes, mask) tensors in batch order. Values
+        # may be on CPU after IPC serialization (msgspec ships tensors as raw
+        # bytes); the loop below moves them to the input_ids device on use.
+        per_req_codes: list[torch.Tensor | None] = []
+        any_codes = False
+        for info in info_dicts:
+            if not isinstance(info, dict):
+                per_req_codes.append(None)
+                continue
+            ids = info.get("audio_input_ids")
+            mask = info.get("audio_input_ids_mask")
+            if isinstance(ids, list):
+                ids = ids[0] if ids else None
+            if isinstance(mask, list):
+                mask = mask[0] if mask else None
+            if not isinstance(ids, torch.Tensor) or not isinstance(mask, torch.Tensor):
+                per_req_codes.append(None)
+                continue
+            if ids.ndim == 3:
+                ids = ids[0]
+            if mask.ndim == 2:
+                mask = mask[0]
+            valid = ids[mask.to(dtype=torch.bool)]  # [T_valid, num_codebooks]
+            if valid.numel() == 0:
+                per_req_codes.append(None)
+                continue
+            per_req_codes.append(valid)
+            any_codes = True
+
+        if not any_codes:
+            return hidden_states
+
+        # Per-request slices in the flat input_ids are recovered from the
+        # forward context's attention metadata (mimo_audio_llm.py:1022-1025
+        # uses the same pattern). Without spans we cannot route codes to the
+        # right placeholder positions, so we no-op instead of risking a
+        # cross-request mix-up.
+        from vllm.forward_context import get_forward_context
+
+        try:
+            attn_metadata = get_forward_context().attn_metadata
+        except Exception:
+            return hidden_states
+        if isinstance(attn_metadata, dict):
+            if not attn_metadata:
+                return hidden_states
+            attn = next(iter(attn_metadata.values()))
+        else:
+            attn = attn_metadata
+        q_start = getattr(attn, "query_start_loc", None)
+        if not isinstance(q_start, torch.Tensor):
+            return hidden_states
+        q_start_cpu = q_start.detach().to("cpu").tolist()
+        if len(q_start_cpu) != len(info_dicts) + 1:
+            return hidden_states
+
+        audio_token_id = int(self.config.audio_token_id)
+        audio_delay_id = int(self.config.audio_delay_token_id)
+        offsets = self.audio_tokens_offsets.to(input_ids.device)
+
+        new_hidden: torch.Tensor | None = None
+        for i, codes in enumerate(per_req_codes):
+            if codes is None:
+                continue
+            s = int(q_start_cpu[i])
+            e = int(q_start_cpu[i + 1])
+            if e - s <= 1:
+                # Decode step — let _maybe_apply_audio_feedback handle this row.
+                continue
+            slice_ids = input_ids[s:e]
+            mask = (slice_ids == audio_token_id) | (slice_ids == audio_delay_id)
+            placeholders = mask.nonzero(as_tuple=True)[0]
+            n_real = int(codes.shape[0])
+            if int(placeholders.numel()) < n_real:
+                # Mismatch (likely a truncated prompt): skip this request rather
+                # than corrupt the batch. The user-visible failure surfaces as
+                # the model not honoring the ref-audio rather than a crash.
+                continue
+            target = placeholders[:n_real] + s
+            embeds = self.audio_codebook_embeddings(
+                codes.to(device=input_ids.device, dtype=torch.long) + offsets
+            ).sum(dim=-2)
+            if new_hidden is None:
+                new_hidden = hidden_states.clone()
+            new_hidden[target] = embeds.to(new_hidden.dtype)
+
+        return new_hidden if new_hidden is not None else hidden_states
+
     # ----------------------------------------------------------------- weights
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
@@ -851,7 +968,7 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: Any | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        **_: Any,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """DualFFN-routed Stage-0 forward.
 
@@ -872,6 +989,19 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         # active, so for our use case we have to keep our own copy.
         if input_ids is not None:
             self._last_step_input_ids = input_ids
+
+        # Voice-clone ref-audio substitution: at the prompt-side audio
+        # placeholder span we overwrite the text-embed lookups with the
+        # multi-codebook embedding of the encoded reference clip carried in
+        # ``model_intermediate_buffer``. No-op for plain-text requests and
+        # for decode steps (which fall through to the audio-feedback path).
+        if input_ids is not None and inputs_embeds is None:
+            info_dicts = kwargs.get("model_intermediate_buffer")
+            if info_dicts is None:
+                info_dicts = kwargs.get("runtime_additional_information")
+            hidden_states = self._maybe_apply_ref_audio_substitution(
+                hidden_states, input_ids, info_dicts,
+            )
 
         # Audio-feedback substitution: vLLM's AR runner calls forward()
         # with ``inputs_embeds=None`` and lets the model embed its own

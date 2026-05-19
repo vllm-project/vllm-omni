@@ -27,6 +27,7 @@ os.environ.setdefault("VLLM_MOE_USE_DEEP_GEMM", "0")
 import pytest
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import load_test_audio_data_url
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -55,6 +56,16 @@ DEFAULT_SPEECH_TIMEOUT_S = 180.0
 # A WAV header adds 44 bytes; pick a conservative floor that catches truncated
 # / silence-only outputs without flagging short legitimate clips.
 _MIN_AUDIO_BYTES = 20_000
+
+# Reuse the qwen3_tts vendored reference clip (clean ~5 s 24 kHz mono human
+# speech) + its transcript. See tests/e2e/online_serving/test_qwen3_tts_base.py
+# for the asset rationale — keeping a single shared reference clip across TTS
+# tests avoids duplicating WAVs in the repo.
+_REF_AUDIO_URL = load_test_audio_data_url("qwen3_tts/clone_2.wav")
+_REF_TEXT = (
+    "Okay. Yeah. I resent you. I love you. I respect you. But you know "
+    "what? You blew it! And thanks to you."
+)
 
 
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
@@ -149,12 +160,30 @@ class TestHiggsAudioV2OnlineValidatorRejections:
     @pytest.mark.core_model
     @pytest.mark.tts
     @hardware_test(res={"cuda": "H100"}, num_cards=1)
-    def test_rejects_ref_audio_voice_cloning(self, omni_server, openai_client) -> None:
+    def test_rejects_ref_audio_without_ref_text(self, omni_server, openai_client) -> None:
+        """Voice clone needs the transcript too — half-supplied is a 4xx."""
         openai_client.send_audio_speech_request(
             {
                 "model": omni_server.model,
                 "input": "Hello world.",
-                "ref_audio": "data:audio/wav;base64,SUQ=",
+                "ref_audio": _REF_AUDIO_URL,
+                "response_format": "wav",
+                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                "status_code": (400, 422),
+                "err_message": "ref_text",
+            }
+        )
+
+    @pytest.mark.core_model
+    @pytest.mark.tts
+    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    def test_rejects_ref_text_without_ref_audio(self, omni_server, openai_client) -> None:
+        """Symmetric guard: ref_text alone is not enough — must come with ref_audio."""
+        openai_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": "Hello world.",
+                "ref_text": "some transcript",
                 "response_format": "wav",
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "status_code": (400, 422),
@@ -221,5 +250,53 @@ class TestHiggsAudioV2OnlineValidatorRejections:
                 "timeout": DEFAULT_SPEECH_TIMEOUT_S,
                 "status_code": (400, 422),
                 "err_message": "empty",
+            }
+        )
+
+
+@pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)
+class TestHiggsAudioV2OnlineVoiceClone:
+    """Shallow voice clone: ref_audio + ref_text -> speech in the cloned voice.
+
+    The HF processor that the serving layer calls (lazy-loaded at the first
+    request) ships with the bundled HiggsAudioV2TokenizerModel and encodes
+    the reference clip in-process. The talker substitutes the encoded codes
+    at the prompt-side audio placeholders via
+    :meth:`HiggsAudioV2TalkerForConditionalGeneration._maybe_apply_ref_audio_substitution`.
+    """
+
+    @pytest.mark.advanced_model
+    @pytest.mark.tts
+    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    def test_voice_clone_basic(self, omni_server, openai_client) -> None:
+        """Single non-streaming WAV request driven by the qwen3_tts ref clip."""
+        openai_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": "Hello world.",
+                "ref_audio": _REF_AUDIO_URL,
+                "ref_text": _REF_TEXT,
+                "stream": False,
+                "response_format": "wav",
+                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                "min_audio_bytes": _MIN_AUDIO_BYTES,
+            }
+        )
+
+    @pytest.mark.advanced_model
+    @pytest.mark.tts
+    @hardware_test(res={"cuda": "H100"}, num_cards=1)
+    def test_voice_clone_pcm_streaming(self, omni_server, openai_client) -> None:
+        """Voice clone over the streaming PCM path."""
+        openai_client.send_audio_speech_request(
+            {
+                "model": omni_server.model,
+                "input": "Innovation distinguishes a leader from a follower.",
+                "ref_audio": _REF_AUDIO_URL,
+                "ref_text": _REF_TEXT,
+                "stream": True,
+                "response_format": "pcm",
+                "timeout": DEFAULT_SPEECH_TIMEOUT_S,
+                "min_audio_bytes": _MIN_AUDIO_BYTES,
             }
         )

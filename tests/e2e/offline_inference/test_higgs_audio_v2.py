@@ -30,6 +30,7 @@ import torch
 from vllm import SamplingParams
 
 from tests.helpers.mark import hardware_test
+from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -39,6 +40,14 @@ SAMPLE_RATE = 24_000
 # A short sentence at 24 kHz must produce at least ~0.5 s of audio.
 MIN_AUDIO_SAMPLES = 12_000
 TEST_TEXT = "Hello world."
+
+# Reuse the qwen3_tts ref clip + transcript for voice clone tests (see
+# tests/e2e/online_serving/test_qwen3_tts_base.py:27-28 for the source).
+_REF_AUDIO_ASSET = "qwen3_tts/clone_2.wav"
+_REF_TEXT = (
+    "Okay. Yeah. I resent you. I love you. I respect you. But you know "
+    "what? You blew it! And thanks to you."
+)
 
 # (model, stage_config_path, extra_omni_kwargs) — same shape as test_voxtral_tts.py.
 # Stage configs already pin enforce_eager=true per stage, so no Omni-level override.
@@ -160,3 +169,68 @@ def test_higgs_audio_v2_offline_batch_two_prompts(omni_runner_function: OmniRunn
     )
     # See the silence-threshold note in test_higgs_audio_v2_offline_plain_text.
     assert np.max(np.abs(pcm.numpy())) > 5e-4, "batched audio output is silent"
+
+
+def _compose_voice_clone_request(model_name: str, text: str, ref_text: str, ref_wav_path) -> dict:
+    """Build the voice-clone prompt + additional_information payload.
+
+    Calls the same ``build_voice_clone_prompt`` the serving layer uses online —
+    the HF processor encodes the reference clip on the spot via the bundled
+    HiggsAudioV2TokenizerModel. The talker's
+    ``_maybe_apply_ref_audio_substitution`` consumes the tensors at prefill.
+    """
+    import soundfile as sf
+    from transformers import AutoProcessor
+
+    from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_tokenizer import (
+        build_voice_clone_prompt,
+    )
+
+    wav, sr = sf.read(str(ref_wav_path), always_2d=False)
+    if wav.ndim == 2:
+        wav = wav.mean(axis=1)  # downmix any stereo asset to mono
+    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+    out = build_voice_clone_prompt(processor, text, wav, int(sr), ref_text)
+    return {
+        "prompt_token_ids": out["prompt_token_ids"],
+        # Pass tensors bare (see serving_speech._build_higgs_audio_v2_params
+        # — list-wrapped tensors get dropped by the msgspec serializer).
+        "additional_information": {
+            "audio_input_ids": out["audio_input_ids"],
+            "audio_input_ids_mask": out["audio_input_ids_mask"],
+        },
+    }
+
+
+@pytest.mark.advanced_model
+@pytest.mark.tts
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_runner_function", [_OMNI_RUNNER_PARAM], indirect=True)
+def test_higgs_audio_v2_offline_voice_clone(omni_runner_function: OmniRunner) -> None:
+    """
+    Shallow voice clone via ref_audio + ref_text, offline.
+
+    Deploy Setting: vllm_omni/deploy/higgs_audio_v2.yaml.
+    Input Modal: text + reference audio (qwen3_tts/clone_2.wav vendored asset)
+    Output Modal: audio (PCM tensor, 24 kHz mono float)
+    Input Setting: single prompt
+    """
+    omni = omni_runner_function.omni
+    ref_path = get_asset_path(_REF_AUDIO_ASSET)
+    inputs = _compose_voice_clone_request(MODEL, TEST_TEXT, _REF_TEXT, ref_path)
+
+    stage_sampling = [
+        SamplingParams(temperature=1.0, top_p=0.95, top_k=50, max_tokens=1024, seed=42),
+        SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, max_tokens=65536, seed=42),
+    ]
+
+    outputs = list(omni.generate([inputs], stage_sampling))
+    assert outputs, "no outputs returned from Omni.generate for voice clone"
+
+    pcm = _extract_pcm(outputs)
+    arr = pcm.numpy()
+    assert arr.size > MIN_AUDIO_SAMPLES, (
+        f"cloned audio too short: {arr.size} samples, expected > {MIN_AUDIO_SAMPLES}"
+    )
+    assert np.max(np.abs(arr)) > 5e-4, "voice-clone output is silent"
+    assert np.isfinite(arr).all(), "voice-clone audio contains non-finite samples"

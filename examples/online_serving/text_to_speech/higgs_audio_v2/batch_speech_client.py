@@ -5,17 +5,27 @@
 Sends a fixed list of prompts to ``/v1/audio/speech`` and saves the returned
 WAV files (or raw PCM bytes when ``--format pcm``) into ``--output-dir``.
 
-Usage:
+Usage (plain text -> speech):
 
   python examples/online_serving/text_to_speech/higgs_audio_v2/batch_speech_client.py \
       --base-url http://localhost:8094 \
       --output-dir /tmp/higgs_audio_v2_batch \
       --prompts "Hello world." "The quick brown fox jumps over the lazy dog."
+
+Usage (shallow voice clone — pass a reference clip + its transcript):
+
+  python examples/online_serving/text_to_speech/higgs_audio_v2/batch_speech_client.py \
+      --base-url http://localhost:8094 \
+      --output-dir /tmp/higgs_audio_v2_clone \
+      --ref-audio path/to/reference.wav \
+      --ref-text "the transcript of the reference clip" \
+      --prompts "Hello world."
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 import sys
 from pathlib import Path
@@ -45,7 +55,32 @@ def main() -> int:
     parser.add_argument("--max-new-tokens", type=int, default=300)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--timeout-s", type=float, default=120.0)
+    parser.add_argument(
+        "--ref-audio",
+        type=Path,
+        default=None,
+        help="Reference clip for voice clone (path to a WAV file). Must be paired with --ref-text.",
+    )
+    parser.add_argument(
+        "--ref-text",
+        type=str,
+        default=None,
+        help="Transcript of the reference clip. Required when --ref-audio is set.",
+    )
     args = parser.parse_args()
+
+    if (args.ref_audio is None) != (args.ref_text is None):
+        print("--ref-audio and --ref-text must be supplied together", file=sys.stderr)
+        return 2
+
+    ref_audio_data_url: str | None = None
+    if args.ref_audio is not None:
+        if not args.ref_audio.exists():
+            print(f"ref-audio file not found: {args.ref_audio}", file=sys.stderr)
+            return 2
+        mime = "audio/wav" if args.ref_audio.suffix.lower() == ".wav" else "audio/mpeg"
+        ref_b64 = base64.b64encode(args.ref_audio.read_bytes()).decode("ascii")
+        ref_audio_data_url = f"data:{mime};base64,{ref_b64}"
 
     try:
         import httpx
@@ -68,6 +103,9 @@ def main() -> int:
                 "max_new_tokens": args.max_new_tokens,
                 "seed": args.seed,
             }
+            if ref_audio_data_url is not None:
+                payload["ref_audio"] = ref_audio_data_url
+                payload["ref_text"] = args.ref_text
             resp = client.post(url, json=payload)
             if resp.status_code != 200:
                 print(f"[FAIL] {prompt!r} -> {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
