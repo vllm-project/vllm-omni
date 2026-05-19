@@ -140,12 +140,24 @@ except ImportError:
     from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 
-try:
-    from vllm.transformers_utils.tokenizer import encode_tokens
-except ImportError:
 
-    def encode_tokens(tokenizer, prompt: str) -> list[int]:
+def encode_tokens(tokenizer, prompt: str) -> list[int]:
+    """Tokenize ``prompt`` without adding special tokens.
+
+    Prefer vllm's ``vllm.transformers_utils.tokenizer.encode_tokens`` when
+    available; falls back to the equivalent ``tokenizer.encode`` call so we
+    keep working across vllm versions that do not ship that helper.
+
+    The import is performed lazily inside the function so the docs builder
+    (griffe / mkdocs strict mode) does not try to statically resolve the
+    upstream alias, which can fail across vllm releases that rename or move
+    the helper.
+    """
+    try:
+        from vllm.transformers_utils.tokenizer import encode_tokens as _impl
+    except ImportError:
         return tokenizer.encode(prompt, add_special_tokens=False)
+    return _impl(tokenizer, prompt)
 
 
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
