@@ -220,14 +220,11 @@ class OmniDiffusionSamplingParams:
     width_latents: list[int] | int | None = None
     num_frames: int = 1  # Default for image models
     num_frames_round_down: bool = False  # Whether to round down num_frames if it's not divisible by num_gpus
-    # Number of output chunks the request produces. Read by ``StreamBatchScheduler``
-    # (temporal PP) to know how many chunks to admit through the pipeline.
-    num_chunks: int = 1
+    chunk_frames: int = 8 # Used when stream_batch=True
 
-    # SLO-adaptive stream batching. ``slo_fps=None`` keeps B fixed at 1.
+    # SLO-adaptive stream batching. ``slo_fps=None`` keeps B_target fixed at 1.
     slo_fps: float | None = None
     slo_max_batch: int = 8
-    slo_ema_alpha: float = 0.3
 
     # Original dimensions (before VAE scaling)
     height: int | None = None

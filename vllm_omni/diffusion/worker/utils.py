@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-import contextlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -113,42 +112,13 @@ class DiffusionRequestState:
         # A real "new request" signal should eventually come from scheduler/runner state transitions.
         return self.step_index == 0 or self.timesteps is None
 
-    @contextlib.contextmanager
-    def use_chunk(self, chunk: ChunkState) -> Iterator[None]:
-        """Temporarily alias per-chunk fields on ``self`` to a ``ChunkState``'s view.
-
-        Swapped fields: ``latents``, ``step_index``, ``scheduler``.
-
-        Lets ``prepare_encode`` / ``denoise_step`` / ``step_scheduler`` operate
-        per-chunk without any pipeline-side changes. Updates made inside the
-        context are written back to the chunk on exit; the request-level fields
-        are restored.
-        """
-        saved_latents = self.latents
-        saved_step_index = self.step_index
-        saved_scheduler = self.scheduler
-        self.latents = chunk.latents
-        self.step_index = chunk.step_index
-        self.scheduler = chunk.scheduler
-        try:
-            yield
-        finally:
-            chunk.latents = self.latents
-            chunk.step_index = self.step_index
-            chunk.scheduler = self.scheduler
-            self.latents = saved_latents
-            self.step_index = saved_step_index
-            self.scheduler = saved_scheduler
-
 
 @dataclass
 class ChunkState:
     """Per-chunk state for one in-flight chunk of a streaming request.
 
     Lives inside ``DiffusionRequestState.extra["chunks"]`` (keyed by
-    ``chunk_idx``). The runner swaps a chunk into the request state via
-    ``state.use_chunk(chunk)`` for the duration of one micro-step's
-    ``denoise_step + step_scheduler`` calls.
+    ``chunk_idx``).
 
     Each chunk owns its own ``scheduler`` instance (deepcopied from the
     pipeline's scheduler by ``prepare_encode``) because multi-step ODE solvers
@@ -169,7 +139,7 @@ class BaseRunnerOutput(ABC):
 
 
 @dataclass
-class RunnerOutput:
+class RunnerOutput(BaseRunnerOutput):
     """Output of a single execution step for a request.
 
     Each scheduler reads the fields it needs:

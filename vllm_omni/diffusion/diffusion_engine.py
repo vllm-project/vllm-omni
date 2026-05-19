@@ -144,8 +144,6 @@ class DiffusionEngine:
         self.executor = executor_class(od_config)
         self.step_execution = bool(getattr(od_config, "step_execution", False))
         self.stream_batch = bool(getattr(od_config, "stream_batch", False))
-        if self.stream_batch and not self.step_execution:
-            raise ValueError("stream_batch=True requires step_execution=True.")
 
         if scheduler is not None:
             self.scheduler: SchedulerInterface = scheduler
@@ -710,22 +708,33 @@ class DiffusionEngine:
             dummy_audio = np.random.randn(audio_sr * 2).astype(np.float32)
             prompt.setdefault("multi_modal_data", {})["audio"] = dummy_audio
 
+        sampling_kwargs: dict[str, Any] = {
+            "height": height,
+            "width": width,
+            "num_inference_steps": num_inference_steps,
+            # Keep warmup path minimal and robust across text encoders.
+            # Some models may fail when warmup implicitly triggers
+            # classifier-free guidance with an empty negative prompt.
+            "guidance_scale": 0.0,
+            "num_outputs_per_prompt": 1,
+            # Disable CFG for warmup to avoid triggering CFG parallel
+            # validation when cfg_parallel_size > 1.
+            "extra_args": {"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
+        }
+        
+        if self.stream_batch:
+            # Stream-batch requires chunk_frames/num_frames and a source video
+            chunk_frames = 8
+            sampling_kwargs["chunk_frames"] = chunk_frames
+            sampling_kwargs["num_frames"] = chunk_frames
+            prompt.setdefault("multi_modal_data", {})["video"] = [
+                torch.zeros(3, height, width, dtype=torch.float32) for _ in range(chunk_frames)
+            ]
+
         req = OmniDiffusionRequest(
             prompts=[prompt],
             request_ids=["dummy_req_id"],
-            sampling_params=OmniDiffusionSamplingParams(
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                # Keep warmup path minimal and robust across text encoders.
-                # Some models may fail when warmup implicitly triggers
-                # classifier-free guidance with an empty negative prompt.
-                guidance_scale=0.0,
-                num_outputs_per_prompt=1,
-                # Disable CFG for warmup to avoid triggering CFG parallel
-                # validation when cfg_parallel_size > 1.
-                extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
-            ),
+            sampling_params=OmniDiffusionSamplingParams(**sampling_kwargs),
         )
         logger.info("dummy run to warm up the model")
         request = self.pre_process_func(req) if self.pre_process_func is not None else req

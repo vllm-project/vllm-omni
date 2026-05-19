@@ -27,6 +27,7 @@ class DiffusionRequestStatus(enum.IntEnum):
     WAITING = enum.auto()
     RUNNING = enum.auto()
     PREEMPTED = enum.auto()
+    BLOCKED = enum.auto()
 
     # if any status is after or equal to FINISHED_COMPLETED, it is considered finished
     FINISHED_COMPLETED = enum.auto()
@@ -123,9 +124,7 @@ class Rank0Layout:
     - rank 0 appends n_new fresh randn rows at the tail before forwarding.
     """
 
-    n_finished: int
     n_circulating: int
-    n_new: int
     finished_idxs: list[int]
     new_idxs: list[int]
 
@@ -142,7 +141,7 @@ class DiffusionSchedulerOutput:
     num_waiting_reqs: int
 
     # stream-batch scheduling fields
-    per_rank_assignment: list[RankTask | None] | None = None
+    assignment: list[RankTask | None] | None = None
     rank0_layouts: dict[str, Rank0Layout] | None = None
 
     @cached_property

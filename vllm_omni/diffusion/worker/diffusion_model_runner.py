@@ -28,7 +28,7 @@ from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import supports_step_execution
+from vllm_omni.diffusion.models.interface import supports_step_execution, supports_micro_step_execution
 from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -153,6 +153,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             raise ValueError(
                 "step_execution=True requires a pipeline implementing "
                 "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
+                f"{self.od_config.model_class_name} does not support that contract."
+            )
+        if getattr(self.od_config, "stream_batch", False) and not self.supports_micro_step_mode():
+            raise ValueError(
+                "stream_batch=True requires a pipeline implementing the micro-step "
+                "execution protocol (prepare_encode, set_pp_recv_dict_buffers, "
+                "denoise_step, prefetch_its, step_scheduler, post_decode, encode_chunk_inputs); "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
 
@@ -491,51 +498,35 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     # Temporal-PP micro-step execution
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _merge_chunk_outputs(chunks: list[DiffusionOutput]) -> DiffusionOutput:
-        """Merge decoded chunk outputs into a single video tensor.
+    def supports_micro_step_mode(self) -> bool:
+        """Return whether current pipeline supports micro-step execution."""
 
-        Each entry's ``.output`` is ``[B_i, C, T, H, W]`` (one batched VAE
-        decode in the stream-batch path). Concat along the batch dim then
-        unroll into the temporal axis → ``[1, C, total_chunks * T, H, W]``.
+        return self.pipeline is not None and supports_micro_step_execution(self.pipeline)
 
-        NOTE: This is a temporary solution until streaming output is supported.
-        """
-        try:
-            cat0 = torch.cat([c.output for c in chunks], dim=0)
-            B, C, T, H, W = cat0.shape
-            merged = cat0.permute(1, 0, 2, 3, 4).reshape(1, C, B * T, H, W)
-        except Exception as e:
-            return DiffusionOutput(error=f"Failed to merge {len(chunks)} chunk outputs: {e}")
-        return DiffusionOutput(output=merged)
-
-    @staticmethod
-    def _get_or_create_chunk(state: DiffusionRequestState, chunk_idx: int) -> tuple[ChunkState, bool]:
-        chunks: dict[int, ChunkState] = state.extra.setdefault("chunks", {})
-        chunk = chunks.get(chunk_idx)
-        if chunk is not None:
-            return chunk, chunk.step_index == 0
-        chunk = ChunkState(idx=chunk_idx)
-        chunks[chunk_idx] = chunk
-        return chunk, True
-
-    def execute_micro_step(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+    def execute_micro_step(self, sched_output: DiffusionSchedulerOutput) -> RunnerOutput:
         """Execute one temporal-PP micro-step."""
-        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
-        if not self.supports_step_mode():
-            raise ValueError("Current pipeline does not support step execution.")
-        if self.od_config.cache_backend not in (None, "none"):
-            raise ValueError("Stream-batch mode does not support cache_backend yet.")
 
-        assignment = scheduler_output.per_rank_assignment
+        assert self.pipeline is not None, "Model not loaded. Call load_model() first."
+        if not self.supports_micro_step_mode():
+            raise ValueError("Current pipeline does not support micro-step execution.")
+        if self.od_config.cache_backend not in (None, "none"):
+            raise ValueError("Micro-step mode does not support cache_backend yet.")
+
+        assignment = sched_output.assignment
         if assignment is None:
-            raise ValueError("execute_micro_step requires per_rank_assignment in scheduler_output.")
+            raise ValueError("execute_micro_step requires assignment in sched_output.")
 
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
 
         with grad_context:
-            state, is_new_request = self._update_states(scheduler_output)
+            states, new_request_ids = self._update_states(sched_output)
+            if len(states) != 1:
+                raise ValueError(
+                    f"Micro-step mode supports exactly one running request, got {len(states)}."
+                )
+            state = states[0]
+            is_new_request = state.req_id in new_request_ids
 
             if is_new_request:
                 if state.sampling.generator is None and state.sampling.seed is not None:
@@ -562,7 +553,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 finished = False
 
                 if pp_group.is_first_rank:
-                    result, finished = self._rank0_assemble_input(state, scheduler_output)
+                    result, finished = self._rank0_assemble_input(state, sched_output)
 
                 if not chunk_idxs:
                     return RunnerOutput(
@@ -580,21 +571,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 ]
 
                 if pp_group.is_last_rank:
-                    # Per-chunk schedulers regardless of pp_size — stateful step().
-                    for c in chunks:
-                        if c.scheduler is None:
-                            c.scheduler = copy.deepcopy(state.scheduler)
-
-                    if pp_group.is_first_rank:
-                        # pp_size==1: state.latents was assembled by
-                        # _rank0_assemble_input; take per-chunk views to avoid
-                        # double randn for new admits on the shared generator.
+                    if pp_group.world_size == 1:
                         for i, c in enumerate(chunks):
                             c.latents = state.latents[i:i + 1]
                     else:
-                        # Multi-rank last rank: maintain per-chunk latents in
-                        # lockstep with rank 0 via shared seed + matching
-                        # randn_like call order.
                         for c in chunks:
                             if c.latents is None:
                                 c.latents = (
@@ -604,8 +584,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                                 )
                         state.latents = torch.cat([c.latents for c in chunks], dim=0)
                 elif not pp_group.is_first_rank:
-                    # Middle rank: ITs carry the forward; state.latents shape only
-                    # for buffer setup. Broadcast view, no extra memory.
                     state.latents = template.expand(len(chunks), *template.shape[1:])
 
                 if not self.pipeline.is_buffer_setup:
@@ -616,22 +594,22 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     [state.scheduler.timesteps[c.step_index] for c in chunks]
                 )
 
-                B = len(chunks)
-                noise_pred = self.pipeline.denoise_step(state, batch_size=B)
+                batch_size = len(chunks)
+                noise_pred = self.pipeline.denoise_step(state, batch_size=batch_size)
 
                 if noise_pred is None and getattr(self.pipeline, "interrupt", False):
-                    self._update_states_after(state, finished=True)
+                    self.state_cache.pop(state.req_id, None)
                     return RunnerOutput(
                         req_id=state.req_id,
                         finished=True,
                         result=DiffusionOutput(error="micro-step denoise interrupted"),
                     )
 
-                self.pipeline.prefetch_its(state, batch_size=B)
+                self.pipeline.prefetch_its(state, batch_size=batch_size)
 
-                schedulers = [c.scheduler for c in chunks] if pp_group.is_last_rank else None
+                schedulers = [c.scheduler for c in chunks]
                 self.pipeline.step_scheduler(
-                    state, noise_pred, per_request_scheduler=schedulers, batch_size=B,
+                    state, noise_pred, per_request_scheduler=schedulers, batch_size=batch_size,
                 )
 
                 if pp_group.is_last_rank:
@@ -650,6 +628,17 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                     ),
                 )
 
+    @staticmethod
+    def _get_or_create_chunk(state: DiffusionRequestState, chunk_idx: int) -> tuple[ChunkState, bool]:
+        chunks: dict[int, ChunkState] = state.extra.setdefault("chunks", {})
+        chunk = chunks.get(chunk_idx)
+        if chunk is not None:
+            return chunk, chunk.step_index == 0
+        chunk = ChunkState(idx=chunk_idx)
+        chunk.scheduler = copy.deepcopy(state.scheduler)
+        chunks[chunk_idx] = chunk
+        return chunk, True
+    
     def _rank0_assemble_input(
         self, state: DiffusionRequestState, scheduler_output: DiffusionSchedulerOutput,
     ) -> tuple[DiffusionOutput | None, bool]:
@@ -663,37 +652,53 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         prev_latents = state.latents
         pieces: list[torch.Tensor] = []
 
-        if layout.n_finished > 0 and prev_latents is not None:
+        n_finished = len(layout.finished_idxs)
+        if n_finished > 0 and prev_latents is not None:
             saved = state.latents
-            state.latents = prev_latents[: layout.n_finished]
+            state.latents = prev_latents[: n_finished]
             decoded = self.pipeline.post_decode(state)
             state.latents = saved
             state.extra.setdefault("decoded_chunks", []).append(decoded)
-            state.extra["chunks_decoded"] = (
-                state.extra.get("chunks_decoded", 0) + layout.n_finished
+            state.extra["num_chunks_decoded"] = (
+                state.extra.get("num_chunks_decoded", 0) + n_finished
             )
             for idx in layout.finished_idxs:
                 state.extra.get("chunks", {}).pop(idx, None)
 
         if layout.n_circulating > 0 and prev_latents is not None:
             pieces.append(
-                prev_latents[layout.n_finished : layout.n_finished + layout.n_circulating]
+                prev_latents[n_finished : n_finished + layout.n_circulating]
             )
 
-        if layout.n_new > 0:
-            template = state.extra["initial_latent_template"]  # [1, C, T, H, W]
-            for idx in layout.new_idxs:
-                row = (
-                    template
-                    if idx == 0
-                    else torch.randn_like(template, generator=state.sampling.generator)
-                )
-                pieces.append(row)
+        if layout.new_idxs:
+            encoded = self.pipeline.encode_chunk_inputs(state, layout.new_idxs)
+            for latent, idx in zip(encoded, layout.new_idxs):
+                chunk, _ = self._get_or_create_chunk(state, idx)
+                chunk.latents = latent
+                pieces.append(latent)
 
         state.latents = torch.cat(pieces, dim=0) if pieces else None
 
-        if state.extra.get("chunks_decoded", 0) >= state.sampling.num_chunks:
-            self._update_states_after(state, finished=True)
+        output_chunks_target = state.sampling.num_frames // state.sampling.chunk_frames
+        if state.extra.get("num_chunks_decoded", 0) >= output_chunks_target:
+            self.state_cache.pop(state.req_id, None)
             return self._merge_chunk_outputs(state.extra["decoded_chunks"]), True
         return None, False
 
+    @staticmethod
+    def _merge_chunk_outputs(chunks: list[DiffusionOutput]) -> DiffusionOutput:
+        """Merge decoded chunk outputs into a single video tensor.
+
+        Each entry's ``.output`` is ``[B_i, C, T, H, W]``. 
+        Concat along the batch dim then unroll into the temporal axis ``[1, C, total_chunks * T, H, W]``.
+
+        NOTE: This is a temporary solution until streaming output is supported.
+        """
+
+        try:
+            cat0 = torch.cat([c.output for c in chunks], dim=0)
+            B, C, T, H, W = cat0.shape
+            merged = cat0.permute(1, 0, 2, 3, 4).reshape(1, C, B * T, H, W)
+        except Exception as e:
+            return DiffusionOutput(error=f"Failed to merge {len(chunks)} chunk outputs: {e}")
+        return DiffusionOutput(output=merged)

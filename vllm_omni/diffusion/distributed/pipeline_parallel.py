@@ -278,7 +278,6 @@ class PipelineParallelMixin:
         do_true_cfg: bool,
         per_request_scheduler: Any | list[Any] | None = None,
         buf_idx: int = 0,
-        is_last_step: bool = False,
         batch_size: int = 1,
     ) -> torch.Tensor | tuple[torch.Tensor, ...] | AsyncLatents:
         """
@@ -329,7 +328,7 @@ class PipelineParallelMixin:
             )
         return torch.cat(new_rows, dim=0)
     
-    def prefetch_its_maybe_with_pp_and_cfg(
+    def prefetch_its_maybe_with_cfg(
         self,
         do_true_cfg: bool,
         buf_idx: int,

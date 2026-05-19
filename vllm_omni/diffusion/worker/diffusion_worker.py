@@ -382,7 +382,7 @@ class DiffusionWorker:
             profiler.step()
         return output
 
-    def execute_micro_step(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+    def execute_micro_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one temporal-PP micro-step by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
         if self.lora_manager is not None:
@@ -966,7 +966,7 @@ class WorkerWrapperBase:
         """Execute one diffusion step."""
         return self.worker.execute_stepwise(scheduler_output)
 
-    def execute_micro_step(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
+    def execute_micro_step(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one temporal-PP micro-step."""
         return self.worker.execute_micro_step(scheduler_output)
 

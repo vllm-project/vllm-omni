@@ -400,6 +400,10 @@ class Wan22Pipeline(
             model, subfolder="vae", torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
 
+        z_dim = self.vae.config.z_dim
+        self._latents_mean = torch.tensor(self.vae.config.latents_mean).view(1, z_dim, 1, 1, 1)
+        self._latents_inv_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, z_dim, 1, 1, 1)
+
         # Initialize transformers with correct config (weights loaded via load_weights)
         if load_transformer:
             transformer_config = load_transformer_config(model, "transformer", local_files_only)
@@ -1416,7 +1420,7 @@ class Wan22Pipeline(
         buf_idx = state.step_index % 2
         is_last_step = state.step_index == state.total_steps - 1
 
-        preposted = self.prefetch_its_maybe_with_pp_and_cfg(
+        preposted = self.prefetch_its_maybe_with_cfg(
             do_true_cfg=do_true_cfg,
             buf_idx=buf_idx,
             is_last_step=is_last_step,
@@ -1495,3 +1499,54 @@ class Wan22Pipeline(
             output=output,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
+
+    def encode_chunk_inputs(
+        self,
+        state: DiffusionRequestState,
+        new_idxs: list[int],
+    ) -> list[torch.Tensor]:
+        """Streaming V2V initial latents (StreamDiffusionV2-style).
+
+        For each newly admitted chunk: VAE-encode the source frames at
+        ``chunk_idx * chunk_frames : (idx+1) * chunk_frames``, normalize, and
+        linearly blend with Gaussian noise via ``extra_args["noise_scale"]``
+        (default 0.8). The transformer then runs the full schedule starting at
+        ``step_index=0`` on this partially-noised latent.
+        """
+        noise_scale = float((state.sampling.extra_args or {}).get("noise_scale", 0.8))
+        chunk_frames = state.sampling.chunk_frames
+        prompt = state.prompts[0] if state.prompts else None
+        video = None
+        if prompt is not None and not isinstance(prompt, str):
+            video = (prompt.get("multi_modal_data") or {}).get("video")
+        if video is None:
+            raise ValueError(
+                "encode_chunk_inputs requires V2V source frames in prompts[0]['multi_modal_data']['video']"
+            )
+
+        latents_mean = self._latents_mean.to(self.device)
+        latents_inv_std = self._latents_inv_std.to(self.device)
+
+        out: list[torch.Tensor] = []
+        for idx in new_idxs:
+            start = idx * chunk_frames
+            end = start + chunk_frames
+            if isinstance(video, list):
+                frames = torch.stack(list(video[start:end]), dim=0)
+            else:
+                frames = video[start:end]
+
+            if frames.shape[0] < chunk_frames:
+                pad = torch.zeros(
+                    (chunk_frames - frames.shape[0], *frames.shape[1:]),
+                    dtype=frames.dtype, device=frames.device,
+                )
+                frames = torch.cat([frames, pad], dim=0)
+
+            # [n, C, H, W] -> [1, C, n, H, W]
+            control = frames.permute(1, 0, 2, 3).unsqueeze(0).to(device=self.device, dtype=self.vae.dtype)
+            clean = retrieve_latents(self.vae.encode(control), sample_mode="argmax")
+            clean = ((clean.float() - latents_mean.to(clean.dtype)) * latents_inv_std.to(clean.dtype)).to(self.vae.dtype)
+            noise = torch.randn_like(clean)
+            out.append(noise * noise_scale + clean * (1.0 - noise_scale))
+        return out
