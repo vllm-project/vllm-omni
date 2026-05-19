@@ -102,9 +102,7 @@ class ImageGenerationRequest(BaseModel):
     bot_task: str | None = Field(
         default=None,
         description=(
-            "Bot task type. Options: t2i_think, t2i_recaption, t2i_vanilla, "
-            "it2i_think, it2i_recaption, t2t, i2t, "
-            "or simplified: think, recaption, vanilla"
+            "Bot task type. Options: think, recaption, think_recaption, vanilla"
         ),
     )
 
@@ -113,10 +111,9 @@ class ImageGenerationRequest(BaseModel):
     def validate_bot_task(cls, v):
         if v is None:
             return None
-        valid_tasks_full = ["t2i_think", "t2i_recaption", "t2i_vanilla", "it2i_think", "it2i_recaption", "t2t", "i2t"]
-        valid_tasks_simple = ["think", "recaption", "vanilla"]
-        if v not in valid_tasks_full and v not in valid_tasks_simple:
-            raise ValueError(f"Invalid bot_task: {v}. Must be one of: {valid_tasks_full + valid_tasks_simple}")
+        valid_tasks = ["think", "recaption", "think_recaption", "vanilla"]
+        if v not in valid_tasks:
+            raise ValueError(f"Invalid bot_task: {v}. Must be one of: {valid_tasks}")
         return v
 
     num_inference_steps: int | None = Field(

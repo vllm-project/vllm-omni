@@ -2248,7 +2248,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         layers = extra_body.get("layers")
         resolution = extra_body.get("resolution")
         bot_task = extra_body.get("bot_task")
-        sys_type = extra_body.get("sys_type")
+        use_system_prompt = extra_body.get("use_system_prompt") or extra_body.get("sys_type")
         custom_system_prompt = extra_body.get("system_prompt")
 
         engine_prompt_data: dict[str, Any] | None = None
@@ -2262,7 +2262,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         prompt_token_ids: list[int] | None = None
         system_prompt_type: str | None = None
-        if bot_task is not None or sys_type is not None or custom_system_prompt is not None:
+        if bot_task is not None or use_system_prompt is not None or custom_system_prompt is not None:
             from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import (
                 build_prompt,
                 build_prompt_tokens,
@@ -2270,7 +2270,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             build_kwargs: dict[str, Any] = {
                 "task": "it2i" if reference_images else "t2i",
-                "sys_type": sys_type,
+                "sys_type": use_system_prompt,
                 "custom_system_prompt": custom_system_prompt,
                 "num_images": len(reference_images) if reference_images else 1,
             }
@@ -2306,6 +2306,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         engine_prompt["modalities"] = modalities
         if negative_prompt is not None:
             engine_prompt["negative_prompt"] = negative_prompt
+
+        from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import resolve_stop_token_ids
+        stop_token_ids = resolve_stop_token_ids(
+            task="it2i" if reference_images else "t2i",
+            bot_task=build_kwargs.get("bot_task"),
+            tokenizer=tokenizer
+        )
+        engine_prompt["stop_token_ids"] = stop_token_ids
 
         mm_processor_kwargs: dict[str, Any] = {}
         if height is not None:
@@ -2509,11 +2517,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if result is None:
                 return self._create_error_response("No output generated from AsyncOmni", status_code=500)
         else:
+            all_outputs = []
             result = await engine.generate(
                 prompt=gen_prompt,
                 sampling_params=gen_params,
                 request_id=request_id,
             )
+            all_outputs.append(result)
 
         images = getattr(result.request_output, "images", [])
         stage_durations = result.stage_durations
