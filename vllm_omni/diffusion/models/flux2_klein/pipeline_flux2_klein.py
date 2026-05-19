@@ -701,6 +701,10 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
             raise ValueError(
                 "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
             )
+        elif isinstance(prompt, str) and not prompt.strip():
+            raise ValueError("`prompt` cannot be empty or whitespace-only.")
+        elif isinstance(prompt, list) and any(isinstance(p, str) and not p.strip() for p in prompt):
+            raise ValueError("`prompt` cannot contain empty or whitespace-only strings.")
         elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
             raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
 
