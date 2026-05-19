@@ -79,6 +79,7 @@ def _make_engine(num_gpus: int = 1):
     engine.executor = executor
     engine._rpc_lock = threading.RLock()
     engine._cv = threading.Condition(engine._rpc_lock)
+    engine._closed = False
     engine._loop_started = False
     engine._rpc_queue = queue.Queue()
     engine.abort_queue = queue.Queue()

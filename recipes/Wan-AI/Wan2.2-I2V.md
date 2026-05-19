@@ -1,4 +1,6 @@
-# Wan2.2 Image To Video
+# Wan2.2 Image-to-Video
+
+> Image-to-video serving (Wan2.2 14B)
 
 ## Summary
 

@@ -1,4 +1,6 @@
-# ERNIE-Image for text-to-image generation
+# ERNIE-Image
+
+> Text-to-image online serving (ERNIE-Image 8B)
 
 ## Summary
 

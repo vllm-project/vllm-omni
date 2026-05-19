@@ -943,6 +943,20 @@ def test_omni_base_errored_false_when_alive():
     assert base.errored is False
 
 
+def test_omni_base_is_running_false_when_stage_engine_dead():
+    base = _make_base()
+    base.engine.is_alive.return_value = True
+    base.engine.stage_clients = [SimpleNamespace(_engine_dead=True)]
+    assert base.is_running is False
+
+
+def test_omni_base_is_running_false_when_stage_resources_engine_dead():
+    base = _make_base()
+    base.engine.is_alive.return_value = True
+    base.engine.stage_clients = [SimpleNamespace(resources=SimpleNamespace(engine_dead=True))]
+    assert base.is_running is False
+
+
 def test_omni_base_errored_true_when_orchestrator_dead():
     base = _make_base()
     base.engine.is_alive.return_value = False

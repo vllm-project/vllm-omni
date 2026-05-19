@@ -196,7 +196,7 @@ class SpeechBatchItem(BaseModel):
     all other fields override the batch-level defaults when set."""
 
     input: str
-    voice: str | None = None
+    voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] | None = None
     speed: float | None = Field(default=None, ge=0.25, le=4.0)
@@ -215,7 +215,7 @@ class BatchSpeechRequest(BaseModel):
 
     model: str | None = None
     items: list[SpeechBatchItem] = Field(..., min_length=1)
-    voice: str | None = None
+    voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     instructions: str | None = None
     response_format: Literal["wav", "pcm", "flac", "mp3", "aac", "opus"] = "wav"
     speed: float | None = Field(default=1.0, ge=0.25, le=4.0)
@@ -248,7 +248,7 @@ class StreamingSpeechSessionConfig(BaseModel):
     """Configuration sent as the first WebSocket message for streaming TTS."""
 
     model: str | None = None
-    voice: str | None = None
+    voice: str | None = Field(default=None, validation_alias=AliasChoices("voice", "speaker"))
     task_type: Literal["CustomVoice", "VoiceDesign", "Base"] | None = None
     language: str | None = None
     instructions: str | None = None
