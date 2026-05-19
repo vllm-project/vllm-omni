@@ -14,13 +14,13 @@ RUN git clone --single-branch --branch vklimkov/qwen3tts_nv \
     VLLM_OMNI_TARGET_DEVICE=cuda pip install --no-cache-dir . && \
     cd / && rm -rf /tmp/vllm-omni
 
-# 5. Install the Qwen3-TTS pieces not provided by vLLM/vLLM-Omni,
-#    and pin the transformers version required by Qwen3-TTS.
+# 5. Extra python requirements
 RUN pip install --no-cache-dir \
     onnxscript \
     librosa \
     sox \
     onnx-graphsurgeon \
     "tritonclient[grpc]"
+RUN pip install --no-cache-dir --force-reinstall --no-deps "numpy==2.3.5"
 
 WORKDIR /workspace

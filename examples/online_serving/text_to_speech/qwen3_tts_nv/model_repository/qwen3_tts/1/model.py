@@ -19,12 +19,20 @@ Pipeline:
      final.
 
 Notes:
-  * The NV talker's ``audio_codes`` multimodal output **contains the
-    ``prompt_len`` prefill rows up front**; we slice them off before
-    forwarding to the codec.
+  * The NV talker exposes per-step codec rows under the ``"audio_codes"``
+    multimodal key. The engine's accumulator passes through three shapes
+    across one request: (a) the first yield is a single tensor — the
+    prefill prefix; (b) the middle yields share a growing Python list
+    (one append per AR step); (c) the final yield is a tensor again
+    (``_consolidate_multimodal_tensors`` cats the list).
+    We **skip the first and last (tensor-typed) yields** entirely — the
+    first is the unused prefill, the last is the already-streamed cat
+    of everything — and only consume from the in-between list yields
+    (always skipping list index 0, which is the same prefill tensor).
   * ``max_num_batched_tokens`` must be at least the longest expected
-    ``prompt_len`` (otherwise prefill is chunked, hurting TTFT). It is
-    plumbed straight through to the engine args.
+    ``prompt_len`` (otherwise prefill is chunked across yields, which
+    breaks the simple "first tensor == prefill" assumption and also
+    hurts TTFT). It is plumbed straight through to the engine args.
 """
 
 from __future__ import annotations
@@ -201,13 +209,16 @@ class TritonPythonModel:
             stage_init_timeout=300,
         )
 
-    def _build_prompt(self, text: str, language: str, speaker: str) -> tuple[dict, int]:
-        """Return (engine_input, prompt_len).
+    def _build_prompt(self, text: str, language: str, speaker: str) -> dict:
+        """Build the engine input.
 
         The NV talker only takes ``{task_type, text, language, speaker}``
-        in ``additional_information``. ``prompt_len`` is the placeholder
-        prefill length that will appear at the front of the streamed
-        ``audio_codes`` tensor and must be sliced off before codec decode.
+        in ``additional_information``. ``prompt_token_ids`` is a
+        placeholder of ``prompt_len`` zeros (the actual prefill embeds are
+        synthesized inside the talker's :meth:`preprocess`); the only
+        reason we still compute ``prompt_len`` here is to warn when it
+        exceeds ``max_num_batched_tokens`` (which would chunk prefill and
+        hurt TTFT).
         """
         additional_information = {
             "task_type": [self.task_type],
@@ -228,31 +239,10 @@ class TritonPythonModel:
                 "prefill will be chunked which hurts TTFT.",
                 prompt_len, self.max_num_batched_tokens,
             )
-        prompt = {
+        return {
             "prompt_token_ids": [0] * prompt_len,
             "additional_information": additional_information,
         }
-        return prompt, prompt_len
-
-    def _normalize_codes(self, mm_codes: Any, prompt_len: int) -> torch.Tensor | None:
-        """Concatenate streamed ``audio_codes`` tensors, drop the prefill
-        ``prompt_len`` rows the NV talker prepends, then mask out invalid
-        rows (zeros / out-of-codebook stop tokens) before codec decode."""
-        if mm_codes is None:
-            return None
-        if isinstance(mm_codes, list):
-            if not mm_codes:
-                return None
-            codes = torch.cat(mm_codes, dim=0)
-        else:
-            codes = mm_codes
-        codes = codes.to(torch.long).cpu()
-        if prompt_len > 0:
-            if codes.shape[0] <= prompt_len:
-                return None
-            codes = codes[prompt_len:]
-        valid = codes.any(dim=1) & (codes.max(dim=1).values < self.codec_codebook_size)
-        return codes[valid]
 
     def _decode_codec(self, codes: torch.Tensor, left_context_frames: int) -> np.ndarray:
         codes_np = codes.numpy().astype(np.int64)
@@ -326,10 +316,7 @@ class TritonPythonModel:
     async def _synthesize(self, text: str, language: str, speaker: str, response_sender):
         t_start = time.perf_counter()
         request_id = f"tts-{uuid.uuid4().hex[:8]}"
-        prompt, prompt_len = self._build_prompt(text, language, speaker)
-
-        sent_frames = 0
-        all_codes: torch.Tensor | None = None
+        prompt = self._build_prompt(text, language, speaker)
 
         codec_q: queue.Queue = queue.Queue()
         state: dict = {"t_first_audio": None, "error": None}
@@ -337,38 +324,51 @@ class TritonPythonModel:
             self._codec_worker, codec_q, response_sender, state,
         )
 
-        def dispatch_chunk(codes: torch.Tensor, new_frames: int, is_final: bool) -> None:
-            nonlocal sent_frames
-            ctx = min(sent_frames, self.codec_left_context)
-            # clone() so the worker thread owns its data and the engine can
-            # overwrite/mutate the underlying buffer freely.
-            chunk = codes[sent_frames - ctx: sent_frames + new_frames].clone()
-            codec_q.put((chunk, ctx, is_final))
-            sent_frames += new_frames
+        # ``mm_codes`` holds the latest list-typed ``audio_codes`` payload
+        # we've seen from the engine. The engine's accumulator passes
+        # through three shapes across one request: the first yield is a
+        # single tensor (the prefill prefix), the middle yields share the
+        # same growing Python list (one .append() per AR step), and the
+        # final yield is the consolidated cat tensor. We skip both tensor
+        # yields. Because the engine's consolidation reassigns
+        # ``mm_accumulated["audio_codes"] = torch.cat(list)`` rather than
+        # mutating the list, our held list reference still sees the EOS
+        # step's append — so the post-loop ``mm_codes`` has every decode
+        # row (index 0 is the prefill, indices 1..N are the N decode rows).
+        sent_frames = 0
+        mm_codes: list | None = None
 
         try:
             async for out in self.omni.generate(prompt, request_id=request_id):
                 if state["error"] is not None:
                     break
-                codes = self._normalize_codes(
-                    out.multimodal_output.get("audio_codes"), prompt_len,
-                )
-                if codes is None:
+                payload = out.multimodal_output.get("audio_codes")
+                if not isinstance(payload, list):
                     continue
-                all_codes = codes
+                mm_codes = payload
+
+                decode_count = len(mm_codes) - 1
                 threshold = (self.first_chunk_frames if sent_frames == 0
                              else self.codec_chunk_size - self.codec_left_context)
-                new_frames = codes.shape[0] - sent_frames
-                while new_frames >= threshold:
-                    dispatch_chunk(codes, threshold, is_final=False)
-                    new_frames = codes.shape[0] - sent_frames
+                while decode_count - sent_frames >= threshold:
+                    ctx = min(sent_frames, self.codec_left_context)
+                    start = 1 + sent_frames - ctx
+                    end = 1 + sent_frames + threshold
+                    chunk = torch.cat(mm_codes[start:end], dim=0)
+                    codec_q.put((chunk, ctx, False))
+                    sent_frames += threshold
                     threshold = self.codec_chunk_size - self.codec_left_context
 
-            # Final trailing chunk (or empty-final sentinel)
+            # Final trailing chunk (or empty-final sentinel). ``mm_codes``
+            # here is the latest list reference; the engine has appended
+            # every decode row up to and including the EOS-sampling step.
             if state["error"] is None:
-                if all_codes is not None and all_codes.shape[0] > sent_frames:
-                    remaining = all_codes.shape[0] - sent_frames
-                    dispatch_chunk(all_codes, remaining, is_final=True)
+                if mm_codes is not None and len(mm_codes) - 1 > sent_frames:
+                    ctx = min(sent_frames, self.codec_left_context)
+                    start = 1 + sent_frames - ctx
+                    end = len(mm_codes)
+                    chunk = torch.cat(mm_codes[start:end], dim=0)
+                    codec_q.put((chunk, ctx, True))
                 else:
                     codec_q.put(None)
 
@@ -379,13 +379,12 @@ class TritonPythonModel:
             if state["error"] is not None:
                 raise state["error"]
 
-            total_frames = all_codes.shape[0] if all_codes is not None else 0
             t_end = time.perf_counter()
             ttfa_ms = ((state["t_first_audio"] or t_end) - t_start) * 1000
             logger.info(
                 "rid=%s ttfa=%.1fms total=%.1fms frames=%d speaker=%s text=%r",
                 request_id, ttfa_ms, (t_end - t_start) * 1000,
-                total_frames, speaker, text[:120],
+                sent_frames, speaker, text[:120],
             )
         except Exception as e:
             logger.error("rid=%s failed: %s", request_id, e, exc_info=True)

@@ -280,7 +280,16 @@ class BenchmarkResult:
 # ---------------------------------------------------------------------------
 
 async def run_one_request(omni, prompt: dict, request_id: str) -> RequestResult:
-    """Submit one TTS request and collect outputs with per-token timing."""
+    """Submit one TTS request and collect outputs with per-token timing.
+
+    AsyncOmni coerces sampling params to ``RequestOutputKind.DELTA`` when no
+    explicit ``sampling_params`` are passed (since #2911). In DELTA mode,
+    ``CompletionOutput.token_ids`` only holds the *new* tokens for the
+    current step, so ``len(token_ids)`` cannot be used as a cumulative
+    counter. The omni output processor always stores the cumulative list on
+    ``cumulative_token_ids``; we use that to detect new tokens and to time
+    inter-token latencies.
+    """
     result = RequestResult()
     t_start = time.perf_counter()
     t_last_token = None
@@ -290,21 +299,24 @@ async def run_one_request(omni, prompt: dict, request_id: str) -> RequestResult:
         async for stage_output in omni.generate(prompt, request_id=request_id):
             now = time.perf_counter()
             ro = stage_output.request_output
+            result.steps += 1
 
+            cur_num_tokens = prev_num_tokens
             if hasattr(ro, "outputs") and ro.outputs:
                 out0 = ro.outputs[0]
-                cur_num_tokens = len(out0.token_ids) if hasattr(out0, "token_ids") else 0
-            else:
-                cur_num_tokens = prev_num_tokens
+                cum_ids = getattr(out0, "cumulative_token_ids", None)
+                if cum_ids is not None:
+                    cur_num_tokens = len(cum_ids)
+                else:
+                    cur_num_tokens = len(getattr(out0, "token_ids", []) or [])
 
-            if t_last_token is None:
-                result.ttft_s = now - t_start
-            elif cur_num_tokens > prev_num_tokens:
-                result.inter_token_latencies.append(now - t_last_token)
-
-            t_last_token = now
-            prev_num_tokens = cur_num_tokens
-            result.steps += 1
+            if cur_num_tokens > prev_num_tokens:
+                if t_last_token is None:
+                    result.ttft_s = now - t_start
+                else:
+                    result.inter_token_latencies.append(now - t_last_token)
+                t_last_token = now
+                prev_num_tokens = cur_num_tokens
 
         t_end = time.perf_counter()
         result.e2e_s = t_end - t_start

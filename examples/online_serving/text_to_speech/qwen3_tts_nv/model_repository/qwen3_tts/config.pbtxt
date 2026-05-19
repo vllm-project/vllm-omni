@@ -42,7 +42,7 @@ instance_group [
 ]
 parameters {
   key: "vllm_model_path"
-  value: { string_value: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice" }
+  value: { string_value: "/workspace/Qwen3-TTS-12Hz-1.7B-CustomVoice" }
 }
 parameters {
   key: "default_speaker"
