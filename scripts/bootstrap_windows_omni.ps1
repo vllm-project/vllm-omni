@@ -203,7 +203,7 @@ Push-Location $OmniRepoPath
 try {
     if (-not $SkipDependencyInstall) {
         Write-Step "Installing vLLM-Omni runtime dependencies"
-        Invoke-Native $pythonExe "-m" "pip" "install" "-r" "requirements\cuda.txt"
+        Invoke-Native $pythonExe "-m" "pip" "install" "-r" "requirements\common.txt" "onnxruntime>=1.23.2"
     }
 
     Write-Step "Installing vLLM-Omni editable"
