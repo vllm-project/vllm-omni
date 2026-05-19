@@ -2308,10 +2308,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             engine_prompt["negative_prompt"] = negative_prompt
 
         from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import resolve_stop_token_ids
+
         stop_token_ids = resolve_stop_token_ids(
-            task="it2i" if reference_images else "t2i",
-            bot_task=build_kwargs.get("bot_task"),
-            tokenizer=tokenizer
+            task="it2i" if reference_images else "t2i", bot_task=build_kwargs.get("bot_task"), tokenizer=tokenizer
         )
         engine_prompt["stop_token_ids"] = stop_token_ids
 

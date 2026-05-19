@@ -101,9 +101,7 @@ class ImageGenerationRequest(BaseModel):
 
     bot_task: str | None = Field(
         default=None,
-        description=(
-            "Bot task type. Options: think, recaption, think_recaption, vanilla"
-        ),
+        description=("Bot task type. Options: think, recaption, think_recaption, vanilla"),
     )
 
     @field_validator("bot_task")
