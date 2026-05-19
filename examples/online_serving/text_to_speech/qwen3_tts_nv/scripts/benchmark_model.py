@@ -685,7 +685,7 @@ def parse_args():
         help="Path to text file (one utterance per line, optionally "
              "tab-separated with text in 2nd column)",
     )
-    model.add_argument("--speaker", type=str, default="vivian")
+    model.add_argument("--speaker", type=str, default="aiden")
     model.add_argument("--language", type=str, default="English")
     model.add_argument(
         "--max-new-tokens", type=int, default=2048,
