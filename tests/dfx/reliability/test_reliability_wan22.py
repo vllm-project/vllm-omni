@@ -20,6 +20,7 @@ from tests.dfx.conftest import (
     supports_video_generation,
 )
 from tests.dfx.reliability.helpers import (
+    FaultInjector,
     assert_no_server_tree_process_residual_and_gpu_release,
     get_health_raw,
     inject_gpu_oom,
@@ -69,16 +70,23 @@ PROCESS_KILL_ERROR_KEYWORDS = (
     "500",
     "503",
 )
-# RFC#2366 signal x target matrix:
-# - worker / serve-root: SIGTERM, SIGKILL
-# - serve-tree: SIGTERM, SIGINT, SIGKILL
+# RFC#2366 signal x target matrix (aligned with test_reliability_qwen3_omni.py):
+# - worker: SIGTERM, SIGKILL
+# - serve-root: SIGTERM, SIGINT; SIGKILL skipped (issue#3725)
+# - serve-tree no-load: SIGTERM, SIGKILL
+# - serve-tree with-load: SIGTERM, SIGKILL
+_SERVE_ROOT_SIGKILL_SKIP = pytest.mark.skip(reason="issue#3725")
 SERVE_SIGNAL_PARAMS = [
     pytest.param("SIGTERM", id="sigterm"),
-    pytest.param("SIGKILL", id="sigkill"),
+    pytest.param("SIGINT", id="sigint"),
+    pytest.param("SIGKILL", id="sigkill", marks=_SERVE_ROOT_SIGKILL_SKIP),
 ]
 TREE_SIGNAL_PARAMS = [
     pytest.param("SIGTERM", id="sigterm"),
-    pytest.param("SIGINT", id="sigint"),
+    pytest.param("SIGKILL", id="sigkill"),
+]
+TREE_WITH_LOAD_SIGNAL_PARAMS = [
+    pytest.param("SIGTERM", id="sigterm"),
     pytest.param("SIGKILL", id="sigkill"),
 ]
 WORKER_SIGNAL_FAULT_PARAMS = [
@@ -220,26 +228,11 @@ def test_reliability_fault_gpu_oom_video_large_request_failure(omni_server_funct
     indirect=True,
 )
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
-def test_reliability_fault_process_kill_video_request_failure(
+def test_reliability_fault_process_kill_request_failure(
     omni_server_after_fault_function,
     openai_client_function,
 ) -> None:
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(1280, 720)['base64']}"
-    request_config = {
-        "form_data": {
-            "prompt": "Generate a realistic road-driving video with camera motion.",
-            "width": 512,
-            "height": 512,
-            "fps": 8,
-            "num_frames": 8,
-            "guidance_scale": 1.0,
-            "flow_shift": 5.0,
-            "num_inference_steps": 4,
-            "seed": 42,
-        },
-        "image_reference": image_data_url,
-        "stream": False,
-    }
+    request_config = _video_request_config()
     try:
         openai_client_function.send_video_diffusion_request(request_config, request_num=1)
     except Exception as exc:
@@ -256,7 +249,7 @@ def test_reliability_fault_process_kill_video_request_failure(
     indirect=True,
 )
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
-def test_reliability_fault_process_kill_video_health_fast_fail_and_concurrent(
+def test_reliability_fault_process_kill_health_fast_fail_and_concurrent(
     omni_server_after_fault_function,
     openai_client_function,
 ) -> None:
@@ -362,6 +355,37 @@ def test_reliability_fault_process_kill_video_health_fast_fail_and_concurrent(
         "[process_kill health] expected /health 503 after fatal fault, "
         f"got status={final_health_status}, last_observation={last_observation}"
     )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
+@pytest.mark.parametrize(
+    "fault_injector",
+    WORKER_SIGNAL_FAULT_PARAMS,
+    indirect=True,
+)
+@pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
+def test_reliability_fault_process_kill_worker_with_load_request_failure(
+    omni_server_function,
+    openai_client_function,
+    fault_injector: FaultInjector,
+) -> None:
+    request_config = _video_request_config()
+    scenario = "kill_worker_with_load"
+    load_result = run_fault_injection_with_rate_load(
+        submit_request=lambda: openai_client_function.send_video_diffusion_request(request_config, request_num=1),
+        inject_fault=lambda: fault_injector(omni_server_function),
+        num_requests=INFLIGHT_INJECTION_REQUEST_COUNT,
+        request_rate=INFLIGHT_INJECTION_REQUEST_RATE,
+        completion_timeout_sec=120.0,
+    )
+    assert load_result["failure_observed"], (
+        f"[{scenario}] expected at least one load request failure after fault; load_result={load_result}"
+    )
+    host = omni_server_function.host
+    port = omni_server_function.port
+    _assert_post_fault_video_fast_fail(host, port, scenario=scenario)
+    _assert_post_fault_health_terminal(host, port, scenario=scenario)
 
 
 @pytest.mark.slow
@@ -487,18 +511,17 @@ def test_reliability_video_oom_recovers_after_fault_removed(
 
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.skip(reason="issue#2768")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
-def test_reliability_fault_process_kill_serve_root_video_no_worker_residual_and_gpu_release(
+def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_cleanup(
     omni_server_function,
     openai_client_function,
     signal_name: str,
 ) -> None:
     """Black-box: during in-flight video requests, kill serve root and verify post-fault behavior/cleanup."""
     request_config = _video_request_config()
-    scenario = f"kill_serve_root_{signal_name.lower()}"
+    scenario = f"kill_serve_root_with_load_{signal_name.lower()}"
     injector = make_server_root_kill_fault_injector(signal_name=signal_name, post_kill_wait_seconds=2.0)
     load_result = run_fault_injection_with_rate_load(
         submit_request=lambda: openai_client_function.send_video_diffusion_request(request_config, request_num=1),
@@ -523,11 +546,10 @@ def test_reliability_fault_process_kill_serve_root_video_no_worker_residual_and_
 
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.skip(reason="issue#2768")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
-def test_reliability_fault_process_kill_serve_root_video_no_load_fast_fail_and_cleanup(
+def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup(
     omni_server_function,
     signal_name: str,
 ) -> None:
@@ -550,12 +572,12 @@ def test_reliability_fault_process_kill_serve_root_video_no_load_fast_fail_and_c
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
 @pytest.mark.parametrize("signal_name", TREE_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
-def test_reliability_fault_process_kill_tree_video_no_load_fast_fail_and_cleanup(
+def test_reliability_fault_process_kill_tree_no_load_fast_fail_and_cleanup(
     omni_server_function,
     signal_name: str,
 ) -> None:
     """Black-box: kill server tree without load; verify fast-fail/health/cleanup."""
-    scenario = f"kill_server_tree_no_load_{signal_name.lower()}"
+    scenario = f"kill_serve_tree_no_load_{signal_name.lower()}"
     injector = make_server_tree_kill_fault_injector(
         signal_name=signal_name,
         post_kill_wait_seconds=2.0,
@@ -575,16 +597,16 @@ def test_reliability_fault_process_kill_tree_video_no_load_fast_fail_and_cleanup
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
-@pytest.mark.parametrize("signal_name", TREE_SIGNAL_PARAMS)
+@pytest.mark.parametrize("signal_name", TREE_WITH_LOAD_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", DIFFUSION_VIDEO_PARAMS, indirect=True)
-def test_reliability_fault_process_kill_tree_video_no_worker_residual_and_gpu_release(
+def test_reliability_fault_process_kill_tree_with_load_fast_fail_and_cleanup(
     omni_server_function,
     openai_client_function,
     signal_name: str,
 ) -> None:
     """Black-box: during in-flight video requests, kill server process tree and verify post-fault behavior/cleanup."""
     request_config = _video_request_config()
-    scenario = f"kill_server_tree_{signal_name.lower()}"
+    scenario = f"kill_serve_tree_with_load_{signal_name.lower()}"
     injector = make_server_tree_kill_fault_injector(
         signal_name=signal_name,
         post_kill_wait_seconds=2.0,
