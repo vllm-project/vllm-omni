@@ -347,6 +347,7 @@ class HunyuanImage3Pipeline(
         from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_hunyuan import (  # noqa: PLC0415
             DistributedAutoencoderKLHunyuan,
         )
+
         self.vae = DistributedAutoencoderKLHunyuan.from_config(self.hf_config.vae)
         self.vae.use_spatial_tiling = self.od_config.vae_use_tiling
         self._pipeline = None
