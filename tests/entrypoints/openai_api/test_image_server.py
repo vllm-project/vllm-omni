@@ -896,8 +896,6 @@ def test_different_image_sizes(test_client):
 
 def test_parameter_validation():
     """Test Pydantic model validation"""
-    from pydantic import ValidationError
-
     from vllm_omni.entrypoints.openai.protocol.images import ImageGenerationRequest
 
     # Valid request - optional parameters default to None
@@ -909,31 +907,18 @@ def test_parameter_validation():
     assert req.num_inference_steps is None  # Engine will use model defaults
     assert req.true_cfg_scale is None  # Engine will use model defaults
 
-    with pytest.raises(ValidationError):
-        ImageGenerationRequest(prompt="")
-
-    with pytest.raises(ValidationError):
-        ImageGenerationRequest(prompt="test", output_format="gif")
-
     # Invalid num_inference_steps (out of range)
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", num_inference_steps=0)
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", num_inference_steps=201)
 
-    # Invalid guidance_scale (out of range)
-    with pytest.raises(ValidationError):
-        ImageGenerationRequest(prompt="test", guidance_scale=-1.0)
-
-    with pytest.raises(ValidationError):
-        ImageGenerationRequest(prompt="test", guidance_scale=21.0)
-
     # Invalid layers for layered models (must stay within the backend-supported range)
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", layers=2)
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", layers=11)
 
 

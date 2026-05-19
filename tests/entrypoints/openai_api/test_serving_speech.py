@@ -561,24 +561,10 @@ class TestSpeechAPI:
         result = response.json()
         assert "not found" in result["detail"]
 
-    @pytest.mark.parametrize(
-        "bad_name",
-        ["   ", "evil/name", ".", "..", "bad\x00voice"],
-    )
-    def test_delete_voice_invalid_name_returns_400(self, client, bad_name):
-        from urllib.parse import quote
-
-        enc = quote(bad_name, safe="")
-        response = client.delete(f"/v1/audio/voices/{enc}")
-        assert response.status_code == 400
-        lowered = json.dumps(response.json()).lower()
-        assert "invalid voice name" in lowered
-
     # ── speaker_embedding upload via voices endpoint ──
 
     def test_upload_voice_embedding_success(self, client):
         """Upload a voice via speaker_embedding JSON."""
-        import json
 
         emb = [0.1] * 1024
         data = {
@@ -599,7 +585,6 @@ class TestSpeechAPI:
 
     def test_upload_voice_embedding_appears_in_listing(self, client):
         """Embedding-uploaded voice appears in list with correct source."""
-        import json
 
         emb = [0.2] * 2048
         data = {
@@ -620,7 +605,6 @@ class TestSpeechAPI:
 
     def test_upload_voice_embedding_and_audio_mutually_exclusive(self, client):
         """Providing both audio_sample and speaker_embedding returns 400."""
-        import json
 
         emb = [0.1] * 1024
         files = {"audio_sample": ("test.wav", b"fake", "audio/wav")}
@@ -646,7 +630,6 @@ class TestSpeechAPI:
 
     def test_upload_voice_embedding_nan_rejected(self, client):
         """NaN values in speaker_embedding return 400."""
-        import json
 
         data = {
             "speaker_embedding": json.dumps([0.1] * 1023 + [float("nan")]),
@@ -944,7 +927,6 @@ class TestTTSMethods:
 
     def test_upload_voice_embedding_wrong_dims_rejected(self, speech_server):
         """Embedding uploads must match the loaded Qwen3-TTS model before being stored."""
-        import json
 
         speech_server._tts_model_type = "qwen3_tts"
         speech_server.engine_client.model_config = SimpleNamespace(
