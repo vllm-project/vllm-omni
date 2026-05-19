@@ -7,12 +7,16 @@ from dataclasses import dataclass
 from enum import Enum
 
 
-class ReplicaStatus(str, Enum):
+class StageStatus(str, Enum):
     """Enumeration for stage replica status."""
 
     UP = "up"  # Replica is ready and available
     DOWN = "down"  # Replica is shutdown gracefully
     ERROR = "error"  # Replica encountered an error or timeout
+
+
+# Backward-compatible alias (main and tests use ReplicaStatus).
+ReplicaStatus = StageStatus
 
 
 @dataclass
@@ -27,7 +31,7 @@ class ReplicaEvent:
     output_addr: str  # Stage replica output ZMQ address (e.g., "tcp://host:port")
     stage_id: int  # Stage ID
     event_type: str  # "update" | "heartbeat"
-    status: ReplicaStatus  # Current status
+    status: StageStatus  # Current status
     queue_length: int  # Current queue length
 
 
@@ -42,7 +46,7 @@ class ReplicaInfo:
     input_addr: str  # Stage replica input ZMQ address (e.g., "tcp://host:port")
     output_addr: str  # Stage replica output ZMQ address (e.g., "tcp://host:port")
     stage_id: int  # Stage ID of this replica
-    status: ReplicaStatus  # Current status of the replica
+    status: StageStatus  # Current status of the replica
     queue_length: int  # Current queue length of this replica
     last_heartbeat: float  # Timestamp of the last heartbeat received (seconds)
     registered_at: float  # Timestamp when the replica was registered (seconds)

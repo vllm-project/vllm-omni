@@ -288,7 +288,16 @@ class StageEngineCoreClientBase(StageClientBase):
                 return None
 
     def _resolve_contact_host(self) -> str | None:
-        """Resolve a routable host for this stage from its client addresses."""
+        """Resolve a routable host for this stage from its client addresses.
+
+        For remote LLM replicas the ZMQ sockets are bound on the head node,
+        so the ZMQ addresses contain the head's IP. The ``replica_host`` key
+        (injected by DistStageRuntime) carries the actual replica IP where
+        the KV connector binds — prefer it when available.
+        """
+        replica_host = self.client_addresses.get("replica_host")
+        if replica_host:
+            return replica_host
         for key in ("input_address", "output_address", "stats_update_address"):
             address = self.client_addresses.get(key)
             if not address:

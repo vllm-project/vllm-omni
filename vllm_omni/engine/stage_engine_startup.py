@@ -13,7 +13,7 @@ from typing import Any
 import msgspec
 import zmq
 from omegaconf import OmegaConf
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_open_ports_list, zmq_socket_ctx
 from vllm.v1.engine.coordinator import DPCoordinator
@@ -21,14 +21,15 @@ from vllm.v1.engine.utils import (
     STARTUP_POLL_PERIOD_MS,
     CoreEngine,
     CoreEngineProcManager,
-    CoreEngineState,
-    EngineHandshakeMetadata,
     EngineZmqAddresses,
     wait_for_engine_startup,
 )
 from vllm.v1.executor import Executor
 
 logger = init_logger(__name__)
+
+# Backward-compatible alias for tests that patch the old private helper name.
+_wait_for_omni_engine_startup = wait_for_engine_startup
 
 StageRoute = tuple[int, int]
 
@@ -95,6 +96,11 @@ class StageAllocation:
     # Output channel: client binds PULL, engine connects PUSH
     output_bind_address: str
     output_connect_address: str
+    # The replica's routable IP (from registration). For LLM remote replicas
+    # the ZMQ sockets are bound on the head, but the KV connector runs on
+    # the replica host — this field preserves the replica's actual IP so the
+    # orchestrator can advertise the correct KV sender endpoint.
+    replica_host: str | None = None
 
 
 @dataclass(frozen=True)
@@ -338,6 +344,13 @@ class OmniMasterServer:
             outputs=[alloc.output_connect_address],
         )
 
+    def get_replica_host(self, stage_id: int, replica_id: int = 0) -> str | None:
+        """Return the replica's routable IP if it registered one."""
+        alloc = self._stage_routes.get((stage_id, replica_id))
+        if alloc is None:
+            return None
+        return alloc.replica_host
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -519,10 +532,16 @@ class OmniMasterServer:
                         input_connect_address=inp_bind_addr,
                         output_bind_address=out_bind_addr,
                         output_connect_address=out_bind_addr,
+                        replica_host=new_bind_address,
                     )
                     self._stage_routes[(stage_id, replica_id)] = alloc
+                else:
+                    # LLM remote replica: ZMQ sockets stay on the master,
+                    # but record the replica's IP for KV connector routing.
+                    alloc.replica_host = new_bind_address
                 logger.info(
-                    "[OmniMasterServer] Stage %d replica %d cross-host bind (sockets bound on %s; replica_ip=%s)",
+                    "[OmniMasterServer] Stage %d replica %d cross-host bind "
+                    "(sockets bound on %s; replica_ip=%s)",
                     stage_id,
                     replica_id,
                     "replica" if replica_binds_sockets else "master",
@@ -669,7 +688,9 @@ def register_stage_with_omni_master(
             # (otherwise the master would hand back ``tcp://<master_ip>:port``
             # and ``zmq.bind`` would EADDRNOTAVAIL on the remote host).
             if replica_bind_address is None:
-                replica_bind_address = _detect_local_bind_address(omni_master_address, omni_master_port)
+                replica_bind_address = _detect_local_bind_address(
+                    omni_master_address, omni_master_port
+                )
             hs_port, inp_port, out_port = get_open_ports_list(count=3)
             payload["replica_bind_address"] = replica_bind_address
             payload["replica_handshake_port"] = hs_port
@@ -725,70 +746,6 @@ def register_stage_with_omni_master(
     return handshake_address
 
 
-def _wait_for_omni_engine_startup(
-    handshake_socket: zmq.Socket,
-    engine_addresses: EngineZmqAddresses,
-    engines: list[CoreEngine],
-    cache_config: CacheConfig,
-) -> None:
-    """Wait for omni-managed engines to finish the HELLO/READY handshake."""
-    conn_pending = len(engines)
-    start_pending = 0
-
-    poller = zmq.Poller()
-    poller.register(handshake_socket, zmq.POLLIN)
-
-    while conn_pending or start_pending:
-        events = poller.poll(STARTUP_POLL_PERIOD_MS)
-        if not events:
-            logger.debug(
-                "[omni] Waiting for %d engine(s) to connect, %d to start.",
-                conn_pending,
-                start_pending,
-            )
-            continue
-
-        eng_identity, msg_bytes = handshake_socket.recv_multipart()
-        eng_index = int.from_bytes(eng_identity, "little")
-        engine = next((e for e in engines if e.identity == eng_identity), None)
-        if engine is None:
-            raise RuntimeError(f"[omni] Handshake message from unexpected engine rank: {eng_index}")
-
-        msg = msgspec.msgpack.decode(msg_bytes)
-        status: str = msg["status"]
-
-        if status == "HELLO" and engine.state == CoreEngineState.NEW:
-            init_message = msgspec.msgpack.encode(
-                EngineHandshakeMetadata(addresses=engine_addresses, parallel_config={})
-            )
-            handshake_socket.send_multipart((eng_identity, init_message), copy=False)
-            conn_pending -= 1
-            start_pending += 1
-            engine.state = CoreEngineState.CONNECTED
-            logger.debug("[omni] HELLO from engine %d", eng_index)
-
-        elif status == "READY" and engine.state == CoreEngineState.CONNECTED:
-            # Upstream vllm >=0.19 dropped `num_gpu_blocks` from the READY
-            # handshake payload (the field is now communicated out-of-band via
-            # stats/health topics); tolerate both legacy and new message
-            # shapes so the omni handshake keeps working across rebases.
-            reported_blocks = msg.get("num_gpu_blocks")
-            if reported_blocks is not None:
-                cache_config.num_gpu_blocks = (cache_config.num_gpu_blocks or 0) + int(reported_blocks)
-            if engine_addresses.frontend_stats_publish_address is None:
-                engine_addresses.frontend_stats_publish_address = msg.get("dp_stats_address")
-            start_pending -= 1
-            engine.state = CoreEngineState.READY
-            logger.debug(
-                "[omni] READY from engine %d (num_gpu_blocks=%s)",
-                eng_index,
-                "unknown" if reported_blocks is None else reported_blocks,
-            )
-
-        else:
-            raise RuntimeError(f"[omni] Unexpected status '{status}' from engine {eng_index} in state {engine.state}.")
-
-
 @contextlib.contextmanager
 def connect_remote_engine_cores(
     vllm_config: VllmConfig,
@@ -834,7 +791,11 @@ def connect_remote_engine_cores(
             handshake_socket,
             addresses,
             engines_to_handshake,
+            vllm_config.parallel_config,
+            False,  # coordinated_dp
             vllm_config.cache_config,
+            None,  # proc_manager (remote — no local procs)
+            None,  # coord_process
         )
 
 

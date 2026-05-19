@@ -11,7 +11,7 @@ from dataclasses import asdict
 
 import zmq
 
-from .messages import ReplicaEvent, ReplicaStatus
+from .messages import ReplicaEvent, StageStatus
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ class OmniCoordClientForStage:
             self._socket.close()
             raise RuntimeError(f"Failed to connect to coordinator at {self._coord_zmq_addr}: {e}") from e
 
-        self._status = ReplicaStatus.UP
+        self._status = StageStatus.UP
         self._queue_length = 0
         self._closed = False
         self._closing = False
@@ -156,7 +156,7 @@ class OmniCoordClientForStage:
 
     def update_info(
         self,
-        status: ReplicaStatus | None = None,
+        status: StageStatus | None = None,
         queue_length: int | None = None,
     ) -> None:
         """Update replica information and notify OmniCoordinator.
@@ -217,7 +217,7 @@ class OmniCoordClientForStage:
             self._closing = True
 
             # Mark status as DOWN and send one last update.
-            self._status = ReplicaStatus.DOWN
+            self._status = StageStatus.DOWN
             try:
                 self._send_event("update")
             except (RuntimeError, zmq.ZMQError):
@@ -230,3 +230,30 @@ class OmniCoordClientForStage:
             except zmq.ZMQError:
                 pass
             self._closed = True
+
+
+def create_stage_coord_client(
+    *,
+    coord_zmq_addr: str,
+    input_addr: str,
+    output_addr: str,
+    stage_id: int,
+    queue_length_getter: Callable[[], int] | None = None,
+) -> OmniCoordClientForStage:
+    """Create a stage coordinator client with an optional heartbeat hook."""
+    client = OmniCoordClientForStage(
+        coord_zmq_addr=coord_zmq_addr,
+        input_addr=input_addr,
+        output_addr=output_addr,
+        stage_id=stage_id,
+    )
+    if queue_length_getter is not None:
+
+        def _refresh_queue_length() -> None:
+            try:
+                client._queue_length = max(int(queue_length_getter()), 0)
+            except Exception:
+                pass
+
+        client._on_heartbeat = _refresh_queue_length
+    return client

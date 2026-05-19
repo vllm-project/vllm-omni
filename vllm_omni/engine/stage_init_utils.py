@@ -61,63 +61,6 @@ class LogicalStageInitPlan:
     replicas: list[ReplicaInitPlan]
 
 
-@dataclass
-class StageRemoteFactoryContext:
-    """Per-stage context cached by AsyncOmniEngine for dynamic replica attach.
-
-    Populated once during ``_bootstrap_orchestrator`` from the per-stage
-    init plans. ``_build_remote_replica`` consumes it to construct the
-    right head-side stage client when a headless replica registers.
-    """
-
-    stage_id: int
-    stage_type: str
-    stage_cfg: Any
-    base_metadata: Any
-    # LLM-only fields:
-    vllm_config: Any | None = None
-    executor_class: type | None = None
-    # Diffusion-only fields:
-    diffusion_batch_size: int = 1
-
-
-def capture_stage_factory_contexts(
-    stage_plans: Sequence[LogicalStageInitPlan],
-    diffusion_batch_size: int,
-) -> dict[int, StageRemoteFactoryContext]:
-    """Snapshot per-stage construction context for dynamic replica attach.
-
-    Called once after ``_initialize_stages`` finishes. The captured
-    context holds everything ``_build_remote_replica`` needs to build a
-    fresh head-side client when a new headless replica registers
-    (vllm_config / executor_class for LLM, batch_size for diffusion,
-    plus the base stage metadata).
-
-    Per-replica fields like ``replica_id`` are filled in at build time,
-    not at capture time.
-    """
-    contexts: dict[int, StageRemoteFactoryContext] = {}
-    for plan in stage_plans:
-        if not plan.replicas:
-            # Stage was declared but has zero replicas locally; we still
-            # want to be able to attach incoming headless ones, so use
-            # the stage_cfg-derived context if any replica plan exists.
-            continue
-        template = plan.replicas[0]
-        stage_id = int(plan.configured_stage_id)
-        stage_type = template.metadata.stage_type or "llm"
-        contexts[stage_id] = StageRemoteFactoryContext(
-            stage_id=stage_id,
-            stage_type=stage_type,
-            stage_cfg=template.stage_cfg,
-            base_metadata=template.metadata,
-            vllm_config=template.stage_vllm_config,
-            executor_class=template.executor_class,
-            diffusion_batch_size=diffusion_batch_size,
-        )
-    return contexts
-
-
 def _resolve_model_to_local_path(model: str) -> str:
     """Resolve an HF Hub model ID to a local cache path."""
     if os.path.isdir(model):
