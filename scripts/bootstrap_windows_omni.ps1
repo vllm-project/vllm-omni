@@ -132,6 +132,7 @@ function Set-OmniEnvironment {
     $env:HF_HUB_DISABLE_SYMLINKS_WARNING = "1"
     $env:VLLM_WORKER_MULTIPROC_METHOD = "spawn"
     $env:VLLM_USE_FLASHINFER_SAMPLER = "0"
+    $env:VLLM_HOST_IP = "127.0.0.1"
 }
 
 function Download-HfSnapshot {
