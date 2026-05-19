@@ -63,6 +63,45 @@ from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2
     HiggsAudioV2Config,
 )
 
+
+def _install_kv_cache_write_fallback() -> None:
+    """R21: monkey-patch FlexAttentionImpl.do_kv_cache_update with a pure-Python
+    fallback because ``torch.ops._C_cache_ops.reshape_and_cache_flash`` is a
+    silent no-op in this vLLM build (verified — direct calls write nothing for
+    any dtype on H100/CUDA 12.9). Without this patch, attention output is
+    constantly zero (R17/R20 root cause: empty KV cache), and the talker can
+    only emit a few real codes before falling back to stream-specials.
+    """
+    try:
+        from vllm.v1.attention.backends.flex_attention import FlexAttentionImpl
+        from vllm.attention.backends.abstract import AttentionType
+    except ImportError:
+        return
+    if getattr(FlexAttentionImpl, "_higgs_kv_patched", False):
+        return
+
+    def _patched_do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        if self.attn_type == AttentionType.ENCODER_ONLY:
+            return
+        key_cache, value_cache = kv_cache.unbind(0)
+        block_size = key_cache.shape[1]
+        valid_mask = slot_mapping >= 0
+        if valid_mask.any():
+            valid_slots = slot_mapping[valid_mask]
+            valid_keys = key[valid_mask]
+            valid_values = value[valid_mask]
+            block_idx = valid_slots // block_size
+            pos_in_block = valid_slots % block_size
+            key_cache[block_idx, pos_in_block] = valid_keys
+            value_cache[block_idx, pos_in_block] = valid_values
+
+    FlexAttentionImpl.do_kv_cache_update = _patched_do_kv_cache_update
+    FlexAttentionImpl._higgs_kv_patched = True
+
+
+# Install the KV-cache write fallback ASAP — before any model loads.
+_install_kv_cache_write_fallback()
+
 __all__ = [
     "DualFFNLayer",
     "HiggsAudioV2DecoderLayer",
