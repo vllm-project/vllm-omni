@@ -6,7 +6,7 @@
 Benchmark online serving for diffusion models (Image/Video Generation).
 If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 
-Supports multiple backends:
+Supports multiple endpoints:
     - /v1/chat/completions: OpenAI chat-compatible image requests
     - /v1/images/generations: OpenAI image generation requests
     - /v1/images/edits: Uses /v1/images/edits endpoint
@@ -44,7 +44,7 @@ Usage:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
         --endpoint /v1/chat/completions --dataset vbench --task i2i --num-prompts 10
 
-    # Image (/v1/images/generations backend)
+    # Image (/v1/images/generations endpoint)
     t2i:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
         --endpoint /v1/images/generations --dataset vbench --task t2i --num-prompts 10 \
