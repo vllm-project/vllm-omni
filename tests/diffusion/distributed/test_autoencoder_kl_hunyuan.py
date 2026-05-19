@@ -14,8 +14,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 class _DummyDistributedAutoencoderKLHunyuan(DistributedAutoencoderKLHunyuan):
     def __init__(self):
         torch.nn.Module.__init__(self)
-        self.tile_latent_min_size = 2
-        self.tile_sample_min_size = 2
+        self.tile_latent_min_size = 8
+        self.tile_sample_min_size = 8
         self.tile_overlap_factor = 0.25
         self.use_spatial_tiling = False
 
@@ -50,30 +50,30 @@ def test_hunyuan_vae_use_tiling_aliases_spatial_tiling():
 def test_hunyuan_vae_decode_tiles_round_trip():
     # Validate decode tile split/exec/merge returns expected reconstructed tensor.
     vae = _DummyDistributedAutoencoderKLHunyuan()
-    z = torch.arange(16, dtype=torch.float32).reshape(1, 1, 1, 4, 4)
+    z = torch.arange(144, dtype=torch.float32).reshape(1, 1, 1, 12, 12)
 
     tile_tasks, grid_spec = vae.tile_split(z)
     decoded_tiles = {task.grid_coord: vae.tile_exec(task) for task in tile_tasks}
     output = vae.tile_merge(decoded_tiles, grid_spec)
 
     assert grid_spec.split_dims == (3, 4)
-    assert grid_spec.grid_shape == (4, 4)
-    assert grid_spec.tile_spec == {"blend_extent": 0, "row_limit": 2}
-    assert len(tile_tasks) == 16
+    assert grid_spec.grid_shape == (2, 2)
+    assert grid_spec.tile_spec == {"blend_extent": 2, "row_limit": 6}
+    assert len(tile_tasks) == 4
     assert torch.equal(output, z + 10)
 
 
 def test_hunyuan_vae_encode_tiles_round_trip():
     # Validate encode tile split/exec/merge returns expected latent tensor.
     vae = _DummyDistributedAutoencoderKLHunyuan()
-    x = torch.arange(16, dtype=torch.float32).reshape(1, 1, 1, 4, 4)
+    x = torch.arange(144, dtype=torch.float32).reshape(1, 1, 1, 12, 12)
 
     tile_tasks, grid_spec = vae.encode_tile_split(x)
     encoded_tiles = {task.grid_coord: vae.encode_tile_exec(task) for task in tile_tasks}
     output = vae.encode_tile_merge(encoded_tiles, grid_spec)
 
     assert grid_spec.split_dims == (3, 4)
-    assert grid_spec.grid_shape == (4, 4)
-    assert grid_spec.tile_spec == {"blend_extent": 0, "row_limit": 2}
-    assert len(tile_tasks) == 16
+    assert grid_spec.grid_shape == (2, 2)
+    assert grid_spec.tile_spec == {"blend_extent": 2, "row_limit": 6}
+    assert len(tile_tasks) == 4
     assert torch.equal(output, x + 20)
