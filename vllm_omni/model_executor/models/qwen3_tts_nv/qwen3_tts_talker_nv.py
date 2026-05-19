@@ -21,12 +21,11 @@
 import bisect
 from collections.abc import Callable, Iterable, Mapping
 from types import SimpleNamespace
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 from torch import nn
 from transformers import AutoTokenizer, PretrainedConfig
-
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import ignore_torch_compile, support_torch_compile
 from vllm.config import CUDAGraphMode, VllmConfig
@@ -91,18 +90,13 @@ class Qwen3TTSNativeRotaryEmbedding(nn.Module):
 
     def __init__(self, head_dim: int, rope_theta: float = 1_000_000.0) -> None:
         super().__init__()
-        inv_freq = 1.0 / (
-            rope_theta
-            ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
-        )
+        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
         # Use nn.Parameter so vLLM natively handles device/dtype casting.
         # requires_grad=False because this is deterministic and not trained.
         # The weight-loader already skips "rotary_emb.inv_freq".
         self.inv_freq = nn.Parameter(inv_freq, requires_grad=False)
 
-    def forward(
-        self, seq_len: int, device: torch.device, dtype: torch.dtype
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
         """Return ``(cos, sin)`` tensors for positions ``[0 .. seq_len)``.
 
         Returns:
@@ -146,10 +140,10 @@ def _sample_from_logits(
     logits: torch.Tensor,
     do_sample: bool = True,
     temperature: float = 1.0,
-    top_k: Optional[int] = None,
-    top_p: Optional[float] = None,
+    top_k: int | None = None,
+    top_p: float | None = None,
     repetition_penalty: float = 1.0,
-    previous_tokens: Optional[torch.Tensor] = None,
+    previous_tokens: torch.Tensor | None = None,
     use_gumbel: bool = True,
 ) -> torch.Tensor:
     """Sample tokens from logits (CUDA-graph safe).
@@ -198,25 +192,19 @@ def _sample_from_logits(
             unsort_idx = sort_idx.argsort(dim=-1)
             vals = sorted_vals.gather(-1, unsort_idx)
 
-        sampled_in_k = (_gumbel_sample(vals) if use_gumbel
-                        else _multinomial_sample(vals))
+        sampled_in_k = _gumbel_sample(vals) if use_gumbel else _multinomial_sample(vals)
         return idxs.gather(-1, sampled_in_k.unsqueeze(-1)).squeeze(-1)
 
     # ── Top-p only (no top-k) ───────────────────────────────────────
     if top_p is not None and 0.0 < top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(
-            logits, dim=-1, descending=True
-        )
+        sorted_logits, sorted_indices = torch.sort(logits, dim=-1, descending=True)
         probs = torch.softmax(sorted_logits, dim=-1)
         cum_probs = torch.cumsum(probs, dim=-1)
         remove = (cum_probs - probs) > top_p
         sorted_logits = sorted_logits.masked_fill(remove, -1e10)
 
-        sampled_sorted = (_gumbel_sample(sorted_logits) if use_gumbel
-                          else _multinomial_sample(sorted_logits))
-        return sorted_indices.gather(
-            -1, sampled_sorted.unsqueeze(-1)
-        ).squeeze(-1)
+        sampled_sorted = _gumbel_sample(sorted_logits) if use_gumbel else _multinomial_sample(sorted_logits)
+        return sorted_indices.gather(-1, sampled_sorted.unsqueeze(-1)).squeeze(-1)
 
     # ── No filtering — sample from full distribution ────────────────
     if use_gumbel:
@@ -226,7 +214,7 @@ def _sample_from_logits(
 
 class Qwen3TTSTalkerResizeMLP(nn.Module):
     """Resize MLP for text projection in Qwen3TTS Talker.
-    
+
     Maps from text_hidden_size to hidden_size with an intermediate layer.
     """
 
@@ -236,7 +224,7 @@ class Qwen3TTSTalkerResizeMLP(nn.Module):
         intermediate_size: int,
         output_size: int,
         hidden_act: str,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -270,7 +258,7 @@ class Qwen3TTSTalkerResizeMLP(nn.Module):
 
 class Qwen3TTSNativeAttention(nn.Module):
     """Native attention for Qwen3TTS using torch SDPA.
-    
+
     Used for the code predictor which has deterministic shapes and doesn't
     benefit from KV caching. Can be captured in CUDA graphs.
     """
@@ -280,7 +268,7 @@ class Qwen3TTSNativeAttention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        head_dim: Optional[int] = None,
+        head_dim: int | None = None,
         rms_norm_eps: float = 1e-6,
         qkv_bias: bool = False,
     ) -> None:
@@ -290,13 +278,13 @@ class Qwen3TTSNativeAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim if head_dim else hidden_size // num_heads
         self.num_kv_groups = num_heads // num_kv_heads
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(hidden_size, num_heads * self.head_dim, bias=qkv_bias)
         self.k_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=qkv_bias)
         self.v_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=qkv_bias)
         self.o_proj = nn.Linear(num_heads * self.head_dim, hidden_size, bias=qkv_bias)
-        
+
         # QK normalization
         self.q_norm = nn.RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -304,11 +292,11 @@ class Qwen3TTSNativeAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Forward pass using torch SDPA.
-        
+
         Args:
             hidden_states: [batch_size, seq_len, hidden_size]
             attention_mask: Optional attention mask
@@ -316,48 +304,50 @@ class Qwen3TTSNativeAttention(nn.Module):
                 embedding, each [1, 1, seq_len, head_dim].
         """
         batch_size, seq_len, _ = hidden_states.shape
-        
+
         # Project Q, K, V
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
-        
+
         # Reshape to [batch, seq, num_heads, head_dim]
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        
+
         # Apply QK normalization
         q = self.q_norm(q)
         k = self.k_norm(k)
-        
+
         # Transpose to [batch, num_heads, seq, head_dim] for SDPA
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        
+
         # Apply rotary position embeddings (standard 1-D RoPE)
         if position_embeddings is not None:
             cos, sin = position_embeddings
             q, k = _apply_rotary_pos_emb(q, k, cos, sin)
-        
+
         # Expand KV heads if using GQA
         if self.num_kv_groups > 1:
             k = k.repeat_interleave(self.num_kv_groups, dim=1)
             v = v.repeat_interleave(self.num_kv_groups, dim=1)
-        
+
         # Apply scaled dot product attention
         attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v,
+            q,
+            k,
+            v,
             attn_mask=attention_mask,
             is_causal=attention_mask is None,  # Use causal if no mask provided
             scale=self.scaling,
         )
-        
+
         # Reshape back to [batch, seq, hidden]
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(batch_size, seq_len, -1)
-        
+
         output = self.o_proj(attn_output)
         return output
 
@@ -382,7 +372,7 @@ class Qwen3TTSNativeMLP(nn.Module):
 
 class Qwen3TTSCodePredictorDecoderLayer(nn.Module):
     """Native decoder layer for Qwen3TTS Code Predictor.
-    
+
     Uses native PyTorch attention (SDPA) instead of vLLM attention.
     This is more efficient for the code predictor since:
     - Shapes are deterministic (fixed 15 steps)
@@ -393,7 +383,7 @@ class Qwen3TTSCodePredictorDecoderLayer(nn.Module):
     def __init__(self, config: PretrainedConfig) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        
+
         self.self_attn = Qwen3TTSNativeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -402,29 +392,25 @@ class Qwen3TTSCodePredictorDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, "attention_bias", False),
         )
-        
+
         self.mlp = Qwen3TTSNativeMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
         )
-        
+
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         # Self Attention with pre-norm
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
-            hidden_states, attention_mask, position_embeddings
-        )
+        hidden_states = self.self_attn(hidden_states, attention_mask, position_embeddings)
         hidden_states = residual + hidden_states
 
         # MLP with pre-norm
@@ -432,7 +418,7 @@ class Qwen3TTSCodePredictorDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        
+
         return hidden_states
 
 
@@ -440,7 +426,7 @@ class Qwen3TTSCodePredictorDecoderLayer(nn.Module):
 _KEEP_AS_DICT_KEYS = {"rope_scaling"}
 
 
-def _dict_to_namespace(d, _key: Optional[str] = None):
+def _dict_to_namespace(d, _key: str | None = None):
     """Recursively convert a dict to SimpleNamespace for attribute access.
 
     Certain keys (e.g. ``rope_scaling``) are kept as plain dicts because
@@ -450,9 +436,7 @@ def _dict_to_namespace(d, _key: Optional[str] = None):
     if isinstance(d, dict):
         if _key in _KEEP_AS_DICT_KEYS:
             return d  # keep as plain dict
-        return SimpleNamespace(
-            **{k: _dict_to_namespace(v, _key=k) for k, v in d.items()}
-        )
+        return SimpleNamespace(**{k: _dict_to_namespace(v, _key=k) for k, v in d.items()})
     return d
 
 
@@ -473,7 +457,7 @@ def _get_talker_config(hf_config: PretrainedConfig):
 
 class Qwen3TTSTalkerCodePredictorModel(nn.Module):
     """Native PyTorch code predictor model for Qwen3TTS Talker.
-    
+
     Uses native attention (SDPA) instead of vLLM attention since:
     - Runs for fixed 15 steps per global time step
     - Shapes are deterministic
@@ -483,31 +467,27 @@ class Qwen3TTSTalkerCodePredictorModel(nn.Module):
 
     def __init__(self, config: PretrainedConfig, embedding_dim: int) -> None:
         super().__init__()
-        
+
         self.config = config
         self.vocab_size = config.vocab_size
         self.hidden_size = config.hidden_size
         self.num_code_groups = config.num_code_groups
-        
+
         # Codec embeddings for groups 1 to N-1 (group 0 uses main model embedding)
-        self.codec_embedding = nn.ModuleList([
-            nn.Embedding(config.vocab_size, embedding_dim)
-            for _ in range(config.num_code_groups - 1)
-        ])
-        
+        self.codec_embedding = nn.ModuleList(
+            [nn.Embedding(config.vocab_size, embedding_dim) for _ in range(config.num_code_groups - 1)]
+        )
+
         # Decoder layers using native attention
-        self.layers = nn.ModuleList([
-            Qwen3TTSCodePredictorDecoderLayer(config)
-            for _ in range(config.num_hidden_layers)
-        ])
-        
+        self.layers = nn.ModuleList(
+            [Qwen3TTSCodePredictorDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+
         # Final layer norm
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        
+
         # Standard 1-D rotary position embeddings (matches HF code predictor)
-        head_dim = getattr(
-            config, "head_dim", config.hidden_size // config.num_attention_heads
-        )
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.rotary_emb = Qwen3TTSNativeRotaryEmbedding(
             head_dim=head_dim,
             rope_theta=getattr(config, "rope_theta", 1_000_000.0),
@@ -520,32 +500,28 @@ class Qwen3TTSTalkerCodePredictorModel(nn.Module):
     def forward(
         self,
         inputs_embeds: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
-        
+
         Args:
             inputs_embeds: [batch_size, seq_len, hidden_size]
             attention_mask: Optional causal mask
-            
+
         Returns:
             hidden_states: [batch_size, seq_len, hidden_size]
         """
         hidden_states = inputs_embeds
-        
+
         # Compute position embeddings shared across all decoder layers.
         # Positions are simply [0, 1, ..., seq_len-1] since we
         # recompute from scratch each call (no KV cache).
         seq_len = hidden_states.shape[1]
-        position_embeddings = self.rotary_emb(
-            seq_len, hidden_states.device, hidden_states.dtype
-        )
-        
+        position_embeddings = self.rotary_emb(seq_len, hidden_states.device, hidden_states.dtype)
+
         for layer in self.layers:
-            hidden_states = layer(
-                hidden_states, attention_mask, position_embeddings
-            )
-        
+            hidden_states = layer(hidden_states, attention_mask, position_embeddings)
+
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
@@ -594,23 +570,18 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         )
 
         # Code-predictor transformer backbone
-        self.model = Qwen3TTSTalkerCodePredictorModel(
-            config, self.talker_hidden_size
-        )
+        self.model = Qwen3TTSTalkerCodePredictorModel(config, self.talker_hidden_size)
 
         # Projection from talker hidden size to code predictor hidden size
         if config.hidden_size != self.talker_hidden_size:
-            self.small_to_mtp_projection = nn.Linear(
-                self.talker_hidden_size, config.hidden_size, bias=True
-            )
+            self.small_to_mtp_projection = nn.Linear(self.talker_hidden_size, config.hidden_size, bias=True)
         else:
             self.small_to_mtp_projection = nn.Identity()
 
         # LM heads for each code group (1 to N-1)
-        self.lm_head = nn.ModuleList([
-            nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-            for _ in range(config.num_code_groups - 1)
-        ])
+        self.lm_head = nn.ModuleList(
+            [nn.Linear(config.hidden_size, config.vocab_size, bias=False) for _ in range(config.num_code_groups - 1)]
+        )
 
         # Sampling parameters for the internal groups-1..N-1 loop,
         # read from code_predictor_config. Fallback defaults match the
@@ -630,16 +601,10 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
         dtype = vllm_config.model_config.dtype
         self._max_cp_len = 1 + N  # prev_hidden ctx + group0 + groups 1..N-1
 
-        self._cp_inputs_embeds = torch.zeros(
-            max_num_tokens, self._max_cp_len, hidden, dtype=dtype
-        )
-        self._cp_hidden_states = torch.empty(
-            max_num_tokens, self._max_cp_len, cp_hidden, dtype=dtype
-        )
+        self._cp_inputs_embeds = torch.zeros(max_num_tokens, self._max_cp_len, hidden, dtype=dtype)
+        self._cp_hidden_states = torch.empty(max_num_tokens, self._max_cp_len, cp_hidden, dtype=dtype)
         # Only groups 1..N-1 (N-1 columns)
-        self._cp_all_codecs = torch.empty(
-            max_num_tokens, N - 1, dtype=torch.long
-        )
+        self._cp_all_codecs = torch.empty(max_num_tokens, N - 1, dtype=torch.long)
 
     def get_group0_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Look up group-0 codec embeddings."""
@@ -665,10 +630,7 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
     ) -> torch.Tensor:
         """Compute logits for a specific inner code group (1..N-1)."""
         if generation_step >= len(self.lm_head):
-            raise ValueError(
-                f"generation_step {generation_step} exceeds number of "
-                f"code groups {len(self.lm_head)}"
-            )
+            raise ValueError(f"generation_step {generation_step} exceeds number of code groups {len(self.lm_head)}")
         return self.lm_head[generation_step](hidden_states)
 
     def generate_groups_1_15(
@@ -706,9 +668,7 @@ class Qwen3TTSTalkerCodePredictor(nn.Module):
             hidden_states = self(inputs_embeds)
 
             current_len = step + 2
-            logits = self._compute_inner_logits(
-                hidden_states[:, current_len - 1, :], step
-            )
+            logits = self._compute_inner_logits(hidden_states[:, current_len - 1, :], step)
 
             if self.repetition_penalty != 1.0 and step > 0:
                 current_context = all_codecs[:, :step]
@@ -778,8 +738,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             # Group-0 codec embedding lives inside the code predictor.
-            "talker.model.codec_embedding.":
-                "code_predictor.codec_embedding.",
+            "talker.model.codec_embedding.": "code_predictor.codec_embedding.",
             # Text embedding lifted to the outer model (vLLM's Qwen3Model
             # owns ``embed_tokens`` for codec ids; text tokens use a
             # separate top-level table).
@@ -828,9 +787,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
 
         # HF AutoTokenizer, loaded eagerly so prefill preprocess has no
         # first-call latency spike.
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_path, trust_remote_code=True, padding_side="left"
-        )
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True, padding_side="left")
 
         # Transformer backbone — vLLM's reusable Qwen3Model. The talker
         # has Qwen3-style decoder layers, so we delegate the entire
@@ -892,25 +849,17 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
         # causing the replayed graph to read stale memory.
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         dtype = vllm_config.model_config.dtype
-        self._out_codes = torch.zeros(
-            max_num_tokens, self.code_predictor.num_code_groups, dtype=torch.long
-        )
-        self._combined_embeddings = torch.zeros(
-            max_num_tokens, config.hidden_size, dtype=dtype
-        )
+        self._out_codes = torch.zeros(max_num_tokens, self.code_predictor.num_code_groups, dtype=torch.long)
+        self._combined_embeddings = torch.zeros(max_num_tokens, config.hidden_size, dtype=dtype)
         # Per-token slot for the previous-step backbone hidden state fed to the
         # code predictor. Written by ``preprocess`` at the request's offset,
         # read by ``forward`` at decode positions.
-        self._prev_hidden_buffer = torch.zeros(
-            max_num_tokens, config.hidden_size, dtype=dtype
-        )
+        self._prev_hidden_buffer = torch.zeros(max_num_tokens, config.hidden_size, dtype=dtype)
         # ``text_proj(text_emb(tts_pad_token_id))`` — request-independent
         # constant added on top of ``codec_emb(group0)`` at every decode
         # step. Declared here so the address is stable across CUDA graph
         # replays; actual value is populated from weights in ``load_weights``.
-        self._tts_pad_text_embed = torch.zeros(
-            1, config.hidden_size, dtype=dtype
-        )
+        self._tts_pad_text_embed = torch.zeros(1, config.hidden_size, dtype=dtype)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Get group-0 codec embeddings for input ids."""
@@ -923,7 +872,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
         """
         helper function that returns indices of decoding tokens,
         that's where exactly the local transformer should be
-        applied. 
+        applied.
 
         Returns:
             decode_idx: indices of decoder requests, if None returned,
@@ -946,10 +895,10 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
             # all requests in the batch a decode-only,
             # apply local transformer everywhere
             return None, 0
-        
+
         start_loc = any_layer_meta.query_start_loc
         tokens_per_req = start_loc[1:] - start_loc[:-1]
-        is_decode = (tokens_per_req == 1)  # shape: (num_reqs,)
+        is_decode = tokens_per_req == 1  # shape: (num_reqs,)
         decode_token_indices = start_loc[:-1][is_decode]
 
         num_requests = decode_token_indices.shape[0]
@@ -960,15 +909,17 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
             if idx < len(sizes):
                 padded_num_requests = sizes[idx]
         if padded_num_requests != num_requests:
-            decode_token_indices = torch.nn.functional.pad(decode_token_indices, (0, padded_num_requests - num_requests))
+            decode_token_indices = torch.nn.functional.pad(
+                decode_token_indices, (0, padded_num_requests - num_requests)
+            )
         return decode_token_indices, num_requests
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: Optional[Any] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        intermediate_tensors: Any | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         **_: Any,
     ) -> torch.Tensor:
         """Forward pass: code predictor -> embedding -> backbone.
@@ -1014,18 +965,14 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
                 prev_hidden=self._prev_hidden_buffer[:num_tokens],
                 group0_tokens=input_ids,
             )
-            self._out_codes[:codes_1_15.shape[0], 1:] = codes_1_15
+            self._out_codes[: codes_1_15.shape[0], 1:] = codes_1_15
             # Assemble decode embedding in-place on top of the (zero)
             # ``inputs_embeds`` produced by ``preprocess``: group-0 codec
             # embedding + tts_pad text embedding + sum of groups 1..N-1.
-            combined_embeddings.add_(
-                self.code_predictor.codec_embedding(input_ids)
-            )
+            combined_embeddings.add_(self.code_predictor.codec_embedding(input_ids))
             combined_embeddings.add_(self._tts_pad_text_embed)
             for i in range(len(group_embeddings)):
-                combined_embeddings.add_(
-                    group_embeddings[i](codes_1_15[:, i])
-                )
+                combined_embeddings.add_(group_embeddings[i](codes_1_15[:, i]))
         elif num_req > 0:
             # need to overwrite the batch descriptor since we are slicing the inputs
             ctx = get_forward_context()
@@ -1046,14 +993,9 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
             # positions keep the full prefill embedding produced by
             # ``preprocess``.
             decode_group0_ids = input_ids[valid_dec_idx]
-            decode_embed = (
-                self.code_predictor.codec_embedding(decode_group0_ids)
-                + self._tts_pad_text_embed
-            )
+            decode_embed = self.code_predictor.codec_embedding(decode_group0_ids) + self._tts_pad_text_embed
             for i in range(len(group_embeddings)):
-                decode_embed = decode_embed + group_embeddings[i](
-                    codes_1_15[:num_req, i]
-                )
+                decode_embed = decode_embed + group_embeddings[i](codes_1_15[:num_req, i])
             combined_embeddings[valid_dec_idx] = decode_embed
 
         # Qwen3Model.forward(input_ids, positions, intermediate_tensors,
@@ -1068,14 +1010,14 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
         )
 
         # save input ids to the output codes
-        self._out_codes[:input_ids.shape[0], 0] = input_ids
+        self._out_codes[: input_ids.shape[0], 0] = input_ids
 
         return hidden_states
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """Compute group-0 logits for vLLM sampling.
 
         Projects backbone hidden states through ``codec_head``, applies the
@@ -1085,12 +1027,12 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
         logits = self.logits_processor(self.codec_head, hidden_states)
-        logits = logits.masked_fill(self.suppress_mask.bool(), float('-inf'))
+        logits = logits.masked_fill(self.suppress_mask.bool(), float("-inf"))
         return logits
 
     def make_omni_output(
         self,
-        model_outputs: Union[torch.Tensor, OmniOutput],
+        model_outputs: torch.Tensor | OmniOutput,
         **_: Any,
     ) -> OmniOutput:
         """Wrap backbone hidden states with the codec groups 1..N-1.
@@ -1131,19 +1073,16 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
 
     @staticmethod
     def _build_assistant_text(text: str) -> str:
-        return (
-            f"<|im_start|>assistant\n{text}"
-            f"<|im_end|>\n<|im_start|>assistant\n"
-        )
+        return f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
 
     @staticmethod
     def estimate_prompt_len_from_additional_information(
-        additional_information: Optional[dict[str, Any]],
+        additional_information: dict[str, Any] | None,
         *,
         task_type: str,
         tokenize_prompt: Callable[[str], list[int]],
-        codec_language_id: Optional[Mapping[str, int]],
-        spk_is_dialect: Optional[Mapping[str, object]] = None,
+        codec_language_id: Mapping[str, int] | None,
+        spk_is_dialect: Mapping[str, object] | None = None,
     ) -> int:
         """Compute the Stage-0 placeholder ``prompt_token_ids`` length.
 
@@ -1180,10 +1119,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
             :meth:`_build_prompt_embeds` will produce for this request.
         """
         if task_type != "CustomVoice":
-            raise ValueError(
-                f"Qwen3-TTS NV talker only supports task_type='CustomVoice', "
-                f"got {task_type!r}."
-            )
+            raise ValueError(f"Qwen3-TTS NV talker only supports task_type='CustomVoice', got {task_type!r}.")
 
         def _first(x: object, default: object) -> object:
             if isinstance(x, list):
@@ -1197,8 +1133,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
 
         if not isinstance(text, str) or not text:
             raise ValueError(
-                "estimate_prompt_len_from_additional_information requires "
-                "non-empty additional_information['text']."
+                "estimate_prompt_len_from_additional_information requires non-empty additional_information['text']."
             )
         if not isinstance(speaker, str) or not speaker:
             raise ValueError(
@@ -1210,7 +1145,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
 
         lang_map: Mapping[str, int] = codec_language_id or {}
         dialect_map: Mapping[str, object] = spk_is_dialect or {}
-        language_id: Optional[int] = None
+        language_id: int | None = None
         if language.lower() != "auto":
             language_id = lang_map.get(language.lower())
         if language_id is None and language.lower() in ("auto", "chinese"):
@@ -1222,17 +1157,9 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
         # Mirrors _build_prompt_embeds: role (3) + codec_prefix
         # (codec_input_len - 1) + (text_body_len = assistant_len - 8 + 1)
         # + tail (1) = prefill_len + assistant_len - 1.
-        assistant_len = len(
-            tokenize_prompt(
-                Qwen3TTSTalkerForConditionalGenerationNv._build_assistant_text(
-                    text
-                )
-            )
-        )
+        assistant_len = len(tokenize_prompt(Qwen3TTSTalkerForConditionalGenerationNv._build_assistant_text(text)))
         if assistant_len < 8:
-            raise ValueError(
-                f"Unexpected assistant prompt length: {assistant_len}"
-            )
+            raise ValueError(f"Unexpected assistant prompt length: {assistant_len}")
         return prefill_len + assistant_len - 1
 
     def _build_prompt_embeds(
@@ -1240,7 +1167,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
         *,
         text: str,
         speaker: str,
-        language: Optional[str],
+        language: str | None,
     ) -> torch.Tensor:
         """Build the full prefill embedding sequence for CustomVoice + non-streaming.
 
@@ -1275,22 +1202,18 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
             device=device,
             dtype=torch.long,
         )
-        tts_bos_embed, tts_eos_embed, tts_pad_embed = self.text_projection(
-            self.text_embedding(tts_tokens)
-        ).chunk(3, dim=1)
+        tts_bos_embed, tts_eos_embed, tts_pad_embed = self.text_projection(self.text_embedding(tts_tokens)).chunk(
+            3, dim=1
+        )
 
         # Codec control prefix: choose with/without language_id.
-        language_id: Optional[int] = None
+        language_id: int | None = None
         lang_map = getattr(tc, "codec_language_id", None) or {}
         if isinstance(language, str) and language.lower() != "auto":
             language_id = lang_map.get(language.lower())
         # Dialect fallback (official behavior): if Chinese/Auto + speaker is a
         # known dialect voice, promote language_id to that dialect.
-        if (
-            language_id is None
-            and isinstance(language, str)
-            and language.lower() in ("auto", "chinese")
-        ):
+        if language_id is None and isinstance(language, str) and language.lower() in ("auto", "chinese"):
             spk_is_dialect = getattr(tc, "spk_is_dialect", None) or {}
             dialect = spk_is_dialect.get(speaker_key)
             if isinstance(dialect, str) and dialect:
@@ -1321,25 +1244,16 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
             )
         )
 
-        spk_map = {
-            k.lower(): v for k, v in (getattr(tc, "spk_id", None) or {}).items()
-        }
+        spk_map = {k.lower(): v for k, v in (getattr(tc, "spk_id", None) or {}).items()}
         if speaker_key not in spk_map:
-            raise ValueError(
-                f"Unsupported CustomVoice speaker: {speaker!r} "
-                f"(known: {sorted(spk_map) or '<none>'})"
-            )
+            raise ValueError(f"Unsupported CustomVoice speaker: {speaker!r} (known: {sorted(spk_map) or '<none>'})")
         speaker_embed = self.code_predictor.codec_embedding(
             torch.tensor([[spk_map[speaker_key]]], device=device, dtype=torch.long)
         )
 
-        codec_input = torch.cat(
-            [codec_input_0, speaker_embed, codec_input_1], dim=1
-        )
+        codec_input = torch.cat([codec_input_0, speaker_embed, codec_input_1], dim=1)
 
-        role_embed = self.text_projection(
-            self.text_embedding(input_ids[:, :3])
-        )
+        role_embed = self.text_projection(self.text_embedding(input_ids[:, :3]))
         codec_prefix = torch.cat(
             (
                 tts_pad_embed.expand(-1, codec_input.shape[1] - 2, -1),
@@ -1351,9 +1265,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
         talker_prompt = torch.cat((role_embed, codec_prefix), dim=1)
 
         # Non-streaming: full synth text in prefill + (tts_pad, codec_bos) tail.
-        text_all = self.text_projection(
-            self.text_embedding(input_ids[:, 3:-5])
-        )
+        text_all = self.text_projection(self.text_embedding(input_ids[:, 3:-5]))
         text_all = torch.cat([text_all, tts_eos_embed], dim=1)
         pad_ids = torch.full(
             (1, int(text_all.shape[1])),
@@ -1361,15 +1273,12 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
             device=device,
             dtype=torch.long,
         )
-        tail_codec_bos = torch.tensor(
-            [[tc.codec_bos_id]], device=device, dtype=torch.long
-        )
+        tail_codec_bos = torch.tensor([[tc.codec_bos_id]], device=device, dtype=torch.long)
         talker_prompt = torch.cat(
             [
                 talker_prompt,
                 text_all + self.code_predictor.codec_embedding(pad_ids),
-                tts_pad_embed
-                + self.code_predictor.codec_embedding(tail_codec_bos),
+                tts_pad_embed + self.code_predictor.codec_embedding(tail_codec_bos),
             ],
             dim=1,
         )
@@ -1379,7 +1288,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
     def preprocess(
         self,
         input_ids: torch.Tensor,
-        input_embeds: Optional[torch.Tensor],
+        input_embeds: torch.Tensor | None,
         *,
         start: int = 0,
         end: int = 0,
@@ -1428,20 +1337,14 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
         # under ``additional_information`` instead of flattened.
         nested = info_dict.get("additional_information")
         if isinstance(nested, dict):
-            merged = {
-                k: v for k, v in info_dict.items() if k != "additional_information"
-            }
+            merged = {k: v for k, v in info_dict.items() if k != "additional_information"}
             for k, v in nested.items():
                 merged.setdefault(k, v)
             info_dict = merged
 
         span_len = int(input_ids.shape[0])
         if span_len <= 0:
-            base = (
-                input_embeds
-                if input_embeds is not None
-                else self.embed_input_ids(input_ids)
-            )
+            base = input_embeds if input_embeds is not None else self.embed_input_ids(input_ids)
             return input_ids, base, {}
 
         tc = self.config
@@ -1451,27 +1354,18 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
         if span_len > 1:
             text = self._first_str(info_dict.get("text"))
             if not text:
-                raise ValueError(
-                    "Qwen3-TTS NV talker.preprocess requires "
-                    "additional_information.text for prefill."
-                )
+                raise ValueError("Qwen3-TTS NV talker.preprocess requires additional_information.text for prefill.")
             speaker = self._first_str(info_dict.get("speaker"))
             if not speaker:
                 raise ValueError(
-                    "Qwen3-TTS NV talker.preprocess requires "
-                    "additional_information.speaker (CustomVoice only)."
+                    "Qwen3-TTS NV talker.preprocess requires additional_information.speaker (CustomVoice only)."
                 )
             language = self._first_str(info_dict.get("language")) or "Auto"
 
             prompt_embeds_cpu = info_dict.get("talker_prompt_embeds")
-            is_first = (
-                not isinstance(prompt_embeds_cpu, torch.Tensor)
-                or prompt_embeds_cpu.ndim != 2
-            )
+            is_first = not isinstance(prompt_embeds_cpu, torch.Tensor) or prompt_embeds_cpu.ndim != 2
             if is_first:
-                full = self._build_prompt_embeds(
-                    text=text, speaker=speaker, language=language
-                )
+                full = self._build_prompt_embeds(text=text, speaker=speaker, language=language)
                 prompt_embeds_cpu = full.detach().to("cpu").contiguous()
                 offset = 0
                 info_update: dict[str, Any] = {
@@ -1524,25 +1418,19 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
         # runs after every forward, including prefill).
         last_hidden = info_dict.get("last_talker_hidden")
         if isinstance(last_hidden, torch.Tensor) and last_hidden.numel() > 0:
-            prev_h = last_hidden.to(
-                device=device, dtype=self._prev_hidden_buffer.dtype
-            ).reshape(1, -1)
+            prev_h = last_hidden.to(device=device, dtype=self._prev_hidden_buffer.dtype).reshape(1, -1)
             self._prev_hidden_buffer[start : start + 1].copy_(prev_h)
 
         return input_ids, inputs_embeds_out, {}
 
-    def postprocess(
-        self, hidden_states: torch.Tensor, **_: Any
-    ) -> dict[str, Any]:
+    def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
         """Stash the last backbone hidden as ``last_talker_hidden`` for the next step."""
         if hidden_states.numel() == 0:
             return {}
         last = hidden_states[-1, :].detach()
         return {"last_talker_hidden": last}
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights directly from a raw HuggingFace Qwen3-TTS checkpoint.
 
         No offline conversion is required: this method renames the
@@ -1559,16 +1447,12 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
           on top of ``codec_emb(group0)`` at every decode step.
         """
         # Filter to talker weights only (skip speaker_encoder.* etc).
-        talker_weights = (
-            (name, w) for name, w in weights if name.startswith("talker.")
-        )
+        talker_weights = ((name, w) for name, w in weights if name.startswith("talker."))
 
         # ``suppress_mask`` is a Parameter we initialise ourselves below;
         # if a converted checkpoint happens to carry one, ignore it.
         loader = AutoWeightsLoader(self, skip_prefixes=["suppress_mask"])
-        loaded = loader.load_weights(
-            talker_weights, mapper=self.hf_to_vllm_mapper
-        )
+        loaded = loader.load_weights(talker_weights, mapper=self.hf_to_vllm_mapper)
 
         self._init_runtime_buffers()
 
@@ -1612,9 +1496,7 @@ class Qwen3TTSTalkerForConditionalGenerationNv(nn.Module):
         # remain reachable as an end-of-stream signal.
         vocab_size = int(tc.vocab_size)
         codec_eos = int(getattr(tc, "codec_eos_token_id", -1))
-        mask = torch.zeros(
-            vocab_size, dtype=torch.bool, device=self.suppress_mask.device
-        )
+        mask = torch.zeros(vocab_size, dtype=torch.bool, device=self.suppress_mask.device)
         suppress_start = vocab_size - 1024
         if suppress_start > 0:
             mask[suppress_start:] = True
