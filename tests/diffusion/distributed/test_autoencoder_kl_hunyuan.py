@@ -37,6 +37,7 @@ class _DummyDistributedAutoencoderKLHunyuan(DistributedAutoencoderKLHunyuan):
 
 
 def test_hunyuan_vae_use_tiling_aliases_spatial_tiling():
+    # Verify use_tiling property maps to use_spatial_tiling.
     vae = _DummyDistributedAutoencoderKLHunyuan()
 
     assert not vae.use_tiling
@@ -47,6 +48,7 @@ def test_hunyuan_vae_use_tiling_aliases_spatial_tiling():
 
 
 def test_hunyuan_vae_decode_tiles_round_trip():
+    # Validate decode tile split/exec/merge returns expected reconstructed tensor.
     vae = _DummyDistributedAutoencoderKLHunyuan()
     z = torch.arange(16, dtype=torch.float32).reshape(1, 1, 1, 4, 4)
 
@@ -62,6 +64,7 @@ def test_hunyuan_vae_decode_tiles_round_trip():
 
 
 def test_hunyuan_vae_encode_tiles_round_trip():
+    # Validate encode tile split/exec/merge returns expected latent tensor.
     vae = _DummyDistributedAutoencoderKLHunyuan()
     x = torch.arange(16, dtype=torch.float32).reshape(1, 1, 1, 4, 4)
 
