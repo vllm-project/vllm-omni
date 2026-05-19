@@ -132,9 +132,9 @@ def test_save_async(build_adapter):
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
 
     adapter.custom_process_next_stage_input_func = lambda **kwargs: {"x": [1], "finished": False}
-    adapter.save_async(pooling_output=None, request=request)
+    adapter.save_async(multimodal_output=None, request=request)
     adapter.custom_process_next_stage_input_func = lambda **kwargs: {}
-    adapter.save_async(pooling_output=None, request=request)
+    adapter.save_async(multimodal_output=None, request=request)
 
     task = adapter._pending_save_reqs.popleft()
     assert task["is_finished"] is False
@@ -191,7 +191,7 @@ def test_send_single_request_cleans_up_after_finished_payload(build_adapter, mon
     cleanup_calls = []
     monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: cleanup_calls.append((a, kw)))
 
-    adapter._send_single_request({"pooling_output": None, "request": request, "is_finished": True})
+    adapter._send_single_request({"multimodal_output": None, "request": request, "is_finished": True})
 
     assert len(cleanup_calls) == 1
     args, _ = cleanup_calls[0]

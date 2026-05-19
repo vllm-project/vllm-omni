@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import psutil
+import vllm.v1.engine as _vllm_engine_module
+import vllm.v1.engine.core_client as _vllm_core_client_module
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.core_client import AsyncMPClient, DPLBAsyncMPClient
@@ -24,6 +26,7 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
     KV_TRANSFER_PORT_OFFSET,
 )
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import kv_zmq_port
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 
@@ -167,6 +170,19 @@ class StageEngineCoreClientBase(StageClientBase):
             self.stage_id,
             self.replica_id,
         )
+
+        # Patch the output decoder type so the client decodes
+        # OmniEngineCoreOutputs (which carries multimodal_output per
+        # EngineCoreOutput) instead of the base EngineCoreOutputs.
+        # Must happen BEFORE super().__init__() which creates the decoder.
+        _vllm_engine_module.EngineCoreOutput = OmniEngineCoreOutput
+        _vllm_engine_module.EngineCoreOutputs = OmniEngineCoreOutputs
+        _vllm_core_client_module.EngineCoreOutputs = OmniEngineCoreOutputs
+        logger.debug(
+            "[StageEngineCoreClient] Patched EngineCoreOutputs -> %s",
+            _vllm_core_client_module.EngineCoreOutputs,
+        )
+
         try:
             super().__init__(
                 vllm_config,

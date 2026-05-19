@@ -1,5 +1,6 @@
 """Stage input processor for Fish Speech S2 Pro: Slow AR → DAC Decoder."""
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -14,9 +15,9 @@ from vllm_omni.data_entry_keys import (
 logger = init_logger(__name__)
 
 
-def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
-    """Extract the last frame of audio codes from the pooling output."""
-    audio_codes = pooling_output.get("audio_codes")
+def _extract_last_frame(multimodal_output: dict[str, Any]) -> torch.Tensor | None:
+    """Extract the last frame of audio codes from the multimodal output."""
+    audio_codes = multimodal_output.get("audio_codes")
     if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
         return None
     if audio_codes.ndim == 2:
@@ -62,7 +63,7 @@ def slow_ar_to_dac_decoder(
 
 def slow_ar_to_dac_decoder_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any] | None,
+    multimodal_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
@@ -75,8 +76,8 @@ def slow_ar_to_dac_decoder_async_chunk(
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
 
-    if isinstance(pooling_output, dict):
-        frame = _extract_last_frame(pooling_output)
+    if isinstance(multimodal_output, Mapping):
+        frame = _extract_last_frame(multimodal_output)
         if frame is not None:
             transfer_manager.code_prompt_token_ids[request_id].append(frame.detach().to(device="cpu", dtype=torch.long))
     elif not finished:

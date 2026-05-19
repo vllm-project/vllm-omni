@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, cast
@@ -447,7 +448,7 @@ class OmniOpenAIServingVideo:
     def _resolve_fps(result: Any) -> int | None:
         """Extract fps from multimodal_output if the model reported it."""
         multimodal_output = getattr(result, "multimodal_output", None)
-        if isinstance(multimodal_output, dict):
+        if isinstance(multimodal_output, Mapping):
             fps = multimodal_output.get("fps")
             if fps is not None:
                 try:
@@ -460,7 +461,7 @@ class OmniOpenAIServingVideo:
         request_output = getattr(result, "request_output", None)
         if isinstance(request_output, dict):
             mm = request_output.get("multimodal_output") or {}
-            if isinstance(mm, dict):
+            if isinstance(mm, Mapping):
                 fps = mm.get("fps")
                 if fps is not None:
                     try:
@@ -471,7 +472,7 @@ class OmniOpenAIServingVideo:
                         pass
         elif hasattr(request_output, "multimodal_output"):
             mm = getattr(request_output, "multimodal_output", None)
-            if isinstance(mm, dict):
+            if isinstance(mm, Mapping):
                 fps = mm.get("fps")
                 if fps is not None:
                     try:
@@ -486,7 +487,7 @@ class OmniOpenAIServingVideo:
     @classmethod
     def _extract_audio_sample_rate_from_result(cls, result: Any) -> int | None:
         multimodal_output = getattr(result, "multimodal_output", None)
-        if isinstance(multimodal_output, dict):
+        if isinstance(multimodal_output, Mapping):
             sample_rate = cls._coerce_audio_sample_rate(
                 multimodal_output.get("audio_sample_rate")
                 or multimodal_output.get("sample_rate")
@@ -499,7 +500,7 @@ class OmniOpenAIServingVideo:
         request_output = getattr(result, "request_output", None)
         if isinstance(request_output, dict):
             multimodal_output = request_output.get("multimodal_output") or {}
-            if isinstance(multimodal_output, dict):
+            if isinstance(multimodal_output, Mapping):
                 return cls._coerce_audio_sample_rate(
                     multimodal_output.get("audio_sample_rate")
                     or multimodal_output.get("sample_rate")
@@ -508,7 +509,7 @@ class OmniOpenAIServingVideo:
                 )
         elif hasattr(request_output, "multimodal_output"):
             multimodal_output = getattr(request_output, "multimodal_output", None)
-            if isinstance(multimodal_output, dict):
+            if isinstance(multimodal_output, Mapping):
                 return cls._coerce_audio_sample_rate(
                     multimodal_output.get("audio_sample_rate")
                     or multimodal_output.get("sample_rate")

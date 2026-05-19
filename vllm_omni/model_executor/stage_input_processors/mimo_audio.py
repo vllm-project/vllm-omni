@@ -123,12 +123,12 @@ def _to_code_tensor(codes: Any) -> torch.Tensor | None:
 
 def llm2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: OmniPayload,
+    multimodal_output: OmniPayload | dict[str, Any],
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
     """
-    Async chunk version: convert stage-0 pooling_output to code2wav payload (pooling / connector accumulation).
+    Async chunk version: convert stage-0 multimodal_output to code2wav payload (pooling / connector accumulation).
 
     Accumulates codes in connector per request_id,
     returns payload only when chunk_size is full or request is finished; returns None when waiting.
@@ -141,7 +141,7 @@ def llm2code2wav_async_chunk(
 
     request_id = getattr(request, "external_req_id", None)
 
-    po_codes = pooling_output.get("codes", {})
+    po_codes = multimodal_output.get("codes", {})
     if "audio" not in po_codes:
         if is_finished:
             return _flush_remaining_codes(transfer_manager, request_id, chunk_size, left_context_size)

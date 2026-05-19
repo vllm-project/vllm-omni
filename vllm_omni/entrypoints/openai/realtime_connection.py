@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import cast
 from uuid import uuid4
 
@@ -82,7 +82,10 @@ class RealtimeConnection(VllmRealtimeConnection):
 
     def _extract_audio_chunks(self, output) -> tuple[list[np.ndarray], int]:
         mm = getattr(output, "multimodal_output", None)
-        if not isinstance(mm, dict):
+        if mm is None:
+            return [], 24000
+        # Support both MultimodalPayload and plain dict
+        if not isinstance(mm, Mapping):
             return [], 24000
 
         sr = mm.get("sr") or mm.get("sample_rate") or mm.get("audio_sample_rate") or 24000

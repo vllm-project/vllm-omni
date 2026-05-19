@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -55,7 +56,7 @@ def latent2vae(
     for source_output in source_outputs:
         output = source_output.outputs[0]
         multimodal_output = getattr(output, "multimodal_output", None)
-        if not isinstance(multimodal_output, dict) or "latent_audio_feat" not in multimodal_output:
+        if not isinstance(multimodal_output, Mapping) or "latent_audio_feat" not in multimodal_output:
             raise ValueError(
                 "VoxCPM latent stage output missing 'latent_audio_feat'. "
                 f"request_id={getattr(source_output, 'request_id', None)}"
@@ -88,7 +89,7 @@ def _eof_payload() -> OmniPayloadStruct:
 
 def latent2vae_async_chunk(
     transfer_manager: Any,
-    pooling_output: dict[str, Any] | None,
+    multimodal_output: dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
@@ -98,10 +99,10 @@ def latent2vae_async_chunk(
     finished_request = _coerce_finished_flag(is_finished)
     if callable(getattr(request, "is_finished", None)):
         finished_request = finished_request or _coerce_finished_flag(request.is_finished())
-    if not isinstance(pooling_output, dict):
+    if not isinstance(multimodal_output, Mapping):
         return _eof_payload() if finished_request else None
 
-    latent = pooling_output.get("latent_audio_feat")
+    latent = multimodal_output.get("latent_audio_feat")
     if isinstance(latent, torch.Tensor) and latent.numel() == 0:
         latent = None
 

@@ -6,6 +6,7 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -49,6 +50,39 @@ from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
+
+
+def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:
+    """Convert a flattened payload to strictly ``dict[str, torch.Tensor]``.
+
+    Non-tensor scalars (int, float) are wrapped with ``torch.tensor()``.
+    Values that cannot be safely converted are dropped with a warning.
+    This enforces the tensor-only invariant required by the
+    ``OmniEngineCoreOutput.multimodal_output`` wire field and msgspec
+    serialization.
+    """
+    result: dict[str, torch.Tensor] = {}
+    for key, val in payload.items():
+        if isinstance(val, torch.Tensor):
+            result[key] = val
+        elif isinstance(val, (int, float, bool)):
+            result[key] = torch.tensor(val)
+        elif isinstance(val, (list, tuple)):
+            try:
+                result[key] = torch.tensor(val)
+            except (ValueError, TypeError, RuntimeError):
+                logger.warning(
+                    "Dropping non-tensorizable multimodal output key '%s' (type=%s) from wire payload.",
+                    key,
+                    type(val).__name__,
+                )
+        else:
+            logger.warning(
+                "Dropping non-tensor multimodal output key '%s' (type=%s) from wire payload.",
+                key,
+                type(val).__name__,
+            )
+    return result
 
 
 class ExecuteModelState(NamedTuple):
@@ -266,7 +300,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
             # If this happens, it generally means the model is not following the correct
             # interface yet and is therefore currently not compatible with prefix cache.
-            if multimodal_outputs is not None and not isinstance(multimodal_outputs, dict):
+            if multimodal_outputs is not None and not isinstance(multimodal_outputs, Mapping):
                 logger.warning_once(
                     "prefix caching expects mm outputs to be a dict, but got %s",
                     type(multimodal_outputs),
@@ -751,6 +785,66 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # Prefix caching is disabled
         return hidden_states_cpu[start:end]
 
+    def _build_multimodal_outputs(
+        self,
+        req_ids: list[str],
+        req_id_to_index: dict[str, int],
+        hidden_states_cpu: torch.Tensor,
+        num_scheduled_tokens_np: np.ndarray,
+        combined_hidden_states: dict[str, torch.Tensor] | None,
+        combined_multimodal_outputs: dict[str, dict[str, object]] | None,
+        mm_cpu: dict[str, object],
+        seq_len: int,
+    ) -> list[dict[str, object]] | None:
+        """Build per-request multimodal output payloads (dedicated channel)."""
+        if self.vllm_config.model_config.engine_output_type == "text":
+            return None
+
+        results: list[dict[str, object]] = []
+        for rid in req_ids:
+            idx = req_id_to_index[rid]
+            start = int(self.query_start_loc.cpu[idx])
+            sched = int(num_scheduled_tokens_np[idx])
+            end = start + sched
+
+            req_hidden_states = self._resolve_req_hidden_states(
+                hidden_states_cpu,
+                combined_hidden_states,
+                rid,
+                start,
+                end,
+            )
+            payload: dict[str, object] = {"hidden": req_hidden_states}
+
+            mm_payload: dict[str, object] = {}
+            if combined_multimodal_outputs or mm_cpu:
+                if combined_multimodal_outputs:
+                    for mm_key in combined_multimodal_outputs.keys():
+                        value = combined_multimodal_outputs[mm_key][rid]
+                        if isinstance(value, list):
+                            mm_payload[mm_key] = value[idx] if idx < len(value) else value[0]
+                        else:
+                            mm_payload[mm_key] = value
+                else:
+                    for mm_key, mm_val in mm_cpu.items():
+                        mm_payload[mm_key] = to_payload_element(
+                            element=mm_val,
+                            idx=idx,
+                            start=start,
+                            end=end,
+                            pass_lists_through=False,
+                            seq_len=seq_len,
+                        )
+                payload.update(mm_payload)
+            # Flatten nested dicts to dotted keys so multimodal_outputs
+            # stays dict[str, torch.Tensor] for msgspec serialization.
+            flat = flatten_payload(payload)
+            # Enforce tensor-only invariant on the wire: wrap scalars/lists
+            # into tensors so msgspec can reconstruct them, and drop
+            # anything that cannot be safely converted.
+            results.append(_ensure_tensor_values(flat))
+        return results
+
     @torch.inference_mode()
     def sample_tokens(
         self,
@@ -932,6 +1026,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
         query_start_loc_cpu = self.query_start_loc.cpu
 
+        # NOTE: pooler_output here is used only for the full-payload accumulation
+        # path (accumulate_full_payload_output) and is NOT passed on the wire via
+        # OmniModelRunnerOutput.pooler_output (which is set to None below).
+        # The actual multimodal wire transport uses multimodal_outputs instead.
         pooler_output: list[dict[str, object]] | None = None
         if needs_pooler_payload:
             # Prior to applying the post-processing func, extract
@@ -977,7 +1075,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 sched = int(num_scheduled_tokens_np[idx])
                 end = start + sched
                 # If prefix cache is enabled, we have already split everything
-                # by request and converted the states to CPU tensors
+                # by request and converted the states to CPU tensors.
                 if req_hidden_states_cpu is not None and combined_hidden_states is None:
                     req_hidden_states = req_hidden_states_cpu[rid]
                 else:
@@ -993,14 +1091,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 mm_payload: dict[str, object] = {}
                 if combined_multimodal_outputs or mm_cpu:
                     if combined_multimodal_outputs:
-                        # Prefix cache enabled; all items have already been processed
-                        # and split apart for each request as needed, and all tensors
-                        # have already been detached to the CPU.  Lists are kept as
-                        # passthrough data for consistent behavior in postprocess.
-                        # Recurse into nested dicts so list-valued sub-keys (e.g.
-                        # embed.tts_bos = [tensor]) are unwrapped to bare tensors
-                        # at the leaves; downstream flatten_payload then yields a
-                        # wire-clean dict[str, torch.Tensor].
+
                         def _unwrap_lists(v):
                             if isinstance(v, list):
                                 return v[idx] if idx < len(v) else v[0]
@@ -1010,9 +1101,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
                         for mm_key in combined_multimodal_outputs.keys():
                             mm_payload[mm_key] = _unwrap_lists(combined_multimodal_outputs[mm_key][rid])
-
                     else:
-                        # Prefix cache disabled; we still need to process the data
                         for mm_key, mm_val in mm_cpu.items():
                             mm_payload[mm_key] = to_payload_element(
                                 element=mm_val,
@@ -1023,8 +1112,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                                 seq_len=seq_len,
                             )
                     payload.update(mm_payload)
-                # Flatten nested dicts to dotted keys so pooling_output
-                # stays dict[str, torch.Tensor] for msgspec serialization.
                 pooler_output.append(flatten_payload(payload))
 
         if pooler_output and self._should_accumulate_full_payload_output():
@@ -1033,6 +1120,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 if req_state is not None and pooler_output[i]:
                     self.accumulate_full_payload_output(rid, pooler_output[i], req_state)
 
+        multimodal_outputs = self._build_multimodal_outputs(
+            req_ids=req_ids_output_copy,
+            req_id_to_index=req_id_to_index_output_copy,
+            hidden_states_cpu=hidden_states_cpu,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+            combined_hidden_states=combined_hidden_states,
+            combined_multimodal_outputs=combined_multimodal_outputs,
+            mm_cpu=mm_cpu,
+            seq_len=seq_len,
+        )
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             routed_experts_dict = None
             if self.routed_experts_initialized:
@@ -1049,7 +1146,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
-                pooler_output=(pooler_output if engine_output_type != "text" and needs_pooler_payload else None),
+                pooler_output=None,
+                multimodal_outputs=multimodal_outputs,
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
                 num_nans_in_logits=num_nans_in_logits,

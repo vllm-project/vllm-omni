@@ -3,7 +3,7 @@
 
 import importlib
 from collections import defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
@@ -106,7 +106,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     def save_async(
         self,
-        pooling_output: torch.Tensor | None = None,
+        multimodal_output: dict[str, Any] | None = None,
         request: Request | None = None,
     ):
         """Build and enqueue one chunk for asynchronous sending.
@@ -115,7 +115,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         background save_loop thread.
 
         Args:
-            pooling_output: Partial pooling output dictionary
+            multimodal_output: Per-request multimodal output dictionary
             request: Request object
         """
 
@@ -130,7 +130,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         self.requests_num_chunks_sent[request.external_req_id] = request.num_computed_tokens
         task = {
-            "pooling_output": pooling_output,
+            "multimodal_output": multimodal_output,
             "request": request,
             "is_finished": request.is_finished(),
         }
@@ -210,8 +210,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return False
 
     def _send_single_request(self, task: dict):
-        raw_po = task["pooling_output"]
-        pooling_output = unflatten_payload(raw_po) if isinstance(raw_po, dict) else raw_po
+        raw_mm = task["multimodal_output"]
+        multimodal_output = unflatten_payload(raw_mm) if isinstance(raw_mm, Mapping) else raw_mm
         request = task["request"]
         is_finished = task["is_finished"]
         stage_id = self.connector.stage_id
@@ -225,7 +225,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             try:
                 payload_data = self.custom_process_next_stage_input_func(
                     transfer_manager=self,
-                    pooling_output=pooling_output,
+                    multimodal_output=multimodal_output,
                     request=request,
                     is_finished=is_finished,
                 )

@@ -51,7 +51,7 @@ def test_latent2vae_async_chunk_serializes_latent_payload():
 
     payload = latent2vae_async_chunk(
         transfer_manager=None,
-        pooling_output={"latent_audio_feat": latent},
+        multimodal_output={"latent_audio_feat": latent},
         request=_request(finished=False),
         is_finished=torch.tensor(False),
     )
@@ -65,7 +65,7 @@ def test_latent2vae_async_chunk_serializes_latent_payload():
 def test_latent2vae_async_chunk_returns_terminal_marker_without_latent():
     payload = latent2vae_async_chunk(
         transfer_manager=None,
-        pooling_output=None,
+        multimodal_output=None,
         request=_request(finished=[torch.tensor(True)]),
         is_finished=False,
     )
@@ -77,7 +77,7 @@ def test_latent2vae_async_chunk_returns_terminal_marker_without_latent():
 def test_latent2vae_async_chunk_returns_none_for_nonterminal_empty_chunk():
     payload = latent2vae_async_chunk(
         transfer_manager=None,
-        pooling_output={"latent_audio_feat": torch.zeros((0,), dtype=torch.float32)},
+        multimodal_output={"latent_audio_feat": torch.zeros((0,), dtype=torch.float32)},
         request=_request(finished=False),
         is_finished=False,
     )
