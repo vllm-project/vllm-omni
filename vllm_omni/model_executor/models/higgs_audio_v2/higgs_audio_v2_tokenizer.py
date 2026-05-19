@@ -106,12 +106,10 @@ def build_plain_text_conversation(text: str) -> list[dict[str, Any]]:
     vLLM attention-backend NaN was unblocked (R14 / FLEX_ATTENTION).
     """
     validate_plain_text_input(text)
-    system_prompt = (
-        "Generate audio following instruction.\n\n"
-        "<|scene_desc_start|>\n"
-        "SPEAKER0: british accent\n"
-        "<|scene_desc_end|>"
-    )
+    # R25: match HF reference fixture's bare system prompt (no scene_desc).
+    # R15's scene_desc block diverged the prefill state from HF reference,
+    # collapsing decode#1 codebook-0 logits to audio_stream_eos (1025).
+    system_prompt = "Generate audio following instruction."
     return [
         {
             "role": "system",

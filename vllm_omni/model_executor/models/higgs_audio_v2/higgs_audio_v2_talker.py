@@ -1411,6 +1411,15 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         bos_local = int(self.config.audio_stream_bos_id)
         seeded_rows: list[int] = []
         seeded_frame: torch.Tensor | None = None
+        # R25: experimental — disable the R13 "skip-first-audio-at-bos" path.
+        # Upstream HF likely samples the first audio frame from the audio_bos
+        # position's hidden state directly; our skip+seed-all-BOS chain feeds
+        # the wrong hidden one step later (where the model fires audio_stream_eos
+        # at codebook 0 with high confidence). Setting first_after_bos to None
+        # makes the audio sampler treat the first audio_token_id row normally.
+        import os as _os_r25
+        if _os_r25.environ.get("HIGGS_R25_NO_SKIP"):
+            first_after_bos = None
         if isinstance(first_after_bos, torch.Tensor) and first_after_bos.numel() == is_audio.shape[0]:
             first_after_bos = first_after_bos.to(is_audio.device)
             skip_rows = first_after_bos & is_audio
