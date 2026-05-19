@@ -19,11 +19,36 @@ import logging
 import multiprocessing
 import multiprocessing.connection
 import os
+import signal
 import weakref
+from typing import Any
 
 from vllm.utils.network_utils import get_open_ports_list
 
+from vllm_omni.distributed.omni_coordinator.omni_coordinator import OmniCoordinator
+
 logger = logging.getLogger(__name__)
+
+
+def run_omni_coordinator_proc(
+    router_zmq_addr: str,
+    pub_zmq_addr: str,
+    heartbeat_timeout: float,
+    ready_pipe: Any,
+) -> None:
+    """Main loop running inside the coordinator child process."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    coordinator = OmniCoordinator(
+        router_zmq_addr=router_zmq_addr,
+        pub_zmq_addr=pub_zmq_addr,
+        heartbeat_timeout=heartbeat_timeout,
+    )
+
+    ready_pipe.send("ready")
+    ready_pipe.close()
+
+    coordinator.wait_for_shutdown()
 
 
 def _get_coordinator_mp_context() -> multiprocessing.context.BaseContext:
@@ -80,8 +105,6 @@ class OmniCoordinatorRuntime:
 
         ctx = _get_coordinator_mp_context()
         parent_conn, child_conn = ctx.Pipe(duplex=False)
-
-        from .omni_coordinator_proc import run_omni_coordinator_proc
 
         self._proc: multiprocessing.Process = ctx.Process(
             target=run_omni_coordinator_proc,

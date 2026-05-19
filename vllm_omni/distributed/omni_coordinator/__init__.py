@@ -9,7 +9,7 @@ from .load_balancer import (
     RoundRobinBalancer,
     Task,
 )
-from .messages import ReplicaEvent, ReplicaInfo, ReplicaList, ReplicaStatus, StageStatus
+from .messages import ReplicaEvent, ReplicaInfo, ReplicaList, ReplicaStatus
 from .omni_coord_client_for_hub import OmniCoordClientForHub
 from .omni_coord_client_for_stage import (
     OmniCoordClientForStage,
@@ -21,7 +21,6 @@ from .runtime import OmniCoordinatorRuntime
 __all__ = [
     "OmniCoordinator",
     "OmniCoordinatorRuntime",
-    "StageStatus",
     "ReplicaStatus",
     "ReplicaEvent",
     "ReplicaInfo",

@@ -11,7 +11,7 @@ from dataclasses import asdict
 
 import zmq
 
-from .messages import ReplicaEvent, StageStatus
+from .messages import ReplicaEvent, ReplicaStatus
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ class OmniCoordClientForStage:
             self._socket.close()
             raise RuntimeError(f"Failed to connect to coordinator at {self._coord_zmq_addr}: {e}") from e
 
-        self._status = StageStatus.UP
+        self._status = ReplicaStatus.UP
         self._queue_length = 0
         self._closed = False
         self._closing = False
@@ -156,7 +156,7 @@ class OmniCoordClientForStage:
 
     def update_info(
         self,
-        status: StageStatus | None = None,
+        status: ReplicaStatus | None = None,
         queue_length: int | None = None,
     ) -> None:
         """Update replica information and notify OmniCoordinator.
@@ -217,7 +217,7 @@ class OmniCoordClientForStage:
             self._closing = True
 
             # Mark status as DOWN and send one last update.
-            self._status = StageStatus.DOWN
+            self._status = ReplicaStatus.DOWN
             try:
                 self._send_event("update")
             except (RuntimeError, zmq.ZMQError):

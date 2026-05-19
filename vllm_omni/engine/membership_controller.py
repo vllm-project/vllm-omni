@@ -20,7 +20,7 @@ from vllm.logger import init_logger
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
 )
-from vllm_omni.distributed.omni_coordinator.messages import StageStatus
+from vllm_omni.distributed.omni_coordinator.messages import ReplicaStatus
 from vllm_omni.distributed.omni_coordinator.omni_coord_client_for_hub import OmniCoordClientForHub
 from vllm_omni.engine.messages import ErrorMessage, EngineQueueMessage
 from vllm_omni.engine.stage_pool import StagePool
@@ -138,7 +138,7 @@ class MembershipController:
                 current = {
                     (rep.stage_id, rep.input_addr)
                     for rep in snap.replicas
-                    if rep.status == StageStatus.UP
+                    if rep.status == ReplicaStatus.UP
                 }
                 for stage_id, addr in last_up - current:
                     self._spawn_task(

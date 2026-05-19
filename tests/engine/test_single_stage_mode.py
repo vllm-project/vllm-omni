@@ -1117,7 +1117,7 @@ class TestConnectRemoteEngineCoresCoordinator:
             yield mocker.Mock()
 
         mocker.patch("vllm_omni.engine.stage_engine_startup.zmq_socket_ctx", return_value=fake_socket_ctx())
-        mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup._wait_for_omni_engine_startup")
+        mock_wait = mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup")
         with connect_remote_engine_cores(
             vllm_config=vllm_config,
             omni_master_server=omni_master_server,
@@ -1150,7 +1150,7 @@ class TestConnectRemoteEngineCoresCoordinator:
             yield mocker.Mock()
 
         mocker.patch("vllm_omni.engine.stage_engine_startup.zmq_socket_ctx", return_value=fake_socket_ctx())
-        mocker.patch("vllm_omni.engine.stage_engine_startup._wait_for_omni_engine_startup")
+        mocker.patch("vllm_omni.engine.stage_engine_startup.wait_for_engine_startup")
         with connect_remote_engine_cores(
             vllm_config=vllm_config,
             omni_master_server=omni_master_server,

@@ -38,6 +38,7 @@ from vllm_omni.engine.messages import (
     ErrorMessage,
     OutputMessage,
     RegisterRemoteReplicaMessage,
+    ShutdownRequestMessage,
     StageMetricsMessage,
     StageSubmissionMessage,
     UnregisterRemoteReplicaMessage,
@@ -254,10 +255,10 @@ class Orchestrator:
             elif isinstance(msg, RegisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_register(msg.stage_id, msg.replica_id)
-            elif msg_type == "unregister_remote_replica":
+            elif isinstance(msg, UnregisterRemoteReplicaMessage):
                 if self._membership is not None:
                     await self._membership.handle_unregister(msg.stage_id, msg.input_addr)
-            elif msg_type == "shutdown":
+            elif isinstance(msg, ShutdownRequestMessage):
                 logger.info("[Orchestrator] Received shutdown signal")
                 self._shutdown_event.set()
                 # Pre-mark stage clients as shutting down to prevent

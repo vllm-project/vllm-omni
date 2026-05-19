@@ -28,9 +28,6 @@ from vllm.v1.executor import Executor
 
 logger = init_logger(__name__)
 
-# Backward-compatible alias for tests that patch the old private helper name.
-_wait_for_omni_engine_startup = wait_for_engine_startup
-
 StageRoute = tuple[int, int]
 
 # Sentinel that signals "auto-assign me a replica_id" on the wire. Negative
@@ -787,7 +784,7 @@ def connect_remote_engine_cores(
     with zmq_socket_ctx(handshake_bind_address, zmq.ROUTER, bind=True) as handshake_socket:
         yield None, coordinator, addresses, None
 
-        _wait_for_omni_engine_startup(
+        wait_for_engine_startup(
             handshake_socket,
             addresses,
             engines_to_handshake,
