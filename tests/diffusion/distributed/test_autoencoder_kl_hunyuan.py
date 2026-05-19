@@ -16,7 +16,7 @@ class _DummyDistributedAutoencoderKLHunyuan(DistributedAutoencoderKLHunyuan):
         torch.nn.Module.__init__(self)
         self.tile_latent_min_size = 2
         self.tile_sample_min_size = 2
-        self.tile_overlap_factor = 0.0
+        self.tile_overlap_factor = 0.25
         self.use_spatial_tiling = False
 
     @property

@@ -24,6 +24,12 @@ class DistributedAutoencoderKLHunyuan(AutoencoderKLConv3D, DistributedVaeMixin):
         model.init_distributed()
         return model
 
+    @classmethod
+    def from_pretrained(cls, *args: Any, **kwargs: Any):
+        model = super().from_pretrained(*args, **kwargs)
+        model.init_distributed()
+        return model
+
     @property
     def use_tiling(self) -> bool:
         return self.use_spatial_tiling
@@ -110,19 +116,7 @@ class DistributedAutoencoderKLHunyuan(AutoencoderKLConv3D, DistributedVaeMixin):
     def encode_tile_merge(
         self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec
     ) -> torch.Tensor:
-        grid_h, grid_w = grid_spec.grid_shape
-        result_rows = []
-        for i in range(grid_h):
-            result_row = []
-            for j in range(grid_w):
-                tile = coord_tensor_map[(i, j)]
-                if i > 0:
-                    tile = self.blend_v(coord_tensor_map[(i - 1, j)], tile, grid_spec.tile_spec["blend_extent"])
-                if j > 0:
-                    tile = self.blend_h(coord_tensor_map[(i, j - 1)], tile, grid_spec.tile_spec["blend_extent"])
-                result_row.append(tile[:, :, :, : grid_spec.tile_spec["row_limit"], : grid_spec.tile_spec["row_limit"]])
-            result_rows.append(torch.cat(result_row, dim=-1))
-        return torch.cat(result_rows, dim=-2)
+        return self.tile_merge(coord_tensor_map, grid_spec)
 
     def spatial_tiled_encode(self, x: torch.Tensor):
         if not self.is_distributed_enabled():
