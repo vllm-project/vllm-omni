@@ -104,7 +104,7 @@ To replay the batching benefit with matched warmup:
 
 ```bash
 python benchmarks/diffusion/diffusion_benchmark_serving.py \
-  --backend vllm-omni \
+  --endpoint /v1/chat/completions \
   --dataset vbench \
   --task t2i \
   --model Qwen/Qwen-Image \

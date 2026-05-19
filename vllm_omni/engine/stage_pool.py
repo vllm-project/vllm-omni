@@ -10,6 +10,13 @@ from typing import TYPE_CHECKING, Any, cast
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
 
+from vllm_omni.distributed.omni_coordinator import (
+    LoadBalancer,
+    OmniCoordClientForHub,
+    ReplicaInfo,
+    ReplicaStatus,
+)
+from vllm_omni.distributed.omni_coordinator.load_balancer import Task
 from vllm_omni.engine.stage_client import (
     StagePoolClient,
     StagePoolDiffusionClient,
@@ -35,7 +42,33 @@ class _ReplicaMetrics:
 
 
 class StagePool:
-    """Replicas of one logical stage with RR + affinity selection."""
+    """Replicas of one logical stage + per-stage routing (LB + affinity).
+
+    The pool owns the head-side stage clients for one logical stage. It also
+    absorbs the per-stage dispatch responsibility (load balancing, affinity
+    tracking, bounded-wait pick) that used to live in a separate
+    ``StageDispatcher`` class — see the design doc for the rationale.
+
+    In distributed mode (when an :class:`OmniCoordClientForHub` and a
+    :class:`LoadBalancer` are injected via :meth:`attach_hub` /
+    :meth:`attach_load_balancer`), :meth:`pick` consults the hub's cached
+    replica list and routes via the load balancer, sticking subsequent calls
+    for the same ``request_id`` to the same replica.
+
+    In non-distributed mode (no hub attached), :meth:`pick` falls back to the
+    legacy ``select_replica_id`` round-robin path so the multi-stage
+    in-process invocation is unchanged.
+
+    Dynamic replica membership: when a remote replica is added or removed
+    (driven by :class:`Orchestrator` via :meth:`add_client` /
+    :meth:`remove_client`), the pool keeps stable integer ``replica_id``s by
+    storing clients in a list whose entries can be ``None`` after a removal.
+    Iteration callers should use :meth:`live_replica_ids` rather than
+    ``range(pool.num_replicas)`` to skip the gaps.
+    """
+
+    DISPATCH_WAIT_TIMEOUT_S: float = 10.0
+    DISPATCH_RETRY_INTERVAL_S: float = 0.1
 
     def __init__(
         self,
@@ -50,33 +83,69 @@ class StagePool:
         else:
             normalized_clients = [clients]
 
-        if not normalized_clients:
-            raise ValueError(f"StagePool for stage {stage_id} has no replicas")
+        # Allow empty pools when running in distributed head mode for a
+        # non-self stage; clients will arrive via add_client(...).
         self.stage_id = stage_id
-        self.clients: list[StagePoolClient] = normalized_clients
+        # Slots can become None after a dynamic remove_client (distributed mode);
+        # iterate via live_replica_ids() to skip holes.
+        self.clients: list[StagePoolClient | None] = list(normalized_clients)
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
         self._replica_metrics: list[_ReplicaMetrics] = [_ReplicaMetrics() for _ in self.clients]
 
+        # Distributed-mode state. Populated by add_client / remove_client.
+        self._addr_to_replica_id: dict[str, int] = {}
+        for replica_id, client in enumerate(self.clients):
+            if client is not None:
+                addr = self._client_input_addr(client)
+                if addr is not None:
+                    self._addr_to_replica_id[addr] = replica_id
+
+        # Distributed-mode dispatch hooks (injected by Orchestrator on bring-up).
+        self._hub: OmniCoordClientForHub | None = None
+        self._lb: LoadBalancer | None = None
+        # ``request_id`` → ``input_addr`` affinity (distributed mode only).
+        # Kept separate from the legacy ``_request_bindings`` so the two
+        # binding shapes do not collide.
+        self._affinity: dict[str, str] = {}
+
     # ---- Stage-level properties ----
 
     @property
     def num_replicas(self) -> int:
+        """Total slot count, including ``None`` holes from removed replicas.
+
+        Use :meth:`live_replica_ids` to iterate only live entries.
+        """
         return len(self.clients)
 
     @property
+    def live_num_replicas(self) -> int:
+        """Number of currently live (non-None) replicas in this pool."""
+        return sum(1 for c in self.clients if c is not None)
+
+    def live_replica_ids(self) -> list[int]:
+        """Return the indices of currently live replicas in this pool."""
+        return [i for i, c in enumerate(self.clients) if c is not None]
+
+    @property
     def stage_type(self) -> str | None:
-        return self.stage_client.stage_type
+        client = self.stage_client
+        return None if client is None else client.stage_type
 
     @property
     def final_output(self) -> bool:
-        return self.clients[0].final_output
+        client = self.stage_client
+        return False if client is None else bool(client.final_output)
 
     @property
-    def stage_client(self) -> StagePoolClient:
-        return self.clients[0]
+    def stage_client(self) -> StagePoolClient | None:
+        for client in self.clients:
+            if client is not None:
+                return client
+        return None
 
     @property
     def llm_stage_client(self) -> StagePoolLLMClient:
@@ -90,11 +159,209 @@ class StagePool:
     def output_processor(self) -> Any:
         return self._output_processor
 
-    # ---- Route binding lifecycle ----
+    @property
+    def is_distributed(self) -> bool:
+        """True iff a hub has been attached (i.e. running in head-distributed mode)."""
+        return self._hub is not None
+
+    # ---- Distributed-mode dispatch hooks ----
+
+    def attach_hub(self, hub: OmniCoordClientForHub | None) -> None:
+        """Inject the shared :class:`OmniCoordClientForHub`.
+
+        Called once by :class:`Orchestrator` after the hub is constructed.
+        ``hub=None`` keeps the pool in legacy mode (no behavior change).
+        """
+        self._hub = hub
+
+    def attach_load_balancer(self, lb: LoadBalancer | None) -> None:
+        """Inject the per-pool :class:`LoadBalancer` for distributed-mode pick."""
+        self._lb = lb
+
+    # ---- Dynamic membership (distributed mode) ----
+
+    @staticmethod
+    def _client_input_addr(client: Any) -> str | None:
+        """Return the input ZMQ address advertised by ``client`` if any.
+
+        LLM clients expose ``client_addresses["input_address"]``; diffusion
+        clients expose ``request_address``. Both are stable strings used by
+        :class:`OmniCoordinator` to key replicas.
+        """
+        request_address = getattr(client, "request_address", None)
+        if isinstance(request_address, str) and request_address:
+            return request_address
+        addrs = getattr(client, "client_addresses", None)
+        if isinstance(addrs, dict):
+            addr = addrs.get("input_address")
+            if isinstance(addr, str) and addr:
+                return addr
+        return None
+
+    def add_client(self, input_addr: str, client: Any) -> int:
+        """Register a head-side client for ``input_addr``.
+
+        Returns the assigned ``replica_id`` (index into :attr:`clients`).
+        If the address is already known, replaces the existing client and
+        returns its existing id (this should not happen in practice — the
+        master server assigns unique slots — but the contract is idempotent
+        to keep the dispatch layer robust).
+        """
+        if not input_addr:
+            raise ValueError("input_addr must be a non-empty string")
+
+        existing = self._addr_to_replica_id.get(input_addr)
+        if existing is not None:
+            self.clients[existing] = client
+            return existing
+
+        replica_id = len(self.clients)
+        self.clients.append(client)
+        self._addr_to_replica_id[input_addr] = replica_id
+        self._replica_metrics.append(_ReplicaMetrics())
+        return replica_id
+
+    def remove_client(self, input_addr: str) -> Any | None:
+        """Remove the client at ``input_addr``. Returns the removed client or ``None``.
+
+        Slot is marked ``None`` to preserve indices for outstanding bindings.
+        """
+        replica_id = self._addr_to_replica_id.pop(input_addr, None)
+        if replica_id is None:
+            return None
+        client = self.clients[replica_id]
+        self.clients[replica_id] = None
+        return client
+
+    def get_client_by_addr(self, input_addr: str) -> Any | None:
+        """Return the live client for ``input_addr`` if present."""
+        replica_id = self._addr_to_replica_id.get(input_addr)
+        if replica_id is None:
+            return None
+        return self.clients[replica_id]
+
+    def get_replica_id_by_addr(self, input_addr: str) -> int | None:
+        """Return the stable replica_id for ``input_addr`` if registered."""
+        return self._addr_to_replica_id.get(input_addr)
+
+    # ---- Per-request distributed dispatch ----
+
+    async def pick(
+        self,
+        request_id: str,
+        task: Task | None = None,
+        *,
+        affinity_request_id: str | None = None,
+    ) -> int:
+        """Return a replica id for ``request_id``.
+
+        In distributed mode: consults the hub for UP replicas, runs the load
+        balancer, and records affinity so future picks for the same
+        ``request_id`` return the same replica. Bounded wait up to
+        ``DISPATCH_WAIT_TIMEOUT_S`` when no UP replica is currently usable.
+
+        In non-distributed (legacy) mode: delegates to
+        :meth:`select_replica_id`.
+        """
+        if self._hub is None or self._lb is None:
+            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+
+        # 1. Sticky: previously bound and still serviceable?
+        bound_addr = self._affinity.get(request_id)
+        if bound_addr is not None:
+            replica_id = self._serviceable_replica_id_for_addr(bound_addr)
+            if replica_id is not None:
+                return replica_id
+            # Bound replica is gone or DOWN — fall through to re-select.
+            self._affinity.pop(request_id, None)
+
+        # 2. Inherited affinity (CFG companion sharing a parent request_id).
+        if affinity_request_id is not None:
+            parent_addr = self._affinity.get(affinity_request_id)
+            if parent_addr is not None:
+                replica_id = self._serviceable_replica_id_for_addr(parent_addr)
+                if replica_id is not None:
+                    self._affinity[request_id] = parent_addr
+                    return replica_id
+
+        # 3. Fresh pick: poll hub + LB with bounded wait.
+        task = task or Task(request_id=request_id)
+        deadline = _time.monotonic() + self.DISPATCH_WAIT_TIMEOUT_S
+        while True:
+            candidates = self._collect_serviceable_replicas()
+            if candidates:
+                # LB chose an index *into our candidates list*.
+                lb_idx = self._lb.select(task, [rep for rep, _ in candidates])
+                replica_info, replica_id = candidates[lb_idx]
+                self._affinity[request_id] = replica_info.input_addr
+                return replica_id
+
+            now = _time.monotonic()
+            if now >= deadline:
+                raise RuntimeError(f"no UP replica for stage {self.stage_id} after {self.DISPATCH_WAIT_TIMEOUT_S:.1f}s")
+            await asyncio.sleep(min(self.DISPATCH_RETRY_INTERVAL_S, deadline - now))
+
+    def _collect_serviceable_replicas(self) -> list[tuple[ReplicaInfo, int]]:
+        """Return list of ``(ReplicaInfo, replica_id)`` for UP, attached replicas."""
+        if self._hub is None:
+            return []
+        snap = self._hub.get_replicas_for_stage(self.stage_id)
+        out: list[tuple[ReplicaInfo, int]] = []
+        for rep in snap.replicas:
+            if rep.status != ReplicaStatus.UP:
+                continue
+            replica_id = self._addr_to_replica_id.get(rep.input_addr)
+            if replica_id is None:
+                continue  # Hub knows about it but head-side client not attached yet.
+            if self.clients[replica_id] is None:
+                continue
+            out.append((rep, replica_id))
+        return out
+
+    def _serviceable_replica_id_for_addr(self, input_addr: str) -> int | None:
+        """Return ``replica_id`` for ``input_addr`` iff currently UP + attached."""
+        if self._hub is None:
+            return None
+        replica_id = self._addr_to_replica_id.get(input_addr)
+        if replica_id is None or self.clients[replica_id] is None:
+            return None
+        snap = self._hub.get_replicas_for_stage(self.stage_id)
+        for rep in snap.replicas:
+            if rep.input_addr == input_addr and rep.status == ReplicaStatus.UP:
+                return replica_id
+        return None
+
+    def bind(self, request_id: str, input_addr: str) -> None:
+        """Explicitly record affinity (distributed mode)."""
+        self._affinity[request_id] = input_addr
+
+    def release(self, request_id: str) -> None:
+        """Drop affinity (distributed mode) and legacy binding for ``request_id``."""
+        self._affinity.pop(request_id, None)
+        self.release_binding(request_id)
+
+    def invalidate_addr(self, input_addr: str) -> list[str]:
+        """Drop affinity rows pointing at ``input_addr``; return affected request ids."""
+        affected: list[str] = [rid for rid, addr in self._affinity.items() if addr == input_addr]
+        for rid in affected:
+            self._affinity.pop(rid, None)
+        return affected
+
+    # ---- Legacy (non-distributed) route binding ----
 
     def get_bound_replica_id(self, request_id: str) -> int | None:
-        """Return the currently bound replica id for *request_id* if present."""
-        return self._request_bindings.get(request_id)
+        """Return the currently bound replica id for *request_id* if present.
+
+        In distributed mode the binding may have been recorded via
+        :meth:`pick`; we honor it transparently here.
+        """
+        legacy = self._request_bindings.get(request_id)
+        if legacy is not None:
+            return legacy
+        addr = self._affinity.get(request_id)
+        if addr is None:
+            return None
+        return self._addr_to_replica_id.get(addr)
 
     def get_bound_client(self, request_id: str) -> StagePoolClient | None:
         """Return the currently bound client for *request_id* if present."""
@@ -113,6 +380,7 @@ class StagePool:
     def release_binding(self, request_id: str) -> None:
         """Drop the route binding for *request_id* in this stage."""
         self._request_bindings.pop(request_id, None)
+        self._affinity.pop(request_id, None)
 
     def release_bindings(self, request_ids: list[str]) -> None:
         """Drop route bindings for the given request ids in this stage."""
@@ -125,27 +393,43 @@ class StagePool:
         *,
         affinity_request_id: str | None = None,
     ) -> int:
-        """Pick a replica id for *request_id* and cache the choice."""
+        """Pick a replica id for *request_id* and cache the choice (legacy path)."""
         cached = self.get_bound_replica_id(request_id)
-        if cached is not None:
+        if cached is not None and self.clients[cached] is not None:
             return cached
 
-        chosen = self.get_bound_replica_id(affinity_request_id) if affinity_request_id is not None else None
+        chosen: int | None = None
+        if affinity_request_id is not None:
+            parent = self.get_bound_replica_id(affinity_request_id)
+            if parent is not None and self.clients[parent] is not None:
+                chosen = parent
+
         if chosen is None:
-            if self.num_replicas == 1:
-                chosen = 0
+            live = self.live_replica_ids()
+            if not live:
+                raise RuntimeError(f"stage {self.stage_id} has no live replicas")
+            if len(live) == 1:
+                chosen = live[0]
             else:
-                chosen = self._next_replica_id
-                self._next_replica_id = (self._next_replica_id + 1) % self.num_replicas
+                # Round-robin over live replicas only.
+                start = self._next_replica_id % len(live)
+                chosen = live[start]
+                self._next_replica_id = (self._next_replica_id + 1) % len(live)
 
         self._request_bindings[request_id] = chosen
         return chosen
 
     def _llm_client(self, replica_id: int) -> StagePoolLLMClient:
-        return cast(StagePoolLLMClient, self.clients[replica_id])
+        client = self.clients[replica_id]
+        if client is None:
+            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+        return cast(StagePoolLLMClient, client)
 
     def _diffusion_client(self, replica_id: int) -> StagePoolDiffusionClient:
-        return cast(StagePoolDiffusionClient, self.clients[replica_id])
+        client = self.clients[replica_id]
+        if client is None:
+            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
+        return cast(StagePoolDiffusionClient, client)
 
     # ---- Metrics ----
 
@@ -206,7 +490,7 @@ class StagePool:
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         submit_kwargs = dict(submit_kwargs or {})
         if self.stage_type == "diffusion":
-            replica_id = self.select_replica_id(
+            replica_id = await self._pick_or_select(
                 request_id,
                 affinity_request_id=affinity_request_id,
             )
@@ -217,10 +501,13 @@ class StagePool:
                 await client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
 
-        replica_id = self.select_replica_id(
+        replica_id = await self._pick_or_select(
             request_id,
             affinity_request_id=affinity_request_id,
         )
+        client = self.clients[replica_id]
+        if client is None:
+            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
         try:
             self.output_processor.add_request(
                 request=request,
@@ -262,8 +549,12 @@ class StagePool:
         """Submit a streaming update to an already admitted request."""
         params = req_state.sampling_params_list[self.stage_id]
         replica_id = self.get_bound_replica_id(request_id)
-        if replica_id is None:
-            replica_id = self.select_replica_id(request_id)
+        if replica_id is None or self.clients[replica_id] is None:
+            replica_id = await self._pick_or_select(request_id)
+
+        client = self.clients[replica_id]
+        if client is None:
+            raise RuntimeError(f"stage {self.stage_id} replica {replica_id} is not attached")
 
         if self.stage_type == "diffusion":
             await self._diffusion_client(replica_id).add_request_async(request_id, request, params)
@@ -281,6 +572,17 @@ class StagePool:
             await self._llm_client(replica_id).add_request_async(request)
         return replica_id
 
+    async def _pick_or_select(
+        self,
+        request_id: str,
+        *,
+        affinity_request_id: str | None = None,
+    ) -> int:
+        """Bridge to ``pick`` in distributed mode or ``select_replica_id`` legacy."""
+        if self.is_distributed:
+            return await self.pick(request_id, affinity_request_id=affinity_request_id)
+        return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+
     # ---- Stage-local polling ----
 
     async def _poll_stage_raw(self, client: StagePoolLLMClient) -> EngineCoreOutputs | None:
@@ -296,7 +598,10 @@ class StagePool:
         raw_outputs: EngineCoreOutputs,
     ) -> list[Any]:
         """Run the shared LLM output processor on one raw poll result."""
-        client = self._llm_client(replica_id)
+        raw_client = self.clients[replica_id]
+        if raw_client is None:
+            return []
+        client = cast(StagePoolLLMClient, raw_client)
         processor = self.output_processor
         processed = processor.process_outputs(
             raw_outputs.outputs,
@@ -319,7 +624,10 @@ class StagePool:
         timeout_s: float = 0.001,
     ) -> EngineCoreOutputs | None:
         """Poll raw EngineCore outputs from one LLM replica once."""
-        client = self._llm_client(replica_id)
+        raw_client = self.clients[replica_id]
+        if raw_client is None:
+            return None
+        client = cast(StagePoolLLMClient, raw_client)
         try:
             return await asyncio.wait_for(
                 self._poll_stage_raw(client),
@@ -339,7 +647,10 @@ class StagePool:
 
     def poll_diffusion_output(self, replica_id: int) -> Any | None:
         """Drain one ready diffusion output from the given replica if present."""
-        return self._diffusion_client(replica_id).get_diffusion_output_nowait()
+        raw_client = self.clients[replica_id]
+        if raw_client is None:
+            return None
+        return cast(StagePoolDiffusionClient, raw_client).get_diffusion_output_nowait()
 
     # ---- Stage-local control plane ----
 
@@ -347,7 +658,7 @@ class StagePool:
         """Abort the given requests in this stage pool.
 
         Request-bound abort routing stays inside the pool because route affinity
-        (`request_id -> replica_id`) is pool-owned.
+        (``request_id -> replica_id``) is pool-owned.
         """
         if not request_ids:
             return
@@ -355,13 +666,16 @@ class StagePool:
         request_ids_by_replica: dict[int, list[str]] = {}
         for request_id in request_ids:
             replica_id = self.get_bound_replica_id(request_id)
-            if replica_id is None:
-                logger.debug("[StagePool] abort: no binding for req=%s in stage-%s", request_id, self.stage_id)
+            if replica_id is None or self.clients[replica_id] is None:
+                logger.debug("[StagePool] abort: no live binding for req=%s in stage-%s", request_id, self.stage_id)
                 continue
             request_ids_by_replica.setdefault(replica_id, []).append(request_id)
 
         for replica_id, replica_request_ids in request_ids_by_replica.items():
-            await self.clients[replica_id].abort_requests_async(replica_request_ids)
+            client = self.clients[replica_id]
+            if client is None:
+                continue
+            await client.abort_requests_async(replica_request_ids)
 
         # Clean up OutputProcessor state (e.g. mm_accumulated tensors) that
         # would otherwise leak — aborted requests never produce a final
@@ -377,10 +691,15 @@ class StagePool:
         timeout: float | None = None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
-    ) -> Any:
+    ) -> dict[str, Any] | Any:
         """Dispatch a stage-scoped control-plane RPC to one physical route."""
         kwargs = dict(kwargs or {})
         client = self.clients[replica_id]
+        if client is None:
+            return {
+                "supported": False,
+                "error": f"stage {self.stage_id} replica {replica_id} is not attached",
+            }
         try:
             return await client.collective_rpc_async(
                 method=method,
@@ -402,7 +721,11 @@ class StagePool:
 
     def shutdown_replica(self, replica_id: int) -> None:
         """Shutdown one backend handle in this stage pool."""
+        if replica_id >= len(self.clients):
+            return
         client = self.clients[replica_id]
+        if client is None:
+            return
         try:
             client.shutdown()
             logger.info(

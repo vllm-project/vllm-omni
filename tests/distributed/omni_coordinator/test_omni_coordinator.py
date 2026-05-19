@@ -11,14 +11,14 @@ from vllm.v1.utils import get_engine_client_zmq_addr
 from vllm_omni.distributed.omni_coordinator import (
     OmniCoordClientForStage,
     OmniCoordinator,
-    StageStatus,
+    ReplicaStatus,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _recv_instance_list(sub: zmq.Socket, timeout_ms: int = 2000) -> dict | None:
-    """Receive InstanceList JSON from SUB socket. Returns None on timeout."""
+def _recv_replica_list(sub: zmq.Socket, timeout_ms: int = 2000) -> dict | None:
+    """Receive ReplicaList JSON from SUB socket. Returns None on timeout."""
     sub.setsockopt(zmq.RCVTIMEO, timeout_ms)
     try:
         data = sub.recv()
@@ -27,16 +27,16 @@ def _recv_instance_list(sub: zmq.Socket, timeout_ms: int = 2000) -> dict | None:
         return None
 
 
-def _wait_for_instance_list(
+def _wait_for_replica_list(
     sub: zmq.Socket,
     expected_count: int,
     timeout: float = 3.0,
 ) -> dict | None:
-    """Wait until received InstanceList with expected_count active instances."""
+    """Wait until received ReplicaList with expected_count active replicas."""
     start = time.time()
     while time.time() - start < timeout:
-        msg = _recv_instance_list(sub, timeout_ms=500)
-        if msg is not None and len(msg.get("instances", [])) == expected_count:
+        msg = _recv_replica_list(sub, timeout_ms=500)
+        if msg is not None and len(msg.get("replicas", [])) == expected_count:
             return msg
     return None
 
@@ -45,7 +45,7 @@ def _drain_sub_messages(sub: zmq.Socket, max_seconds: float = 0.4) -> None:
     """Drain queued SUB messages for a short window."""
     deadline = time.time() + max_seconds
     while time.time() < deadline:
-        _recv_instance_list(sub, timeout_ms=50)
+        _recv_replica_list(sub, timeout_ms=50)
 
 
 def test_omni_coordinator_pub_coalescing_on_rapid_queue_updates():
@@ -81,7 +81,7 @@ def test_omni_coordinator_pub_coalescing_on_rapid_queue_updates():
     )
 
     # Wait for initial registration broadcast and clear any queued messages.
-    msg = _wait_for_instance_list(sub, expected_count=1)
+    msg = _wait_for_replica_list(sub, expected_count=1)
     assert msg is not None
     _drain_sub_messages(sub)
 
@@ -96,7 +96,7 @@ def test_omni_coordinator_pub_coalescing_on_rapid_queue_updates():
     deadline = time.time() + window_s
     recv_count = 0
     while time.time() < deadline:
-        if _recv_instance_list(sub, timeout_ms=100) is not None:
+        if _recv_replica_list(sub, timeout_ms=100) is not None:
             recv_count += 1
 
     assert recv_count < update_count // 2, (
@@ -110,8 +110,8 @@ def test_omni_coordinator_pub_coalescing_on_rapid_queue_updates():
 
 
 def test_omni_coordinator_registration_broadcast():
-    """Verify that after multiple OmniCoordClientForStage instances register,
-    OmniCoordinator publishes an InstanceList containing all registered instances.
+    """Verify that after multiple OmniCoordClientForStage replicas register,
+    OmniCoordinator publishes a ReplicaList containing all registered replicas.
     """
     router_addr = get_engine_client_zmq_addr(
         local_only=False,
@@ -144,12 +144,12 @@ def test_omni_coordinator_registration_broadcast():
         OmniCoordClientForStage(router_addr, "tcp://stage:10003", "tcp://stage:10003-out", 1),
     ]
 
-    msg = _wait_for_instance_list(sub, expected_count=3)
-    assert msg is not None, "Expected InstanceList with 3 instances"
-    assert len(msg["instances"]) == 3
+    msg = _wait_for_replica_list(sub, expected_count=3)
+    assert msg is not None, "Expected ReplicaList with 3 replicas"
+    assert len(msg["replicas"]) == 3
     assert isinstance(msg["timestamp"], (int, float))
 
-    input_addrs = {inst["input_addr"] for inst in msg["instances"]}
+    input_addrs = {rep["input_addr"] for rep in msg["replicas"]}
     assert "tcp://stage:10001" in input_addrs
     assert "tcp://stage:10002" in input_addrs
     assert "tcp://stage:10003" in input_addrs
@@ -162,7 +162,7 @@ def test_omni_coordinator_registration_broadcast():
 
 
 def test_omni_coordinator_heartbeat_timeout_handling():
-    """Verify that when a stage instance stops sending heartbeats,
+    """Verify that when a stage replica stops sending heartbeats,
     OmniCoordinator marks it as unhealthy and excludes it from the active list.
     """
     router_addr = get_engine_client_zmq_addr(
@@ -201,23 +201,23 @@ def test_omni_coordinator_heartbeat_timeout_handling():
         "output_addr": "tcp://stage:c-out",
         "stage_id": 0,
         "event_type": "update",
-        "status": StageStatus.UP.value,
+        "status": ReplicaStatus.UP.value,
         "queue_length": 0,
     }
     dealer_c.send(json.dumps(reg_event).encode("utf-8"))
 
-    msg = _wait_for_instance_list(sub, expected_count=3)
-    assert msg is not None, "Expected initial 3 instances"
-    assert len(msg["instances"]) == 3
+    msg = _wait_for_replica_list(sub, expected_count=3)
+    assert msg is not None, "Expected initial 3 replicas"
+    assert len(msg["replicas"]) == 3
 
     # Wait for heartbeat timeout (timeout=5s, check interval ~2.5s).
     time.sleep(8.0)
 
     # Receive the update (C should be ERROR and excluded from active list).
-    msg_after_timeout = _wait_for_instance_list(sub, expected_count=2, timeout=5.0)
-    assert msg_after_timeout is not None, "Expected InstanceList with 2 instances after timeout"
-    instances = msg_after_timeout.get("instances", [])
-    input_addrs = {inst["input_addr"] for inst in instances}
+    msg_after_timeout = _wait_for_replica_list(sub, expected_count=2, timeout=5.0)
+    assert msg_after_timeout is not None, "Expected ReplicaList with 2 replicas after timeout"
+    replicas = msg_after_timeout.get("replicas", [])
+    input_addrs = {rep["input_addr"] for rep in replicas}
 
     assert "tcp://stage:a" in input_addrs
     assert "tcp://stage:b" in input_addrs
@@ -232,8 +232,8 @@ def test_omni_coordinator_heartbeat_timeout_handling():
     sub_ctx.term()
 
 
-def test_omni_coordinator_instance_shutdown_handling():
-    """Verify that when a stage instance sends status='down',
+def test_omni_coordinator_replica_shutdown_handling():
+    """Verify that when a stage replica sends status='down',
     OmniCoordinator removes it from the active list and broadcasts an updated list.
     """
     router_addr = get_engine_client_zmq_addr(
@@ -261,18 +261,18 @@ def test_omni_coordinator_instance_shutdown_handling():
 
     client = OmniCoordClientForStage(router_addr, "tcp://stage:shutdown", "tcp://stage:shutdown-out", 0)
 
-    msg = _wait_for_instance_list(sub, expected_count=1)
+    msg = _wait_for_replica_list(sub, expected_count=1)
     assert msg is not None
-    assert len(msg["instances"]) == 1
-    assert msg["instances"][0]["input_addr"] == "tcp://stage:shutdown"
+    assert len(msg["replicas"]) == 1
+    assert msg["replicas"][0]["input_addr"] == "tcp://stage:shutdown"
 
     # Send down status (simulating graceful shutdown).
-    client.update_info(status=StageStatus.DOWN)
+    client.update_info(status=ReplicaStatus.DOWN)
 
-    # Receive updated list (should have 0 active instances).
-    msg = _wait_for_instance_list(sub, expected_count=0)
+    # Receive updated list (should have 0 active replicas).
+    msg = _wait_for_replica_list(sub, expected_count=0)
     assert msg is not None
-    assert len(msg["instances"]) == 0
+    assert len(msg["replicas"]) == 0
 
     client.close()
     coordinator.close()

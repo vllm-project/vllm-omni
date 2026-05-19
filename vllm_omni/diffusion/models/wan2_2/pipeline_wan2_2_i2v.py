@@ -17,10 +17,12 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -135,7 +137,12 @@ def get_wan22_i2v_pre_process_func(
 
 
 class Wan22I2VPipeline(
-    nn.Module, SupportImageInput, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin
+    nn.Module,
+    SupportImageInput,
+    PipelineParallelMixin,
+    CFGParallelMixin,
+    ProgressBarMixin,
+    DiffusionPipelineProfilerMixin,
 ):
     """
     Wan2.2 Image-to-Video Pipeline.
@@ -283,7 +290,7 @@ class Wan22I2VPipeline(
         attention_kwargs: dict[str, Any],
         condition: torch.Tensor,
         first_frame_mask: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
         with self.progress_bar(total=len(timesteps)) as pbar:
@@ -348,7 +355,6 @@ class Wan22I2VPipeline(
 
                 # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
-
                 pbar.update()
 
         return latents
@@ -667,7 +673,11 @@ class Wan22I2VPipeline(
             output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
         )
 
-    def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
+    def predict_noise(
+        self,
+        current_model: nn.Module | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | IntermediateTensors:
         """
         Forward pass through transformer to predict noise.
 
@@ -676,11 +686,12 @@ class Wan22I2VPipeline(
             **kwargs: Arguments to pass to the transformer
 
         Returns:
-            Predicted noise tensor
+            Predicted noise tensor or IntermediateTensors on non-last PP stages.
         """
         if current_model is None:
             current_model = self.transformer
-        return current_model(**kwargs)[0]
+        result = current_model(**kwargs)
+        return result if isinstance(result, IntermediateTensors) else result[0]
 
     def encode_prompt(
         self,
