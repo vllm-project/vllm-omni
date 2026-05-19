@@ -1052,7 +1052,7 @@ async def test_stage_pool_abort_requests_logs_when_binding_is_missing(caplog) ->
         target_logger.setLevel(prev_level)
 
     assert not stage0.abort_calls
-    assert "abort: no binding for req=missing-req in stage-0" in caplog.text
+    assert "abort: no live binding for req=missing-req in stage-0" in caplog.text
 
 
 @pytest.mark.asyncio
