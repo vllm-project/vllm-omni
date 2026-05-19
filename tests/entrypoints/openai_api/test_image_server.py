@@ -914,6 +914,13 @@ def test_parameter_validation():
     with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", num_inference_steps=201)
 
+    # Invalid guidance_scale (out of range)
+    with pytest.raises(ValueError):
+        ImageGenerationRequest(prompt="test", guidance_scale=-1.0)
+
+    with pytest.raises(ValueError):
+        ImageGenerationRequest(prompt="test", guidance_scale=21.0)
+
     # Invalid layers for layered models (must stay within the backend-supported range)
     with pytest.raises(ValueError):
         ImageGenerationRequest(prompt="test", layers=2)
