@@ -746,54 +746,6 @@ def filter_dataclass_kwargs(cls: Any, kwargs: dict) -> dict:
     return filtered_kwargs
 
 
-# TODO(wuhang): Remove after PR #1115.
-def build_base_engine_args(source: Any) -> dict[str, Any] | None:
-    """Build base engine args with tokenizer and parallel configuration.
-
-    Automatically detects whether source is a dict-like object or namespace object.
-
-    Args:
-        source: Source object (args namespace or kwargs dict) containing configuration.
-
-    Returns:
-        Dictionary containing tokenizer and parallel configuration overrides,
-        or None if no configuration is present.
-    """
-    # Auto-detect source type: dict-like objects have 'get' method
-    is_dict_like = hasattr(source, "get") and callable(getattr(source, "get"))
-
-    # Extract tokenizer
-    if is_dict_like:
-        tokenizer = source.get("tokenizer", None)
-    else:
-        tokenizer = getattr(source, "tokenizer", None)
-
-    base_engine_args = {"tokenizer": tokenizer} if tokenizer is not None else None
-
-    # Extract parallel configuration
-    parallel_keys = [
-        "tensor_parallel_size",
-        "pipeline_parallel_size",
-        "data_parallel_size",
-        "data_parallel_size_local",
-        "data_parallel_backend",
-        "distributed_executor_backend",
-    ]
-
-    if is_dict_like:
-        parallel_overrides = {k: source[k] for k in parallel_keys if k in source and source[k] is not None}
-    else:
-        parallel_overrides = {
-            k: getattr(source, k) for k in parallel_keys if hasattr(source, k) and getattr(source, k) is not None
-        }
-
-    if parallel_overrides:
-        base_engine_args = base_engine_args or {}
-        base_engine_args.update(parallel_overrides)
-
-    return base_engine_args
-
-
 # The following code detects if the process is running in a container and if
 # PID host is available. If so, we can use process-scoped memory tracking;
 # otherwise we need sequential init locks.
