@@ -207,7 +207,7 @@ try {
     }
 
     Write-Step "Installing vLLM-Omni editable"
-    Invoke-Native $pythonExe "-m" "pip" "install" "-e" "." "--no-build-isolation"
+    Invoke-Native $pythonExe "-m" "pip" "install" "-e" "." "--no-build-isolation" "--no-deps"
 
     if (-not $SkipUnitTests) {
         Write-Step "Running focused Windows async streaming tests"
