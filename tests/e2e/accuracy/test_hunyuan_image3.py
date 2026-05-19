@@ -33,9 +33,21 @@ pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, *hardware_marks(re
 # ============================================================================
 # Configurable Parameters
 # ============================================================================
-# Comma-separated CUDA device ids per stage; override via HUNYUAN_AR_DEVICES / HUNYUAN_DIT_DEVICES.
-AR_DEVICES = os.environ.get("HUNYUAN_AR_DEVICES", "0,1,2,3")
-DIT_DEVICES = os.environ.get("HUNYUAN_DIT_DEVICES", "4,5,6,7")
+# Comma-separated logical CUDA device ids per stage: split visible GPUs (0..n-1), first half -> AR, second -> DiT.
+
+
+def _default_ar_dit_devices() -> tuple[str, str]:
+    """First floor(n/2) logical devices -> AR, rest -> DiT. ``device_count`` respects ``CUDA_VISIBLE_DEVICES``."""
+    n = torch.accelerator.device_count()
+    if n < 2:
+        return "0,1", "2,3"
+    split = n // 2
+    ar = ",".join(str(i) for i in range(split))
+    dit = ",".join(str(i) for i in range(split, n))
+    return ar, dit
+
+
+AR_DEVICES, DIT_DEVICES = _default_ar_dit_devices()
 MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
 NUM_INFERENCE_STEPS = 50
 GUIDANCE_SCALE = 2.5
