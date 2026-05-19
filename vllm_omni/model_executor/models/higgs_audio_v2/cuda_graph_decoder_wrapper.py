@@ -42,9 +42,8 @@ class HiggsAudioV2CUDAGraphWrapper:
     talker:
         The Stage-0 talker module. Must expose ``forward(input_ids, positions, **kw)``.
     capture_batch_sizes:
-        Batch sizes at which to capture graphs. Defaults to ``(1, 2, 4)`` to
-        match the AC-8 positive test (replay must preserve AC-2 parity at
-        batch sizes 1, 2, 4).
+        Batch sizes at which to capture graphs. Defaults to ``(1, 2, 4)`` so
+        that CUDA-graph replay covers the common decode-batch shapes.
     enabled:
         Master kill switch. Capture is skipped when False; the wrapper still
         delegates to the underlying module so callers can keep using the same

@@ -11,7 +11,7 @@ falling into an unsupported code path.
 
 The prompt token ID sequence emitted by :func:`build_plain_text_prompt`
 matches the upstream ``HiggsAudioV2Processor.apply_chat_template`` output for
-the equivalent conversation, so that AC-1 (input-token parity) holds.
+the equivalent conversation (input-token parity with the HF reference).
 """
 
 from __future__ import annotations
@@ -99,8 +99,8 @@ def build_plain_text_conversation(text: str) -> list[dict[str, Any]]:
     """Build the canonical single-speaker plain-text conversation.
 
     Uses the bare system prompt ``"Generate audio following instruction."``
-    that matches the upstream HF reference's input formatting. AC-1
-    (input-token parity) requires this exact wording.
+    that matches the upstream HF reference's input formatting; this exact
+    wording is required for input-token parity with the upstream processor.
     """
     validate_plain_text_input(text)
     system_prompt = "Generate audio following instruction."
@@ -129,10 +129,8 @@ def build_plain_text_prompt(
     such as ``attention_mask``). The serving layer passes ``input_ids`` to
     Stage 0 as ``prompt_token_ids`` after a ``.tolist()``.
 
-    Using the upstream processor verbatim (no system-prompt rewriting) is what
-    gives AC-1 input-token parity its meaning. DEC-2 (use upstream verbatim vs.
-    a normalized template) is currently set to verbatim, in line with the
-    Claude-recommended default in the plan.
+    Using the upstream processor verbatim (no system-prompt rewriting) is
+    what preserves input-token parity with the HF reference.
     """
     conversation = build_plain_text_conversation(text)
     inputs = processor.apply_chat_template(

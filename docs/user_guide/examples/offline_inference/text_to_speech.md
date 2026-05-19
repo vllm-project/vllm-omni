@@ -364,8 +364,9 @@ Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-T
 
 ## higgs-audio v2
 
-Launch the online server (Stage 0 talker + Stage 1 codec) and call the
-OpenAI-compatible `/v1/audio/speech` endpoint:
+2-stage TTS at 24 kHz: a vLLM-native Llama-3.2-3B talker with a DualFFN audio expert (Stage 0) feeding a HiggsAudio codec decoder (Stage 1) over the `async_chunk` shared-memory connector. Stage 1 reuses the OmniVoice HiggsAudio decoder kernel through `vllm_omni/model_executor/models/_shared/higgs_audio_decoder.py`.
+
+higgs-audio v2 is online-only in this release. Launch the server and call the OpenAI-compatible `/v1/audio/speech` endpoint:
 
 ```bash
 bash examples/online_serving/text_to_speech/higgs_audio_v2/run_server.sh
@@ -375,9 +376,9 @@ python examples/online_serving/text_to_speech/higgs_audio_v2/batch_speech_client
     --output-dir /tmp/higgs_out
 ```
 
-The Stage-0 talker uses a vLLM-native Llama-3.2-3B backbone with a DualFFN audio expert (see `docs/contributing/model/adding_tts_model.md` for the architectural appendix). Stage 1 reuses the OmniVoice HiggsAudio decoder kernel via the shared utility at `vllm_omni/model_executor/models/_shared/higgs_audio_decoder.py`.
+### Scope (v1)
 
-Scope (v1, see `results/plan.md` AC-5 for the full list): plain text -> 24 kHz speech only. Voice cloning, multi-speaker dialogue, language overrides, `task_type`, `speed != 1.0`, and reference audio are rejected with explicit 4xx by the request validator.
+Plain text -> 24 kHz speech only. Voice cloning, multi-speaker dialogue, language overrides, `task_type`, `speed != 1.0`, and reference audio are rejected with explicit 4xx by the request validator in `vllm_omni/entrypoints/openai/serving_speech.py`.
 
 ## Example materials
 

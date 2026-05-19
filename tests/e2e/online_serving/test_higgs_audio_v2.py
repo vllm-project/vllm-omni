@@ -5,12 +5,7 @@
 This test suite exercises the parts of the higgs_audio_v2 path that do NOT
 require booting the full vLLM engine: the request-validator scope checks,
 the prompt builder's tokenization parity, the stage_input_processor adapter
-contract, and Stage-1 decode parity against the upstream reference fixture
-(AC-4).
-
-The Stage-0 talker AR-loop is gated on the reference fixtures + the
-upstream-trace memo and is exercised in a follow-up online test once the
-forward path lands; see ``results/plan.md`` Milestone 4 Step G.
+contract, the DualFFN routing behavior, and the Stage-1 codec wiring.
 """
 
 from __future__ import annotations
@@ -500,7 +495,7 @@ def test_stage1_engine_runtime_forward_returns_omni_output() -> None:
     assert trimmed_audio.shape == ((n_frames - 5) * HOP,)
 
 def test_dual_ffn_routing_fault_injection_changes_audio_output() -> None:
-    """AC-3 negative: disabling the audio MLP must change the layer output on audio positions only.
+    """Disabling the audio MLP must change the layer output on audio positions only.
 
     Drives ``HiggsAudioV2DecoderLayer._routed_mlp`` (which is the upstream DualFFN
     routing rule) on synthetic text/audio inputs with random text/audio MLPs.
@@ -792,7 +787,7 @@ def test_talker_audio_codebook_logits_emits_all_codebooks() -> None:
     assert int(codes.min()) >= 0
 
 def test_stage1_rms_threshold_is_meaningful_with_corrupted_codebook() -> None:
-    """AC-4 negative #2: a corrupted RVQ codebook must push the PCM RMS above 1e-4.
+    """A corrupted RVQ codebook must push the PCM RMS above 1e-4.
 
     Builds a stub Stage-1 around the shared HiggsAudioRVQ kernel, generates a
     reference PCM with the kernel at its initialized weights, then scrambles
@@ -833,14 +828,14 @@ def test_stage1_rms_threshold_is_meaningful_with_corrupted_codebook() -> None:
         rvq.quantizers[0].codebook.weight.zero_()
     corrupted = rvq.decode(codes.clone())
 
-    # AC-4 negative #2 expects the RMS to exceed 1e-4 (normalized float).
+    # The corrupted codebook must push the normalized-float RMS above 1e-4.
     base_f = baseline.to(torch.float32).flatten()
     corr_f = corrupted.to(torch.float32).flatten()
     n = min(int(base_f.shape[0]), int(corr_f.shape[0]))
     rms = ((base_f[:n] - corr_f[:n]) ** 2).mean().sqrt().item()
     assert rms > 1e-4, (
-        f"corrupting a codebook should push the RMS difference above the AC-4 "
-        f"threshold; got rms={rms:.3e}"
+        f"corrupting a codebook should push the RMS difference above the "
+        f"1e-4 threshold; got rms={rms:.3e}"
     )
 
 def test_cuda_graph_wrapper_falls_back_to_eager_without_warmup() -> None:
@@ -883,8 +878,8 @@ def test_cuda_graph_wrapper_disabled_is_passthrough() -> None:
     out = wrapper(x=x)
     assert torch.equal(out, x + 100)
 
-def test_ac9_offline_smoke_runs_through_shared_codec() -> None:
-    """AC-9 offline smoke test (clean-machine target).
+def test_offline_smoke_runs_through_shared_codec() -> None:
+    """Offline smoke test (clean-machine target).
 
     Builds the shared HiggsAudio codec kernel with random-but-valid weights and
     runs a synthetic ``[1, 8, T]`` code tensor through Stage-1's direct decode
@@ -910,7 +905,7 @@ def test_ac9_offline_smoke_runs_through_shared_codec() -> None:
     stage1 = HiggsAudioV2Code2Wav(cfg)
 
     # Build a synthetic but valid Stage-1 stack with the shared kernel.
-    # Random weights are fine for the AC-9 SHAPE smoke (no parity).
+    # Random weights are fine for the shape smoke (no parity assertion).
     torch.manual_seed(0)
     quantizer = HiggsAudioRVQ(
         num_quantizers=int(cfg.num_codebooks),
@@ -932,7 +927,7 @@ def test_ac9_offline_smoke_runs_through_shared_codec() -> None:
     # Shape: [B, 1, T * hop=960]
     expected_samples = int(codes.shape[2]) * 960
     assert pcm.shape == (1, 1, expected_samples), (
-        f"AC-9 offline smoke expected PCM shape (1, 1, {expected_samples}); got {tuple(pcm.shape)}"
+        f"offline smoke expected PCM shape (1, 1, {expected_samples}); got {tuple(pcm.shape)}"
     )
     assert torch.isfinite(pcm).all()
 

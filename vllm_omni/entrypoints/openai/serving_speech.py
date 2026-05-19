@@ -1523,7 +1523,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Loads (and caches) the upstream ``AutoProcessor`` for the configured
         model id, then invokes
         ``vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_tokenizer.build_plain_text_prompt``
-        to emit input_ids that satisfy AC-1 (upstream-faithful tokenization).
+        to emit upstream-faithful input_ids.
         """
         from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_tokenizer import (
             build_plain_text_prompt,
@@ -2188,9 +2188,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             prompt = self._build_covo_audio_prompt(request)
             tts_params = {}
         elif self._tts_model_type == "higgs_audio_v2":
-            # Explicit higgs_audio_v2 branch (see AC-5 in results/plan.md): do NOT fall
-            # through to the Qwen-style generic placeholder path; build prompt_token_ids
-            # directly via the upstream processor + the project's plain-text helper.
+            # Explicit higgs_audio_v2 branch: do NOT fall through to the
+            # Qwen-style generic placeholder path; build prompt_token_ids
+            # directly via the upstream processor + the project's plain-text
+            # helper.
             validation_error = self._validate_higgs_audio_v2_request(request)
             if validation_error:
                 raise ValueError(validation_error)

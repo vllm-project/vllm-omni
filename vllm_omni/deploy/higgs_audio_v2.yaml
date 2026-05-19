@@ -6,12 +6,11 @@
 # vllm_omni/entrypoints/openai/serving_speech.py and
 # vllm_omni/model_executor/models/higgs_audio_v2/higgs_audio_v2_tokenizer.py).
 #
-# `async_chunk` is on by default for higgs-audio v2. DEC-1 in results/plan.md
-# was Claude's recommended "include streaming in v1" call; the streaming
-# wiring is shipped here (the stage-input processor's async-chunk callback,
-# the shared-memory connector codec_streaming flag, and the WAV/PCM streaming
-# convention in serving_speech.py). To run a strictly non-streaming smoke
-# test, set `codec_streaming: false` in the connector extras below.
+# Streaming is wired through the stage-input processor's async-chunk
+# callback, the shared-memory connector ``codec_streaming`` flag, and the
+# WAV/PCM streaming convention in serving_speech.py. To run a strictly
+# non-streaming smoke test, set ``codec_streaming: false`` in the connector
+# extras below.
 async_chunk: false
 
 connectors:
@@ -39,8 +38,8 @@ stages:
     enable_prefix_caching: false
     async_scheduling: false
     max_num_batched_tokens: 2048
-    # Max_model_len covers prompt + max_new_tokens (default <=1500 codec
-    # frames per DEC-4, so 4096 is comfortable).
+    # max_model_len covers prompt + max_new_tokens. Up to ~1500 codec
+    # frames per request fit comfortably under 4096.
     max_model_len: 4096
     devices: "0"
     output_connectors:

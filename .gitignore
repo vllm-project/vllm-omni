@@ -132,9 +132,6 @@ ENV/
 env.bak/
 venv.bak/
 
-# Humanize local loop state (RLCR / gen-plan / refine-plan)
-.humanize*
-
 # Spyder project settings
 .spyderproject
 .spyproject
@@ -203,10 +200,6 @@ checkpoints/
 *.safetensors
 *.pt
 *.pth
-
-# Higgs-audio v2 reference fixtures are committed (AC-1/AC-2/AC-3 verification source).
-# Must come AFTER `*.pt` so the un-ignore wins (last matching pattern in gitignore).
-!tests/fixtures/higgs_audio_v2/*.pt
 
 # Cache directories
 cache/

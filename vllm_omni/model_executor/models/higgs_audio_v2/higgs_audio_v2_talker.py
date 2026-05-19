@@ -15,8 +15,7 @@ source and the boson-ai checkpoint config.json):
   next to the standard text path (``input_layernorm`` + ``post_attention_layernorm``
   + ``mlp``). A per-position ``audio_token_mask`` of shape ``[B, S]`` selects
   between the two. The mask is the union of positions where the input token id
-  equals ``audio_token_id=128016`` or ``audio_delay_token_id=128014``; see
-  ``UPSTREAM_TRACE.md`` for the full derivation.
+  equals ``audio_token_id=128016`` or ``audio_delay_token_id=128014``.
 
 - Multi-codebook output head: at audio positions, Stage 0 emits one ID per
   codebook (8 codebooks of vocabulary 1026 each). Codebook 0 comes from the
@@ -32,8 +31,8 @@ source and the boson-ai checkpoint config.json):
 
 This file delivers the structural pieces (module classes, weight mapping,
 forward pass, AR sampler dispatch, and the upstream delay-pattern logits
-processor). See ``UPSTREAM_TRACE.md`` in the same directory for the contract
-this implementation must reproduce.
+processor) to reproduce the upstream behavior under vLLM's compiled forward
+path.
 """
 
 from __future__ import annotations
@@ -197,8 +196,7 @@ class HiggsAudioV2DecoderLayer(LlamaDecoderLayer):
     for the self-attention path (so PagedAttention KV caches keep working) and
     overlays the upstream HiggsAudioV2 DualFFN routing for the layernorm + MLP
     pairs. The implementation follows the upstream rule from
-    ``transformers.models.higgs_audio_v2.HiggsAudioV2DecoderLayer.forward``
-    described in ``UPSTREAM_TRACE.md``:
+    ``transformers.models.higgs_audio_v2.HiggsAudioV2DecoderLayer.forward``:
 
     1. Pre-attention norm: per-position split into ``audio_input_layernorm``
        (audio mask True) vs ``input_layernorm`` (audio mask False). The mixed
@@ -403,14 +401,9 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
       4. ``load_weights`` HF -> vLLM mapping (GQA reshape, llama3 RoPE,
          text/audio MLP split, audio code heads, audio token embeddings).
 
-    NOTE: The forward path that interleaves DualFFN routing with vLLM's
-    compiled attention path is the largest single integration concern in this
-    package and is gated on the reference fixtures + the upstream-trace
-    runtime instrumentation (see ``UPSTREAM_TRACE.md``). This file lays down
-    the structural scaffold; subsequent rounds will harden the forward path
-    and the AR hot loop. The class is registered so the rest of the wiring
-    (pipeline_registry, serving_speech, deploy yaml, stage_input_processor)
-    can be smoke-tested end-to-end as soon as the runtime is exercised.
+    The forward path interleaves DualFFN routing with vLLM's compiled
+    attention path so the talker integrates with the rest of the wiring
+    (pipeline_registry, serving_speech, deploy yaml, stage_input_processor).
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -925,14 +918,9 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
 
         - Text-position logits come from ``lm_head`` (128256-wide Llama vocab).
         - Audio-position logits at audio_token_id placeholders are also
-          read from ``lm_head`` for now; the per-position codebook-0
-          routing path described in ``UPSTREAM_TRACE.md`` lives in
-          :meth:`audio_codebook0_logits` and is consumed by a separate
-          codebook-0 sampling adapter (round-6 follow-up). The previous
-          dict-return form broke the AR runner's
-          ``compute_logits(...).contiguous()`` contract; this restores
-          tensor-only output so the engine can boot the talker even before
-          the dedicated audio-sampler dispatch lands.
+          read from ``lm_head``; the per-position codebook-0 routing path
+          lives in :meth:`audio_codebook0_logits` and is consumed by a
+          separate codebook-0 sampling adapter.
 
         Call :meth:`audio_codebook0_logits` for the audio-side 1026-wide
         head; that helper is exercised by unit tests + the upcoming
