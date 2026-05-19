@@ -119,21 +119,28 @@ PROCESS_KILL_ERROR_KEYWORDS = (
 RUNTIME_WORKER_PATTERN = "VLLM::"
 # RFC#2366 signal x target matrix:
 # - worker: SIGTERM, SIGKILL
-# - serve-root: SIGINT (Ctrl+C on root only); SIGTERM/SIGKILL skipped (residual process)
-# - serve-tree: SIGTERM/SIGKILL; tree with-load SIGTERM skipped (issue#3683)
+# - serve-root no-load: SIGINT; SIGTERM/SIGKILL skipped (vllm issue#43060)
+# - serve-root with-load: SIGINT; SIGTERM skipped (issue#3683); SIGKILL skipped (issue#43060)
+# - serve-tree no-load: SIGTERM/SIGKILL
+# - serve-tree with-load: SIGKILL; SIGTERM skipped (issue#3683)
 _SERVE_ROOT_NON_SIGINT_SKIP = pytest.mark.skip(reason="vllm issue#43060")
-_TREE_WITH_LOAD_SIGTERM_SKIP = pytest.mark.skip(reason="issue#3683")
+_WITH_LOAD_SIGTERM_SKIP = pytest.mark.skip(reason="issue#3683")
 SERVE_SIGNAL_PARAMS = [
     pytest.param("SIGTERM", id="sigterm"),
     pytest.param("SIGINT", id="sigint"),
     pytest.param("SIGKILL", id="sigkill", marks=_SERVE_ROOT_NON_SIGINT_SKIP),
+]
+SERVE_WITH_LOAD_SIGNAL_PARAMS = [
+    pytest.param("SIGTERM", id="sigterm", marks=_WITH_LOAD_SIGTERM_SKIP),
+    pytest.param("SIGINT", id="sigint", marks=_WITH_LOAD_SIGTERM_SKIP),
+    pytest.param("SIGKILL", id="sigkill", marks=_WITH_LOAD_SIGTERM_SKIP),
 ]
 TREE_SIGNAL_PARAMS = [
     pytest.param("SIGTERM", id="sigterm"),
     pytest.param("SIGKILL", id="sigkill"),
 ]
 TREE_WITH_LOAD_SIGNAL_PARAMS = [
-    pytest.param("SIGTERM", id="sigterm", marks=_TREE_WITH_LOAD_SIGTERM_SKIP),
+    pytest.param("SIGTERM", id="sigterm", marks=_WITH_LOAD_SIGTERM_SKIP),
     pytest.param("SIGKILL", id="sigkill"),
 ]
 WORKER_SIGNAL_FAULT_PARAMS = [
@@ -667,9 +674,8 @@ def test_reliability_fault_process_kill_serve_root_no_load_fast_fail_and_cleanup
 
 @pytest.mark.slow
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.skip(reason="issue#3683")
 @pytest.mark.skipif(os.name == "nt", reason="process-kill injection helper is POSIX-only")
-@pytest.mark.parametrize("signal_name", SERVE_SIGNAL_PARAMS)
+@pytest.mark.parametrize("signal_name", SERVE_WITH_LOAD_SIGNAL_PARAMS)
 @pytest.mark.parametrize("omni_server_function", QWEN_PARAMS, indirect=True)
 def test_reliability_fault_process_kill_serve_root_with_load_fast_fail_and_cleanup(
     omni_server_function,
