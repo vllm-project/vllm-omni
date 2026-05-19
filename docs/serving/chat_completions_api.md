@@ -1,4 +1,4 @@
-# Diffusion Chat Completions API
+# Chat Completions API
 
 vLLM-Omni supports generating and editing images via the `/v1/chat/completions`
 endpoint using diffusion models. This page explains how to pass generation
