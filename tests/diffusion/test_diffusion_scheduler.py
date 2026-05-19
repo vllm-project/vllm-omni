@@ -817,12 +817,20 @@ def _make_stream_request(
     *,
     num_inference_steps: int = 2,
     num_chunks: int = 1,
+    chunk_frames: int = 1,
 ) -> OmniDiffusionRequest:
+    """``num_chunks`` is a test-helper shorthand for ``num_frames / chunk_frames``."""
+    num_frames = num_chunks * chunk_frames
+    video = [torch.zeros(3, 8, 8) for _ in range(num_frames)]
     return OmniDiffusionRequest(
-        prompts=[f"prompt_{req_id}"],
+        prompts=[{
+            "prompt": f"prompt_{req_id}",
+            "multi_modal_data": {"video": video},
+        }],
         sampling_params=OmniDiffusionSamplingParams(
             num_inference_steps=num_inference_steps,
-            num_chunks=num_chunks,
+            chunk_frames=chunk_frames,
+            num_frames=num_frames,
         ),
         request_ids=[req_id],
     )
@@ -849,11 +857,11 @@ def _make_od_config(pp_size: int) -> SimpleNamespace:
 
 
 def _ranks(sched_output) -> list[tuple[str, list[int]] | None]:
-    if sched_output.per_rank_assignment is None:
+    if sched_output.assignment is None:
         return []
     return [
         (t.sched_req_id, list(t.chunk_indices)) if t is not None else None
-        for t in sched_output.per_rank_assignment
+        for t in sched_output.assignment
     ]
 
 
@@ -863,7 +871,7 @@ def _layout(sched_output, sched_req_id: str) -> tuple[int, int, int] | None:
     layout = sched_output.rank0_layouts.get(sched_req_id)
     if layout is None:
         return None
-    return (layout.n_finished, layout.n_circulating, layout.n_new)
+    return (len(layout.finished_idxs), layout.n_circulating, len(layout.new_idxs))
 
 
 class TestStreamBatchScheduler:
@@ -1041,13 +1049,13 @@ class TestStreamBatchScheduler:
         scheduler.update_from_output(out1, _make_stream_output(req_id, finished=True))
 
         scheduler.pop_request_state(req_id)
-        assert req_id not in scheduler._chunk_progress
+        assert req_id not in scheduler._progress
         assert scheduler.has_requests() is False
 
     def test_schedule_with_no_requests_emits_no_assignment(self) -> None:
         scheduler = self._make_scheduler(pp_size=2)
         out = scheduler.schedule()
-        assert out.per_rank_assignment is None
+        assert out.assignment is None
         assert out.rank0_layouts is None
         assert out.scheduled_req_ids == []
 
@@ -1063,7 +1071,8 @@ class TestStreamBatchScheduler:
 
         out1 = scheduler.schedule()
         assert _new_ids(out1) == []
-        scheduler.update_from_output(out1, _make_stream_output(req_a, finished=True))
+        finished = scheduler.update_from_output(out1, _make_stream_output(req_a, finished=True))
+        scheduler.pop_request_state(req_a)
 
         out2 = scheduler.schedule()
         assert _new_ids(out2) == [req_b]
@@ -1124,22 +1133,22 @@ class TestStreamBatchScheduler:
         assert _ranks(out1) == [(req_id, [1]), (req_id, [0])]
         scheduler.update_from_output(out1, _make_stream_output(req_id))
 
-        before = scheduler._chunk_progress[req_id]
-        assert before.chunks_admitted == 2
+        before = scheduler._progress[req_id]
+        assert before.next_chunk_idx == 2
         snapshot = [[c.chunk_idx for c in q] for q in before.chunks_at]
         assert snapshot == [[1], [0]]
 
         assert scheduler.preempt_request(req_id) is True
         assert scheduler.get_request_state(req_id).status == DiffusionRequestStatus.PREEMPTED
 
-        after = scheduler._chunk_progress[req_id]
-        assert after.chunks_admitted == 2
+        after = scheduler._progress[req_id]
+        assert after.next_chunk_idx == 2
         assert [[c.chunk_idx for c in q] for q in after.chunks_at] == snapshot
 
     def test_b_admission(self) -> None:
         scheduler = self._make_scheduler(pp_size=1)
         req_id = scheduler.add_request(_make_stream_request("b", num_inference_steps=2, num_chunks=4))
-        scheduler._slo.register(req_id, slo_fps=30.0, max_batch=4, ema_alpha=0.3, chunk_frames=1)
+        scheduler._slo.register(req_id, slo_fps=30.0, max_batch=4, chunk_frames=1)
         scheduler._slo._reqs[req_id].batch_size = 2
 
         out0 = scheduler.schedule()
