@@ -137,17 +137,20 @@ function Set-OmniEnvironment {
 
 function Download-HfSnapshot {
     param([string]$PythonExe, [string]$RepoId, [string]$LocalDir)
+    $env:VLLM_OMNI_BOOTSTRAP_MODEL_ID = $RepoId
+    $env:VLLM_OMNI_BOOTSTRAP_MODEL_LOCAL_DIR = $LocalDir
     $code = @"
+import os
 from huggingface_hub import snapshot_download
 
 kwargs = {
-    "repo_id": r"$RepoId",
-    "resume_download": True,
+    'repo_id': os.environ['VLLM_OMNI_BOOTSTRAP_MODEL_ID'],
+    'resume_download': True,
 }
-if r"$LocalDir":
-    kwargs["local_dir"] = r"$LocalDir"
+if os.environ.get('VLLM_OMNI_BOOTSTRAP_MODEL_LOCAL_DIR'):
+    kwargs['local_dir'] = os.environ['VLLM_OMNI_BOOTSTRAP_MODEL_LOCAL_DIR']
 snapshot_download(**kwargs)
-print("Downloaded", r"$RepoId")
+print('Downloaded', os.environ['VLLM_OMNI_BOOTSTRAP_MODEL_ID'])
 "@
     Invoke-Native $PythonExe "-c" $code
 }
