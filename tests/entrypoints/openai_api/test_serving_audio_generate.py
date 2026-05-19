@@ -1,13 +1,16 @@
-# tests/entrypoints/openai_api/test_serving_audio_generate.py
 import logging
 from inspect import Signature, signature
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import torch
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
+from vllm.v1.engine.exceptions import EngineGenerateError
 
+from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
+from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai.protocol.audio import (
     CreateAudio,
     OpenAICreateAudioGenerateRequest,
@@ -104,6 +107,29 @@ def test_app():
 @pytest.fixture
 def client(test_app):
     return TestClient(test_app)
+
+
+def _make_api_server_test_app(handler, *, request_id: str = "audio-gen-req-1"):
+    app = FastAPI()
+    app.state.openai_serving_audio_generate = handler
+    app.state.engine_client = SimpleNamespace(
+        engine=SimpleNamespace(is_alive=lambda: False),
+        errored=True,
+    )
+    app.state.server = SimpleNamespace()
+
+    @app.middleware("http")
+    async def add_request_metadata(request: Request, call_next):
+        request.state.request_metadata = SimpleNamespace(request_id=request_id)
+        return await call_next(request)
+
+    app.add_api_route(
+        "/v1/audio/generate",
+        api_server_module.create_audio_generate,
+        methods=["POST"],
+        response_model=None,
+    )
+    return app
 
 
 # Request Validation (Pydantic model)
@@ -389,7 +415,7 @@ class TestErrorHandling:
 
         async def empty_gen(*args, **kwargs):
             return
-            yield  # noqa: unreachable – makes this an async generator
+            yield  # unreachable – makes this an async generator
 
         engine.generate = MagicMock(side_effect=empty_gen)
         server = _make_server(engine_client=engine)
@@ -448,7 +474,7 @@ class TestErrorHandling:
 
         async def gen_value_error(*args, **kwargs):
             raise ValueError("bad value")
-            yield  # noqa: unreachable
+            yield  # unreachable
 
         engine.generate = MagicMock(side_effect=gen_value_error)
         server = _make_server(engine_client=engine)
@@ -463,7 +489,7 @@ class TestErrorHandling:
 
         async def gen_runtime_error(*args, **kwargs):
             raise RuntimeError("something went wrong")
-            yield  # noqa: unreachable
+            yield  # unreachable
 
         engine.generate = MagicMock(side_effect=gen_runtime_error)
         server = _make_server(engine_client=engine)
@@ -471,6 +497,35 @@ class TestErrorHandling:
         resp = await server.create_audio_generate(req)
 
         assert "Audio generation failed" in resp.error.message
+
+    @pytest.mark.parametrize(
+        ("exc", "expected_message", "expected_stage_id"),
+        [
+            (OmniEngineDeadError("engine dead", error_stage_id=2), "engine dead", 2),
+            (EngineGenerateError("engine generate failed"), "engine generate failed", None),
+        ],
+    )
+    def test_api_server_engine_error_response_includes_request_and_stage_id(
+        self,
+        exc,
+        expected_message,
+        expected_stage_id,
+    ):
+        handler = MagicMock()
+        handler.create_audio_generate = AsyncMock(side_effect=exc)
+        app = _make_api_server_test_app(handler)
+
+        with patch.object(api_server_module, "terminate_if_errored") as terminate_mock:
+            with TestClient(app) as client:
+                response = client.post("/v1/audio/generate", json={"input": "Hello"})
+
+        assert response.status_code == 500
+        payload = response.json()
+        assert payload["error"]["message"] == expected_message
+        assert payload["error"]["code"] == 500
+        assert payload["error"]["request_id"] == "audio-gen-req-1"
+        assert payload["error"]["error_stage_id"] == expected_stage_id
+        terminate_mock.assert_called_once()
 
 
 # End-to-End via TestClient

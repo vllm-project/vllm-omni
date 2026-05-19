@@ -5,6 +5,7 @@ import pytest
 from vllm import SamplingParams
 
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine.messages import OutputMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 from vllm_omni.engine.stage_pool import StagePool
@@ -225,11 +226,12 @@ def test_forward_to_diffusion_returns_terminal_error_for_empty_custom_inputs():
     assert diffusion_stage.calls == []
     assert len(orchestrator.output_async_queue.items) == 1
     terminal_msg = orchestrator.output_async_queue.items[0]
-    assert terminal_msg["type"] == "output"
-    assert terminal_msg["request_id"] == "req-empty"
-    assert terminal_msg["stage_id"] == 1
-    assert terminal_msg["finished"] is True
-    assert "produced no valid inputs" in terminal_msg["engine_outputs"].error
+    assert isinstance(terminal_msg, OutputMessage)
+    assert terminal_msg.type == "output"
+    assert terminal_msg.request_id == "req-empty"
+    assert terminal_msg.stage_id == 1
+    assert terminal_msg.finished is True
+    assert "produced no valid inputs" in terminal_msg.engine_outputs.error
     assert "req-empty" not in orchestrator.request_states
 
 

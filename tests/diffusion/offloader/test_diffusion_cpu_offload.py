@@ -5,6 +5,7 @@ import pytest
 import torch
 from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
 
+from tests.helpers import skip_if_gated_repo_inaccessible
 from tests.helpers.env import DeviceMemoryMonitor
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
@@ -20,6 +21,11 @@ IMAGE_VIDEO_MODELS = {
 }
 
 MODELS = {**AUDIO_MODEL, **IMAGE_VIDEO_MODELS}
+
+_GATED_MODELS = {"stabilityai/stable-audio-open-1.0"}
+
+# Aliased for backward compatibility (imported by test_diffusion_layerwise_offload.py).
+_skip_if_gated_repo_inaccessible = skip_if_gated_repo_inaccessible
 
 AUDIO_MODEL_PARAMS = {
     "runner_params": {},
@@ -94,10 +100,23 @@ def check_audio_determinism(audio1, audio2, atol=1e-2):
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"})
 @pytest.mark.parametrize("model_name", list(MODELS.keys()))
 def test_cpu_offload_diffusion_model(model_name: str):
+    if model_name in _GATED_MODELS:
+        _skip_if_gated_repo_inaccessible(model_name)
     try:
         offload_peak_memory, output_offload = inference(model_name, offload=True)
         cleanup_dist_env_and_memory()
         no_offload_peak_memory, output_no_offload = inference(model_name, offload=False)
+    except ValueError as exc:
+        # omni_snapshot_download wraps GatedRepoError in a ValueError.
+        # If the pre-flight guard above did not catch it (e.g. partial
+        # HF_TOKEN where config.json is accessible but weight shards are
+        # blocked), skip instead of failing.
+        if "Access to model" in str(exc) and "is restricted" in str(exc):
+            pytest.skip(
+                f"Skipping: gated HF repo {model_name!r} inaccessible "
+                f"({exc}). See docs/contributing/ci/hf_credentials.md."
+            )
+        pytest.fail(f"Inference failed: {exc}")
     except Exception:
         pytest.fail("Inference failed")
     print(f"Offload peak memory: {offload_peak_memory} MB")
