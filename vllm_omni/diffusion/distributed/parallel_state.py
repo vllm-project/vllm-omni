@@ -746,11 +746,6 @@ def initialize_model_parallel(
             f" but got {sequence_parallel_size} != {ring_degree} * {ulysses_degree}"
         )
 
-    # FIXME: Since the async p2p communication operation of NPU is not same as cuda in torch,
-    # the pipefusion is not ready for npu yet
-    if current_omni_platform.is_npu():
-        assert pipeline_parallel_size == 1, "Current pipefusion is not ready for NPU"
-
     dit_parallel_size = (
         data_parallel_size * cfg_parallel_size * sequence_parallel_size * pipeline_parallel_size * tensor_parallel_size
     )
