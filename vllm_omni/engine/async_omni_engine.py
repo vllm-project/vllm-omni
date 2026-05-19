@@ -100,8 +100,7 @@ from vllm_omni.engine.stage_init_utils import (
     load_omni_transfer_config_for_model,
     prepare_engine_environment,
     release_device_locks,
-    setup_stage_devices,
-    stage_runtime_env,
+    stage_runtime_setup,
     terminate_alive_proc,
 )
 from vllm_omni.engine.stage_pool import StagePool, StagePoolClient
@@ -876,11 +875,10 @@ class AsyncOmniEngine:
                     with llm_stage_launch_lock:
                         previous_visible_devices = os.environ.get(device_control_env)
                         try:
-                            with stage_runtime_env(
+                            with stage_runtime_setup(
                                 plan.metadata.stage_id,
-                                cast(dict[str, Any], plan.metadata.runtime_cfg or {}),
+                                plan.metadata.runtime_cfg,
                             ):
-                                setup_stage_devices(plan.metadata.stage_id, plan.metadata.runtime_cfg)
                                 vllm_config = plan.stage_vllm_config
                                 executor_class = plan.executor_class
                                 assert vllm_config is not None
@@ -1022,11 +1020,10 @@ class AsyncOmniEngine:
                 with stage_launch_lock:
                     previous_visible_devices = os.environ.get(device_control_env)
                     try:
-                        with stage_runtime_env(
+                        with stage_runtime_setup(
                             plan.metadata.stage_id,
-                            cast(dict[str, Any], plan.metadata.runtime_cfg or {}),
+                            plan.metadata.runtime_cfg,
                         ):
-                            setup_stage_devices(plan.metadata.stage_id, plan.metadata.runtime_cfg)
                             omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
                             if omni_conn_cfg:
                                 inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)

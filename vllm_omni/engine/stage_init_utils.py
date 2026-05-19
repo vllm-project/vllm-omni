@@ -16,7 +16,7 @@ import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
@@ -637,20 +637,42 @@ def setup_stage_devices(stage_id: int, runtime_cfg: Any) -> None:
 
 
 @contextmanager
-def stage_runtime_env(stage_id: int, runtime_cfg: dict[str, Any]) -> Generator[None, None, None]:
+def stage_runtime_setup(stage_id: int, runtime_cfg: Any) -> Generator[None, None, None]:
+    """Apply per-stage ``runtime.env`` and ``runtime.devices`` for the context.
+
+    Restores ``runtime.env`` on exit. Device visibility restore remains the
+    caller's responsibility (e.g. ``AsyncOmniEngine`` saves/restores the
+    platform device-control env var around this block).
+    """
+    with stage_runtime_env(stage_id, runtime_cfg):
+        setup_stage_devices(stage_id, runtime_cfg)
+        yield
+
+
+@contextmanager
+def stage_runtime_env(stage_id: int, runtime_cfg: Any) -> Generator[None, None, None]:
     """Apply per-stage ``runtime.env`` for the duration of the context."""
-    runtime_env = runtime_cfg.get("env")
-    if runtime_env is None:
+    if runtime_cfg is None:
+        runtime_cfg = {}
+    elif not isinstance(runtime_cfg, dict):
+        runtime_cfg = cast(dict[str, Any], _to_dict(runtime_cfg))
+
+    raw_env = runtime_cfg.get("env")
+    if raw_env is None:
         yield
         return
-    if not isinstance(runtime_env, dict):
-        logger.warning(
-            "[stage_init] Stage-%s ignored runtime.env with unsupported type %s",
-            stage_id,
-            type(runtime_env).__name__,
-        )
-        yield
-        return
+    if isinstance(raw_env, dict):
+        runtime_env = cast(dict[str, Any], raw_env)
+    else:
+        runtime_env = cast(dict[str, Any], _to_dict(raw_env))
+        if not runtime_env:
+            logger.warning(
+                "[stage_init] Stage-%s ignored runtime.env with unsupported type %s",
+                stage_id,
+                type(raw_env).__name__,
+            )
+            yield
+            return
 
     previous_env: dict[str, str | None] = {}
     for key, value in runtime_env.items():
