@@ -1,5 +1,6 @@
 """Server/client/runner runtime primitives for tests."""
 
+import asyncio
 import base64
 import concurrent.futures
 import copy
@@ -19,6 +20,7 @@ from dataclasses import asdict, dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, NamedTuple
+from urllib.parse import quote
 
 import psutil
 import requests
@@ -37,6 +39,7 @@ from vllm.logger import init_logger
 from tests.helpers.assertions import (
     assert_audio_speech_response,
     assert_diffusion_response,
+    assert_http_error,
     assert_omni_response,
 )
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
@@ -84,6 +87,16 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
             torch._C._host_emptyCache()
         except AttributeError:
             logger.warning("torch._C._host_emptyCache() only available in Pytorch >=2.5")
+
+
+def _parse_response_json(r: requests.Response) -> dict[str, Any] | list[Any] | None:
+    try:
+        data = r.json()
+        if isinstance(data, (dict, list)):
+            return data
+    except Exception:
+        pass
+    return None
 
 
 def _split_request_config_by_per_output_sizes(cfg: dict[str, Any]) -> list[dict[str, Any]] | None:
@@ -647,6 +660,8 @@ class OmniServerStageCli(OmniServer):
 
 @dataclass
 class OmniResponse:
+    """Decoded multimodal / chat output from the OpenAI SDK or offline runner (not raw ``requests``)."""
+
     text_content: str | None = None
     audio_data: list[str] | None = None
     audio_content: str | None = None
@@ -656,16 +671,15 @@ class OmniResponse:
     #: OpenAI client call through response parsing and local post-process (e.g. audio decode).
     e2e_latency: float | None = None
     success: bool = False
-    error_message: str | None = None
     prompt_tokens: int | None = None
     cached_tokens: int | None = None
-    # Set for HTTP-level assertions (e.g. ``assert_audio_speech_response`` with ``status_code`` in config).
-    status_code: int | None = None
     logprobs: list | None = None
 
 
 @dataclass
 class DiffusionResponse:
+    """Decoded diffusion output from chat completions or offline runner (not raw ``requests``)."""
+
     text_content: str | None = None
     images: list[Image.Image] | None = None
     audios: list[Any] | None = None
@@ -674,7 +688,67 @@ class DiffusionResponse:
     #: ``chat.completions.create`` through local image / audio decode.
     e2e_latency: float | None = None
     success: bool = False
+
+
+@dataclass
+class HttpResponse:
+    """Normalized view of a ``requests`` response from :class:`OpenAIClientHandler` HTTP helpers."""
+
+    status_code: int
+    success: bool
     error_message: str | None = None
+    json_body: dict[str, Any] | list[Any] | None = None
+
+
+@dataclass
+class WebSocketJsonResponse:
+    """First JSON object delivered as a text WebSocket frame (streaming endpoints)."""
+
+    json_body: dict[str, Any]
+
+
+def _merge_http_expectation_kwargs(
+    base: dict[str, Any] | None,
+    *,
+    err_code: int | tuple[int, ...] | list[int] | None = None,
+    err_message: str | tuple[str, ...] | list[str] | None = None,
+) -> dict[str, Any]:
+    cfg = dict(base or {})
+    if err_code is not None:
+        cfg["err_code"] = err_code
+    if err_message is not None:
+        cfg["err_message"] = err_message
+    return cfg
+
+
+def _merge_ws_expectation_kwargs(
+    base: dict[str, Any] | None,
+    *,
+    err_message: str | tuple[str, ...] | list[str] | None = None,
+    ws_json_type: str | None = None,
+    ws_error_code: str | None = None,
+) -> dict[str, Any]:
+    cfg = dict(base or {})
+    if err_message is not None:
+        cfg["err_message"] = err_message
+    if ws_json_type is not None:
+        cfg["ws_json_type"] = ws_json_type
+    if ws_error_code is not None:
+        cfg["ws_error_code"] = ws_error_code
+    return cfg
+
+
+def _run_ws_expectations_from_request_config(cfg: dict[str, Any], resp: WebSocketJsonResponse) -> None:
+    jb = resp.json_body
+    want_type = cfg.get("ws_json_type")
+    if want_type is not None:
+        assert jb.get("type") == want_type, (jb, want_type)
+    want_code = cfg.get("ws_error_code")
+    if want_code is not None:
+        assert jb.get("code") == want_code, (jb, want_code)
+    err_message = cfg.get("err_message")
+    if err_message is not None:
+        assert_http_error(resp, err_message=err_message, websocket_json_message=True)
 
 
 def _merge_diffusion_responses(parts: list[DiffusionResponse]) -> DiffusionResponse:
@@ -739,8 +813,8 @@ class OpenAIClientHandler:
             result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
         except Exception as e:
-            result.error_message = f"Stream processing error: {str(e)}"
-            print(f"Error: {result.error_message}")
+            msg = f"Stream processing error: {str(e)}"
+            print(f"Error: {msg}")
         return result
 
     def _process_non_stream_omni_response(self, chat_completion, *, wall_start: float) -> OmniResponse:
@@ -771,8 +845,8 @@ class OpenAIClientHandler:
                 result.logprobs = chat_completion.choices[0].logprobs.content
             result.success = True
         except Exception as e:
-            result.error_message = f"Non-stream processing error: {str(e)}"
-            print(f"Error: {result.error_message}")
+            msg = f"Non-stream processing error: {str(e)}"
+            print(f"Error: {msg}")
         return result
 
     def _process_diffusion_response(self, chat_completion, *, wall_start: float) -> DiffusionResponse:
@@ -811,11 +885,592 @@ class OpenAIClientHandler:
             result.e2e_latency = time.perf_counter() - wall_start
             result.success = True
         except Exception as e:
-            result.error_message = f"Diffusion response processing error: {str(e)}"
-            print(f"Error: {result.error_message}")
+            msg = f"Diffusion response processing error: {str(e)}"
+            print(f"Error: {msg}")
         return result
 
+    def _http_response_from_requests(self, r: requests.Response) -> HttpResponse:
+        payload = _parse_response_json(r)
+        ok = 200 <= r.status_code < 300
+        return HttpResponse(
+            status_code=r.status_code,
+            success=ok,
+            error_message=None if ok else (r.text[:8000] if r.text else None),
+            json_body=payload,
+        )
+
+    def send_health_http_request(
+        self,
+        request_config: dict[str, Any] | None = None,
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """GET ``/health`` (raw ``requests``).
+
+        ``request_config``: optional ``timeout`` plus optional ``err_code`` / ``err_message`` for
+        :func:`~tests.helpers.assertions.assert_http_error` (also as keyword-only args).
+        """
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = requests.get(self._build_url("/health"), timeout=float(cfg.get("timeout", 120.0)))
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_models_http_request(
+        self,
+        request_config: dict[str, Any] | None = None,
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """GET ``/v1/models``. Optional ``timeout`` and HTTP assertions (see :func:`~tests.helpers.assertions.assert_http_error`)."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = requests.get(
+            self._build_url("/v1/models"),
+            headers={"Accept": "application/json"},
+            timeout=float(cfg.get("timeout", 120.0)),
+        )
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_chat_completions_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """POST ``/v1/chat/completions`` with ``json`` or ``raw_body`` (malformed-body / contract tests)."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_json_endpoint("/v1/chat/completions", cfg, default_timeout=120.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_omni_sleep_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """POST ``/v1/omni/sleep`` — ``json`` or ``raw_body``, ``timeout``."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_json_endpoint("/v1/omni/sleep", cfg, default_timeout=120.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_omni_wakeup_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """POST ``/v1/omni/wakeup``."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_json_endpoint("/v1/omni/wakeup", cfg, default_timeout=120.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_audio_voices_list_http_request(
+        self,
+        request_config: dict[str, Any] | None = None,
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """GET ``/v1/audio/voices``."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = requests.get(
+            self._build_url("/v1/audio/voices"),
+            headers={"Accept": "application/json"},
+            timeout=float(cfg.get("timeout", 120.0)),
+        )
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_audio_voices_create_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """POST ``/v1/audio/voices`` (multipart): ``data`` / ``files`` / ``timeout``."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_form_endpoint("/v1/audio/voices", cfg, default_timeout=120.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_audio_voices_delete_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """DELETE ``/v1/audio/voices/{name}`` — requires ``name``, optional ``timeout``."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        name = cfg["name"]
+        timeout = float(cfg.get("timeout", 120.0))
+        path = f"/v1/audio/voices/{quote(str(name), safe='')}"
+        r = requests.delete(
+            self._build_url(path),
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        )
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_audio_speech_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """POST ``/v1/audio/speech`` with ``json`` or ``raw_body``."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_json_endpoint("/v1/audio/speech", cfg, default_timeout=120.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_audio_speech_batch_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """POST ``/v1/audio/speech/batch``."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_json_endpoint("/v1/audio/speech/batch", cfg, default_timeout=120.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_audio_generate_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """POST ``/v1/audio/generate``."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_json_endpoint("/v1/audio/generate", cfg, default_timeout=120.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_images_generations_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """POST ``/v1/images/generations`` — ``json`` or ``raw_body``, ``timeout``."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_json_endpoint("/v1/images/generations", cfg, default_timeout=300.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_images_edits_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """POST ``/v1/images/edits`` — ``data`` / ``files`` / ``timeout``."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_form_endpoint("/v1/images/edits", cfg, default_timeout=300.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_videos_create_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """POST ``/v1/videos`` (async job) — multipart ``data`` / ``files``."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_form_endpoint("/v1/videos", cfg, default_timeout=120.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_videos_sync_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """POST ``/v1/videos/sync``."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = self._post_form_endpoint("/v1/videos/sync", cfg, default_timeout=120.0)
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_videos_list_http_request(
+        self,
+        request_config: dict[str, Any] | None = None,
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """GET ``/v1/videos`` — optional ``params``, ``timeout``."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        r = requests.get(
+            self._build_url("/v1/videos"),
+            params=cfg.get("params"),
+            headers={"Accept": "application/json"},
+            timeout=float(cfg.get("timeout", 120.0)),
+        )
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_video_retrieve_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """GET ``/v1/videos/{video_id}``."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        video_id = cfg["video_id"]
+        timeout = float(cfg.get("timeout", 120.0))
+        r = requests.get(
+            self._build_url(f"/v1/videos/{quote(str(video_id), safe='')}"),
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        )
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_video_delete_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """DELETE ``/v1/videos/{video_id}``."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        video_id = cfg["video_id"]
+        timeout = float(cfg.get("timeout", 120.0))
+        r = requests.delete(
+            self._build_url(f"/v1/videos/{quote(str(video_id), safe='')}"),
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+        )
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def send_video_content_http_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_code: int | tuple[int, ...] | list[int] | None = None,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[HttpResponse]:
+        """GET ``/v1/videos/{video_id}/content``."""
+        cfg = _merge_http_expectation_kwargs(
+            request_config,
+            err_code=err_code,
+            err_message=err_message,
+        )
+        video_id = cfg["video_id"]
+        timeout = float(cfg.get("timeout", 120.0))
+        r = requests.get(
+            self._build_url(f"/v1/videos/{quote(str(video_id), safe='')}/content"),
+            timeout=timeout,
+        )
+        resp = self._http_response_from_requests(r)
+        assert_http_error(
+            resp,
+            err_code=cfg.get("err_code"),
+            err_message=cfg.get("err_message"),
+        )
+        return [resp]
+
+    def _build_ws_url(self, path: str) -> str:
+        """Turn HTTP ``base_url`` into ``ws`` / ``wss`` for WebSocket helpers."""
+        base = self.base_url.rstrip("/")
+        suffix = "/" + path.lstrip("/")
+        if base.startswith("http://"):
+            return "ws://" + base.removeprefix("http://") + suffix
+        if base.startswith("https://"):
+            return "wss://" + base.removeprefix("https://") + suffix
+        raise ValueError(f"Unsupported base_url for WebSocket: {base!r}")
+
+    def _send_websocket_first_json_request(
+        self,
+        path: str,
+        cfg: dict[str, Any],
+    ) -> list[WebSocketJsonResponse]:
+        """Connect, optionally send text frames, return first JSON text frame as :class:`WebSocketJsonResponse`.
+
+        ``request_config`` keys:
+
+        - ``send_frames``: optional ``str`` or sequence of ``str`` raw WebSocket text frames (omit when the server
+          speaks first, e.g. ``/v1/realtime`` rejection path).
+        - ``timeout``: seconds to wait for the first inbound text frame (default ``120``).
+        - ``ws_max_size``: passed through as ``max_size`` to :func:`websockets.connect` when the key is present.
+        """
+        send_frames_raw = cfg.get("send_frames")
+        if send_frames_raw is None:
+            frames: list[str] = []
+        elif isinstance(send_frames_raw, str):
+            frames = [send_frames_raw]
+        else:
+            frames = list(send_frames_raw)
+
+        timeout = float(cfg.get("timeout", 120.0))
+        uri = self._build_ws_url(path)
+
+        connect_kw: dict[str, Any] = {}
+        if "ws_max_size" in cfg:
+            connect_kw["max_size"] = cfg["ws_max_size"]
+
+        async def _recv_first_json_object() -> WebSocketJsonResponse:
+            import websockets
+
+            async with websockets.connect(uri, **connect_kw) as ws:
+                for frame in frames:
+                    await ws.send(frame)
+                raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+                if not isinstance(raw, str):
+                    raise AssertionError(f"Expected JSON text frame from {uri}, got {type(raw).__name__}")
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise AssertionError(f"Expected JSON text frame from {uri}, body={raw[:500]!r}") from exc
+                if not isinstance(data, dict):
+                    raise AssertionError(f"Expected JSON object from {uri}, got {type(data).__name__}")
+                return WebSocketJsonResponse(json_body=data)
+
+        resp = asyncio.run(_recv_first_json_object())
+        _run_ws_expectations_from_request_config(cfg, resp)
+        return [resp]
+
+    def send_audio_speech_stream_ws_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+        ws_json_type: str | None = None,
+        ws_error_code: str | None = None,
+    ) -> list[WebSocketJsonResponse]:
+        """WebSocket ``/v1/audio/speech/stream`` — send ``send_frames`` then read first JSON text frame."""
+        cfg = _merge_ws_expectation_kwargs(
+            request_config,
+            err_message=err_message,
+            ws_json_type=ws_json_type,
+            ws_error_code=ws_error_code,
+        )
+        return self._send_websocket_first_json_request("/v1/audio/speech/stream", cfg)
+
+    def send_video_chat_stream_ws_request(
+        self,
+        request_config: dict[str, Any],
+        *,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+        ws_json_type: str | None = None,
+        ws_error_code: str | None = None,
+    ) -> list[WebSocketJsonResponse]:
+        """WebSocket ``/v1/video/chat/stream`` — send ``send_frames`` then read first JSON text frame."""
+        cfg = _merge_ws_expectation_kwargs(
+            request_config,
+            err_message=err_message,
+            ws_json_type=ws_json_type,
+            ws_error_code=ws_error_code,
+        )
+        return self._send_websocket_first_json_request("/v1/video/chat/stream", cfg)
+
+    def send_realtime_ws_request(
+        self,
+        request_config: dict[str, Any] | None = None,
+        *,
+        err_message: str | tuple[str, ...] | list[str] | None = None,
+        ws_json_type: str | None = None,
+        ws_error_code: str | None = None,
+    ) -> list[WebSocketJsonResponse]:
+        """WebSocket ``/v1/realtime`` — optional outbound frames, then first JSON text frame (often server-initiated)."""
+        cfg = _merge_ws_expectation_kwargs(
+            request_config,
+            err_message=err_message,
+            ws_json_type=ws_json_type,
+            ws_error_code=ws_error_code,
+        )
+        return self._send_websocket_first_json_request("/v1/realtime", cfg)
+
     def send_omni_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+        """Chat completions via the OpenAI Python SDK (not raw HTTP)."""
         responses: list[OmniResponse] = []
         stream = request_config.get("stream", False)
         modalities = request_config.get("modalities", ["text", "audio"])
@@ -939,8 +1594,8 @@ class OpenAIClientHandler:
                 result.audio_format = result.audio_format.headers.get("content-type", "")
 
         except Exception as e:
-            result.error_message = f"Audio speech stream processing error: {str(e)}"
-            print(f"Error: {result.error_message}")
+            msg = f"Audio speech stream processing error: {str(e)}"
+            print(f"Error: {msg}")
 
         return result
 
@@ -978,8 +1633,8 @@ class OpenAIClientHandler:
                 result.audio_format = result.audio_format.headers.get("content-type", "")
 
         except Exception as e:
-            result.error_message = f"Audio speech non-stream processing error: {str(e)}"
-            print(f"Error: {result.error_message}")
+            msg = f"Audio speech non-stream processing error: {str(e)}"
+            print(f"Error: {msg}")
 
         return result
 
@@ -1201,6 +1856,7 @@ class OpenAIClientHandler:
         Send OpenAI requests for diffusion models.
         If ``extra_body`` has list ``height``/``width``, sends one chat completion per index in parallel
         (scalar h/w, ``num_outputs_per_prompt=1`` each) and merges images in list order.
+
         Args:
             request_config: A single request configuration dict, or a list of
                 request configuration dicts (one request per element)
@@ -1300,10 +1956,13 @@ class OpenAIClientHandler:
         self, request_config: dict[str, Any], request_num: int = 1
     ) -> list[DiffusionResponse]:
         """
-        Send native /v1/videos requests.
+        Send native /v1/videos requests: multipart ``form_data`` job create, poll until done, download content.
+
+        For raw HTTP to video routes without polling, use ``send_videos_create_http_request``, etc.
         """
         if request_num != 1:
             raise NotImplementedError("Concurrent video diffusion requests are not currently implemented")
+
         form_data = request_config.get("form_data")
         if not isinstance(form_data, dict):
             raise ValueError("Video request_config must contain 'form_data'")
@@ -1345,6 +2004,54 @@ class OpenAIClientHandler:
         else:
             self._print_client_stat("[diffusion] request#1 completed")
         return [result]
+
+    def _post_json_endpoint(
+        self,
+        path: str,
+        request_config: dict[str, Any],
+        *,
+        default_timeout: float,
+    ) -> requests.Response:
+        url = self._build_url(path)
+        timeout = float(request_config.get("timeout", default_timeout))
+        if "raw_body" in request_config:
+            raw = request_config["raw_body"]
+            payload = raw.encode("utf-8") if isinstance(raw, str) else raw
+            return requests.post(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                timeout=timeout,
+            )
+        if "json" not in request_config:
+            raise ValueError(f"{path} request_config must include 'json' or 'raw_body'")
+        return requests.post(
+            url,
+            json=request_config["json"],
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=timeout,
+        )
+
+    def _post_form_endpoint(
+        self,
+        path: str,
+        request_config: dict[str, Any],
+        *,
+        default_timeout: float = 120.0,
+    ) -> requests.Response:
+        url = self._build_url(path)
+        timeout = float(request_config.get("timeout", default_timeout))
+        data = request_config.get("data")
+        files = request_config.get("files")
+        if data is None and not files:
+            data = {}
+        return requests.post(
+            url,
+            data=data,
+            files=files,
+            headers={"Accept": "application/json"} if not files else {"Accept": "application/json"},
+            timeout=timeout,
+        )
 
     def _wait_until_video_completed(
         self, video_id: str, poll_interval_seconds: int = 2, timeout_seconds: int = 300
@@ -1693,9 +2400,9 @@ class OmniRunnerHandler:
             result.text_content = text_content
             result.success = True
         except Exception as e:
-            result.error_message = f"Output processing error: {str(e)}"
+            msg = f"Output processing error: {str(e)}"
             result.success = False
-            print(f"Error: {result.error_message}")
+            print(f"Error: {msg}")
         return result
 
     def _process_diffusion_output(self, outputs: list[OmniRequestOutput]) -> DiffusionResponse:
@@ -1831,15 +2538,11 @@ class OmniRunnerHandler:
                 mm_out = stage_out.request_output.outputs[0].multimodal_output
                 break
         if mm_out is None:
-            result = OmniResponse(success=False, error_message="No audio output from pipeline")
-            assert result.success, result.error_message
-            return result
+            raise AssertionError("No audio output from pipeline")
 
         audio_data = mm_out.get("audio")
         if audio_data is None:
-            result = OmniResponse(success=False, error_message="No audio tensor in multimodal output")
-            assert result.success, result.error_message
-            return result
+            raise AssertionError("No audio tensor in multimodal output")
 
         sr_raw = mm_out.get("sr")
         sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
@@ -2004,6 +2707,8 @@ def iter_omni_runner(
 
 __all__ = [
     "DiffusionResponse",
+    "HttpResponse",
+    "WebSocketJsonResponse",
     "OmniResponse",
     "OmniRunner",
     "OmniRunnerHandler",
