@@ -557,7 +557,7 @@ class CUDAGraphDecoderWrapper:
         start_index = 0
         total_len = codes.shape[-1]
         total_upsample = self.decoder.total_upsample
-        wav_out = None
+        wavs: list[torch.Tensor] = []
 
         while start_index < total_len:
             end_index = min(start_index + chunk_size, total_len)
@@ -566,21 +566,13 @@ class CUDAGraphDecoderWrapper:
             codes_chunk = codes[..., start_index - context_size : end_index]
             wav_chunk = self._decode(codes_chunk, clone_graph_output=False)
 
-            if wav_out is None:
-                wav_out = torch.empty(
-                    (*wav_chunk.shape[:-1], total_len * total_upsample),
-                    dtype=wav_chunk.dtype,
-                    device=wav_chunk.device,
-                )
             src_start = context_size * total_upsample
-            dst_start = start_index * total_upsample
-            dst_end = end_index * total_upsample
-            wav_out[..., dst_start:dst_end].copy_(wav_chunk[..., src_start:])
+            wavs.append(wav_chunk[..., src_start:].clone())
             start_index = end_index
 
-        if wav_out is None:
+        if not wavs:
             return self.decoder(codes)
-        return wav_out
+        return torch.cat(wavs, dim=-1)
 
     def batched_chunked_decode_with_cudagraph(
         self,

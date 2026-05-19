@@ -55,7 +55,7 @@ stages:
   - stage_id: 2
     max_num_batched_tokens: 65536
     max_model_len: 65536
-    max_num_seqs: 64
+    max_num_seqs: 1
     gpu_memory_utilization: 0.1
     enforce_eager: true
     trust_remote_code: true
