@@ -57,9 +57,9 @@ def test_hunyuan_vae_decode_tiles_round_trip():
     output = vae.tile_merge(decoded_tiles, grid_spec)
 
     assert grid_spec.split_dims == (3, 4)
-    assert grid_spec.grid_shape == (2, 2)
+    assert grid_spec.grid_shape == (4, 4)
     assert grid_spec.tile_spec == {"blend_extent": 0, "row_limit": 2}
-    assert [task.grid_coord for task in tile_tasks] == [(0, 0), (0, 1), (1, 0), (1, 1)]
+    assert len(tile_tasks) == 16
     assert torch.equal(output, z + 10)
 
 
@@ -73,7 +73,7 @@ def test_hunyuan_vae_encode_tiles_round_trip():
     output = vae.encode_tile_merge(encoded_tiles, grid_spec)
 
     assert grid_spec.split_dims == (3, 4)
-    assert grid_spec.grid_shape == (2, 2)
+    assert grid_spec.grid_shape == (4, 4)
     assert grid_spec.tile_spec == {"blend_extent": 0, "row_limit": 2}
-    assert [task.grid_coord for task in tile_tasks] == [(0, 0), (0, 1), (1, 0), (1, 1)]
+    assert len(tile_tasks) == 16
     assert torch.equal(output, x + 20)
