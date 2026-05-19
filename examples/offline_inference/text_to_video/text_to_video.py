@@ -232,7 +232,8 @@ def parse_args() -> argparse.Namespace:
 def _extract_peak_memory_mb(result: Any) -> float:
     """Pull worker-reported peak VRAM (MiB) generation result.
 
-    Mirrors vllm_omni/entrypoints/openai/serving_video.py:_extract_peak_memory_mb."""
+    Mirrors vllm_omni/entrypoints/openai/serving_video.py:_extract_peak_memory_mb.
+    """
     if isinstance(result, list):
         result = result[0] if result else None
     if result is None:
