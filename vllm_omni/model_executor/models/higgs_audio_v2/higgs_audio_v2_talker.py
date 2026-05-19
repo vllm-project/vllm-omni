@@ -100,6 +100,9 @@ def _install_kv_cache_write_fallback() -> None:
             pos_in_block = valid_slots % block_size
             key_cache[block_idx, pos_in_block] = valid_keys
             value_cache[block_idx, pos_in_block] = valid_values
+        # R23 probe: tag call counter on the impl so we can verify the
+        # patched function is being executed by the engine
+        self._higgs_kv_patch_calls = getattr(self, "_higgs_kv_patch_calls", 0) + 1
 
     FlexAttentionImpl.do_kv_cache_update = _patched_do_kv_cache_update
     FlexAttentionImpl._higgs_kv_patched = True
@@ -332,6 +335,17 @@ class HiggsAudioV2DecoderLayer(LlamaDecoderLayer):
         if mask_flat.any():
             audio_out = audio_norm(hidden_flat[mask_flat])
             out[mask_flat] = audio_out.to(out.dtype)
+        # R23 norm probe: show what was applied per row at decode
+        import os as _os_norm
+        if _os_norm.environ.get("HIGGS_R23_NORM_PROBE") and hidden.shape[0] == 1:
+            import sys as _sys_norm
+            _aout_norm = float(audio_out.float().norm()) if mask_flat.any() else -1
+            print(
+                f"[R23norm] in={float(hidden_flat[0].float().norm()):.3f} "
+                f"out={float(out.flatten().float().norm()):.3f} "
+                f"audio_out_norm={_aout_norm:.3f} mask={mask_flat.tolist()}",
+                file=_sys_norm.stderr, flush=True,
+            )
         return out.reshape_as(hidden), new_residual
 
     def _routed_mlp(
@@ -351,7 +365,24 @@ class HiggsAudioV2DecoderLayer(LlamaDecoderLayer):
         if (~mask_flat).any():
             out[~mask_flat] = self.mlp(hidden_flat[~mask_flat]).to(out.dtype)
         if mask_flat.any():
-            out[mask_flat] = self.audio_mlp(hidden_flat[mask_flat]).to(out.dtype)
+            am_input = hidden_flat[mask_flat]
+            # R23 deep probe: inspect each step
+            gu, _ = self.audio_mlp.gate_up_proj(am_input)
+            gate, up = gu.chunk(2, dim=-1)
+            gated = torch.nn.functional.silu(gate) * up
+            am_output, _ = self.audio_mlp.down_proj(gated)
+            import os as _os_dp
+            if _os_dp.environ.get("HIGGS_R23_MLP_DEEP") and hidden.shape[0] == 1:
+                import sys as _sys_dp
+                print(
+                    f"[R23mlp_deep] in_norm={float(am_input.float().norm()):.3f} "
+                    f"gu_norm={float(gu.float().norm()):.3f} "
+                    f"gate_norm={float(gate.float().norm()):.3f} up_norm={float(up.float().norm()):.3f} "
+                    f"gated_norm={float(gated.float().norm()):.3f} "
+                    f"out_norm={float(am_output.float().norm()):.3f}",
+                    file=_sys_dp.stderr, flush=True,
+                )
+            out[mask_flat] = am_output.to(out.dtype)
         return out.reshape_as(hidden)
 
     # ------------------------------------------------------------------ forward
@@ -950,18 +981,80 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         # where ``residual`` is the pre-MLP residual (carrying everything up
         # to the post_attention_layernorm point). The final norm adds them.
         residual: torch.Tensor | None = None
-        for layer in self.layers:
+        # R23 per-layer probe at decode time
+        import os as _os_layer
+        _probe_decode = _os_layer.environ.get("HIGGS_R23_LAYER_DECODE") and hidden_states.shape[0] == 1
+        if _probe_decode:
+            import sys as _sys_layer
+            print(
+                f"[R23layer] decode IN: hidden_norm={float(hidden_states[0].float().norm()):.3f}",
+                file=_sys_layer.stderr, flush=True,
+            )
+        for li, layer in enumerate(self.layers):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 residual,
                 audio_token_mask=audio_mask,
             )
+            if _probe_decode and li in (0, 1, 5, 13, 20, 27):
+                import sys as _sys_layer
+                _hn = float(hidden_states[0].float().norm())
+                _rn = float(residual[0].float().norm()) if residual is not None else -1
+                print(
+                    f"[R23layer] decode layer={li} hidden_norm={_hn:.3f} residual_norm={_rn:.3f}",
+                    file=_sys_layer.stderr, flush=True,
+                )
 
-        # Final fused norm: combine final mlp_out with carried residual.
-        norm_out = self.norm(hidden_states, residual)
-        if isinstance(norm_out, tuple):
-            norm_out = norm_out[0]
+        # R24: probe pre-norm state to verify whether the final fused norm is
+        # actually normalizing (suspected silent-no-op like reshape_and_cache_flash).
+        import os as _os_r23x
+        _r24_probe = _os_r23x.environ.get("HIGGS_R23_FINAL_PROBE")
+        if _r24_probe:
+            import sys as _sys_r24
+            _hn_pre = float(hidden_states[-1].float().norm())
+            _rn_pre = (
+                float(residual[-1].float().norm()) if residual is not None else -1
+            )
+            print(
+                f"[R24prenorm] shape={tuple(hidden_states.shape)} "
+                f"hidden_last_norm={_hn_pre:.3f} residual_last_norm={_rn_pre:.3f}",
+                file=_sys_r24.stderr, flush=True,
+            )
+
+        # R24: manual final-norm fallback. The vLLM custom CUDA op
+        # ``ops.fused_add_rms_norm`` (called via RMSNorm.forward_cuda when a
+        # residual is provided) appears to be a silent no-op at decode in this
+        # build — sibling failure mode to ``reshape_and_cache_flash`` (R21).
+        # Implement RMSNorm + residual-add directly so the lm_head receives a
+        # properly normalized vector (otherwise logits explode and softmax
+        # collapses onto audio_eos, terminating playback in ~1 frame).
+        if residual is not None:
+            _combined = hidden_states + residual
+        else:
+            _combined = hidden_states
+        _orig_dtype = _combined.dtype
+        _x = _combined.to(torch.float32)
+        _variance = _x.pow(2).mean(-1, keepdim=True)
+        _x = _x * torch.rsqrt(_variance + float(self.norm.variance_epsilon))
+        _x = _x.to(_orig_dtype)
+        if getattr(self.norm, "has_weight", True):
+            norm_out = _x * self.norm.weight.data
+        else:
+            norm_out = _x
+        if _r24_probe:
+            import sys as _sys_r24b
+            _h = norm_out
+            _suffix = ""
+            if _h.shape[0] > 1:
+                _suffix = (
+                    f" first_norm={float(_h[0].float().norm()):.3f} "
+                    f"mid_norm={float(_h[_h.shape[0]//2].float().norm()):.3f}"
+                )
+            print(
+                f"[R24final] shape={tuple(_h.shape)} last_norm={float(_h[-1].float().norm()):.3f}{_suffix}",
+                file=_sys_r24b.stderr, flush=True,
+            )
         return norm_out
 
     def compute_logits(
@@ -971,6 +1064,14 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         *,
         audio_token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        import os as _os_cl
+        if _os_cl.environ.get("HIGGS_R23_FINAL_PROBE"):
+            import sys as _sys_cl
+            print(
+                f"[R23compute] shape={tuple(hidden_states.shape)} "
+                f"row0_norm={float(hidden_states[0].float().norm()):.3f}",
+                file=_sys_cl.stderr, flush=True,
+            )
         """Sampler-compatible logits tensor.
 
         Returns a single ``[N, vocab_size]`` tensor that the stock
@@ -1350,6 +1451,24 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
 
         # Per-codebook logits at audio positions only.
         cb_logits = self.audio_codebook_logits(hidden, is_audio)  # [N_audio, Q, V]
+        # R23 diag: dump first audio decode step's cb_logits top-5 per codebook
+        import os as _os_r23
+        if _os_r23.environ.get("HIGGS_R23_DUMP") and cb_logits.shape[0] > 0:
+            if not hasattr(self, "_r23_n"):
+                self._r23_n = 0
+            self._r23_n += 1
+            if self._r23_n in (1, 2, 3):
+                import sys as _sys_r23
+                _cb0 = cb_logits[0]
+                _hn = float(hidden[0].float().norm())
+                for q in range(_cb0.shape[0]):
+                    tk = _cb0[q].float().topk(5)
+                    idxs = tk.indices.detach().to("cpu").tolist()
+                    vals = tk.values.detach().to("cpu").tolist()
+                    print(
+                        f"[R23logits] sample#{self._r23_n} q={q} top5_idx={idxs} top5_val={['%.3f' % v for v in vals]} hidden_norm={_hn:.3f}",
+                        file=_sys_r23.stderr, flush=True,
+                    )
         # R12 (PyTorch align): do NOT mask stream specials before sampling —
         # upstream lets the model emit ``audio_stream_bos_id`` (1024) and
         # ``audio_stream_eos_id`` (1025) freely; the delay-pattern logic
