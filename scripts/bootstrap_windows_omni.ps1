@@ -203,7 +203,7 @@ Push-Location $OmniRepoPath
 try {
     if (-not $SkipDependencyInstall) {
         Write-Step "Installing vLLM-Omni runtime dependencies"
-        Invoke-Native $pythonExe "-m" "pip" "install" "-r" "requirements\common.txt" "onnxruntime>=1.23.2" "pytest>=8.0.0"
+        Invoke-Native $pythonExe "-m" "pip" "install" "-r" "requirements\common.txt" "onnxruntime>=1.23.2" "pytest>=8.0.0" "pytest-asyncio>=0.24.0" "pytest-mock>=3.14.0"
     }
 
     Write-Step "Installing vLLM-Omni editable"
