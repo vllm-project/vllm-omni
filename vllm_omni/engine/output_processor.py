@@ -310,7 +310,15 @@ class OmniRequestState(RequestState):
         routed_experts: np.ndarray | None = None,
     ) -> Any:
         # Reuse base text/logprobs logic, then annotate with pooling_result.
-        base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason, routed_experts)
+        base_params = signature(super()._new_completion_output).parameters
+        if "routed_experts" in base_params:
+            base_output = super()._new_completion_output(
+                token_ids, finish_reason, stop_reason, routed_experts
+            )
+        else:
+            base_output = super()._new_completion_output(
+                token_ids, finish_reason, stop_reason
+            )
 
         # Inter-stage processors need the full cumulative token sequence.
         # In DELTA mode, base_output.token_ids only has the latest step's
