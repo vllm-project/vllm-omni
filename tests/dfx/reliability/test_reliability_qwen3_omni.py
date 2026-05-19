@@ -121,7 +121,7 @@ RUNTIME_WORKER_PATTERN = "VLLM::"
 # - worker: SIGTERM, SIGKILL
 # - serve-root: SIGINT (Ctrl+C on root only); SIGTERM/SIGKILL skipped (residual process)
 # - serve-tree: SIGTERM/SIGKILL; tree with-load SIGTERM skipped (issue#3683)
-_SERVE_ROOT_NON_SIGINT_SKIP = pytest.mark.skip(reason="remain process after kill serve root")
+_SERVE_ROOT_NON_SIGINT_SKIP = pytest.mark.skip(reason="vllm issue#43060")
 _TREE_WITH_LOAD_SIGTERM_SKIP = pytest.mark.skip(reason="issue#3683")
 SERVE_SIGNAL_PARAMS = [
     pytest.param("SIGTERM", id="sigterm", marks=_SERVE_ROOT_NON_SIGINT_SKIP),
