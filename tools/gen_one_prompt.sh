@@ -23,6 +23,7 @@ setsid env PATH="$ROOT/.venv/bin:$PATH" \
   HF_HOME=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/.cache/huggingface \
   HIGGS_R23_DUMP=1 \
   HIGGS_R25_NO_SKIP=1 \
+  HIGGS_R26_AFB_PROBE=1 \
   vllm-omni serve "bosonai/higgs-audio-v2-generation-3B-base" \
     --deploy-config vllm_omni/deploy/higgs_audio_v2.yaml \
     --attention-backend FLEX_ATTENTION \

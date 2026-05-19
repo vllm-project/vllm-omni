@@ -1197,6 +1197,18 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         flat_hidden = new_hidden.reshape(-1, new_hidden.shape[-1])
         idx = torch.tensor(rep_positions, dtype=torch.long, device=new_hidden.device)
         rep = torch.stack(rep_embeds, dim=0)
+        # R26 probe: log what audio_feedback substituted at each decode step
+        import os as _os_afp
+        if _os_afp.environ.get("HIGGS_R26_AFB_PROBE") and hidden_states.shape[0] <= 4:
+            import sys as _sys_afp
+            _orig_norm = float(flat_hidden[idx[0]].float().norm())
+            _new_norm = float(rep[0].float().norm())
+            _last_frame_str = audio_out_ids[:, -1].detach().cpu().tolist() if isinstance(audio_out_ids, torch.Tensor) else "N/A"
+            print(
+                f"[R26afb] pos={rep_positions} orig_norm={_orig_norm:.3f} feedback_norm={_new_norm:.3f} "
+                f"last_frame={_last_frame_str}",
+                file=_sys_afp.stderr, flush=True,
+            )
         flat_hidden.index_copy_(0, idx, rep)
         return new_hidden
 
@@ -1466,18 +1478,18 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             if not hasattr(self, "_r23_n"):
                 self._r23_n = 0
             self._r23_n += 1
-            if self._r23_n in (1, 2, 3):
+            if self._r23_n <= 30:
                 import sys as _sys_r23
                 _cb0 = cb_logits[0]
                 _hn = float(hidden[0].float().norm())
-                for q in range(_cb0.shape[0]):
-                    tk = _cb0[q].float().topk(5)
-                    idxs = tk.indices.detach().to("cpu").tolist()
-                    vals = tk.values.detach().to("cpu").tolist()
-                    print(
-                        f"[R23logits] sample#{self._r23_n} q={q} top5_idx={idxs} top5_val={['%.3f' % v for v in vals]} hidden_norm={_hn:.3f}",
-                        file=_sys_r23.stderr, flush=True,
-                    )
+                # Only dump codebook 0 (the EOS-gating one) for brevity
+                tk = _cb0[0].float().topk(5)
+                idxs = tk.indices.detach().to("cpu").tolist()
+                vals = tk.values.detach().to("cpu").tolist()
+                print(
+                    f"[R26cb0] s#{self._r23_n} top5_idx={idxs} top5_val={['%.3f' % v for v in vals]} hn={_hn:.3f}",
+                    file=_sys_r23.stderr, flush=True,
+                )
         # R26: emulate upstream's ``HiggsAudioV2DelayPatternLogitsProcessor``.
         # The raw audio_lm_head has very large weights at index 1025
         # (audio_stream_eos): cb1 |w[1025]|=9.25 vs mean content 1.53 (6x).
