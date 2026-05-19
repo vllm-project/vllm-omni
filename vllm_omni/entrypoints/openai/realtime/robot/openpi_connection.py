@@ -5,8 +5,13 @@
 
 Protocol (compatible with OpenPI policy clients):
     Connect  -> server sends msgpack(PolicyServerConfig fields)
-    Infer    -> client sends msgpack(obs), server sends msgpack(ndarray)
+    Infer    -> client sends msgpack(obs), server sends
+                msgpack(ndarray | dict[str, ndarray])
     Reset    -> client sends msgpack({endpoint:reset}), server sends msgpack(status)
+
+Single-stream policies (DreamZero) send an ndarray; multi-stream policies
+(GR00T-N1.7) send a per-action-key dict of ndarrays.  msgpack-numpy encodes
+both transparently.
 """
 
 from __future__ import annotations

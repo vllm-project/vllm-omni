@@ -266,6 +266,19 @@ _DIFFUSION_MODELS = {
         "pipeline_dreamzero",
         "DreamZeroPipeline",
     ),
+    "Gr00tN1d7Pipeline": (
+        "gr00t",
+        "pipeline_gr00t",
+        "Gr00tN1d7Pipeline",
+    ),
+    # Alias: GR00T-N1.7-3B's config.json declares `architectures: ["Gr00tN1d7"]`,
+    # which vllm-omni uses verbatim as model_class_name.  Register the same
+    # Pipeline class under that key so the engine resolves it.
+    "Gr00tN1d7": (
+        "gr00t",
+        "pipeline_gr00t",
+        "Gr00tN1d7Pipeline",
+    ),
 }
 
 

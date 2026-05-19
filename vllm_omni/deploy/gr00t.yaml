@@ -1,0 +1,65 @@
+# GR00T-N1.7 deploy: single diffusion stage.
+#
+# Topology is declared in vllm_omni/model_executor/models/gr00t/pipeline.py.
+# This default uses one GPU with TP=1 and CFG parallel disabled.
+#
+# OpenPI handshake fields under `policy_server_config` advertise GR00T's
+# action schema (per issue #3553 requirement #3): action_horizon=40,
+# the per-embodiment action keys, and the supported embodiment tags.
+
+pipeline: gr00t
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_class_name: Gr00tN1d7Pipeline
+    model_config:
+      # Optional: override the Qwen3-VL backbone source.  The GR00T-N1.7-3B
+      # config.json hard-codes "nvidia/Cosmos-Reason2-2B" (a gated HF repo).
+      # Uncomment + point at a local checkout if you don't want to rely on
+      # `huggingface-cli login`/HF_TOKEN.
+      # backbone_model_name: /path/to/Cosmos-Reason2-2B
+
+      # Embodiment tag -> projector index. Keys mirror Isaac-GR00T
+      # EMBODIMENT_TAG_TO_PROJECTOR_INDEX (lines 56-72 in
+      # gr00t/model/gr00t_n1d7/processing_gr00t_n1d7.py).
+      embodiment_name_to_id:
+        oxe_droid_relative_eef_relative_joint: 24
+        xdof_relative_eef_relative_joint: 27
+        xdof_relative_eef_relative_joint_subtask: 27
+        real_g1_relative_eef_relative_joints: 25
+        real_r1_pro_sharpa_relative_eef: 26
+        real_r1_pro_sharpa_relative_eef_human: 26
+        real_r1_pro_sharpa_relative_eef_maxinsights: 26
+        real_r1_pro_sharpa_relative_eef_mecka: 26
+        unitree_g1_full_body_with_waist_height_nav_cmd: 25
+        simpler_env_google: 0
+        simpler_env_widowx: 1
+        libero_sim: 2
+        new_embodiment: 10
+      policy_server_config:
+        image_resolution: [256, 256]
+        n_external_cameras: 1
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: true
+        action_horizon: 40
+        # Per-embodiment action keys + dims (132-dim padded action vector).
+        # Clients use these to unpack the per-key dict OpenPI returns.
+        action_keys:
+          - eef_9d
+          - gripper_position
+          - joint_position
+        supported_embodiments:
+          - oxe_droid_relative_eef_relative_joint
+          - xdof_relative_eef_relative_joint
+          - real_g1_relative_eef_relative_joints
+          - real_r1_pro_sharpa_relative_eef
+          - simpler_env_google
+          - simpler_env_widowx
+          - libero_sim

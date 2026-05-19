@@ -115,8 +115,15 @@ class ServingRealtimeRobotOpenPI:
     def reset(self, obs: dict) -> None:
         """Compatibility hook; per-connection state lives in RobotRealtimeConnection."""
 
-    async def infer(self, obs: dict, *, session_id: str, reset: bool) -> np.ndarray:
-        """raw obs → engine → actions."""
+    async def infer(
+        self, obs: dict, *, session_id: str, reset: bool
+    ) -> np.ndarray | dict[str, np.ndarray]:
+        """raw obs → engine → actions.
+
+        Returns an ``np.ndarray`` for single-stream policies (DreamZero) or a
+        ``dict[str, np.ndarray]`` for multi-stream policies (GR00T-N1.7).
+        The wire format (msgpack-numpy) handles both transparently.
+        """
         # Build request, run inference through AsyncOmni
         request = self._build_request(obs, session_id=session_id, reset=reset)
         result = None
@@ -157,8 +164,13 @@ class ServingRealtimeRobotOpenPI:
             request_ids=[f"robot-{session_id}"],
         )
 
-    def _extract_actions(self, result: Any) -> np.ndarray:
-        """Extract actions from engine result."""
+    def _extract_actions(self, result: Any) -> np.ndarray | dict[str, np.ndarray]:
+        """Extract actions from engine result.
+
+        Returns either a single ndarray (DreamZero) or a per-action-key dict
+        of ndarrays (GR00T-N1.7), depending on the policy model's output
+        contract.  Per issue #3553 the OpenPI wire format supports both.
+        """
         if hasattr(result, "__iter__"):
             result = list(result)
             if result:
@@ -170,4 +182,13 @@ class ServingRealtimeRobotOpenPI:
         actions = result.multimodal_output.get("actions")
         if actions is None:
             raise RuntimeError("Missing multimodal_output['actions'] in robot policy result")
+
+        if isinstance(actions, Mapping):
+            converted = {key: np.asarray(value, dtype=np.float32) for key, value in actions.items()}
+            if not converted:
+                raise RuntimeError(
+                    "multimodal_output['actions'] is an empty dict; policy must emit "
+                    "at least one action stream"
+                )
+            return converted
         return np.asarray(actions, dtype=np.float32)
