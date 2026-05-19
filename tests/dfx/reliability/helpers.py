@@ -676,56 +676,6 @@ def list_alive_pids(pids: Sequence[int]) -> list[int]:
     return out
 
 
-def reliability_ps_ef_active_modes() -> frozenset[str]:
-    """Which ``ps -ef`` transcript modes are enabled via ``RELIABILITY_PS_EF``.
-
-    Values (case-insensitive):
-
-    - unset / ``0`` / ``off`` / ``false`` — disabled
-    - ``1`` / ``on`` / ``session`` — session start + finish only
-    - ``each`` / ``test`` / ``per-test`` — before + after every collected test node
-    - ``all`` — session + per-test
-
-    Per-test dumps run **after** function-scoped fixtures (e.g. ``omni_server_function``)
-    tear down, so the ``after`` transcript reflects post-server cleanup for that test.
-    """
-    raw = os.environ.get("RELIABILITY_PS_EF", "").strip().lower()
-    if raw in ("", "0", "false", "no", "off"):
-        return frozenset()
-    if raw in ("1", "true", "yes", "on", "session"):
-        return frozenset({"session"})
-    if raw in ("each", "test", "per-test"):
-        return frozenset({"each"})
-    if raw == "all":
-        return frozenset({"session", "each"})
-    return frozenset({"each"})
-
-
-def dump_ps_ef_transcript(phase: str) -> None:
-    """Print ``ps -ef`` to stdout for manual leak triage (POSIX only)."""
-    print(f"[reliability][ps-ef] === {phase} ===", flush=True)
-    if os.name == "nt":
-        print("[reliability][ps-ef] skipped: Windows has no standard ``ps -ef``", flush=True)
-        return
-    try:
-        proc = subprocess.run(
-            ["ps", "-ef"],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            check=False,
-        )
-        if proc.stdout:
-            print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n", flush=True)
-        if proc.stderr:
-            print(proc.stderr, flush=True)
-        if proc.returncode != 0:
-            print(f"[reliability][ps-ef] ps exited with code {proc.returncode}", flush=True)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        print(f"[reliability][ps-ef] failed to run ps: {exc}", flush=True)
-    print(f"[reliability][ps-ef] === end {phase} ===", flush=True)
-
-
 def query_gpu_compute_pid_used_memory_mb() -> dict[int, int] | None:
     """Query NVIDIA compute-process memory map (pid -> used MB).
 
