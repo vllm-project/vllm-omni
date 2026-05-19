@@ -20,9 +20,6 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.transformers_utils.config import get_config
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_hunyuan import (
-    DistributedAutoencoderKLHunyuan,
-)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput
@@ -345,6 +342,11 @@ class HunyuanImage3Pipeline(
         quant_config = od_config.quantization_config
         self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
         self.transformer = self.model
+        # Lazy import to break circular dependency:
+        # autoencoder_kl_hunyuan -> hunyuan_image3/__init__ -> pipeline_hunyuan_image3 -> autoencoder_kl_hunyuan
+        from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_hunyuan import (  # noqa: PLC0415
+            DistributedAutoencoderKLHunyuan,
+        )
         self.vae = DistributedAutoencoderKLHunyuan.from_config(self.hf_config.vae)
         self.vae.use_spatial_tiling = self.od_config.vae_use_tiling
         self._pipeline = None
