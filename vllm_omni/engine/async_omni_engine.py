@@ -878,7 +878,7 @@ class AsyncOmniEngine:
                         try:
                             with stage_runtime_env(
                                 plan.metadata.stage_id,
-                                cast(dict[str, Any], plan.metadata.runtime_cfg),
+                                cast(dict[str, Any], plan.metadata.runtime_cfg or {}),
                             ):
                                 setup_stage_devices(plan.metadata.stage_id, plan.metadata.runtime_cfg)
                                 vllm_config = plan.stage_vllm_config
@@ -1024,7 +1024,7 @@ class AsyncOmniEngine:
                     try:
                         with stage_runtime_env(
                             plan.metadata.stage_id,
-                            cast(dict[str, Any], plan.metadata.runtime_cfg),
+                            cast(dict[str, Any], plan.metadata.runtime_cfg or {}),
                         ):
                             setup_stage_devices(plan.metadata.stage_id, plan.metadata.runtime_cfg)
                             omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
