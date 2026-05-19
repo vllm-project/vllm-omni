@@ -51,7 +51,6 @@ from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
     BaseProcessingInfo,
-    ProcessorInputs,
     PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
@@ -341,21 +340,87 @@ class MiniMindForCausalLM(PreTrainedModel):
         )
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         if self.config.tie_word_embeddings: self.model.embed_tokens.weight = self.lm_head.weight
-        self.post_init()              
+        self.post_init() 
+
+
+class MMAudioProjector(nn.Module):
+    def __init__(self, config: MiniMindOmniConfig, quant_config: QuantizationConfig|None=None, prefix: str=""):
+        super().__init__()
+        self.mlp = nn.ModuleList(
+            [
+                LayerNorm(config.audio_hidden_size),
+                ReplicatedLinear(
+                    config.audio_hidden_size,
+                    config.hidden_size,
+                    bias=True,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "mlp.1"),
+                ),
+                nn.GELU(),
+                ReplicatedLinear(
+                    config.hidden_size,
+                    config.hidden_size,
+                    bias=True,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "mlp.3"),
+                ),
+            ]
+        )
+
+    def forward(self, x):
+        x = self.mlp[0](x)
+        x, _ = self.mlp[1](x)
+        x = self.mlp[2](x)
+        x, _ = self.mlp[3](x)
+        return x
     
+class MMVisionProjector(nn.Module):
+    def __init__(self, config: MiniMindOmniConfig, quant_config: QuantizationConfig|None=None, prefix: str = ""):
+        super().__init__()
+        self.mlp = nn.ModuleList(
+            [
+                LayerNorm(config.image_hidden_size),
+                ReplicatedLinear(
+                    config.image_hidden_size,
+                    config.hidden_size,
+                    bias=True,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "mlp.1"),
+                ),
+                nn.GELU(),
+                ReplicatedLinear(
+                    config.hidden_size,
+                    config.hidden_size,
+                    bias=True,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "mlp.3"),
+                ),
+            ]
+        )
+                
+    def forward(self, x):
+        x = self.mlp[0](x)
+        x, _ = self.mlp[1](x)
+        x = self.mlp[2](x)
+        x, _ = self.mlp[3](x)
+        return x
+
+  
 def _load_sensevoice_model(path: str, *, device: torch.device | str = "cpu"):
     if not path or not os.path.exists(path):
         raise FileNotFoundError(f"SenseVoice path not found: {path}")
     
-    from funasr import AutoModel
+    try:
+        from funasr import AutoModel
 
-    return AutoModel(
-        model=path,
-        trust_remote_code=True,
-        disable_update=True,
-        device=device,
-    )
-
+        return AutoModel(
+            model=path,
+            trust_remote_code=True,
+            disable_update=True,
+            device=device,
+        )
+    except ImportError as exc:
+        raise ImportError(f"funasr is required to load SenseVoice model: {exc}") from exc
 
 class MiniMindOmniProcessingInfo(BaseProcessingInfo):
     def get_hf_config(self) -> MiniMindOmniConfig:
@@ -373,13 +438,17 @@ class MiniMindOmniProcessingInfo(BaseProcessingInfo):
         config = self.get_hf_config()
         limits: dict[str, int] = {}
         if mm_counts.get("image", 0) > 0:
-            limits["image"] = int(getattr(config, "image_token_len", 64))
+            limits["image"] = int(config.image_token_len)
         if mm_counts.get("audio", 0) > 0:
-            limits["audio"] = int(getattr(config, "max_audio_tokens", 3000))
+            limits["audio"] = int(config.max_audio_tokens)
         return limits
 
     def get_data_parser(self):
-        return MultiModalDataParser(target_sr=16000, target_channels=1)
+        return MultiModalDataParser(
+            target_sr=self.get_hf_config().audio_sample_rate,
+            target_channels=self.get_hf_config().audio_target_channels,
+            expected_hidden_size=self._get_expected_hidden_size(),
+        )
 
 
 class MiniMindOmniDummyInputsBuilder(BaseDummyInputsBuilder[MiniMindOmniProcessingInfo]):
@@ -398,32 +467,24 @@ class MiniMindOmniDummyInputsBuilder(BaseDummyInputsBuilder[MiniMindOmniProcessi
         del seq_len
         num_images = mm_counts.get("image", 0)
         num_audios = mm_counts.get("audio", 0)
-        audio_len = mm_options.get("audio").length if mm_options and mm_options.get("audio") else 16000
-
         mm_data: MultiModalDataDict = {}
         if num_images:
             mm_data["image"] = self._get_dummy_images(width=256, height=256, num_images=num_images)
         if num_audios:
-            mm_data["audio"] = [(np.zeros((audio_len,), dtype=np.float32), 16000) for _ in range(num_audios)]
+            config = self.info.get_hf_config()
+            audio_overrides = mm_options.get("audio") if mm_options else None
+            mm_data["audio"] = self._get_dummy_audios(
+                length=int(config.audio_sample_rate),
+                num_audios=num_audios,
+                overrides=audio_overrides,
+            )
         return mm_data
-
-    def get_dummy_processor_inputs(
-        self,
-        seq_len: int,
-        mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
-    ) -> ProcessorInputs:
-        return ProcessorInputs(
-            prompt=self.get_dummy_text(mm_counts),
-            mm_data_items=self.info.parse_mm_data(self.get_dummy_mm_data(seq_len, mm_counts, mm_options)),
-        )
-
 
 class MiniMindOmniMultiModalProcessor(BaseMultiModalProcessor[MiniMindOmniProcessingInfo]):
     def _get_sensevoice_frontend(self):
         if not hasattr(self, "_sensevoice_frontend"):
             config = self.info.get_hf_config()
-            model = _load_sensevoice_model(getattr(config, "audio_encoder_path", ""), device="cpu")
+            model = _load_sensevoice_model(config.audio_encoder_path, device="cpu")
             self._sensevoice_frontend = model.kwargs["frontend"].eval()
         return self._sensevoice_frontend
 
@@ -566,70 +627,6 @@ class MiniMindOmniMultiModalProcessor(BaseMultiModalProcessor[MiniMindOmniProces
         data.update(tokenizer(prompt, return_tensors="pt", **tok_kwargs))
         return BatchFeature(data=data, tensor_type=None)
 
-
-class MMAudioProjector(nn.Module):
-    def __init__(self, config: MiniMindOmniConfig, quant_config: QuantizationConfig|None=None, prefix: str=""):
-        super().__init__()
-        self.mlp = nn.ModuleList(
-            [
-                LayerNorm(config.audio_hidden_size),
-                ReplicatedLinear(
-                    config.audio_hidden_size,
-                    config.hidden_size,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=maybe_prefix(prefix, "mlp.1"),
-                ),
-                nn.GELU(),
-                ReplicatedLinear(
-                    config.hidden_size,
-                    config.hidden_size,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=maybe_prefix(prefix, "mlp.3"),
-                ),
-            ]
-        )
-
-    def forward(self, x):
-        x = self.mlp[0](x)
-        x, _ = self.mlp[1](x)
-        x = self.mlp[2](x)
-        x, _ = self.mlp[3](x)
-        return x
-    
-class MMVisionProjector(nn.Module):
-    def __init__(self, config: MiniMindOmniConfig, quant_config: QuantizationConfig|None=None, prefix: str = ""):
-        super().__init__()
-        self.mlp = nn.ModuleList(
-            [
-                LayerNorm(config.image_hidden_size),
-                ReplicatedLinear(
-                    config.image_hidden_size,
-                    config.hidden_size,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=maybe_prefix(prefix, "mlp.1"),
-                ),
-                nn.GELU(),
-                ReplicatedLinear(
-                    config.hidden_size,
-                    config.hidden_size,
-                    bias=True,
-                    quant_config=quant_config,
-                    prefix=maybe_prefix(prefix, "mlp.3"),
-                ),
-            ]
-        )
-                
-    def forward(self, x):
-        x = self.mlp[0](x)
-        x, _ = self.mlp[1](x)
-        x = self.mlp[2](x)
-        x, _ = self.mlp[3](x)
-        return x
-
-
 @MULTIMODAL_REGISTRY.register_processor(
     MiniMindOmniMultiModalProcessor,
     info=MiniMindOmniProcessingInfo,
@@ -696,12 +693,14 @@ class MiniMindOmniThinkerForConditionalGeneration(
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "audio_proj"),
         )
-        self.audio_encoder = self._init_audio_encoder(
-            getattr(self.audio_config, "audio_encoder_path", None)
-        )
+        self.audio_encoder = (
+            self._init_audio_encoder(self.audio_config.audio_encoder_path)
+            if self.audio_config.audio_encoder_path 
+            else None
+         )
 
     def _init_audio_encoder(self, path: str | None) -> nn.Module | None:
-        if path is None or not os.path.exists(path):
+        if not os.path.exists(path):
             warnings.warn(f"[MiniMindOmni] SenseVoice path not found: {path}")
             return None
         try:

@@ -54,6 +54,9 @@ class OmniConfig(MiniMindConfig):
         self.audio_pad_token = kwargs.get("audio_pad_token", 2049)
         self.audio_stop_token = kwargs.get("audio_stop_token", 2050)
         self.audio_spk_token = kwargs.get("audio_spk_token", 2051)
+        self.audio_sample_rate = kwargs.get("audio_sample_rate", 16000)
+        self.audio_target_channels = kwargs.get("audio_target_channels", 1)
+        self.max_audio_tokens = kwargs.get("max_audio_tokens", 3000)
         self.spk_emb_size = kwargs.get("spk_emb_size", 192)
         self.think_end_ids = kwargs.get("think_end_ids", [26, 234, 234]) # </think>\n\n
         self.image_ids = kwargs.get("image_ids", [12]) # "<|image_pad|>" token id
