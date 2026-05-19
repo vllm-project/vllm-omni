@@ -865,7 +865,11 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput, Diffusi
 
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        num_inference_steps = (
+            req.sampling_params.num_inference_steps
+            if req.sampling_params.num_inference_steps is not None
+            else num_inference_steps
+        )
         sigmas = req.sampling_params.sigmas or sigmas
         guidance_scale = (
             req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
