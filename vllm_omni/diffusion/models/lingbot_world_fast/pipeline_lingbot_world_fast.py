@@ -13,24 +13,22 @@ from einops import rearrange
 from torch import nn
 from tqdm import tqdm
 
-# Load dependencies from Lingbot World source code
-from wan.modules.t5 import T5EncoderModel
-from wan.modules.vae2_1 import Wan2_1_VAE
-from wan.utils.cam_utils import (
-    compute_relative_poses,
-    get_Ks_transformed,
-    get_plucker_embeddings,
-    interpolate_camera_poses,
-)
-from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.interface import SupportCameraPosInput, SupportImageInput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
+from .cam_utils import (
+    compute_relative_poses,
+    get_Ks_transformed,
+    get_plucker_embeddings,
+    interpolate_camera_poses,
+)
+from .fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .state_lingbot_world_fast import LingbotWorldFastState
+from .t5 import T5EncoderModel
+from .vae2_1 import Wan2_1_VAE
 from .wan_fast import WanModelFast
 
 logger = logging.getLogger(__name__)

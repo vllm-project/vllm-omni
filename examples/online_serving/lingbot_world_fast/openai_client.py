@@ -77,7 +77,7 @@ def generate_video(args: Namespace) -> np.ndarray:
     for i in range(args.num_calls):
         camera = {
             "poses": full_camera["poses"][starting_frame : starting_frame + args.num_frames],
-            "intrinsics": full_camera["intrinsics"][starting_frame : starting_frame + args.num_frames ],
+            "intrinsics": full_camera["intrinsics"][starting_frame : starting_frame + args.num_frames],
         }
 
         if i == 0:
@@ -96,11 +96,11 @@ def generate_video(args: Namespace) -> np.ndarray:
 
         with ws_sync.connect(endpoint, max_size=None, ping_interval=None, ping_timeout=None) as ws:
             # 1. Server sends CameraServerConfig on connect.
-            server_config = _unpack(ws.recv())
+            _unpack(ws.recv())
 
             # 2. Send obs.
             print(
-                f"Sending obs ({'image=' + str(image.shape) if obs.get('image', None) is not None else 'None'}, "
+                f"Sending obs image=  ({str(image.shape) if obs.get('image', None) is not None else 'None'}, "
                 f"poses={camera['poses'].shape}, intrinsics={camera['intrinsics'].shape})..."
             )
             ws.send(_pack(obs))
@@ -169,15 +169,6 @@ def main():
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    print(frames.__class__)
-    print(len(frames))
-    print(frames[0].shape)
-
-    for i, frame in enumerate(frames):
-        tmp_frame = (frame * 255).astype(np.uint8)
-        im = PIL.Image.fromarray(tmp_frame)
-        im.save(f"{args.output[:-4]}_{i}.png")
 
     export_to_video(frames, str(output_path), fps=args.fps)
     print(f"Saved generated video to {output_path}")

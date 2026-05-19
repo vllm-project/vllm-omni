@@ -135,6 +135,7 @@ def main():
             generator=generator,
             num_frames=args.num_frames,
             frame_rate=args.fps,
+            extra_args={"session_id": "offline_generation"},
         ),
     )
     generation_end = time.perf_counter()

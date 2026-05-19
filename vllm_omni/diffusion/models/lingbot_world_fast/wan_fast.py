@@ -8,11 +8,11 @@ import torch.nn.functional as torch_F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange
-from wan.modules.model import WanLayerNorm, WanRMSNorm, WanSelfAttention, rope_params, sinusoidal_embedding_1d
 
 from vllm_omni.diffusion.attention.layer import Attention
 
 from .state_lingbot_world_fast import CacheIndex
+from .wan_model import WanLayerNorm, WanRMSNorm, WanSelfAttention, rope_params, sinusoidal_embedding_1d
 
 
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):

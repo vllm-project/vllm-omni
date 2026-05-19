@@ -1,9 +1,7 @@
 import argparse
-import fcntl
 import json
 import os
 import site
-import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -19,17 +17,6 @@ DEPENDENCY_DIR = CACHE_DIR / "Lingbot-World"
 
 def download_dependency():
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    with open(LOCK_FILE, "w") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        if not DEPENDENCY_DIR.exists():
-            print(f"Downloading Lingbot World Fast to {DEPENDENCY_DIR} ...")
-            subprocess.run(
-                ["git", "clone", "--depth", "1", DEPENDENCY_REPO, "--branch", DEPENDENCY_BRANCH, str(DEPENDENCY_DIR)],
-                check=True,
-            )
-            print("Download finished.")
-        fcntl.flock(f, fcntl.LOCK_UN)
 
     # write .pth to site-packages
     site_packages = Path(site.getsitepackages()[0])

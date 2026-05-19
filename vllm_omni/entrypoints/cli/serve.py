@@ -548,7 +548,7 @@ class OmniServeCommand(CLISubcommand):
         omni_config_group.add_argument(
             "--ws-max-size",
             type=int,
-            default=1_048_576, # 1MB
+            default=1_048_576,  # 1MB
             help="Change max size of a websocket payload that is accepted by the server",
         )
         omni_config_group.add_argument(
