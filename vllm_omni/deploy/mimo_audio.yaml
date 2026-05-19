@@ -24,14 +24,13 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 1
-    gpu_memory_utilization: 0.6
+    gpu_memory_utilization: 0.5
     enforce_eager: true
     trust_remote_code: true
     enable_prefix_caching: false
     max_num_batched_tokens: 8192
     max_model_len: 8192
-    tensor_parallel_size: 2
-    devices: "1,2"
+    devices: "0"
     output_connectors:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
@@ -44,14 +43,14 @@ stages:
 
   - stage_id: 1
     max_num_seqs: 1
-    gpu_memory_utilization: 0.8
+    gpu_memory_utilization: 0.3
     enforce_eager: true
     trust_remote_code: true
     enable_prefix_caching: false
     async_scheduling: false
     max_num_batched_tokens: 8192
     max_model_len: 8192
-    devices: "3"
+    devices: "0"
     input_connectors:
       from_stage_0: connector_of_shared_memory
     default_sampling_params:
