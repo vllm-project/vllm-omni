@@ -26,6 +26,7 @@ stages:
     gpu_memory_utilization: 0.70
     enforce_eager: true
     attention_backend: TRITON_ATTN
+    moe_backend: triton
     mm_encoder_attn_backend: TORCH_SDPA
     mm_processor_cache_gb: 0
     default_sampling_params:
@@ -44,6 +45,7 @@ stages:
     gpu_memory_utilization: 0.18
     enforce_eager: true
     attention_backend: TRITON_ATTN
+    moe_backend: triton
     mm_encoder_attn_backend: TORCH_SDPA
     mm_processor_cache_gb: 0
     input_connectors:
@@ -63,6 +65,7 @@ stages:
     gpu_memory_utilization: 0.05
     enforce_eager: true
     attention_backend: TRITON_ATTN
+    moe_backend: triton
     mm_encoder_attn_backend: TORCH_SDPA
     async_scheduling: false
     mm_processor_cache_gb: 0
