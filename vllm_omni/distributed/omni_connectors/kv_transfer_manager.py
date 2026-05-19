@@ -21,6 +21,7 @@ from .utils.kv_utils import (
     build_rank_aware_send_keys,
     get_kv_target_ranks,
     get_local_tp_rank,
+    get_omni_replica_id,
     get_tp_world_size,
     kv_zmq_port,
     merge_received_rank_shards,
@@ -415,7 +416,13 @@ class OmniKVTransferManager:
                             stage_int = int(self.config.from_stage) if self.config.from_stage is not None else 0
                         except (TypeError, ValueError):
                             stage_int = 0
-                        zmq_port = kv_zmq_port(base_port, stage_int, self._tp_topo.local_rank)
+                        replica_id = get_omni_replica_id()
+                        zmq_port = kv_zmq_port(
+                            base_port,
+                            stage_int,
+                            self._tp_topo.local_rank,
+                            replica_id=replica_id,
+                        )
 
                         if self.config.need_send_cache:
                             c_extra["role"] = "sender"

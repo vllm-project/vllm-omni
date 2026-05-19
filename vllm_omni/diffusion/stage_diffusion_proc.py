@@ -7,6 +7,7 @@ communicating with StageDiffusionClient via ZMQ (PUSH/PULL).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import signal
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -30,6 +31,7 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackDecoder,
     OmniMsgpackEncoder,
 )
+from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -54,6 +56,56 @@ class StageDiffusionProc:
         self._engine: DiffusionEngine | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._closed = False
+        # Set by ``run_loop`` to the live dispatch task dict so
+        # :attr:`queue_length` can report in-flight requests for the
+        # OmniCoordinator heartbeat hook.
+        self._active_tasks: dict[str, asyncio.Task] | None = None
+        # Set when a request-handler detects that the engine's multiproc
+        # executor has died (e.g. a worker process crashed and the executor's
+        # monitor thread closed it). Once set, ``run_loop`` breaks out so the
+        # outer ``except``/``finally`` can send ``DIFFUSION_PROC_DEAD`` and
+        # ``ReplicaStatus.DOWN``, then the subprocess exits non-zero. Without
+        # this, the run_loop would swallow per-request errors and keep
+        # serving 500s indefinitely while heartbeats still report UP.
+        self._fatal_event: asyncio.Event | None = None
+
+    @property
+    def queue_length(self) -> int:
+        """Number of in-flight diffusion requests.
+
+        Returns 0 before :meth:`run_loop` starts and after it exits.
+        """
+        tasks = self._active_tasks
+        return 0 if tasks is None else len(tasks)
+
+    def _is_executor_dead(self) -> bool:
+        """True iff the multiproc executor has been closed or marked failed.
+
+        Detects the "workers died but the diffusion proc is still pulling
+        requests" case: ``MultiprocDiffusionExecutor`` sets ``_closed = True``
+        and ``is_failed = True`` from its worker-monitor thread the moment any
+        worker process exits; every subsequent ``execute_request`` /
+        ``collective_rpc`` then raises ``RuntimeError("DiffusionExecutor is
+        closed.")`` inside the engine. Callers in ``run_loop`` use this to
+        decide whether a per-request failure is recoverable or fatal.
+        """
+        if self._engine is None:
+            return False
+        executor = getattr(self._engine, "executor", None)
+        if executor is None:
+            return False
+        return bool(getattr(executor, "_closed", False) or getattr(executor, "is_failed", False))
+
+    def _signal_fatal_engine_failure(self, reason: str) -> None:
+        """Idempotently signal ``run_loop`` to tear down on a fatal engine error."""
+        if self._fatal_event is None or self._fatal_event.is_set():
+            return
+        logger.error(
+            "[StageDiffusionProc] fatal engine failure detected (%s); "
+            "signaling run_loop to send DIFFUSION_PROC_DEAD and exit.",
+            reason,
+        )
+        self._fatal_event.set()
 
     # ------------------------------------------------------------------
     # Initialization
@@ -309,6 +361,14 @@ class StageDiffusionProc:
         decoder = OmniMsgpackDecoder()
 
         tasks: dict[str, asyncio.Task] = {}
+        # Expose the live task dict so :attr:`queue_length` (used by the
+        # OmniCoordinator heartbeat hook) can read the in-flight count.
+        self._active_tasks = tasks
+        # Wakes the main recv loop when a request-handler detects a fatal
+        # engine failure so we tear down promptly instead of swallowing
+        # "DiffusionExecutor is closed" on every subsequent request.
+        fatal_event = asyncio.Event()
+        self._fatal_event = fatal_event
 
         async def _dispatch_request(
             request_id: str,
@@ -342,12 +402,40 @@ class StageDiffusionProc:
                         }
                     )
                 )
+                # Per-request errors are usually recoverable, but a closed
+                # executor means every future request will get the same
+                # "DiffusionExecutor is closed" error. Signal the main loop
+                # to send DIFFUSION_PROC_DEAD and exit so the head's hub
+                # demotes this replica instead of waiting on the heartbeat
+                # timeout (~30 s by default).
+                if self._is_executor_dead():
+                    self._signal_fatal_engine_failure(f"add_request {request_id}: {e!s}")
             finally:
                 tasks.pop(request_id, None)
 
         try:
             while True:
-                raw = await request_socket.recv()
+                # Await recv and fatal_event concurrently so the loop wakes
+                # up immediately when a per-request handler signals a fatal
+                # engine failure — even if no fresh ZMQ frame arrives.
+                recv_task: asyncio.Task = asyncio.ensure_future(request_socket.recv())
+                fatal_task: asyncio.Task = asyncio.ensure_future(fatal_event.wait())
+                try:
+                    done, pending = await asyncio.wait(
+                        [recv_task, fatal_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for waiter in (recv_task, fatal_task):
+                        if not waiter.done():
+                            waiter.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, Exception):
+                                await waiter
+                if fatal_event.is_set():
+                    raise RuntimeError(
+                        "StageDiffusionProc executor reported permanent failure; tearing down the diffusion subprocess."
+                    )
+                raw = recv_task.result()
                 msg = decoder.decode(raw)
                 msg_type = msg.get("type")
 
@@ -397,6 +485,11 @@ class StageDiffusionProc:
                                     }
                                 )
                             )
+                            # Same rationale as the single-request path: a
+                            # closed executor turns every subsequent batch
+                            # into a 500, so escalate now.
+                            if self._is_executor_dead():
+                                self._signal_fatal_engine_failure(f"add_batch_request {rid}: {e!s}")
                         finally:
                             tasks.pop(rid, None)
 
@@ -446,6 +539,13 @@ class StageDiffusionProc:
                                 }
                             )
                         )
+                        # Collective RPCs run through the same multiproc
+                        # executor — a closed executor means every future
+                        # RPC fails the same way, so tear down promptly.
+                        if self._is_executor_dead():
+                            self._signal_fatal_engine_failure(
+                                f"collective_rpc {msg['method']} (rpc_id={rpc_id}): {e!s}"
+                            )
 
                 elif msg_type == "shutdown":
                     break
@@ -466,6 +566,8 @@ class StageDiffusionProc:
             if tasks:
                 await asyncio.gather(*tasks.values(), return_exceptions=True)
 
+            self._active_tasks = None
+            self._fatal_event = None
             request_socket.close()
             response_socket.close()
             ctx.term()
@@ -504,8 +606,22 @@ class StageDiffusionProc:
         handshake_address: str,
         request_address: str,
         response_address: str,
+        *,
+        omni_coordinator_address: str | None = None,
+        omni_stage_id: int | None = None,
+        omni_replica_id: int = 0,
     ) -> None:
-        """Entry point for the diffusion subprocess."""
+        """Entry point for the diffusion subprocess.
+
+        Omni-specific kwargs (mirroring :meth:`StageEngineCoreProc.run_stage_core`):
+          - ``omni_coordinator_address``: ROUTER address of the head-side
+            OmniCoordinator. When set, a :class:`OmniCoordClientForStage`
+            reports the diffusion replica's status + queue length.
+          - ``omni_stage_id``: logical stage id; required when
+            ``omni_coordinator_address`` is set.
+          - ``omni_replica_id``: cluster-unique replica id within the
+            stage (logging / metrics only).
+        """
         shutdown_requested = False
 
         def signal_handler(signum: int, frame: Any) -> None:
@@ -518,6 +634,7 @@ class StageDiffusionProc:
         signal.signal(signal.SIGINT, signal_handler)
 
         proc = cls(model, od_config)
+        coord_client: OmniCoordClientForStage | None = None
         try:
             proc.initialize()
 
@@ -529,6 +646,32 @@ class StageDiffusionProc:
             handshake_socket.close()
             handshake_ctx.term()
 
+            # Wire OmniCoordClientForStage *after* READY so that the head
+            # has bound its head-side request/response sockets — the
+            # address pair we report is the same pair this proc binds to
+            # (request/response addresses passed in).
+            if omni_coordinator_address is not None:
+                if omni_stage_id is None:
+                    raise ValueError("omni_stage_id must be provided when omni_coordinator_address is set")
+                coord_client = OmniCoordClientForStage(
+                    coord_zmq_addr=omni_coordinator_address,
+                    input_addr=request_address,
+                    output_addr=response_address,
+                    stage_id=int(omni_stage_id),
+                )
+
+                def _refresh_queue_length() -> None:
+                    coord_client._queue_length = proc.queue_length  # type: ignore[union-attr]
+
+                coord_client._on_heartbeat = _refresh_queue_length
+
+                logger.info(
+                    "StageDiffusionProc registered with OmniCoordinator (stage_id=%d replica_id=%d coord=%s)",
+                    omni_stage_id,
+                    omni_replica_id,
+                    omni_coordinator_address,
+                )
+
             # Run async event loop
             asyncio.run(proc.run_loop(request_address, response_address))
 
@@ -539,6 +682,9 @@ class StageDiffusionProc:
             logger.exception("StageDiffusionProc encountered a fatal error.")
             raise
         finally:
+            if coord_client is not None:
+                with contextlib.suppress(RuntimeError):
+                    coord_client.close()
             proc.close()
 
 
@@ -551,10 +697,17 @@ def spawn_diffusion_proc(
     handshake_address: str | None = None,
     request_address: str | None = None,
     response_address: str | None = None,
+    *,
+    omni_coordinator_address: str | None = None,
+    omni_stage_id: int | None = None,
+    omni_replica_id: int = 0,
 ) -> tuple[BaseProcess, str, str, str]:
     """Spawn a StageDiffusionProc subprocess.
 
     Returns ``(proc, handshake_address, request_address, response_address)``.
+
+    Pass ``omni_coordinator_address`` / ``omni_stage_id`` / ``omni_replica_id``
+    to have the subprocess publish heartbeats to an OmniCoordinator.
     """
     handshake_address = handshake_address or get_open_zmq_ipc_path()
     request_address = request_address or get_open_zmq_ipc_path()
@@ -570,6 +723,9 @@ def spawn_diffusion_proc(
             "handshake_address": handshake_address,
             "request_address": request_address,
             "response_address": response_address,
+            "omni_coordinator_address": omni_coordinator_address,
+            "omni_stage_id": omni_stage_id,
+            "omni_replica_id": omni_replica_id,
         },
     )
     proc.start()
