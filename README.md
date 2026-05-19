@@ -15,7 +15,19 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 ---
 
-*Latest News* 🔥
+## What's new
+
+- [2026/05/19] Windows async Omni streaming is now documented and validated on
+  the `windows-compat` branch. See [WINDOWS_COMPAT.md](WINDOWS_COMPAT.md) for a
+  start-from-scratch vLLM + vLLM-Omni Windows setup, runtime environment
+  variables, and focused verification commands.
+- [2026/05/19] Added a Windows single-GPU Qwen3-Omni deploy config at
+  [vllm_omni/deploy/qwen3_omni_moe_windows_single_gpu.yaml](vllm_omni/deploy/qwen3_omni_moe_windows_single_gpu.yaml),
+  including FlashInfer runtime attention and Torch SDPA multimodal encoder
+  attention for Blackwell-safe execution.
+- [2026/05/19] Added a streaming Qwen3-Omni audio in -> audio out probe at
+  [examples/offline_inference/qwen3_omni/windows_audio_stream_probe.py](examples/offline_inference/qwen3_omni/windows_audio_stream_probe.py).
+  It verifies async audio chunk delivery without writing an output WAV file.
 - [2026/05] We released [0.20.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.20.0) - refreshes the serving/runtime stack for large-scale omni workloads, and improves diffusion model performance, quantization, and hardware readiness across CUDA, ROCm, MUSA, NPU, and XPU backends.
 - [2026/03] We released [0.18.0](https://github.com/vllm-project/vllm-omni/releases/tag/v0.18.0) - strengthens the core runtime through a large entrypoint refactor and scheduler/runtime cleanups, expands unified quantization and diffusion execution, broadens multimodal model coverage, and improves production readiness across audio, omni, image, video, RL, and multi-platform deployments.
 - [2026/03] Check out our first public [project deepdive](https://youtu.be/sgwNfsNnR9I) at the vLLM Hong Kong Meetup!
