@@ -17,7 +17,7 @@ Both strategies use pinned memory for faster CPU-GPU transfers. The strategies a
 Model-level offloading implements mutual exclusion between DiT transformer and encoder modules using pre forward hooks:
 
 - **When encoders run**: DiT transformer is offloaded to CPU
-- **When DiT runs**: Encoders are offloaded to CPU
+- **When DiT runs**: Encoders are offloaded to CPU, if more than one dit models, only one loaded on GPU, others get offloaded to CPU.
 - **VAE**: Stays resident on GPU
 
 Before each module's forward pass, the hook automatically moves it to GPU while offloading the other module group to CPU. Transfers use pinned memory for speed.
@@ -38,14 +38,15 @@ vllm-omni serve diffusion Wan-AI/Wan2.2-T2V-A14B-Diffusers --enable-cpu-offload
 
 ### To Support a Model
 
-Implement the `SupportsModuleOffload` protocol to declare which
-submodules participate in offloading:
+Implement the `SupportsComponentDiscovery` protocol to declare which
+submodules serve as pipeline components (used by offloading, HSDP
+sharding, and other framework features):
 
 ```python
 from typing import ClassVar
-from vllm_omni.diffusion.models.interface import SupportsModuleOffload
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 
-class MyPipeline(nn.Module, SupportsModuleOffload):
+class MyPipeline(nn.Module, SupportsComponentDiscovery):
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "vision_model"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
@@ -158,7 +159,7 @@ class Flux2Transformer2DModel(nn.Module):
 The offloader discovers pipeline components in two ways:
 
 1. **Protocol-based** (preferred): If the pipeline implements
-    `SupportsModuleOffload`, its `_dit_modules`, `_encoder_modules`,
+    `SupportsComponentDiscovery`, its `_dit_modules`, `_encoder_modules`,
     `_vae_modules`, and `_resident_modules` class variables are used
     directly.  All attribute names support dotted paths (e.g.
     `"pipe.transformer"`, `"bagel.time_embedder"`) for nested submodules.

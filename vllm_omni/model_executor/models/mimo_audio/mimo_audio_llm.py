@@ -519,13 +519,18 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
 
         vllm_config.model_config.hf_config = self.config
 
-        # Configure MRoPE parameters for multimodal rotary embeddings
+        # Configure MRoPE parameters for multimodal rotary embeddings.
+        # NOTE: In transformers >=5.x, `rope_scaling` is a property alias whose setter *replaces*
+        # `rope_parameters` wholesale. If we assign `rope_scaling = mrope_config` first, any
+        # pre-existing `rope_theta` key inside `rope_parameters` (standardized from the checkpoint's
+        # top-level `rope_theta`) is silently dropped, which breaks `Qwen2RotaryEmbedding`'s
+        # `compute_default_rope_parameters` (it reads `config.rope_parameters["rope_theta"]`).
+        # Update `rope_parameters` in-place instead so the standardized `rope_theta` is preserved.
         mrope_config = {
             "mrope_section": [16, 24, 24],
             "rope_type": "default",
             "type": "default",
         }
-        setattr(vllm_config.model_config.hf_config, "rope_scaling", mrope_config)
         vllm_config.model_config.hf_config.rope_parameters.update(mrope_config)
 
         self.model = init_vllm_registered_model(
@@ -788,7 +793,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         local_embeds: torch.FloatTensor,  # [1, 1, hidden_size]
         tokens_dtype: torch.dtype = torch.int64,
         tokens_device: torch.device = torch.device(
-            f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
+            f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
         ),
         local_sampler: MiMoSampler | MiMoLocalSamplerTensor | None = None,
     ):
@@ -842,7 +847,7 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         local_embeds: torch.FloatTensor,  # [1, 1, hidden_size]
         tokens_dtype: torch.dtype = torch.int64,
         tokens_device: torch.device = torch.device(
-            f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu"
+            f"cuda:{torch.accelerator.current_device_index()}" if torch.cuda.is_available() else "cpu"
         ),
         local_sampler: MiMoSampler | None = None,
     ):

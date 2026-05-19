@@ -78,6 +78,16 @@ else:
         except (ImportError, ModuleNotFoundError):
             pass
 
+    # Fallback: Try vLLM's encapsulated flash attention dispatcher
+    # TODO discuss priority and remove potentially redundant fallbacks
+    if flash_attn_varlen_func is None:
+        try:
+            from vllm.vllm_flash_attn import (  # noqa: F401
+                flash_attn_varlen_func,
+            )
+        except (ImportError, ModuleNotFoundError):
+            pass
+
 # If no FA backend available, SDPA backend will be selected at the platform level
 # flash_attn_func and flash_attn_varlen_func will be None
 HAS_FLASH_ATTN = flash_attn_func is not None or flash_attn_varlen_func is not None
@@ -112,6 +122,16 @@ def is_flash_attn_installed() -> bool:
 
         if __version__ < "2.6.0":
             raise ImportError("install flash_attn >= 2.6.0")
+        return True
+    except (ImportError, ModuleNotFoundError):
+        pass
+
+    # Try vLLM's flash attention wrapper
+    try:
+        from vllm.vllm_flash_attn import (  # noqa: F401
+            flash_attn_varlen_func,
+        )
+
         return True
     except (ImportError, ModuleNotFoundError):
         logger.warning("No Flash Attention backend found, using pytorch SDPA implementation")

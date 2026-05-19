@@ -51,6 +51,40 @@ def voxcpm_server(mocker: MockerFixture):
     )
 
 
+@pytest.fixture
+def voxcpm2_server(mocker: MockerFixture):
+    mocker.patch.object(OmniOpenAIServingSpeech, "_load_codec_frame_rate", return_value=None)
+
+    mock_engine_client = mocker.MagicMock()
+    mock_engine_client.errored = False
+    mock_engine_client.model_config = mocker.MagicMock(model="OpenBMB/VoxCPM2")
+    mock_engine_client.default_sampling_params_list = [SimpleNamespace(max_tokens=2048)]
+    mock_engine_client.tts_batch_max_items = 32
+    mock_engine_client.generate = mocker.MagicMock(return_value="generator")
+    mock_engine_client.stage_configs = [
+        SimpleNamespace(
+            engine_args=SimpleNamespace(
+                model_stage="latent_generator",
+                model_arch="VoxCPM2TalkerForConditionalGeneration",
+            ),
+            tts_args={},
+        ),
+        SimpleNamespace(
+            engine_args=SimpleNamespace(model_stage="vae"),
+            tts_args={},
+        ),
+    ]
+
+    mock_models = mocker.MagicMock()
+    mock_models.is_base_model.return_value = True
+
+    return OmniOpenAIServingSpeech(
+        engine_client=mock_engine_client,
+        models=mock_models,
+        request_logger=mocker.MagicMock(),
+    )
+
+
 class TestVoxCPMServing:
     def test_voxcpm_model_type_detection(self, voxcpm_server):
         assert voxcpm_server._tts_model_type == "voxcpm"
@@ -109,6 +143,7 @@ class TestVoxCPMServing:
         assert call.kwargs["prompt"] == {
             "prompt_token_ids": [1],
             "additional_information": tts_params,
+            "type": "token",
         }
         assert call.kwargs["output_modalities"] == ["audio"]
 
@@ -140,4 +175,20 @@ class TestVoxCPMServing:
         assert call.kwargs["prompt"] == {
             "prompt_token_ids": [1],
             "additional_information": tts_params,
+            "type": "token",
         }
+
+
+class TestVoxCPM2Serving:
+    """Regression tests for VoxCPM2 serving behavior."""
+
+    def test_voxcpm2_model_type_detection(self, voxcpm2_server):
+        assert voxcpm2_server._tts_model_type == "voxcpm2"
+        assert voxcpm2_server._is_tts is True
+
+    def test_voxcpm2_default_voice_is_supported(self, voxcpm2_server):
+        """VoxCPM2 should accept voice='default' (zero-shot mode, no voice cloning).
+
+        Regression: previously returned 400 Invalid voice 'default'.
+        """
+        assert "default" in voxcpm2_server.supported_speakers

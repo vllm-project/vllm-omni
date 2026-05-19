@@ -28,6 +28,8 @@ def test_generate_html_report_with_perf_templates(tmp_path: Path):
 
     omni_record = json.loads(omni_template_path.read_text(encoding="utf-8"))
     diffusion_records = json.loads(diffusion_template_path.read_text(encoding="utf-8"))
+    diffusion_records[0]["endpoint"] = "/v1/videos"
+    diffusion_records[0]["result"]["endpoint"] = "/v1/videos"
 
     input_dir = tmp_path / "input"
     diffusion_input_dir = tmp_path / "diffusion_input"
@@ -52,3 +54,4 @@ def test_generate_html_report_with_perf_templates(tmp_path: Path):
     assert "Omni records <strong>1</strong>" in html
     assert f"Diffusion records <strong>{len(diffusion_records)}</strong>" in html
     assert "const DIFF_DATA =" in html
+    assert '"endpoint": "/v1/videos"' in html

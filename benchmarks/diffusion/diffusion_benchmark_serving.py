@@ -6,31 +6,31 @@
 Benchmark online serving for diffusion models (Image/Video Generation).
 If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 
-Supports multiple backends:
-    - vllm-omni: Uses /v1/chat/completions endpoint (default)
-    - openai: Uses /v1/images/generations endpoint
-    - v1/videos: Use /v1/videos endpoint
+Supports multiple endpoints:
+    - /v1/chat/completions: OpenAI chat-compatible image requests
+    - /v1/images/generations: OpenAI image generation requests
+    - /v1/videos: Async video jobs
 
 Usage:
-    # Video (v1/videos backend)
+    # Video (/v1/videos endpoint)
     t2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend v1/videos --dataset vbench --task t2v --num-prompts 10 \
+        --endpoint /v1/videos --dataset vbench --task t2v --num-prompts 10 \
         --height 480 --width 640 --fps 16 --num-frames 80
 
     i2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend v1/videos --dataset vbench --task i2v --num-prompts 10
+        --endpoint /v1/videos --dataset vbench --task i2v --num-prompts 10
 
 
-    # Image (vllm-omni backend)
+    # Image (/v1/chat/completions endpoint)
     t2i:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend vllm-omni --dataset vbench --task t2i --num-prompts 10 \
+        --endpoint /v1/chat/completions --dataset vbench --task t2i --num-prompts 10 \
         --height 1024 --width 1024
 
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend vllm-omni --dataset random --task t2i --num-prompts 1 \
+        --endpoint /v1/chat/completions --dataset random --task t2i --num-prompts 1 \
         --max-concurrency 1 --enable-negative-prompt \
         --random-request-config '[
             {"width":512,"height":512,"num_inference_steps":20,"weight":0.15},
@@ -41,18 +41,18 @@ Usage:
 
     i2i:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend vllm-omni --dataset vbench --task i2i --num-prompts 10
+        --endpoint /v1/chat/completions --dataset vbench --task i2i --num-prompts 10
 
-    # Image (openai backend)
+    # Image (/v1/images/generations endpoint)
     t2i:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend openai --dataset vbench --task t2i --num-prompts 10 \
+        --endpoint /v1/images/generations --dataset vbench --task t2i --num-prompts 10 \
         --height 1024 --width 1024 --port 3000
 
     # Video (v1/videos)
     t2v:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
-        --backend v1/videos --dataset random --task t2v --num-prompts 1 \
+        --endpoint /v1/videos --dataset random --task t2v --num-prompts 1 \
         --max-concurrency 1 --enable-negative-prompt \
         --random-request-config '[
             {"width":854,"height":480,"num_inference_steps":18,"num_frames":120,"fps":24,"weight":1}
@@ -80,7 +80,12 @@ from typing import Any
 import aiohttp
 import numpy as np
 import requests
-from backends import RequestFuncInput, RequestFuncOutput, backends_function_mapping
+from backends import (
+    RequestFuncInput,
+    RequestFuncOutput,
+    backends_function_mapping,
+    normalize_endpoint,
+)
 from PIL import Image
 from tqdm.asyncio import tqdm
 
@@ -751,6 +756,52 @@ async def iter_requests(
         yield req
 
 
+def _make_warmup_request(
+    requests_list: list[RequestFuncInput],
+    index: int,
+    args,
+) -> RequestFuncInput:
+    warm_req = requests_list[index % len(requests_list)]
+    if args.warmup_num_inference_steps is not None:
+        warm_req = replace(
+            warm_req,
+            num_inference_steps=args.warmup_num_inference_steps,
+        )
+    if args.task == "t2v":
+        warm_req = replace(warm_req, num_frames=1)
+    return warm_req
+
+
+async def _run_warmups(
+    requests_list: list[RequestFuncInput],
+    args,
+    session: aiohttp.ClientSession,
+    request_func,
+) -> list[tuple[RequestFuncInput, RequestFuncOutput]]:
+    if not args.warmup_requests or not requests_list:
+        return []
+
+    warmup_requests = [_make_warmup_request(requests_list, i, args) for i in range(args.warmup_requests)]
+    warmup_concurrency = min(int(args.warmup_concurrency), len(warmup_requests))
+    warmup_semaphore = asyncio.Semaphore(warmup_concurrency)
+
+    print(
+        f"Running {len(warmup_requests)} warmup request(s) "
+        f"with num_inference_steps={args.warmup_num_inference_steps} "
+        f"and warmup_concurrency={warmup_concurrency}..."
+    )
+
+    async def limited_warmup_request_func(
+        req: RequestFuncInput,
+    ) -> RequestFuncOutput:
+        async with warmup_semaphore:
+            return await request_func(req, session, None)
+
+    warmup_tasks = [asyncio.create_task(limited_warmup_request_func(req)) for req in warmup_requests]
+    warmup_outputs = await asyncio.gather(*warmup_tasks)
+    return list(zip(warmup_requests, warmup_outputs))
+
+
 def calculate_metrics(
     outputs: list[RequestFuncOutput],
     total_duration: float,
@@ -837,6 +888,14 @@ def wait_for_service(base_url: str, timeout: int = 120) -> None:
         time.sleep(1)
 
 
+def _default_endpoint_for_task(task: str) -> str:
+    if task in {"t2v", "i2v", "ti2v"}:
+        return "/v1/videos"
+    if task in {"t2i", "i2i", "ti2i"}:
+        return "/v1/chat/completions"
+    raise ValueError(f"Unsupported task for endpoint resolution: {task}")
+
+
 async def benchmark(args):
     # Construct base_url if not provided
     if args.base_url is None:
@@ -856,18 +915,23 @@ async def benchmark(args):
             f"Valid image tasks: {sorted(IMAGE_TASKS)}"
         )
 
-    valid_backends = sorted(backends_function_mapping[task_type].keys())
+    raw_endpoint = args.endpoint if args.endpoint is not None else args.backend
+    if raw_endpoint is None:
+        raw_endpoint = _default_endpoint_for_task(args.task)
+    args.endpoint = normalize_endpoint(raw_endpoint)
 
-    if args.backend not in valid_backends:
+    valid_endpoints = sorted(backends_function_mapping[task_type].keys())
+
+    if args.endpoint not in valid_endpoints:
         logger.error(
-            f"Invalid backend '{args.backend}' for task '{args.task}' (task type: '{task_type}').\n"
-            f"Valid backends for this task type: {valid_backends}\n"
-            f"Example usage: --task {args.task} --backend {valid_backends[0]}"
+            f"Invalid endpoint '{args.endpoint}' for task '{args.task}' (task type: '{task_type}').\n"
+            f"Valid endpoints for this task type: {valid_endpoints}\n"
+            f"Example usage: --task {args.task} --endpoint {valid_endpoints[0]}"
         )
-        raise ValueError("Backend validation failed. See log above for valid options.")
+        raise ValueError("Endpoint validation failed. See log above for valid options.")
 
-    # Setup API URL and request function based on backend
-    request_func, api_url = backends_function_mapping[task_type][args.backend]
+    # Setup API URL and request function based on endpoint.
+    request_func, api_url = backends_function_mapping[task_type][args.endpoint]
     api_url = f"{args.base_url}{api_url}"
 
     if args.dataset == "vbench":
@@ -900,23 +964,12 @@ async def benchmark(args):
     pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
 
     async with aiohttp.ClientSession() as session:
-        warmup_pairs: list[tuple[RequestFuncInput, RequestFuncOutput]] = []
-        if args.warmup_requests and requests_list:
-            print(
-                f"Running {args.warmup_requests} warmup request(s) \
-                with num_inference_steps={args.warmup_num_inference_steps}..."
-            )
-            for i in range(args.warmup_requests):
-                warm_req = requests_list[i % len(requests_list)]
-                if args.warmup_num_inference_steps is not None:
-                    warm_req = replace(
-                        warm_req,
-                        num_inference_steps=args.warmup_num_inference_steps,
-                    )
-                if args.task == "t2v":
-                    warm_req = replace(warm_req, num_frames=1)
-                warm_out = await limited_request_func(warm_req, session, None)
-                warmup_pairs.append((warm_req, warm_out))
+        warmup_pairs = await _run_warmups(
+            requests_list=requests_list,
+            args=args,
+            session=session,
+            request_func=request_func,
+        )
 
         if args.slo:
             # Prefer trace-provided per-request slo_ms. Only populate when missing.
@@ -941,15 +994,15 @@ async def benchmark(args):
     metrics = calculate_metrics(outputs, total_duration, requests_list, args, args.slo)
 
     # Add configuration info to metrics for JSON output
-    metrics["backend"] = args.backend
+    metrics["endpoint"] = args.endpoint
     metrics["model"] = args.model
     metrics["dataset"] = args.dataset
     metrics["task"] = args.task
 
-    print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=60, c="="))
+    print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
 
     # Section 1: Configuration
-    print("{:<40} {:<15}".format("Backend:", args.backend))
+    print("{:<40} {:<15}".format("Endpoint:", args.endpoint))
     print("{:<40} {:<15}".format("Model:", args.model))
     print("{:<40} {:<15}".format("Dataset:", args.dataset))
     print("{:<40} {:<15}".format("Task:", args.task))
@@ -1013,11 +1066,16 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8091, help="Server port.")
     parser.add_argument("--model", type=str, default="default", help="Model name.")
     parser.add_argument(
+        "--endpoint",
+        type=str,
+        default=None,
+        help=("Endpoint path to target. Leading '/' is optional, e.g. /v1/videos or v1/videos."),
+    )
+    parser.add_argument(
         "--backend",
         type=str,
-        default="vllm-omni",
-        choices=["vllm-omni", "openai", "v1/videos"],
-        help="Backend to target the benchmark to.",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--dataset",
@@ -1071,6 +1129,13 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="num_inference_steps used for warmup requests.",
+    )
+    parser.add_argument(
+        "--warmup-concurrency",
+        type=int,
+        default=1,
+        help="Maximum number of warmup requests to run concurrently. "
+        "Set this to match the real batch shape when warming up torch.compile or CUDA graphs.",
     )
     parser.add_argument("--width", type=int, default=None, help="Image/Video width.")
     parser.add_argument("--height", type=int, default=None, help="Image/Video height.")
@@ -1135,5 +1200,4 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-
     asyncio.run(benchmark(args))

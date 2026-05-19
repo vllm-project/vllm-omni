@@ -148,10 +148,11 @@ def _build_omni_kwargs(args, quantization=None):
 def _generate_image(omni, args, prompt, seed):
     """Generate a single image and return (PIL.Image, time_seconds, memory_gib)."""
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+    from vllm_omni.outputs import OmniRequestOutput
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
-    torch.cuda.reset_peak_memory_stats()
+    torch.accelerator.reset_peak_memory_stats()
     start = time.perf_counter()
     outputs = omni.generate(
         {"prompt": prompt},
@@ -163,10 +164,11 @@ def _generate_image(omni, args, prompt, seed):
         ),
     )
     elapsed = time.perf_counter() - start
-    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+    peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
-    first = outputs[0]
-    req_out = first.request_output[0] if hasattr(first, "request_output") else first
+    req_out = OmniRequestOutput.unwrap_result(outputs)
+    if not req_out.images:
+        raise ValueError("Could not extract image output from result.")
     img = req_out.images[0]
     return img, elapsed, peak_mem
 
@@ -178,7 +180,7 @@ def _generate_video(omni, args, prompt, seed):
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
-    torch.cuda.reset_peak_memory_stats()
+    torch.accelerator.reset_peak_memory_stats()
     start = time.perf_counter()
     outputs = omni.generate(
         {"prompt": prompt, "negative_prompt": ""},
@@ -192,7 +194,7 @@ def _generate_video(omni, args, prompt, seed):
         ),
     )
     elapsed = time.perf_counter() - start
-    peak_mem = torch.cuda.max_memory_allocated() / (1024**3)
+    peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
 
     first = outputs[0]
     if hasattr(first, "request_output") and isinstance(first.request_output, list):
@@ -228,8 +230,8 @@ def _unload_omni(omni):
     del omni
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        torch.accelerator.empty_cache()
+        torch.accelerator.synchronize()
 
 
 def run_benchmark(args):

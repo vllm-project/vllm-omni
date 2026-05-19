@@ -243,6 +243,44 @@ class ISTFT(nn.Module):
 
         return y
 
+    def forward_fixed(self, spec: torch.Tensor) -> torch.Tensor:
+        """CUDA-Graph-safe ISTFT: identical to forward() but without assert."""
+        if self.padding == "center":
+            return torch.istft(
+                spec,
+                self.n_fft,
+                self.hop_length,
+                self.win_length,
+                self.window,
+                center=True,
+            )
+
+        pad = (self.win_length - self.hop_length) // 2
+        B, N, T = spec.shape
+
+        ifft = torch.fft.irfft(spec, self.n_fft, dim=1, norm="backward")
+        ifft = ifft * self.window[None, :, None]
+
+        output_size = (T - 1) * self.hop_length + self.win_length
+        y = torch.nn.functional.fold(
+            ifft,
+            output_size=(1, output_size),
+            kernel_size=(1, self.win_length),
+            stride=(1, self.hop_length),
+        )[:, 0, 0, pad:-pad]
+
+        window_sq = self.window.square().expand(1, T, -1).transpose(1, 2)
+        window_envelope = torch.nn.functional.fold(
+            window_sq,
+            output_size=(1, output_size),
+            kernel_size=(1, self.win_length),
+            stride=(1, self.hop_length),
+        ).squeeze()[pad:-pad]
+
+        y = y / window_envelope
+
+        return y
+
 
 class ISTFTHead(nn.Module):
     """
@@ -291,18 +329,71 @@ class ISTFTHead(nn.Module):
         audio = audio.to(original_dtype)
         return audio
 
+    def forward_fixed(self, x: torch.Tensor) -> torch.Tensor:
+        """CUDA-Graph-safe ISTFTHead: uses istft.forward_fixed (no assert)."""
+        x = self.out(x).transpose(1, 2)
+        mag, p = x.chunk(2, dim=1)
+        mag = torch.exp(mag)
+        mag = torch.clip(mag, max=1e2)
+        x = torch.cos(p)
+        y = torch.sin(p)
+        original_dtype = x.dtype
+        S = mag.float() * (x.float() + 1j * y.float())
+        audio = self.istft.forward_fixed(S)
+        audio = audio.to(original_dtype)
+        return audio
+
 
 class RotaryEmbedding(nn.Module):
+    inv_freq: torch.Tensor
+
     def __init__(self, base, dim, max_seq_len, rope_type="default", device=None):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.rope_type = rope_type
+        # Cache base/dim so we can reconstruct `inv_freq` from scratch during transformers >=5.x's
+        # `PreTrainedModel._init_weights` reinit path (which calls
+        # `module.compute_default_rope_parameters(module.config)` and then `init.copy_` the result
+        # into `inv_freq` / `original_inv_freq`). Our class does not carry an HF config, so we
+        # ignore it and rely on these cached values.
+        self._rope_base = base
+        self._rope_dim = dim
+        # transformers 5.x `_init_weights` reads `module.config` for modules whose class name
+        # contains "RotaryEmbedding" (see `PreTrainedModel._init_weights`). Provide a placeholder
+        # so that attribute access works; the value is unused by our
+        # `compute_default_rope_parameters` below.
+        self.config = None
 
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(device=device, base=base, dim=dim)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
+        # Register `original_inv_freq` as a proper buffer (rather than a plain attribute alias of
+        # `self.inv_freq`). In transformers >=5.x `from_pretrained` builds the model on a meta
+        # device, then `_move_missing_keys_from_meta_to_device` iterates `named_buffers()` and
+        # replaces each non-persistent buffer with an `empty_like` on the real device. A plain
+        # attribute alias is invisible to `named_buffers()`, so it would be left pointing at the
+        # stale meta tensor and `init.copy_(module.original_inv_freq, ...)` inside `_init_weights`
+        # would then fail / operate on a wrong-device tensor.
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+
+    def compute_default_rope_parameters(
+        self,
+        config=None,
+        device: "torch.device | None" = None,
+        seq_len: int | None = None,
+    ) -> tuple[torch.Tensor, float]:
+        """Recompute `inv_freq` for transformers >=5.x's `_init_weights` reinit path.
+
+        transformers calls this as `module.compute_default_rope_parameters(module.config)` and then
+        `init.copy_` the returned tensor into `inv_freq` / `original_inv_freq`. Our RotaryEmbedding
+        does not carry an HF config, so we ignore the `config` arg and reuse the `base`/`dim`
+        captured at construction time. This is critical: with `transformers>=5.x`, models are
+        built on meta device and the non-persistent `inv_freq` buffer is replaced by uninitialized
+        memory during `_move_missing_keys_from_meta_to_device`, so we MUST let `_init_weights`
+        refill it (hence why we do not set `_is_hf_initialized = True` here).
+        """
+        return self.rope_init_fn(device=device, base=self._rope_base, dim=self._rope_dim)
 
     @torch.no_grad()
     @dynamic_rope_update
@@ -407,6 +498,44 @@ class Attention(nn.Module):
         attn_output = self.out_proj(attn_output)
         return attn_output
 
+    def forward_fixed(
+        self,
+        hidden_states: torch.Tensor,
+        rope_position_embeddings=None,
+        attn_mask: torch.Tensor | None = None,
+    ):
+        """Fixed-shape forward for CUDA Graph (batch_size=1, 3D tensor [B, L, D]).
+
+        Uses F.scaled_dot_product_attention instead of flash_attn_varlen_func.
+
+        Args:
+            attn_mask: optional [B, 1, L, L] bool/float mask for SDPA.
+                       Needed when padding is present and attention is non-causal,
+                       or when sliding-window behavior must be replicated.
+        """
+        B, L, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+
+        if rope_position_embeddings is not None:
+            cos, sin = rope_position_embeddings
+            query_states = apply_rotary_pos_emb(query_states, cos, sin, unsqueeze_dim=1)
+            key_states = apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=1)
+
+        attn_output = F.scaled_dot_product_attention(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attn_mask,
+            is_causal=(self.causal and attn_mask is None),
+        )
+
+        attn_output = attn_output.transpose(1, 2).reshape(B, L, self.embed_dim)
+        attn_output = self.out_proj(attn_output)
+        return attn_output
+
 
 class TransformerLayer(nn.Module):
     def __init__(
@@ -452,6 +581,33 @@ class TransformerLayer(nn.Module):
         ):
             clamp_value = torch.finfo(hidden_states.dtype).max - 1000
             hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+        return hidden_states
+
+    def forward_fixed(
+        self,
+        hidden_states: torch.Tensor,
+        rope_position_embeddings: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Fixed-shape forward for CUDA Graph (3D input [B, L, D])."""
+        residual = hidden_states
+        hidden_states = self.self_attn_layer_norm(hidden_states)
+        hidden_states = self.self_attn.forward_fixed(
+            hidden_states,
+            rope_position_embeddings=rope_position_embeddings,
+            attn_mask=attn_mask,
+        )
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.final_layer_norm(hidden_states)
+        hidden_states = self.activation_fn(self.fc1(hidden_states))
+        hidden_states = self.fc2(hidden_states)
+        hidden_states = residual + hidden_states
+
+        if hidden_states.dtype == torch.float16 or hidden_states.dtype == torch.bfloat16:
+            clamp_value = torch.finfo(hidden_states.dtype).max - 1000
+            hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
+
         return hidden_states
 
 
@@ -507,6 +663,65 @@ class TransformerVocos(nn.Module):
         x = unpack_hidden_states(x, input_length, attention_mask, unpacking_index)
         x = self.head(x)
         output_length = input_length * self.hop_size
+        return x[:, None, :], output_length
+
+    @staticmethod
+    def build_vocoder_attn_mask(
+        seq_len: int,
+        actual_len: int,
+        window_size: tuple[int, int],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Build a [1, 1, seq_len, seq_len] attention mask combining padding + sliding window.
+
+        - Padding positions (>= actual_len) are masked out.
+        - Sliding window (left, right) is applied.
+        - Returns a float mask: 0.0 for attend, -inf for mask out.
+        """
+        row = torch.arange(seq_len, device=device)
+        col = torch.arange(seq_len, device=device)
+
+        valid_mask = (col.unsqueeze(0) < actual_len) & (row.unsqueeze(1) < actual_len)
+
+        left_win, right_win = window_size
+        if left_win > 0 or right_win > 0:
+            dist = row.unsqueeze(1) - col.unsqueeze(0)
+            if left_win > 0 and right_win > 0:
+                window_mask = (dist >= -right_win) & (dist <= left_win)
+            elif left_win > 0:
+                window_mask = dist <= left_win
+            else:
+                window_mask = dist >= -right_win
+            valid_mask = valid_mask & window_mask
+
+        mask = torch.zeros(seq_len, seq_len, device=device, dtype=dtype)
+        mask.masked_fill_(~valid_mask, float("-inf"))
+        return mask.unsqueeze(0).unsqueeze(0)
+
+    def forward_fixed(self, x: torch.Tensor, vocoder_attn_mask: torch.Tensor | None = None):
+        """Fixed-shape forward for CUDA Graph. x: [1, n_mels, L].
+
+        Args:
+            vocoder_attn_mask: optional pre-built [1, 1, L, L] attention mask.
+                Caller is responsible for constructing this (e.g. via
+                build_vocoder_attn_mask) and, when used with CUDA Graph,
+                updating the static tensor in-place before replay.
+        """
+
+        x = x.transpose(1, 2)  # [1, L, n_mels]
+        B, L, _ = x.size()
+        x = self.embeddings(x)  # [1, L, vocoder_dim]
+        position_ids = torch.arange(0, L, device=x.device, dtype=torch.long)
+        rope_position_embeddings = self.position_embedding(x.view(L, -1), position_ids)
+        cos, sin = rope_position_embeddings
+        cos = cos.unsqueeze(0)  # [1, L, head_dim]
+        sin = sin.unsqueeze(0)
+        for layer in self.layers:
+            x = layer.forward_fixed(x, rope_position_embeddings=(cos, sin), attn_mask=vocoder_attn_mask)
+        x = self.layer_norm(x)
+        x = self.head.forward_fixed(x)
+        output_length = L * self.hop_size
         return x[:, None, :], output_length
 
 
@@ -716,9 +931,9 @@ class CausalConvTranspose1d(nn.Module):
         hidden_states = self.norm(hidden_states)
         hidden_states = hidden_states.transpose(2, 1)  # (N, C, L) -> (N, L, C)
 
-        casual_padding_right = max(0, kernel_size - stride)
-        hidden_states = hidden_states[:, : hidden_states.shape[1] - casual_padding_right, :]
-        output_length = (input_length - 1) * stride + kernel_size - casual_padding_right
+        causal_padding_right = max(0, kernel_size - stride)
+        hidden_states = hidden_states[:, : hidden_states.shape[1] - causal_padding_right, :]
+        output_length = (input_length - 1) * stride + kernel_size - causal_padding_right
         sequence_mask, _ = get_sequence_mask(hidden_states, output_length)
         if output_dim <= 2:
             hidden_states = torch.masked_select(hidden_states, sequence_mask).view(-1, self.out_channels)
@@ -726,6 +941,19 @@ class CausalConvTranspose1d(nn.Module):
             hidden_states = torch.where(sequence_mask, hidden_states, 0)
             hidden_states = hidden_states[:, : torch.max(output_length), :]
         return hidden_states, output_length
+
+    def forward_fixed(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Fixed-shape forward for CUDA Graph. Input: [1, L, C], Output: [1, L', C']."""
+        kernel_size = self.conv.kernel_size[0]
+        stride = self.conv.stride[0]
+        hidden_states = hidden_states.transpose(2, 1)  # (1, L, C) -> (1, C, L)
+        hidden_states = self.conv(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        hidden_states = hidden_states.transpose(2, 1)  # (1, C, L') -> (1, L', C)
+        causal_padding_right = max(0, kernel_size - stride)
+        if causal_padding_right > 0:
+            hidden_states = hidden_states[:, : hidden_states.shape[1] - causal_padding_right, :]
+        return hidden_states
 
 
 class AudioDecoder(nn.Module):
@@ -816,12 +1044,69 @@ class AudioDecoder(nn.Module):
 
         return recon_wav
 
+    def forward_fixed(
+        self,
+        audio_embed: torch.Tensor,
+        vocoder_attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Fixed-shape forward for CUDA Graph.
+
+        Input: audio_embed [1, T, d_model] — padded, batch_size=1.
+        Output: recon_wav [1, 1, wav_len].
+
+        Args:
+            vocoder_attn_mask: pre-built attention mask for the vocoder's
+                non-causal layers. Shape [1, 1, L_voc, L_voc].
+        """
+        audio_embed = audio_embed.to(self.layer_norm.weight)
+        B, L, D = audio_embed.size()
+
+        if self.dconv1 is not None:
+            audio_embed = self.dconv1.forward_fixed(audio_embed)  # [1, L', d_model]
+
+        hidden_states = audio_embed
+        _, cur_L, _ = hidden_states.size()
+
+        position_ids = torch.arange(0, cur_L, device=hidden_states.device, dtype=torch.long)
+        rope_position_embeddings = self.position_embedding(hidden_states.view(cur_L, -1), position_ids)
+        cos, sin = rope_position_embeddings
+        cos = cos.unsqueeze(0)  # [1, L', head_dim]
+        sin = sin.unsqueeze(0)
+
+        for layer in self.layers:
+            hidden_states = layer.forward_fixed(hidden_states, rope_position_embeddings=(cos, sin))
+
+        hidden_states = self.layer_norm(hidden_states)
+
+        coarse_mel = self.dconv2.forward_fixed(hidden_states)  # [1, L'', n_mels]
+
+        recon_wav, wav_length = self.vocoder.forward_fixed(
+            x=coarse_mel.transpose(1, 2),
+            vocoder_attn_mask=vocoder_attn_mask,
+        )
+
+        return recon_wav
+
 
 class MiMoAudioTokenizer(PreTrainedModel):
     config_class = MiMoAudioTokenizerConfig
 
+    @property
+    def all_tied_weights_keys(self) -> dict[str, list[str]]:
+        # Transformers `from_pretrained` -> `caching_allocator_warmup` -> `get_total_byte_count`
+        # accesses this on the root module; some PreTrainedModel versions omit the property for
+        # custom subclasses. MiMo-Audio tokenizer has no weight tying at the root.
+        return {}
+
     def __init__(self, config: MiMoAudioTokenizerConfig):
         super().__init__(config)
+        # Transformers `caching_allocator_warmup` / `get_total_byte_count` calls `len(model._tp_plan)`
+        # on the root module. The base `PreTrainedModel` class default is `None`, and this subclass
+        # does not invoke `self.post_init()` where `_tp_plan` would otherwise be initialized to `{}`.
+        # Set it explicitly to avoid `TypeError: object of type 'NoneType' has no len()`.
+        self._tp_plan = {}
+        self._pp_plan = {}
+        self._ep_plan = {}
         self.config = config
         self.sampling_rate = config.sampling_rate
         self.encoder = AudioEncoder(config=config)
@@ -847,6 +1132,47 @@ class MiMoAudioTokenizer(PreTrainedModel):
             hidden_states,
             torch.tensor([hidden_states.size(0)], device=hidden_states.device),
         )
+        return output
+
+    def _compute_vocoder_seq_len(self, code_len: int) -> int:
+        """Compute the vocoder input sequence length from code_len."""
+        cfg = self.config
+        L = code_len
+        if cfg.avg_pooler != 1:
+            k, s = cfg.avg_pooler, cfg.avg_pooler
+            L = (L - 1) * s + k - max(0, k - s)
+        k2, s2 = cfg.decoder_kernel_size, cfg.decoder_stride_size
+        L = (L - 1) * s2 + k2 - max(0, k2 - s2)
+        return L
+
+    @torch.no_grad()
+    def decode_fixed(
+        self,
+        codes: torch.Tensor,
+        padded_len: int,
+        vocoder_attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Fixed-shape decode for CUDA Graph capture.
+
+        Args:
+            codes: [audio_channels, T] — actual codes (T <= padded_len).
+            padded_len: the fixed sequence length to pad to.
+            vocoder_attn_mask: optional pre-built vocoder attention mask.
+        Returns:
+            recon_wav: [1, 1, wav_len] — full padded output (caller truncates).
+        """
+        hidden_states = self.encoder.decode_vq(codes)  # [T, d_model]
+        actual_len = hidden_states.size(0)
+        if actual_len < padded_len:
+            pad = torch.zeros(
+                padded_len - actual_len,
+                hidden_states.size(1),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            hidden_states = torch.cat([hidden_states, pad], dim=0)
+        hidden_states = hidden_states.unsqueeze(0)  # [1, padded_len, d_model]
+        output = self.decoder.forward_fixed(hidden_states, vocoder_attn_mask=vocoder_attn_mask)
         return output
 
     @torch.no_grad()

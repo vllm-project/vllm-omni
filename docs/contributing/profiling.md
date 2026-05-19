@@ -37,6 +37,8 @@ Supported fields:
 | `warmup_iterations` | Torch-profiler warmup iterations. |
 | `active_iterations` | Torch-profiler active iterations. |
 
+For detailed explanations of the fields, please refer to upstream vLLM implementation [vllm/config/profiler.py](https://github.com/vllm-project/vllm/blob/v0.20.1/vllm/config/profiler.py)
+
 ### Minimal configurations by output
 
 Only collect trace output:
@@ -124,7 +126,7 @@ profiler_config = {
     "max_iterations": 0,
     "wait_iterations": 0,
     "warmup_iterations": 0,
-    "active_iterations": 0,
+    "active_iterations": 1,
 }
 ```
 
@@ -220,7 +222,7 @@ vllm serve Wan-AI/Wan2.2-I2V-A14B-Diffusers \
     "max_iterations": 0,
     "wait_iterations": 0,
     "warmup_iterations": 0,
-    "active_iterations": 0
+    "active_iterations": 1
   }'
 ```
 

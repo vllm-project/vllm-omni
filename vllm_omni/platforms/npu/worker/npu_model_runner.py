@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -15,7 +16,7 @@ from vllm.v1.worker.gpu_model_runner import PerLayerAttnMetadata
 from vllm_ascend.ascend_forward_context import get_forward_context, set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import using_paged_attention
-from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
+from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE, NPUModelRunner
@@ -42,11 +43,9 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             self.has_talker_mtp = True
             cudagraph_mode = self.compilation_config.cudagraph_mode
             assert cudagraph_mode is not None
-            # Only wrap talker_mtp in CUDAGraphWrapper for Omni models that
-            # have a separate .talker sub-module.  TTS models' code predictor
-            # has internal AR loops / torch.multinomial — not graph-safe.
             has_separate_talker = getattr(self.model, "talker", None) is not None
-            if cudagraph_mode.has_full_cudagraphs() and has_separate_talker:
+            talker_mtp_graph_safe = getattr(self.model, "talker_mtp_graph_safe", False)
+            if cudagraph_mode.has_full_cudagraphs() and (has_separate_talker or talker_mtp_graph_safe):
                 self.talker_mtp = ACLGraphWrapper(talker_mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
             # TTS exposes mtp_hidden_size; Omni uses hf_text_config.hidden_size.
             hidden_size = int(
@@ -76,6 +75,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        profile_cpp: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -101,11 +101,13 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         if create_mixed_batch:
             raise NotImplementedError("create_mixed_batch is used for warmup deepgemm, vllm-ascend does not need it")
         elif uniform_decode:
-            assert not create_mixed_batch
             num_reqs = min(max_num_reqs, cdiv(num_tokens, max_query_len))
             num_scheduled_tokens_list = [max_query_len] * num_reqs
             if num_tokens % max_query_len != 0:
                 num_scheduled_tokens_list[-1] = num_tokens % max_query_len
+        elif profile_cpp:
+            num_reqs = 1
+            num_scheduled_tokens_list = [num_tokens] * num_reqs
         else:
             num_reqs = min(num_tokens, max_num_reqs)
             min_tokens_per_req = num_tokens // num_reqs
@@ -128,7 +130,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             max_num_scheduled_tokens=max_query_len,
             use_cascade_attn=False,
             allow_microbatching=allow_microbatching,
-            force_eager=is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE),
+            force_eager=is_profile or (cudagraph_runtime_mode == CUDAGraphMode.NONE) or profile_cpp,
             # `force_uniform_decode` is used for cudagraph capture; because for
             # capturing mixed prefill-decode batches, we sometimes use
             # num_tokens == num_reqs which looks like a uniform decode batch to the
@@ -190,16 +192,21 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                     if is_graph_capturing and using_paged_attention(num_tokens, self.vllm_config)
                     else max_query_len
                 )  # type: ignore[assignment]
-            self.seq_lens.np[:num_reqs_padded] = seq_lens
-            self.seq_lens.np[num_reqs_padded:] = 0
-            self.seq_lens.copy_to_gpu()
+            self.optimistic_seq_lens_cpu[:num_reqs] = seq_lens
+            self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+            self.seq_lens.copy_(self.optimistic_seq_lens_cpu, non_blocking=True)
 
-            cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
+            cum_num_tokens = self._get_cumsum_and_arange(num_scheduled_tokens, self.query_pos.np)
             self.query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
             self.query_start_loc.copy_to_gpu()
-            num_reqs_padded = self._pad_query_start_loc_for_fia(
-                num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_runtime_mode, batch_desc.num_reqs
-            )
+            if self._has_gdn:
+                self.gdn_query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
+                self.gdn_query_start_loc.copy_to_gpu()
+
+            if not profile_cpp:
+                num_reqs_padded = self._pad_query_start_loc_for_fia(
+                    num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_runtime_mode, batch_desc.num_reqs
+                )
 
             pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
             attn_metadata, _ = self._build_attention_metadata(
@@ -224,7 +231,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         ):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
-            if self.is_multimodal_model and not self.model_config.is_encoder_decoder or self.enable_prompt_embeds:
+            if self.supports_mm_inputs and not self.model_config.is_encoder_decoder or self.enable_prompt_embeds:
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
             else:
@@ -236,7 +243,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             elif self.uses_xdrope_dim > 0:
                 positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
-                positions = self.positions.gpu[:num_tokens_padded]
+                positions = self.positions[:num_tokens_padded]
 
             # update global cos, sin
             update_cos_sin(positions)
@@ -300,7 +307,6 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                         self.text_step.gpu[:num_tokens_padded_talker_mtp],
                     )
                     self.compilation_config.cache_dir = None
-                # ---------------------------------------Omni-new----------------------------------------------
                 # Call self.model() directly (like GPU) to avoid make_omni_output during dummy_run
                 outputs = self.model(
                     input_ids=input_ids,
@@ -308,6 +314,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                     intermediate_tensors=intermediate_tensors,
                     inputs_embeds=inputs_embeds,
                 )
+                # ---------------------------------------Omni-new----------------------------------------------
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:
@@ -330,7 +337,8 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                     is_profile=is_profile,
                 )
             if is_profile and self.dynamic_eplb:
-                self.model.clear_all_moe_loads()
+                target = self.model.language_model if hasattr(self.model, "language_model") else self.model
+                target.clear_all_moe_loads()
             if self.dynamic_eplb:
                 self.eplb_updator.forward_end()
             return hidden_states, hidden_states
@@ -354,17 +362,28 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         """
         # Omni-specific: build and inject extra model kwargs
         model_kwargs_extra = self._build_model_kwargs_extra()
-
-        # Call the model forward (same as NPUModelRunner)
         assert self.model is not None
-        model_output = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
+
+        forward_context = get_forward_context()
+        assert forward_context is not None
+
+        model_inputs: dict[str, Any] = {
+            "input_ids": input_ids,
+            "positions": positions,
+            "intermediate_tensors": intermediate_tensors,
+            "inputs_embeds": inputs_embeds,
             **model_kwargs,
             **model_kwargs_extra,
-        )
+        }
+        run_model = partial(self.model, **model_inputs)
+
+        if self.enable_enpu:
+            # The soft segmentation scenario requires event.record first, then event.wait.
+            self._update_full_graph_params_if_needed(forward_context, num_tokens_padded, positions)
+            model_output = run_model()
+        else:
+            model_output = run_model()
+            self._update_full_graph_params_if_needed(forward_context, num_tokens_padded, positions)
 
         # Omni-specific: wrap output if needed
         if not isinstance(model_output, OmniOutput) and hasattr(self.model, "make_omni_output"):
@@ -373,27 +392,8 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         # Omni-specific: cache model output for later sample_tokens
         self._omni_last_model_output = model_output
 
-        # NPU-specific: update full graph params
-        forward_context = get_forward_context()
-        assert forward_context is not None
-        if (
-            forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
-            and not forward_context.capturing
-            and not self.use_sparse
-        ):
-            assert positions is not None
-            update_full_graph_params(
-                self.attn_backend,
-                self.update_stream,
-                forward_context,
-                num_tokens_padded,
-                self.vllm_config,
-                self.speculative_config,
-                positions.shape[0],
-            )
-
         # NPU-specific: all-gather for sequence parallelism
-        if get_forward_context().flash_comm_v1_enabled and not isinstance(model_output, IntermediateTensors):
+        if forward_context.flash_comm_v1_enabled and not isinstance(model_output, IntermediateTensors):
             model_output = self._all_gather_hidden_states_and_aux(model_output)
 
         return model_output
@@ -460,7 +460,6 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                 **talker_kwargs,
             )
         # update the inputs_embeds and code_predictor_codes
-        code_predictor_codes_cpu = code_predictor_codes.detach().to("cpu").contiguous()
         out_key = getattr(self.model, "talker_mtp_output_key", ("codes", "audio"))
         if not isinstance(out_key, tuple) or len(out_key) != 2:
             raise TypeError(f"talker_mtp_output_key must be a 2-tuple, got {type(out_key).__name__}: {out_key!r}")
@@ -468,5 +467,5 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             req_index = self.input_batch.req_ids.index(req_id)
             start_offset = int(self.query_start_loc.cpu[req_index])
             inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
-            update_dict = {out_key[0]: {out_key[1]: code_predictor_codes_cpu[idx : idx + 1]}}
+            update_dict = {out_key[0]: {out_key[1]: code_predictor_codes[idx : idx + 1]}}
             self._merge_additional_information_update(req_id, update_dict)

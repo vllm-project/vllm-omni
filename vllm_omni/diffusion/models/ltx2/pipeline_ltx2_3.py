@@ -5,9 +5,9 @@
 Fully independent LTX-2.3 pipeline for vLLM-Omni.
 
 This pipeline does NOT inherit from LTX2Pipeline because:
-- LTX-2.3 uses a different text encoding strategy (flatten ALL 49 hidden states
-  vs. LTX-2's _pack_text_embeds with per-layer normalization and pooling)
-- LTX-2.3 connectors expect the padding_side API (not additive_mask)
+- LTX-2.3 connectors run per_token_rms_norm + per-modality video/audio
+  projection internally (per_modality_projections=True),
+  versus LTX-2's per_layer_masked_mean_norm + shared projection path
 - LTX-2.3 uses a BWE vocoder outputting 48kHz audio (not 16kHz)
 - LTX-2.3 transformer requires the sigma parameter for prompt modulation
 - CPU offloading is required for the 22B transformer (~44GB VRAM)
@@ -230,10 +230,10 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
     ):
         """Encode prompts using Gemma-3-12B, returning ALL 49 hidden states flattened.
 
-        LTX-2.3 differs from LTX-2 in text encoding:
-        - LTX-2: uses _pack_text_embeds (layer selection + pooling)
-        - LTX-2.3: stacks ALL 49 hidden states and flattens to [B, seq, 188160]
-          The connectors unflatten, apply per_token_rms_norm, and project internally.
+        Stacks all 49 hidden states and flattens to [B, seq, hidden * 49]. The
+        connectors unflatten, apply per_token_rms_norm, and project internally
+        (same shape contract as LTX-2 since the `diffusers==0.38` connector
+        migration; the two differ only in the connector's internal norm path).
         """
         device = device or self.device
         dtype = dtype or self.text_encoder.dtype
@@ -267,7 +267,7 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
         )
         # Move text encoder back to CPU immediately
         self.text_encoder.to("cpu")
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
 
         hidden_states = text_encoder_outputs.hidden_states
 
@@ -754,7 +754,7 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
         )
         self.connectors.to("cpu")
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
 
         # ---- Prepare latents ----
         latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
@@ -978,7 +978,7 @@ class LTX23Pipeline(nn.Module, ProgressBarMixin):
             self.vocoder.to(device)
             audio = self.vocoder(generated_mel_spectrograms)
             self.vocoder.to("cpu")
-            torch.cuda.empty_cache()
+            torch.accelerator.empty_cache()
 
         return DiffusionOutput(output=(video, audio))
 

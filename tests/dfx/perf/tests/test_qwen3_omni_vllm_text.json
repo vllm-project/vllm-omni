@@ -1,0 +1,137 @@
+[
+    {
+        "test_name": "test_qwen3_omni_vllm_text",
+        "server_params": {
+            "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "use_omni": false,
+            "extra_cli_args": ["--no-enable-prefix-caching"]
+        },
+        "benchmark_params": [
+            {
+                "dataset_name": "random",
+                "backend": "vllm",
+                "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+                "endpoint": "/v1/completions",
+                "num_prompts": [4, 16, 32, 64, 128],
+                "max_concurrency": [1, 4, 8, 16, 32],
+                "random_input_len": 2500,
+                "random_output_len": 900,
+                "temperature": 0.4,
+                "top_p": 0.9,
+                "top_k": 1,
+                "seed": 42,
+                "repetition_penalty": 1.05,
+                "ignore_eos": true,
+                "extra_body": {
+                    "modalities": ["text"]
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el",
+                "baseline": {
+                    "mean_ttft_ms": [1000, 3000, 5000, 7000, 9000]
+                }
+            },
+            {
+                "dataset_name": "random-mm",
+                "backend": "vllm",
+                "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+                "endpoint": "/v1/completions",
+                "num_prompts": [10],
+                "request_rate": [0.1],
+                "random_input_len": 100,
+                "random_output_len": 100,
+                "random_range_ratio": 0.0,
+                "temperature": 0.4,
+                "top_p": 0.9,
+                "top_k": 1,
+                "seed": 42,
+                "repetition_penalty": 1.05,
+                "ignore_eos": true,
+                "extra_body": {
+                    "modalities": ["text"]
+                },
+                "random_mm_base_items_per_request": 1,
+                "random_mm_num_mm_items_range_ratio": 0.5,
+                "random_mm_limit_mm_per_prompt": {
+                    "audio": 1
+                },
+                "random_mm_bucket_config": {
+                    "(0, 60, 3)": 1.0
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el",
+                "baseline": {
+                    "mean_ttft_ms": [2000]
+                }
+            },
+            {
+                "dataset_name": "random-mm",
+                "backend": "vllm",
+                "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+                "endpoint": "/v1/completions",
+                "num_prompts": [40],
+                "request_rate": [0.5],
+                "random_input_len": 100,
+                "random_output_len": 100,
+                "random_range_ratio": 0.0,
+                "temperature": 0.4,
+                "top_p": 0.9,
+                "top_k": 1,
+                "seed": 42,
+                "repetition_penalty": 1.05,
+                "ignore_eos": true,
+                "extra_body": {
+                    "modalities": ["text"]
+                },
+                "random_mm_base_items_per_request": 2,
+                "random_mm_num_mm_items_range_ratio": 0.5,
+                "random_mm_limit_mm_per_prompt": {
+                    "image": 1,
+                    "video": 1
+                },
+                "random_mm_bucket_config": {
+                    "(256, 256, 1)": 0.5,
+                    "(720, 1280, 2)": 0.5
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el",
+                "baseline": {
+                    "mean_ttft_ms": [6000]
+                }
+            },
+            {
+                "dataset_name": "random-mm",
+                "backend": "vllm",
+                "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+                "endpoint": "/v1/completions",
+                "num_prompts": [100],
+                "request_rate": [1.0],
+                "random_input_len": 100,
+                "random_output_len": 100,
+                "random_range_ratio": 0.0,
+                "temperature": 0.4,
+                "top_p": 0.9,
+                "top_k": 1,
+                "seed": 42,
+                "repetition_penalty": 1.05,
+                "ignore_eos": true,
+                "extra_body": {
+                    "modalities": ["text"]
+                },
+                "random_mm_base_items_per_request": 3,
+                "random_mm_num_mm_items_range_ratio": 0.5,
+                "random_mm_limit_mm_per_prompt": {
+                    "image": 1,
+                    "video": 1,
+                    "audio": 1
+                },
+                "random_mm_bucket_config": {
+                    "(256, 256, 1)": 0.34,
+                    "(720, 1280, 2)": 0.33,
+                    "(0, 60, 3)": 0.33
+                },
+                "percentile-metrics": "ttft,tpot,itl,e2el",
+                "baseline": {
+                    "mean_ttft_ms": [6000]
+                }
+            }
+        ]
+    }
+]

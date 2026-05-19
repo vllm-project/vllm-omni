@@ -70,17 +70,42 @@ class RMSNorm(CustomOp):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
+    def _forward_fused(self, x: torch.Tensor) -> torch.Tensor:
+        from vllm._custom_ops import rms_norm as fused_rms_norm
+
+        orig_shape = x.shape
+        hidden_size = orig_shape[-1]
+        x_2d = x.reshape(-1, hidden_size)
+        out = torch.empty_like(x_2d)
+        fused_rms_norm(out, x_2d, self.weight.data, self.variance_epsilon)
+        return out.reshape(orig_shape)
+
     def forward_cuda(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_native(x)
+        # During torch.compile tracing, fused_rms_norm writes to `out` in-place
+        # (returns None) and accesses self.weight.data, which is a DTensor under
+        # HSDP. Both patterns confuse inductor's compute_ancestors scheduler.
+        # Fall back to forward_native so inductor can fuse the pure-PyTorch ops
+        # itself.
+        if torch.compiler.is_compiling():
+            return self.forward_native(x)
+        try:
+            return self._forward_fused(x)
+        except Exception:
+            return self.forward_native(x)
 
     def forward_hip(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        return self.forward_native(x)
+        if torch.compiler.is_compiling():
+            return self.forward_native(x)
+        try:
+            return self._forward_fused(x)
+        except Exception:
+            return self.forward_native(x)
 
     def forward_npu(
         self,

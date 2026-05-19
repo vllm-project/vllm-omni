@@ -44,16 +44,12 @@ def _transfer_manager(
 
 
 def test_text2flow_supports_batched_source_outputs():
-    stage_list = [
-        SimpleNamespace(
-            engine_outputs=[
-                _source_output("req-0", [10, 11], [1, 2, 3], {"speech_token": torch.tensor([[1, 2]])}),
-                _source_output("req-1", [20, 21], [4, 5], {"speech_token": torch.tensor([[3, 4]])}),
-            ]
-        )
+    source_outputs = [
+        _source_output("req-0", [10, 11], [1, 2, 3], {"speech_token": torch.tensor([[1, 2]])}),
+        _source_output("req-1", [20, 21], [4, 5], {"speech_token": torch.tensor([[3, 4]])}),
     ]
 
-    outputs = text2flow(stage_list=stage_list, engine_input_source=[0], prompt=None)
+    outputs = text2flow(source_outputs=source_outputs, prompt=None)
 
     assert len(outputs) == 2
     assert outputs[0]["prompt_token_ids"] == [1, 2, 3]
@@ -68,9 +64,11 @@ def test_talker2code2wav_async_chunk_final_payload_uses_absolute_token_offset():
         external_req_id="rid-0",
         output_token_ids=[1, 2, 6562, 3],
         additional_information={
-            "speech_token": [torch.tensor([[11, 12, 13]])],
-            "speech_feat": [torch.tensor([[[0.1, 0.2], [0.3, 0.4]]])],
-            "embedding": [torch.tensor([[0.5, 0.6]])],
+            "embed": {
+                "speech_token": [torch.tensor([[11, 12, 13]])],
+                "speech_feat": [torch.tensor([[[0.1, 0.2], [0.3, 0.4]]])],
+                "embedding": [torch.tensor([[0.5, 0.6]])],
+            },
         },
         is_finished=lambda: True,
     )
@@ -83,15 +81,14 @@ def test_talker2code2wav_async_chunk_final_payload_uses_absolute_token_offset():
     )
 
     assert payload is not None
-    assert payload["meta"]["finished"].item() is True
-    assert payload["codes"]["audio"] == [1, 2, 3]
-    assert payload["token_offset"] == 0
-    assert payload["left_context_size"] == 0
-    assert payload["req_id"] == ["rid-0"]
-    assert payload["stream_finished"].item() is True
-    assert "speech_token" in payload
-    assert "speech_feat" in payload
-    assert "embedding" in payload
+    assert payload.meta.finished.item() is True
+    assert payload.codes.audio.tolist() == [1, 2, 3]
+    assert payload.meta.left_context_size == 0
+    assert payload.meta.req_id == ["rid-0"]
+    assert payload.meta.stream_finished.item() is True
+    assert payload.embed.speech_token is not None
+    assert payload.embed.speech_feat is not None
+    assert payload.embed.embedding is not None
 
 
 def test_talker2code2wav_async_chunk_emits_eof_when_finished_without_valid_codes():
@@ -111,8 +108,8 @@ def test_talker2code2wav_async_chunk_emits_eof_when_finished_without_valid_codes
     )
 
     assert payload is not None
-    assert payload["codes"]["audio"] == []
-    assert payload["meta"]["finished"].item() is True
+    assert payload.codes.audio.tolist() == []
+    assert payload.meta.finished.item() is True
 
 
 def test_talker2code2wav_async_chunk_does_not_reemit_without_new_tokens():
@@ -138,8 +135,8 @@ def test_talker2code2wav_async_chunk_does_not_reemit_without_new_tokens():
     )
 
     assert payload1 is not None
-    assert payload1["codes"]["audio"] == [1, 2]
-    assert payload1["token_offset"] == 0
+    assert payload1.codes.audio.tolist() == [1, 2]
+    assert payload1.meta.left_context_size == 0
     assert payload2 is None
 
 
@@ -168,9 +165,9 @@ def test_talker2code2wav_async_chunk_waits_for_prelookahead_and_emits_cumulative
 
     assert payload_pending is None
     assert payload_ready is not None
-    assert payload_ready["codes"]["audio"] == [1, 2, 3]
-    assert payload_ready["token_offset"] == 0
-    assert payload_ready["meta"]["finished"].item() is False
+    assert payload_ready.codes.audio.tolist() == [1, 2, 3]
+    assert payload_ready.meta.left_context_size == 0
+    assert payload_ready.meta.finished.item() is False
 
 
 def test_talker2code2wav_async_chunk_final_flush_uses_previous_token_offset():
@@ -197,13 +194,13 @@ def test_talker2code2wav_async_chunk_final_flush_uses_previous_token_offset():
     )
 
     assert payload_stream is not None
-    assert payload_stream["meta"]["finished"].item() is False
-    assert payload_stream["codes"]["audio"] == [3, 4, 5]
-    assert payload_stream["token_offset"] == 0
+    assert payload_stream.meta.finished.item() is False
+    assert payload_stream.codes.audio.tolist() == [3, 4, 5]
+    assert payload_stream.meta.left_context_size == 0
     assert payload_final is not None
-    assert payload_final["meta"]["finished"].item() is True
-    assert payload_final["codes"]["audio"] == [3, 4, 5, 6]
-    assert payload_final["token_offset"] == 2
+    assert payload_final.meta.finished.item() is True
+    assert payload_final.codes.audio.tolist() == [3, 4, 5, 6]
+    assert payload_final.meta.left_context_size == 2
 
 
 def test_talker2code2wav_async_chunk_respects_prompt_token_pad_on_first_chunk():
@@ -212,7 +209,7 @@ def test_talker2code2wav_async_chunk_respects_prompt_token_pad_on_first_chunk():
         external_req_id="rid-pad",
         output_token_ids=[8, 9, 10],
         additional_information={
-            "speech_token": [torch.tensor([[1, 2, 3]])],
+            "embed": {"speech_token": [torch.tensor([[1, 2, 3]])]},
         },
         is_finished=lambda: False,
     )
@@ -233,8 +230,8 @@ def test_talker2code2wav_async_chunk_respects_prompt_token_pad_on_first_chunk():
 
     assert payload_pending is None
     assert payload_ready is not None
-    assert payload_ready["codes"]["audio"] == [8, 9, 10, 11]
-    assert payload_ready["token_offset"] == 0
+    assert payload_ready.codes.audio.tolist() == [8, 9, 10, 11]
+    assert payload_ready.meta.left_context_size == 0
 
 
 def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio():
@@ -260,8 +257,8 @@ def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio(
     )
 
     assert payload_stream is not None
-    assert payload_stream["meta"]["finished"].item() is False
-    assert payload_stream["codes"]["audio"] == [3, 4]
+    assert payload_stream.meta.finished.item() is False
+    assert payload_stream.codes.audio.tolist() == [3, 4]
     assert payload_final is not None
-    assert payload_final["meta"]["finished"].item() is True
-    assert payload_final["codes"]["audio"] == []
+    assert payload_final.meta.finished.item() is True
+    assert payload_final.codes.audio.tolist() == []

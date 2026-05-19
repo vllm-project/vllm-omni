@@ -1,11 +1,16 @@
 """Assertion and response validation helpers for tests."""
 
 import io
+import json
 import tempfile
 import threading
+import wave
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from tests.helpers.runtime import DiffusionResponse
 
 import numpy as np
 import soundfile as sf
@@ -29,7 +34,7 @@ _PRESET_VOICE_GENDER_MAP: dict[str, str] = {
 
 
 def assert_image_diffusion_response(
-    response,
+    response: "DiffusionResponse",
     request_config: dict[str, Any],
     run_level: str = None,
 ) -> None:
@@ -63,12 +68,24 @@ def assert_image_diffusion_response(
         height = extra_body.get("height")
 
         if width is not None or height is not None:
-            for img in response.images:
-                assert_image_valid(img, width=width, height=height)
+            if isinstance(width, (list, tuple)) and isinstance(height, (list, tuple)):
+                assert len(response.images) == len(width) == len(height), (
+                    f"Per-output size lists require one image per entry; got {len(response.images)} images, "
+                    f"len(width)={len(width)}, len(height)={len(height)}"
+                )
+                for img, w, h in zip(response.images, width, height, strict=True):
+                    assert_image_valid(img, width=int(w), height=int(h))
+            else:
+                for img in response.images:
+                    assert_image_valid(
+                        img,
+                        width=_maybe_int(width) if width is not None else None,
+                        height=_maybe_int(height) if height is not None else None,
+                    )
 
 
 def assert_video_diffusion_response(
-    response,
+    response: "DiffusionResponse",
     request_config: dict[str, Any],
     run_level: str = None,
 ) -> None:
@@ -109,14 +126,23 @@ def assert_video_diffusion_response(
 
 
 def assert_audio_diffusion_response(
-    response,
+    response: "DiffusionResponse",
     request_config: dict[str, Any],
     run_level: str = None,
 ) -> None:
     """
     Validate audio diffusion response.
+
+    `response.audios` carries one entry per choice, each a `dict` with raw WAV
+    bytes (`wav_bytes`) and the OpenAI audio metadata (`id`, `expires_at`).
     """
-    raise NotImplementedError("Audio validation is not implemented yet")
+    assert response.audios, "Audio response is empty"
+    for audio in response.audios:
+        wav_bytes = audio.get("wav_bytes")
+        assert wav_bytes, "Audio entry missing decoded WAV bytes"
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wav_file:
+            assert wav_file.getnframes() > 0, "Decoded WAV has zero frames"
+            assert wav_file.getframerate() > 0, "Decoded WAV has invalid sample rate"
 
 
 def _maybe_int(value: Any) -> int | None:
@@ -380,14 +406,23 @@ def _compute_pcm_hnr_db(pcm_samples: np.ndarray, sr: int = _PCM_SPEECH_SAMPLE_RA
     return float(np.mean(hnr_values)) if hnr_values else 0.0
 
 
-def _assert_pcm_int16_speech_hnr(audio_bytes: bytes) -> None:
+def _assert_pcm_int16_speech_hnr(audio_bytes: bytes, min_hnr_db: float = _MIN_PCM_SPEECH_HNR_DB) -> None:
+    """Validate harmonic-to-noise ratio on raw int16 PCM from /v1/audio/speech.
+
+    min_hnr_db defaults to the global _MIN_PCM_SPEECH_HNR_DB (1.0 dB),
+    which matches the cleaner TTS models the helper was originally calibrated
+    for. Quieter codecs (e.g. MOSS-TTS-Nano, whose voice_clone output is
+    intrinsically around -2 dB) can pass a lower per-test threshold via
+    request_config["min_hnr_db"] to keep the catastrophic-failure check
+    while not gating CI on a model-intrinsic property.
+    """
     assert audio_bytes is not None and len(audio_bytes) >= 2, "missing PCM bytes"
     assert len(audio_bytes) % 2 == 0, "PCM byte length must be aligned to int16"
     pcm_samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
     hnr = _compute_pcm_hnr_db(pcm_samples)
-    print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {_MIN_PCM_SPEECH_HNR_DB} dB)")
-    assert hnr >= _MIN_PCM_SPEECH_HNR_DB, (
-        f"Audio distortion detected: HNR={hnr:.2f} dB < {_MIN_PCM_SPEECH_HNR_DB} dB. "
+    print(f"PCM speech HNR: {hnr:.2f} dB (threshold: {min_hnr_db} dB)")
+    assert hnr >= min_hnr_db, (
+        f"Audio distortion detected: HNR={hnr:.2f} dB < {min_hnr_db} dB. "
         "Voice clone decoder may be losing ref_code speaker context on later chunks."
     )
 
@@ -403,9 +438,6 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
         AssertionError: When the response does not meet validation criteria
     """
     assert response.success, "The request failed."
-    e2e_latency = response.e2e_latency
-    if e2e_latency is not None:
-        print(f"the e2e latency is: {e2e_latency}")
 
     modalities = request_config.get("modalities", ["text", "audio"])
 
@@ -465,14 +497,26 @@ def assert_omni_response(response: Any, request_config: dict[str, Any], run_leve
 
 
 def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str) -> None:
+    """Validate speech API results from :class:`~tests.helpers.runtime.OmniResponse`.
+
+    Success path only. Use :meth:`OpenAIClientHandler.send_audio_speech_http_request` with ``err_code`` /
+    ``err_message`` for expected HTTP errors.
+    """
     assert response.success, "The request failed."
-    e2e_latency = getattr(response, "e2e_latency", None)
-    if e2e_latency is not None:
-        print(f"the avg e2e latency is: {e2e_latency}")
+
+    # Optional floor on decoded audio size (models with very short clips may use a lower value).
+    min_audio = request_config.get("min_audio_bytes")
+    if min_audio is not None:
+        n = int(min_audio)
+        if n > 0:
+            ab = response.audio_bytes
+            assert ab is not None, "Expected audio bytes when min_audio_bytes is set"
+            assert len(ab) > n, f"Audio payload too small: {len(ab)} bytes, expected more than {n} (min_audio_bytes)"
 
     req_fmt = request_config.get("response_format")
     if req_fmt == "pcm" and response.audio_bytes:
-        _assert_pcm_int16_speech_hnr(response.audio_bytes)
+        min_hnr_db = float(request_config.get("min_hnr_db", _MIN_PCM_SPEECH_HNR_DB))
+        _assert_pcm_int16_speech_hnr(response.audio_bytes, min_hnr_db=min_hnr_db)
         if response.audio_format:
             assert "pcm" in response.audio_format.lower(), (
                 f"Expected audio/pcm content-type, got {response.audio_format!r}"
@@ -494,11 +538,8 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
         _assert_preset_voice_gender_from_audio(response.audio_bytes, request_config.get("voice"))
 
 
-def assert_diffusion_response(response: Any, request_config: dict[str, Any], run_level: str = None):
+def assert_diffusion_response(response: "DiffusionResponse", request_config: dict[str, Any], run_level: str = None):
     assert response.success, "The request failed."
-    e2e_latency = getattr(response, "e2e_latency", None)
-    if e2e_latency is not None:
-        print(f"the avg e2e is: {e2e_latency}")
     has_any_content = any(content is not None for content in (response.images, response.videos, response.audios))
     assert has_any_content, "Response contains no images, videos, or audios"
     if response.images is not None:
@@ -509,10 +550,128 @@ def assert_diffusion_response(response: Any, request_config: dict[str, Any], run
         assert_audio_diffusion_response(response=response, request_config=request_config, run_level=run_level)
 
 
+def _http_response_body_materialize(resp: Any) -> tuple[bytes, dict[str, Any] | None]:
+    """Serialize ``HttpResponse``-like body to UTF-8 bytes and parse a JSON object when possible."""
+    jb = getattr(resp, "json_body", None)
+    if jb is not None:
+        raw = json.dumps(jb, ensure_ascii=False).encode("utf-8")
+        if isinstance(jb, dict):
+            return raw, jb
+        try:
+            parsed = json.loads(raw.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            return raw, None
+        return raw, parsed if isinstance(parsed, dict) else None
+    err = getattr(resp, "error_message", None)
+    raw = (err or "").encode("utf-8", errors="replace")
+    try:
+        parsed = json.loads(raw.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return raw, None
+    return raw, parsed if isinstance(parsed, dict) else None
+
+
+def assert_err_message_in_text(
+    haystack: str,
+    err_message: str | tuple[str, ...] | list[str] | set[str] | frozenset[str],
+    *,
+    sequence_match: Literal["all", "any"] = "all",
+) -> None:
+    """Assert ``err_message`` appears in ``haystack`` (case-insensitive).
+
+    For non-string sequences: ``sequence_match='all'`` requires every substring (HTTP-style);
+    ``sequence_match='any'`` requires at least one (WebSocket first-frame JSON helpers).
+    """
+    hl = haystack.lower()
+    if isinstance(err_message, (list, tuple, set, frozenset)):
+        if sequence_match == "all":
+            missing = [s for s in err_message if str(s).lower() not in hl]
+            assert not missing, (
+                f"Expected error text to contain all of {err_message!r}; missing {missing!r}. haystack={haystack!r}"
+            )
+        else:
+            assert any(str(s).lower() in hl for s in err_message), (
+                f"Expected error text to contain one of {err_message!r}. haystack={haystack!r}"
+            )
+    else:
+        assert str(err_message).lower() in hl, f"Expected error text to contain {str(err_message)!r}, got: {haystack!r}"
+
+
+def assert_http_error(
+    resp: Any,
+    *,
+    err_code: int | tuple[int, ...] | list[int] | None = None,
+    err_message: str | tuple[str, ...] | list[str] | None = None,
+    websocket_json_message: bool = False,
+) -> dict[str, Any] | None:
+    """Validate a raw-HTTP :class:`~tests.helpers.runtime.HttpResponse`-like object.
+
+    Used by :class:`~tests.helpers.runtime.OpenAIClientHandler` ``send_*_http_request`` helpers when
+    ``request_config`` contains optional ``err_code`` and/or ``err_message``.
+
+    When ``websocket_json_message=True``, only ``json_body`` is checked (first JSON WebSocket text frame).
+    Tuple/list ``err_message`` then uses **any** substring match; HTTP mode still requires **all** pieces.
+
+    - ``err_code``: exact HTTP ``int``, or membership if a non-string sequence (e.g. ``(400, 422)``).
+      When ``err_code`` is set and the actual status is a client error in ``400..499`` other than ``404``,
+      the JSON body must include FastAPI ``detail`` and/or OpenAI-style ``error`` (2xx skips this).
+    - ``err_message``: substring match (case-insensitive) against serialized ``json_body`` and ``error_message``.
+      If ``err_message`` is a non-string sequence (``list`` / ``tuple`` / ``set`` / ``frozenset``), **every**
+      element must appear as a substring; a plain ``str`` still requires that single substring.
+    """
+    if websocket_json_message:
+        if err_code is not None:
+            raise ValueError("assert_http_error: err_code is incompatible with websocket_json_message=True")
+        jb_ws = getattr(resp, "json_body", None)
+        assert jb_ws is not None, resp
+        if err_message is None:
+            return jb_ws if isinstance(jb_ws, dict) else None
+        assert_err_message_in_text(
+            json.dumps(jb_ws, ensure_ascii=False),
+            err_message,
+            sequence_match="any",
+        )
+        return jb_ws if isinstance(jb_ws, dict) else None
+
+    if err_code is None and err_message is None:
+        return None
+
+    actual = getattr(resp, "status_code", None)
+    assert actual is not None, "response missing status_code"
+
+    if err_code is not None:
+        if isinstance(err_code, int):
+            assert actual == err_code, (resp, err_code)
+        else:
+            allowed = tuple(err_code)
+            assert actual in allowed, (resp, allowed)
+
+    body_bytes, payload = _http_response_body_materialize(resp)
+
+    if err_code is not None and actual is not None and 400 <= actual < 500 and actual != 404:
+        assert payload is not None, getattr(resp, "error_message", resp)
+        assert "detail" in payload or "error" in payload, payload
+
+    if err_message is not None:
+        pieces: list[str] = []
+        jb = getattr(resp, "json_body", None)
+        if jb is not None:
+            pieces.append(json.dumps(jb, ensure_ascii=False))
+        em = getattr(resp, "error_message", None)
+        if em:
+            pieces.append(str(em))
+        haystack = "\n".join(pieces) if pieces else body_bytes.decode("utf-8", errors="replace")
+        assert_err_message_in_text(haystack, err_message, sequence_match="all")
+
+    return payload
+
+
 __all__ = [
     "assert_audio_diffusion_response",
     "assert_audio_speech_response",
     "assert_diffusion_response",
+    "assert_err_message_in_text",
+    "assert_http_error",
     "assert_image_diffusion_response",
     "assert_image_valid",
     "assert_omni_response",

@@ -106,7 +106,7 @@ class _FastARAttention(nn.Module):
             q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(q.shape)
             k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(k.shape)
 
-        q, k = self.rotary_emb(position_ids, q, k)
+        q, k = self.rotary_emb(position_ids.reshape(-1), q, k)
 
         q = q.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
@@ -372,7 +372,7 @@ class FishSpeechFastAR(nn.Module):
                 dtype=torch.long,
             )
             self(hidden, semantic, do_sample=False)
-        torch.cuda.synchronize(device)
+        torch.accelerator.synchronize(device)
 
     @torch.inference_mode()
     def _run_model(self, step_input: torch.Tensor, step_pos_ids: torch.Tensor, bsz: int) -> torch.Tensor:

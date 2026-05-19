@@ -8,6 +8,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
+from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
@@ -115,6 +116,11 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2_i2v",
         "Wan22I2VPipeline",
     ),
+    "WanS2VPipeline": (
+        "wan2_2",
+        "pipeline_wan2_2_s2v",
+        "Wan22S2VPipeline",
+    ),
     "WanT2VDMD2Pipeline": (
         "wan2_2",
         "pipeline_wan2_2",
@@ -165,6 +171,11 @@ _DIFFUSION_MODELS = {
         "pipeline_flux2_klein",
         "Flux2KleinPipeline",
     ),
+    "ErnieImagePipeline": (
+        "ernie_image",
+        "pipeline_ernie_image",
+        "ErnieImagePipeline",
+    ),
     "NextStep11Pipeline": (
         "nextstep_1_1",
         "pipeline_nextstep_1_1",
@@ -174,6 +185,16 @@ _DIFFUSION_MODELS = {
         "flux",
         "pipeline_flux",
         "FluxPipeline",
+    ),
+    "FluxDMD2Pipeline": (
+        "flux",
+        "pipeline_flux",
+        "FluxDMD2Pipeline",
+    ),
+    "QwenImageDMD2Pipeline": (
+        "qwen_image",
+        "pipeline_qwen_image",
+        "QwenImageDMD2Pipeline",
     ),
     "OmniGen2Pipeline": (
         "omnigen2",
@@ -199,6 +220,16 @@ _DIFFUSION_MODELS = {
         "dreamid_omni",
         "pipeline_dreamid_omni",
         "DreamIDOmniPipeline",
+    ),
+    "SenseNovaU1Pipeline": (
+        "sensenova_u1",
+        "pipeline_sensenova_u1",
+        "SenseNovaU1Pipeline",
+    ),
+    "AudioXPipeline": (
+        "audiox",
+        "pipeline_audiox",
+        "AudioXPipeline",
     ),
     "HunyuanVideo15Pipeline": (
         "hunyuan_video",
@@ -246,6 +277,8 @@ DiffusionModelRegistry = _ModelRegistry(
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
+    "SenseNovaU1Pipeline",
+    "AudioXPipeline",
 }
 
 
@@ -254,7 +287,7 @@ def _prepare_diffusion_quant_config(
     model_class: type[nn.Module],
 ) -> None:
     """Prepare diffusion quant config using vLLM-style model bindings."""
-    quant_config = od_config.quantization_config
+    quant_config = getattr(od_config, "quantization_config", None)
     if quant_config is None:
         return
     if hasattr(quant_config, "maybe_update_config"):
@@ -288,7 +321,8 @@ def initialize_model(
     model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
     if model_class is not None:
         _prepare_diffusion_quant_config(od_config, model_class)
-        model = model_class(od_config=od_config)
+        with set_current_diffusion_config(od_config):
+            model = model_class(od_config=od_config)
 
         vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
         is_distributed_vae = hasattr(model, "vae") and isinstance(model.vae, DistributedVaeMixin)
@@ -421,7 +455,9 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX23Pipeline": "get_ltx2_post_process_func",
     "LTX23ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
+    "AudioXPipeline": "get_audiox_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
+    "WanS2VPipeline": "get_wan22_s2v_post_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
@@ -431,8 +467,11 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "FluxKontextPipeline": "get_flux_kontext_post_process_func",
     "Flux2KleinPipeline": "get_flux2_klein_post_process_func",
+    "ErnieImagePipeline": "get_ernie_image_post_process_func",
     "NextStep11Pipeline": "get_nextstep11_post_process_func",
     "FluxPipeline": "get_flux_post_process_func",
+    "FluxDMD2Pipeline": "get_flux_post_process_func",
+    "QwenImageDMD2Pipeline": "get_qwen_image_post_process_func",
     "OmniGen2Pipeline": "get_omnigen2_post_process_func",
     "HeliosPipeline": "get_helios_post_process_func",
     "HeliosPyramidPipeline": "get_helios_post_process_func",
@@ -442,6 +481,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
+    "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -456,20 +496,77 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "WanPipeline": "get_wan22_pre_process_func",
     "WanVACEPipeline": "get_wan22_vace_pre_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_pre_process_func",
+    "WanS2VPipeline": "get_wan22_s2v_pre_process_func",
     "WanT2VDMD2Pipeline": "get_wan22_pre_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_pre_process_func",
     "OmniGen2Pipeline": "get_omnigen2_pre_process_func",
     "HeliosPipeline": "get_helios_pre_process_func",
     "HeliosPyramidPipeline": "get_helios_pre_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_pre_process_func",
+    "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
     "MagiHumanPipeline": "get_magi_human_pre_process_func",
 }
+
+
+def register_diffusion_model(
+    model_arch: str,
+    module_name: str,
+    class_name: str,
+    pre_process_func_name: str | None = None,
+    post_process_func_name: str | None = None,
+) -> None:
+    """Register a diffusion model pipeline from an out-of-tree plugin.
+
+    This can be used to add new model architectures or to replace an
+    existing built-in pipeline with a platform-optimised implementation
+    (same ``model_arch`` key).
+
+    Args:
+        model_arch: Architecture name (e.g. ``"WanPipeline"``).
+        module_name: Fully qualified module path
+            (e.g. ``"my_plugin.diffusion.pipeline_wan"``).
+        class_name: Class name within *module_name*.
+        pre_process_func_name: Optional name of the pre-process function
+            located in *module_name*.  Pass ``None`` to keep the existing
+            entry when replacing a built-in model.
+        post_process_func_name: Optional name of the post-process function
+            located in *module_name*.  Pass ``None`` to keep the existing
+            entry when replacing a built-in model.
+    """
+    # Register model class in DiffusionModelRegistry
+    DiffusionModelRegistry.register_model(
+        model_arch,
+        f"{module_name}:{class_name}",
+    )
+
+    # Store in _DIFFUSION_MODELS so _load_process_func can resolve the
+    # module.  Convention: when mod_relname is empty the mod_folder field
+    # stores a *full* module path instead of a relative folder.
+    _DIFFUSION_MODELS[model_arch] = (module_name, "", class_name)
+
+    # Optionally register pre/post process funcs.
+    if pre_process_func_name is not None:
+        _DIFFUSION_PRE_PROCESS_FUNCS[model_arch] = pre_process_func_name
+    if post_process_func_name is not None:
+        _DIFFUSION_POST_PROCESS_FUNCS[model_arch] = post_process_func_name
+
+    logger.info(
+        "Registered diffusion model %s -> %s.%s",
+        model_arch,
+        module_name,
+        class_name,
+    )
 
 
 def _load_process_func(od_config: OmniDiffusionConfig, func_name: str):
     """Load and return a process function from the appropriate module."""
     mod_folder, mod_relname, _ = _DIFFUSION_MODELS[od_config.model_class_name]
-    module_name = f"vllm_omni.diffusion.models.{mod_folder}.{mod_relname}"
+    if mod_relname == "":
+        # Full module path (registered via register_diffusion_model)
+        module_name = mod_folder
+    else:
+        # Built-in model (relative path convention)
+        module_name = f"vllm_omni.diffusion.models.{mod_folder}.{mod_relname}"
     module = importlib.import_module(module_name)
     func = getattr(module, func_name)
     return func(od_config)

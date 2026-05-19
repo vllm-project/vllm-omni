@@ -68,10 +68,13 @@ def print_text_metrics(task_type, selected_percentile_metrics, metrics: MultiMod
     print("{:<40} {:<10.2f}".format("Total Token throughput (tok/s):", metrics.total_token_throughput))
 
     if task_type == TaskType.GENERATION:
+        # No text tokens generated (e.g. pure TTS speech endpoint): per-token
+        # latency metrics (ttft/tpot/itl) are undefined, so skip them.
+        has_text_output = metrics.total_output > 0
         for metric in selected_percentile_metrics:
             if metric == "e2el":
                 continue
-            if not metric.startswith("audio"):
+            if not metric.startswith("audio") and has_text_output:
                 process_one_metric(metric, metrics)
 
 
@@ -188,7 +191,10 @@ def calculate_metrics(
             total_input += outputs[i].prompt_len
             tpot = 0
             if output_len > 1:
-                latency_minus_ttft = outputs[i].text_latency - outputs[i].ttft
+                try:
+                    latency_minus_ttft = outputs[i].text_latency - outputs[i].ttft
+                except Exception:
+                    latency_minus_ttft = outputs[i].latency - outputs[i].ttft
                 tpot = latency_minus_ttft / (output_len - 1)
                 tpots.append(tpot)
             # Note: if output_len <= 1, we regard tpot as 0 for goodput
