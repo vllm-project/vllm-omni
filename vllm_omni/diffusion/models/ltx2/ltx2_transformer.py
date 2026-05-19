@@ -1696,8 +1696,6 @@ class LTX2VideoTransformer3DModel(nn.Module):
             num_attention_heads=audio_num_attention_heads,
         )
 
-        print(" >>> LTX2VideoTransformer3DModel.__init__: quant_config: \n", quant_config)
-
         # 5. Transformer Blocks
         self.transformer_blocks = nn.ModuleList(
             [

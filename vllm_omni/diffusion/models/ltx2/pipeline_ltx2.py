@@ -224,7 +224,6 @@ class LTX2Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
 
         transformer_config = load_transformer_config(model, "transformer", local_files_only)
         quant_config = getattr(self.od_config, "quantization_config", None)
-        print(" >>> LTX2Pipeline.__init__: quant_config: \n", quant_config)
         self.transformer = create_transformer_from_config(transformer_config, quant_config=quant_config)
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
