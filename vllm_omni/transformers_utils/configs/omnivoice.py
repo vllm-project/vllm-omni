@@ -82,6 +82,7 @@ class OmniVoiceConfig(PretrainedConfig):
 
         # Serving
         self.speculative_config = None
+        # Precedence: config.json > OMNIVOICE_CUDA_GRAPH env var > default (enabled).
         # Read once at init; changing OMNIVOICE_CUDA_GRAPH at runtime has no effect.
         self.enable_cuda_graph = getattr(self, "enable_cuda_graph", os.environ.get("OMNIVOICE_CUDA_GRAPH", "1") != "0")
         self.cuda_graph_capture_sizes = getattr(
