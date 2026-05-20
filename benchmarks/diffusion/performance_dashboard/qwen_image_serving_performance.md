@@ -58,7 +58,7 @@ Record these parameters when reporting performance results.
 
 ```bash
 python benchmarks/diffusion/diffusion_benchmark_serving.py \
-    --backend vllm-omni \
+    --endpoint /v1/chat/completions \
     --dataset <DATASET_NAME> \
     --task t2i \
     --num-prompts <N> \
@@ -71,7 +71,7 @@ python benchmarks/diffusion/diffusion_benchmark_serving.py \
 
 | Parameter              | Description                       |
 | ---------------------- | --------------------------------- |
-| `--backend`            | Serving backend (use `vllm-omni`) |
+| `--endpoint`           | API endpoint (use `/v1/chat/completions`; leading `/` is optional) |
 | `--dataset`            | Dataset name (`random` or custom) |
 | `--task`               | Task type (e.g., `t2i`)           |
 | `--num-prompts`        | Total number of requests          |
@@ -129,7 +129,7 @@ python benchmarks/diffusion/diffusion_benchmark_serving.py \
 
 ```bash
 python benchmarks/diffusion/diffusion_benchmark_serving.py \
-    --backend vllm-omni \
+    --endpoint /v1/chat/completions \
     --dataset random \
     --task t2i \
     --num-prompts 1 \

@@ -54,6 +54,7 @@ class OmniNewRequestData(NewRequestData):
             num_computed_tokens=request.num_computed_tokens,
             lora_request=request.lora_request,
             prompt_embeds=getattr(request, "prompt_embeds", None),
+            prompt_is_token_ids=getattr(request, "prompt_is_token_ids", None),
             prefill_token_ids=prefill_token_ids,
             additional_information=getattr(request, "additional_information", None),
         )

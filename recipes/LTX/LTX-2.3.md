@@ -1,4 +1,4 @@
-# LTX-2.3 Text-to-Video with Audio on 1x GPU (96GB VRAM)
+# LTX-2.3
 
 > 22B parameter text-to-video + audio generation model served via vLLM-Omni
 

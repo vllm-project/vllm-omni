@@ -7,6 +7,8 @@ busy loop in a subprocess, communicating with StageEngineCoreClient via ZMQ.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import signal
 from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING, Any
@@ -33,6 +35,8 @@ from vllm.v1.engine.utils import (
 )
 from vllm.v1.utils import shutdown
 
+from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.executor import Executor
@@ -53,34 +57,82 @@ class StageEngineCoreProc(EngineCoreProc):
         *args: Any,
         dp_rank: int = 0,
         local_dp_rank: int = 0,
+        omni_coordinator_address: str | None = None,
+        omni_stage_id: int | None = None,
+        omni_replica_id: int = 0,
         **kwargs: Any,
     ) -> None:
-        """Launch StageEngineCoreProc busy loop in background process."""
+        """Launch StageEngineCoreProc busy loop in background process.
+
+        Omni-specific kwargs:
+          - ``omni_coordinator_address``: ROUTER address of the head-side
+            :class:`OmniCoordinator`. When provided, this subprocess
+            instantiates an :class:`OmniCoordClientForStage` after the
+            HELLO/INIT/READY handshake completes and reports its status +
+            queue length via heartbeats. The hook is wired so each
+            heartbeat refreshes ``queue_length`` from the live scheduler.
+          - ``omni_stage_id``: logical stage id this replica belongs to.
+            Required when ``omni_coordinator_address`` is provided.
+          - ``omni_replica_id``: cluster-unique replica id within the
+            stage (assigned by :class:`OmniMasterServer`). Used for
+            logging / metrics only.
+        """
         signal_callback: SignalCallback | None = None
         maybe_register_config_serialize_by_value()
 
         engine_core: StageEngineCoreProc | None = None
+        coord_client: OmniCoordClientForStage | None = None
         try:
-            vllm_config: VllmConfig = kwargs["vllm_config"]
-            parallel_config = vllm_config.parallel_config
+            # NOTE: previous revisions hardcoded data_parallel_size=1 here
+            # (TODO referencing issue #984). The hardcoding has been removed
+            # so the DP fields propagate through from the caller exactly
+            # like upstream vLLM.
 
-            set_process_title(f"StageEngineCoreProc_DP{dp_rank}")
+            stage_label = f"stage{omni_stage_id}" if omni_stage_id is not None else "noid"
+            set_process_title(f"StageEngineCoreProc_{stage_label}_replica{omni_replica_id}_DP{dp_rank}")
             decorate_logs()
-
-            # the current vllm-omni does not support data parallelism,
-            # so we set the data parallel size to 1.
-            # [TODO] support data parallelism in the future.
-            # https://github.com/vllm-project/vllm-omni/issues/984
-            parallel_config.data_parallel_size = 1
-            parallel_config.data_parallel_size_local = 1
-            parallel_config.data_parallel_rank = 0
-            parallel_config.data_parallel_index = dp_rank
+            os.environ["VLLM_OMNI_REPLICA_ID"] = str(max(int(omni_replica_id), 0))
 
             engine_core = StageEngineCoreProc(
                 *args,
                 engine_index=dp_rank,
                 **kwargs,
             )
+
+            # Each subprocess corresponds to exactly one omni replica with
+            # its own OmniMasterServer allocation, so the heartbeat client
+            # runs unconditionally — there is no dp_rank-based gating.
+            if omni_coordinator_address is not None:
+                if omni_stage_id is None:
+                    raise ValueError("omni_stage_id must be provided when omni_coordinator_address is set")
+                addresses: EngineZmqAddresses = engine_core.addresses
+                if not addresses.inputs or not addresses.outputs:
+                    raise RuntimeError(
+                        "EngineCore handshake did not populate input/output addresses; "
+                        "cannot start OmniCoordClientForStage"
+                    )
+                coord_client = OmniCoordClientForStage(
+                    coord_zmq_addr=omni_coordinator_address,
+                    input_addr=addresses.inputs[0],
+                    output_addr=addresses.outputs[0],
+                    stage_id=int(omni_stage_id),
+                )
+
+                def _refresh_queue_length() -> None:
+                    """Pre-heartbeat hook: refresh queue_length from scheduler."""
+                    scheduler = getattr(engine_core, "scheduler", None)
+                    if scheduler is None:
+                        return
+                    try:
+                        coord_client._queue_length = int(  # type: ignore[union-attr]
+                            scheduler.get_num_unfinished_requests()
+                        )
+                    except Exception:
+                        # Live scheduler stats are best-effort — heartbeats
+                        # must not fail because of a stats lookup error.
+                        pass
+
+                coord_client._on_heartbeat = _refresh_queue_length
 
             def wakeup_engine() -> None:
                 engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
@@ -111,6 +163,9 @@ class StageEngineCoreProc(EngineCoreProc):
             signal.signal(signal.SIGINT, signal.SIG_DFL)
             if signal_callback is not None:
                 signal_callback.stop()
+            if coord_client is not None:
+                with contextlib.suppress(RuntimeError):
+                    coord_client.close()
             if engine_core is not None:
                 engine_core.shutdown()
 

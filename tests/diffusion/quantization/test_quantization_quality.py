@@ -32,16 +32,30 @@ Optional artifact dump:
 from __future__ import annotations
 
 import gc
+import importlib.util
 import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 from tests.helpers.mark import hardware_marks
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_BENCH_MODULE_PATH = _REPO_ROOT / "benchmarks" / "diffusion" / "quantization_quality.py"
+_BENCH_MODULE_NAME = "benchmarks.diffusion.quantization_quality"
+
+if _BENCH_MODULE_NAME not in sys.modules:
+    _spec = importlib.util.spec_from_file_location(_BENCH_MODULE_NAME, _BENCH_MODULE_PATH)
+    _mod = importlib.util.module_from_spec(_spec)
+    sys.modules[_BENCH_MODULE_NAME] = _mod
+    _spec.loader.exec_module(_mod)
 
 # ---------------------------------------------------------------------------
 # Configuration — add new quantization methods / models here
@@ -315,6 +329,37 @@ def _unload(omni):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_benchmark_generate_image_unwraps_nested_omni_request_output(monkeypatch):
+    from benchmarks.diffusion.quantization_quality import _generate_image as benchmark_generate_image
+    from vllm_omni.outputs import OmniRequestOutput
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_type", "cpu", raising=False)
+    monkeypatch.setattr(torch.accelerator, "reset_peak_memory_stats", lambda: None, raising=False)
+    monkeypatch.setattr(torch.accelerator, "max_memory_allocated", lambda: 0, raising=False)
+
+    image = Image.new("RGB", (2, 2))
+    inner = OmniRequestOutput.from_diffusion(request_id="req", images=[image])
+    outer = OmniRequestOutput(
+        request_id="req",
+        stage_id=0,
+        final_output_type="image",
+        request_output=inner,
+        finished=True,
+    )
+
+    class DummyOmni:
+        def generate(self, *_args, **_kwargs):
+            return [outer]
+
+    args = SimpleNamespace(height=2, width=2, num_inference_steps=1)
+    output, _elapsed, peak_mem = benchmark_generate_image(DummyOmni(), args, "prompt", 42)
+
+    assert output is image
+    assert peak_mem == 0.0
+
 
 _marks = hardware_marks(res={"cuda": "H100"})
 _OUTPUT_DIR = Path(os.environ["VLLM_OMNI_QUALITY_OUTPUT_DIR"]) if "VLLM_OMNI_QUALITY_OUTPUT_DIR" in os.environ else None

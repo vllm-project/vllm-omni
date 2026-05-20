@@ -20,6 +20,8 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "VoxCPMConfig": "vllm_omni.transformers_utils.configs.voxcpm",
     "VoxCPM2Config": "vllm_omni.transformers_utils.configs.voxcpm2",
     "VoxtralTTSConfig": "vllm_omni.transformers_utils.configs.voxtral_tts",
+    "CosyVoice3Config": "vllm_omni.transformers_utils.configs.cosyvoice3",
+    "OmniVoiceConfig": "vllm_omni.transformers_utils.configs.omnivoice",
     "BailingMoeV2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "BailingMM2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "MingFlashOmniConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
@@ -38,6 +40,8 @@ __all__ = [
     "VoxCPMConfig",
     "VoxCPM2Config",
     "VoxtralTTSConfig",
+    "CosyVoice3Config",
+    "OmniVoiceConfig",
     "BailingMoeV2Config",
     "BailingMM2Config",
     "MingFlashOmniConfig",
@@ -61,9 +65,11 @@ def __dir__():
 
 # Eagerly import all config modules so their AutoConfig.register() side-effects
 # run as soon as `vllm_omni.transformers_utils.configs` is imported.
+from vllm_omni.transformers_utils.configs import cosyvoice3 as _cosyvoice3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_omni  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import omnivoice as _omnivoice  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm as _voxcpm  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxtral_tts as _voxtral_tts  # noqa: F401, E402

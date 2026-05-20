@@ -431,27 +431,28 @@ def thinker2talker_async_chunk(
             payload.hidden_states.output = torch.cat(
                 (save_payload.get("hidden_states", {}).get("output"), payload.hidden_states.output), dim=0
             )
+            prefill_shape = payload.embed.prefill.shape[0]
+            if not is_finished and prefill_shape <= len(prompt_token_ids):
+                transfer_manager.request_payload[request_id] = to_dict(payload)
+                return None
     else:
-        output_token_ids = _ensure_list(request.output_token_ids)
+        if thinker_emb.shape[0] > 1:
+            logger.warning(
+                "Unexpected multiple embeddings in thinker2talker_async_chunk for chunk_id %d: "
+                "request_id %s, num_computed_tokens%d %s. Expected shape [1, D].",
+                chunk_id,
+                request_id,
+                request.num_computed_tokens,
+                thinker_emb.shape,
+            )
+            return None
         meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
-        if output_token_ids:
-            meta.override_keys = [("embed", "decode"), ("ids", "output")]
-            payload = OmniPayloadStruct(
-                meta=meta,
-                embed=EmbeddingsStruct(decode=thinker_emb.detach().cpu()),
-                ids=IdsStruct(output=output_token_ids),
-                speaker=speaker,
-                language=language,
-            )
-        else:
-            # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
-            payload = OmniPayloadStruct(
-                meta=meta,
-                embed=EmbeddingsStruct(prefill=thinker_emb.detach().cpu()),
-                hidden_states=HiddenStatesStruct(output=thinker_hid.detach().cpu()),
-                speaker=speaker,
-                language=language,
-            )
+        payload = OmniPayloadStruct(
+            meta=meta,
+            embed=EmbeddingsStruct(decode=thinker_emb.detach().cpu()),
+            speaker=speaker,
+            language=language,
+        )
     return payload
 
 

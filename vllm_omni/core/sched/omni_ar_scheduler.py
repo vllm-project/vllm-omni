@@ -203,6 +203,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return False
 
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
+        # Remove FINISHED_ABORTED requests before the upstream scheduler sees
+        # them. Upstream vllm raises RuntimeError on this status; omni allows
+        # async abort (e.g. client disconnect during TTS streaming) to leave
+        # requests in the waiting/running queues temporarily.
+        for queue in (self.waiting, self.running):
+            for req in list(queue):
+                if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
+                    queue.remove(req)
         connector_output = self._latest_omni_connector_output
         self._latest_omni_connector_output = None
         if self.input_coordinator:
@@ -250,6 +258,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     lora_request=nr.lora_request,
                     # Enrich with omni payloads from the live request object
                     prompt_embeds=(getattr(request, "prompt_embeds", None) if request else None),
+                    prompt_is_token_ids=nr.prompt_is_token_ids,
                     additional_information=(getattr(request, "additional_information", None) if request else None),
                 )
                 new_list.append(omni_nr)
@@ -419,7 +428,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     stopped = True
 
             if stopped:
-                routed_experts = self._get_routed_experts(request)
+                if (
+                    model_runner_output.routed_experts_dict is not None
+                    and req_id in model_runner_output.routed_experts_dict
+                ):
+                    routed_experts = model_runner_output.routed_experts_dict[req_id]
 
                 # Capture finish_reason BEFORE _handle_stopped_request, which may
                 # reset the status to WAITING for streaming requests that continue.
