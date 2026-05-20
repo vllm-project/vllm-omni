@@ -79,6 +79,12 @@ def _build_inc(**kw: Any) -> QuantizationConfig:
     if "bits" in kw and "weight_bits" not in kw:
         kw["weight_bits"] = kw.pop("bits")
 
+    # AutoRound MXFP8 (data_type="mx_fp"): set dummy weight_bits/group_size
+    # since INCConfig requires them but they're unused for MXFP8 path
+    if kw.get("data_type") == "mx_fp":
+        kw.setdefault("weight_bits", 8)  # MXFP8 uses 8-bit FP8
+        kw.setdefault("group_size", 32)  # MX block size is 32
+
     # Filter to only valid INCConfig params
     valid = set(inspect.signature(OmniINCConfig.__init__).parameters) - {"self"}
     filtered = {k: v for k, v in kw.items() if k in valid}
