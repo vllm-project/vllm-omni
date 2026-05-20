@@ -13,27 +13,13 @@ from typing import Any
 
 import numpy as np
 import torch
-from torchaudio.functional import melscale_fbanks
 
+from vllm_omni.model_executor.models.cosyvoice3.utils import (
+    log_mel_spectrogram,
+)
+from vllm_omni.utils.audio import mel_filter_bank
 
-def _mel_filter_bank(
-    sr: int,
-    n_fft: int,
-    n_mels: int,
-    fmin: float = 0.0,
-    fmax: float | None = None,
-) -> torch.Tensor:
-    if fmax is None:
-        fmax = float(sr) / 2.0
-    return melscale_fbanks(
-        n_freqs=n_fft // 2 + 1,
-        f_min=float(fmin),
-        f_max=float(fmax),
-        n_mels=n_mels,
-        sample_rate=sr,
-        mel_scale="slaney",
-        norm="slaney",
-    ).T
+__all__ = ["log_mel_spectrogram"]  # re-export for local callers
 
 
 def mel_spectrogram(
@@ -55,7 +41,7 @@ def mel_spectrogram(
     if wav.ndim > 1:
         wav = wav.mean(dim=-1)
 
-    mel_basis = _mel_filter_bank(
+    mel_basis = mel_filter_bank(
         sr=sampling_rate,
         n_fft=n_fft,
         n_mels=n_mel_channels,
@@ -82,35 +68,6 @@ def mel_spectrogram(
     mel = mel_basis @ magnitudes
     mel = torch.log(torch.clamp(mel, min=1e-5))
     return mel.unsqueeze(0)
-
-
-def log_mel_spectrogram(
-    audio: torch.Tensor,
-    n_mels: int = 80,
-    padding: int = 0,
-    device: str | torch.device | None = None,
-) -> torch.Tensor:
-    N_FFT = 400
-    HOP_LENGTH = 160
-
-    if not torch.is_tensor(audio):
-        raise TypeError(f"audio is not tensor {type(audio)}")
-
-    if device is not None:
-        audio = audio.to(device)
-    if padding > 0:
-        audio = torch.nn.functional.pad(audio, (0, padding))
-    window = torch.hann_window(N_FFT).to(audio.device)
-    stft = torch.stft(audio, N_FFT, HOP_LENGTH, window=window, return_complex=True)
-    magnitudes = stft[..., :-1].abs() ** 2
-
-    filters = _mel_filter_bank(sr=16000, n_fft=N_FFT, n_mels=n_mels).to(audio.device)
-    mel_spec = filters @ magnitudes
-
-    log_spec = torch.clamp(mel_spec, min=1e-10).log10()
-    log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
-    log_spec = (log_spec + 4.0) / 4.0
-    return log_spec
 
 
 # ---------------------------------------------------------------------------

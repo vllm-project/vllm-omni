@@ -2252,6 +2252,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         )
 
         # CosyVoice3: set dynamic min/max tokens based on text length.
+        # The official model requires min_token_text_ratio to prevent early
+        # EOS and max_token_text_ratio to cap generation length.
         if self._tts_model_type == "cosyvoice3" and sampling_params_list:
             sampling_params_list = self._apply_cosyvoice3_dynamic_tokens(sampling_params_list, request)
 

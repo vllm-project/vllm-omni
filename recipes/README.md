@@ -30,6 +30,7 @@ recipes/
 | [`audiox/AudioX.md`](./audiox/AudioX.md) | Offline + online unified text/video→audio diffusion | 1x L4 24GB |
 | [`Baidu/ERNIE-Image.md`](./Baidu/ERNIE-Image.md) | Text-to-image online serving (ERNIE-Image 8B) | 1x or 2x RTX 4090 24GB |
 | [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md) | Online serving for TTS | 1x A800 80GB |
+| [`FunAudioLLM/FunCineForge.md`](./FunAudioLLM/FunCineForge.md) | Zero-shot movie dubbing and TTS | 1x A100 80GB |
 | [`inclusionAI/Ming-flash-omni-2.0.md`](./inclusionAI/Ming-flash-omni-2.0.md) | Online serving for multimodal chat + standalone TTS | 4x H100 / 1x H100 80GB |
 | [`LTX/LTX-2.md`](./LTX/LTX-2.md) | Text-to-video and image-to-video serving | 1x H200 141GB |
 | [`LTX/LTX-2.3.md`](./LTX/LTX-2.3.md) | Text-to-video with audio generation (22B) | 1x GPU (96GB VRAM) |

@@ -147,6 +147,7 @@ class FunCineForgeCode2Wav(nn.Module):
         # Flow matching parameters
         self.feat_token_ratio = int(flow_cfg.get("feat_token_ratio", 2))
         self.context_size = self.lookahead_conv1d.pre_lookahead_len
+        self.rand_noise_max_len = int(flow_cfg.get("rand_noise_max_len", 15000))
         self.rand_noise: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
@@ -468,11 +469,11 @@ class FunCineForgeCode2Wav(nn.Module):
 
         return x
 
-    def _get_rand_noise(self, mu: torch.Tensor, max_len: int = 50 * 300) -> torch.Tensor:
+    def _get_rand_noise(self, mu: torch.Tensor) -> torch.Tensor:
         """Return the fixed inference noise buffer used by upstream FunCineForge."""
         if self.rand_noise is None or self.rand_noise.shape[1] < mu.shape[1] or self.rand_noise.shape[2] != mu.shape[2]:
             self.rand_noise = torch.randn(
-                (1, max_len, mu.shape[2]),
+                (1, self.rand_noise_max_len, mu.shape[2]),
                 device=mu.device,
                 dtype=mu.dtype,
             )
