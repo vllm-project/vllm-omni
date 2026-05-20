@@ -227,7 +227,7 @@ try {
 
     if (-not $SkipProof) {
         Write-Step "Running Qwen3-Omni audio in -> audio out streaming proof"
-        Invoke-Native $pythonExe "examples\offline_inference\qwen3_omni\windows_audio_stream_probe.py" "--model" $ModelId "--deploy-config" "vllm_omni\deploy\qwen3_omni_moe_windows_single_gpu.yaml" "--init-timeout" "1800" "--stage-init-timeout" "1800" "--generation-timeout" "600" "--stop-after-audio-chunks" "1" "--out" $ProofOut
+        Invoke-Native $pythonExe "examples\offline_inference\qwen3_omni\windows_audio_stream_probe.py" "--model" $ModelId "--deploy-config" "vllm_omni\deploy\qwen3_omni_moe_windows_single_gpu.yaml" "--init-timeout" "21600" "--stage-init-timeout" "21600" "--generation-timeout" "600" "--stop-after-audio-chunks" "1" "--out" $ProofOut
     }
 }
 finally {
