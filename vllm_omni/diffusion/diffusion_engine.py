@@ -166,6 +166,13 @@ class DiffusionEngine:
 
         try:
             self._dummy_run()
+        except EngineDeadError:
+            logger.error(
+                "Dummy run failed: worker process died. %s",
+                self.executor._failure_reason if hasattr(self.executor, "_failure_reason") else "",
+            )
+            self.close()
+            raise
         except Exception as e:
             logger.error(f"Dummy run failed: {e}")
             self.close()

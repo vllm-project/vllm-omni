@@ -1525,6 +1525,11 @@ CUSTOM_DIT_ENABLERS.update(
         "HunyuanVideo15Pipeline": enable_cache_for_hunyuan_video_15,
         "HunyuanVideo15I2VPipeline": enable_cache_for_hunyuan_video_15,
         "HeliosPipeline": enable_cache_for_helios,
+        "QwenImagePipeline": enable_cache_for_dit,
+        "QwenImageEditPipeline": enable_cache_for_dit,
+        "QwenImageEditPlusPipeline": enable_cache_for_dit,
+        "QwenImageLayeredPipeline": enable_cache_for_dit,
+        "QwenImageDMD2Pipeline": enable_cache_for_dit,
     }
 )
 

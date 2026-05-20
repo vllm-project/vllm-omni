@@ -74,6 +74,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._processes: list[mp.Process] = []
         self._closed = False
         self.is_failed = False
+        self._failure_reason: str | None = None
         self._failure_callbacks: list[Callable[[], None]] = []
 
         num_workers = self.od_config.num_gpus
@@ -130,7 +131,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                 return self._result_mq.dequeue(timeout=chunk_timeout)
             except (TimeoutError, zmq.error.Again):
                 if self.is_failed:
-                    raise EngineDeadError()
+                    raise EngineDeadError(self._failure_reason or "Worker process exited before producing a result.")
                 continue
 
     def _launch_workers(self, broadcast_handle, wake_events):
@@ -233,10 +234,15 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         details.append(f"{p.name}(exitcode={code}, {sig})")
                     else:
                         details.append(f"{p.name}(exitcode={code})")
-                logger.error(
-                    "Diffusion worker(s) died unexpectedly: %s",
-                    details,
+                reason = (
+                    f"Diffusion worker(s) died unexpectedly: {details}. "
+                    "Check worker logs above for the root-cause traceback. "
+                    "Common causes: CUDA OOM during warmup, "
+                    "torch.compile + cache_dit interaction, "
+                    "or IPC/collective failure in distributed rank."
                 )
+                logger.error(reason)
+                self._failure_reason = reason
                 self.is_failed = True
 
             self.shutdown()
@@ -402,12 +408,13 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
 
     def check_health(self) -> None:
         if self.is_failed:
-            raise EngineDeadError()
+            raise EngineDeadError(self._failure_reason or "Worker process died (reason unknown).")
         self._ensure_open()
         for p in self._processes:
             if not p.is_alive():
                 self.is_failed = True
-                raise EngineDeadError(f"Worker process {p.name} is dead")
+                self._failure_reason = f"Worker process {p.name} is dead (exitcode={p.exitcode})."
+                raise EngineDeadError(self._failure_reason)
 
     def shutdown(self) -> None:
         self._closed = True

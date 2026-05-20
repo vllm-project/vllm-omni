@@ -840,14 +840,22 @@ class WorkerProc:
             pass  # setproctitle not installed, skip process title setting
 
         load_omni_general_plugins()
-        worker_proc = WorkerProc(
-            od_config,
-            gpu_id=rank,
-            broadcast_handle=broadcast_handle,
-            wake_event=wake_event,
-            worker_extension_cls=worker_extension_cls,
-            custom_pipeline_args=custom_pipeline_args,
-        )
+        try:
+            worker_proc = WorkerProc(
+                od_config,
+                gpu_id=rank,
+                broadcast_handle=broadcast_handle,
+                wake_event=wake_event,
+                worker_extension_cls=worker_extension_cls,
+                custom_pipeline_args=custom_pipeline_args,
+            )
+        except Exception:
+            logger.exception(
+                "Worker %d: FATAL — failed during initialization. The parent will see EngineDeadError.",
+                rank,
+            )
+            pipe_writer.send({"status": "error", "rank": rank})
+            raise
         logger.info(f"Worker {rank}: Scheduler loop started.")
         pipe_writer.send(
             {
@@ -855,7 +863,14 @@ class WorkerProc:
                 "result_handle": worker_proc.result_mq_handle if rank == 0 else None,
             }
         )
-        worker_proc.worker_busy_loop()
+        try:
+            worker_proc.worker_busy_loop()
+        except Exception:
+            logger.exception(
+                "Worker %d: FATAL — unhandled exception in busy loop. The parent will see EngineDeadError.",
+                rank,
+            )
+            raise
         logger.info(f"Worker {rank}: Shutdown complete.")
 
 

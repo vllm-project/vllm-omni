@@ -161,18 +161,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             logger.info(f" Enabling offloader backend: {self.offload_backend.__class__.__name__}")
             self.offload_backend.enable(self.pipeline)
 
-        # Apply torch.compile if not in eager mode
-        if not self.od_config.enforce_eager:
-            if current_omni_platform.supports_torch_inductor():
-                self._compile_transformer("transformer")
-                self._compile_transformer("transformer_2")
-            else:
-                logger.warning(
-                    "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
-                    current_omni_platform.get_torch_device(),
-                )
-
-        # Setup cache backend
+        # Setup cache backend BEFORE torch.compile so cache_dit's monkey-patches
+        # on attention blocks are captured in the compiled graph. If compile runs
+        # first, the compiled wrappers bypass cache_dit's hooks, causing CUDA
+        # illegal memory access during the forward pass.
         self.cache_backend = get_cache_backend(self.od_config.cache_backend, self.od_config.cache_config)
 
         if self.cache_backend is not None:
@@ -186,6 +178,18 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 self.od_config.cache_backend = None
             else:
                 self.cache_backend.enable(self.pipeline)
+
+        # Apply torch.compile after cache backend so compiled graphs include
+        # the cache-dit modifications.
+        if not self.od_config.enforce_eager:
+            if current_omni_platform.supports_torch_inductor():
+                self._compile_transformer("transformer")
+                self._compile_transformer("transformer_2")
+            else:
+                logger.warning(
+                    "Model runner: Platform %s does not support torch inductor, skipping torch.compile.",
+                    current_omni_platform.get_torch_device(),
+                )
 
         logger.info("Model runner: Initialization complete.")
 
