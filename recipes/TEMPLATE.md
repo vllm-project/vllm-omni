@@ -1,6 +1,6 @@
 # Recipe Title
 
-> Example: Qwen3-Omni for speech chat on 1x A100 80GB
+> Example: Qwen3-Omni for speech chat
 
 ## Summary
 

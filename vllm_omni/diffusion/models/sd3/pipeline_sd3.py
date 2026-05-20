@@ -779,8 +779,10 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
         del prompt_embeds, pooled_prompt_embeds
         if do_cfg:
             del negative_prompt_embeds, negative_pooled_prompt_embeds
-        if current_omni_platform.is_available():
-            current_omni_platform.empty_cache()
+        if self._sd3_fp8_vram_extras:
+            if current_omni_platform.is_available():
+                current_omni_platform.empty_cache()
+            self._sd3_fp8_maybe_empty_cuda_cache()
 
         if self.output_type == "latent":
             image = latents

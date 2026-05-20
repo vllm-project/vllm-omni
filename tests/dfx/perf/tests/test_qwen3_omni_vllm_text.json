@@ -4,7 +4,9 @@
         "server_params": {
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
             "use_omni": false,
-            "extra_cli_args": ["--no-enable-prefix-caching"]
+            "extra_cli_args": [
+                "--no-enable-prefix-caching"
+            ]
         },
         "benchmark_params": [
             {
@@ -12,8 +14,20 @@
                 "backend": "vllm",
                 "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
                 "endpoint": "/v1/completions",
-                "num_prompts": [4, 16, 32, 64, 128],
-                "max_concurrency": [1, 4, 8, 16, 32],
+                "num_prompts": [
+                    4,
+                    16,
+                    32,
+                    64,
+                    128
+                ],
+                "max_concurrency": [
+                    1,
+                    4,
+                    8,
+                    16,
+                    32
+                ],
                 "random_input_len": 2500,
                 "random_output_len": 900,
                 "temperature": 0.4,
@@ -23,11 +37,26 @@
                 "repetition_penalty": 1.05,
                 "ignore_eos": true,
                 "extra_body": {
-                    "modalities": ["text"]
+                    "modalities": [
+                        "text"
+                    ]
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el",
                 "baseline": {
-                    "mean_ttft_ms": [1000, 3000, 5000, 7000, 9000]
+                    "mean_ttft_ms": [
+                        300,
+                        300,
+                        1000,
+                        600,
+                        800
+                    ],
+                    "mean_e2el_ms": [
+                        6000,
+                        8000,
+                        11000,
+                        13000,
+                        17000
+                    ]
                 }
             },
             {
@@ -35,8 +64,12 @@
                 "backend": "vllm",
                 "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
                 "endpoint": "/v1/completions",
-                "num_prompts": [10],
-                "request_rate": [0.1],
+                "num_prompts": [
+                    10
+                ],
+                "request_rate": [
+                    0.1
+                ],
                 "random_input_len": 100,
                 "random_output_len": 100,
                 "random_range_ratio": 0.0,
@@ -47,7 +80,9 @@
                 "repetition_penalty": 1.05,
                 "ignore_eos": true,
                 "extra_body": {
-                    "modalities": ["text"]
+                    "modalities": [
+                        "text"
+                    ]
                 },
                 "random_mm_base_items_per_request": 1,
                 "random_mm_num_mm_items_range_ratio": 0.5,
@@ -59,7 +94,12 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el",
                 "baseline": {
-                    "mean_ttft_ms": [2000]
+                    "mean_ttft_ms": [
+                        30
+                    ],
+                    "mean_e2el_ms": [
+                        540
+                    ]
                 }
             },
             {
@@ -67,8 +107,12 @@
                 "backend": "vllm",
                 "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
                 "endpoint": "/v1/completions",
-                "num_prompts": [40],
-                "request_rate": [0.5],
+                "num_prompts": [
+                    40
+                ],
+                "request_rate": [
+                    0.5
+                ],
                 "random_input_len": 100,
                 "random_output_len": 100,
                 "random_range_ratio": 0.0,
@@ -79,7 +123,9 @@
                 "repetition_penalty": 1.05,
                 "ignore_eos": true,
                 "extra_body": {
-                    "modalities": ["text"]
+                    "modalities": [
+                        "text"
+                    ]
                 },
                 "random_mm_base_items_per_request": 2,
                 "random_mm_num_mm_items_range_ratio": 0.5,
@@ -93,7 +139,12 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el",
                 "baseline": {
-                    "mean_ttft_ms": [6000]
+                    "mean_ttft_ms": [
+                        30
+                    ],
+                    "mean_e2el_ms": [
+                        600
+                    ]
                 }
             },
             {
@@ -101,8 +152,12 @@
                 "backend": "vllm",
                 "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
                 "endpoint": "/v1/completions",
-                "num_prompts": [100],
-                "request_rate": [1.0],
+                "num_prompts": [
+                    100
+                ],
+                "request_rate": [
+                    1.0
+                ],
                 "random_input_len": 100,
                 "random_output_len": 100,
                 "random_range_ratio": 0.0,
@@ -113,7 +168,9 @@
                 "repetition_penalty": 1.05,
                 "ignore_eos": true,
                 "extra_body": {
-                    "modalities": ["text"]
+                    "modalities": [
+                        "text"
+                    ]
                 },
                 "random_mm_base_items_per_request": 3,
                 "random_mm_num_mm_items_range_ratio": 0.5,
@@ -129,7 +186,12 @@
                 },
                 "percentile-metrics": "ttft,tpot,itl,e2el",
                 "baseline": {
-                    "mean_ttft_ms": [6000]
+                    "mean_ttft_ms": [
+                        40
+                    ],
+                    "mean_e2el_ms": [
+                        700
+                    ]
                 }
             }
         ]

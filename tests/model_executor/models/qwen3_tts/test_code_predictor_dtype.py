@@ -403,3 +403,57 @@ class TestCodePredictorWrapperConfig:
         assert config.use_parallel_embedding is False
         assert config.return_proj_buf is False
         assert config.sampling_mode == "per_call"
+
+    def test_prefix_graph_config_helpers(self, loaded_target_classes) -> None:
+        """Prefix graph helpers parse deploy config values and keep valid seq lens only."""
+        _ = loaded_target_classes
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        wrapper_cls = common_mod.CodePredictorWrapper
+
+        assert wrapper_cls._parse_positive_int_set("64; 128,0,-1") == {
+            64,
+            128,
+        }
+        assert wrapper_cls._parse_positive_int_set([2, "4", 0]) == {2, 4}
+        with pytest.raises(ValueError, match="Invalid positive int config value 'bad'"):
+            wrapper_cls._parse_positive_int_set("2,bad")
+
+        wrapper = object.__new__(wrapper_cls)
+        wrapper._prefix_graph_seq_lens = {1, 2, 4, 8, 99}
+        assert wrapper._prefix_seq_lens(6) == [2, 4]
+
+    def test_prefix_graph_env_requires_cuda_graphs(
+        self,
+        mocker: MockerFixture,
+        loaded_target_classes,
+    ) -> None:
+        """Avoid prefix warmup on shared code-predictor users that disable CUDA graphs."""
+        _ = loaded_target_classes
+        common_mod = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+        mocker.patch.object(common_mod.current_omni_platform, "is_npu", return_value=False)
+
+        cp_config, _ = _make_tiny_config(loaded_target_classes)
+        vllm_config = _make_vllm_config(mocker, max_num_seqs=2)
+        vllm_config.model_config.stage_connector_config = {
+            "extra": {
+                "code_predictor_prefix_graphs": True,
+                "code_predictor_prefix_graph_buckets": [2],
+                "code_predictor_prefix_graph_seq_lens": "2,3",
+            }
+        }
+
+        no_graph_wrapper = common_mod.CodePredictorWrapper(
+            vllm_config=vllm_config,
+            cp_config=cp_config,
+            wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=False),
+        )
+        assert no_graph_wrapper._prefix_graphs_enabled is False
+        assert no_graph_wrapper._prefix_graph_buckets == {2}
+        assert no_graph_wrapper._prefix_graph_seq_lens == {2, 3}
+
+        graph_wrapper = common_mod.CodePredictorWrapper(
+            vllm_config=vllm_config,
+            cp_config=cp_config,
+            wrapper_config=common_mod.CodePredictorWrapperConfig(use_cuda_graphs=True),
+        )
+        assert graph_wrapper._prefix_graphs_enabled is True

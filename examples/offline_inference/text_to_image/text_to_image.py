@@ -399,8 +399,6 @@ def main():
         "cache_config": cache_config,
         "enable_cache_dit_summary": args.enable_cache_dit_summary,
         "parallel_config": parallel_config,
-        "vae_patch_parallel_size": args.vae_patch_parallel_size,
-        "enable_expert_parallel": args.enable_expert_parallel,
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
         "mode": "text-to-image",

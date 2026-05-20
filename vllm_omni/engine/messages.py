@@ -56,6 +56,18 @@ class ShutdownRequestMessage(EngineQueueMessage, kw_only=True):
     type: Literal["shutdown"] = "shutdown"
 
 
+class RegisterRemoteReplicaMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["register_remote_replica"] = "register_remote_replica"
+    stage_id: int
+    replica_id: int
+
+
+class UnregisterRemoteReplicaMessage(EngineQueueMessage, kw_only=True):
+    type: Literal["unregister_remote_replica"] = "unregister_remote_replica"
+    stage_id: int
+    input_addr: str
+
+
 class ErrorMessage(EngineQueueMessage, kw_only=True):
     type: Literal["error"] = "error"
     error: str

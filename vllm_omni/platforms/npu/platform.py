@@ -32,6 +32,14 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
     dist_backend: str = "hccl"
 
     @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        super().set_device(device)
+        # Ascend quantized weights are converted from ND to FRACTAL_NZ
+        # after loading. Enable internal format so the NZ storage layout
+        # is preserved for fused NPU kernels.
+        torch.npu.config.allow_internal_format = True
+
+    @classmethod
     def get_omni_ar_worker_cls(cls) -> str:
         return "vllm_omni.platforms.npu.worker.npu_ar_worker.NPUARWorker"
 

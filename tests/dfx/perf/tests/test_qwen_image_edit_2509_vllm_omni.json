@@ -22,10 +22,10 @@
                 "num-input-images": 2,
                 "enable-negative-prompt": true,
                 "baseline": {
-                    "throughput_qps": 0.05,
-                    "latency_mean": 18,
-                    "peak_memory_mb_max": 78500,
-                    "peak_memory_mb_mean": 78500
+                    "throughput_qps": 0.06,
+                    "latency_mean": 20,
+                    "peak_memory_mb_max": 57000,
+                    "peak_memory_mb_mean": 57000
                 }
             },
             {
@@ -41,9 +41,9 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.01,
-                    "latency_mean": 70,
-                    "peak_memory_mb_max": 81000,
-                    "peak_memory_mb_mean": 81000
+                    "latency_mean": 60,
+                    "peak_memory_mb_max": 67000,
+                    "peak_memory_mb_mean": 67000
                 }
             }
         ]
@@ -75,10 +75,10 @@
                 "num-input-images": 2,
                 "enable-negative-prompt": true,
                 "baseline": {
-                    "throughput_qps": 0.1,
-                    "latency_mean": 12,
-                    "peak_memory_mb_max": 69000,
-                    "peak_memory_mb_mean": 69000
+                    "throughput_qps": 0.15,
+                    "latency_mean": 10,
+                    "peak_memory_mb_max": 55000,
+                    "peak_memory_mb_mean": 55000
                 }
             },
             {
@@ -93,10 +93,10 @@
                 "num-input-images": 2,
                 "enable-negative-prompt": true,
                 "baseline": {
-                    "throughput_qps": 0.03,
-                    "latency_mean": 28,
-                    "peak_memory_mb_max": 69000,
-                    "peak_memory_mb_mean": 69000
+                    "throughput_qps": 0.05,
+                    "latency_mean": 20,
+                    "peak_memory_mb_max": 55000,
+                    "peak_memory_mb_mean": 55000
                 }
             }
         ]
@@ -138,10 +138,10 @@
                 "num-input-images": 2,
                 "enable-negative-prompt": true,
                 "baseline": {
-                    "throughput_qps": 0.10,
-                    "latency_mean": 12,
-                    "peak_memory_mb_max": 73000,
-                    "peak_memory_mb_mean": 73000
+                    "throughput_qps": 0.21,
+                    "latency_mean": 10,
+                    "peak_memory_mb_max": 57000,
+                    "peak_memory_mb_mean": 57000
                 }
             },
             {
@@ -156,10 +156,10 @@
                 "num-input-images": 2,
                 "enable-negative-prompt": true,
                 "baseline": {
-                    "throughput_qps": 0.05,
+                    "throughput_qps": 0.08,
                     "latency_mean": 20,
-                    "peak_memory_mb_max": 81000,
-                    "peak_memory_mb_mean": 81000
+                    "peak_memory_mb_max": 66000,
+                    "peak_memory_mb_mean": 66000
                 }
             }
         ]
