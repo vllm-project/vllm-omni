@@ -32,8 +32,6 @@ import torch
 __all__ = [
     "UnsupportedInputError",
     "MULTI_SPEAKER_TAG_PATTERN",
-    "REJECTED_REQUEST_FIELDS",
-    "validate_plain_text_request",
     "validate_plain_text_input",
     "build_plain_text_conversation",
     "build_plain_text_prompt",
@@ -49,19 +47,6 @@ class UnsupportedInputError(ValueError):
 
 # Matches the upstream multi-speaker SPEAKERn tag, e.g. [SPEAKER0], [SPEAKER12].
 MULTI_SPEAKER_TAG_PATTERN = re.compile(r"\[SPEAKER\d+\]", re.IGNORECASE)
-
-# Rich-input aliases the validator still rejects so callers using upstream
-# field names hit a 4xx pointing at the canonical (``ref_audio``, ``ref_text``)
-# spellings instead of silently dropping the audio. ``ref_audio`` and
-# ``ref_text`` themselves are now accepted for shallow voice clone.
-# ``messages`` + ``speakers`` (multi-speaker dialogue) remain out of scope.
-REJECTED_REQUEST_FIELDS: tuple[str, ...] = (
-    "reference_audio",
-    "voice_prompt",
-    "speaker_audio",
-    "speakers",
-    "messages",
-)
 
 
 def validate_plain_text_input(text: str) -> None:
@@ -81,29 +66,6 @@ def validate_plain_text_input(text: str) -> None:
             "higgs_audio_v2 v1 does not support multi-speaker [SPEAKERn] tags; "
             "received text contains a speaker tag"
         )
-
-
-def validate_plain_text_request(request_payload: dict[str, Any]) -> None:
-    """Walk through a request dict and reject any out-of-scope field.
-
-    The serving layer calls this BEFORE building the prompt so the 4xx error
-    message can name the model and the offending field. Anything still
-    present in :data:`REJECTED_REQUEST_FIELDS` after the validator is treated
-    as a hard reject regardless of value.
-    """
-    for field in REJECTED_REQUEST_FIELDS:
-        if field in request_payload and request_payload[field] not in (None, "", [], {}):
-            raise UnsupportedInputError(
-                f"higgs_audio_v2 v1 does not support the request field "
-                f"{field!r}; supply plain text via the 'input' field instead"
-            )
-
-    text = request_payload.get("input")
-    if text is None:
-        raise UnsupportedInputError(
-            "higgs_audio_v2 requires plain text in the 'input' field"
-        )
-    validate_plain_text_input(text)
 
 
 def build_plain_text_conversation(text: str) -> list[dict[str, Any]]:

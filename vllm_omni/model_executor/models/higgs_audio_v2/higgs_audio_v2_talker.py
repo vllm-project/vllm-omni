@@ -18,10 +18,9 @@ source and the boson-ai checkpoint config.json):
   equals ``audio_token_id=128016`` or ``audio_delay_token_id=128014``.
 
 - Multi-codebook output head: at audio positions, Stage 0 emits one ID per
-  codebook (8 codebooks of vocabulary 1026 each). Codebook 0 comes from the
-  audio-side LM head; codebooks 1..7 come from a nested fast-AR
-  :class:`HiggsAudioCodePredictor` that runs once per AR step using the last
-  hidden state plus the previously emitted codebook embedding.
+  codebook (8 codebooks of vocabulary 1026 each) in parallel via a single
+  fused ``audio_lm_head: Linear(hidden, num_codebooks * codebook_size)``
+  whose output is reshaped to ``[N_audio, num_codebooks, codebook_size]``.
 
 - Delay pattern: codebook k is staggered by k frames using
   ``audio_delay_token_id=128014`` as a filler at the LM-token positions where
@@ -60,113 +59,11 @@ from vllm_omni.model_executor.models.higgs_audio_v2.configuration_higgs_audio_v2
 
 
 __all__ = [
-    "DualFFNLayer",
     "HiggsAudioV2DecoderLayer",
-    "HiggsAudioCodePredictor",
     "HiggsAudioV2TalkerForConditionalGeneration",
 ]
 
 logger = init_logger(__name__)
-
-
-class DualFFNLayer(nn.Module):
-    """Routed FFN that runs the text or audio expert per token position.
-
-    The routing follows the exact rule from
-    ``transformers.models.higgs_audio_v2.HiggsAudioV2DecoderLayer.forward``:
-
-      * Pre-attention norm: positions with ``audio_token_mask`` True use
-        ``audio_input_layernorm``; the rest use ``input_layernorm``. The two
-        outputs are stitched via ``masked_scatter`` and fed to a single
-        self-attention.
-      * Post-attention norm + FFN: text positions take the text path, audio
-        positions take the audio path. Both deltas are ADDED to the residual
-        (not replacing) so the residual stream remains shared.
-
-    This module owns the four parallel sub-layers and a forward helper that
-    consumes a precomputed routing mask.
-    """
-
-    def __init__(self, config: HiggsAudioV2Config, prefix: str = ""):
-        super().__init__()
-        rms_norm_eps = float(config.rms_norm_eps)
-        hidden_size = int(config.hidden_size)
-        intermediate_size = int(config.intermediate_size)
-        hidden_act = str(config.hidden_act)
-        mlp_bias = bool(getattr(config, "mlp_bias", False))
-
-        # Two normalization pairs.  We use stock nn.RMSNorm-equivalents to keep
-        # the parameter names aligned with the upstream state dict.
-        self.input_layernorm = HiggsAudioRMSNorm(hidden_size, eps=rms_norm_eps)
-        self.audio_input_layernorm = HiggsAudioRMSNorm(hidden_size, eps=rms_norm_eps)
-        self.post_attention_layernorm = HiggsAudioRMSNorm(hidden_size, eps=rms_norm_eps)
-        self.audio_post_attention_layernorm = HiggsAudioRMSNorm(hidden_size, eps=rms_norm_eps)
-
-        # Two parallel MLPs.  vLLM's LlamaMLP fuses gate_proj+up_proj for TP;
-        # we use it for both expert paths and rely on load_weights to repack
-        # HF's separate gate/up tensors into the fused gate_up_proj.
-        self.mlp = LlamaMLP(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            hidden_act=hidden_act,
-            bias=mlp_bias,
-            prefix=f"{prefix}.mlp",
-        )
-        self.audio_mlp = LlamaMLP(
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            hidden_act=hidden_act,
-            bias=mlp_bias,
-            prefix=f"{prefix}.audio_mlp",
-        )
-
-    def pre_attention_norm(
-        self,
-        hidden_states: torch.Tensor,
-        audio_token_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Apply input_layernorm / audio_input_layernorm based on the mask."""
-        if audio_token_mask is None:
-            return self.audio_input_layernorm(hidden_states)
-        mask = audio_token_mask.to(hidden_states.device)
-        out = hidden_states.clone()
-        if mask.any():
-            out = out.masked_scatter(
-                mask.unsqueeze(-1),
-                self.audio_input_layernorm(hidden_states[mask]).to(hidden_states.device),
-            )
-        if (~mask).any():
-            out = out.masked_scatter(
-                (~mask).unsqueeze(-1),
-                self.input_layernorm(hidden_states[~mask]).to(hidden_states.device),
-            )
-        return out
-
-    def post_attention_ffn(
-        self,
-        hidden_states: torch.Tensor,
-        audio_token_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Run text MLP on text positions and audio MLP on audio positions.
-
-        Both expert outputs are ADDED to ``hidden_states`` (mirroring upstream).
-        When the mask is None, audio expert is applied to all positions.
-        """
-        if audio_token_mask is None:
-            audio_h = self.audio_post_attention_layernorm(hidden_states)
-            audio_h = self.audio_mlp(audio_h)
-            return hidden_states + audio_h
-        mask = audio_token_mask.to(hidden_states.device)
-        out = hidden_states.clone()
-        if (~mask).any():
-            text_h = self.post_attention_layernorm(hidden_states[~mask])
-            text_h = self.mlp(text_h)
-            out[~mask] = out[~mask] + text_h.to(out.dtype).to(out.device)
-        if mask.any():
-            audio_h = self.audio_post_attention_layernorm(hidden_states[mask])
-            audio_h = self.audio_mlp(audio_h)
-            out[mask] = out[mask] + audio_h.to(out.dtype).to(out.device)
-        return out
 
 
 class HiggsAudioRMSNorm(nn.Module):
@@ -331,62 +228,6 @@ class HiggsAudioV2DecoderLayer(LlamaDecoderLayer):
         return mlp_out, residual
 
 
-class HiggsAudioCodePredictor(nn.Module):
-    """Fast-AR head for residual codebooks 1..N-1.
-
-    At each AR step the talker produces a hidden state at the current audio
-    position; this module emits codebooks 1..N-1 sequentially, each consuming
-    the previously emitted codebook's embedding plus the running hidden state.
-
-    The structure mirrors ``qwen3_tts.CodePredictorWrapper`` so existing
-    talker plumbing (``embed_input_ids``, ``make_omni_output``, ``postprocess``)
-    can be lifted with minimal changes during the AR-loop integration round.
-    """
-
-    def __init__(self, config: HiggsAudioV2Config, prefix: str = ""):
-        super().__init__()
-        self.config = config
-        self.num_codebooks = int(config.num_codebooks)
-        self.codebook_size = int(config.codebook_size)
-        self.hidden_size = int(config.hidden_size)
-
-        # Embedding for codebook k looks up among `codebook_size` entries.
-        # We mirror upstream's HiggsAudioV2Embeddings layout: a single fused
-        # embedding sized `num_codebooks * codebook_size`, addressed via a
-        # per-codebook offset of ``k * codebook_size``.
-        self.embed_codebooks = nn.Embedding(
-            self.num_codebooks * self.codebook_size, self.hidden_size
-        )
-        self.register_buffer(
-            "codebook_offsets",
-            torch.arange(self.num_codebooks) * self.codebook_size,
-            persistent=False,
-        )
-
-        # One output head per residual codebook (1..N-1). Codebook 0 is
-        # emitted by the talker's audio LM head.
-        self.residual_heads = nn.ModuleList(
-            [
-                nn.Linear(self.hidden_size, self.codebook_size, bias=False)
-                for _ in range(self.num_codebooks - 1)
-            ]
-        )
-
-    def embed_codebook(self, codebook_idx: int, code_ids: torch.Tensor) -> torch.Tensor:
-        """Embedding lookup for a single codebook with the offset applied."""
-        offset = int(self.codebook_offsets[codebook_idx].item())
-        return self.embed_codebooks(code_ids + offset)
-
-    def predict_residual(self, hidden_state: torch.Tensor, codebook_idx: int) -> torch.Tensor:
-        """Logits for residual codebook ``codebook_idx`` (1 <= idx < N)."""
-        if codebook_idx < 1 or codebook_idx >= self.num_codebooks:
-            raise IndexError(
-                f"codebook_idx must be in [1, {self.num_codebooks - 1}]; got {codebook_idx}"
-            )
-        head = self.residual_heads[codebook_idx - 1]
-        return head(hidden_state)
-
-
 class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
     """Stage-0 talker class registered under
     ``HiggsAudioV2ForConditionalGeneration`` (canonical HF arch identifier)
@@ -396,8 +237,9 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
       1. vLLM-native ``LlamaModel`` backbone (PagedAttention scheduling).
       2. A parallel set of DualFFN modules (one per decoder layer) for the
          audio-expert path.
-      3. Multi-codebook output: audio LM head (codebook 0) +
-         :class:`HiggsAudioCodePredictor` (codebooks 1..N-1).
+      3. Multi-codebook output via a single fused ``audio_lm_head`` of shape
+         ``[num_codebooks * codebook_size, hidden]`` (all codebooks emitted
+         in parallel per audio position).
       4. ``load_weights`` HF -> vLLM mapping (GQA reshape, llama3 RoPE,
          text/audio MLP split, audio code heads, audio token embeddings).
 
@@ -913,13 +755,6 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         # Per-codebook head, when the upstream exports it un-fused.
         if hf_name == "codebook_head_0.weight":
             return "audio_codebook0_head.weight"
-        if hf_name.startswith("codebook_head_") and hf_name.endswith(".weight"):
-            try:
-                idx = int(hf_name[len("codebook_head_") : -len(".weight")])
-            except ValueError:
-                return None
-            if idx >= 1:
-                return f"code_predictor.residual_heads.{idx - 1}.weight"
         # Per-layer audio norms -> our HiggsAudioV2DecoderLayer side.
         if hf_name.startswith("model.layers.") and hf_name.endswith(
             ".audio_input_layernorm.weight"
