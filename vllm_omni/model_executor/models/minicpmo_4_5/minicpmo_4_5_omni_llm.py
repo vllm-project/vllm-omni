@@ -2544,7 +2544,7 @@ class MiniCPMWhisperEncoder(WhisperEncoder):
         return_dict=None,
         past_key_values: EncoderDecoderCache | None = None,
         use_cache: bool | None = None,
-    ):
+    ) -> BaseModelOutputWithPast | tuple:
         r"""
         Forward pass of the Whisper encoder.
 
