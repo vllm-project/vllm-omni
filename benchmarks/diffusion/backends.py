@@ -218,6 +218,105 @@ async def async_request_openai_image_generations(
     return output
 
 
+async def async_request_openai_image_edits(
+    input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> RequestFuncOutput:
+    """
+    Send request to OpenAI's /v1/images/edits endpoint for image-to-image editing.
+    """
+    output = RequestFuncOutput()
+    output.start_time = time.perf_counter()
+
+    if not input.image_paths or len(input.image_paths) == 0:
+        output.error = "image_paths is required for /v1/images/edits"
+        output.success = False
+        if pbar:
+            pbar.update(1)
+        return output
+
+    if not input.prompt:
+        output.error = "prompt is required for /v1/images/edits"
+        output.success = False
+        if pbar:
+            pbar.update(1)
+        return output
+
+    width = input.width or 1024
+    height = input.height or 1024
+    size = f"{width}x{height}"
+
+    form = aiohttp.FormData()
+    form.add_field("model", input.model)
+    form.add_field("prompt", input.prompt)
+    form.add_field("n", "1")
+    form.add_field("size", size)
+    form.add_field("response_format", "b64_json")
+
+    if input.seed is not None:
+        form.add_field("seed", str(input.seed))
+    if input.num_inference_steps is not None:
+        form.add_field("num_inference_steps", str(input.num_inference_steps))
+
+    if input.extra_body:
+        for key, value in input.extra_body.items():
+            if key not in ["prompt", "model"]:
+                if isinstance(value, bool):
+                    form.add_field(key, "true" if value else "false")
+                else:
+                    form.add_field(key, str(value))
+
+    image_file = None
+    try:
+        image_path = input.image_paths[0]
+        image_file = open(image_path, "rb")
+        image_data = image_file.read()
+        form.add_field(
+            "image",
+            image_data,
+            filename=os.path.basename(image_path),
+            content_type="application/octet-stream",
+        )
+    except OSError as e:
+        output.error = f"Failed to read image file: {e}"
+        output.success = False
+        if pbar:
+            pbar.update(1)
+        return output
+    finally:
+        if image_file is not None:
+            image_file.close()
+
+    headers = {
+        "Authorization": "Bearer EMPTY",
+    }
+
+    try:
+        async with session.post(input.api_url, data=form, headers=headers) as response:
+            if response.status == 200:
+                resp_json = await response.json()
+                output.response_body = resp_json
+                output.success = True
+                if "usage" in resp_json and "peak_memory_mb" in resp_json.get("usage", {}):
+                    output.peak_memory_mb = resp_json["usage"]["peak_memory_mb"]
+            else:
+                output.error = f"HTTP {response.status}: {await response.text()}"
+                output.success = False
+    except Exception as e:
+        output.error = str(e)
+        output.success = False
+
+    output.latency = time.perf_counter() - output.start_time
+
+    if output.success and input.slo_ms is not None:
+        output.slo_achieved = (output.latency * 1000.0) <= float(input.slo_ms)
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 async def async_request_v1_videos(
     input: RequestFuncInput,
     session: aiohttp.ClientSession,
@@ -378,6 +477,7 @@ backends_function_mapping = {
     "2i": {
         "/v1/chat/completions": (async_request_chat_completions, "/v1/chat/completions"),
         "/v1/images/generations": (async_request_openai_image_generations, "/v1/images/generations"),
+        "/v1/images/edits": (async_request_openai_image_edits, "/v1/images/edits"),
     },
     "2v": {
         "/v1/videos": (async_request_v1_videos, "/v1/videos"),

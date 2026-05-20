@@ -9,6 +9,7 @@ If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 Supports multiple endpoints:
     - /v1/chat/completions: OpenAI chat-compatible image requests
     - /v1/images/generations: OpenAI image generation requests
+    - /v1/images/edits: OpenAI image edit requests
     - /v1/videos: Async video jobs
 
 Usage:
@@ -42,6 +43,11 @@ Usage:
     i2i:
     python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
         --endpoint /v1/chat/completions --dataset vbench --task i2i --num-prompts 10
+
+    # Image (/v1/images/edits endpoint)
+    i2i:
+    python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
+        --endpoint /v1/images/edits --dataset vbench --task i2i --num-prompts 10
 
     # Image (/v1/images/generations endpoint)
     t2i:
