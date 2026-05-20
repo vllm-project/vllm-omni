@@ -1323,6 +1323,7 @@ class Wan22Pipeline(
 
         pp_group = get_pp_group()
         if pp_group.world_size == 1:
+            self.is_buffer_setup = True
             return
 
         # Pre-populate buffer pairs for every B in 1..slo_max_batch
@@ -1401,7 +1402,7 @@ class Wan22Pipeline(
         )
         preposted_its = state.extra.pop("preposted_its", None)
 
-        return self.predict_noise_maybe_with_pp_and_cfg(
+        return self.predict_noise_maybe_with_cfg(
             do_true_cfg=do_true_cfg,
             true_cfg_scale=current_guidance_scale,
             positive_kwargs=positive_kwargs,
@@ -1454,7 +1455,7 @@ class Wan22Pipeline(
         if per_request_scheduler is None:
             per_request_scheduler = state.scheduler
 
-        state.latents = self.scheduler_step_maybe_with_pp_and_cfg(
+        state.latents = self.scheduler_step_maybe_with_cfg(
             noise_pred,
             t,
             state.latents,
@@ -1471,7 +1472,7 @@ class Wan22Pipeline(
         **kwargs: Any,
     ) -> DiffusionOutput:
         """Decode final latents after denoising completes."""
-        self.sync_pp_send()
+        self._sync_pp_send()
         self._current_timestep = None
 
         # if current_omni_platform.is_available():

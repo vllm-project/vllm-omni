@@ -109,7 +109,7 @@ class _SLOController:
             chunk_frames=max(1, chunk_frames),
         )
 
-    def get_target(self, sched_req_id: int) -> int:
+    def get_target(self, sched_req_id: str) -> int:
         st = self._reqs.get(sched_req_id)
         return st.batch_size if st is not None else 1
 
@@ -299,8 +299,8 @@ class StreamBatchScheduler(_BaseScheduler):
 
     def _build_assignment(self) -> list[RankTask | None]:
         assert len(self._progress) <= 1 #TODO: support multiple requests
+        assignment: list[RankTask | None] = [None] * self.pp_size
         for progress in self._progress.values():
-            assignment: list[RankTask | None] = [None] * self.pp_size
             for r in range(self.pp_size):
                 queue = progress.chunks_at[r]
                 if not queue:
@@ -309,7 +309,7 @@ class StreamBatchScheduler(_BaseScheduler):
                     sched_req_id=progress.sched_req_id,
                     chunk_indices=[c.chunk_idx for c in queue],
                 )
-            return assignment
+        return assignment
 
     # ── Output processing ──────────────────────────────────────────────────
 
