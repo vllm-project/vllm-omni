@@ -990,6 +990,30 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         if input_ids is not None:
             self._last_step_input_ids = input_ids
 
+        # Stash query_start_loc here (inside the forward context) so
+        # _apply_audio_mode_bias (which runs LATER in sample(), after the
+        # forward context exits) can recover each request's last token
+        # position from the flat input_ids — see the per-row prev-token
+        # lookup below. Without this, mixed prefill+decode batches would
+        # fall back to ``input_ids[-num_rows:]``, which silently misroutes
+        # the audio_out_bos detection in batch>1 voice clone (was the root
+        # cause of the slot-shifted gibberish at batch=4).
+        try:
+            from vllm.forward_context import get_forward_context
+
+            attn_metadata = get_forward_context().attn_metadata
+            if isinstance(attn_metadata, dict) and attn_metadata:
+                attn = next(iter(attn_metadata.values()))
+            else:
+                attn = attn_metadata
+            qsl = getattr(attn, "query_start_loc", None)
+            if isinstance(qsl, torch.Tensor):
+                self._last_step_query_start_loc = qsl.detach().clone()
+            else:
+                self._last_step_query_start_loc = None
+        except Exception:
+            self._last_step_query_start_loc = None
+
         # Voice-clone ref-audio substitution: at the prompt-side audio
         # placeholder span we overwrite the text-embed lookups with the
         # multi-codebook embedding of the encoded reference clip carried in
@@ -1241,31 +1265,33 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         if info_dicts is None:
             info_dicts = []
 
+        # Build a per-request audio-codes list whose length exactly equals
+        # ``len(info_dicts)`` (== batch size). Requests with no emitted codes
+        # this step get an empty tensor placeholder — that way the runner's
+        # ``to_payload_element`` (which indexes ``element[idx]`` per request)
+        # can never silently fall back to ``element[0]`` for higher slots,
+        # which was the root of the batch>1 voice-clone slot-shift bug
+        # (slot k ended up speaking slot k-1's text).
         audio_codes_list: list[torch.Tensor] = []
+        any_nonempty = False
         for info in info_dicts:
-            if not isinstance(info, dict):
-                continue
-            codes_field = info.get("codes")
-            if isinstance(codes_field, dict):
-                ac = codes_field.get("audio")
-            else:
-                ac = info.get("audio_codes")
+            ac: torch.Tensor | None = None
+            if isinstance(info, dict):
+                codes_field = info.get("codes")
+                if isinstance(codes_field, dict):
+                    ac = codes_field.get("audio")
+                else:
+                    ac = info.get("audio_codes")
             if isinstance(ac, torch.Tensor) and ac.numel() > 0:
                 audio_codes_list.append(ac)
+                any_nonempty = True
+            else:
+                audio_codes_list.append(torch.empty(0, dtype=torch.long))
 
-        if audio_codes_list:
-            audio_codes = torch.cat(audio_codes_list, dim=0)
-            # NOTE: do not slice ``hidden`` by ``audio_codes.shape[0]`` — the
-            # talker emits one audio frame per request per decode step, so
-            # ``hidden.shape[0]`` is the BATCH dim (one row per request), not
-            # an audio-frame dim. Slicing here corrupted multi-request decode
-            # (gather assert in the runner's ``hidden_states[logits_indices]``
-            # because ``logits_indices`` then refers to rows that no longer
-            # exist). Qwen3-TTS / Fish-Speech can slice because their hidden
-            # carries multi-frame outputs; higgs-audio v2 does not.
+        if any_nonempty:
             return OmniOutput(
                 text_hidden_states=hidden,
-                multimodal_outputs={"codes": {"audio": audio_codes}},
+                multimodal_outputs={"codes": {"audio": audio_codes_list}},
             )
 
         # Fallbacks: explicit kwarg or wrapped model_kwargs dicts (preserved for
@@ -1774,15 +1800,35 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
         output_ids = getattr(sampling_metadata, "output_token_ids", None)
         num_rows = int(logits.shape[0])
         biased = 0
-        # Fallback "previous token" source: input_ids stashed by :meth:`forward`.
-        # The runner concatenates per-request input_ids; ``logits`` rows are
-        # produced from logits_indices which (for the common AR case) are the
-        # last position of each request slice. So input_ids' tail matches the
-        # logits' rows in order.
+        # Fallback "previous token" source: read each request's LAST input
+        # position from ``self._last_step_input_ids`` using ``query_start_loc``
+        # from the forward context. The previous version of this code took
+        # ``stash_ids[-num_rows:]`` which only works for pure-decode batches
+        # (where each row contributes exactly one token to the flat input_ids).
+        # In MIXED prefill+decode batches the last N tokens of flat input_ids
+        # all belong to the LAST prefilling request, so the "prev token" for
+        # other rows came back as random tokens from inside that request's
+        # prompt — which caused the audio_out_bos detection to fail for some
+        # rows, the audio_token_id bias to skip them, and the per-row codes to
+        # collapse to -1 silently (see the batch>1 voice-clone gibberish bug).
         stash_ids = getattr(self, "_last_step_input_ids", None)
         stash_tail: list[int] | None = None
-        if isinstance(stash_ids, torch.Tensor) and stash_ids.numel() >= num_rows:
-            stash_tail = stash_ids[-num_rows:].detach().to("cpu").tolist()
+        if isinstance(stash_ids, torch.Tensor) and stash_ids.numel() > 0:
+            # forward() stashed query_start_loc for us inside the forward
+            # context — get_forward_context() would fail here because we're
+            # past the with-block by the time sample() runs.
+            q_start = getattr(self, "_last_step_query_start_loc", None)
+            if isinstance(q_start, torch.Tensor) and int(q_start.numel()) == num_rows + 1:
+                # Per-request last position: q_start_loc[i+1] - 1.
+                q_start_cpu = q_start.detach().to("cpu").tolist()
+                tail_idx = [max(0, int(q_start_cpu[i + 1]) - 1) for i in range(num_rows)]
+                flat_ids = stash_ids.detach().to("cpu").tolist()
+                stash_tail = [int(flat_ids[idx]) if idx < len(flat_ids) else -1 for idx in tail_idx]
+            elif int(stash_ids.numel()) >= num_rows:
+                # Pure-decode fallback when query_start_loc is unavailable:
+                # input_ids has exactly num_rows tokens (one per request) and
+                # the slice is order-preserving.
+                stash_tail = stash_ids[-num_rows:].detach().to("cpu").tolist()
         # Also stash a per-row "is this the first audio-mode step right
         # after audio_out_bos" flag. Upstream NEVER samples audio codes at
         # the audio_out_bos position (its audio_out_mask is False there);
@@ -1856,11 +1902,17 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
     ) -> dict[str, Any]:
         """Publish per-request audio codes into model_intermediate_buffer.
 
-        The runner calls this once per request, passing the request's slice of
-        hidden states. We use the slice's length to pick out the matching rows
-        from ``self._last_audio_codes`` (a per-batch [N_total, num_codebooks]
-        tensor scattered by :meth:`sample`). The returned dict is merged into
-        ``model_intermediate_buffer[req_id]`` for downstream Stage-1 use.
+        The runner calls this once per request in batch order. We index into
+        ``self._last_audio_codes`` (a per-batch ``[num_requests, num_codebooks]``
+        tensor produced by :meth:`sample`, one row per request slot regardless
+        of prompt span length) by a running cursor — exactly one row per
+        request. Using ``hidden_states_slice.shape[0]`` as the stride is
+        WRONG at prefill: prompt span length is hundreds of tokens, but each
+        request still contributes exactly one sampled row to ``_last_audio_codes``.
+        That bug used to drop the first audio frame at prefill-end (the
+        all-BOS seed) and, in mixed prefill+decode batches, scrambled the
+        per-request → codes mapping so batch=4 output came back shifted /
+        cross-talked across slots.
         """
         _ = multimodal_outputs  # consumed by the runner directly
         codes_full = getattr(self, "_last_audio_codes", None)
@@ -1868,15 +1920,15 @@ class HiggsAudioV2TalkerForConditionalGeneration(nn.Module):
             return {}
 
         # The runner walks requests in batch order; pop from the cursor as we go.
+        # ``_last_audio_codes`` is one row per request slot (== one logits_indices
+        # row), not one row per prompt token, so advance by 1 per call.
         cursor = int(getattr(self, "_postprocess_cursor", 0))
-        n = int(hidden_states_slice.shape[0])
-        end = cursor + n
-        if end > int(codes_full.shape[0]):
+        if cursor >= int(codes_full.shape[0]):
             # Defensive: shape drift between forward and postprocess.
             self._postprocess_cursor = 0
             return {}
-        slice_codes = codes_full[cursor:end]
-        self._postprocess_cursor = end
+        slice_codes = codes_full[cursor:cursor + 1]
+        self._postprocess_cursor = cursor + 1
         # Drop placeholder rows (-1) — only emit codes for actual audio positions.
         audio_rows = slice_codes[:, 0] >= 0
         if not bool(audio_rows.any()):
