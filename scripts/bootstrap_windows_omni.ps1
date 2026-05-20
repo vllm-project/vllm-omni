@@ -18,7 +18,7 @@ param(
     [string]$Branch = "windows-compat",
     [string]$VllmRepoPath = "",
     [string]$OmniRepoPath = "",
-    [string]$VenvPath = "C:\tmp\vllmvenv",
+    [string]$VenvPath = "",
     [string]$CudaPath = "C:\tmp\cuda13",
     [string]$CudaArch = "120",
     [string]$FetchContentBaseDir = "C:\tmp\vllm_deps",
@@ -169,6 +169,9 @@ if (-not $OmniRepoPath) {
     else {
         $OmniRepoPath = Join-Path $InstallRoot "vllm-omni-windows"
     }
+}
+if (-not $VenvPath) {
+    $VenvPath = Join-Path $InstallRoot "venv"
 }
 if (-not $ProofOut) {
     $ProofOut = Join-Path $OmniRepoPath "demo_outputs\bootstrap_qwen3_omni_audio_stream_probe.json"
