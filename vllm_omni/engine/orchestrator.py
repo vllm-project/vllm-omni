@@ -4,12 +4,20 @@ Orchestrator for vLLM-Omni multi-stage runtime.
 Runs inside a background thread with its own asyncio event loop.
 Owns logical request progression across stage pools and handles
 stage-to-stage transfer logic.
+
+In distributed mode (``coordinator_pub_address`` provided), it also
+owns the single :class:`OmniCoordClientForHub`, runs a
+:meth:`_watch_replica_list` task that converts replica disappearances
+into ``unregister_remote_replica`` control messages, and handles the
+``register_remote_replica`` / ``unregister_remote_replica`` flow that
+attaches / detaches head-side stage clients for headless replicas.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time as _time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,6 +30,12 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.distributed.omni_coordinator import (
+    LoadBalancer,
+    OmniCoordClientForHub,
+    RandomBalancer,
+    ReplicaStatus,
+)
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.messages import (
@@ -32,12 +46,25 @@ from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,
     OutputMessage,
+    RegisterRemoteReplicaMessage,
+    ShutdownRequestMessage,
     StageMetricsMessage,
     StageSubmissionMessage,
+    UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.outputs import OmniRequestOutput
+
+# Factory signature for building a head-side stage client for a
+# *dynamically attached* (auto-assigned) remote replica.
+#
+# Receives ``(stage_id, replica_id)`` and returns an awaitable yielding the
+# constructed client (any type — it must satisfy the shape expected by the
+# matching :class:`StagePool`, i.e. expose ``client_addresses["input_address"]``
+# or ``request_address``, plus the usual ``add_request_async`` /
+# ``get_output_async`` / ``shutdown`` surface).
+RemoteReplicaFactory = Callable[[int, int], Awaitable[Any]]
 
 logger = init_logger(__name__)
 
@@ -124,6 +151,10 @@ class StreamingInputState:
 class Orchestrator:
     """Runs inside a background thread's asyncio event loop."""
 
+    # Cadence at which the replica-list watcher polls for disappearances.
+    _WATCH_REPLICA_INTERVAL_S: float = 0.5
+    _WATCH_REPLICA_IDLE_INTERVAL_S: float = 1.0
+
     def __init__(
         self,
         request_async_queue: janus.AsyncQueue[EngineQueueMessage],
@@ -133,6 +164,9 @@ class Orchestrator:
         *,
         async_chunk: bool = False,
         pd_config: dict[str, Any] | None = None,
+        coordinator_pub_address: str | None = None,
+        load_balancer_factory: Callable[[], LoadBalancer] | None = None,
+        remote_replica_factory: RemoteReplicaFactory | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -159,6 +193,28 @@ class Orchestrator:
         self._fatal_error: str | None = None
         self._fatal_error_stage_id: int | None = None
 
+        # Background tasks for fire-and-forget message handlers (currently
+        # only ``register_remote_replica`` and ``unregister_remote_replica``).
+        # Held as a set so each task's reference survives the loop and the
+        # task can self-deregister on completion.
+        self._membership_tasks: set[asyncio.Task[None]] = set()
+
+        # Distributed-mode wiring. The hub is constructed on the
+        # orchestrator's asyncio loop because it spawns a SUB background
+        # thread; building it from another thread would race the
+        # ``_init_done`` event.
+        self._hub: OmniCoordClientForHub | None = (
+            OmniCoordClientForHub(coordinator_pub_address) if coordinator_pub_address is not None else None
+        )
+        self._remote_replica_factory = remote_replica_factory
+        # Inject hub + per-pool LB into each StagePool so they can run
+        # distributed dispatch via ``StagePool.pick``.
+        if self._hub is not None:
+            factory = load_balancer_factory or RandomBalancer
+            for pool in self.stage_pools:
+                pool.attach_hub(self._hub)
+                pool.attach_load_balancer(factory())
+
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
         logger.info("[Orchestrator] Starting event loop")
@@ -168,9 +224,16 @@ class Orchestrator:
             self._orchestration_output_handler(),
             name="orchestrator-stage-output-handler",
         )
+        # The replica watcher only runs in distributed mode. It's still
+        # created in both cases so ``run()`` has a uniform task graph;
+        # ``_watch_replica_list`` is a no-op poll when ``self._hub`` is None.
+        watch_task = asyncio.create_task(
+            self._watch_replica_list(),
+            name="orchestrator-replica-watcher",
+        )
 
         try:
-            await asyncio.gather(request_task, output_task)
+            await asyncio.gather(request_task, output_task, watch_task)
         except asyncio.CancelledError:
             raise
         except EngineDeadError as e:
@@ -185,11 +248,11 @@ class Orchestrator:
             raise
         finally:
             self._shutdown_event.set()
-            for task in (request_task, output_task):
+            for task in (request_task, output_task, watch_task):
                 if not task.done():
                     task.cancel()
             try:
-                await asyncio.gather(request_task, output_task, return_exceptions=True)
+                await asyncio.gather(request_task, output_task, watch_task, return_exceptions=True)
             except Exception:
                 pass
 
@@ -199,7 +262,31 @@ class Orchestrator:
             if self._fatal_error is not None:
                 await self._drain_pending_requests_on_fatal()
 
+            # Wait briefly for any in-flight membership handlers (register /
+            # unregister remote replica) to finish so they don't leave the
+            # head-side pool in a half-attached state. Cancel anything that
+            # hasn't completed in time; the generic pending-task sweep below
+            # will collect the cancellations.
+            if self._membership_tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*self._membership_tasks, return_exceptions=True),
+                        timeout=10.0,
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    for t in self._membership_tasks:
+                        if not t.done():
+                            t.cancel()
+
             self._shutdown_stages()
+
+            # Close the hub last so any in-flight dispatch still has access.
+            if self._hub is not None:
+                try:
+                    self._hub.close()
+                except RuntimeError:
+                    pass
+                self._hub = None
 
             loop = asyncio.get_running_loop()
             pending = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task() and not t.done()]
@@ -207,6 +294,27 @@ class Orchestrator:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+
+    # ---- Background task helpers ----
+
+    def _spawn_membership_task(self, coro: Awaitable[None], *, label: str) -> None:
+        """Run a fire-and-forget membership-change coroutine.
+
+        Holds a strong reference until completion (asyncio would otherwise
+        garbage-collect a bare task), and logs any uncaught exception.
+        """
+        task = asyncio.create_task(coro, name=f"orchestrator-{label}")
+        self._membership_tasks.add(task)
+
+        def _on_done(t: asyncio.Task[None]) -> None:
+            self._membership_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.error("[Orchestrator] %s task crashed", label, exc_info=exc)
+
+        task.add_done_callback(_on_done)
 
     # ---- Request handling ----
 
@@ -226,7 +334,20 @@ class Orchestrator:
                 await self._handle_abort(msg)
             elif msg_type == "collective_rpc":
                 await self._handle_collective_rpc(msg)
-            elif msg_type == "shutdown":
+            elif isinstance(msg, RegisterRemoteReplicaMessage):
+                # Dynamic-attach involves a ~5s blocking handshake (run in a
+                # thread by ``_build_remote_replica``); ``await`` here would
+                # block the queue and stall the next ``add_request`` until
+                # the attach finishes. Dispatch as a background task so the
+                # main message loop keeps draining.
+                self._spawn_membership_task(self._handle_register_remote_replica(msg), label="register_remote_replica")
+            elif isinstance(msg, UnregisterRemoteReplicaMessage):
+                # Symmetric with register: keep the main queue flowing.
+                self._spawn_membership_task(
+                    self._handle_unregister_remote_replica(msg),
+                    label="unregister_remote_replica",
+                )
+            elif isinstance(msg, ShutdownRequestMessage):
                 logger.info("[Orchestrator] Received shutdown signal")
                 self._shutdown_event.set()
                 # Pre-mark stage clients as shutting down to prevent
@@ -415,7 +536,7 @@ class Orchestrator:
         results: list[Any] = []
         stage_ids: list[int] = []
         for pool in target_pools:
-            for replica_id in range(pool.num_replicas):
+            for replica_id in pool.live_replica_ids():
                 stage_result = await pool.collective_rpc(
                     replica_id=replica_id,
                     method=method,
@@ -451,7 +572,7 @@ class Orchestrator:
             idle = True
             for stage_id in range(self.num_stages):
                 pool = self.stage_pools[stage_id]
-                for replica_id in range(pool.num_replicas):
+                for replica_id in pool.live_replica_ids():
                     if self._shutdown_event.is_set():
                         return
 
@@ -1105,14 +1226,137 @@ class Orchestrator:
                 )
             self.request_states.pop(req_id, None)
 
+    # ---- Distributed-mode replica attach / detach ----
+
+    async def _watch_replica_list(self) -> None:
+        """Convert hub replica disappearances into unregister control messages."""
+        last_up: set[tuple[int, str]] = set()
+        while not self._shutdown_event.is_set():
+            if self._hub is None:
+                # No coordinator wired up; sleep coarsely and re-check shutdown.
+                try:
+                    await asyncio.sleep(self._WATCH_REPLICA_IDLE_INTERVAL_S)
+                except asyncio.CancelledError:
+                    raise
+                continue
+
+            try:
+                snap = self._hub.get_replica_list()
+                current = {(rep.stage_id, rep.input_addr) for rep in snap.replicas if rep.status == ReplicaStatus.UP}
+                for stage_id, addr in last_up - current:
+                    await self.request_async_queue.put(
+                        UnregisterRemoteReplicaMessage(
+                            stage_id=stage_id,
+                            input_addr=addr,
+                        )
+                    )
+                last_up = current
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[Orchestrator] _watch_replica_list iteration failed")
+
+            try:
+                await asyncio.sleep(self._WATCH_REPLICA_INTERVAL_S)
+            except asyncio.CancelledError:
+                raise
+
+    async def _handle_register_remote_replica(self, msg: RegisterRemoteReplicaMessage) -> None:
+        """Bind a head-side client for a newly registered remote replica."""
+        stage_id = int(msg.stage_id)
+        replica_id = int(msg.replica_id)
+        if not (0 <= stage_id < self.num_stages):
+            logger.warning(
+                "[Orchestrator] register_remote_replica: stage_id %d out of range (num_stages=%d)",
+                stage_id,
+                self.num_stages,
+            )
+            return
+        if self._remote_replica_factory is None:
+            logger.warning(
+                "[Orchestrator] register_remote_replica received for stage=%d replica=%d but no factory installed",
+                stage_id,
+                replica_id,
+            )
+            return
+
+        try:
+            await self._attach_remote_replica(stage_id, replica_id)
+        except Exception:
+            logger.exception(
+                "[Orchestrator] failed to attach remote replica stage=%d replica=%d",
+                stage_id,
+                replica_id,
+            )
+
+    async def _handle_unregister_remote_replica(self, msg: UnregisterRemoteReplicaMessage) -> None:
+        """Tear down the head-side client for a vanished remote replica."""
+        stage_id = int(msg.stage_id)
+        input_addr = str(msg.input_addr)
+        if not (0 <= stage_id < self.num_stages):
+            return
+        pool = self.stage_pools[stage_id]
+        affected = pool.invalidate_addr(input_addr)
+        self._detach_remote_replica(stage_id, input_addr)
+        if affected:
+            await self._cleanup_request_ids(affected, abort=True)
+            for req_id in affected:
+                await self.output_async_queue.put(
+                    ErrorMessage(
+                        error="stage replica disappeared",
+                        request_id=req_id,
+                        stage_id=stage_id,
+                    )
+                )
+
+    async def _attach_remote_replica(self, stage_id: int, replica_id: int) -> None:
+        """Build a head-side stage client via the injected factory and register it."""
+        factory = self._remote_replica_factory
+        if factory is None:
+            return
+        pool = self.stage_pools[stage_id]
+        client = await factory(stage_id, replica_id)
+        input_addr = StagePool._client_input_addr(client)
+        if input_addr is None:
+            raise RuntimeError(
+                f"remote replica factory for stage {stage_id} produced a client without a discoverable input address"
+            )
+        pool.add_client(input_addr, client)
+        logger.info(
+            "[Orchestrator] attached remote replica stage=%d replica=%d addr=%s",
+            stage_id,
+            replica_id,
+            input_addr,
+        )
+
+    def _detach_remote_replica(self, stage_id: int, input_addr: str) -> None:
+        """Shut down + remove the head-side client at ``input_addr``."""
+        pool = self.stage_pools[stage_id]
+        client = pool.remove_client(input_addr)
+        if client is None:
+            return
+        try:
+            client.shutdown()
+        except Exception:
+            logger.exception(
+                "[Orchestrator] failed to shutdown client for stage=%d addr=%s",
+                stage_id,
+                input_addr,
+            )
+        logger.info(
+            "[Orchestrator] detached remote replica stage=%d addr=%s",
+            stage_id,
+            input_addr,
+        )
+
     def _shutdown_stages(self) -> None:
         """Shutdown all stage pools."""
         if self._stages_shutdown:
             return
 
         self._stages_shutdown = True
-        total = sum(pool.num_replicas for pool in self.stage_pools)
+        total = sum(pool.live_num_replicas for pool in self.stage_pools)
         logger.info("[Orchestrator] Shutting down all %d client(s)", total)
         for pool in self.stage_pools:
-            for replica_id in range(pool.num_replicas):
+            for replica_id in pool.live_replica_ids():
                 pool.shutdown_replica(replica_id)
