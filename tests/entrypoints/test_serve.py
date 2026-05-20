@@ -325,7 +325,10 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
 
     run_headless(_make_headless_args(stage_id=1))
 
-    mock_inject.assert_called_once_with(stage_cfg, 1)
+    mock_inject.assert_called_once()
+    assert mock_inject.call_args.args[0] is stage_cfg
+    assert mock_inject.call_args.args[1] == 1
+    assert mock_inject.call_args.args[2] == [stage_cfg]
 
     reg_kwargs = mock_register.call_args.kwargs
     assert reg_kwargs["omni_master_address"] == "127.0.0.1"
