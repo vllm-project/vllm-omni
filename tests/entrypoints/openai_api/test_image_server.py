@@ -1349,8 +1349,16 @@ def test_image_edit_parameter_default(async_omni_test_client):
     engine = async_omni_test_client.app.state.engine_client
     captured_sampling_params = engine.captured_sampling_params_list[-1]
 
-    assert captured_sampling_params.width == 24
-    assert captured_sampling_params.height == 16
+    # size="auto" on multi-stage pipelines deliberately leaves the diffusion
+    # stages sampling_params width/height unset so AR-driven pipelines (e.g.
+    # HunyuanImage-3.0) can let ar2diffusion override the final bucket from
+    # the AR-predicted ratio token; see
+    # test_image_edits_size_auto_preserves_bridge_size for the contract.
+    # Single-stage diffusion (test_image_edit_parameter_default_single_stage)
+    # still pins width/height to the input image size via api_servers
+    # gen_params, which is unchanged.
+    assert captured_sampling_params.width is None
+    assert captured_sampling_params.height is None
     assert captured_sampling_params.num_outputs_per_prompt == 1
     assert captured_sampling_params.num_inference_steps == 4
     assert captured_sampling_params.guidance_scale == 7.5
@@ -1649,3 +1657,59 @@ def test_extract_images_from_result():
     assert len(images) == 1
     assert isinstance(images[0], Image.Image)
     assert images[0].size == (32, 32)
+
+
+def test_image_edits_size_auto_preserves_bridge_size(async_omni_stage_configs_only_client):
+    """size=auto must NOT pin the diffusion stage sampling_params.height/width.
+
+    Regression: prior to the fix, edit_images resolved size=auto to the
+    first input image dimensions and forwarded them through gen_params +
+    extra_body to the diffusion stages sampling_params. AR-driven
+    pipelines (e.g. HunyuanImage-3.0) rely on ar2diffusions
+    bridge to override the final bucket via the AR-predicted ratio token,
+    and the DiT pre_process_func only fills sampling_params from the
+    bridge value when sampling_params.width is None (see
+    pipeline_hunyuan_image3.py:290). Non-None width from the input image
+    silently suppressed the AR decision, producing the wrong bucket
+    (e.g. 1024x1024 square instead of the AR-decided 1280x720 landscape
+    for multi-image fusion).
+
+    Cross-pins the multi-image fix at the API level: 2 reference images
+    with bot_task=think must produce 2 <img> placeholders in the captured
+    AR prompt (build_prompt called with num_images=2).
+    """
+    img_a = make_test_image_bytes((32, 32))
+    img_b = make_test_image_bytes((128, 64))
+    response = async_omni_stage_configs_only_client.post(
+        "/v1/images/edits",
+        files=[("image", img_a), ("image", img_b)],
+        data={
+            "prompt": "fuse",
+            "size": "auto",
+            "bot_task": "think",
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    engine = async_omni_stage_configs_only_client.app.state.engine_client
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert len(captured) == 2
+
+    diffusion_params = captured[1]
+    assert diffusion_params.height is None, (
+        f"size=auto leaked into diffusion sampling_params.height={diffusion_params.height}; "
+        "must stay None so AR-driven pipelines can apply the bridges decision."
+    )
+    assert diffusion_params.width is None, (
+        f"size=auto leaked into diffusion sampling_params.width={diffusion_params.width}; "
+        "must stay None so AR-driven pipelines can apply the bridges decision."
+    )
+
+    KEY = "prompt"
+    IMG = "<img>"
+    captured_prompt = engine.captured_prompt
+    if isinstance(captured_prompt, dict) and isinstance(captured_prompt.get("prompt"), str):
+        assert captured_prompt["prompt"].count("<img>") == 2, (
+            f"N=2 reference images must emit 2 <img> placeholders in AR prompt; got {captured_prompt[KEY].count(IMG)} -- prompt: {captured_prompt[KEY]!r}"
+        )

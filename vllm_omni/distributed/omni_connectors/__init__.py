@@ -7,6 +7,13 @@ from .connectors.shm_connector import SharedMemoryConnector
 from .connectors.yuanrong_connector import YuanrongConnector
 
 try:
+    from vllm_omni.platforms.npu.omni_connectors.yuanrong_transfer_engine_connector import (
+        YuanrongTransferEngineConnector,
+    )
+except ImportError:
+    YuanrongTransferEngineConnector = None
+
+try:
     from .connectors.mooncake_transfer_engine_connector import MooncakeTransferEngineConnector
 except ImportError:
     MooncakeTransferEngineConnector = None  # RDMA deps (msgspec/zmq/mooncake) not installed
@@ -39,6 +46,7 @@ __all__ = [
     "MooncakeTransferEngineConnector",
     "SharedMemoryConnector",
     "YuanrongConnector",
+    "YuanrongTransferEngineConnector",
     # Utilities
     "load_omni_transfer_config",
     "initialize_connectors_from_config",

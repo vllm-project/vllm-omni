@@ -72,6 +72,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_fused_moe import HunyuanFusedMoE
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
@@ -471,8 +472,21 @@ class Resolution:
         return f"{self.h}x{self.w}"
 
 
+# Baked-in extras matching the official model's
+# `HunyuanImage3ImageProcessor.vae_reso_group` (image_processor.py:147-152).
+# These four aspect buckets sit at ratio_token indices 33-36 in the trained
+# model and the AR was trained to address them, so any deviation breaks the
+# ratio-token vocab → output-shape lookup.
+HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS: tuple[str, ...] = (
+    "1024x768",
+    "1280x720",
+    "768x1024",
+    "720x1280",
+)
+
+
 class ResolutionGroup:
-    def __init__(self, base_size=None, step=None, align=1):
+    def __init__(self, base_size=None, step=None, align=1, extra_resolutions=None):
         self.align = align
         self.base_size = base_size
         assert base_size % align == 0, f"base_size {base_size} is not divisible by align {align}"
@@ -485,6 +499,11 @@ class ResolutionGroup:
 
         self.step = step
         self.data = self._calc_by_step()
+
+        if extra_resolutions is not None:
+            for er in extra_resolutions:
+                if not any(r.ratio == er.ratio for r in self.data):
+                    self.data.append(er)
 
         self.ratio = np.array([x.ratio for x in self.data])
         self.attr = ["" for _ in range(len(self.data))]
@@ -850,7 +869,15 @@ class ImageKVCacheManager:
     Manages specialized caching and updating of KV-Cache for image tokens in multimodal models.
     """
 
-    def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int, scaling: float, image_token_len: int = 4097):
+    def __init__(
+        self,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        scaling: float,
+        image_token_len: int = 4097,
+        prefix: str = "",
+    ):
         """
         Args:
             image_token_len: Number of tokens per image (including special placeholders),
@@ -874,6 +901,7 @@ class ImageKVCacheManager:
             causal=False,
             softmax_scale=self.scaling,
             num_kv_heads=self.num_kv_heads,
+            prefix=f"{prefix}.attn" if prefix else "",
         )
 
     def _cache_prompt_kv(
@@ -1351,7 +1379,10 @@ class HunyuanImage3ImageProcessor:
     def __init__(self, config):
         self.config = config
 
-        self.reso_group = ResolutionGroup(base_size=config.image_base_size)
+        self.reso_group = ResolutionGroup(
+            base_size=config.image_base_size,
+            extra_resolutions=[Resolution(s) for s in HUNYUAN_IMAGE3_EXTRA_RESOLUTIONS],
+        )
         self.vae_processor = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -1629,6 +1660,7 @@ class HunYuanAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             scaling=self.scaling,
             image_token_len=4097,
+            prefix=f"{prefix}.image_attn",
         )
         self.image_rope2d_emb = HunYuanRotary2DEmbedder(
             num_heads=self.num_heads,
@@ -3000,6 +3032,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                set_forward_context_denoise_step_idx(i)
                 if cfg_parallel_ready:
                     # CFG parallel: each rank forwards its own branch (no batch doubling)
                     latent_model_input = latents
@@ -3087,6 +3120,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
                     progress_bar.update()
+
+        set_forward_context_denoise_step_idx(None)
 
         if hasattr(self.vae.config, "scaling_factor") and self.vae.config.scaling_factor:
             latents = latents / self.vae.config.scaling_factor
