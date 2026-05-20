@@ -159,54 +159,10 @@ def create_transformer_from_config(
     if "pos_embed_seq_len" in config:
         kwargs["pos_embed_seq_len"] = config["pos_embed_seq_len"]
 
-    # Auto-detect quantization from transformer's config.json when not explicitly provided.
-    # merge_mxfp8_checkpoint.py injects quantization_config into config.json so that
-    # offline quantized checkpoints are recognized here without a CLI flag.
     if "quantization_config" in config:
-        from vllm_omni.quantization.factory import build_quant_config
+        from vllm_omni.quantization.factory import resolve_quant_config_from_disk
 
-        disk_qc = config["quantization_config"]
-        if isinstance(disk_qc, dict) and "quant_method" in disk_qc:
-            qc_method = disk_qc["quant_method"]
-            qc_kwargs = {k: v for k, v in disk_qc.items() if k != "quant_method"}
-            if quant_config is None:
-                # No CLI flag: full auto-detection.
-                quant_config = build_quant_config(qc_method, **qc_kwargs)
-                logger.info(
-                    "Auto-detected quantization from transformer config.json: method=%s kwargs=%s",
-                    qc_method,
-                    qc_kwargs,
-                )
-            elif quant_config.get_name() != qc_method:
-                # The caller supplied a quant_config of a different method than
-                # what the checkpoint was built with. Loading serialized tensors
-                # (e.g. MXFP8 weight scales) with the wrong linear method would
-                # produce corrupt output or a shape mismatch crash.  Reject early
-                # so the user gets a clear message instead of a silent failure.
-                raise ValueError(
-                    f"Checkpoint config.json declares quant_method={qc_method!r} but the "
-                    f"active quantization config is {quant_config.get_name()!r}. "
-                    "Pass a matching --quantization flag or omit it for auto-detection."
-                )
-            elif (
-                qc_kwargs.get("is_checkpoint_mxfp8_serialized", False)
-                and hasattr(quant_config, "is_checkpoint_mxfp8_serialized")
-                and not quant_config.is_checkpoint_mxfp8_serialized
-            ):
-                # Same method: CLI provided online mode but config.json marks this
-                # as a pre-quantized offline checkpoint.  Switch to offline mode so
-                # users can pass --quantization mxfp8 without knowing the
-                # online/offline distinction.
-                quant_config = build_quant_config(qc_method, **qc_kwargs)
-                logger.info(
-                    "config.json marks checkpoint as serialized; switching from online to offline MXFP8 mode.",
-                )
-        elif isinstance(disk_qc, str) and quant_config is None:
-            quant_config = build_quant_config(disk_qc)
-            logger.info(
-                "Auto-detected quantization from transformer config.json: method=%s",
-                disk_qc,
-            )
+        quant_config = resolve_quant_config_from_disk(quant_config, config["quantization_config"])
 
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
