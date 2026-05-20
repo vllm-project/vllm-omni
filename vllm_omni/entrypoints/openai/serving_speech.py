@@ -1787,6 +1787,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self,
         request: OpenAICreateSpeechRequest,
         ref_audio_data: tuple[list[float], int] | None = None,
+        *,
+        has_inline_ref_audio: bool = False,
     ) -> dict[str, Any]:
         """Build prompt for Fish Speech S2 Pro.
 
@@ -1838,7 +1840,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Pass voice identity for model-side DAC code caching.
         if request.voice is not None:
             voice_lower = request.voice.lower()
-            if voice_lower in self.uploaded_speakers:
+            if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
                 additional_information["voice_name"] = voice_lower
                 additional_information["voice_created_at"] = self._voice_created_at(voice_lower)
         if request.max_new_tokens is not None:
@@ -1852,6 +1854,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     async def _build_cosyvoice3_prompt(
         self,
         request: OpenAICreateSpeechRequest,
+        *,
+        has_inline_ref_audio: bool = False,
     ) -> dict[str, Any]:
         """Build prompt for CosyVoice3.
 
@@ -1870,8 +1874,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Pass voice metadata for caching in the processor
         if request.voice:
             voice_lower = request.voice.lower()
-            mm_kwargs["voice_name"] = voice_lower
-            mm_kwargs["voice_created_at"] = self._voice_created_at(voice_lower)
+            if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
+                mm_kwargs["voice_name"] = voice_lower
+                mm_kwargs["voice_created_at"] = self._voice_created_at(voice_lower)
 
         return {
             "prompt": request.input,
@@ -2020,6 +2025,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Resolve uploaded voice for non-Qwen3 models.
         # Qwen3 TTS has its own uploaded voice handling in _build_tts_params().
+        has_inline_ref_audio = request.ref_audio is not None
         if self._tts_model_type in ("fish_tts", "cosyvoice3", "moss_tts_nano"):
             err = self._apply_uploaded_speaker(request)
             if err:
@@ -2033,7 +2039,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.ref_audio is not None:
                 wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
                 ref_audio_data = (wav_list, sr)
-            prompt = await self._build_fish_speech_prompt_async(request, ref_audio_data=ref_audio_data)
+            prompt = await self._build_fish_speech_prompt_async(
+                request, ref_audio_data=ref_audio_data, has_inline_ref_audio=has_inline_ref_audio
+            )
             tts_params = {}
         elif self._tts_model_type == "omnivoice":
             if not request.input or not request.input.strip():
@@ -2050,8 +2058,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt["ref_text"] = request.ref_text
             if request.voice:
                 voice_lower = request.voice.lower()
-                prompt["voice_name"] = voice_lower
-                prompt["voice_created_at"] = self._voice_created_at(voice_lower)
+                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
+                    prompt["voice_name"] = voice_lower
+                    prompt["voice_created_at"] = self._voice_created_at(voice_lower)
             if request.language:
                 prompt["lang"] = request.language
             if request.instructions:
@@ -2068,7 +2077,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if voice_lower not in self.uploaded_speakers and voice_lower not in self.supported_speakers:
                     all_voices = sorted(self.uploaded_speakers.keys() | self.supported_speakers)
                     raise ValueError(f"Invalid voice '{request.voice}'. Supported: {', '.join(all_voices) or 'none'}")
-                if voice_lower in self.uploaded_speakers:
+                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
                     if self.uploaded_speakers[voice_lower].get("embedding_source") == "direct":
                         raise ValueError(
                             f"Uploaded voice '{request.voice}' uses a speaker embedding (Qwen3-only). "
@@ -2080,9 +2089,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params = {}
             if request.voice:
                 voice_lower = request.voice.lower()
-                additional = prompt.setdefault("additional_information", {})
-                additional["voice_name"] = voice_lower
-                additional["voice_created_at"] = self._voice_created_at(voice_lower)
+                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
+                    additional = prompt.setdefault("additional_information", {})
+                    additional["voice_name"] = voice_lower
+                    additional["voice_created_at"] = self._voice_created_at(voice_lower)
         elif self._is_tts:
             validation_error = self._validate_tts_request(request)
             if validation_error:
@@ -2092,7 +2102,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt = await self._build_voxtral_prompt_async(request)
                 tts_params = {}
             elif self._tts_model_type == "cosyvoice3":
-                prompt = await self._build_cosyvoice3_prompt(request)
+                prompt = await self._build_cosyvoice3_prompt(request, has_inline_ref_audio=has_inline_ref_audio)
                 tts_params = {}
             elif self._tts_model_type == "ming_flash_omni_tts":
                 prompt = self._build_ming_prompt(request)
@@ -2101,8 +2111,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 tts_params = await self._build_moss_tts_params(request)
                 if request.voice:
                     voice_lower = request.voice.lower()
-                    tts_params["voice_name"] = [voice_lower]
-                    tts_params["voice_created_at"] = [self._voice_created_at(voice_lower)]
+                    if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
+                        tts_params["voice_name"] = [voice_lower]
+                        tts_params["voice_created_at"] = [self._voice_created_at(voice_lower)]
                 # Propagate seed from sampling params for deterministic generation.
                 # MOSS-TTS-Nano uses its own internal sampling inside
                 # inference_stream(), which reads seed from additional_information
@@ -2375,6 +2386,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     all_voices = sorted(self.uploaded_speakers.keys() | self.supported_speakers)
                     raise ValueError(f"Invalid voice '{request.voice}'. Supported: {', '.join(all_voices) or 'none'}")
 
+            has_inline_ref_audio = request.ref_audio is not None
             err = self._apply_uploaded_speaker(request)
             if err:
                 raise ValueError(err)
@@ -2388,8 +2400,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 prompt["ref_text"] = request.ref_text
             if request.voice:
                 voice_lower = request.voice.lower()
-                prompt["voice_name"] = voice_lower
-                prompt["voice_created_at"] = self._voice_created_at(voice_lower)
+                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
+                    prompt["voice_name"] = voice_lower
+                    prompt["voice_created_at"] = self._voice_created_at(voice_lower)
             if request.language:
                 prompt["lang"] = request.language
             if request.instructions:
