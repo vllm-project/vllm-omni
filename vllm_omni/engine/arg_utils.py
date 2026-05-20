@@ -42,7 +42,6 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
         from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
         from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
-        from vllm_omni.transformers_utils.configs.voxcpm import VoxCPMConfig
         from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
@@ -61,7 +60,6 @@ def _register_omni_hf_configs() -> None:
         ("cosyvoice3", CosyVoice3Config),
         ("glm_tts", GLMTTSConfig),
         ("omnivoice", OmniVoiceConfig),
-        ("voxcpm", VoxCPMConfig),
         ("voxcpm2", VoxCPM2Config),
     ]:
         try:
