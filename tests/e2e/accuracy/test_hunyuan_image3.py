@@ -23,18 +23,31 @@ from tests.e2e.accuracy.helpers import (
     download_images,
     model_output_dir,
 )
-from tests.helpers.runtime import OmniRunner
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.hunyuan_image3.prompt_utils import build_prompt_tokens, resolve_stop_token_ids
 
 os.environ["DIFFUSION_ATTENTION_BACKEND"] = "TORCH_SDPA"
 
-pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "H100"}, num_cards=8)]
 
 # ============================================================================
 # Configurable Parameters
 # ============================================================================
-AR_DEVICES = "0,1"
-DIT_DEVICES = "2,3"
+# Comma-separated logical CUDA device ids per stage: split visible GPUs (0..n-1), first half -> AR, second -> DiT.
+
+
+def _default_ar_dit_devices() -> tuple[str, str]:
+    """First floor(n/2) logical devices -> AR, rest -> DiT. ``device_count`` respects ``CUDA_VISIBLE_DEVICES``."""
+    n = torch.accelerator.device_count()
+    if n < 2:
+        return "0,1", "2,3"
+    split = n // 2
+    ar = ",".join(str(i) for i in range(split))
+    dit = ",".join(str(i) for i in range(split, n))
+    return ar, dit
+
+
+AR_DEVICES, DIT_DEVICES = _default_ar_dit_devices()
 MODEL_NAME = "tencent/HunyuanImage-3.0-Instruct"
 NUM_INFERENCE_STEPS = 50
 GUIDANCE_SCALE = 2.5
@@ -75,7 +88,7 @@ _BASE_CONFIG = {
                 "scheduler_cls": "vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler",
                 "gpu_memory_utilization": 0.95, "enforce_eager": True, "trust_remote_code": True,
                 "engine_output_type": "latent", "enable_prefix_caching": False,
-                "max_num_batched_tokens": 32768, "tensor_parallel_size": 2, "pipeline_parallel_size": 1,
+                "max_num_batched_tokens": 32768, "tensor_parallel_size": AR_TP_SIZE, "pipeline_parallel_size": 1,
                 "hf_overrides": {"rope_parameters": {"mrope_section": [0, 32, 32], "rope_type": "default"}},
             },
             "is_comprehension": False, "final_output": True, "final_output_type": "text",
@@ -91,7 +104,7 @@ _BASE_CONFIG = {
             "engine_args": {
                 "model_stage": "dit", "model_arch": "HunyuanImage3ForCausalMM",
                 "enforce_eager": True, "trust_remote_code": True, "distributed_executor_backend": "mp",
-                "parallel_config": {"tensor_parallel_size": 2, "enable_expert_parallel": True},
+                "parallel_config": {"tensor_parallel_size": DIT_TP_SIZE, "enable_expert_parallel": True},
             },
             "engine_input_source": [0],
             "custom_process_input_func": "vllm_omni.model_executor.stage_input_processors.hunyuan_image3.ar2diffusion",
@@ -134,12 +147,13 @@ def _make_config(enable_kv_reuse: bool, path: Path) -> None:
 def _run_offline(stage_configs_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
     from transformers import AutoTokenizer
 
+    from tests.helpers.runtime import OmniRunner
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
     from vllm_omni.platforms import current_omni_platform
 
     build_kwargs: dict = {"task": "it2i", "bot_task": "think_recaption", "sys_type": "en_unified", "num_images": 2}
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
     result = build_prompt_tokens(
         PROMPT,
         tokenizer,
@@ -149,7 +163,7 @@ def _run_offline(stage_configs_path: str, output_path: Path) -> tuple[Image.Imag
     system_prompt_type = result.system_prompt_type
 
     ar_stop_token_ids = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=tokenizer)
-    with OmniRunner(MODEL_NAME, stage_configs_path=stage_configs_path) as runner:
+    with OmniRunner(MODEL_PATH, stage_configs_path=stage_configs_path) as runner:
         params_list = list(runner.omni.default_sampling_params_list)
         for sp in params_list:
             if isinstance(sp, OmniDiffusionSamplingParams):
@@ -206,7 +220,10 @@ def _run_offline(stage_configs_path: str, output_path: Path) -> tuple[Image.Imag
     return image, cot_text, elapsed
 
 
-@pytest.mark.skipif(torch.accelerator.device_count() < 4, reason="Needs 4+ GPUs (2 AR + 2 DiT)")
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < AR_TP_SIZE + DIT_TP_SIZE,
+    reason=f"Needs {AR_TP_SIZE + DIT_TP_SIZE}+ GPUs ({AR_TP_SIZE} AR + {DIT_TP_SIZE} DiT)",
+)
 def test_image_to_image_alignment(accuracy_artifact_root: Path, accuracy_assets_root: Path) -> None:
     if importlib.util.find_spec("FlagEmbedding") is None:
         raise ImportError("Missing dependency: FlagEmbedding\nInstall with: pip install FlagEmbedding")
