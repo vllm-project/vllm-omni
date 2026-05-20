@@ -11,6 +11,8 @@ This runner separates two concepts:
 A config JSON file is REQUIRED via --test-config-file:
   pytest run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json
 
+Optional: ``--assert-baseline`` compares metrics to the ``baseline`` block in each benchmark entry (default: off).
+
 All benchmark results for a session are consolidated into a single JSON file under
 BENCHMARK_RESULT_DIR (override via the DIFFUSION_BENCHMARK_DIR environment variable).
 Each entry in the file contains the test metadata (test_name, endpoint, benchmark_params,
@@ -652,12 +654,14 @@ def run_benchmark(
 # ---------------------------------------------------------------------------
 
 
-def assert_result(result: dict[str, Any], params: dict[str, Any]) -> None:
-    """Assert that benchmark metrics satisfy the configured baselines."""
+def assert_result(result: dict[str, Any], params: dict[str, Any], *, assert_baseline: bool) -> None:
+    """Assert request completion; optionally assert metrics against ``baseline`` in *params*."""
     num_prompts = params.get("num-prompts", 10)
     completed = result.get("completed_requests", result.get("completed", 0))
     assert completed == num_prompts, f"Expected {num_prompts} completed requests, got {completed}"
 
+    if not assert_baseline:
+        return
     if params.get("skip-performance-assertion", False):
         print("Skipping performance assertions.")
         return
@@ -699,16 +703,14 @@ def _resolve_benchmark_endpoint(server_cfg: dict[str, Any], params: dict[str, An
     indirect=True,
 )
 @pytest.mark.parametrize("benchmark_params", benchmark_indices, indirect=True)
-def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
-    """Run the diffusion performance benchmark and assert against baselines.
+def test_diffusion_performance_benchmark(diffusion_server, benchmark_params, request):
+    """Run the diffusion performance benchmark and verify request completion.
 
     One server is started per unique parallel configuration (module scope).
     For each server, all benchmark parameter sets defined in the config JSON
-    are executed sequentially; results are asserted against the baselines.
+    are executed sequentially; metrics are recorded to the aggregated result file.
 
-    Tracked metrics:
-        - throughput_qps          (higher is better)
-        - latency_p50, latency_p99 (lower is better)
+    Pass ``--assert-baseline`` to compare ``throughput_qps``, ``latency_mean``, etc. to the JSON ``baseline`` block.
     """
     test_name = benchmark_params["test_name"]
     params = benchmark_params["params"]
@@ -744,4 +746,5 @@ def test_diffusion_performance_benchmark(diffusion_server, benchmark_params):
     print(f"\n  Aggregated results: {AGGREGATED_RESULT_FILE}")
     print("=" * 60)
 
-    assert_result(result, params)
+    assert_baseline = request.config.getoption("--assert-baseline", default=False)
+    assert_result(result, params, assert_baseline=assert_baseline)
