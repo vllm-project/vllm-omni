@@ -1,4 +1,6 @@
-# Ming-flash-omni 2.0 for omni-speech chat and standalone TTS
+# Ming-flash-omni 2.0
+
+> Online serving for multimodal chat + standalone TTS
 
 ## Summary
 

@@ -36,6 +36,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
 _ASSERTION_EXPORT_NAMES = (
     "assert_audio_speech_response",
     "assert_diffusion_response",
+    "assert_http_error",
     "assert_image_diffusion_response",
     "assert_image_valid",
     "assert_omni_response",
@@ -54,6 +55,7 @@ _MEDIA_EXPORT_NAMES = (
 _STAGE_CONFIG_EXPORT_NAMES = ("modify_stage_config",)
 _RUNTIME_EXPORT_NAMES = (
     "DiffusionResponse",
+    "HttpResponse",
     "OmniResponse",
     "OmniRunner",
     "OmniRunnerHandler",

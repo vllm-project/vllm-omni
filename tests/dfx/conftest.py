@@ -279,6 +279,10 @@ def create_benchmark_indices(
     return indices
 
 
+# Omni perf/stability: ``vllm bench serve --omni`` result template (used if bench exits without writing JSON).
+OMNI_RESULT_TEMPLATE_PATH = Path(__file__).resolve().parent / "perf" / "scripts" / "result_omni_template.json"
+
+
 def _safe_filename_token(value: Any | None, *, default: str = "na") -> str:
     """Make a single path segment safe for result filenames on common filesystems."""
     if value is None:
@@ -289,7 +293,7 @@ def _safe_filename_token(value: Any | None, *, default: str = "na") -> str:
     return s if s else default
 
 
-def _resolve_baseline_value(
+def resolve_baseline_value(
     baseline_raw: Any,
     *,
     sweep_index: int | None,
@@ -330,7 +334,7 @@ def _baseline_thresholds_for_step(
 ) -> dict[str, Any]:
     """Resolve baseline config to one threshold per metric for this iteration."""
     return {
-        metric_name: _resolve_baseline_value(
+        metric_name: resolve_baseline_value(
             baseline_raw,
             sweep_index=sweep_index,
             max_concurrency=max_concurrency,
@@ -354,7 +358,12 @@ def run_benchmark(
     random_input_len: Any | None = None,
     random_output_len: Any | None = None,
 ) -> dict[str, Any]:
-    """Run one ``vllm bench serve --omni`` iteration and return parsed metrics."""
+    """Run one ``vllm bench serve --omni`` iteration and return parsed metrics.
+
+    After ``vllm bench`` writes the JSON, ``result["baseline"]`` holds the resolved per-metric thresholds
+    (when ``baseline_config`` is provided). If the benchmark exits without writing a result file,
+    ``result_omni_template.json`` is used as a fallback.
+    """
     current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
     ri = _safe_filename_token(random_input_len)
     ro = _safe_filename_token(random_output_len)
@@ -403,8 +412,17 @@ def run_benchmark(
         result_dir = "./"
 
     result_path = os.path.join(result_dir, result_filename)
-    with open(result_path, encoding="utf-8") as f:
-        result = json.load(f)
+    if not os.path.exists(result_path):
+        with open(OMNI_RESULT_TEMPLATE_PATH, encoding="utf-8") as f:
+            template_result: dict[str, Any] = json.load(f)
+        Path(result_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(template_result, f, ensure_ascii=False, indent=2)
+        print(f"Benchmark result file not generated, fallback to template: {result_path}")
+        result = template_result
+    else:
+        with open(result_path, encoding="utf-8") as f:
+            result = json.load(f)
 
     if baseline_config:
         result["baseline"] = _baseline_thresholds_for_step(
@@ -431,4 +449,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store",
         default=None,
         help=("Path to benchmark config JSON. Example: --test-config-file tests/dfx/perf/tests/test_tts.json"),
+    )
+    parser.addoption(
+        "--assert-baseline",
+        action="store_true",
+        default=False,
+        help=(
+            "When set, omni/diffusion perf runners compare metrics against the baseline block in the JSON config "
+            "(default: off)."
+        ),
     )

@@ -1,4 +1,6 @@
-# SenseNova-U1 for unified image generation and understanding
+# SenseNova-U1
+
+> Unified image generation and understanding
 
 ## Summary
 

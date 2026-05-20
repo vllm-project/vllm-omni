@@ -199,37 +199,53 @@ def test_send_single_request_cleans_up_after_finished_payload(build_adapter, mon
     assert args[1] == "ext-finished"
 
 
-def test_update_request_payload(build_adapter):
-    adapter, _ = build_adapter()
-
-    first: OmniPayload = {
+def test_load_poll_non_ar_merges_into_existing_additional_information(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="diffusion")
+    request = _req("req-non-ar", RequestStatus.WAITING, external_req_id="ext-non-ar")
+    request.additional_information = {
         "hidden_states": {"output": torch.tensor([[1.0]])},
-        "codes": {"audio": [1]},
-        "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
+        "ids": {"prompt": [11, 12]},
+        "meta": {"finished": torch.tensor(False, dtype=torch.bool), "step": 1},
     }
-    adapter._update_request_payload("ext", first)
-    second: OmniPayload = {
-        "hidden_states": {"output": torch.tensor([[2.0]])},
-        "codes": {"audio": [2]},
-        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
-    }
-    merged = adapter._update_request_payload("ext", second)
+    request.num_computed_tokens = 9
 
-    assert torch.equal(merged["hidden_states"]["output"], torch.tensor([[1.0], [2.0]]))
-    assert merged["codes"]["audio"] == [1, 2]
-    assert merged["meta"]["finished"].item() is True
+    payload: OmniPayload = {
+        "hidden_states": {"output": torch.tensor([[2.0]])},
+        "ids": {"all": [21, 22]},
+        "codes": {"audio": torch.tensor([7, 8], dtype=torch.long)},
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool), "phase": "decode"},
+        "kv_metadata": {"foo": "bar"},
+    }
+    connector.get.return_value = (payload, 8)
+
+    assert adapter._poll_single_request(request) is True
+
+    assert request.prompt_token_ids == [7, 8]
+    assert request.num_computed_tokens == 0
+    assert torch.equal(
+        request.additional_information["hidden_states"]["output"],
+        torch.tensor([[2.0]]),
+    )
+    assert request.additional_information["ids"]["prompt"] == [11, 12]
+    assert request.additional_information["ids"]["all"] == [21, 22]
+    # non-ar merge path intentionally doesn't overwrite meta.finished.
+    assert request.additional_information["meta"]["finished"].item() is False
+    assert request.additional_information["meta"]["phase"] == "decode"
+    assert request.additional_information["kv_metadata"] == {"foo": "bar"}
+    assert "req-non-ar" in adapter._finished_load_reqs
+    assert "req-non-ar" in adapter.finished_requests
 
 
 def test_load_poll_ar_request_additional_information_concats_tensors(build_adapter):
     adapter, connector = build_adapter(stage_id=2, model_mode="ar")
     request = _req("req-merged", RequestStatus.WAITING, external_req_id="ext-merged")
-
-    adapter.request_ids_mapping["req-merged"] = "ext-merged"
-    adapter.request_payload["ext-merged"] = {
+    request.additional_information = {
         "hidden_states": {"output": torch.tensor([[1.0]])},
         "ids": {"prompt": [11, 12]},
         "meta": {"finished": torch.tensor(False, dtype=torch.bool)},
     }
+
+    adapter.request_ids_mapping["req-merged"] = "ext-merged"
     payload: OmniPayload = {
         "hidden_states": {"output": torch.tensor([[2.0]])},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
@@ -238,12 +254,8 @@ def test_load_poll_ar_request_additional_information_concats_tensors(build_adapt
 
     adapter._poll_single_request(request)
 
-    assert torch.equal(
-        request.additional_information["hidden_states"]["output"],
-        torch.tensor([[1.0], [2.0]]),
-    )
-    # Keys absent from the new chunk are dropped (matches main's behavior).
-    assert "ids" not in request.additional_information
+    # AR mode now forwards the latest payload directly.
+    assert request.additional_information == payload
     assert request.additional_information["meta"]["finished"].item() is True
 
 
@@ -528,6 +540,7 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
         kv_connector_output=None,
         cudagraph_stats=None,
         req_id_to_index={"req-s1": 0},
+        routed_experts_dict=None,
     )
 
     OmniGenerationScheduler.update_from_output(scheduler, scheduler_output, model_runner_output)
@@ -613,6 +626,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
         cudagraph_stats=None,
         req_id_to_index={"req-ar": 0},
         kv_extracted_req_ids=None,
+        routed_experts_dict=None,
     )
 
     OmniARScheduler.update_from_output(scheduler, scheduler_output, model_runner_output)
@@ -686,3 +700,232 @@ def test_wire_round_trip_struct_to_dict_contract():
     assert set(decoded.keys()) == set(expected.keys())
     assert set(decoded["meta"].keys()) == set(expected["meta"].keys())
     assert set(decoded["codes"].keys()) == set(expected["codes"].keys())
+
+
+# ---------------------------------------------------------------
+# Deferred finish for upstream-completed requests
+# ---------------------------------------------------------------
+
+
+def _build_deferred_finish_scheduler(mocker, *, running, pending_finish_reqs):
+    """Build a mock scheduler with requests queued for deferred finish."""
+    adapter_mock = mocker.MagicMock()
+    adapter_mock.finished_requests = {r.request_id for r in pending_finish_reqs}
+    cleanup_calls = []
+    adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
+
+    scheduler = mocker.MagicMock()
+    scheduler.chunk_transfer_adapter = adapter_mock
+    scheduler.connector = None
+    scheduler.ec_connector = None
+    scheduler.perf_metrics = None
+    scheduler.log_stats = False
+    scheduler.recompute_kv_load_failures = False
+    scheduler.structured_output_manager = mocker.MagicMock()
+    scheduler.structured_output_manager.should_advance.return_value = False
+    scheduler.finished_req_ids_dict = {}
+    scheduler.kv_cache_manager.take_events.return_value = None
+    scheduler.kv_event_publisher = mocker.MagicMock()
+    scheduler._pending_finish_reqs = list(pending_finish_reqs)
+
+    scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
+    scheduler._free_request = mocker.MagicMock(return_value=None)
+    scheduler._get_routed_experts = mocker.MagicMock(return_value=None)
+    scheduler.running = list(running)
+    scheduler.waiting = mocker.MagicMock()
+    scheduler.waiting.remove_requests = mocker.MagicMock()
+    scheduler.make_stats = mocker.MagicMock(return_value=None)
+    scheduler.requests = {r.request_id: r for r in running}
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+    )
+    model_runner_output = SimpleNamespace(
+        sampled_token_ids=None,
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=None,
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        req_id_to_index={},
+    )
+    return scheduler, scheduler_output, model_runner_output, cleanup_calls
+
+
+def test_deferred_finish_emits_finished_output(mocker: MockerFixture):
+    """A request whose upstream completed with no remaining tokens should
+    emit a FINISHED EngineCoreOutput, free resources, and clean up adapter state."""
+    from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+
+    request = _HashableRequest(
+        request_id="req-df1",
+        external_req_id="ext-df1",
+        status=RequestStatus.RUNNING,
+        is_finished=lambda: False,
+        num_computed_tokens=16,
+        num_prompt_tokens=16,
+        prompt_token_ids=list(range(1, 17)),
+        num_output_placeholders=0,
+        sampling_params=None,
+        pooling_params=None,
+        stop_reason=None,
+        client_index=0,
+        take_events=lambda: [],
+        trace_headers=None,
+        has_encoder_inputs=False,
+        take_prefill_stats=lambda: None,
+        num_nans_in_logits=0,
+        get_finished_reason=lambda: "stop",
+    )
+    scheduler, sched_out, model_out, cleanup_calls = _build_deferred_finish_scheduler(
+        mocker,
+        running=[request],
+        pending_finish_reqs=[request],
+    )
+    scheduler._free_request.return_value = {"mock": "kv_params"}
+
+    result = OmniGenerationScheduler.update_from_output(scheduler, sched_out, model_out)
+
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    scheduler._handle_stopped_request.assert_called_once_with(request)
+    scheduler._free_request.assert_called_once_with(request)
+    assert len(cleanup_calls) == 1
+    assert cleanup_calls[0][0] == ("req-df1", "ext-df1")
+
+    eco = result[0]
+    assert len(eco.outputs) == 1
+    assert eco.outputs[0].request_id == "req-df1"
+    assert eco.outputs[0].finish_reason == "stop"
+    assert eco.outputs[0].kv_transfer_params == {"mock": "kv_params"}
+    assert scheduler._pending_finish_reqs == []
+
+
+def test_deferred_finish_empty_prompt(mocker: MockerFixture):
+    """A request that never received any tokens (finished immediately upstream)
+    should still emit a FINISHED output and clean up."""
+    from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+
+    request = _HashableRequest(
+        request_id="req-df2",
+        external_req_id="ext-df2",
+        status=RequestStatus.WAITING,
+        is_finished=lambda: False,
+        num_computed_tokens=0,
+        num_prompt_tokens=0,
+        prompt_token_ids=[],
+        num_output_placeholders=0,
+        sampling_params=None,
+        pooling_params=None,
+        stop_reason=None,
+        client_index=0,
+        take_events=lambda: [],
+        trace_headers=None,
+        has_encoder_inputs=False,
+        take_prefill_stats=lambda: None,
+        num_nans_in_logits=0,
+        get_finished_reason=lambda: "stop",
+    )
+    scheduler, sched_out, model_out, cleanup_calls = _build_deferred_finish_scheduler(
+        mocker,
+        running=[],
+        pending_finish_reqs=[request],
+    )
+
+    result = OmniGenerationScheduler.update_from_output(scheduler, sched_out, model_out)
+
+    assert request.status == RequestStatus.FINISHED_STOPPED
+    scheduler._free_request.assert_called_once_with(request)
+    assert len(cleanup_calls) == 1
+    eco = result[0]
+    assert len(eco.outputs) == 1
+    assert eco.outputs[0].finish_reason == "stop"
+    assert scheduler._pending_finish_reqs == []
+
+
+def test_deferred_finish_skips_already_finished(mocker: MockerFixture):
+    """A request that was aborted between schedule() and update_from_output()
+    should be skipped without emitting output or freeing resources twice."""
+    from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+
+    request = _HashableRequest(
+        request_id="req-df3",
+        external_req_id="ext-df3",
+        status=RequestStatus.FINISHED_ABORTED,
+        is_finished=lambda: True,
+        num_computed_tokens=0,
+        num_prompt_tokens=0,
+        prompt_token_ids=[],
+        num_output_placeholders=0,
+        sampling_params=None,
+        pooling_params=None,
+        stop_reason=None,
+        client_index=0,
+        take_events=lambda: [],
+        trace_headers=None,
+        has_encoder_inputs=False,
+        take_prefill_stats=lambda: None,
+        num_nans_in_logits=0,
+        get_finished_reason=lambda: "stop",
+    )
+    scheduler, sched_out, model_out, cleanup_calls = _build_deferred_finish_scheduler(
+        mocker,
+        running=[],
+        pending_finish_reqs=[request],
+    )
+
+    result = OmniGenerationScheduler.update_from_output(scheduler, sched_out, model_out)
+
+    scheduler._handle_stopped_request.assert_not_called()
+    scheduler._free_request.assert_not_called()
+    assert len(cleanup_calls) == 0
+    assert 0 not in result
+    assert scheduler._pending_finish_reqs == []
+
+
+def test_deferred_finish_not_finished_still_emits_output(mocker: MockerFixture):
+    """When _handle_stopped_request returns False (resumable request), the
+    output must still be emitted so the client stream doesn't hang."""
+    from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+
+    request = _HashableRequest(
+        request_id="req-df4",
+        external_req_id="ext-df4",
+        status=RequestStatus.RUNNING,
+        is_finished=lambda: False,
+        num_computed_tokens=16,
+        num_prompt_tokens=16,
+        prompt_token_ids=list(range(1, 17)),
+        num_output_placeholders=0,
+        sampling_params=None,
+        pooling_params=None,
+        stop_reason=None,
+        client_index=0,
+        take_events=lambda: [],
+        trace_headers=None,
+        has_encoder_inputs=False,
+        take_prefill_stats=lambda: None,
+        num_nans_in_logits=0,
+        get_finished_reason=lambda: "stop",
+    )
+    scheduler, sched_out, model_out, cleanup_calls = _build_deferred_finish_scheduler(
+        mocker,
+        running=[request],
+        pending_finish_reqs=[request],
+    )
+    scheduler._handle_stopped_request.return_value = False
+
+    result = OmniGenerationScheduler.update_from_output(scheduler, sched_out, model_out)
+
+    scheduler._handle_stopped_request.assert_called_once_with(request)
+    scheduler._free_request.assert_not_called()
+    assert len(cleanup_calls) == 0
+
+    eco = result[0]
+    assert len(eco.outputs) == 1
+    assert eco.outputs[0].request_id == "req-df4"
+    assert eco.outputs[0].finish_reason == "stop"
+    assert eco.outputs[0].kv_transfer_params is None
+    assert scheduler._pending_finish_reqs == []

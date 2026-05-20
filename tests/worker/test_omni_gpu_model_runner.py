@@ -83,6 +83,7 @@ class CaptureTalkerMTP(torch.nn.Module):
     ):
         self.calls.append(
             {
+                "batch_size": int(req_embeds.shape[0]),
                 "do_sample": do_sample,
                 "temperature": temperature,
                 "top_k": top_k,
@@ -266,6 +267,7 @@ def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker
 
     assert runner.talker_mtp.calls == [
         {
+            "batch_size": 1,
             "do_sample": False,
             "temperature": 0.2,
             "top_k": 9,
@@ -274,6 +276,45 @@ def test_talker_mtp_forward_passes_qwen3_tts_subtalker_sampling_params_to_talker
         }
     ]
     assert runner.talker_mtp.calls[0]["generator"] is not None
+
+
+def test_talker_mtp_forward_keeps_explicit_seeded_requests_scalar(monkeypatch):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod, "set_forward_context", _noop_forward_context)
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    runner.requests["r1"].sampling_params = SimpleNamespace(
+        seed=11,
+        extra_args={"qwen3_tts_request_seed": 11},
+    )
+    runner.requests["r2"].sampling_params = SimpleNamespace(
+        seed=22,
+        extra_args={"qwen3_tts_request_seed": 22},
+    )
+    runner.talker_mtp = CaptureTalkerMTP()
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(subtalker_sampling_params={}))
+
+    def fake_determine(self, num_tokens, num_reqs, num_scheduled_tokens_np, max_num_scheduled_tokens, use_cascade_attn):
+        batch_desc = SimpleNamespace(num_tokens=int(num_tokens))
+        return (False, batch_desc, None, None, None)
+
+    monkeypatch.setattr(runner, "_determine_batch_execution_and_padding", fake_determine.__get__(runner, type(runner)))
+
+    runner.talker_mtp_input_ids.gpu[:] = torch.tensor([101, 202], dtype=torch.int64)
+    runner.talker_mtp_inputs_embeds.gpu[0] = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    runner.talker_mtp_inputs_embeds.gpu[1] = torch.tensor([10.0, 20.0, 30.0, 40.0])
+    saved_input_ids = runner.talker_mtp_input_ids.gpu.clone()
+    saved_embeds = runner.talker_mtp_inputs_embeds.gpu.clone()
+
+    inputs_embeds = torch.zeros((6, 4), dtype=torch.float32)
+    OmniGPUModelRunner._talker_mtp_forward(runner, ["r1", "r2"], inputs_embeds)
+
+    assert [call["batch_size"] for call in runner.talker_mtp.calls] == [1, 1]
+    assert all(call["generator"] is not None for call in runner.talker_mtp.calls)
+    assert runner.talker_mtp.calls[0]["generator"] is not runner.talker_mtp.calls[1]["generator"]
+    assert torch.equal(runner.talker_mtp_input_ids.gpu, saved_input_ids)
+    assert torch.equal(runner.talker_mtp_inputs_embeds.gpu, saved_embeds)
 
 
 def test_update_intermediate_buffer_writes_to_buffer_and_setattr(monkeypatch):
@@ -329,6 +370,30 @@ def test_update_intermediate_buffer_skips_unknown_req_id():
     OmniGPUModelRunner._update_intermediate_buffer(runner, "unknown_req", {"key": torch.tensor([1.0])})
 
     assert "unknown_req" not in runner.model_intermediate_buffer
+
+
+def test_maybe_run_batch_preprocess_calls_model_hook():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model_intermediate_buffer = {"r1": {"text": ["hello"]}}
+    calls = []
+
+    class DummyModel:
+        def preprocess_batch(self, *, req_ids, model_intermediate_buffer, device):
+            calls.append((req_ids, model_intermediate_buffer, device))
+
+    runner.model = DummyModel()
+
+    OmniGPUModelRunner._maybe_run_batch_preprocess(runner, ["r1"], torch.device("cpu"))
+
+    assert calls == [(["r1"], runner.model_intermediate_buffer, torch.device("cpu"))]
+
+
+def test_maybe_run_batch_preprocess_skips_missing_hook():
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model_intermediate_buffer = {}
+    runner.model = object()
+
+    OmniGPUModelRunner._maybe_run_batch_preprocess(runner, ["r1"], torch.device("cpu"))
 
 
 def _make_full_payload_accumulation_runner(
