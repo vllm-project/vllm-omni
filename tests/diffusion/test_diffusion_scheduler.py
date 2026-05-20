@@ -452,6 +452,7 @@ class TestDiffusionEngine:
     @pytest.mark.asyncio
     async def test_step_refreshes_canonical_prompts_after_preprocess(self, mocker: MockerFixture) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine._closed = False
         engine._loop_started = True
         engine.pre_process_func = lambda request: request
         engine.async_add_req_and_wait_for_response = mocker.AsyncMock(return_value=DiffusionOutput(output=None))
