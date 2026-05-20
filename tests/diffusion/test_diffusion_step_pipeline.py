@@ -285,6 +285,19 @@ def _make_scheduler_output(req, sched_req_id="req-1", step_id=0, finished_req_id
     )
 
 
+def _make_batch_scheduler_output(reqs, *, step_id=0, finished_req_ids=None):
+    """Scheduler output for a homogeneous batch (one NewRequestData per req)."""
+    new_reqs = [NewRequestData(sched_req_id=r.request_ids[0], req=r) for r in reqs]
+    return DiffusionSchedulerOutput(
+        step_id=step_id,
+        scheduled_new_reqs=new_reqs,
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        finished_req_ids=set() if finished_req_ids is None else set(finished_req_ids),
+        num_running_reqs=len(new_reqs),
+        num_waiting_reqs=0,
+    )
+
+
 def _make_cached_scheduler_output(sched_req_id="req-1", step_id=1, finished_req_ids=None):
     return DiffusionSchedulerOutput(
         step_id=step_id,
@@ -489,71 +502,128 @@ class TestRunner:
             DiffusionModelRunner.load_model(runner)
 
 
+class _RecordingLoRAManager:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object | None, float]] = []
+
+    def set_active_adapter(self, adapter, scale: float = 1.0) -> None:
+        self.calls.append((adapter, scale))
+
+
+def _make_step_worker(lora_manager=None, *, expected_output=None):
+    """Build a bare DiffusionWorker primed for execute_stepwise tests."""
+    worker = object.__new__(DiffusionWorker)
+    worker.lora_manager = lora_manager
+    worker._step_lora_state = {}
+    output = expected_output if expected_output is not None else RunnerOutput(req_id="req-1")
+    worker.model_runner = SimpleNamespace(execute_stepwise=lambda arg: output)
+    return worker
+
+
 @pytest.mark.cpu
 class TestWorker:
     """DiffusionWorker.execute_stepwise"""
 
     def test_delegates_to_model_runner(self):
-        worker = object.__new__(DiffusionWorker)
         expected = RunnerOutput(req_id="req-1", step_index=1, finished=False, result=None)
-        scheduler_output = SimpleNamespace(
-            scheduled_new_reqs=[
-                SimpleNamespace(
-                    req=SimpleNamespace(
-                        sampling_params=SimpleNamespace(lora_request=None),
-                    )
-                )
-            ]
-        )
-        worker.lora_manager = None
-        worker.model_runner = SimpleNamespace(
-            execute_stepwise=lambda arg: expected if arg is scheduler_output else None
-        )
+        worker = _make_step_worker(expected_output=expected)
+        scheduler_output = _make_scheduler_output(_make_engine_request("req-1"), sched_req_id="req-1")
 
         output = DiffusionWorker.execute_stepwise(worker, scheduler_output)
 
         assert output is expected
 
-    def test_clears_active_lora_before_stepwise_execution(self):
-        worker = object.__new__(DiffusionWorker)
-        scheduler_output = SimpleNamespace(
-            scheduled_new_reqs=[
-                SimpleNamespace(
-                    req=SimpleNamespace(
-                        sampling_params=SimpleNamespace(lora_request=None),
-                    )
-                )
-            ]
-        )
-        calls: list[object | None] = []
-
-        class _FakeLoRAManager:
-            def set_active_adapter(self, adapter):
-                calls.append(adapter)
-
-        worker.lora_manager = _FakeLoRAManager()
-        worker.model_runner = SimpleNamespace(execute_stepwise=lambda arg: RunnerOutput(req_id="req-1"))
+    def test_deactivates_lora_when_request_has_no_adapter(self):
+        manager = _RecordingLoRAManager()
+        worker = _make_step_worker(lora_manager=manager)
+        scheduler_output = _make_scheduler_output(_make_engine_request("req-1"), sched_req_id="req-1")
 
         DiffusionWorker.execute_stepwise(worker, scheduler_output)
 
-        assert calls == [None]
+        assert manager.calls == [(None, 1.0)]
 
-    def test_rejects_lora_requests_in_step_mode(self):
-        worker = object.__new__(DiffusionWorker)
-        scheduler_output = SimpleNamespace(
-            scheduled_new_reqs=[
-                SimpleNamespace(
-                    req=SimpleNamespace(
-                        sampling_params=SimpleNamespace(lora_request=object()),
-                    )
-                )
-            ]
+    def test_activates_lora_for_step_requests(self):
+        from vllm_omni.lora.request import LoRARequest
+
+        lora_request = LoRARequest(lora_name="adapter", lora_int_id=7, lora_path="/tmp/lora")
+        request = _make_engine_request("req-1")
+        request.sampling_params.lora_request = lora_request
+        request.sampling_params.lora_scale = 0.75
+
+        manager = _RecordingLoRAManager()
+        worker = _make_step_worker(lora_manager=manager)
+        scheduler_output = _make_scheduler_output(request, sched_req_id="req-1")
+
+        DiffusionWorker.execute_stepwise(worker, scheduler_output)
+
+        assert manager.calls == [(lora_request, 0.75)]
+
+    def test_recovers_lora_for_cached_step_requests(self):
+        from vllm_omni.lora.request import LoRARequest
+
+        lora_request = LoRARequest(lora_name="adapter", lora_int_id=11, lora_path="/tmp/lora")
+        request = _make_engine_request("req-1")
+        request.sampling_params.lora_request = lora_request
+        request.sampling_params.lora_scale = 0.5
+
+        manager = _RecordingLoRAManager()
+        worker = _make_step_worker(lora_manager=manager)
+        first = _make_scheduler_output(request, sched_req_id="req-1")
+        second = _make_cached_scheduler_output(sched_req_id="req-1", step_id=1)
+
+        DiffusionWorker.execute_stepwise(worker, first)
+        DiffusionWorker.execute_stepwise(worker, second)
+
+        assert manager.calls == [(lora_request, 0.5), (lora_request, 0.5)]
+
+    def test_activates_single_lora_for_homogeneous_batch(self):
+        """Multiple requests sharing the same LoRA → exactly one activation,
+        and every request id is registered in ``_step_lora_state``."""
+        from vllm_omni.lora.request import LoRARequest
+
+        lora_request = LoRARequest(lora_name="adapter", lora_int_id=9, lora_path="/tmp/lora")
+        reqs = []
+        for rid in ("req-1", "req-2", "req-3"):
+            r = _make_engine_request(rid)
+            r.sampling_params.lora_request = lora_request
+            r.sampling_params.lora_scale = 0.6
+            reqs.append(r)
+
+        manager = _RecordingLoRAManager()
+        worker = _make_step_worker(lora_manager=manager)
+        scheduler_output = _make_batch_scheduler_output(reqs)
+
+        DiffusionWorker.execute_stepwise(worker, scheduler_output)
+
+        assert manager.calls == [(lora_request, 0.6)]
+        assert set(worker._step_lora_state) == {"req-1", "req-2", "req-3"}
+        for entry in worker._step_lora_state.values():
+            assert entry == (lora_request, 0.6)
+
+    def test_evicts_step_lora_state_for_finished_requests(self):
+        from vllm_omni.lora.request import LoRARequest
+
+        lora_request = LoRARequest(lora_name="adapter", lora_int_id=3, lora_path="/tmp/lora")
+        finishing = _make_engine_request("req-1")
+        finishing.sampling_params.lora_request = lora_request
+        next_request = _make_engine_request("req-2")
+        next_request.sampling_params.lora_request = lora_request
+
+        worker = _make_step_worker(lora_manager=_RecordingLoRAManager())
+        first = _make_scheduler_output(finishing, sched_req_id="req-1")
+        next_batch = _make_scheduler_output(
+            next_request,
+            sched_req_id="req-2",
+            step_id=1,
+            finished_req_ids={"req-1"},
         )
-        worker.lora_manager = None
-        worker.model_runner = SimpleNamespace(execute_stepwise=lambda arg: RunnerOutput(req_id="req-1"))
 
-        with pytest.raises(ValueError, match="does not support LoRA"):
-            DiffusionWorker.execute_stepwise(worker, scheduler_output)
+        DiffusionWorker.execute_stepwise(worker, first)
+        assert "req-1" in worker._step_lora_state
+
+        DiffusionWorker.execute_stepwise(worker, next_batch)
+        assert "req-1" not in worker._step_lora_state
+        assert worker._step_lora_state == {"req-2": (lora_request, 1.0)}
 
 
 @pytest.mark.cpu
