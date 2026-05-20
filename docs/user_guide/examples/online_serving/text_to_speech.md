@@ -18,6 +18,7 @@ For the full list of supported architectures across all modalities, see
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 |---|---|---|---|---|---|
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
+| higgs-audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` | ✓ (`ref_audio`+`ref_text`) | ✓ (codec_streaming) | — | — |
 | OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM | local model dir | ✓ | ✓ (PCM stream) | — | — |
@@ -141,6 +142,48 @@ python fish_speech/gradio_demo.py --api-base http://localhost:8091  # if server 
 ### Notes
 - Output: 44.1 kHz mono.
 - Streaming PCM player command must use `-r 44100`.
+
+---
+
+## higgs-audio v2
+
+2-stage TTS at 24 kHz: a vLLM-native Llama-3.2-3B talker with a DualFFN audio expert (Stage 0) feeding a HiggsAudio codec decoder (Stage 1) that streams chunks back to the client.
+
+### Prerequisites
+
+Voice clone uses HF's `HiggsAudioV2TokenizerModel` loaded from `k2-fsa/OmniVoice/audio_tokenizer/` (~806 MB subdir; the boson-ai standalone tokenizer Hub repo's `model.safetensors` is the 3B talker LM, not the codec):
+
+```bash
+pip install -U "transformers>=5.3.0"
+```
+
+### Launch
+```bash
+GPUS=6,7 PORT=8094 bash examples/online_serving/text_to_speech/higgs_audio_v2/run_server.sh
+```
+Deploy config auto-loads from `vllm_omni/deploy/higgs_audio_v2.yaml`.
+
+### Sending requests
+```bash
+# Plain TTS
+python higgs_audio_v2/batch_speech_client.py \
+    --base-url http://localhost:8094 \
+    --output-dir /tmp/higgs_out \
+    --prompts "Hello world." "The quick brown fox jumps over the lazy dog."
+
+# Voice cloning — pass a reference clip and its transcript together
+python higgs_audio_v2/batch_speech_client.py \
+    --base-url http://localhost:8094 \
+    --output-dir /tmp/higgs_clone \
+    --ref-audio /path/to/reference.wav \
+    --ref-text  "Exact transcript spoken in reference.wav." \
+    --prompts "Hello, this is a cloned voice."
+```
+
+### Notes
+- Output: 24 kHz mono.
+- `--ref-text` must be the real transcript of `--ref-audio`; mismatched text degrades cloned-voice quality.
+- Out of scope (rejected with explicit 4xx): multi-speaker `[SPEAKERn]` tags inside `input`, `profile:` text-only speaker descriptions, the `ref_audio_in_system_message` system-block variant, chunked long-form generation, and per-request `voice` / `instructions` / `task_type` / `language` / `speed != 1.0` / `x_vector_only_mode` / `speaker_embedding`.
 
 ---
 
@@ -422,6 +465,14 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
 ??? abstract "fish_speech/speech_client.py"
     ``````py
     --8<-- "examples/online_serving/text_to_speech/fish_speech/speech_client.py"
+    ``````
+??? abstract "higgs_audio_v2/batch_speech_client.py"
+    ``````py
+    --8<-- "examples/online_serving/text_to_speech/higgs_audio_v2/batch_speech_client.py"
+    ``````
+??? abstract "higgs_audio_v2/run_server.sh"
+    ``````sh
+    --8<-- "examples/online_serving/text_to_speech/higgs_audio_v2/run_server.sh"
     ``````
 ??? abstract "omnivoice/run_server.sh"
     ``````sh

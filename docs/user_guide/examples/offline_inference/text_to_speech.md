@@ -23,7 +23,7 @@ list of supported architectures across all modalities, see
 | OmniVoice | `k2-fsa/OmniVoice` | 2 (gen + dec) | ✓ | — | voice design (`--instruct`), language (`--lang`) | 24 kHz |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants (`--query-type`) | 24 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets (`--voice`) | 24 kHz |
-| higgs-audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` + `bosonai/higgs-audio-v2-tokenizer` | 2 (talker + code2wav, DualFFN) | — (v1) | — (v1) | plain-text only; voice / ref_audio / ref_text / task_type / language / x_vector_only_mode / speaker_embedding / non-1.0 speed are all 4xx | 24 kHz |
+| higgs-audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` (+ `k2-fsa/OmniVoice/audio_tokenizer/` codec) | 2 (talker + code2wav, DualFFN) | ✓ (`--ref-audio` + `--ref-text`) | — | — | 24 kHz |
 
 ## Common Quick Start
 
@@ -364,21 +364,41 @@ Available voice presets are listed on the HF model card (`mistralai/Voxtral-4B-T
 
 ## higgs-audio v2
 
-2-stage TTS at 24 kHz: a vLLM-native Llama-3.2-3B talker with a DualFFN audio expert (Stage 0) feeding a HiggsAudio codec decoder (Stage 1) over the `async_chunk` shared-memory connector. Stage 1 reuses the OmniVoice HiggsAudio decoder kernel through `vllm_omni/model_executor/models/_shared/higgs_audio_decoder.py`.
+2-stage TTS at 24 kHz: a vLLM-native Llama-3.2-3B talker with a DualFFN audio expert (Stage 0) feeding a HiggsAudio codec decoder (Stage 1) over the shared-memory connector. Stage 1 reuses the shared HiggsAudio decoder kernel at `vllm_omni/model_executor/models/_shared/higgs_audio_decoder.py`.
 
-higgs-audio v2 is online-only in this release. Launch the server and call the OpenAI-compatible `/v1/audio/speech` endpoint:
+### Prerequisites
+
+Voice clone uses HF's `HiggsAudioV2TokenizerModel`, instantiated from `k2-fsa/OmniVoice/audio_tokenizer/` — the boson-ai standalone tokenizer Hub repo's `model.safetensors` is actually the 3B talker LM, so we point HF at k2's repackaged codec weights instead. Only the `audio_tokenizer/` subdir (~806 MB) is downloaded.
 
 ```bash
-bash examples/online_serving/text_to_speech/higgs_audio_v2/run_server.sh
-python examples/online_serving/text_to_speech/higgs_audio_v2/batch_speech_client.py \
-    --prompts "Hello world." \
-              "The quick brown fox jumps over the lazy dog." \
-    --output-dir /tmp/higgs_out
+pip install -U "transformers>=5.3.0"
 ```
 
-### Scope (v1)
+### Quick start (plain TTS)
 
-Plain text -> 24 kHz speech only. Voice cloning, multi-speaker dialogue, language overrides, `task_type`, `speed != 1.0`, and reference audio are rejected with explicit 4xx by the request validator in `vllm_omni/entrypoints/openai/serving_speech.py`.
+```bash
+python examples/offline_inference/text_to_speech/higgs_audio_v2/end2end.py \
+    --texts "Hello world." "The quick brown fox jumps over the lazy dog." \
+    --output-dir results/wavs
+```
+
+### Voice cloning
+
+Pass both `--ref-audio` and `--ref-text` together:
+
+```bash
+python examples/offline_inference/text_to_speech/higgs_audio_v2/end2end.py \
+    --texts "Hello, this is a cloned voice." \
+    --ref-audio /path/to/reference.wav \
+    --ref-text  "Exact transcript spoken in reference.wav." \
+    --output-dir results/wavs
+```
+
+### Notes
+
+- Deploy config auto-loads from `vllm_omni/deploy/higgs_audio_v2.yaml`.
+- `--ref-text` must be the real transcript of `--ref-audio`; mismatched text degrades cloned-voice quality.
+- Out of scope (rejected with 4xx by the request validator): multi-speaker `[SPEAKERn]` dialogue, `profile:` text-only speaker descriptions, the `ref_audio_in_system_message` system-block variant, chunked long-form generation, and per-request `voice` / `instructions` / `task_type` / `language` / `speed != 1.0` / `x_vector_only_mode` / `speaker_embedding`.
 
 ## Example materials
 
@@ -389,6 +409,10 @@ Plain text -> 24 kHz speech only. Voice cloning, multi-speaker dialogue, languag
 ??? abstract "fish_speech/end2end.py"
     ``````py
     --8<-- "examples/offline_inference/text_to_speech/fish_speech/end2end.py"
+    ``````
+??? abstract "higgs_audio_v2/end2end.py"
+    ``````py
+    --8<-- "examples/offline_inference/text_to_speech/higgs_audio_v2/end2end.py"
     ``````
 ??? abstract "omnivoice/end2end.py"
     ``````py
