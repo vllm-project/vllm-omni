@@ -18,6 +18,7 @@ import zmq
 from ..utils.logging import get_connector_logger
 from ..utils.memory_pool import BufferAllocator, ManagedBuffer
 from ..utils.serialization import OmniSerializer
+from ..utils.wire_types import deserialize_tensor_dict, is_tensor_dict, serialize_tensor_dict
 from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
@@ -36,6 +37,9 @@ TRANS_DONE = b"trans_done"
 TRANS_ERROR = b"trans_error"
 QUERY_INFO = b"query_info"
 INFO_NOT_FOUND = b"info_not_found"
+PAYLOAD_KIND_RAW = "raw"
+PAYLOAD_KIND_MSGPACK = "msgpack"
+PAYLOAD_KIND_TENSOR_DICT = "tensor_dict"
 
 
 @dataclass
@@ -52,6 +56,7 @@ class QueryResponse:
     request_id: str
     data_size: int
     is_fast_path: bool
+    payload_kind: str = PAYLOAD_KIND_RAW
 
 
 @dataclass
@@ -368,6 +373,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         - ManagedBuffer (from this pool): Zero-copy, is_fast_path=True
         - ManagedBuffer (different pool): Fallback to tensor copy path
         - torch.Tensor / bytes: Copy to pool, is_fast_path=True
+        - dict[str, torch.Tensor]: Binary tensor-dict wire format, is_fast_path=False
         - Other (dict, etc.): Serialize to bytes, copy to pool, is_fast_path=False
           (receiver will deserialize automatically)
         """
@@ -396,6 +402,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             size = 0
             holder = None
             is_fast_path = True
+            payload_kind = PAYLOAD_KIND_RAW
             should_release_holder = False
 
             # Reject empty data early — alloc(0) has undefined behaviour and
@@ -411,9 +418,14 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             # Pre-process: serialize non-raw types before entering the copy path.
             # This avoids the previous recursive put() pattern and keeps
             # _local_buffers writes atomic (single write, no override needed).
-            if not isinstance(data, (ManagedBuffer, torch.Tensor, bytes)):
+            if is_tensor_dict(data):
+                data = serialize_tensor_dict(data)
+                is_fast_path = False
+                payload_kind = PAYLOAD_KIND_TENSOR_DICT
+            elif not isinstance(data, ManagedBuffer | torch.Tensor | bytes):
                 data = OmniSerializer.serialize(data)
                 is_fast_path = False  # Receiver must deserialize
+                payload_kind = PAYLOAD_KIND_MSGPACK
 
             if isinstance(data, ManagedBuffer):
                 # Zero-Copy Path
@@ -432,7 +444,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
             # Use 'if' (not 'elif') so the ManagedBuffer fallback above can
             # convert to Tensor and flow into this branch seamlessly.
-            if isinstance(data, (torch.Tensor, bytes)):
+            if isinstance(data, torch.Tensor | bytes):
                 # Copy Path
                 # 1. Determine size
                 if isinstance(data, torch.Tensor):
@@ -506,18 +518,19 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 # Release old buffer if put_key already exists (prevents pool leak)
                 old_item = self._local_buffers.pop(put_key, None)
                 if old_item:
-                    _, _, old_holder, old_should_release, _, _ = old_item
+                    _, _, old_holder, old_should_release, _, _, _ = old_item
                     if old_should_release and isinstance(old_holder, ManagedBuffer):
                         old_holder.release()
                         logger.warning(f"Released old buffer for duplicate put_key: {put_key}")
 
-                # Store: (src_addrs, lengths, holder, should_release, is_fast_path, created_at)
+                # Store: (src_addrs, lengths, holder, should_release, is_fast_path, payload_kind, created_at)
                 self._local_buffers[put_key] = (
                     [src_addr],
                     [size],
                     holder,
                     should_release_holder,
                     is_fast_path,
+                    payload_kind,
                     _time_mod.monotonic(),
                 )
 
@@ -527,6 +540,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 "source_port": self.zmq_port,
                 "data_size": size,
                 "is_fast_path": is_fast_path,  # Hint: True = return ManagedBuffer, False = deserialize
+                "payload_kind": payload_kind,
             }
 
             self._metrics["puts"] += 1
@@ -558,7 +572,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
     def _query_metadata_at(self, get_key: str, host: str, port: int) -> dict[str, Any] | None:
         """Query metadata from a sender endpoint via ZMQ.
 
-        Returns ``{source_host, source_port, data_size, is_fast_path}``
+        Returns ``{source_host, source_port, data_size, is_fast_path, payload_kind}``
         or ``None`` when the key is not found / the query fails.
         """
         zmq_addr = f"tcp://{host}:{port}"
@@ -574,6 +588,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 "source_port": port,
                 "data_size": query_resp.data_size,
                 "is_fast_path": query_resp.is_fast_path,
+                "payload_kind": query_resp.payload_kind,
             }
         except Exception as e:
             self._invalidate_req_socket(zmq_addr)
@@ -679,6 +694,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         src_port = metadata.get("source_port")
         data_size = metadata.get("data_size", 0)
         is_fast_path = metadata.get("is_fast_path", False)
+        payload_kind = metadata.get("payload_kind", PAYLOAD_KIND_RAW if is_fast_path else PAYLOAD_KIND_MSGPACK)
 
         if not src_host or not src_port or str(src_host).lower() == "auto":
             logger.error(
@@ -776,7 +792,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                         _copy_ms = (_t_copy_end - _t_copy_start) * 1000
 
                         _t_deser_start = _time_mod.perf_counter()
-                        val = OmniSerializer.deserialize(raw_bytes)
+                        if payload_kind == PAYLOAD_KIND_TENSOR_DICT:
+                            val = deserialize_tensor_dict(raw_bytes)
+                        else:
+                            val = OmniSerializer.deserialize(raw_bytes)
                         _t_deser_end = _time_mod.perf_counter()
                         _deser_ms = (_t_deser_end - _t_deser_start) * 1000
 
@@ -828,8 +847,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         with self._local_buffers_lock:
             item = self._local_buffers.pop(request_id, None)
             if item:
-                # item is (src_addrs, lengths, holder, should_release, is_fast_path, created_at)
-                _, _, holder, should_release, _, _ = item
+                # item is (src_addrs, lengths, holder, should_release, is_fast_path, payload_kind, created_at)
+                _, _, holder, should_release, _, _, _ = item
                 if should_release and isinstance(holder, ManagedBuffer):
                     # We own this buffer (created internally), so we must release it.
                     holder.release()
@@ -881,7 +900,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         # 4. Release all pending buffers
         with self._local_buffers_lock:
             for req_id, item in list(self._local_buffers.items()):
-                _, _, holder, should_release, _, _ = item
+                _, _, holder, should_release, _, _, _ = item
                 if should_release and isinstance(holder, ManagedBuffer):
                     holder.release()
             self._local_buffers.clear()
@@ -934,10 +953,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         """
         now = _time_mod.monotonic()
         with self._local_buffers_lock:
-            stale_keys = [k for k, v in self._local_buffers.items() if now - v[5] > _BUFFER_TTL_SECONDS]
+            stale_keys = [k for k, v in self._local_buffers.items() if now - v[6] > _BUFFER_TTL_SECONDS]
             for k in stale_keys:
                 item = self._local_buffers.pop(k)
-                _, _, holder, should_release, _, _ = item
+                _, _, holder, should_release, _, _, _ = item
                 if should_release and isinstance(holder, ManagedBuffer):
                     holder.release()
                 logger.warning(f"TTL expired ({_BUFFER_TTL_SECONDS}s): cleaned up stale buffer for {k}")
@@ -1045,7 +1064,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 self._notify_listener(notify_addr)
                 return
 
-            src_addrs, src_lengths, _, _, _, _ = item
+            src_addrs, src_lengths, _, _, _, _, _ = item
             remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
 
             # RDMA Write
@@ -1082,12 +1101,13 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             if not item:
                 response_queue.put((identity, INFO_NOT_FOUND))
             else:
-                src_addrs, src_lengths, _, _, is_fast_path, _ = item
+                src_addrs, src_lengths, _, _, is_fast_path, payload_kind, _ = item
 
                 resp = QueryResponse(
                     request_id=query.request_id,
                     data_size=src_lengths[0] if src_lengths else 0,
                     is_fast_path=is_fast_path,
+                    payload_kind=payload_kind,
                 )
                 response_queue.put((identity, msgspec.msgpack.encode(resp)))
 
