@@ -92,7 +92,7 @@ TREE_WITH_LOAD_SIGNAL_PARAMS = [
 WORKER_SIGNAL_FAULT_PARAMS = [
     pytest.param(
         make_process_kill_fault_injector(
-            grep_patterns="multiprocessing.spawn",
+            grep_patterns="vLLM-Omni::",
             signal_name="SIGTERM",
             limit=1,
             post_kill_wait_seconds=2.0,
@@ -101,7 +101,7 @@ WORKER_SIGNAL_FAULT_PARAMS = [
     ),
     pytest.param(
         make_process_kill_fault_injector(
-            grep_patterns="multiprocessing.spawn",
+            grep_patterns="vLLM-Omni::",
             signal_name="SIGKILL",
             limit=1,
             post_kill_wait_seconds=2.0,
