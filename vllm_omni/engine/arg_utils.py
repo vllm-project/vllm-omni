@@ -311,6 +311,7 @@ class OmniEngineArgs(EngineArgs):
                             model_path,
                             allow_patterns=[
                                 f"{subfolder}/tokenizer*",
+                                f"{subfolder}/tokenization_*",
                                 f"{subfolder}/special_tokens*",
                                 f"{subfolder}/vocab*",
                                 f"{subfolder}/merges*",

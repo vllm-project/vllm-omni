@@ -117,6 +117,7 @@ def resolve_glm_tts_tokenizer_path(model_name_or_path: Any) -> str:
         model_path,
         allow_patterns=[
             f"{_GLM_TTS_TOKENIZER_SUBDIR}/tokenizer*",
+            f"{_GLM_TTS_TOKENIZER_SUBDIR}/tokenization_*",
             f"{_GLM_TTS_TOKENIZER_SUBDIR}/special_tokens*",
             f"{_GLM_TTS_TOKENIZER_SUBDIR}/vocab*",
             f"{_GLM_TTS_TOKENIZER_SUBDIR}/merges*",

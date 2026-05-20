@@ -22,12 +22,10 @@ connectors:
       connector_get_sleep_s: 0.002
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      # Progressive chunk sizes: small first chunk for low TTFP, then ramp up.
-      # 10-token first chunk → 20 mel frames → DiT attention O(n²) is ~6×
-      # faster than the previous 25-token (50 mel frame) first chunk.
-      codec_chunk_frames: [10, 25, 50, 200]
-      codec_left_context_frames: 15
-      crossfade_sec: 0.05
+      # Progressive chunk sizes matching original GLM-TTS defaults.
+      codec_chunk_frames: [25, 50, 200]
+      codec_left_context_frames: 25
+      crossfade_sec: 0.1
 
 stages:
   - stage_id: 0
