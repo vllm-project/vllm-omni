@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+import contextlib
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -835,7 +836,7 @@ class TestSingleStageReplicaInitialization:
         prev_device_env = os.environ.get(device_env_var)
         os.environ[device_env_var] = "0"
 
-        mocker.patch.object(engine_mod, "setup_stage_devices")
+        mocker.patch.object(engine_mod, "stage_runtime_setup", return_value=contextlib.nullcontext())
         mocker.patch.object(engine_mod, "build_engine_args_dict", return_value={})
         mocker.patch.object(engine_mod, "acquire_device_locks", return_value=[])
         mocker.patch.object(engine_mod, "release_device_locks")
@@ -909,7 +910,7 @@ class TestSingleStageReplicaInitialization:
         prev_device_env = os.environ.get(device_env_var)
         os.environ[device_env_var] = "0"
 
-        mocker.patch.object(engine_mod, "setup_stage_devices")
+        mocker.patch.object(engine_mod, "stage_runtime_setup", return_value=contextlib.nullcontext())
         mocker.patch.object(engine_mod, "inject_kv_stage_info")
         mocker.patch.object(engine_mod, "build_diffusion_config", return_value="diffusion-config")
         mock_register = mocker.patch.object(
@@ -988,7 +989,7 @@ class TestSingleStageReplicaInitialization:
         prev_device_env = os.environ.get(device_env_var)
         os.environ[device_env_var] = "0"
 
-        mocker.patch.object(engine_mod, "setup_stage_devices")
+        mocker.patch.object(engine_mod, "stage_runtime_setup", return_value=contextlib.nullcontext())
         mocker.patch.object(engine_mod, "inject_kv_stage_info")
         mocker.patch.object(engine_mod, "build_diffusion_config", return_value="diffusion-config")
         mocker.patch.object(
