@@ -192,3 +192,84 @@ class TestVoxCPM2Serving:
         Regression: previously returned 400 Invalid voice 'default'.
         """
         assert "default" in voxcpm2_server.supported_speakers
+
+    def test_voxcpm2_inline_ref_audio_does_not_set_voice_name(self, voxcpm2_server):
+        """Inline ref_audio must not populate voice_name in additional_information.
+
+        Regression: the speaker cache keys on voice_name, so two requests with
+        the same voice but different inline ref_audio would collide — the second
+        request reused stale cached features from the first, causing a prefill
+        length mismatch and engine crash.
+        """
+        mock_prompt = {"prompt_token_ids": [1, 1, 1], "additional_information": {}, "type": "token"}
+        voxcpm2_server._build_voxcpm2_prompt = AsyncMock(return_value=mock_prompt)
+
+        request = OpenAICreateSpeechRequest(
+            input="test",
+            voice="default",
+            ref_audio="data:audio/wav;base64,QUJD",
+        )
+
+        asyncio.run(voxcpm2_server._prepare_speech_generation(request))
+
+        additional = mock_prompt["additional_information"]
+        assert "voice_name" not in additional, (
+            "voice_name must not be set for inline ref_audio — "
+            "it causes speaker cache collisions across different audio clips"
+        )
+
+    def test_voxcpm2_uploaded_voice_sets_voice_name(self, voxcpm2_server):
+        """Uploaded voice without inline ref_audio must populate voice_name.
+
+        This ensures the speaker cache still works for the intended use case:
+        a voice uploaded once and referenced by name in subsequent requests.
+        """
+        mock_prompt = {"prompt_token_ids": [1, 1, 1], "additional_information": {}, "type": "token"}
+        voxcpm2_server._build_voxcpm2_prompt = AsyncMock(return_value=mock_prompt)
+        voxcpm2_server.uploaded_speakers["my_voice"] = {
+            "name": "my_voice",
+            "file_path": "/tmp/fake.wav",
+            "created_at": 12345,
+        }
+        voxcpm2_server.supported_speakers.add("my_voice")
+
+        request = OpenAICreateSpeechRequest(
+            input="test",
+            voice="my_voice",
+        )
+
+        asyncio.run(voxcpm2_server._prepare_speech_generation(request))
+
+        additional = mock_prompt["additional_information"]
+        assert additional.get("voice_name") == "my_voice"
+        assert "voice_created_at" in additional
+
+    def test_voxcpm2_uploaded_voice_with_inline_override_does_not_set_voice_name(self, voxcpm2_server):
+        """Uploaded voice with inline ref_audio override must not populate voice_name.
+
+        Prevents cache poisoning: an attacker could send an uploaded voice name
+        with crafted ref_audio, caching malicious features under the uploaded
+        voice's name for subsequent legitimate requests.
+        """
+        mock_prompt = {"prompt_token_ids": [1, 1, 1], "additional_information": {}, "type": "token"}
+        voxcpm2_server._build_voxcpm2_prompt = AsyncMock(return_value=mock_prompt)
+        voxcpm2_server.uploaded_speakers["my_voice"] = {
+            "name": "my_voice",
+            "file_path": "/tmp/fake.wav",
+            "created_at": 12345,
+        }
+        voxcpm2_server.supported_speakers.add("my_voice")
+
+        request = OpenAICreateSpeechRequest(
+            input="test",
+            voice="my_voice",
+            ref_audio="data:audio/wav;base64,QUJD",
+        )
+
+        asyncio.run(voxcpm2_server._prepare_speech_generation(request))
+
+        additional = mock_prompt["additional_information"]
+        assert "voice_name" not in additional, (
+            "voice_name must not be set when inline ref_audio overrides an "
+            "uploaded voice — it would poison the cache for future requests"
+        )

@@ -63,6 +63,38 @@ def test_total_input_aggregated_from_output_prompt_len():
     )
 
 
+def test_audio_continuity_aggregation():
+    """Continuity rate and underrun percentile must aggregate from per-output fields."""
+    bad = _make_output(100)
+    bad.audio_underrun_s = 0.5
+    bad.audio_continuity_ok = False
+    good_a = _make_output(100)
+    good_a.audio_underrun_s = 0.02
+    good_a.audio_continuity_ok = True
+    good_b = _make_output(100)
+    good_b.audio_underrun_s = 0.0
+    good_b.audio_continuity_ok = True
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[bad, good_a, good_b],
+        dur_s=10.0,
+        tokenizer=None,
+        selected_percentiles=[50.0, 99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["audio_underrun"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+    )
+
+    assert metrics.audio_continuity_ok_rate == pytest.approx(2 / 3, abs=1e-6)
+    # p99 of [0.5, 0.02, 0.0] is dominated by the 0.5 outlier.
+    p99 = dict(metrics.percentiles_audio_underrun_s).get(99.0)
+    assert p99 is not None and p99 > 0.4
+
+
 # ============================================================================
 # TTFT suppression for pure-audio (TTS) benchmarks
 # ============================================================================
