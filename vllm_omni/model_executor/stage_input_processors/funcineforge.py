@@ -11,85 +11,25 @@ from collections import defaultdict
 from contextlib import nullcontext
 from typing import Any
 
-import numpy as np
 import torch
 from vllm.inputs import TextPrompt
 
 from vllm_omni.data_entry_keys import (
     CodesStruct,
-    EmbeddingsStruct,
     MetaStruct,
     OmniPayloadStruct,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
+    _build_prompt_embed_struct,
+    _decode_additional_information,
+    _ensure_list,
+    _to_cpu_tensor,
+)
 
 __all__ = ["text2flow", "talker2code2wav_async_chunk"]
 
 _STATE_KEY = "_funcineforge_async_state"
-
-
-def _ensure_list(x: Any) -> list[Any]:
-    if hasattr(x, "_x"):
-        return list(x._x)
-    if isinstance(x, list):
-        return list(x)
-    if isinstance(x, tuple):
-        return list(x)
-    if x is None:
-        return []
-    try:
-        return list(x)
-    except TypeError:
-        return [x]
-
-
-def _to_cpu_tensor(x: Any) -> torch.Tensor | None:
-    if isinstance(x, list):
-        if not x:
-            return None
-        x = x[0]
-    if isinstance(x, torch.Tensor):
-        return x.detach().cpu()
-    return None
-
-
-def _decode_additional_information(raw_info: Any) -> dict[str, Any]:
-    if raw_info is None:
-        return {}
-    if isinstance(raw_info, dict):
-        return raw_info
-
-    entries = getattr(raw_info, "entries", None)
-    if not isinstance(entries, dict):
-        return {}
-
-    decoded: dict[str, Any] = {}
-    for key, entry in entries.items():
-        tensor_data = getattr(entry, "tensor_data", None)
-        if tensor_data is not None:
-            dtype_name = getattr(entry, "tensor_dtype", "float32")
-            tensor_shape = getattr(entry, "tensor_shape", None)
-            if tensor_shape is None:
-                continue
-            dt = np.dtype(dtype_name)
-            arr = np.frombuffer(tensor_data, dtype=dt).reshape(tensor_shape)
-            decoded[key] = torch.from_numpy(arr.copy())
-        else:
-            decoded[key] = getattr(entry, "list_data", None)
-    return decoded
-
-
-def _build_prompt_embed_struct(prompt_payload: dict[str, Any]) -> EmbeddingsStruct | None:
-    speech_token = prompt_payload.get("speech_token")
-    speech_feat = prompt_payload.get("speech_feat")
-    embedding = prompt_payload.get("embedding")
-    if speech_token is None and speech_feat is None and embedding is None:
-        return None
-    return EmbeddingsStruct(
-        speech_token=speech_token,
-        speech_feat=speech_feat,
-        embedding=embedding,
-    )
 
 
 def text2flow(

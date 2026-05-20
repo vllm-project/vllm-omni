@@ -15,11 +15,17 @@ import numpy as np
 import torch
 
 from vllm_omni.model_executor.models.cosyvoice3.utils import (
+    extract_speech_token,
+    extract_spk_embedding,
     log_mel_spectrogram,
 )
 from vllm_omni.utils.audio import mel_filter_bank
 
-__all__ = ["log_mel_spectrogram"]  # re-export for local callers
+__all__ = [
+    "extract_speech_token",
+    "extract_spk_embedding",
+    "log_mel_spectrogram",
+]
 
 
 def mel_spectrogram(
@@ -71,69 +77,6 @@ def mel_spectrogram(
 
 
 # ---------------------------------------------------------------------------
-# Speech token extraction (codec via speech_tokenizer_v3 ONNX)
-# ---------------------------------------------------------------------------
-
-
-def _load_wav(
-    audio: tuple[Any, int],
-    target_sr: int,
-) -> torch.Tensor:
-    """Load & resample audio to *target_sr*.  Returns (1, T) float tensor."""
-    wav, sr = audio
-    if isinstance(wav, list):
-        wav = np.asarray(wav, dtype=np.float32)
-    if isinstance(wav, np.ndarray):
-        wav = torch.from_numpy(wav).float()
-    if wav.ndim == 1:
-        wav = wav.unsqueeze(0)
-    if sr != target_sr:
-        import torchaudio
-
-        wav = torchaudio.functional.resample(wav, sr, target_sr)
-    return wav.to(dtype=torch.float32)
-
-
-def extract_speech_token(
-    audio: tuple[Any, int],
-    speech_tokenizer: Any,
-    device: str = "cpu",
-) -> tuple[torch.Tensor, int]:
-    """Extract speech codec tokens from audio using the ONNX speech tokenizer.
-
-    The ``speech_tokenizer_v3`` ONNX model expects Whisper-style 128-mel
-    log-mel spectrogram features at 16 kHz (identical to CosyVoice3).
-
-    Args:
-        audio: (wav_samples_or_np, sample_rate) tuple.
-        speech_tokenizer: ONNX InferenceSession for speech_tokenizer_v3.
-        device: Target device for the output tensor.
-
-    Returns:
-        (speech_token_tensor, token_len) where tensor shape is (1, T).
-    """
-    speech = _load_wav(audio, target_sr=16000)
-    assert speech.shape[1] / 16000 <= 60, "do not support extract speech token for audio longer than 60s"
-
-    feat = log_mel_spectrogram(speech, n_mels=128)
-
-    speech_token = (
-        speech_tokenizer.run(
-            None,
-            {
-                speech_tokenizer.get_inputs()[0].name: feat.detach().cpu().numpy(),
-                speech_tokenizer.get_inputs()[1].name: np.array([feat.shape[2]], dtype=np.int32),
-            },
-        )[0]
-        .flatten()
-        .tolist()
-    )
-    speech_token = torch.tensor([speech_token], dtype=torch.int32).to(device)
-    speech_token_len = torch.tensor([speech_token.shape[1]], dtype=torch.int32).to(device)
-    return speech_token, speech_token_len
-
-
-# ---------------------------------------------------------------------------
 # Speech feature extraction (mel)
 # ---------------------------------------------------------------------------
 
@@ -177,42 +120,6 @@ def extract_speech_feat(
 
     feat_len = feat.shape[-1]
     return feat, feat_len
-
-
-# ---------------------------------------------------------------------------
-# Speaker embedding extraction (campplus)
-# ---------------------------------------------------------------------------
-
-
-def extract_spk_embedding(
-    audio: tuple[Any, int],
-    campplus_session: Any,
-    device: str = "cpu",
-) -> torch.Tensor:
-    """Extract speaker x-vector embedding from audio using campplus ONNX.
-
-    campplus expects 80-dim fbank features at 16 kHz as input with shape
-    ``(batch, seq_len, 80)``.  Matches CosyVoice3 pattern.
-
-    Args:
-        audio: (wav_samples_or_np, sample_rate) tuple.
-        campplus_session: ONNX InferenceSession for campplus model.
-
-    Returns:
-        Embedding tensor of shape (1, emb_dim).
-    """
-    import torchaudio.compliance.kaldi as kaldi
-
-    speech = _load_wav(audio, target_sr=16000)
-    feat = kaldi.fbank(speech, num_mel_bins=80, dither=0, sample_frequency=16000)
-    feat = feat - feat.mean(dim=0, keepdim=True)
-
-    outputs = campplus_session.run(
-        None,
-        {campplus_session.get_inputs()[0].name: feat.unsqueeze(0).cpu().numpy()},
-    )
-    embedding = torch.from_numpy(outputs[0].flatten()).float().unsqueeze(0)
-    return embedding
 
 
 # ---------------------------------------------------------------------------

@@ -57,7 +57,7 @@ class LookaheadBlock(nn.Module):
             padding=0,
         )
 
-    def forward(self, inputs, ilens, context=torch.zeros(0, 0, 0)):
+    def forward(self, inputs: torch.Tensor, ilens: torch.Tensor, context: torch.Tensor = torch.zeros(0, 0, 0)):
         """Forward.
 
         Args:
