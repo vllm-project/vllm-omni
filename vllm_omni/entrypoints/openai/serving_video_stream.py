@@ -45,6 +45,7 @@ from vllm_omni.entrypoints.openai.video_frame_filter import FrameSimilarityFilte
 from vllm_omni.entrypoints.openai.video_stream_context import (
     text_only_message,
 )
+from vllm_omni.entrypoints.openai.video_stream_samplers import sample_frames
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -105,6 +106,21 @@ class StreamingVideoSessionConfig(BaseModel):
         le=1.0,
         description="EVS similarity threshold (higher = keep more frames).",
     )
+    sampling_strategy: str = Field(
+        default="uniform",
+        description=(
+            "Frame sampling strategy: "
+            "'uniform' (even across buffer), "
+            "'latest_frames' (most recent N frames), "
+            "'latest_seconds' (frames within last T seconds)."
+        ),
+    )
+    window_seconds: float = Field(
+        default=5.0,
+        gt=0.0,
+        le=300.0,
+        description="Time window in seconds (only used with 'latest_seconds').",
+    )
 
 
 class OmniStreamingVideoHandler:
@@ -140,6 +156,7 @@ class OmniStreamingVideoHandler:
                 return
 
             frame_buffer: list[str] = []  # base64-encoded JPEG frames
+            frame_timestamps: list[float] = []  # monotonic timestamps aligned with frame_buffer
             # Per-frame PIL cache + uuid for mm_hash reuse. Aligned with frame_buffer by index.
             frame_pil_cache: dict[str, tuple[Any, str] | object] = {}  # b64 -> (PIL.Image, uuid) or _BAD_FRAME
             frame_filter = (
@@ -227,7 +244,10 @@ class OmniStreamingVideoHandler:
                         frame_data = msg.get("b64", "")
                         removed = frame_data in frame_buffer
                         if removed:
-                            frame_buffer[:] = [f for f in frame_buffer if f != frame_data]
+                            # Remove matching frame(s) and their aligned timestamps.
+                            keep = [(f, ts) for f, ts in zip(frame_buffer, frame_timestamps) if f != frame_data]
+                            frame_buffer[:] = [f for f, _ in keep]
+                            frame_timestamps[:] = [ts for _, ts in keep]
                         if frame_pil_cache.get(frame_data) is _BAD_FRAME:
                             frame_pil_cache.pop(frame_data, None)
                         if removed:
@@ -255,8 +275,10 @@ class OmniStreamingVideoHandler:
                         max_buf = config.max_frames
                         if len(frame_buffer) >= max_buf:
                             dropped = frame_buffer.pop(0)
+                            frame_timestamps.pop(0)
                             frame_pil_cache.pop(dropped, None)
                         frame_buffer.append(frame_data)
+                        frame_timestamps.append(_time.monotonic())
                         # Prewarm: decode PIL off the event loop so query-time chat_template
                         # can skip base64+Image.open. uuid=md5 lets mm_cache dedupe identical frames.
                         if frame_data not in frame_pil_cache:
@@ -329,6 +351,7 @@ class OmniStreamingVideoHandler:
                         active_request_id = request_id
                         interrupt_event.clear()
                         query_frames = list(frame_buffer)
+                        query_frame_timestamps = list(frame_timestamps)
                         query_audio_buffer = bytearray(audio_buffer)
                         audio_buffer.clear()
                         query_prewarmed_frames = dict(frame_pil_cache)
@@ -346,6 +369,7 @@ class OmniStreamingVideoHandler:
                                     request_id,
                                     interrupt_event,
                                     query_prewarmed_frames,
+                                    query_frame_timestamps,
                                 )
                             finally:
                                 if active_request_id == request_id:
@@ -448,6 +472,7 @@ class OmniStreamingVideoHandler:
         request_id: str,
         interrupt_event: asyncio.Event,
         prewarmed_frames: dict[str, tuple[Any, str]],
+        frame_timestamps: list[float] | None = None,
     ) -> None:
         """Build prompt, run inference, stream text + audio response."""
 
@@ -465,6 +490,7 @@ class OmniStreamingVideoHandler:
             request_id,
             interrupt_event,
             prewarmed_frames,
+            frame_timestamps,
         )
 
     # ------------------------------------------------------------------
@@ -482,6 +508,7 @@ class OmniStreamingVideoHandler:
         request_id: str,
         interrupt_event: asyncio.Event,
         prewarmed_frames: dict[str, tuple[Any, str]],
+        frame_timestamps: list[float] | None = None,
     ) -> None:
         """Direct engine_client.generate() path for async_chunk audio."""
         from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -495,6 +522,7 @@ class OmniStreamingVideoHandler:
             message_history,
             query_text,
             prewarmed_frames,
+            frame_timestamps,
         )
 
         request_kwargs: dict[str, Any] = {
@@ -671,19 +699,20 @@ class OmniStreamingVideoHandler:
         message_history: list[dict[str, Any]],
         query_text: str,
         prewarmed_frames: dict[str, tuple[Any, str]],
+        frame_timestamps: list[float] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Build OpenAI-style messages list and the current user message.
 
         Returns (messages, user_message).
         """
-        # Stride sampling (index 0 anchor, last slot = newest). Covers full buffer + stable mm_hash.
-        n_buf = len(frame_buffer)
-        if n_buf <= config.num_frames:
-            frames = list(frame_buffer)
-        else:
-            stride = max(1, n_buf // config.num_frames)
-            idx = [i * stride for i in range(config.num_frames - 1)] + [n_buf - 1]
-            frames = [frame_buffer[i] for i in idx]
+        # Sample frames from buffer using the configured strategy.
+        frames = sample_frames(
+            frame_buffer,
+            strategy=config.sampling_strategy,  # type: ignore[arg-type]
+            num_frames=config.num_frames,
+            window_seconds=config.window_seconds,
+            frame_timestamps=frame_timestamps,
+        )
 
         # Prefer prewarmed PIL + uuid so mm_cache can dedupe by hash.
         prewarmed = prewarmed_frames or {}
