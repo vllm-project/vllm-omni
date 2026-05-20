@@ -17,10 +17,12 @@ from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
+from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -157,54 +159,10 @@ def create_transformer_from_config(
     if "pos_embed_seq_len" in config:
         kwargs["pos_embed_seq_len"] = config["pos_embed_seq_len"]
 
-    # Auto-detect quantization from transformer's config.json when not explicitly provided.
-    # merge_mxfp8_checkpoint.py injects quantization_config into config.json so that
-    # offline quantized checkpoints are recognized here without a CLI flag.
     if "quantization_config" in config:
-        from vllm_omni.quantization.factory import build_quant_config
+        from vllm_omni.quantization.factory import resolve_quant_config_from_disk
 
-        disk_qc = config["quantization_config"]
-        if isinstance(disk_qc, dict) and "quant_method" in disk_qc:
-            qc_method = disk_qc["quant_method"]
-            qc_kwargs = {k: v for k, v in disk_qc.items() if k != "quant_method"}
-            if quant_config is None:
-                # No CLI flag: full auto-detection.
-                quant_config = build_quant_config(qc_method, **qc_kwargs)
-                logger.info(
-                    "Auto-detected quantization from transformer config.json: method=%s kwargs=%s",
-                    qc_method,
-                    qc_kwargs,
-                )
-            elif quant_config.get_name() != qc_method:
-                # The caller supplied a quant_config of a different method than
-                # what the checkpoint was built with. Loading serialized tensors
-                # (e.g. MXFP8 weight scales) with the wrong linear method would
-                # produce corrupt output or a shape mismatch crash.  Reject early
-                # so the user gets a clear message instead of a silent failure.
-                raise ValueError(
-                    f"Checkpoint config.json declares quant_method={qc_method!r} but the "
-                    f"active quantization config is {quant_config.get_name()!r}. "
-                    "Pass a matching --quantization flag or omit it for auto-detection."
-                )
-            elif (
-                qc_kwargs.get("is_checkpoint_mxfp8_serialized", False)
-                and hasattr(quant_config, "is_checkpoint_mxfp8_serialized")
-                and not quant_config.is_checkpoint_mxfp8_serialized
-            ):
-                # Same method: CLI provided online mode but config.json marks this
-                # as a pre-quantized offline checkpoint.  Switch to offline mode so
-                # users can pass --quantization mxfp8 without knowing the
-                # online/offline distinction.
-                quant_config = build_quant_config(qc_method, **qc_kwargs)
-                logger.info(
-                    "config.json marks checkpoint as serialized; switching from online to offline MXFP8 mode.",
-                )
-        elif isinstance(disk_qc, str) and quant_config is None:
-            quant_config = build_quant_config(disk_qc)
-            logger.info(
-                "Auto-detected quantization from transformer config.json: method=%s",
-                disk_qc,
-            )
+        quant_config = resolve_quant_config_from_disk(quant_config, config["quantization_config"])
 
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
@@ -297,7 +255,9 @@ def get_wan22_pre_process_func(
     return pre_process_func
 
 
-class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin):
+class Wan22Pipeline(
+    nn.Module, PipelineParallelMixin, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin
+):
     def __init__(
         self,
         *,
@@ -460,7 +420,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
         attention_kwargs: dict[str, Any],
         latent_condition: torch.Tensor | None = None,
         first_frame_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
         with self.progress_bar(total=len(timesteps)) as pbar:
@@ -858,7 +818,11 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
             output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
         )
 
-    def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
+    def predict_noise(
+        self,
+        current_model: nn.Module | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | IntermediateTensors:
         """
         Forward pass through transformer to predict noise.
 
@@ -867,11 +831,12 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipe
             **kwargs: Arguments to pass to the transformer
 
         Returns:
-            Predicted noise tensor
+            Predicted noise tensor or IntermediateTensors on non-last PP stages.
         """
         if current_model is None:
             current_model = self.transformer
-        return current_model(**kwargs)[0]
+        result = current_model(**kwargs)
+        return result if isinstance(result, IntermediateTensors) else result[0]
 
     def encode_prompt(
         self,

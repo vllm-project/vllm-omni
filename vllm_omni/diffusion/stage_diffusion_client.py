@@ -17,6 +17,7 @@ from threading import Thread
 from typing import TYPE_CHECKING, Any
 
 import zmq
+import zmq.asyncio
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -124,12 +125,20 @@ class StageDiffusionClient(StageClientBase):
         self.engine_input_source = getattr(metadata, "engine_input_source", [])
         self._proc = proc
         self._owns_process = proc is not None
+        # Expose the ZMQ addresses on the instance so callers (e.g.
+        # ``StagePool._client_input_addr``) can identify the diffusion
+        # replica by its bound address.
+        self.request_address = request_address
+        self.response_address = response_address
 
         self._zmq_ctx = zmq.Context()
         self._request_socket = self._zmq_ctx.socket(zmq.PUSH)
         self._request_socket.connect(request_address)
         self._response_socket = self._zmq_ctx.socket(zmq.PULL)
         self._response_socket.connect(response_address)
+
+        self._response_poller = zmq.asyncio.Poller()
+        self._response_poller.register(self._response_socket, zmq.POLLIN)
 
         self._encoder = OmniMsgpackEncoder()
         self._decoder = OmniMsgpackDecoder()
@@ -468,17 +477,27 @@ class StageDiffusionClient(StageClientBase):
         try:
             while True:
                 self._drain_responses()
-                if rpc_id in self._rpc_results:
-                    return self._rpc_results.pop(rpc_id)
+                result = self._rpc_results.pop(rpc_id, None)
+                if result is not None:
+                    return result
                 if self._engine_dead or (self._owns_process and self._proc is not None and not self._proc.is_alive()):
                     self._engine_dead = True
                     raise EngineDeadError(
                         f"StageDiffusionProc died while waiting for "
                         f"collective_rpc '{method}' (exit code {self._proc.exitcode})"
                     )
-                if deadline and time.monotonic() > deadline:
+                if deadline is not None and time.monotonic() > deadline:
                     raise TimeoutError(f"collective_rpc_async '{method}' timed out after {timeout}s")
-                await asyncio.sleep(0.01)
+                # Block (async) until data arrives on the ZMQ response
+                # socket or until the timeout expires, then loop back to
+                # drain and check.
+                if deadline is not None:
+                    poll_timeout_ms = max(int((deadline - time.monotonic()) * 1000), 0)
+                else:
+                    poll_timeout_ms = 100
+                # no exception raised on timeout (capped at 100ms so the
+                # engine-dead check still fires regularly).
+                await self._response_poller.poll(timeout=min(poll_timeout_ms, 100))
         finally:
             self._pending_rpcs.discard(rpc_id)
 

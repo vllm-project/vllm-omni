@@ -554,10 +554,10 @@ class CUDAGraphDecoderWrapper:
         chunk_size: int = 300,
         left_context_size: int = 25,
     ) -> torch.Tensor:
+        wavs = []
         start_index = 0
         total_len = codes.shape[-1]
         total_upsample = self.decoder.total_upsample
-        wav_out = None
 
         while start_index < total_len:
             end_index = min(start_index + chunk_size, total_len)
@@ -566,21 +566,16 @@ class CUDAGraphDecoderWrapper:
             codes_chunk = codes[..., start_index - context_size : end_index]
             wav_chunk = self._decode(codes_chunk, clone_graph_output=False)
 
-            if wav_out is None:
-                wav_out = torch.empty(
-                    (*wav_chunk.shape[:-1], total_len * total_upsample),
-                    dtype=wav_chunk.dtype,
-                    device=wav_chunk.device,
-                )
-            src_start = context_size * total_upsample
-            dst_start = start_index * total_upsample
-            dst_end = end_index * total_upsample
-            wav_out[..., dst_start:dst_end].copy_(wav_chunk[..., src_start:])
+            # Keep origin/main's concat semantics: Qwen3-Omni can return a chunk
+            # that is shorter than the nominal code_len * total_upsample length.
+            # Clone each slice because graph outputs are static buffers that later
+            # replays may overwrite.
+            wavs.append(wav_chunk[..., context_size * total_upsample :].clone())
             start_index = end_index
 
-        if wav_out is None:
+        if not wavs:
             return self.decoder(codes)
-        return wav_out
+        return torch.cat(wavs, dim=-1)
 
     def batched_chunked_decode_with_cudagraph(
         self,
