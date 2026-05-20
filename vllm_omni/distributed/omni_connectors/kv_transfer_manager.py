@@ -831,6 +831,10 @@ class OmniKVTransferManager:
         num_layers = len(kv_caches)
         key_cache: list[torch.Tensor | None] = [None] * num_layers
         value_cache: list[torch.Tensor | None] = [None] * num_layers
+        # Track the global max_block across all layers so the receiving
+        # side can clamp block_ids that were valid on the sender but may be
+        # out of range in the receiver's own BlockManager (multi-CLI layout).
+        sender_max_block: int | None = None
 
         for layer_idx, layer_kv in enumerate(kv_caches):
             kv_pair = normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=layer_idx)
@@ -846,7 +850,19 @@ class OmniKVTransferManager:
 
             # Validate block IDs - shape: [num_blocks, block_size, n_heads, head_dim]
             max_block = min(key_blocks.shape[0], value_blocks.shape[0]) - 1
+            if sender_max_block is None or max_block > sender_max_block:
+                sender_max_block = max_block
             valid_ids = [bid for bid in block_ids if 0 <= bid <= max_block]
+            if len(valid_ids) < len(block_ids):
+                logger.warning(
+                    "Layer %d for request %s: %d/%d block_ids out of range "
+                    "(max_block=%d). Multi-CLI block table mismatch suspected.",
+                    layer_idx,
+                    req_id,
+                    len(block_ids) - len(valid_ids),
+                    len(block_ids),
+                    max_block,
+                )
             if not valid_ids:
                 continue
 
@@ -875,6 +891,10 @@ class OmniKVTransferManager:
                 "num_layers": num_layers,
                 "dtype": str(cache_dtype),
                 "seq_len": seq_len,
+                # Sender's maximum valid block index — propagated so the
+                # receiving side can clamp block_ids that are out of range
+                # in its own BlockManager (multi-CLI / multi-subprocess layout).
+                "sender_max_block": sender_max_block,
                 **(custom_metadata or {}),
             },
         )
@@ -1131,6 +1151,25 @@ class OmniKVTransferManager:
                         elapsed,
                         link_ms,
                     )
+                    # Validate sender block layout metadata for multi-CLI
+                    # diagnostics — warn early if the sender's block table
+                    # differs from what the receiver expects.
+                    if isinstance(data, dict):
+                        meta = data.get("metadata") or {}
+                        sender_max = meta.get("sender_max_block")
+                        bids = data.get("block_ids")
+                        if sender_max is not None and bids:
+                            oob = [b for b in bids if b > sender_max]
+                            if oob:
+                                logger.warning(
+                                    "KV cache for %s has %d block_ids exceeding "
+                                    "sender_max_block=%d — multi-CLI block table "
+                                    "mismatch. Out-of-range IDs: %s",
+                                    request_id,
+                                    len(oob),
+                                    sender_max,
+                                    oob[:5],
+                                )
                     return data, total_size
 
                 if time.time() - start_time > timeout:
