@@ -119,11 +119,6 @@ class ChunkState:
 
     Lives inside ``DiffusionRequestState.extra["chunks"]`` (keyed by
     ``chunk_idx``).
-
-    Each chunk owns its own ``scheduler`` instance (deepcopied from the
-    pipeline's scheduler by ``prepare_encode``) because multi-step ODE solvers
-    (e.g. ``FlowUniPCMultistepScheduler``) are stateful — they track per-step
-    ``model_outputs`` that must not leak between chunks.
     """
 
     idx: int

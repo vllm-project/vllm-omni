@@ -70,8 +70,9 @@ class _Progress:
     frames_committed: int = 0
     next_chunk_idx: int = 0
     batch_size: int = 0
-
-    chunks_at: list[deque[_InFlightChunk]] = field(default_factory=list) # chunks that will be processed by rank r at the current micro-step
+    
+    # chunks that will be processed by rank r at the current micro-step
+    chunks_at: list[deque[_InFlightChunk]] = field(default_factory=list) 
 
     @property
     def output_chunks_target(self) -> int:

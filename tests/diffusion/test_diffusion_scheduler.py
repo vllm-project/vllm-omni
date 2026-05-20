@@ -1071,7 +1071,7 @@ class TestStreamBatchScheduler:
 
         out1 = scheduler.schedule()
         assert _new_ids(out1) == []
-        finished = scheduler.update_from_output(out1, _make_stream_output(req_a, finished=True))
+        scheduler.update_from_output(out1, _make_stream_output(req_a, finished=True))
         scheduler.pop_request_state(req_a)
 
         out2 = scheduler.schedule()

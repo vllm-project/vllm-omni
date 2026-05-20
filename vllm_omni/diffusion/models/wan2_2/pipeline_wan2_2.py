@@ -1545,7 +1545,11 @@ class Wan22Pipeline(
                 frames = torch.cat([frames, pad], dim=0)
 
             # [n, C, H, W] -> [1, C, n, H, W]
-            control = frames.permute(1, 0, 2, 3).unsqueeze(0).to(device=self.device, dtype=self.vae.dtype)
+            control = (
+                frames.permute(1, 0, 2, 3)
+                .unsqueeze(0)
+                .to(device=self.device, dtype=self.vae.dtype)
+            )
             clean = retrieve_latents(self.vae.encode(control), sample_mode="argmax")
             clean = ((clean.float() - latents_mean.to(clean.dtype)) * latents_inv_std.to(clean.dtype)).to(self.vae.dtype)
             noise = torch.randn_like(clean)
