@@ -1589,7 +1589,13 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
             ]
 
         self._sampler: Sampler | None = None
-        self._eos_token_id: int = tokenizer.eos_token_id
+        self._eos_token_id: int | None = tokenizer.eos_token_id
+        if self._eos_token_id is None:
+            logger.warning(
+                "HunyuanImage3 tokenizer has no eos_token_id; "
+                "set stop_token_ids explicitly in default_sampling_params "
+                "or the ratio-phase EOS termination will be unavailable"
+            )
         # Lazily built on first sample() call so we can pick up logits.device
         # without guessing during init. See `sample()` for the comprehension
         # fast path that uses this.
@@ -2026,9 +2032,17 @@ class HunyuanImage3ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppo
                 logits[req_idx, forced] = 0
             elif last_token == self._size_token_id:
                 self._apply_ratio_restriction(logits, req_idx, min_score)
-            elif last_token in self._all_ratio_ids:
-                logits[req_idx].fill_(min_score)
-                logits[req_idx, self._eos_token_id] = 0
+            elif self._eos_token_id is not None and last_token in self._all_ratio_ids:
+                # After emitting a ratio token, force EOS as the next step.
+                # Guard against NPU tokenizer mismatch: if _eos_token_id is
+                # not listed in SamplingParams.stop_token_ids the engine loop
+                # will never detect termination, causing an infinite hang.
+                # Only force when the two signals agree.
+                sp = sampling_metadata.sampling_params
+                stop_ids: set[int] = set(sp.stop_token_ids) if sp is not None and sp.stop_token_ids else set()
+                if self._eos_token_id in stop_ids:
+                    logits[req_idx].fill_(min_score)
+                    logits[req_idx, self._eos_token_id] = 0
 
         return self._sampler(logits=logits, sampling_metadata=sampling_metadata)
 
