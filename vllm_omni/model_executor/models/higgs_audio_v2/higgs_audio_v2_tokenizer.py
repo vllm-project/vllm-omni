@@ -208,110 +208,72 @@ def _build_delay_pattern(codes: torch.Tensor) -> torch.Tensor:
 
 
 _ENCODER_CACHE: Any | None = None
+_K2_OMNIVOICE_REPO = "k2-fsa/OmniVoice"
+_K2_OMNIVOICE_SUBDIR = "audio_tokenizer"
 
 
-def _load_upstream_boson_tokenizer(
-    tokenizer_id: str = "bosonai/higgs-audio-v2-tokenizer",
-):
-    """Construct + weight-load the upstream ``HiggsAudioTokenizer`` directly.
+def _load_audio_tokenizer():
+    """Load the higgs-audio v2 codec via HF ``HiggsAudioV2TokenizerModel``.
 
-    Bypasses ``boson_multimodal.load_higgs_audio_tokenizer`` because the Hub's
-    ``config.json`` has been updated to the new HF nested-config schema
-    (``acoustic_model_config``, ``semantic_model_config``) that the older
-    upstream constructor signature doesn't accept. We pass only the kwargs
-    ``HiggsAudioTokenizer.__init__`` actually consumes, mapped from the new
-    schema where they differ.
+    The boson-ai standalone tokenizer repo (``bosonai/higgs-audio-v2-tokenizer``)
+    ships a ``model.safetensors`` that is actually a copy of the 3B talker LM,
+    not the codec — pointing HF's ``from_pretrained`` at it yields an
+    encoder/decoder with randomly initialized structural weights, producing
+    noise codes at encode time. The k2-fsa OmniVoice repo bundles the same
+    codec weights repackaged under
+    ``audio_tokenizer/{config.json,model.safetensors,preprocessor_config.json}``
+    with key naming aligned to ``HiggsAudioV2TokenizerModel``'s class layout
+    (``acoustic_encoder.*`` / ``acoustic_decoder.*`` / ``quantizer.quantizers.*``
+    / ``fc/fc2`` / ``semantic_model.*``), so HF can load it directly.
+
+    Only the ``audio_tokenizer/`` subdirectory (~806 MB) is downloaded.
     """
-    from boson_multimodal.audio_processing.higgs_audio_tokenizer import (
-        HiggsAudioTokenizer,
-    )
     from huggingface_hub import snapshot_download
+    from transformers import HiggsAudioV2TokenizerModel
 
-    snapshot_path = snapshot_download(tokenizer_id)
-    config_path = os.path.join(snapshot_path, "config.json")
-    weights_path = os.path.join(snapshot_path, "model.pth")
-    import json
-
-    with open(config_path, encoding="utf-8") as f:
-        cfg = json.load(f)
-    acoustic_cfg = cfg.get("acoustic_model_config") or {}
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = HiggsAudioTokenizer(
-        # Map the new HF nested config to the upstream constructor signature.
-        n_filters=32,
-        D=int(acoustic_cfg.get("hidden_size", 256)),
-        target_bandwidths=[1, 1.5, 2, 4, 6],
-        # downsampling_ratios product = sample_rate / frame_rate; for the
-        # higgs-v2 tokenizer this is [8, 5, 4, 2, 3] = 960 (25 Hz at 24 kHz).
-        ratios=list(acoustic_cfg.get("downsampling_ratios", [8, 5, 4, 2, 3])),
-        sample_rate=int(cfg.get("sample_rate", 24000)),
-        bins=int(cfg.get("codebook_size", 1024)),
-        n_q=int(acoustic_cfg.get("n_codebooks", 8)) - 1 if int(acoustic_cfg.get("n_codebooks", 8)) == 9 else 8,
-        codebook_dim=int(cfg.get("codebook_dim", 64)),
-        semantic_techer="hubert_base_general",
-        semantic_sample_rate=int(cfg.get("semantic_sample_rate", 16000)),
-        device=device,
+    repo_path = snapshot_download(
+        _K2_OMNIVOICE_REPO,
+        allow_patterns=[f"{_K2_OMNIVOICE_SUBDIR}/*"],
     )
-    state_dict = torch.load(weights_path, map_location=device, weights_only=True)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing:
-        # Only flag the structural keys; some keys (e.g. semantic_model
-        # internals re-initialized from facebook/hubert-base-ls960 via
-        # HuggingFace AutoModel.from_pretrained inside the tokenizer constructor)
-        # are expected.
-        critical_missing = [
-            k for k in missing
-            if not k.startswith(("semantic_model.", "_codebook.inited"))
-        ]
-        if critical_missing:
-            raise RuntimeError(
-                f"upstream higgs audio tokenizer is missing {len(critical_missing)} "
-                f"non-semantic-model params: {critical_missing[:5]}"
-            )
-    return model.to(device).eval()
+    audio_tokenizer_dir = os.path.join(repo_path, _K2_OMNIVOICE_SUBDIR)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = HiggsAudioV2TokenizerModel.from_pretrained(audio_tokenizer_dir).to(device)
+    return model.eval()
 
 
 def _encode_ref_audio_codes(
     wav: "np.ndarray",
     sr: int,
-    *,
-    tokenizer_id: str = "bosonai/higgs-audio-v2-tokenizer",
 ) -> torch.Tensor:
-    """Encode a single ref clip to codec codes via the upstream boson tokenizer.
-
-    The HF transformers ``HiggsAudioV2TokenizerModel.from_pretrained`` can't
-    load the boson-ai ``model.pth`` — the Hub's ``model.safetensors`` contains
-    the talker weights, not the encoder/decoder — so the ``audio_tokenizer``
-    attached to ``HiggsAudioV2Processor`` runs on randomly-initialized weights
-    and produces noise codes. We instead instantiate the upstream
-    ``HiggsAudioTokenizer`` directly (see :func:`_load_upstream_boson_tokenizer`),
-    which loads ``model.pth`` cleanly.
+    """Encode a single ref clip to codec codes via HF ``HiggsAudioV2TokenizerModel``.
 
     Returns shape ``[num_codebooks, T_raw]`` (before BOS/EOS + delay-pattern wrap).
     """
+    import torchaudio
+
     global _ENCODER_CACHE
     if _ENCODER_CACHE is None:
         try:
-            _ENCODER_CACHE = _load_upstream_boson_tokenizer(tokenizer_id)
+            _ENCODER_CACHE = _load_audio_tokenizer()
         except ImportError as exc:
-            extra_path = os.environ.get("HIGGS_AUDIO_BOSON_MULTIMODAL_PATH")
             raise RuntimeError(
-                "higgs_audio_v2 voice clone needs the upstream "
-                "`boson_multimodal` package on PYTHONPATH (the HF transformers "
-                "audio_tokenizer model class cannot load boson-ai's model.pth). "
-                "Install it via `pip install boson-multimodal` or set "
-                "HIGGS_AUDIO_BOSON_MULTIMODAL_PATH to a checked-out copy of "
-                "https://github.com/boson-ai/higgs-audio."
-                + (f" HIGGS_AUDIO_BOSON_MULTIMODAL_PATH={extra_path!r}" if extra_path else "")
+                "higgs_audio_v2 voice clone needs `transformers>=5.3.0` "
+                "(which ships the HiggsAudioV2TokenizerModel class). "
+                "Install via `pip install -U 'transformers>=5.3.0'`."
             ) from exc
 
-    # ``HiggsAudioTokenizer.encode`` accepts either a path or a raw waveform;
-    # its internal feature extractor resamples to the configured sample rate.
-    codes = _ENCODER_CACHE.encode(wav, sr=sr) if sr else _ENCODER_CACHE.encode(wav)
-    if isinstance(codes, torch.Tensor):
-        return codes.detach().to("cpu").long()
-    return torch.as_tensor(codes, dtype=torch.long)
+    target_sr = int(getattr(_ENCODER_CACHE.config, "sample_rate", 24000))
+    wav_t = torch.as_tensor(wav, dtype=torch.float32).reshape(-1)
+    if sr and sr != target_sr:
+        wav_t = torchaudio.functional.resample(wav_t, sr, target_sr)
+    # HF encode() expects (batch=1, channels=1, num_samples).
+    input_values = wav_t.unsqueeze(0).unsqueeze(0).to(_ENCODER_CACHE.device)
+    with torch.inference_mode():
+        codes = _ENCODER_CACHE.encode(input_values, return_dict=False)
+    # codes shape: (batch=1, num_quantizers, codes_length) -> (num_quantizers, T).
+    if codes.dim() == 3:
+        codes = codes.squeeze(0)
+    return codes.detach().to("cpu").long()
 
 
 def build_voice_clone_conversation(

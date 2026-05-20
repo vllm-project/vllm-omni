@@ -1529,12 +1529,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Plain-text path: runs ``build_plain_text_prompt`` and returns the
         token-only prompt. Voice-clone path (``ref_audio`` + ``ref_text``):
         resolves the reference clip via ``_resolve_ref_audio``, runs
-        ``build_voice_clone_prompt`` (which encodes the clip through the
-        upstream ``boson_multimodal`` audio tokenizer — the HF processor's
-        bundled audio tokenizer can't load the boson ``model.pth``), and
-        attaches the encoded ``audio_input_ids`` + ``audio_input_ids_mask``
-        tensors via ``additional_information`` so the talker substitutes
-        them at the prompt-side audio placeholders.
+        ``build_voice_clone_prompt`` (which encodes the clip through HF's
+        ``HiggsAudioV2TokenizerModel`` loaded from the k2-fsa/OmniVoice
+        ``audio_tokenizer/`` subdirectory), and attaches the encoded
+        ``audio_input_ids`` + ``audio_input_ids_mask`` tensors via
+        ``additional_information`` so the talker substitutes them at the
+        prompt-side audio placeholders.
         """
         from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_v2_tokenizer import (
             build_plain_text_prompt,
