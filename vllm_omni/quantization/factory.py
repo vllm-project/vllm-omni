@@ -48,6 +48,29 @@ def _build_mxfp8(**kw: Any) -> QuantizationConfig:
     return DiffusionMXFP8Config(**kw)
 
 
+def _build_mxfp4(**kw: Any) -> QuantizationConfig:
+    """Lazy import for W4A4 MXFP4 diffusion config (NPU only)."""
+    from .mxfp4_config import DiffusionMXFP4Config
+
+    return DiffusionMXFP4Config(**kw)
+
+
+def _build_mxfp4_dualscale(**kw: Any) -> QuantizationConfig:
+    """Lazy import for MXFP4 DualScale + BF16 mixed diffusion config (NPU only).
+
+    Offline mode (is_checkpoint_serialized=True):
+        ignored_layers from config.json marks interleaved BF16 fallback layers.
+        All other linear layers use W4A4 MXFP4 DualScale.
+
+    Online mode (is_checkpoint_serialized=False):
+        num_bf16_fallback_layers leading transformer blocks use BF16 original weights
+        (default 5 when not specified). Remaining blocks use W4A4 MXFP4 DualScale online.
+    """
+    from .mxfp4_config import DiffusionMXFP4DualScaleMixedConfig
+
+    return DiffusionMXFP4DualScaleMixedConfig(**kw)
+
+
 def _build_inc(**kw: Any) -> QuantizationConfig:
     """Lazy import for INC/AutoRound config with checkpoint kwarg normalization."""
     from .inc_config import OmniINCConfig
@@ -66,6 +89,8 @@ _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "gguf": _build_gguf,
     "int8": _build_int8,
     "mxfp8": _build_mxfp8,
+    "mxfp4": _build_mxfp4,
+    "mxfp4_dualscale": _build_mxfp4_dualscale,
     "inc": _build_inc,
     "auto-round": _build_inc,
     "auto_round": _build_inc,
@@ -255,3 +280,80 @@ def build_quant_config(
         return _build_from_method_and_config(method, merged)
 
     raise TypeError(f"quantization config must be str, dict, QuantizationConfig, or None, got {type(spec).__name__}")
+
+
+def _disk_marks_serialized(qc_kwargs: dict[str, Any], quant_config: object) -> bool:
+    """Return True when config.json says serialized but the active quant_config does not.
+
+    Matches any flag following the is_checkpoint_*_serialized naming convention,
+    so new quant methods don't require updating an explicit allowlist.
+    """
+    for key, val in qc_kwargs.items():
+        if key.startswith("is_checkpoint_") and key.endswith("_serialized"):
+            if val and hasattr(quant_config, key) and not getattr(quant_config, key):
+                return True
+    return False
+
+
+def resolve_quant_config_from_disk(
+    quant_config: QuantizationConfig | None,
+    disk_qc: dict[str, Any] | str | None,
+) -> QuantizationConfig | None:
+    """Reconcile an active quant_config against quantization_config from a transformer's config.json.
+
+    Used when loading individual transformer blocks that each have their own config.json
+    (e.g. cascade models with separate transformer and transformer_2 directories).
+
+    Rules:
+      - disk_qc is None: return quant_config unchanged.
+      - quant_config is None: auto-detect from disk_qc (full build).
+      - Methods mismatch: raise ValueError — prevents silent weight corruption.
+      - Disk marks serialized but quant_config is online: rebuild from disk.
+      - ignored_layers differ: rebuild from disk (per-transformer BF16 routing).
+    """
+    if disk_qc is None:
+        return quant_config
+
+    if isinstance(disk_qc, str):
+        if quant_config is None:
+            logger.info("Auto-detected quantization from config.json: method=%s", disk_qc)
+            return build_quant_config(disk_qc)
+        return quant_config
+
+    if not isinstance(disk_qc, Mapping) or "quant_method" not in disk_qc:
+        return quant_config
+
+    qc_method: str = disk_qc["quant_method"]
+    qc_kwargs: dict[str, Any] = {k: v for k, v in disk_qc.items() if k != "quant_method"}
+
+    if quant_config is None:
+        logger.info(
+            "Auto-detected quantization from config.json: method=%s kwargs=%s",
+            qc_method,
+            qc_kwargs,
+        )
+        return build_quant_config(qc_method, **qc_kwargs)
+
+    if quant_config.get_name() != qc_method:
+        raise ValueError(
+            f"Checkpoint config.json declares quant_method={qc_method!r} but the "
+            f"active quantization config is {quant_config.get_name()!r}. "
+            "Pass a matching --quantization flag or omit it for auto-detection."
+        )
+
+    if _disk_marks_serialized(qc_kwargs, quant_config):
+        logger.info(
+            "config.json marks checkpoint as serialized; switching to offline %s mode.",
+            qc_method,
+        )
+        return build_quant_config(qc_method, **qc_kwargs)
+
+    if (
+        "ignored_layers" in qc_kwargs
+        and hasattr(quant_config, "ignored_layers")
+        and set(qc_kwargs.get("ignored_layers") or []) != set(quant_config.ignored_layers or [])
+    ):
+        logger.info("config.json ignored_layers differs from active config; rebuilding quant_config.")
+        return build_quant_config(qc_method, **qc_kwargs)
+
+    return quant_config
