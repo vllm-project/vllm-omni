@@ -2474,10 +2474,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             except Exception as e:  # pragma: no cover - safeguard
                 logger.warning("Failed to parse LoRA request: %s", e)
 
-        gen_prompt: OmniTextPrompt = {
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
-        }
+        gen_prompt: OmniTextPrompt = {"prompt": prompt}
+        if negative_prompt is not None:
+            gen_prompt["negative_prompt"] = negative_prompt
         if pil_images:
             if len(pil_images) == 1:
                 gen_prompt["multi_modal_data"] = {"image": pil_images[0]}
@@ -2645,10 +2644,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     logger.warning("Failed to decode reference image: %s", e)
 
             # Build generation kwargs
-            gen_prompt: OmniTextPrompt = {
-                "prompt": prompt,
-                "negative_prompt": negative_prompt,
-            }
+            gen_prompt: OmniTextPrompt = {"prompt": prompt}
+            if negative_prompt is not None:
+                gen_prompt["negative_prompt"] = negative_prompt
             gen_params = OmniDiffusionSamplingParams(
                 height=height,
                 width=width,

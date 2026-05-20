@@ -5,6 +5,7 @@
 import random
 from dataclasses import dataclass, field
 
+from vllm_omni.diffusion.prompt_utils import has_negative_prompt, normalize_omni_diffusion_prompts
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 
@@ -31,6 +32,8 @@ class OmniDiffusionRequest:
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
+        self.prompts = normalize_omni_diffusion_prompts(self.prompts)
+
         # When neither a generator nor a seed is provided, assign a random seed
         # so that all ranks derive the same generator state.
         if self.sampling_params.generator is None and self.sampling_params.seed is None:
@@ -47,9 +50,7 @@ class OmniDiffusionRequest:
             self.sampling_params.guidance_scale = 1.0
 
         # Set do_classifier_free_guidance based on guidance scale and negative prompt
-        if self.sampling_params.guidance_scale > 1.0 and any(
-            (not isinstance(p, str) and p.get("negative_prompt")) for p in self.prompts
-        ):
+        if self.sampling_params.guidance_scale > 1.0 and has_negative_prompt(self.prompts):
             self.sampling_params.do_classifier_free_guidance = True
 
         # Auto-fill guidance_scale_2 from the (now-resolved) guidance_scale

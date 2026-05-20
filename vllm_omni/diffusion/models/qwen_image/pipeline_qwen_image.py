@@ -35,6 +35,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
+from vllm_omni.diffusion.prompt_utils import extract_batch_prompts
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.prompt_utils import (
     validate_prompt_sequence_lengths,
@@ -602,14 +603,8 @@ class QwenImagePipeline(nn.Module, QwenImageCFGParallelMixin, DiffusionPipelineP
 
     def _extract_prompts(self, prompts):
         """Extract prompt and negative_prompt from OmniPromptType list."""
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in prompts] or None
-        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in prompts):
-            negative_prompt = None
-        elif prompts:
-            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in prompts]
-        else:
-            negative_prompt = None
-        return prompt, negative_prompt
+        prompt, negative_prompt = extract_batch_prompts(prompts)
+        return prompt or None, negative_prompt
 
     def _prepare_generation_context(
         self,
