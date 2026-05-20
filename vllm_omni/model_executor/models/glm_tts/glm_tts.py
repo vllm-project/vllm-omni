@@ -398,7 +398,7 @@ class GLMTTSMultiModalProcessor(BaseMultiModalProcessor[GLMTTSMultiModalProcessi
                 tok_path = os.path.join(model_dir, _GLM_TTS_TOKENIZER_SUBDIR)
                 if not os.path.isdir(tok_path):
                     tok_path = model_dir
-            trust_remote_code = bool(getattr(self.info.ctx.model_config, "trust_remote_code", True))
+            trust_remote_code = bool(getattr(self.info.ctx.model_config, "trust_remote_code", False))
             self.tokenizer = load_glm_tts_tokenizer(
                 tok_path,
                 model_name_or_path=self.info.ctx.model_config.model,

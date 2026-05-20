@@ -63,12 +63,17 @@ dev = [
     "funasr>=1.0.0",
     "lpips>=0.1.4", # for quantization fp8
     "orjson>=3.11.7", # to make v1/embeddings API fast
-    "voxcpm>=2.0.2", # for voxcpm model Test
+    "voxcpm>=2.0.2", # for VoxCPM2 path-locating in tests
     "torchdiffeq>=0.2.5" # for covo_audio Test
 ]
 
 demo = [
     "gradio>=6.7.0",
+]
+
+# Local-test-only extras
+local = [
+    "FlagEmbedding",
 ]
 
 docs = [
@@ -184,6 +189,7 @@ markers = [
     "core_model: L1&L2 tests (run in each PR)",
     "advanced_model: L3 level tests (run on each merge)",
     "full_model: L4 level tests (run nightly)",
+    "local_model: tests (run locally)",
     # function module markers
     "diffusion: Diffusion model tests",
     "omni: Omni model tests",
