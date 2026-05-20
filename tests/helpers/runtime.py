@@ -2128,6 +2128,34 @@ def _validate_qwen3_tts_offline_request(
     return text_str, x_vector_only_mode
 
 
+def _build_qwen3_tts_additional_information(
+    text_str: str,
+    tts_kw: dict[str, Any],
+    x_vector_only_mode: bool = False,
+) -> dict[str, Any]:
+    """Build ``additional_information`` dict for a Qwen3-TTS offline request."""
+    additional_information: dict[str, Any] = {
+        "task_type": [tts_kw.get("task_type", "CustomVoice")],
+        "text": [text_str],
+        "language": [tts_kw.get("language", "Auto")],
+        "speaker": [tts_kw.get("speaker", "Vivian")],
+        "max_new_tokens": [int(tts_kw.get("max_new_tokens", 2048))],
+    }
+    ref_audio = tts_kw.get("ref_audio")
+    ref_text = tts_kw.get("ref_text")
+    speaker_embedding = tts_kw.get("speaker_embedding")
+
+    if ref_audio is not None:
+        additional_information["ref_audio"] = [ref_audio]
+    if ref_text is not None:
+        additional_information["ref_text"] = [ref_text]
+    if speaker_embedding is not None:
+        additional_information["voice_clone_prompt"] = [{"ref_spk_embedding": speaker_embedding}]
+    if x_vector_only_mode:
+        additional_information["x_vector_only_mode"] = [True]
+    return additional_information
+
+
 class OmniRunner:
     def __init__(
         self,
@@ -2250,32 +2278,11 @@ class OmniRunner:
         is_tts_model = "Qwen3-TTS" in self.model_name or "qwen3_tts" in self.model_name.lower()
         if is_tts_model and modalities == ["audio"]:
             tts_kw = mm_processor_kwargs or {}
-            task_type = tts_kw.get("task_type", "CustomVoice")
-            speaker = tts_kw.get("speaker", "Vivian")
-            language = tts_kw.get("language", "Auto")
-            max_new_tokens = int(tts_kw.get("max_new_tokens", 2048))
-            ref_audio = tts_kw.get("ref_audio")
-            ref_text = tts_kw.get("ref_text")
-            speaker_embedding = tts_kw.get("speaker_embedding")
 
             omni_inputs: list[TextPrompt] = []
             for prompt_text in prompts:
                 text_str, x_vector_only_mode = _validate_qwen3_tts_offline_request(prompt_text, tts_kw)
-                additional_information: dict[str, Any] = {
-                    "task_type": [task_type],
-                    "text": [text_str],
-                    "language": [language],
-                    "speaker": [speaker],
-                    "max_new_tokens": [max_new_tokens],
-                }
-                if ref_audio is not None:
-                    additional_information["ref_audio"] = [ref_audio]
-                if ref_text is not None:
-                    additional_information["ref_text"] = [ref_text]
-                if speaker_embedding is not None:
-                    additional_information["speaker_embedding"] = [speaker_embedding]
-                if x_vector_only_mode:
-                    additional_information["x_vector_only_mode"] = [True]
+                additional_information = _build_qwen3_tts_additional_information(text_str, tts_kw, x_vector_only_mode)
                 plen = self._estimate_prompt_len(additional_information, self.model_name)
                 input_dict: TextPrompt = {
                     "prompt_token_ids": [0] * plen,

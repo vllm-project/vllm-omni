@@ -3,9 +3,14 @@
 
 import pytest
 
-from tests.helpers.runtime import _validate_qwen3_tts_offline_request
+from tests.helpers.runtime import (
+    _build_qwen3_tts_additional_information,
+    _validate_qwen3_tts_offline_request,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
+
+SPK_EMB = [0.1, 0.2, 0.3]
 
 
 # --- Rejection tests ---
@@ -119,7 +124,6 @@ def test_accepts_base_speaker_embedding_without_ref_text():
 
 
 def test_accepts_base_speaker_embedding_with_ref_audio():
-    """speaker_embedding + ref_audio: embedding takes priority for voice source."""
     text, x_vector = _validate_qwen3_tts_offline_request(
         "Hello",
         {
@@ -136,3 +140,52 @@ def test_accepts_customvoice_default_task():
     text, x_vector = _validate_qwen3_tts_offline_request("Hello", {})
     assert text == "Hello"
     assert x_vector is False
+
+
+# --- additional_information builder tests ---
+
+
+def test_builder_embedding_schema():
+    """Embedding lands in voice_clone_prompt[0].ref_spk_embedding, not speaker_embedding."""
+    info = _build_qwen3_tts_additional_information(
+        "Hello", {"task_type": "Base", "speaker_embedding": SPK_EMB}, x_vector_only_mode=True
+    )
+    vcp = info["voice_clone_prompt"]
+    assert isinstance(vcp, list) and vcp[0]["ref_spk_embedding"] == SPK_EMB
+    assert "speaker_embedding" not in info
+    assert info["x_vector_only_mode"] == [True]
+    assert "ref_audio" not in info
+
+
+def test_builder_embedding_with_ref_audio():
+    """embedding + ref_audio: embedding in voice_clone_prompt, not silently dropped."""
+    info = _build_qwen3_tts_additional_information(
+        "Hello",
+        {"task_type": "Base", "speaker_embedding": SPK_EMB, "ref_audio": "data:audio/wav;base64,AAA="},
+        x_vector_only_mode=True,
+    )
+    vcp = info["voice_clone_prompt"]
+    assert vcp[0]["ref_spk_embedding"] == SPK_EMB
+    assert "speaker_embedding" not in info
+
+
+def test_builder_ref_audio_no_embedding():
+    """ref_audio path: no voice_clone_prompt, no speaker_embedding leak."""
+    info = _build_qwen3_tts_additional_information(
+        "Hello",
+        {"task_type": "Base", "ref_audio": "data:audio/wav;base64,AAA=", "ref_text": "transcript"},
+    )
+    assert info["ref_audio"] == ["data:audio/wav;base64,AAA="]
+    assert "voice_clone_prompt" not in info
+    assert "speaker_embedding" not in info
+
+
+def test_validate_then_build_embedding():
+    """End-to-end: validate + build for embedding path."""
+    tts_kw = {"task_type": "Base", "speaker_embedding": SPK_EMB}
+    text_str, x_vector = _validate_qwen3_tts_offline_request("Hi", tts_kw)
+    info = _build_qwen3_tts_additional_information(text_str, tts_kw, x_vector)
+    assert x_vector is True
+    assert info["voice_clone_prompt"][0]["ref_spk_embedding"] == SPK_EMB
+    assert info["x_vector_only_mode"] == [True]
+    assert "speaker_embedding" not in info
