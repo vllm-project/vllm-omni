@@ -5,6 +5,7 @@ vLLM-Omni provides an OpenAI-compatible API for text-to-speech (TTS) generation.
 - **Qwen3-TTS** (`Qwen/Qwen3-TTS-12Hz-*`) -- Qwen3-based TTS with CustomVoice, VoiceDesign, and Base (voice cloning) task types. Output: 24 kHz.
 - **Fish Speech S2 Pro** (`fishaudio/s2-pro`) -- Dual-AR TTS with DAC codec. Supports text-to-speech and voice cloning via reference audio. Output: 44.1 kHz.
 - **Voxtral TTS** (`mistralai/Voxtral-4B-TTS-2603`) -- AR + FlowMatching TTS with preset voices. Output: 24 kHz.
+- **FunCineForge** (`FunAudioLLM/Fun-CineForge`) -- Movie dubbing & TTS with voice cloning, optional face embedding and dialogue metadata. Output: 24 kHz.
 
 Each server instance runs a single model (specified at startup via `vllm serve <model> --omni`).
 
@@ -587,6 +588,12 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 | Model | Description |
 |-------|-------------|
 | `openbmb/VoxCPM2` | TTS + voice cloning with built-in speaker presets and uploaded-voice support. Accepts `voice` (preset or uploaded) or `ref_audio` + optional `ref_text`. |
+
+### FunCineForge
+
+| Model | Description |
+|-------|-------------|
+| `FunAudioLLM/Fun-CineForge` | Movie dubbing & voice cloning. Requires `ref_audio` + `ref_text`. Optionally accepts `face_path`, `speech_type`, `speech_len`, and `dialogue` for cinematic dubbing. |
 
 ### MOSS-TTS-Nano
 

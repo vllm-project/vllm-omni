@@ -15,6 +15,7 @@ For the full list of supported architectures across all modalities, see
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 |---|---|---|---|---|---|
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
+| FunCineForge | `FunAudioLLM/Fun-CineForge` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | — |
 | Ming-flash-omni-TTS | `Jonathan1909/Ming-flash-omni-2.0` | — (caption-controlled) | — | caption fields (`instructions`) | — |
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
@@ -140,6 +141,62 @@ python fish_speech/gradio_demo.py --api-base http://localhost:8091  # if server 
 ### Notes
 - Output: 44.1 kHz mono.
 - Streaming PCM player command must use `-r 44100`.
+
+---
+
+## FunCineForge
+
+Movie dubbing & TTS with voice cloning at 24 kHz. Requires `ref_audio` + `ref_text` for every request. Optionally accepts face embeddings and dialogue metadata for cinematic dubbing.
+
+### Launch
+
+```bash
+./examples/online_serving/text_to_speech/funcineforge/run_server.sh
+# or manually:
+vllm serve FunAudioLLM/Fun-CineForge \
+    --deploy-config vllm_omni/deploy/funcineforge.yaml \
+    --omni --port 8091 --trust-remote-code
+```
+
+### Sending requests
+
+```bash
+python examples/online_serving/text_to_speech/funcineforge/speech_client.py \
+    --text "Every closet on a Carnival cruise ship." \
+    --ref-audio https://raw.githubusercontent.com/FunAudioLLM/FunCineForge/main/exps/data/ref.wav \
+    --ref-text "A single middle-aged male speaker with a practical tone."
+```
+
+### Streaming
+
+```bash
+python examples/online_serving/text_to_speech/funcineforge/speech_client.py \
+    --text "Hello world" \
+    --ref-audio ref.wav --ref-text "Voice description." \
+    --stream --output output.pcm
+```
+
+### Face embedding & dialogue (cinematic dubbing)
+
+FunCineForge accepts extra fields beyond standard TTS for movie dubbing:
+
+- `face_path`: Path to a `.npz` file with pre-extracted face embeddings
+- `speech_type`: `旁白` (narration), `独白` (monologue), `对话` (dialogue), `多人` (multi-speaker)
+- `speech_len`: Target speech sequence length
+- `dialogue`: JSON array of per-speaker metadata (start, duration, spk, gender, age)
+
+```bash
+python examples/online_serving/text_to_speech/funcineforge/speech_client.py \
+    --text "The door creaked open." \
+    --ref-audio ref.wav --ref-text "Voice description." \
+    --face-path faces.npz --speech-type "对话" --speech-len 200 \
+    --dialogue-json '[{"start":0,"duration":3,"spk":1,"gender":"男","age":"中年"}]'
+```
+
+### Notes
+- Output: 24 kHz mono WAV.
+- Deploy config: `vllm_omni/deploy/funcineforge.yaml` (2-stage: talker + code2wav, `async_chunk: true`).
+- For offline inference, see [`examples/offline_inference/text_to_speech/funcineforge/`](../../offline_inference/text_to_speech/funcineforge/).
 
 ---
 

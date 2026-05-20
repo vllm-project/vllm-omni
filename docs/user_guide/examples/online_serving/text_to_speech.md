@@ -18,6 +18,7 @@ For the full list of supported architectures across all modalities, see
 | Model | HuggingFace repo | Voice cloning | Streaming | Voice presets / upload | Gradio demo |
 |---|---|---|---|---|---|
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
+| FunCineForge | `FunAudioLLM/Fun-CineForge` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | — |
 | OmniVoice | `k2-fsa/OmniVoice` | (offline only) | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
 | VoxCPM | local model dir | ✓ | ✓ (PCM stream) | — | — |
@@ -407,6 +408,14 @@ The demo handles voice-preset selection and reference-audio upload. `voxtral_tts
 
 ## Example materials
 
+??? abstract "funcineforge/run_server.sh"
+    ``````sh
+    --8<-- "examples/online_serving/text_to_speech/funcineforge/run_server.sh"
+    ``````
+??? abstract "funcineforge/speech_client.py"
+    ``````py
+    --8<-- "examples/online_serving/text_to_speech/funcineforge/speech_client.py"
+    ``````
 ??? abstract "fish_speech/gradio_demo.py"
     ``````py
     --8<-- "examples/online_serving/text_to_speech/fish_speech/gradio_demo.py"
