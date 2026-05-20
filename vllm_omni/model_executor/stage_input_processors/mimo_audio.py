@@ -90,11 +90,11 @@ def _flush_remaining_codes(
 
     length = len(accumulated)
     chunk_length = length % chunk_size
-    if chunk_length == 0:
-        # All frames were already dispatched as complete chunks; nothing left to flush.
-        return _make_finished_sentinel()
-
-    context_length = chunk_length
+    # When the accumulated length aligns with chunk_size boundary (remainder == 0),
+    # we still need to flush the final chunk with full context to give the vocoder
+    # enough attention window — otherwise the tail audio cuts off and produces
+    # voice instability. Fall back to chunk_size as the context length.
+    context_length = chunk_length if chunk_length != 0 else chunk_size
     end_index = min(length, left_context_size + context_length)
 
     # Align with qwen3_omni talker2code2wav_async_chunk: decoder strip uses explicit frame count.
