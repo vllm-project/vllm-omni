@@ -85,9 +85,9 @@ class OpenAICreateSpeechRequest(BaseModel):
     face_path: str | None = Field(
         default=None,
         description=(
-            "Server-local path to a .npz face embedding file for lip-sync "
-            "conditioning. The file must contain 'embeddings' (N, 512) and "
-            "'faceI' (N,) arrays. Only used by FunCineForge."
+            "Server-local path to a .npz or .pkl face embedding file for "
+            "lip-sync conditioning. The file must contain 'embeddings' (N, 512)"
+            " and 'faceI' (N,) arrays. Only used by FunCineForge."
         ),
     )
     speech_type: str | None = Field(

@@ -156,7 +156,7 @@ python examples/offline_inference/text_to_speech/funcineforge/end2end.py \
 ```
 
 ### Face embedding (cinematic dubbing)
-When a pre-extracted face embedding `.npz` file is available (containing `embeddings` and `faceI` arrays), pass it via `--face-path` together with `--speech-len`:
+When a pre-extracted face embedding file is available (`.npz` or `.pkl` containing `embeddings` and `faceI` arrays), pass it via `--face-path` together with `--speech-len`:
 ```bash
 python examples/offline_inference/text_to_speech/funcineforge/end2end.py \
     --ref-audio /path/to/vocal.wav \

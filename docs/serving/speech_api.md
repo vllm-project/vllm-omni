@@ -602,6 +602,15 @@ Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` ne
 |-------|-------------|
 | `FunAudioLLM/Fun-CineForge` | Movie dubbing & voice cloning. Requires `ref_audio` + `ref_text`. Optionally accepts `face_path`, `speech_type`, `speech_len`, and `dialogue` for cinematic dubbing. |
 
+#### Cinematic Dubbing Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `face_path` | string | null | Server-local path to a `.npz` or `.pkl` face embedding file for lip-sync conditioning. Must contain `embeddings` (N, 512) and `faceI` (N,) arrays. |
+| `speech_type` | string | null | Speech style type: `旁白` (narration), `独白` (monologue), `对话` (dialogue), `多人` (multi-speaker). |
+| `speech_len` | integer | null | Target speech sequence length in codec frames (25 Hz). Controls face embedding padding size. |
+| `dialogue` | array | null | Dialogue metadata for multi-speaker dubbing. Each entry: `{"start": float, "duration": float, "spk": int, "gender": str, "age": str}`. |
+
 ### MOSS-TTS-Nano
 
 | Model | Description |

@@ -179,7 +179,7 @@ python examples/online_serving/text_to_speech/funcineforge/speech_client.py \
 
 FunCineForge accepts extra fields beyond standard TTS for movie dubbing:
 
-- `face_path`: Path to a `.npz` file with pre-extracted face embeddings
+- `face_path`: Path to a `.npz` or `.pkl` file with pre-extracted face embeddings
 - `speech_type`: `旁白` (narration), `独白` (monologue), `对话` (dialogue), `多人` (multi-speaker)
 - `speech_len`: Target speech sequence length
 - `dialogue`: JSON array of per-speaker metadata (start, duration, spk, gender, age)
