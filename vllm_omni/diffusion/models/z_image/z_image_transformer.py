@@ -1036,9 +1036,13 @@ class ZImageTransformer2DModel(CachedTransformer):
             (".to_qkv.", ".to_q.", "q"),
             (".to_qkv.", ".to_k.", "k"),
             (".to_qkv.", ".to_v.", "v"),
-            # ffn
-            (".w13", ".w1", 0),
-            (".w13", ".w3", 1),
+            # ffn — trailing dots required: `.w1` without a boundary is a
+            # substring of `.w13.`, so a pre-fused-on-disk checkpoint with
+            # `.w13.qweight` keys (e.g. the SVDQuant NVFP4 converter that
+            # half-swaps gate/up at quant time) would otherwise match
+            # `.w1` and rewrite `.w13.proj_down` → `.w133.proj_down`.
+            (".w13.", ".w1.", 0),
+            (".w13.", ".w3.", 1),
         ]
         # Expose packed shard mappings for LoRA handling of fused projections.
         self.stacked_params_mapping = stacked_params_mapping
