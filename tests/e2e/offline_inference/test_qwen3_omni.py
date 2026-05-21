@@ -16,7 +16,7 @@ import pytest
 from vllm import SamplingParams
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import generate_synthetic_video, generate_synthetic_audio, generate_synthetic_image
+from tests.helpers.media import generate_synthetic_image, generate_synthetic_video
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.config.omni_config import (
     VllmOmniARStageConfig,
@@ -64,9 +64,10 @@ def get_question(prompt_type="text"):
         "video": "Describe the video briefly.",
         "image": "Describe the image.",
         "audio": "Describe the audio.",
-        "text": "What is the capital of the United Kingdom?"
+        "text": "What is the capital of the United Kingdom?",
     }
     return prompts.get(prompt_type, prompts["text"])
+
 
 @pytest.mark.advanced_model
 @pytest.mark.omni
@@ -79,6 +80,7 @@ def test_text_to_text(omni_runner, omni_runner_handler) -> None:
     # Test single completion
     omni_runner_handler.send_omni_request(request_config)
 
+
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -89,6 +91,7 @@ def test_text_to_audio(omni_runner, omni_runner_handler) -> None:
 
     # Test single completion
     omni_runner_handler.send_omni_request(request_config)
+
 
 @pytest.mark.advanced_model
 @pytest.mark.omni
@@ -103,6 +106,7 @@ def test_image_to_text(omni_runner, omni_runner_handler) -> None:
     # Test single completion
     omni_runner_handler.send_omni_request(request_config)
 
+
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -116,6 +120,7 @@ def test_image_to_audio(omni_runner, omni_runner_handler) -> None:
     # Test single completion
     omni_runner_handler.send_omni_request(request_config)
 
+
 @pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
@@ -128,6 +133,7 @@ def test_video_to_text(omni_runner, omni_runner_handler) -> None:
 
     # Test single completion
     omni_runner_handler.send_omni_request(request_config)
+
 
 @pytest.mark.advanced_model
 @pytest.mark.omni
