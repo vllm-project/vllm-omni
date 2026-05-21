@@ -648,3 +648,209 @@ def test_build_messages_keeps_recent_history_text_only():
     assert messages[1] == {"role": "assistant", "content": "recent answer"}
     assert messages[2] == user_message
     assert user_message["content"][-1] == {"type": "text", "text": "current question"}
+
+
+# ---------------------------------------------------------------------------
+# Frame Sampling Strategy Tests
+# ---------------------------------------------------------------------------
+
+
+class TestSampleFramesUniform:
+    """Tests for the 'uniform' sampling strategy."""
+
+    def test_first_last_anchored(self):
+        from vllm_omni.entrypoints.openai.video_stream_samplers import sample_frames
+
+        frames = list(range(10))
+        out = sample_frames(frames, strategy="uniform", num_frames=4)
+        assert out[0] == 0
+        assert out[-1] == 9
+        assert len(out) == 4
+
+    def test_no_truncation_when_buffer_small(self):
+        from vllm_omni.entrypoints.openai.video_stream_samplers import sample_frames
+
+        assert sample_frames([1, 2], strategy="uniform", num_frames=8) == [1, 2]
+
+    def test_single_frame(self):
+        from vllm_omni.entrypoints.openai.video_stream_samplers import sample_frames
+
+        assert sample_frames(["only"], strategy="uniform", num_frames=4) == ["only"]
+
+    def test_empty_buffer(self):
+        from vllm_omni.entrypoints.openai.video_stream_samplers import sample_frames
+
+        assert sample_frames([], strategy="uniform", num_frames=4) == []
+
+
+class TestSampleFramesLatestFrames:
+    """Tests for the 'latest_frames' sampling strategy."""
+
+    def test_takes_tail(self):
+        from vllm_omni.entrypoints.openai.video_stream_samplers import sample_frames
+
+        assert sample_frames(list(range(10)), strategy="latest_frames", num_frames=3) == [7, 8, 9]
+
+    def test_buffer_smaller_than_num_frames(self):
+        from vllm_omni.entrypoints.openai.video_stream_samplers import sample_frames
+
+        assert sample_frames([1, 2], strategy="latest_frames", num_frames=5) == [1, 2]
+
+
+class TestSampleFramesLatestSeconds:
+    """Tests for the 'latest_seconds' sampling strategy."""
+
+    def test_filters_by_window(self):
+        import time as _time
+
+        from vllm_omni.entrypoints.openai.video_stream_samplers import sample_frames
+
+        now = _time.monotonic()
+        frames = ["old", "mid", "new"]
+        ts = [now - 100.0, now - 3.0, now - 1.0]
+        out = sample_frames(
+            frames,
+            strategy="latest_seconds",
+            num_frames=8,
+            window_seconds=5.0,
+            frame_timestamps=ts,
+        )
+        assert out == ["mid", "new"]
+
+    def test_falls_back_when_no_timestamps(self):
+        from vllm_omni.entrypoints.openai.video_stream_samplers import sample_frames
+
+        out = sample_frames(
+            ["a", "b", "c"],
+            strategy="latest_seconds",
+            num_frames=8,
+            window_seconds=5.0,
+        )
+        assert out == ["c"]
+
+    def test_falls_back_when_window_empty(self):
+        import time as _time
+
+        from vllm_omni.entrypoints.openai.video_stream_samplers import sample_frames
+
+        now = _time.monotonic()
+        frames = ["very_old"]
+        ts = [now - 999.0]
+        out = sample_frames(
+            frames,
+            strategy="latest_seconds",
+            num_frames=8,
+            window_seconds=5.0,
+            frame_timestamps=ts,
+        )
+        assert out == ["very_old"]
+
+    def test_subsamples_when_too_many_in_window(self):
+        import time as _time
+
+        from vllm_omni.entrypoints.openai.video_stream_samplers import sample_frames
+
+        now = _time.monotonic()
+        frames = list(range(20))
+        ts = [now - 2.0 + i * 0.1 for i in range(20)]  # all within 2s window
+        out = sample_frames(
+            frames,
+            strategy="latest_seconds",
+            num_frames=4,
+            window_seconds=5.0,
+            frame_timestamps=ts,
+        )
+        assert len(out) == 4
+        assert out[0] == 0
+        assert out[-1] == 19
+
+
+class TestSampleFramesUnknownStrategy:
+    """Unknown strategy falls back to uniform."""
+
+    def test_unknown_falls_back_to_uniform(self):
+        from vllm_omni.entrypoints.openai.video_stream_samplers import sample_frames
+
+        out = sample_frames([1, 2, 3, 4], strategy="bogus", num_frames=2)  # type: ignore[arg-type]
+        assert out == [1, 4]
+
+
+class TestSessionConfigSamplingFields:
+    """session.config correctly exposes sampling_strategy and window_seconds."""
+
+    def test_defaults(self):
+        cfg = StreamingVideoSessionConfig(model="test")
+        assert cfg.sampling_strategy == "uniform"
+        assert cfg.window_seconds == 5.0
+
+    def test_custom_values(self):
+        cfg = StreamingVideoSessionConfig(
+            model="test",
+            sampling_strategy="latest_frames",
+            window_seconds=10.0,
+        )
+        assert cfg.sampling_strategy == "latest_frames"
+        assert cfg.window_seconds == 10.0
+
+
+class TestBuildMessagesSamplingIntegration:
+    """_build_messages respects sampling_strategy."""
+
+    def test_latest_frames_uses_tail(self):
+        handler = OmniStreamingVideoHandler(chat_service=object())
+        f1 = _b64(_make_jpeg(1, 2, 3))
+        f2 = _b64(_make_jpeg(4, 5, 6))
+        f3 = _b64(_make_jpeg(7, 8, 9))
+        cfg = StreamingVideoSessionConfig(
+            model="test",
+            num_frames=2,
+            sampling_strategy="latest_frames",
+        )
+        _, user_message = handler._build_messages(cfg, [f1, f2, f3], bytearray(), [], "q", {})
+        image_urls = [
+            c["image_url"]["url"].split(",", 1)[1] for c in user_message["content"] if c.get("type") == "image_url"
+        ]
+        assert image_urls == [f2, f3]
+
+    def test_latest_seconds_filters_by_window(self):
+        import time as _time
+
+        handler = OmniStreamingVideoHandler(chat_service=object())
+        f_old = _b64(_make_jpeg(1, 2, 3))
+        f_new = _b64(_make_jpeg(4, 5, 6))
+        now = _time.monotonic()
+        cfg = StreamingVideoSessionConfig(
+            model="test",
+            num_frames=8,
+            sampling_strategy="latest_seconds",
+            window_seconds=5.0,
+        )
+        _, user_message = handler._build_messages(
+            cfg,
+            [f_old, f_new],
+            bytearray(),
+            [],
+            "q",
+            {},
+            frame_timestamps=[now - 100.0, now - 1.0],
+        )
+        image_urls = [
+            c["image_url"]["url"].split(",", 1)[1] for c in user_message["content"] if c.get("type") == "image_url"
+        ]
+        assert image_urls == [f_new]
+
+    def test_uniform_default_anchors_first_last(self):
+        handler = OmniStreamingVideoHandler(chat_service=object())
+        frames = [_b64(_make_jpeg(i, i, i)) for i in range(10)]
+        cfg = StreamingVideoSessionConfig(
+            model="test",
+            num_frames=3,
+            sampling_strategy="uniform",
+        )
+        _, user_message = handler._build_messages(cfg, frames, bytearray(), [], "q", {})
+        image_urls = [
+            c["image_url"]["url"].split(",", 1)[1] for c in user_message["content"] if c.get("type") == "image_url"
+        ]
+        assert image_urls[0] == frames[0]
+        assert image_urls[-1] == frames[-1]
+        assert len(image_urls) == 3

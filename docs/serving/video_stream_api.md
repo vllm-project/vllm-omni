@@ -63,6 +63,8 @@ WebSocket /v1/video/chat/stream
 | `sampling_params_list` | list or null | null | Optional per-stage sampling parameter overrides. |
 | `enable_frame_filter` | bool | `true` | Enable EVS near-duplicate frame filtering. |
 | `frame_filter_threshold` | float, 0.0-1.0 | `0.95` | EVS similarity threshold. Higher keeps more frames; lower drops more near-duplicates. |
+| `sampling_strategy` | string | `"uniform"` | Frame sampling strategy. One of `"uniform"`, `"latest_frames"`, `"latest_seconds"`. |
+| `window_seconds` | float, 0–300 | `5.0` | Time window for `latest_seconds` strategy. Ignored otherwise. |
 
 ### Legacy Aliases
 
@@ -80,6 +82,14 @@ The server accepts these legacy field names and rewrites them before validation.
 |----------|--------|---------|-------------|
 | `VLLM_VIDEO_ASYNC_CHUNK` | `on`, `off` | `on` | Wire-level streaming switch. `off` buffers server-side deltas and emits coalesced outputs at the end of a query. |
 | `VLLM_VIDEO_AUDIO_DELTA_MODE` | `fast`, `slow` | `fast` | Audio delta extraction strategy. `fast` emits only newly produced chunks; `slow` recomputes from accumulated audio and exists for A/B verification. |
+
+## Frame Sampling Strategies
+
+Before each `video.query`, frames are sampled from the retained frame buffer using the configured `sampling_strategy`:
+
+- **`uniform`** (default): Evenly spaced across the entire buffer with first and last frames anchored. Best for understanding the full timeline.
+- **`latest_frames`**: Takes the most recent `num_frames` frames from the tail of the buffer. Best for reacting to "what just happened".
+- **`latest_seconds`**: Takes all frames whose arrival time falls within the last `window_seconds`. If the window contains more than `num_frames` frames, uniform sub-sampling is applied within the window. If the window is empty or timestamps are unavailable, falls back to the single most recent frame.
 
 ## EVS Semantics
 
