@@ -436,17 +436,20 @@ class MiniMindOmniProcessingInfo(BaseProcessingInfo):
     ) -> Mapping[str, int]:
         del seq_len
         config = self.get_hf_config()
+        vision_config = config.vision_config
+        audio_config = config.audio_config
         limits: dict[str, int] = {}
         if mm_counts.get("image", 0) > 0:
-            limits["image"] = int(config.image_token_len)
+            limits["image"] = int(vision_config.image_token_len)
         if mm_counts.get("audio", 0) > 0:
-            limits["audio"] = int(config.max_audio_tokens)
+            limits["audio"] = int(audio_config.max_audio_tokens)
         return limits
 
     def get_data_parser(self):
+        audio_config = self.get_hf_config().audio_config
         return MultiModalDataParser(
-            target_sr=self.get_hf_config().audio_sample_rate,
-            target_channels=self.get_hf_config().audio_target_channels,
+            target_sr=audio_config.audio_sample_rate,
+            target_channels=audio_config.audio_target_channels,
             expected_hidden_size=self._get_expected_hidden_size(),
         )
 
@@ -454,9 +457,11 @@ class MiniMindOmniProcessingInfo(BaseProcessingInfo):
 class MiniMindOmniDummyInputsBuilder(BaseDummyInputsBuilder[MiniMindOmniProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         config = self.info.get_hf_config()
+        vision_config = config.vision_config
+        audio_config = config.audio_config
         num_images = mm_counts.get("image", 0)
         num_audios = mm_counts.get("audio", 0)
-        return (config.image_special_token * num_images) + (config.audio_special_token * num_audios)
+        return (vision_config.image_special_token * num_images) + (audio_config.audio_special_token * num_audios)
 
     def get_dummy_mm_data(
         self,
@@ -469,12 +474,18 @@ class MiniMindOmniDummyInputsBuilder(BaseDummyInputsBuilder[MiniMindOmniProcessi
         num_audios = mm_counts.get("audio", 0)
         mm_data: MultiModalDataDict = {}
         if num_images:
-            mm_data["image"] = self._get_dummy_images(width=256, height=256, num_images=num_images)
+            image_overrides = mm_options.get("image") if mm_options else None
+            mm_data["image"] = self._get_dummy_images(
+                width=256, 
+                height=256, 
+                num_images=num_images,
+                overrides=image_overrides,
+            )
         if num_audios:
-            config = self.info.get_hf_config()
+            audio_config = self.info.get_hf_config().audio_config
             audio_overrides = mm_options.get("audio") if mm_options else None
             mm_data["audio"] = self._get_dummy_audios(
-                length=int(config.audio_sample_rate),
+                length=int(audio_config.audio_sample_rate),
                 num_audios=num_audios,
                 overrides=audio_overrides,
             )
@@ -483,15 +494,15 @@ class MiniMindOmniDummyInputsBuilder(BaseDummyInputsBuilder[MiniMindOmniProcessi
 class MiniMindOmniMultiModalProcessor(BaseMultiModalProcessor[MiniMindOmniProcessingInfo]):
     def _get_sensevoice_frontend(self):
         if not hasattr(self, "_sensevoice_frontend"):
-            config = self.info.get_hf_config()
-            model = _load_sensevoice_model(config.audio_encoder_path, device="cpu")
+            audio_config = self.info.get_hf_config().audio_config
+            model = _load_sensevoice_model(audio_config.audio_encoder_path, device="cpu")
             self._sensevoice_frontend = model.kwargs["frontend"].eval()
         return self._sensevoice_frontend
 
     def _get_image_processor(self):
         if not hasattr(self, "_image_processor"):
-            config = self.info.get_hf_config()
-            self._image_processor = SiglipImageProcessor.from_pretrained(config.vision_model_path)
+            vision_config = self.info.get_hf_config().vision_config
+            self._image_processor = SiglipImageProcessor.from_pretrained(vision_config.vision_model_path)
         return self._image_processor
 
     @staticmethod
@@ -518,8 +529,7 @@ class MiniMindOmniMultiModalProcessor(BaseMultiModalProcessor[MiniMindOmniProces
         lens: list[int] = []
         for item in audio_items:
             wav = self._normalise_audio_item(item)
-            with torch.no_grad():
-                fbank, flen = frontend(wav.unsqueeze(0), torch.tensor([wav.numel()]))
+            fbank, flen = frontend(wav.unsqueeze(0), torch.tensor([wav.numel()]))
             fbanks.append(fbank.squeeze(0))
             lens.append(int(flen[0].item()))
 
@@ -541,9 +551,11 @@ class MiniMindOmniMultiModalProcessor(BaseMultiModalProcessor[MiniMindOmniProces
     ) -> Sequence[PromptUpdate]:
         del hf_processor_mm_kwargs
         config = self.info.get_hf_config()
+        vision_config = config.vision_config
+        audio_config = config.audio_config
         out_mm_data = out_mm_kwargs.get_data()
-        audio_token_id = int(config.audio_ids[0])
-        image_token_id = int(config.image_ids[0])
+        audio_token_id = int(audio_config.audio_ids[0])
+        image_token_id = int(vision_config.image_ids[0])
 
         def get_replacement_audio(item_idx: int) -> PromptUpdateDetails:
             audio_lens = out_mm_data.get("audio_lens")
@@ -557,7 +569,7 @@ class MiniMindOmniMultiModalProcessor(BaseMultiModalProcessor[MiniMindOmniProces
 
         def get_replacement_image(item_idx: int) -> PromptUpdateDetails:
             del item_idx
-            num_tokens = int(getattr(config, "image_token_len", 64))
+            num_tokens = int(getattr(vision_config, "image_token_len", 64))
             return PromptUpdateDetails.select_token_id(
                 [image_token_id] * num_tokens,
                 embed_token_id=image_token_id,
@@ -568,7 +580,7 @@ class MiniMindOmniMultiModalProcessor(BaseMultiModalProcessor[MiniMindOmniProces
             updates.append(
                 PromptReplacement(
                     modality="image",
-                    target=config.image_special_token,
+                    target=vision_config.image_special_token,
                     replacement=get_replacement_image,
                 )
             )
@@ -576,7 +588,7 @@ class MiniMindOmniMultiModalProcessor(BaseMultiModalProcessor[MiniMindOmniProces
             updates.append(
                 PromptReplacement(
                     modality="audio",
-                    target=config.audio_special_token,
+                    target=audio_config.audio_special_token,
                     replacement=get_replacement_audio,
                 )
             )
@@ -664,40 +676,53 @@ class MiniMindOmniThinkerForConditionalGeneration(
         self.multimodal_config=multimodal_config
         self.device = get_local_device()
 
-        self.text_config = getattr(thinker_config, "text_config", thinker_config)
-        self.language_model=MiniMindForCausalLM(
-            self.text_config,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "language_model"),
-        )
+        self.text_config = thinker_config.get_text_config()
+        with self._mark_language_model(vllm_config):
+            self.language_model = MiniMindForCausalLM(
+                self.text_config,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "language_model"),
+            )
 
-        
-        self.vision_config=getattr(thinker_config, "vision_config", thinker_config)
-        self.vision_encoder=(
-            SiglipVisionModel.from_pretrained(
-            self.vision_config.vision_model_path, 
-            local_files_only=os.path.exists(self.vision_config.vision_model_path)).to(self.device)
-            if self.vision_config.vision_model_path
-            else None
-        )
-        self.vision_proj=MMVisionProjector(
-            self.vision_config,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "vision_proj"),
-        )
+        self.vision_config = thinker_config.vision_config
+        with self._mark_tower_model(vllm_config, "image"):
+            if multimodal_config.get_limit_per_prompt("image"):
+                self.vision_encoder = (
+                    SiglipVisionModel.from_pretrained(
+                        self.vision_config.vision_model_path,
+                        local_files_only=os.path.exists(
+                            self.vision_config.vision_model_path
+                        ),
+                    ).to(self.device)
+                    if self.vision_config.vision_model_path
+                    else None
+                )
+                self.vision_proj = MMVisionProjector(
+                    self.vision_config,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "vision_proj"),
+                )
+            else:
+                self.vision_encoder = None
+                self.vision_proj = None
 
-        self.audio_config=getattr(thinker_config, "audio_config", thinker_config)
-        self.audio_proj=MMAudioProjector(
-            self.audio_config,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "audio_proj"),
-        )
-        self.audio_encoder = (
-            self._init_audio_encoder(self.audio_config.audio_encoder_path)
-            if self.audio_config.audio_encoder_path 
-            else None
-         )
+        self.audio_config = thinker_config.audio_config
+        with self._mark_tower_model(vllm_config, "audio"):
+            if multimodal_config.get_limit_per_prompt("audio"):
+                self.audio_proj = MMAudioProjector(
+                    self.audio_config,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "audio_proj"),
+                )
+                self.audio_encoder = (
+                    self._init_audio_encoder(self.audio_config.audio_encoder_path)
+                    if self.audio_config.audio_encoder_path
+                    else None
+                )
+            else:
+                self.audio_proj = None
+                self.audio_encoder = None
 
     def _init_audio_encoder(self, path: str | None) -> nn.Module | None:
         if not os.path.exists(path):
@@ -738,8 +763,7 @@ class MiniMindOmniThinkerForConditionalGeneration(
                 dtype=torch.long,
             )
 
-        with torch.no_grad():
-            audio_hidden, _ = self.audio_encoder(valid_fbank, valid_lens)
+        audio_hidden, _ = self.audio_encoder(valid_fbank, valid_lens)
 
         proj_dtype = next(self.audio_proj.parameters()).dtype
         audio_embeddings = []
@@ -775,8 +799,7 @@ class MiniMindOmniThinkerForConditionalGeneration(
         elif pixel_values is not None:
             if self.vision_encoder is None:
                 raise RuntimeError("pixel_values were provided but vision_encoder is not initialized.")
-            with torch.no_grad():
-                image_hidden = self.vision_encoder(pixel_values=pixel_values).last_hidden_state  # type: ignore[arg-type]
+            image_hidden = self.vision_encoder(pixel_values=pixel_values).last_hidden_state  # type: ignore[arg-type]
             multimodal_embeddings += self._as_embedding_tuple(self.vision_proj(image_hidden))
 
         if audio_embeds is not None:
