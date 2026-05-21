@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.minimind_o.minimind_omni_config import MiniMindOmniCode2WavConfig
+from vllm_omni.model_executor.models.minimind_o.resource_utils import resolve_model_dir
 
 logger = init_logger(__name__)
 
@@ -60,8 +61,8 @@ class MiniMindOmniCode2Wav(nn.Module):
                 "MiniMind-O Code2Wav requires code2wav_config.mimi_path "
                 "to point to a Mimi checkpoint directory."
             )
-        mimi_dir = os.fspath(self.mimi_path)
-        model = MimiModel.from_pretrained(mimi_dir)
+        mimi_dir = resolve_model_dir(os.fspath(self.mimi_path), "Mimi decoder")
+        model = MimiModel.from_pretrained(mimi_dir, local_files_only=True)
         model.eval().to(self.vllm_config.device_config.device)
         self._mimi_model = model
         logger.info("Loaded MiniMind-O Mimi codec from %s", mimi_dir)

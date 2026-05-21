@@ -322,6 +322,16 @@ _OMNI_MODELS = {
         "MingFlashOmniTalkerForConditionalGeneration",
     ),
     ## MiniMind-Omni
+    "MiniMindOmni": (
+        "minimind_o",
+        "minimind_omni",
+        "MiniMindOmniForConditionalGeneration"
+    ),
+    "MiniMindOmniForConditionalGeneration": (
+        "minimind_o",
+        "minimind_omni",
+        "MiniMindOmniForConditionalGeneration",
+    ),
     "MiniMindOmniThinkerForConditionalGeneration": (
         "minimind_o",
         "minimind_omni_thinker",
@@ -331,11 +341,6 @@ _OMNI_MODELS = {
         "minimind_o",
         "minimind_omni_talker",
         "MiniMindOmniTalkerForConditionalGeneration",
-    ),
-    "MiniMindOmniForConditionalGeneration": (
-        "minimind_o",
-        "minimind_omni",
-        "MiniMindOmniForConditionalGeneration",
     ),
     # Alias: HF repo currently ships this architecture name in config.json
     "BailingMM2NativeForConditionalGeneration": (

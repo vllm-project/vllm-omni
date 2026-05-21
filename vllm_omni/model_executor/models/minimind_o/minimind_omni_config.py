@@ -97,7 +97,7 @@ class MiniMindOmniVisionConfig(PretrainedConfig):
         image_special_token: str = "<|image_pad|>",
         image_hidden_size: int = 768,
         image_token_len: int = 64,
-        vision_model_path: str = "./model/siglip2-base-p32-256-ve",
+        vision_model_path: str = "jingyaogong/siglip2-base-p32-256-ve",
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -118,7 +118,7 @@ class MiniMindOmniAudioConfig(PretrainedConfig):
         audio_ids: list[int] | None = None,
         audio_special_token: str = "<|audio_pad|>",
         audio_hidden_size: int = 512,
-        audio_encoder_path: str = "./model/SenseVoiceSmall",
+        audio_encoder_path: str = "jingyaogong/SenseVoiceSmall",
         audio_vocab_size: int = 2112,
         audio_pad_token: int = 2049,
         audio_stop_token: int = 2050,
@@ -150,7 +150,7 @@ class MiniMindOmniCode2WavConfig(PretrainedConfig):
 
     def __init__(
         self,
-        mimi_path: str | None = None,
+        mimi_path: str | None = "jingyaogong/mimi",
         codec_num_code_layers: int = 8,
         codec_sample_rate: int = 24000,
         codec_pad_token: int = 2049,
@@ -241,7 +241,7 @@ class MiniMindOmniConfig(PretrainedConfig):
         audio_ids: list[int] | None = None,
         audio_special_token: str = "<|audio_pad|>",
         audio_hidden_size: int = 512,
-        audio_encoder_path: str = "./model/SenseVoiceSmall",
+        audio_encoder_path: str = "jingyaogong/SenseVoiceSmall",
         audio_vocab_size: int = 2112,
         audio_pad_token: int = 2049,
         audio_stop_token: int = 2050,
@@ -255,13 +255,10 @@ class MiniMindOmniConfig(PretrainedConfig):
         image_special_token: str = "<|image_pad|>",
         image_hidden_size: int = 768,
         image_token_len: int = 64,
-        vision_model_path: str = "./model/siglip2-base-p32-256-ve",
+        vision_model_path: str = "jingyaogong/siglip2-base-p32-256-ve",
         bridge_layer: int | None = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(**kwargs)
-        
-        #  init text config
         text_defaults = {
             "hidden_size": hidden_size,
             "num_hidden_layers": num_hidden_layers,
@@ -294,6 +291,7 @@ class MiniMindOmniConfig(PretrainedConfig):
             text_config = MiniMindConfig(**text_defaults)
         self.text_config = text_config
 
+        super().__init__(**kwargs)
 
         # init vision config
         vision_defaults = {
@@ -371,7 +369,7 @@ class MiniMindOmniConfig(PretrainedConfig):
             "audio_pad_token": self.audio_config.audio_pad_token,
             "audio_stop_token": self.audio_config.audio_stop_token,
             "audio_spk_token": self.audio_config.audio_spk_token,
-            "spk_emb_size": audio_config.spk_emb_size,
+            "spk_emb_size": self.audio_config.spk_emb_size,
         }
         if isinstance(talker_config, dict):
             talker_config = MiniMindOmniTalkerConfig(**{**talker_defaults, **talker_config})
@@ -409,14 +407,11 @@ class MiniMindOmniConfig(PretrainedConfig):
         self.bridge_layer = (
             bridge_layer
             if bridge_layer is not None
-            else int(getattr(self.text_config, "num_hidden_layers", self.num_hidden_layers)) // 2 - 1
+            else int(getattr(self.text_config, "num_hidden_layers", num_hidden_layers)) // 2 - 1
         )
 
     def get_text_config(self, **kwargs: Any) -> PretrainedConfig:
         return self.text_config
-
-
-MiniMindOmniConfig = MiniMindOmniConfig
 
 try:
     AutoConfig.register(MiniMindConfig.model_type, MiniMindConfig)
@@ -426,7 +421,6 @@ try:
 except ValueError:
     pass
 
-
 __all__ = [
     "MiniMindConfig",
     "MiniMindOmniAudioConfig",
@@ -434,5 +428,4 @@ __all__ = [
     "MiniMindOmniConfig",
     "MiniMindOmniTalkerConfig",
     "MiniMindOmniVisionConfig",
-    "MiniMindOmniConfig",
 ]

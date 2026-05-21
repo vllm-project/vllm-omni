@@ -178,4 +178,7 @@ class MiniMindOmniForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return self.model.load_weights(weights)
+        loaded = self.model.load_weights(weights)
+        if self.model_stage in {"thinker", "talker"}:
+            return {f"{self.model_stage}.{name}" for name in loaded}
+        return loaded

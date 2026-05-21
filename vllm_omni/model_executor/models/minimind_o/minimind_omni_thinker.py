@@ -70,6 +70,7 @@ from vllm_omni.model_executor.models.minimind_o.minimind_omni_config import (
     MiniMindConfig,
     MiniMindOmniConfig,
 )
+from vllm_omni.model_executor.models.minimind_o.resource_utils import resolve_model_dir
 
 CapturedHiddenStates = dict[str, dict[str, dict[int, torch.Tensor]]]
 
@@ -434,8 +435,9 @@ class MMVisionProjector(nn.Module):
 
   
 def _load_sensevoice_model(path: str, *, device: torch.device | str = "cpu"):
-    if not path or not os.path.exists(path):
-        raise FileNotFoundError(f"SenseVoice path not found: {path}")
+    if not path:
+        raise FileNotFoundError("SenseVoice path or repo id is empty.")
+    path = resolve_model_dir(path, "SenseVoice encoder")
     
     try:
         from funasr import AutoModel
@@ -529,7 +531,11 @@ class MiniMindOmniMultiModalProcessor(BaseMultiModalProcessor[MiniMindOmniProces
     def _get_image_processor(self):
         if not hasattr(self, "_image_processor"):
             vision_config = self.info.get_hf_config().vision_config
-            self._image_processor = SiglipImageProcessor.from_pretrained(vision_config.vision_model_path)
+            vision_dir = resolve_model_dir(vision_config.vision_model_path, "vision encoder")
+            self._image_processor = SiglipImageProcessor.from_pretrained(
+                vision_dir,
+                local_files_only=True,
+            )
         return self._image_processor
 
     @staticmethod
@@ -716,14 +722,17 @@ class MiniMindOmniThinkerForConditionalGeneration(
         self.vision_config = config.vision_config
         with self._mark_tower_model(vllm_config, "image"):
             if multimodal_config.get_limit_per_prompt("image"):
+                vision_dir = (
+                    resolve_model_dir(self.vision_config.vision_model_path, "vision encoder")
+                    if self.vision_config.vision_model_path
+                    else None
+                )
                 self.vision_encoder = (
                     SiglipVisionModel.from_pretrained(
-                        self.vision_config.vision_model_path,
-                        local_files_only=os.path.exists(
-                            self.vision_config.vision_model_path
-                        ),
+                        vision_dir,
+                        local_files_only=True,
                     ).to(self.device)
-                    if self.vision_config.vision_model_path
+                    if vision_dir
                     else None
                 )
                 self.vision_proj = MMVisionProjector(
@@ -753,13 +762,13 @@ class MiniMindOmniThinkerForConditionalGeneration(
                 self.audio_encoder = None
 
     def _init_audio_encoder(self, path: str | None) -> nn.Module | None:
-        if not os.path.exists(path):
-            warnings.warn(f"[MiniMindOmni] SenseVoice path not found: {path}")
+        if not path:
+            warnings.warn("[MiniMindOmni] SenseVoice path or repo id is empty.")
             return None
         try:
             model = _load_sensevoice_model(path, device=str(self.device))
-        except ImportError as exc:
-            warnings.warn(f"[MiniMindOmni] funasr is required to load SenseVoice: {exc}")
+        except (ImportError, RuntimeError, FileNotFoundError) as exc:
+            warnings.warn(f"[MiniMindOmni] {exc}")
             return None
         return model.model.encoder
 
