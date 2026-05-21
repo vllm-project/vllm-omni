@@ -1,6 +1,8 @@
 import pytest
 from vllm_ascend.quantization.modelslim_config import get_linear_quant_type
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 class TestQwen2_5OmniWeightLoading:
     def test_qkv_weight_mapping(self):
