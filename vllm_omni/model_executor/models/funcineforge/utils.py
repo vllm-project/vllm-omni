@@ -280,10 +280,10 @@ def dialogue_to_timespk_ids(dialogue: list[dict[str, Any]] | None, config: Any) 
 
 
 def load_face_embedding(face_path: str, speech_len: int, face_size: int = 512) -> torch.Tensor:
-    """Load face embeddings from a ``.npz`` file.
+    """Load face embeddings from ``.npz`` or ``.pkl`` file.
 
     Args:
-        face_path: Path to npz file with ``embeddings`` and ``faceI`` arrays.
+        face_path: Path to npz/pkl file with ``embeddings`` and ``faceI`` arrays.
         speech_len: Length of the speech sequence (for zero-padding).
         face_size: Dimension of each face embedding vector.
 
@@ -291,7 +291,12 @@ def load_face_embedding(face_path: str, speech_len: int, face_size: int = 512) -
         Tensor of shape (1, speech_len, face_size).
     """
     face_embs = torch.zeros((speech_len, face_size), dtype=torch.float32)
-    data = np.load(face_path, allow_pickle=False)
+    if face_path.endswith(".pkl"):
+        import pickle
+        with open(face_path, "rb") as f:
+            data = pickle.load(f)  # noqa: S301
+    else:
+        data = np.load(face_path, allow_pickle=False)
     embeddings = data["embeddings"]
     face_indices = data["faceI"]
     for emb, frame_idx in zip(embeddings, face_indices):
