@@ -4,6 +4,11 @@ builds an AsyncOmni engine from the ``nemotron_voicechat`` deploy YAML,
 streams Nemotron prefill + ``N_DECODE`` decode chunks (one per acoustic embedding step) into stage 0,
 and accumulates text tokens, ASR tokens, and EarTTS acoustic codes.
 
+The Nemotron prefill chunk is driven by a *system prompt string*
+(``--system-prompt``). The NemotronDuplexHForCausalLM model tokenizes
+it in-process and constructs the prefill combined embedding itself —
+no pre-computed embedding file is needed.
+
 When ``--profile`` is set the trace is always recorded with
 ``with_stack=True`` and ``record_shapes=True`` and dumped under
 ``./profiler_traces`` (hardcoded — change in code if needed).
@@ -13,17 +18,16 @@ Usage:
     python examples/offline_inference/nemotron_voicechat/run_nemotron_voicechat.py \\
         --ckpt-dir <wrapper_dir> \\
         --acoustic-embeddings <acoustic.pt> \\
-        --llm-prefill <prefill.pt> \\
+        --system-prompt "You are a helpful AI assistant." \\
         --profile
 """
-
-import os
 
 import argparse
 import asyncio
 import copy
 import json
 import logging
+import os
 import tempfile
 import time
 import uuid
@@ -34,15 +38,21 @@ from typing import Any
 import torch
 import torch.cuda.nvtx as nvtx
 import yaml
+from transformers import AutoTokenizer
 from vllm import SamplingParams
 from vllm.engine.protocol import StreamingInput
 from vllm.sampling_params import RequestOutputKind
+
+from vllm_omni.model_executor.models.nemotron_duplex_h.nemotron_duplex_h import (
+    NemotronDuplexHForCausalLM,
+)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
 
 def _default_deploy_yaml() -> Path:
     """Locate the nemotron_voicechat deploy YAML shipped with vllm_omni.
@@ -52,6 +62,7 @@ def _default_deploy_yaml() -> Path:
     examples/offline_inference/..., user scratch dirs, etc.).
     """
     import vllm_omni
+
     return Path(vllm_omni.__file__).resolve().parent / "deploy" / "nemotron_voicechat.yaml"
 
 
@@ -63,6 +74,7 @@ TORCH_PROFILER_DIR = Path.cwd() / "profiler_traces"
 # ---------------------------------------------------------------------------
 #  Stage config: load deploy YAML + optionally inject profiler_config
 # ---------------------------------------------------------------------------
+
 
 def _build_stage_config(
     deploy_yaml: Path,
@@ -91,7 +103,10 @@ def _build_stage_config(
 def _write_temp_stage_config(cfg: dict) -> str:
     """Write stage config dict to a temp YAML file, return its path."""
     tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yaml", prefix="nemotron_voicechat_prof_", delete=False,
+        mode="w",
+        suffix=".yaml",
+        prefix="nemotron_voicechat_prof_",
+        delete=False,
     )
     yaml.dump(cfg, tmp, default_flow_style=False, sort_keys=False)
     tmp.close()
@@ -103,24 +118,28 @@ def _write_temp_stage_config(cfg: dict) -> str:
 #  Input loading
 # ---------------------------------------------------------------------------
 
+
 def _load_inputs(
     ckpt_dir: Path,
     acoustic_path: Path,
-    prefill_path: Path,
+    system_prompt: str,
     speaker_latent_path: Path | None,
 ) -> dict[str, Any]:
     """Replicate the notebook's input-loading cell."""
-    nemotron_config = ckpt_dir / "nemotron" / "config.json"
+    nemotron_dir = ckpt_dir / "nemotron"
+    nemotron_config = nemotron_dir / "config.json"
     with open(nemotron_config, encoding="utf-8") as f:
         nemotron_hidden_size = int(json.load(f)["hidden_size"])
 
     torch.manual_seed(0)
 
-    prefill_combined_embeddings = (
-        torch.load(prefill_path, weights_only=False, map_location="cpu")
-        .to(torch.float32)
-        .contiguous()
-    )  # (T_prefill, hidden_size)
+    # Compute the prefill chunk length from the system prompt using the
+    # same recipe the model applies internally. This is just a length
+    # so vLLM's ``prompt_token_ids`` placeholder list is sized correctly;
+    # the actual combined embedding is constructed inside the model's
+    # ``preprocess`` directly from the system_prompt string.
+    nemotron_tokenizer = AutoTokenizer.from_pretrained(str(nemotron_dir), trust_remote_code=True)
+    t_prefill = NemotronDuplexHForCausalLM.compute_prefix_len(nemotron_tokenizer, system_prompt)
 
     pkg = torch.load(acoustic_path, weights_only=False, map_location="cpu")
     acoustic_embeddings = pkg["acoustic_embeddings"].to(torch.float32).contiguous()
@@ -128,9 +147,7 @@ def _load_inputs(
 
     if speaker_latent_path is None:
         speaker_latent_path = ckpt_dir / "eartts" / "speaker_latents" / "Aria.pt"
-    assert speaker_latent_path.is_file(), (
-        f"Speaker latent not found: {speaker_latent_path}"
-    )
+    assert speaker_latent_path.is_file(), f"Speaker latent not found: {speaker_latent_path}"
     speaker_latent = torch.load(speaker_latent_path, weights_only=False)[0]
     speaker_latent = speaker_latent.detach().cpu().contiguous()
     tref = int(speaker_latent.shape[0])
@@ -138,11 +155,8 @@ def _load_inputs(
     logger.info("nemotron hidden_size       : %d", nemotron_hidden_size)
     logger.info("Tref (speaker latent len)  : %d", tref)
     logger.info("N_DECODE                   : %d", n_decode)
-    logger.info(
-        "prefill_combined_embeddings: shape=%s dtype=%s",
-        tuple(prefill_combined_embeddings.shape),
-        prefill_combined_embeddings.dtype,
-    )
+    logger.info("system_prompt              : %r", system_prompt)
+    logger.info("T_PREFILL (BOS+text+EOS)   : %d", t_prefill)
     logger.info(
         "acoustic_embeddings        : shape=%s dtype=%s",
         tuple(acoustic_embeddings.shape),
@@ -155,7 +169,8 @@ def _load_inputs(
     )
 
     return {
-        "prefill_combined_embeddings": prefill_combined_embeddings,
+        "system_prompt": system_prompt,
+        "t_prefill": t_prefill,
         "acoustic_embeddings": acoustic_embeddings,
         "speaker_latent": speaker_latent,
         "n_decode": n_decode,
@@ -165,6 +180,7 @@ def _load_inputs(
 # ---------------------------------------------------------------------------
 #  Streaming inference (mirrors notebook cell 7)
 # ---------------------------------------------------------------------------
+
 
 def _step_delta(v, finished: bool):
     """Extract the *new* multimodal chunk for this step (see notebook)."""
@@ -184,7 +200,8 @@ async def run_streaming_request(
     request_id: str,
 ) -> dict[str, Any]:
     """Submit one streaming TTS request, accumulate all three output streams."""
-    prefill_combined_embeddings = inputs["prefill_combined_embeddings"]
+    system_prompt = inputs["system_prompt"]
+    t_prefill = inputs["t_prefill"]
     acoustic_embeddings = inputs["acoustic_embeddings"]
     speaker_latent = inputs["speaker_latent"]
     n_decode = inputs["n_decode"]
@@ -207,11 +224,18 @@ async def run_streaming_request(
     next_text_id: asyncio.Queue[int] = asyncio.Queue()
 
     async def input_generator() -> AsyncGenerator[StreamingInput, None]:
+        # Prefill chunk: ``prompt_token_ids`` is a placeholder of the
+        # right length so vLLM schedules a prefill of size ``t_prefill``;
+        # the model's ``preprocess`` reads ``system_prompt`` from
+        # ``additional_information``, tokenizes it as
+        # ``[BOS] + tokenizer.encode(prompt) + [EOS]`` (same recipe
+        # ``compute_prefix_len`` used to derive ``t_prefill``), and
+        # constructs the combined prefill embedding in-process.
         yield StreamingInput(
             prompt={
-                "prompt_token_ids": [0] * prefill_combined_embeddings.shape[0],
+                "prompt_token_ids": [0] * t_prefill,
                 "additional_information": {
-                    "prefill_combined_embeddings": prefill_combined_embeddings.clone(),
+                    "system_prompt": system_prompt,
                     "speaker_latent": speaker_latent.clone(),
                 },
             },
@@ -223,7 +247,7 @@ async def run_streaming_request(
                 prompt={
                     "prompt_token_ids": [tok],
                     "additional_information": {
-                        "prefill_combined_embeddings": None,
+                        "system_prompt": None,
                         "acoustic_embedding": acoustic_embeddings[step : step + 1].clone(),
                     },
                 },
@@ -272,11 +296,7 @@ async def run_streaming_request(
     if t_first_output is None:
         t_first_output = t_end
 
-    audio_codes = (
-        torch.cat(audio_chunks, dim=0)
-        if audio_chunks
-        else torch.empty(0, dtype=torch.long)
-    )
+    audio_codes = torch.cat(audio_chunks, dim=0) if audio_chunks else torch.empty(0, dtype=torch.long)
 
     return {
         "text_ids": text_ids,
@@ -291,38 +311,31 @@ async def run_streaming_request(
 #  Main
 # ---------------------------------------------------------------------------
 
+
 async def main(args):
     from vllm_omni import AsyncOmni
 
     ckpt_dir = Path(args.ckpt_dir).expanduser().resolve()
     acoustic_path = Path(args.acoustic_embeddings).expanduser().resolve()
-    prefill_path = Path(args.llm_prefill).expanduser().resolve()
-    speaker_latent_path = (
-        Path(args.speaker_latent).expanduser().resolve()
-        if args.speaker_latent
-        else None
-    )
+    speaker_latent_path = Path(args.speaker_latent).expanduser().resolve() if args.speaker_latent else None
     deploy_yaml = Path(args.deploy_yaml).expanduser().resolve()
 
     assert ckpt_dir.is_dir(), f"Wrapper checkpoint dir not found: {ckpt_dir}"
     assert (ckpt_dir / "config.json").is_file(), (
-        f"{ckpt_dir}/config.json missing (should declare "
-        '{"model_type": "nemotron_voicechat"})'
+        f'{ckpt_dir}/config.json missing (should declare {{"model_type": "nemotron_voicechat"}})'
     )
     assert (ckpt_dir / "nemotron").is_dir(), (
         f"{ckpt_dir}/nemotron subdir missing — should hold NemotronDuplexH checkpoint."
     )
-    assert (ckpt_dir / "eartts").is_dir(), (
-        f"{ckpt_dir}/eartts subdir missing — should hold EarTTS checkpoint."
-    )
+    assert (ckpt_dir / "eartts").is_dir(), f"{ckpt_dir}/eartts subdir missing — should hold EarTTS checkpoint."
     assert deploy_yaml.is_file(), f"Deploy YAML not found: {deploy_yaml}"
     assert acoustic_path.is_file(), f"Acoustic embeddings not found: {acoustic_path}"
-    assert prefill_path.is_file(), f"LLM prefill data not found: {prefill_path}"
+    assert args.system_prompt and args.system_prompt.strip(), "--system-prompt must be a non-empty string"
 
     inputs = _load_inputs(
         ckpt_dir=ckpt_dir,
         acoustic_path=acoustic_path,
-        prefill_path=prefill_path,
+        system_prompt=args.system_prompt,
         speaker_latent_path=speaker_latent_path,
     )
 
@@ -411,10 +424,7 @@ def _print_summary(result: dict[str, Any]) -> None:
     print(f"Sampled ASR token ids  ({len(asr_ids)} ids):")
     print(f"  {asr_ids}")
     print()
-    print(
-        f"EarTTS acoustic codes  shape={tuple(audio_codes.shape)} "
-        f"dtype={audio_codes.dtype}"
-    )
+    print(f"EarTTS acoustic codes  shape={tuple(audio_codes.shape)} dtype={audio_codes.dtype}")
     if audio_codes.numel() > 0:
         print(f"  codes min/max        : {int(audio_codes.min())} / {int(audio_codes.max())}")
 
@@ -428,24 +438,35 @@ def parse_args():
 
     inputs = parser.add_argument_group("inputs")
     inputs.add_argument(
-        "--ckpt-dir", type=str, required=True,
+        "--ckpt-dir",
+        type=str,
+        required=True,
         help="Wrapper checkpoint directory containing config.json, nemotron/, eartts/.",
     )
     inputs.add_argument(
-        "--acoustic-embeddings", type=str, required=True,
+        "--acoustic-embeddings",
+        type=str,
+        required=True,
         help="Path to acoustic_embeddings.pt (must contain key 'acoustic_embeddings').",
     )
     inputs.add_argument(
-        "--llm-prefill", type=str, required=True,
-        help="Path to Nemotron prefill_combined_embeddings .pt file.",
+        "--system-prompt",
+        type=str,
+        default="You are a helpful AI assistant.",
+        help="System prompt fed to NemotronDuplexH on the prefill chunk. "
+        "The model tokenizes it in-process and constructs the prefill "
+        "combined embedding itself (no pre-computed .pt file needed).",
     )
     inputs.add_argument(
-        "--speaker-latent", type=str, default=None,
-        help="Optional speaker latent .pt path. "
-             "Default: <ckpt-dir>/eartts/speaker_latents/Aria.pt",
+        "--speaker-latent",
+        type=str,
+        default=None,
+        help="Optional speaker latent .pt path. Default: <ckpt-dir>/eartts/speaker_latents/Aria.pt",
     )
     inputs.add_argument(
-        "--deploy-yaml", type=str, default=str(DEFAULT_DEPLOY_YAML),
+        "--deploy-yaml",
+        type=str,
+        default=str(DEFAULT_DEPLOY_YAML),
         help=f"Deploy YAML path. Default: {DEFAULT_DEPLOY_YAML}",
     )
 
@@ -455,22 +476,28 @@ def parse_args():
 
     output = parser.add_argument_group("output")
     output.add_argument(
-        "--save-audio-codes", type=str, default=None,
+        "--save-audio-codes",
+        type=str,
+        default=None,
         help="If set, save the final audio_codes tensor to this .pt path.",
     )
 
     prof = parser.add_argument_group("profiling")
     prof.add_argument(
-        "--profile", action="store_true",
-        help=f"Enable torch profiler (traces -> {TORCH_PROFILER_DIR}, "
-             "always with_stack=True, record_shapes=True).",
+        "--profile",
+        action="store_true",
+        help=f"Enable torch profiler (traces -> {TORCH_PROFILER_DIR}, always with_stack=True, record_shapes=True).",
     )
     prof.add_argument(
-        "--profile-prefix", type=str, default=None,
+        "--profile-prefix",
+        type=str,
+        default=None,
         help="Optional prefix for profiler trace filenames.",
     )
     prof.add_argument(
-        "--num-warmups", type=int, default=1,
+        "--num-warmups",
+        type=int,
+        default=1,
         help="Warmup runs before the profiled run (default: 1; ignored when --profile is off).",
     )
 

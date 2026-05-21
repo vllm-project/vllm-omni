@@ -7,17 +7,24 @@ A minimal extension of the upstream :class:`NemotronHForCausalLM` that:
 
 1. Accepts pre-computed acoustic encoder embeddings per step via
    ``additional_information["acoustic_embedding"]`` (one row per
-   scheduled token). The prefill step accepts a pre-computed full
-   combined embedding via
-   ``additional_information["prefill_combined_embeddings"]``; on this
-   path the model's :meth:`preprocess` returns the tensor as-is and
-   simultaneously clears the buffer entry (by returning
-   ``{"prefill_combined_embeddings": None}`` as its update dict) so
-   that subsequent decode steps fall through to the decode branch.
-   The producer should still send
-   ``prefill_combined_embeddings=None`` on every decode chunk to make
-   the intent explicit, but the actual clearing happens consumer-side
-   because the orchestrator's serialization filters ``None`` values.
+   scheduled token). The prefill step receives the *system prompt as
+   raw text* via ``additional_information["system_prompt"]``; the
+   model's :meth:`preprocess` tokenizes it in-process (using a
+   HuggingFace tokenizer loaded once in ``__init__`` from the
+   checkpoint dir) and constructs the prefill combined embedding
+   itself as
+
+       prompt_embed = embed_tokens([BOS] + text_ids + [EOS])
+                    + embed_tokens(pad_id)
+                    + embed_asr_tokens(pad_id)
+
+   It then *clears* the buffer entry by returning
+   ``{"system_prompt": None}`` as its update dict so that subsequent
+   decode steps fall through to the decode branch. The producer
+   should still send ``system_prompt=None`` on every decode chunk to
+   make the intent explicit, but the actual clearing happens
+   consumer-side because the orchestrator's serialization filters
+   ``None`` values.
 2. Embeds an additional per-step ASR token id stream. The id is fed
    **autoregressively from the model itself** via the per-request
    ``input_asr_ids`` buffer that ``postprocess`` keeps populated after
@@ -55,6 +62,7 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
@@ -119,6 +127,62 @@ class NemotronDuplexHForCausalLM(NemotronHForCausalLM):
             prefix=maybe_prefix(prefix, "asr_head"),
         )
 
+        # Tokenizer is used in ``preprocess`` to convert the
+        # ``additional_information["system_prompt"]`` text into token
+        # IDs on the prefill chunk. Loaded from the checkpoint dir so
+        # the vocabulary aligns with ``embed_tokens``. Cached once on
+        # init to keep the per-step preprocess fast.
+        model_path = vllm_config.model_config.model
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+        # Special token IDs used to construct the prefill prompt:
+        # ``[BOS] + text_ids + [EOS]`` and the pad embedding added to
+        # every prefill position (mirrors the reference STT recipe
+        # where the BOS / pad embeddings are both ``embed_tokens(pad_id)``).
+        self.pad_token_id = int(config.pad_token_id)
+        self.bos_token_id = int(config.bos_token_id)
+        self.eos_token_id = int(config.eos_token_id)
+
+        # Per-position pad embedding added on every prefill step:
+        # ``embed_tokens(pad_id) + embed_asr_tokens(pad_id)``, shape
+        # ``(hidden_size,)``. Materialized at the end of
+        # :meth:`load_weights` because the embedding tables are not
+        # populated yet in ``__init__``. Registered as a *non-persistent*
+        # buffer so it follows ``.to(device)`` / dtype casts with the
+        # rest of the module but is **not** saved in the state_dict
+        # (it is fully derived from ``embed_tokens`` /
+        # ``embed_asr_tokens`` which are already saved — duplicating it
+        # in the checkpoint would just be a footgun).
+        self.register_buffer("_pad_combined_emb", None, persistent=False)
+
+    # ------------------------------------------------------------------ #
+    #  producer-side helper                                              #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def compute_prefix_len(tokenizer: PreTrainedTokenizerBase, system_prompt: str) -> int:
+        """Length of the prefill chunk for a given system prompt.
+
+        Mirrors the in-model tokenization done by :meth:`preprocess`:
+
+            [BOS] + tokenizer.encode(system_prompt, add_special_tokens=False) + [EOS]
+
+        The streaming producer needs this number to size the
+        placeholder ``prompt_token_ids`` it hands vLLM on the prefill
+        chunk — vLLM schedules off that list's length, while the
+        actual embedding is constructed inside :meth:`preprocess`
+        from the ``system_prompt`` string.
+
+        Exposed as a ``@staticmethod`` so callers can compute the
+        length without instantiating the model (which would download
+        the full checkpoint). They just need any tokenizer compatible
+        with the model's vocabulary — typically the same
+        ``AutoTokenizer.from_pretrained(MODEL_DIR)`` instance the
+        notebook already uses for decoding output tokens.
+        """
+        text_ids = tokenizer.encode(system_prompt, add_special_tokens=False)
+        return len(text_ids) + 2  # +2 for BOS / EOS wrapped in preprocess
+
     # ------------------------------------------------------------------ #
     #  preprocess                                                        #
     # ------------------------------------------------------------------ #
@@ -133,19 +197,31 @@ class NemotronDuplexHForCausalLM(NemotronHForCausalLM):
 
         Two paths:
 
-        * **Prefill short-circuit.** When
-          ``additional_information["prefill_combined_embeddings"]`` is
-          a tensor, the caller has pre-computed the
-          ``(T_prefill, hidden_size)`` combined embedding offline. We
-          return it as-is, bypassing the text+asr+acoustic sum, and
-          *clear* the buffer entry by returning
-          ``{"prefill_combined_embeddings": None}`` in the update
-          dict. Clearing has to happen here because the orchestrator's
-          serialization (:func:`vllm_omni.data_entry_keys.serialize_payload`)
+        * **Prefill construction.** When
+          ``additional_information["system_prompt"]`` is a non-empty
+          string, this is the prefill chunk. We tokenize the prompt
+          in-process as ``[BOS] + tokenizer.encode(prompt) + [EOS]``,
+          embed it with ``model.embed_tokens``, and add the pad
+          embedding from both the text and the ASR vocabularies
+          (which the reference STT recipe folds in uniformly across
+          every prefill position):
+
+              prefill_combined = embed_tokens(prompt_token_ids)
+                               + embed_tokens(pad_id)
+                               + embed_asr_tokens(pad_id)
+
+          The producer-supplied ``input_ids`` for this chunk are
+          placeholders (their length must match the tokenized prompt
+          length so vLLM's scheduling sees the right prefill size);
+          they are returned unchanged so vLLM's bookkeeping is
+          consistent. We then *clear* the buffer entry by returning
+          ``{"system_prompt": None}`` in the update dict. Clearing has
+          to happen here because the orchestrator's serialization
+          (:func:`vllm_omni.data_entry_keys.serialize_payload`)
           silently drops ``None`` values, so the producer cannot
           overwrite the buffer with ``None`` via the streaming-input
-          merge; the producer still sends ``prefill_combined_embeddings=None``
-          on each decode chunk as a documentation hint, but the actual
+          merge; the producer still sends ``system_prompt=None`` on
+          each decode chunk as a documentation hint, but the actual
           state transition lives on this consumer side.
 
         * **Decode (single-token step).** Builds the combined embedding
@@ -168,33 +244,36 @@ class NemotronDuplexHForCausalLM(NemotronHForCausalLM):
         n = int(input_ids.shape[0])
 
         # Prefill vs decode is detected directly on the value of
-        # ``prefill_combined_embeddings``: a tensor means prefill, anything
-        # else (``None`` / missing) means decode. The buffer flips from
-        # tensor → ``None`` inside this method itself (see the update dict
-        # returned below) because serialization drops ``None`` and the
-        # producer's "send None on each decode chunk" pattern alone is not
-        # enough to clear the slot.
-        prefill_combined = info_dict.get("prefill_combined_embeddings")
-        if isinstance(prefill_combined, torch.Tensor):
+        # ``system_prompt``: a non-empty string means prefill, anything
+        # else (``None`` / missing / empty) means decode. The buffer
+        # flips from str → ``None`` inside this method itself (see the
+        # update dict returned below) because serialization drops
+        # ``None`` and the producer's "send None on each decode chunk"
+        # pattern alone is not enough to clear the slot.
+        system_prompt = info_dict.get("system_prompt")
+        if isinstance(system_prompt, str) and system_prompt.strip():
             target_dtype = self.model.embed_tokens.weight.dtype
-            prefill_combined = prefill_combined.to(
-                device=device, dtype=target_dtype
+
+            # [BOS] + encode(text, add_special_tokens=False) + [EOS].
+            # ``add_special_tokens=False`` keeps full control of which
+            # specials get wrapped around the text (the underlying HF
+            # tokenizer would otherwise prepend its own BOS, which may
+            # or may not equal ``config.bos_token_id``).
+            text_ids = self.tokenizer.encode(system_prompt, add_special_tokens=False)
+            prompt_token_ids = [self.bos_token_id] + list(text_ids) + [self.eos_token_id]
+            assert len(prompt_token_ids) == n, (
+                f"system_prompt tokenizes to {len(prompt_token_ids)} ids "
+                f"but the scheduled prefill chunk has {n} tokens; the "
+                f"producer's prompt_token_ids length must match the "
+                f"in-model tokenization of the same system prompt"
             )
-            assert prefill_combined.dim() == 2, (
-                f"prefill_combined_embeddings must be 2D, got "
-                f"shape {tuple(prefill_combined.shape)}"
-            )
-            assert prefill_combined.shape[0] == n, (
-                f"prefill_combined_embeddings length {prefill_combined.shape[0]} "
-                f"does not match scheduled token count {n}"
-            )
-            # Clear the buffer entry: ``None`` is not serialization-safe
-            # (serialize_payload drops it), so we cannot rely on the producer
-            # to overwrite this slot from the next chunk. The runner's
-            # ``_update_intermediate_buffer`` does preserve ``None`` though,
-            # so returning it here flips the buffer to ``None`` in-process
-            # and the next preprocess call takes the decode branch.
-            return input_ids, prefill_combined, {"prefill_combined_embeddings": None}
+
+            prompt_tokens = torch.tensor(prompt_token_ids, device=device, dtype=torch.long)
+
+            # Text token embeddings for the prompt sequence.
+            text_emb = self.model.embed_tokens(prompt_tokens).to(target_dtype)
+            prefill_combined = text_emb + self._pad_combined_emb
+            return input_ids, prefill_combined, {"system_prompt": None}
 
         text_emb = self.model.embed_tokens(input_ids)
 
@@ -202,10 +281,7 @@ class NemotronDuplexHForCausalLM(NemotronHForCausalLM):
         assert isinstance(asr_ids, torch.Tensor), "input_asr_ids is not a tensor"
         asr_ids = asr_ids.to(device=device, dtype=torch.long).reshape(-1)
 
-        assert asr_ids.numel() == n, (
-            f"input_asr_ids length {asr_ids.numel()} does not match "
-            f"scheduled token count {n}"
-        )
+        assert asr_ids.numel() == n, f"input_asr_ids length {asr_ids.numel()} does not match scheduled token count {n}"
 
         asr_emb = self.embed_asr_tokens(asr_ids)
 
@@ -215,17 +291,12 @@ class NemotronDuplexHForCausalLM(NemotronHForCausalLM):
         # ``additional_information["acoustic_embedding"]``.
         acoustic = info_dict.get("acoustic_embedding")
         assert isinstance(acoustic, torch.Tensor), (
-            "acoustic_embedding is required in additional_information "
-            "on every decode step"
+            "acoustic_embedding is required in additional_information on every decode step"
         )
         acoustic = acoustic.to(device=device, dtype=combined.dtype)
-        assert acoustic.dim() == 2, (
-            f"acoustic_embedding must be 2D, got "
-            f"shape {tuple(acoustic.shape)}"
-        )
+        assert acoustic.dim() == 2, f"acoustic_embedding must be 2D, got shape {tuple(acoustic.shape)}"
         assert acoustic.shape[0] == n, (
-            f"acoustic_embedding length {acoustic.shape[0]} does not "
-            f"match scheduled token count {n}"
+            f"acoustic_embedding length {acoustic.shape[0]} does not match scheduled token count {n}"
         )
         combined = combined + acoustic
 
@@ -305,9 +376,7 @@ class NemotronDuplexHForCausalLM(NemotronHForCausalLM):
         every step (which is essential — there is no separate "prefill"
         phase in this streaming setup).
         """
-        hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
+        hidden_states = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
         return hidden_states
 
     # ------------------------------------------------------------------ #
@@ -348,8 +417,23 @@ class NemotronDuplexHForCausalLM(NemotronHForCausalLM):
     #  weight loading                                                    #
     # ------------------------------------------------------------------ #
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]]
-    ) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_prefixes=["mtp"])
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+        # Now that ``embed_tokens`` and ``embed_asr_tokens`` are
+        # populated, materialize the per-prefill pad embedding into
+        # the ``_pad_combined_emb`` buffer declared in ``__init__``.
+        # See the buffer's registration site for why this lives here
+        # rather than in ``__init__`` (embedding tables are empty
+        # there) and why it's non-persistent (derived from weights
+        # that are already saved).
+        embed_weight = self.model.embed_tokens.weight
+        device = embed_weight.device
+        dtype = embed_weight.dtype
+        pad_tokens = torch.full((1,), self.pad_token_id, device=device, dtype=torch.long)
+        pad_emb = self.model.embed_tokens(pad_tokens).to(dtype).squeeze(0)
+        pad_asr_emb = self.embed_asr_tokens(pad_tokens).to(dtype).squeeze(0)
+        self._pad_combined_emb = (pad_emb + pad_asr_emb).detach()
+
+        return loaded
