@@ -1555,10 +1555,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             response_kwargs = {
                 "created": int(time.time()),
                 "data": image_data,
-                "output_format": output_format,
             }
-            if request.size:
-                response_kwargs["size"] = size_str
             if cot_output is not None:
                 response_kwargs["cot_output"] = cot_output
 
