@@ -83,7 +83,10 @@ There are two important details:
 
 Today that compatibility rule is still shape-sensitive. `height`, `width`,
 `num_frames`, and CFG-related fields remain part of the key, so different
-resolutions or incompatible guidance settings do **not** co-batch yet.
+resolutions or incompatible guidance settings do **not** co-batch yet. The
+key also covers LoRA identity (`lora_int_id`, `lora_scale`), so requests
+targeting different adapters or scales run in separate batches and the
+worker can activate exactly one adapter per step.
 
 The current batching unit is one `OmniDiffusionRequest`. Requests with
 multiple prompts do not participate in batching today.
