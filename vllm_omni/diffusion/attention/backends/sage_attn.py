@@ -9,17 +9,31 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
-try:
-    from sageattention import sageattn
-except ImportError:
-    logger.warning(
-        "SageAttentionBackend is not available. You may install sage-attention"
-        " by pip install git+https://github.com/thu-ml/SageAttention.git"
-    )
-    raise ImportError
+if current_omni_platform.is_xpu():
+    try:
+        from auto_round_kernel import ARK
+
+        _ark = ARK()
+        xpu_sageattn = _ark.sagev1
+    except ImportError:
+        logger.warning(
+            "XPU SageAttention (auto_round_kernel.ARK.sagev1) is not available. "
+            "Install auto-round-lib==0.13.0 for XPU sage attention support."
+        )
+        xpu_sageattn = None
+else:
+    try:
+        from sageattention import sageattn
+    except ImportError:
+        logger.warning(
+            "SageAttentionBackend is not available. You may install sage-attention"
+            " by pip install git+https://github.com/thu-ml/SageAttention.git"
+        )
+        raise ImportError
 
 # TODO add sage3 attention backend
 
@@ -72,4 +86,37 @@ class SageAttentionImpl(AttentionImpl):
             is_causal=self.causal,
             sm_scale=self.softmax_scale,
         )
+        return output
+
+    def forward_xpu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata = None,
+    ) -> torch.Tensor:
+        if xpu_sageattn is None:
+            raise ImportError(
+                "XPU SageAttention requires auto-round-lib==0.13.0. Install with: pip install auto-round-lib==0.13.0"
+            )
+        orig_dtype = query.dtype
+        # ARK.sagev1 requires float16 inputs
+        q = query.to(torch.float16) if orig_dtype != torch.float16 else query
+        k = key.to(torch.float16) if orig_dtype != torch.float16 else key
+        v = value.to(torch.float16) if orig_dtype != torch.float16 else value
+        # Input is NHD layout [B, S, H, D], ARK.sagev1 expects [B, H, S, D]
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+        output = xpu_sageattn(
+            q,
+            k,
+            v,
+            is_causal=self.causal,
+            scale=self.softmax_scale,
+        )
+        # Output is [B, H, S, D], convert back to [B, S, H, D]
+        output = output.transpose(1, 2).contiguous()
+        if orig_dtype != torch.float16:
+            output = output.to(orig_dtype)
         return output
