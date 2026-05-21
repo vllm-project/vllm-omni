@@ -1994,9 +1994,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Build prompt for FunCineForge.
 
         FunCineForge uses multimodal input with reference audio for voice cloning,
-        similar to CosyVoice3.  Face embeddings can be provided via the
-        ``face_embedding`` field in ``mm_processor_kwargs``; if absent the
-        model falls back to zero face embeddings.
+        similar to CosyVoice3.  Cinematic dubbing parameters (face embeddings,
+        speech type, dialogue metadata) are forwarded via ``mm_processor_kwargs``.
         """
         wav_samples, sr = await self._resolve_ref_audio(request.ref_audio)
         audio_data = (np.asarray(wav_samples, dtype=np.float32), sr)
@@ -2006,11 +2005,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "sample_rate": sr,
         }
 
+        if request.face_path is not None:
+            from vllm_omni.model_executor.models.funcineforge.config import FunCineForgeConfig
+            from vllm_omni.model_executor.models.funcineforge.utils import load_face_embedding
+
+            config = FunCineForgeConfig()
+            speech_len = request.speech_len or 200
+            face_emb = load_face_embedding(request.face_path, speech_len, face_size=config.face_size)
+            mm_kwargs["face_embedding"] = face_emb
+
+        if request.speech_type is not None:
+            mm_kwargs["speech_type"] = request.speech_type
+        if request.speech_len is not None:
+            mm_kwargs["speech_len"] = request.speech_len
+        if request.dialogue is not None:
+            mm_kwargs["dialogue"] = request.dialogue
+
         return {
             "prompt": request.input,
-            "multi_modal_data": {
-                "audio": audio_data,
-            },
+            "multi_modal_data": {"audio": audio_data},
             "mm_processor_kwargs": mm_kwargs,
         }
 

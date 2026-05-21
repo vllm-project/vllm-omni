@@ -49,7 +49,9 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
+from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model as _CosyVoice3Sampling
 from vllm_omni.model_executor.models.funcineforge.config import FunCineForgeConfig
+from vllm_omni.model_executor.models.funcineforge.utils import load_deepspeed_checkpoint
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
@@ -477,90 +479,6 @@ class FunCineForgeModel(
         valid_mask = (req_ids >= 0) & (req_ids < vocab_size)
         return req_ids[valid_mask]
 
-    @staticmethod
-    def _req_scalar(param: torch.Tensor | None, req_idx: int, default: float | int) -> float | int:
-        if param is None or param.numel() == 0:
-            return default
-        index = min(req_idx, int(param.numel()) - 1)
-        value = param.reshape(-1)[index].item()
-        if isinstance(default, int):
-            return int(value)
-        return float(value)
-
-    @staticmethod
-    def _multinomial_sample(probs: torch.Tensor) -> torch.Tensor:
-        return torch.multinomial(probs, 1, replacement=True).reshape(())
-
-    @classmethod
-    def _nucleus_sample_one(
-        cls,
-        weighted_scores: torch.Tensor,
-        *,
-        top_p: float,
-        top_k: int,
-    ) -> int:
-        sorted_prob, sorted_idx = weighted_scores.softmax(dim=0).sort(descending=True, stable=True)
-        probs: list[torch.Tensor] = []
-        indices: list[torch.Tensor] = []
-        cum_prob = 0.0
-        max_keep = len(sorted_idx) if top_k <= 0 else min(int(top_k), len(sorted_idx))
-        for i in range(len(sorted_idx)):
-            if cum_prob < top_p and len(probs) < max_keep:
-                cum_prob += sorted_prob[i]
-                probs.append(sorted_prob[i])
-                indices.append(sorted_idx[i])
-            else:
-                break
-        if not probs:
-            return int(sorted_idx[0].item())
-        sample_probs = torch.tensor(probs).to(weighted_scores)
-        sample_indices = torch.tensor(indices, dtype=torch.long, device=weighted_scores.device)
-        sample_idx = cls._multinomial_sample(sample_probs)
-        return int(sample_indices[int(sample_idx.item())].item())
-
-    @classmethod
-    def _ras_sample_one(
-        cls,
-        weighted_scores: torch.Tensor,
-        decoded_tokens: Sequence[int],
-        *,
-        top_p: float,
-        top_k: int,
-        win_size: int,
-        tau_r: float,
-    ) -> int:
-        top_id = cls._nucleus_sample_one(
-            weighted_scores,
-            top_p=top_p,
-            top_k=top_k,
-        )
-        if win_size > 0 and decoded_tokens:
-            recent = torch.as_tensor(
-                list(decoded_tokens[-win_size:]),
-                device=weighted_scores.device,
-                dtype=torch.long,
-            )
-            rep_num = int((recent == top_id).sum().item())
-            if rep_num >= win_size * tau_r:
-                fallback_probs = weighted_scores.softmax(dim=0)
-                top_id = int(cls._multinomial_sample(fallback_probs).item())
-        return top_id
-
-    @staticmethod
-    def _reset_official_rng(
-        sampling_metadata: SamplingMetadata,
-        req_idx: int,
-        decoded_tokens: Sequence[int],
-        device: torch.device,
-    ) -> None:
-        if len(decoded_tokens) != 0:
-            return
-        generator = sampling_metadata.generators.get(req_idx)
-        seed = int(generator.initial_seed()) if generator is not None else 0
-        torch.manual_seed(seed)
-        if device.type == "cuda":
-            torch.cuda.manual_seed_all(seed)
-
     def _funcineforge_ras_enabled(self, sampling_metadata: SamplingMetadata) -> bool:
         if self.model_stage != "funcineforge_talker":
             return False
@@ -618,25 +536,26 @@ class FunCineForgeModel(
         sampled_ids: list[int] = []
         for req_idx in range(int(logits.shape[0])):
             row_logits = logits[req_idx]
-            temperature = float(self._req_scalar(sampling_metadata.temperature, req_idx, 1.0))
+            temperature = float(_CosyVoice3Sampling._req_scalar(sampling_metadata.temperature, req_idx, 1.0))
             if temperature < self._sampling_eps:
                 sampled_ids.append(int(torch.argmax(row_logits).item()))
                 continue
 
-            top_p = float(self._req_scalar(sampling_metadata.top_p, req_idx, default_top_p))
-            top_k = int(self._req_scalar(sampling_metadata.top_k, req_idx, default_top_k))
+            top_p = float(_CosyVoice3Sampling._req_scalar(sampling_metadata.top_p, req_idx, default_top_p))
+            top_k = int(_CosyVoice3Sampling._req_scalar(sampling_metadata.top_k, req_idx, default_top_k))
+            generator = sampling_metadata.generators.get(req_idx)
             weighted_scores = torch.log_softmax(row_logits / max(temperature, self._sampling_eps), dim=0)
             decoded_tokens = (
                 sampling_metadata.output_token_ids[req_idx] if req_idx < len(sampling_metadata.output_token_ids) else []
             )
-            self._reset_official_rng(sampling_metadata, req_idx, decoded_tokens, logits.device)
-            sampled_id = self._ras_sample_one(
+            sampled_id = _CosyVoice3Sampling._ras_sample_one(
                 weighted_scores,
                 decoded_tokens,
                 top_p=top_p,
                 top_k=top_k,
                 win_size=win_size,
                 tau_r=tau_r,
+                generator=generator,
             )
             if self._debug_tokens and len(decoded_tokens) < 35:
                 probs = weighted_scores.softmax(dim=0)
@@ -993,33 +912,11 @@ class FunCineForgeModel(
     # Weight loading
     # ------------------------------------------------------------------
 
-    def _load_deepspeed_checkpoint(self, path: str, device: torch.device) -> dict[str, torch.Tensor]:
-        """Load a DeepSpeed mp_rank_00_model_states.pt checkpoint.
-
-        Strips the ``module.`` prefix that DeepSpeed ZeRO adds.
-        """
-        raw = torch.load(path, map_location=device, weights_only=False)
-        # DeepSpeed checkpoints may wrap state in various keys
-        if isinstance(raw, dict):
-            if "state_dict" in raw:
-                raw = raw["state_dict"]
-            elif "model_state_dict" in raw:
-                raw = raw["model_state_dict"]
-            elif "module" in raw:
-                raw = raw["module"]
-
-        # Strip "module." prefix added by DDP/ZeRO
-        stripped = {}
-        for k, v in raw.items():
-            key = k.replace("module.", "", 1) if k.startswith("module.") else k
-            stripped[key] = v
-        return stripped
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         if self.model_stage == "funcineforge_talker":
             device = next(self.parameters()).device
             ckpt_path = os.path.join(self.model_dir, self.config.llm_ckpt)
-            checkpoint = self._load_deepspeed_checkpoint(ckpt_path, device)
+            checkpoint = load_deepspeed_checkpoint(ckpt_path, device)
 
             # 1. Load Qwen2 model weights into vLLM's Qwen2Model
             # DeepSpeed keys: "llm.model.X" → vLLM Qwen2Model expects "X"

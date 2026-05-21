@@ -36,7 +36,6 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
-        from vllm_omni.model_executor.models.funcineforge.config import FunCineForgeConfig
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
         )
@@ -47,6 +46,7 @@ def _register_omni_hf_configs() -> None:
     # Register with both transformers AutoConfig and vLLM's config registry
     # so models with empty/missing config.json (e.g. CosyVoice3) can be
     # resolved when model_type is injected via hf_overrides.
+    # NOTE: FunCineForge is registered via transformers_utils/configs/funcineforge.py
     try:
         from vllm.transformers_utils.config import _CONFIG_REGISTRY
     except ImportError:
@@ -54,7 +54,6 @@ def _register_omni_hf_configs() -> None:
 
     for model_type, config_cls in [
         ("qwen3_tts", Qwen3TTSConfig),
-        ("funcineforge", FunCineForgeConfig),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)

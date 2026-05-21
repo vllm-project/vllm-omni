@@ -81,6 +81,40 @@ class OpenAICreateSpeechRequest(BaseModel):
         ge=0,
         description="Per-request initial chunk size override. If null, computed dynamically based on server load.",
     )
+    # FunCineForge cinematic dubbing parameters
+    face_path: str | None = Field(
+        default=None,
+        description=(
+            "Server-local path to a .npz face embedding file for lip-sync "
+            "conditioning. The file must contain 'embeddings' (N, 512) and "
+            "'faceI' (N,) arrays. Only used by FunCineForge."
+        ),
+    )
+    speech_type: str | None = Field(
+        default=None,
+        description=(
+            "Speech style type tag for FunCineForge dubbing. "
+            "Valid values: '旁白' (narration), '独白' (monologue), "
+            "'对话' (dialogue), '多人' (multi-speaker)."
+        ),
+    )
+    speech_len: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Target speech sequence length in codec frames (25 Hz) for "
+            "FunCineForge. Controls face embedding padding size."
+        ),
+    )
+    dialogue: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Dialogue metadata for FunCineForge multi-speaker dubbing. "
+            'Each entry: {"start": float, "duration": float, "spk": int, '
+            '"gender": str, "age": str}.'
+        ),
+    )
+
     extra_params: dict[str, Any] | None = Field(
         default=None,
         description=("Optional model-specific parameters passed directly to the model's extra_args."),

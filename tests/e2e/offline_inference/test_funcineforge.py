@@ -29,6 +29,8 @@ from huggingface_hub import snapshot_download
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
+
+pytestmark = [pytest.mark.core_model, pytest.mark.tts]
 from vllm_omni.model_executor.models.funcineforge.config import (
     FunCineForgeConfig,
 )
@@ -167,7 +169,6 @@ def _assert_valid_audio(outputs, *, min_dur: float = 0.5, max_dur: float = 65.0)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("async_chunk", ASYNC_CHUNK_MODES)
@@ -206,7 +207,6 @@ def test_funcineforge_offline_tts(async_chunk: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("async_chunk", ASYNC_CHUNK_MODES)

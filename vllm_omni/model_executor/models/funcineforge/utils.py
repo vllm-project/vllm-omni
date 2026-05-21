@@ -17,14 +17,12 @@ import torch
 from vllm_omni.model_executor.models.cosyvoice3.utils import (
     extract_speech_token,
     extract_spk_embedding,
-    log_mel_spectrogram,
 )
 from vllm_omni.utils.audio import mel_filter_bank
 
 __all__ = [
     "extract_speech_token",
     "extract_spk_embedding",
-    "log_mel_spectrogram",
 ]
 
 
@@ -302,3 +300,28 @@ def load_face_embedding(face_path: str, speech_len: int, face_size: int = 512) -
             end = min(fi + 5, speech_len)
             face_embs[fi:end] = torch.from_numpy(np.asarray(emb)).expand(end - fi, -1)
     return face_embs.unsqueeze(0)
+
+
+# ---------------------------------------------------------------------------
+# DeepSpeed checkpoint loading
+# ---------------------------------------------------------------------------
+
+
+def load_deepspeed_checkpoint(path: str, device: torch.device) -> dict[str, torch.Tensor]:
+    """Load a DeepSpeed ``mp_rank_00_model_states.pt`` checkpoint.
+
+    Strips the ``module.`` prefix that DeepSpeed ZeRO/DDP adds.
+    """
+    raw = torch.load(path, map_location=device, weights_only=False)
+    if isinstance(raw, dict):
+        if "state_dict" in raw:
+            raw = raw["state_dict"]
+        elif "model_state_dict" in raw:
+            raw = raw["model_state_dict"]
+        elif "module" in raw:
+            raw = raw["module"]
+    stripped = {}
+    for k, v in raw.items():
+        key = k.replace("module.", "", 1) if k.startswith("module.") else k
+        stripped[key] = v
+    return stripped

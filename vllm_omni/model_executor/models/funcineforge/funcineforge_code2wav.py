@@ -19,11 +19,12 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.funcineforge.config import FunCineForgeConfig
+from vllm_omni.model_executor.models.funcineforge.utils import load_deepspeed_checkpoint
 
-logger_init = __import__("vllm.logger", fromlist=["init_logger"])
-logger = logger_init.init_logger(__name__)
+logger = init_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +498,7 @@ class FunCineForgeCode2Wav(nn.Module):
         """
         flow_path = os.path.join(model_dir, self.config.flow_ckpt)
         if os.path.exists(flow_path):
-            flow_state = self._load_deepspeed_checkpoint(flow_path, device)
+            flow_state = load_deepspeed_checkpoint(flow_path, device)
 
             # 1. codec_embedder → input_embedding
             emb_state = {
@@ -547,7 +548,7 @@ class FunCineForgeCode2Wav(nn.Module):
         # Load vocoder weights
         voc_path = os.path.join(model_dir, self.config.vocoder_ckpt)
         if os.path.exists(voc_path):
-            voc_state = self._load_deepspeed_checkpoint(voc_path, device)
+            voc_state = load_deepspeed_checkpoint(voc_path, device)
             gen_state = {k.replace("generator.", ""): v for k, v in voc_state.items() if k.startswith("generator.")}
             if gen_state:
                 self.vocoder.generator.load_state_dict(gen_state, strict=False)
@@ -559,19 +560,3 @@ class FunCineForgeCode2Wav(nn.Module):
             logger.info("Loaded vocoder weights from %s", voc_path)
         else:
             logger.warning("Vocoder checkpoint not found: %s", voc_path)
-
-    @staticmethod
-    def _load_deepspeed_checkpoint(path: str, device: torch.device) -> dict[str, torch.Tensor]:
-        raw = torch.load(path, map_location=device, weights_only=False)
-        if isinstance(raw, dict):
-            if "state_dict" in raw:
-                raw = raw["state_dict"]
-            elif "model_state_dict" in raw:
-                raw = raw["model_state_dict"]
-            elif "module" in raw:
-                raw = raw["module"]
-        stripped = {}
-        for k, v in raw.items():
-            key = k.replace("module.", "", 1) if k.startswith("module.") else k
-            stripped[key] = v
-        return stripped
