@@ -107,7 +107,7 @@ class Qwen3OmniMoeTalkerForConditionalGeneration(
         self.codec_head = nn.Linear(self.config.text_config.hidden_size, self.config.text_config.vocab_size, bias=False)
 
         self.rope_deltas = None
-        self.spatial_merge_size = self.config.spatial_merge_size
+        self.spatial_merge_size = self.config.vision_config.spatial_merge_size
 
         self.vocab_size = self.config.code_predictor_config.vocab_size
         self.num_code_groups = self.config.code_predictor_config.num_code_groups
