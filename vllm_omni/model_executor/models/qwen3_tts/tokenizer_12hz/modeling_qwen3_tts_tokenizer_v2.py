@@ -13,6 +13,7 @@
 # limitations under the License.
 """PyTorch Qwen3TTSTokenizerV2 model."""
 
+import inspect
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -562,7 +563,9 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
 
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
-            # Prepare mask arguments
+            # Prepare mask arguments. transformers 5.9.0 dropped `cache_position` and
+            # renamed `input_embeds` -> `inputs_embeds`; transformers 4.x still uses the
+            # singular `input_embeds`. Filter by the live signature so we work on both.
             mask_kwargs = {
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
@@ -571,13 +574,23 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
+
+            def _mask_args(fn):
+                params = inspect.signature(fn).parameters
+                args = {k: v for k, v in mask_kwargs.items() if k in params}
+                if "inputs_embeds" not in params and "input_embeds" in params:
+                    args["input_embeds"] = args.pop("inputs_embeds")
+                return args
+
             # Create the masks
             causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
+                "full_attention": create_causal_mask(**_mask_args(create_causal_mask)),
             }
             # The sliding window alternating layers are not always activated depending on the config
             if self.has_sliding_layers:
-                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+                causal_mask_mapping["sliding_attention"] = create_sliding_window_causal_mask(
+                    **_mask_args(create_sliding_window_causal_mask)
+                )
 
         hidden_states = inputs_embeds
 
