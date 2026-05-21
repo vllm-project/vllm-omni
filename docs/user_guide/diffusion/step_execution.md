@@ -60,6 +60,9 @@ batching only becomes relevant when `--max-num-seqs > 1`.
 - `cache_backend` is not supported together with step execution.
 - Unsupported pipelines fail early during model loading.
 - Request-mode extras such as KV transfer are not wired into step mode yet.
+- LoRA is supported in step mode, but each batch must use a single adapter:
+  requests with different `lora_request` or `lora_scale` are scheduled into
+  separate batches.
 
 ## When To Use It
 
