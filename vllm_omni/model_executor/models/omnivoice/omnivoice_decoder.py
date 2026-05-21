@@ -34,7 +34,7 @@ from vllm_omni.model_executor.models._shared.higgs_audio_decoder import (
     adjust_conv_transpose_output_padding,
     load_higgs_audio_codec,
 )
-from vllm_omni.model_executor.models.omnivoice.config import OmniVoiceConfig
+from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
 __all__ = [
     "HiggsAudioVQLayer",
