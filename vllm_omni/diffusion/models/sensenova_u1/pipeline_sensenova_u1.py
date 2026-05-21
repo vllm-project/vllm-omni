@@ -35,7 +35,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportsModuleOffload
+from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -488,7 +488,7 @@ def _optimized_scale(positive_flat, negative_flat):
 # ---------------------------------------------------------------------------
 
 
-class SenseNovaU1Pipeline(nn.Module, SupportsModuleOffload, DiffusionPipelineProfilerMixin):
+class SenseNovaU1Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
     """SenseNova-U1 text-to-image and image-to-image pipeline for vllm-omni.
 
     Builds the full model graph internally:

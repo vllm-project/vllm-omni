@@ -1,5 +1,6 @@
 # tests/entrypoints/openai/test_serving_speech.py
 import asyncio
+import json
 import logging
 import os
 import struct
@@ -564,7 +565,6 @@ class TestSpeechAPI:
 
     def test_upload_voice_embedding_success(self, client):
         """Upload a voice via speaker_embedding JSON."""
-        import json
 
         emb = [0.1] * 1024
         data = {
@@ -585,7 +585,6 @@ class TestSpeechAPI:
 
     def test_upload_voice_embedding_appears_in_listing(self, client):
         """Embedding-uploaded voice appears in list with correct source."""
-        import json
 
         emb = [0.2] * 2048
         data = {
@@ -606,7 +605,6 @@ class TestSpeechAPI:
 
     def test_upload_voice_embedding_and_audio_mutually_exclusive(self, client):
         """Providing both audio_sample and speaker_embedding returns 400."""
-        import json
 
         emb = [0.1] * 1024
         files = {"audio_sample": ("test.wav", b"fake", "audio/wav")}
@@ -632,7 +630,6 @@ class TestSpeechAPI:
 
     def test_upload_voice_embedding_nan_rejected(self, client):
         """NaN values in speaker_embedding return 400."""
-        import json
 
         data = {
             "speaker_embedding": json.dumps([0.1] * 1023 + [float("nan")]),
@@ -930,7 +927,6 @@ class TestTTSMethods:
 
     def test_upload_voice_embedding_wrong_dims_rejected(self, speech_server):
         """Embedding uploads must match the loaded Qwen3-TTS model before being stored."""
-        import json
 
         speech_server._tts_model_type = "qwen3_tts"
         speech_server.engine_client.model_config = SimpleNamespace(

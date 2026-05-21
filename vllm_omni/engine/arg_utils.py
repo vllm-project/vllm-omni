@@ -23,7 +23,6 @@ _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "FunCineForgeModel": "funcineforge",
     "OmniVoiceModel": "omnivoice",
     "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
-    "VoxCPMForConditionalGeneration": "voxcpm",
 }
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
@@ -159,6 +158,10 @@ class OmniEngineArgs(EngineArgs):
 
     omni_master_address: str | None = None
     omni_master_port: int | None = None
+    # OmniCoordinator integration knobs (process-local).
+    omni_dp_size_local: int = 1
+    omni_lb_policy: str = "random"
+    omni_heartbeat_timeout: float = 30.0
     stage_configs_path: str | None = None
     output_modalities: list[str] | None = None
     log_stats: bool = False
