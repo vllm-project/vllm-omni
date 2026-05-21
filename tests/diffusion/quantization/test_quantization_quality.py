@@ -32,16 +32,30 @@ Optional artifact dump:
 from __future__ import annotations
 
 import gc
+import importlib.util
 import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 from tests.helpers.mark import hardware_marks
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_BENCH_MODULE_PATH = _REPO_ROOT / "benchmarks" / "diffusion" / "quantization_quality.py"
+_BENCH_MODULE_NAME = "benchmarks.diffusion.quantization_quality"
+
+if _BENCH_MODULE_NAME not in sys.modules:
+    _spec = importlib.util.spec_from_file_location(_BENCH_MODULE_NAME, _BENCH_MODULE_PATH)
+    _mod = importlib.util.module_from_spec(_spec)
+    sys.modules[_BENCH_MODULE_NAME] = _mod
+    _spec.loader.exec_module(_mod)
 
 # ---------------------------------------------------------------------------
 # Configuration — add new quantization methods / models here
@@ -128,6 +142,18 @@ QUALITY_CONFIGS = [
         max_lpips=0.35,
         seed=142,
         num_inference_steps=20,
+    ),
+    QualityTestConfig(
+        id="fp8_ltx2",
+        model="Lightricks/LTX-2",
+        quantization="fp8",
+        task="t2v",
+        prompt="A serene lakeside sunrise with mist over the water",
+        max_lpips=0.10,
+        height=256,
+        width=256,
+        num_frames=25,
+        num_inference_steps=8,
     ),
 ]
 
@@ -247,8 +273,17 @@ def _generate_video(omni, config: QualityTestConfig):
         else:
             frames = inner
     elif hasattr(first, "images") and first.images:
-        frames = first.images
+        frames = first.images[0]
     else:
+        raise ValueError("Could not extract video frames from output.")
+
+    # LTX-2 (audio+video) may surface (video, audio) tuples or {"video": ...} dicts
+    if isinstance(frames, dict):
+        frames = frames.get("video") or frames.get("frames")
+    elif isinstance(frames, tuple) and len(frames) == 2:
+        frames = frames[0]
+
+    if frames is None:
         raise ValueError("Could not extract video frames from output.")
 
     if isinstance(frames, torch.Tensor):
@@ -261,7 +296,11 @@ def _generate_video(omni, config: QualityTestConfig):
             video = video.clamp(-1, 1) * 0.5 + 0.5
         return video.float().numpy(), peak_mem
 
-    return np.asarray(frames), peak_mem
+    frames_array = np.asarray(frames)
+    if frames_array.ndim == 5:
+        # strip the leading batch dim
+        frames_array = frames_array[0]
+    return frames_array, peak_mem
 
 
 def _compute_lpips(baseline, quantized, task: str) -> float:
@@ -304,8 +343,7 @@ def _compute_psnr_and_mae(baseline, quantized, task: str) -> tuple[float, float]
     return psnr, mae
 
 
-def _unload(omni):
-    del omni
+def _free_gpu_memory():
     gc.collect()
     if torch.cuda.is_available():
         torch.accelerator.empty_cache()
@@ -316,12 +354,49 @@ def _unload(omni):
 # Tests
 # ---------------------------------------------------------------------------
 
+
+def test_benchmark_generate_image_unwraps_nested_omni_request_output(monkeypatch):
+    from benchmarks.diffusion.quantization_quality import _generate_image as benchmark_generate_image
+    from vllm_omni.outputs import OmniRequestOutput
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_type", "cpu", raising=False)
+    monkeypatch.setattr(torch.accelerator, "reset_peak_memory_stats", lambda: None, raising=False)
+    monkeypatch.setattr(torch.accelerator, "max_memory_allocated", lambda: 0, raising=False)
+
+    image = Image.new("RGB", (2, 2))
+    inner = OmniRequestOutput.from_diffusion(request_id="req", images=[image])
+    outer = OmniRequestOutput(
+        request_id="req",
+        stage_id=0,
+        final_output_type="image",
+        request_output=inner,
+        finished=True,
+    )
+
+    class DummyOmni:
+        def generate(self, *_args, **_kwargs):
+            return [outer]
+
+    args = SimpleNamespace(height=2, width=2, num_inference_steps=1)
+    output, _elapsed, peak_mem = benchmark_generate_image(DummyOmni(), args, "prompt", 42)
+
+    assert output is image
+    assert peak_mem == 0.0
+
+
 _marks = hardware_marks(res={"cuda": "H100"})
 _OUTPUT_DIR = Path(os.environ["VLLM_OMNI_QUALITY_OUTPUT_DIR"]) if "VLLM_OMNI_QUALITY_OUTPUT_DIR" in os.environ else None
 
 
 def _quality_param(c: QualityTestConfig):
     marks = list(_marks)
+    if c.id == "fp8_z_image":
+        marks.append(
+            pytest.mark.skip(
+                reason="Z-Image FP8 quality gate temporarily disabled: https://github.com/vllm-project/vllm-omni/issues/3531"
+            )
+        )
     if c.id == "fp8_qwen_image":
         marks.append(
             pytest.mark.skip(reason="Qwen-Image FP8 quality gate temporarily disabled (see CI / issue tracker).")
@@ -344,7 +419,9 @@ def test_quantization_quality(config: QualityTestConfig):
     # --- BF16 baseline ---
     omni_bl = Omni(model=config.baseline_ref())
     baseline_out, bl_mem = generate_fn(omni_bl, config)
-    _unload(omni_bl)
+    omni_bl.shutdown()
+    del omni_bl
+    _free_gpu_memory()
     _maybe_save_output(_OUTPUT_DIR, config, "baseline", baseline_out)
 
     # --- Quantized ---
@@ -354,7 +431,9 @@ def test_quantization_quality(config: QualityTestConfig):
     else:
         omni_qt = Omni(model=config.quantized_ref(), quantization_config=quantization)
     quant_out, qt_mem = generate_fn(omni_qt, config)
-    _unload(omni_qt)
+    omni_qt.shutdown()
+    del omni_qt
+    _free_gpu_memory()
     _maybe_save_output(_OUTPUT_DIR, config, "quantized", quant_out)
 
     # --- Similarity metrics ---

@@ -16,7 +16,11 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import logger
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    extract_routed_experts_for_current_batch,
+    get_global_experts_capturer,
+    issue_routing_d2h_copy,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import (
@@ -28,8 +32,8 @@ from vllm.v1.outputs import (
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
-from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, PerLayerAttnMetadata
+from vllm.v1.worker.mamba_utils import preprocess_mamba
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
@@ -167,7 +171,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
 
             self.omni_prefix_cache.update_omni_tensor_prefix_cache(
                 hidden_states=hidden_states,
-                multimodal_outputs=multimodal_outputs,
+                multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
                 slot_mapping=self.input_batch.block_table[0].slot_mapping.cpu,
                 num_tokens_padded=num_tokens_padded,
@@ -190,7 +194,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
                 query_start_loc=self.query_start_loc.cpu,
                 input_batch=self.input_batch,
-                multimodal_outputs=multimodal_outputs,
+                multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
                 num_scheduled_tokens=num_scheduled_tokens,
             )
         return combined_hidden_states, combined_multimodal_outputs
@@ -246,11 +250,9 @@ class NPUARModelRunner(OmniNPUModelRunner):
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | IntermediateTensors | None:
         if self.vllm_config.model_config.enable_return_routed_experts:
-            capturer = RoutedExpertsCapturer.get_instance()
-            if capturer is not None:
-                capturer.clear_buffer()
-            else:
-                logger.warning("RoutedExpertsCapturer is not initialized.")
+            capturer = get_global_experts_capturer()
+            if capturer is not None and hasattr(capturer, "finalize_pending_copy"):
+                capturer.finalize_pending_copy()
         if self.ascend_config.profiling_chunk_config.enabled:
             self._sync_device()
             self._execution_start_time = time.perf_counter()
@@ -299,7 +301,9 @@ class NPUARModelRunner(OmniNPUModelRunner):
         # TODO(Ronald1995): deepcopy is expensive when there is a large
         # number of requests, optimize it later.
         if ((
-            self.use_async_scheduling and self.num_spec_tokens and self._draft_token_ids is None  # type: ignore[has-type]
+            self.use_async_scheduling
+            and self.num_spec_tokens
+            and self._draft_token_ids is None  # type: ignore[has-type]
         ) or (
             # NOTE: This branch specifically triggers a deepcopy during the prefill phase
             # only for PCP (Parallel Context Processing) + Multi-Modal (MM) scenarios.
@@ -455,7 +459,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     if deferred_state_corrections_fn:
                         deferred_state_corrections_fn()
                         deferred_state_corrections_fn = None
-                    mamba_utils.preprocess_mamba(
+                    preprocess_mamba(
                         scheduler_output,
                         self.kv_cache_config,
                         self.cache_config,
@@ -715,6 +719,15 @@ class NPUARModelRunner(OmniNPUModelRunner):
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
+
+        if self.vllm_config.model_config.enable_return_routed_experts and hasattr(self, "_positions_cpu"):
+            issue_routing_d2h_copy(
+                input_batch_req_ids=self.input_batch.req_ids,
+                num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                positions=self.positions,
+                positions_cpu=self._positions_cpu,
+            )
+
         return None
 
     @torch.inference_mode()
@@ -858,12 +871,17 @@ class NPUARModelRunner(OmniNPUModelRunner):
             if self.speculative_config is not None:
                 self.finalize_kv_connector()
 
+        routed_experts_dict = None
         if self.model_config.enable_return_routed_experts:
-            capturer = RoutedExpertsCapturer.get_instance()
-            if capturer is not None:
-                capturer.save_captured_experts(indices=self.cpu_slot_mapping)
-            else:
-                logger.warning("RoutedExpertsCapturer is not initialized.")
+            capturer = get_global_experts_capturer()
+            if capturer is not None and hasattr(self.input_batch, "num_tokens_no_spec"):
+                routed_experts_dict = extract_routed_experts_for_current_batch(
+                    req_ids=req_ids_output_copy,
+                    requests=self.requests,
+                    req_id_to_index=self.input_batch.req_id_to_index,
+                    num_tokens_no_spec=self.input_batch.num_tokens_no_spec,
+                    max_model_len=self.max_model_len,
+                )
 
         #  -------------------------------------- Omni-new -------------------------------------------------
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
@@ -944,12 +962,23 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 mm_payload: dict[str, object] = {}
                 if combined_multimodal_outputs or mm_cpu:
                     if combined_multimodal_outputs:
+                        # Prefix cache enabled; all items have already been processed
+                        # and split apart for each request as needed, and all tensors
+                        # have already been detached to the CPU.  Lists are kept as
+                        # passthrough data for consistent behavior in postprocess.
+                        # Recurse into nested dicts so list-valued sub-keys (e.g.
+                        # embed.tts_bos = [tensor]) are unwrapped to bare tensors
+                        # at the leaves; downstream flatten_payload then yields a
+                        # wire-clean dict[str, torch.Tensor].
+                        def _unwrap_lists(v):
+                            if isinstance(v, list):
+                                return v[idx] if idx < len(v) else v[0]
+                            if isinstance(v, dict):
+                                return {k: _unwrap_lists(sv) for k, sv in v.items()}
+                            return v
+
                         for mm_key in combined_multimodal_outputs.keys():
-                            value = combined_multimodal_outputs[mm_key][rid]
-                            if isinstance(value, list):
-                                mm_payload[mm_key] = value[idx] if idx < len(value) else value[0]
-                            else:
-                                mm_payload[mm_key] = value
+                            mm_payload[mm_key] = _unwrap_lists(combined_multimodal_outputs[mm_key][rid])
                     else:
                         for mm_key, mm_val in mm_cpu.items():
                             mm_payload[mm_key] = to_payload_element(
@@ -973,6 +1002,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
+            routed_experts_dict=routed_experts_dict,
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted_req_ids
         #  -------------------------------------- Omni-new -------------------------------------------------

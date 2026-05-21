@@ -5,6 +5,10 @@ E2E tests for speaker_embedding API parameter.
 
 Tests Base models (0.6B-Base and 1.7B-Base) which support voice cloning
 via pre-computed ECAPA-TDNN embeddings, bypassing ref_audio extraction.
+
+Invalid combinations (mutually exclusive with ref_audio, empty embedding,
+wrong embedding dimensions) live in
+``tests/dfx/reliability/http_invalid/test_invalid_audio_speech.py``.
 """
 
 import os
@@ -147,45 +151,6 @@ class TestSpeakerEmbeddingBase:
         assert len(response.content) > MIN_AUDIO_BYTES
         assert_not_silence(response.content)
 
-    @pytest.mark.advanced_model
-    @pytest.mark.tts
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_speaker_embedding_mutually_exclusive_with_ref_audio(self, omni_server) -> None:
-        """Sending both speaker_embedding and ref_audio returns 400."""
-        url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech"
-        payload = {
-            "model": omni_server.model,
-            "input": SYN_TEXT,
-            "task_type": "Base",
-            "speaker_embedding": DUMMY_EMBEDDING_1024,
-            "ref_audio": "https://example.com/audio.wav",
-            "response_format": "wav",
-        }
-        with httpx.Client(timeout=30.0) as client:
-            response = client.post(url, json=payload)
-
-        assert response.status_code == 400, f"Expected 400, got {response.status_code}: {response.text}"
-        assert "mutually exclusive" in response.text
-
-    @pytest.mark.advanced_model
-    @pytest.mark.tts
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_speaker_embedding_empty_rejected(self, omni_server) -> None:
-        """Empty speaker_embedding list returns 400."""
-        url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech"
-        payload = {
-            "model": omni_server.model,
-            "input": SYN_TEXT,
-            "task_type": "Base",
-            "speaker_embedding": [],
-            "response_format": "wav",
-        }
-        with httpx.Client(timeout=30.0) as client:
-            response = client.post(url, json=payload)
-
-        assert response.status_code == 400, f"Expected 400, got {response.status_code}: {response.text}"
-        assert "non-empty" in response.text
-
 
 # ── 1.7B-Base model tests (2048-dim embeddings) ──
 
@@ -216,26 +181,3 @@ class TestSpeakerEmbedding1_7B:
         assert response.headers.get("content-type") == "audio/wav"
         assert verify_wav_audio(response.content), "Response is not valid WAV"
         assert len(response.content) > MIN_AUDIO_BYTES, f"Audio too small: {len(response.content)} bytes"
-
-    @pytest.mark.advanced_model
-    @pytest.mark.tts
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_1024_dim_on_1_7b_model_rejected(self, omni_server) -> None:
-        """1024-dim speaker_embedding on a 1.7B model (expects 2048) should fail gracefully."""
-        url = f"http://{omni_server.host}:{omni_server.port}/v1/audio/speech"
-        payload = {
-            "model": omni_server.model,
-            "input": SYN_TEXT,
-            "task_type": "Base",
-            "speaker_embedding": DUMMY_EMBEDDING_1024,
-            "x_vector_only_mode": True,
-            "response_format": "wav",
-            "max_new_tokens": MAX_NEW_TOKENS,
-        }
-        with httpx.Client(timeout=120.0) as client:
-            response = client.post(url, json=payload)
-
-        # Wrong dimensions should produce an error, not silent garbage.
-        assert response.status_code == 400, f"Expected 400, got {response.status_code}: {response.text}"
-        assert "speaker_embedding has 1024 dimensions" in response.text
-        assert "expected 2048" in response.text
