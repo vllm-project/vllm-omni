@@ -4,8 +4,8 @@
 E2E Online tests for Qwen3-Omni model.
 """
 
-import os
 import base64
+import os
 from pathlib import Path
 
 import pytest
