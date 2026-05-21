@@ -10,7 +10,7 @@ for text-to-image generation, with vllm-omni specific extensions.
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 
@@ -29,6 +29,8 @@ class ImageGenerationRequest(BaseModel):
     Follows the OpenAI Images API specification with vllm-omni extensions
     for advanced diffusion parameters.
     """
+
+    model_config = ConfigDict(extra="allow")
 
     # Required fields
     prompt: str = Field(..., description="Text description of the desired image(s)")
@@ -99,21 +101,6 @@ class ImageGenerationRequest(BaseModel):
             raise ValueError(f"Invalid use_system_prompt type: {v}. Must be one of: {valid_types[1:] + [None]}")
         return v
 
-    bot_task: str | None = Field(
-        default=None,
-        description=("Bot task type. Options: think, recaption, think_recaption, vanilla"),
-    )
-
-    @field_validator("bot_task")
-    @classmethod
-    def validate_bot_task(cls, v):
-        if v is None:
-            return None
-        valid_tasks = ["think", "recaption", "think_recaption", "vanilla"]
-        if v not in valid_tasks:
-            raise ValueError(f"Invalid bot_task: {v}. Must be one of: {valid_tasks}")
-        return v
-
     num_inference_steps: int | None = Field(
         default=None,
         ge=1,
@@ -176,8 +163,8 @@ class ImageGenerationResponse(BaseModel):
     Returns generated images with metadata.
     """
 
+    model_config = ConfigDict(extra="allow")
     created: int = Field(..., description="Unix timestamp of when the generation completed")
     data: list[ImageData] = Field(..., description="Array of generated images")
     output_format: str = Field(None, description="The output format of the image generation")
     size: str = Field(None, description="The size of the image generated")
-    cot_output: str | None = Field(None, description="Chain-of-Thought output from the model")
