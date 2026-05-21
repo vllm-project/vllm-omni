@@ -77,50 +77,59 @@ THRESHOLDS = {
     "psnr": 11.0,  # Peak signal-to-noise ratio (dB)
 }
 # fmt: off
-_BASE_CONFIG = {
-    "stage_args": [
+_DEPLOY_CONFIG = {
+    "pipeline": "hunyuan_image_3_moe",
+    "async_chunk": False,
+    "trust_remote_code": True,
+    "connectors": {
+        "shared_memory_connector": {
+            "name": "SharedMemoryConnector",
+            "extra": {"shm_threshold_bytes": 65536},
+        },
+    },
+    "stages": [
         {
-            "stage_id": 0, "stage_type": "llm",
-            "runtime": {"process": True, "devices": AR_DEVICES, "max_batch_size": 1, "requires_multimodal_data": True},
-            "engine_args": {
-                "model_stage": "AR", "model_arch": "HunyuanImage3ForCausalMM",
-                "worker_cls": "vllm_omni.worker.gpu_ar_worker.GPUARWorker",
-                "scheduler_cls": "vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler",
-                "gpu_memory_utilization": 0.95, "enforce_eager": True, "trust_remote_code": True,
-                "engine_output_type": "latent", "enable_prefix_caching": False,
-                "max_num_batched_tokens": 32768, "tensor_parallel_size": AR_TP_SIZE, "pipeline_parallel_size": 1,
-                "hf_overrides": {"rope_parameters": {"mrope_section": [0, 32, 32], "rope_type": "default"}},
-            },
-            "is_comprehension": False, "final_output": True, "final_output_type": "text",
-            "default_sampling_params": {
-                "temperature": 0.0, "top_p": 1, "top_k": -1, "max_tokens": 8192,
-                "stop_token_ids": [128025], "detokenize": True, "skip_special_tokens": False,
+            "stage_id": 0,
+            "is_comprehension": False,
+            "final_output": True,
+            "final_output_type": "text",
+            "max_num_seqs": 1,
+            "gpu_memory_utilization": 0.95,
+            "enforce_eager": True,
+            "trust_remote_code": True,
+            "max_num_batched_tokens": 32768,
+            "devices": AR_DEVICES,
+            "tensor_parallel_size": AR_TP_SIZE,
+            "hf_overrides": {
+                "rope_parameters": {"mrope_section": [0, 32, 32], "rope_type": "default"},
             },
             "output_connectors": {"to_stage_1": "shared_memory_connector"},
+            "default_sampling_params": {
+                "temperature": 0.0,
+                "top_p": 1,
+                "top_k": -1,
+                "max_tokens": 8192,
+                "stop_token_ids": [128025],
+                "detokenize": True,
+                "skip_special_tokens": False,
+            },
         },
         {
-            "stage_id": 1, "stage_type": "diffusion",
-            "runtime": {"process": True, "devices": DIT_DEVICES, "max_batch_size": 1, "requires_multimodal_data": True},
-            "engine_args": {
-                "model_stage": "dit", "model_arch": "HunyuanImage3ForCausalMM",
-                "enforce_eager": True, "trust_remote_code": True, "distributed_executor_backend": "mp",
-                "parallel_config": {"tensor_parallel_size": DIT_TP_SIZE, "enable_expert_parallel": True},
-            },
-            "engine_input_source": [0],
-            "custom_process_input_func": "vllm_omni.model_executor.stage_input_processors.hunyuan_image3.ar2diffusion",
-            "final_output": True, "final_output_type": "image",
-            "default_sampling_params": {"num_inference_steps": NUM_INFERENCE_STEPS, "guidance_scale": GUIDANCE_SCALE},
+            "stage_id": 1,
+            "max_num_seqs": 1,
+            "enforce_eager": True,
+            "trust_remote_code": True,
+            "devices": DIT_DEVICES,
+            "distributed_executor_backend": "mp",
+            "parallel_config": {"tensor_parallel_size": DIT_TP_SIZE, "enable_expert_parallel": True},
             "input_connectors": {"from_stage_0": "shared_memory_connector"},
+            "default_sampling_params": {
+                "num_inference_steps": NUM_INFERENCE_STEPS,
+                "guidance_scale": GUIDANCE_SCALE,
+            },
         },
     ],
-    "runtime": {
-        "enabled": True,
-        "connectors": {"shared_memory_connector": {
-            "name": "SharedMemoryConnector",
-            "extra": {"shm_threshold_bytes": 65536}
-        }},
-        "edges": [{"from": 0, "to": 1}],
-    },
+    "edges": [{"from": 0, "to": 1}],
 }
 # fmt: on
 
@@ -138,13 +147,13 @@ COT_REF = ("首先，我分析所有输入图像：图像1是一个圆形的logo
 
 
 def _make_config(enable_kv_reuse: bool, path: Path) -> None:
-    config = copy.deepcopy(_BASE_CONFIG)
-    config["stage_args"][0]["engine_args"]["omni_kv_config"] = {"need_send_cache": enable_kv_reuse}
-    config["stage_args"][1]["engine_args"]["omni_kv_config"] = {"need_recv_cache": enable_kv_reuse}
+    config = copy.deepcopy(_DEPLOY_CONFIG)
+    config["stages"][0]["omni_kv_config"] = {"need_send_cache": enable_kv_reuse}
+    config["stages"][1]["omni_kv_config"] = {"need_recv_cache": enable_kv_reuse}
     path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
 
 
-def _run_offline(stage_configs_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
+def _run_offline(deploy_config_path: str, output_path: Path) -> tuple[Image.Image, str, float]:
     from transformers import AutoTokenizer
 
     from tests.helpers.runtime import OmniRunner
@@ -163,7 +172,7 @@ def _run_offline(stage_configs_path: str, output_path: Path) -> tuple[Image.Imag
     system_prompt_type = result.system_prompt_type
 
     ar_stop_token_ids = resolve_stop_token_ids(task="it2i", bot_task="think_recaption", tokenizer=tokenizer)
-    with OmniRunner(MODEL_PATH, stage_configs_path=stage_configs_path) as runner:
+    with OmniRunner(MODEL_PATH, deploy_config=deploy_config_path) as runner:
         params_list = list(runner.omni.default_sampling_params_list)
         for sp in params_list:
             if isinstance(sp, OmniDiffusionSamplingParams):
