@@ -17,7 +17,7 @@ import inspect
 from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed
@@ -38,6 +38,9 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
@@ -173,7 +176,16 @@ class LTX2AdaLayerNormSingle(nn.Module):
 
 
 class ColumnParallelApproxGELU(nn.Module):
-    def __init__(self, dim_in: int, dim_out: int, *, approximate: str, bias: bool = True):
+    def __init__(
+        self,
+        dim_in: int,
+        dim_out: int,
+        *,
+        approximate: str,
+        bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.proj = ColumnParallelLinear(
             dim_in,
@@ -181,6 +193,8 @@ class ColumnParallelApproxGELU(nn.Module):
             bias=bias,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.proj" if prefix else "proj",
         )
         self.approximate = approximate
 
@@ -200,6 +214,8 @@ class LTX2FeedForward(nn.Module):
         bias: bool = True,
         dropout: float = 0.0,
         final_dropout: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -211,13 +227,22 @@ class LTX2FeedForward(nn.Module):
         dropout_layer: nn.Module = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         layers: list[nn.Module] = [
-            ColumnParallelApproxGELU(dim, inner_dim, approximate="tanh", bias=bias),
+            ColumnParallelApproxGELU(
+                dim,
+                inner_dim,
+                approximate="tanh",
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.net.0" if prefix else "net.0",
+            ),
             dropout_layer,
             RowParallelLinear(
                 inner_dim,
                 dim_out,
                 input_is_parallel=True,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.net.2" if prefix else "net.2",
             ),
         ]
         if final_dropout:
@@ -515,6 +540,9 @@ class LTX2Attention(torch.nn.Module):
         rope_type: str = "interleaved",
         apply_gated_attention: bool = False,
         processor=None,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
+        disable_kv_quant: bool = False,
     ):
         super().__init__()
         # LTX-2 uses "rms_norm_across_heads", LTX-2.3 uses "rms_norm" -- both
@@ -548,6 +576,8 @@ class LTX2Attention(torch.nn.Module):
                 head_size=self.head_dim,
                 total_num_heads=heads,
                 bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_qkv" if prefix else "to_qkv",
             )
             self.query_num_heads = self.to_qkv.num_heads
             self.kv_num_heads = self.to_qkv.num_kv_heads
@@ -562,6 +592,8 @@ class LTX2Attention(torch.nn.Module):
                 bias=bias,
                 gather_output=False,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_q" if prefix else "to_q",
             )
             self.to_k = ColumnParallelLinear(
                 self.cross_attention_dim,
@@ -569,6 +601,8 @@ class LTX2Attention(torch.nn.Module):
                 bias=bias,
                 gather_output=False,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_k" if prefix else "to_k",
             )
             self.to_v = ColumnParallelLinear(
                 self.cross_attention_dim,
@@ -576,6 +610,8 @@ class LTX2Attention(torch.nn.Module):
                 bias=bias,
                 gather_output=False,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_v" if prefix else "to_v",
             )
 
         self.heads = self.query_num_heads
@@ -617,6 +653,8 @@ class LTX2Attention(torch.nn.Module):
                     bias=out_bias,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out.0" if prefix else "to_out.0",
                 ),
                 torch.nn.Dropout(dropout) if dropout > 0 else torch.nn.Identity(),
             ]
@@ -627,9 +665,12 @@ class LTX2Attention(torch.nn.Module):
             num_kv_heads=self.kv_num_heads,
             softmax_scale=1.0 / (dim_head**0.5),
             causal=False,
+            prefix=prefix,
+            disable_kv_quant=disable_kv_quant,
         )
 
         # LTX-2.3: per-head gated attention
+        # leave unquantized for this linear
         if apply_gated_attention:
             self.to_gate_logits = nn.Linear(query_dim, heads, bias=True)
         else:
@@ -748,6 +789,8 @@ class LTX2VideoTransformerBlock(nn.Module):
         elementwise_affine: bool = False,
         rope_type: str = "interleaved",
         perturbed_attn: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.video_cross_attn_adaln = video_cross_attn_adaln
@@ -767,6 +810,8 @@ class LTX2VideoTransformerBlock(nn.Module):
             qk_norm=qk_norm,
             rope_type=rope_type,
             apply_gated_attention=video_gated_attn,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn1" if prefix else "attn1",
         )
 
         self.audio_norm1 = _make_rms_norm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
@@ -781,6 +826,8 @@ class LTX2VideoTransformerBlock(nn.Module):
             qk_norm=qk_norm,
             rope_type=rope_type,
             apply_gated_attention=audio_gated_attn,
+            quant_config=quant_config,
+            prefix=f"{prefix}.audio_attn1" if prefix else "audio_attn1",
         )
 
         # 2. Prompt Cross-Attention
@@ -796,6 +843,9 @@ class LTX2VideoTransformerBlock(nn.Module):
             qk_norm=qk_norm,
             rope_type=rope_type,
             apply_gated_attention=video_gated_attn,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn2" if prefix else "attn2",
+            disable_kv_quant=True,
         )
 
         self.audio_norm2 = _make_rms_norm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
@@ -810,9 +860,14 @@ class LTX2VideoTransformerBlock(nn.Module):
             qk_norm=qk_norm,
             rope_type=rope_type,
             apply_gated_attention=audio_gated_attn,
+            quant_config=quant_config,
+            prefix=f"{prefix}.audio_attn2" if prefix else "audio_attn2",
+            disable_kv_quant=True,
         )
 
         # 3. Audio-to-Video (a2v) and Video-to-Audio (v2a) Cross-Attention
+        # K/V here come from the other modality's latents (long sequences),
+        # so KV-cache quant remains enabled.
         self.audio_to_video_norm = _make_rms_norm(dim, eps=eps, elementwise_affine=elementwise_affine)
         self.audio_to_video_attn = LTX2Attention(
             query_dim=dim,
@@ -825,6 +880,8 @@ class LTX2VideoTransformerBlock(nn.Module):
             qk_norm=qk_norm,
             rope_type=rope_type,
             apply_gated_attention=video_gated_attn,
+            quant_config=quant_config,
+            prefix=f"{prefix}.audio_to_video_attn" if prefix else "audio_to_video_attn",
         )
 
         self.video_to_audio_norm = _make_rms_norm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
@@ -839,14 +896,26 @@ class LTX2VideoTransformerBlock(nn.Module):
             qk_norm=qk_norm,
             rope_type=rope_type,
             apply_gated_attention=audio_gated_attn,
+            quant_config=quant_config,
+            prefix=f"{prefix}.video_to_audio_attn" if prefix else "video_to_audio_attn",
         )
 
         # 4. Feedforward layers
         self.norm3 = _make_rms_norm(dim, eps=eps, elementwise_affine=elementwise_affine)
-        self.ff = LTX2FeedForward(dim, activation_fn=activation_fn)
+        self.ff = LTX2FeedForward(
+            dim,
+            activation_fn=activation_fn,
+            quant_config=quant_config,
+            prefix=f"{prefix}.ff" if prefix else "ff",
+        )
 
         self.audio_norm3 = _make_rms_norm(audio_dim, eps=eps, elementwise_affine=elementwise_affine)
-        self.audio_ff = LTX2FeedForward(audio_dim, activation_fn=activation_fn)
+        self.audio_ff = LTX2FeedForward(
+            audio_dim,
+            activation_fn=activation_fn,
+            quant_config=quant_config,
+            prefix=f"{prefix}.audio_ff" if prefix else "audio_ff",
+        )
 
         # 5. Per-Layer Modulation Parameters
         # LTX-2.3 with cross_attn_adaln uses 9 params (extra 3 for cross-attn modulation);
@@ -1365,6 +1434,9 @@ class LTX2VideoTransformer3DModel(nn.Module):
     _layerwise_offload_blocks_attrs = ["transformer_blocks"]
     _hsdp_shard_conditions = [is_transformer_block_module]
     _sp_plan: dict[str, Any] | None = None
+    packed_modules_mapping = {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+    }
 
     @staticmethod
     def _build_sp_plan(rope_type: str) -> dict[str, Any]:
@@ -1453,6 +1525,7 @@ class LTX2VideoTransformer3DModel(nn.Module):
         cross_attn_mod: bool = False,
         audio_gated_attn: bool = False,
         audio_cross_attn_mod: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
     ) -> None:
         super().__init__()
         self.perturbed_attn = perturbed_attn
@@ -1647,8 +1720,10 @@ class LTX2VideoTransformer3DModel(nn.Module):
                     elementwise_affine=norm_elementwise_affine,
                     rope_type=rope_type,
                     perturbed_attn=perturbed_attn,
+                    quant_config=quant_config,
+                    prefix=f"transformer_blocks.{layer_idx}",
                 )
-                for _ in range(num_layers)
+                for layer_idx in range(num_layers)
             ]
         )
 
