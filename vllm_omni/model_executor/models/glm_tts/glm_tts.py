@@ -54,6 +54,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm_omni.model_executor.models.common.nucleus_ras_sampling import ras_sample_one as _ras_sample_one
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.glm_tts import GLMTTSConfig
+from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 from .text_frontend import GLMTTSTextFrontend
 from .voice_clone import (
@@ -422,6 +423,9 @@ class GLMTTSMultiModalProcessor(BaseMultiModalProcessor[GLMTTSMultiModalProcessi
                 campplus_path=campplus_path,
             )
 
+        if not hasattr(self, "_speaker_cache"):
+            self._speaker_cache = get_speaker_cache()
+
         self._loaded_cache_key = cache_key
 
     def _encode_text(self, text: str) -> torch.Tensor:
@@ -498,6 +502,33 @@ class GLMTTSMultiModalProcessor(BaseMultiModalProcessor[GLMTTSMultiModalProcessi
         )
         prompt_text_ids = self._encode_text(normalized_prompt_text)
 
+        # Speaker cache: skip WhisperVQ + mel + CampPlus on hit
+        voice_name = mm_kwargs.get("voice_name")
+        cache_key = None
+        if voice_name and isinstance(voice_name, str):
+            cache_key = self._speaker_cache.make_cache_key(
+                voice_name,
+                model_type="glm_tts",
+                created_at=int(mm_kwargs.get("voice_created_at") or 0),
+            )
+            cached = self._speaker_cache.get(cache_key)
+            if cached is not None:
+                boa_tensor = torch.tensor([[int(self.special_ids["boa"])]], dtype=torch.long)
+                input_ids = torch.cat([prompt_text_ids, text_ids, boa_tensor], dim=1)
+                return BatchFeature(
+                    {
+                        "input_ids": input_ids,
+                        "prompt_speech_token": cached["prompt_speech_token"].clone(),
+                        "prompt_speech_token_len": [cached["prompt_speech_token_len"].clone()],
+                        "glm_tts_prompt_text_token_len": [
+                            torch.tensor([int(prompt_text_ids.shape[1])], dtype=torch.long)
+                        ],
+                        "prompt_feat": cached["prompt_feat"].clone(),
+                        "embedding": cached["embedding"].clone(),
+                        "glm_tts_text_token_len": [torch.tensor([int(text_ids.shape[1])], dtype=torch.long)],
+                    }
+                )
+
         prompt_speech_token = extract_prompt_speech_token(wav, int(sr or 24000), self.speech_tokenizer)
         if not prompt_speech_token:
             raise RuntimeError("GLM-TTS failed to extract WhisperVQ prompt speech tokens from ref_audio.")
@@ -522,14 +553,29 @@ class GLMTTSMultiModalProcessor(BaseMultiModalProcessor[GLMTTSMultiModalProcessi
         if embedding is None:
             raise RuntimeError("GLM-TTS failed to extract CampPlus speaker embedding from ref_audio.")
 
+        prompt_speech_token_len = torch.tensor([len(prompt_speech_token)], dtype=torch.long)
+        prompt_feat_cpu = prompt_feat.detach().to("cpu").unsqueeze(0).contiguous()
+        embedding_tensor = torch.tensor([embedding], dtype=torch.float32)
+
+        if cache_key is not None:
+            self._speaker_cache.put(
+                cache_key,
+                {
+                    "prompt_speech_token": prompt_speech_token_tensor.detach().cpu(),
+                    "prompt_speech_token_len": prompt_speech_token_len.detach().cpu(),
+                    "prompt_feat": prompt_feat_cpu.detach().cpu(),
+                    "embedding": embedding_tensor.detach().cpu(),
+                },
+            )
+
         return BatchFeature(
             {
                 "input_ids": input_ids,
                 "prompt_speech_token": prompt_speech_token_tensor,
-                "prompt_speech_token_len": [torch.tensor([len(prompt_speech_token)], dtype=torch.long)],
+                "prompt_speech_token_len": [prompt_speech_token_len],
                 "glm_tts_prompt_text_token_len": [torch.tensor([int(prompt_text_ids.shape[1])], dtype=torch.long)],
-                "prompt_feat": prompt_feat.detach().to("cpu").unsqueeze(0).contiguous(),
-                "embedding": torch.tensor([embedding], dtype=torch.float32),
+                "prompt_feat": prompt_feat_cpu,
+                "embedding": embedding_tensor,
                 "glm_tts_text_token_len": [torch.tensor([int(text_ids.shape[1])], dtype=torch.long)],
             }
         )

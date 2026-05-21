@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 
 import torch
+import torchaudio.compliance.kaldi as kaldi
+import torchaudio.transforms as T
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -216,8 +218,6 @@ def extract_prompt_speech_token(
 
     audio = ref_audio_wav.float().to(device)
     if ref_audio_sr != 16000:
-        import torchaudio.transforms as T
-
         resampler = T.Resample(orig_freq=ref_audio_sr, new_freq=16000).to(device)
         audio = resampler(audio)
 
@@ -257,12 +257,8 @@ def extract_spk_embedding(
 ) -> list[float] | None:
     """Extract speaker embedding from reference audio using CampPlus ONNX."""
 
-    import torchaudio.compliance.kaldi as kaldi
-
     audio = ref_audio_wav.float().cpu()
     if ref_audio_sr != 16000:
-        import torchaudio.transforms as T
-
         resampler = T.Resample(orig_freq=ref_audio_sr, new_freq=16000)
         audio = resampler(audio)
     if audio.ndim > 1:
@@ -284,8 +280,6 @@ def extract_prompt_feat(
     """Extract mel features from reference audio for DiT conditioning."""
     audio = ref_audio_wav.float().to(model_device)
     if ref_audio_sr != 24000:
-        import torchaudio.transforms as T
-
         resampler = T.Resample(orig_freq=ref_audio_sr, new_freq=24000).to(model_device)
         audio = resampler(audio)
     if audio.ndim > 1:
