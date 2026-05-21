@@ -31,6 +31,7 @@ _OMNI_MODELS = {
         "Qwen2_5OmniToken2WavModel",
     ),
     "Qwen2ForCausalLM_old": ("qwen2_5_omni", "qwen2_old", "Qwen2ForCausalLM"),  # need to discuss
+    "MiniMindForCausalLM": ("minimind_o", "minimind_llm", "MiniMindForCausalLM"),
     # Qwen3 Omni MoE models
     "Qwen3OmniMoeForConditionalGeneration": (
         "qwen3_omni",
@@ -193,6 +194,38 @@ _OMNI_MODELS = {
         "covo_audio",
         "covo_audio_code2wav",
         "CovoAudioCode2WavForConditionalGeneration",
+    ),
+    # MiniMind-O models (HF checkpoint uses architecture MiniMindOmni)
+    "MiniMindOmni": (
+        "minimind_o",
+        "minimind_o",
+        "MiniMindOForConditionalGeneration",
+    ),
+    "MiniMindOForConditionalGeneration": (
+        "minimind_o",
+        "minimind_o",
+        "MiniMindOForConditionalGeneration",
+    ),
+    "MiniMindOMoeForConditionalGeneration": (
+        "minimind_o",
+        "minimind_o",
+        "MiniMindOMoeForConditionalGeneration",
+    ),
+    # Stage-specific models (if needed for individual stage serving)
+    "MiniMindOThinkerForConditionalGeneration": (
+        "minimind_o",
+        "minimind_o_thinker",
+        "MiniMindOThinkerForConditionalGeneration",
+    ),
+    "MiniMindOTalkerForConditionalGeneration": (
+        "minimind_o",
+        "minimind_o_talker",
+        "MiniMindOTalkerForConditionalGeneration",
+    ),
+    "MiniMindOCode2Wav": (
+        "minimind_o",
+        "minimind_o_code2wav",
+        "MiniMindOCode2Wav",
     ),
     ## MOSS-TTS-Nano
     "MossTTSNanoForCausalLM": (
