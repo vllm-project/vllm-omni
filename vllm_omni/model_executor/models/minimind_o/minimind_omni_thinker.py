@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025 The vLLM-Omni team.
+
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 import contextlib
@@ -19,6 +22,7 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -27,6 +31,10 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
@@ -60,7 +68,7 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.model_executor.models.minimind_o.minimind_omni_config import (
     MiniMindConfig,
-    OmniConfig as MiniMindOmniConfig,
+    MiniMindOmniConfig,
 )
 
 CapturedHiddenStates = dict[str, dict[str, dict[int, torch.Tensor]]]
@@ -268,7 +276,12 @@ class MiniMindModel(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
+        )
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList(
             [
@@ -316,6 +329,9 @@ class MiniMindModel(nn.Module):
                     layers[layer_idx] = hidden_states.clone().view(-1, hidden_states.shape[-1])
 
             hidden_states = layer(positions, hidden_states)
+            if captured_hidden_states is not None and layer_idx == getattr(self.config, "bridge_layer", -1):
+                hs = captured_hidden_states.setdefault("hidden_states", {})
+                hs["bridge"] = hidden_states.clone().view(-1, hidden_states.shape[-1])
 
         hidden_states = self.norm(hidden_states)
         return hidden_states, captured_hidden_states
@@ -338,9 +354,20 @@ class MiniMindForCausalLM(PreTrainedModel):
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "model"),
         )
-        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        if self.config.tie_word_embeddings: self.model.embed_tokens.weight = self.lm_head.weight
-        self.post_init() 
+        if self.config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.lm_head = ParallelLMHead(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+        self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        self.post_init()
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return self.logits_processor(self.lm_head, hidden_states)
 
 
 class MMAudioProjector(nn.Module):
@@ -666,17 +693,18 @@ class MiniMindOmniThinkerForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.vllm_config=vllm_config
-        thinker_config =vllm_config.model_config.hf_config
-        cache_config = getattr(vllm_config, "cache_config", None)
+        config: MiniMindOmniConfig =vllm_config.model_config.hf_config
+        cache_config = vllm_config.cache_config
         quant_config=vllm_config.quant_config
         multimodal_config=vllm_config.model_config.multimodal_config
 
-        self.config=thinker_config
+        self.config= config
         self.quant_config=quant_config
         self.multimodal_config=multimodal_config
         self.device = get_local_device()
 
-        self.text_config = thinker_config.get_text_config()
+        self.text_config = config.text_config
+        self.text_config.bridge_layer = config.bridge_layer
         with self._mark_language_model(vllm_config):
             self.language_model = MiniMindForCausalLM(
                 self.text_config,
@@ -685,7 +713,7 @@ class MiniMindOmniThinkerForConditionalGeneration(
                 prefix=maybe_prefix(prefix, "language_model"),
             )
 
-        self.vision_config = thinker_config.vision_config
+        self.vision_config = config.vision_config
         with self._mark_tower_model(vllm_config, "image"):
             if multimodal_config.get_limit_per_prompt("image"):
                 self.vision_encoder = (
@@ -707,7 +735,7 @@ class MiniMindOmniThinkerForConditionalGeneration(
                 self.vision_encoder = None
                 self.vision_proj = None
 
-        self.audio_config = thinker_config.audio_config
+        self.audio_config = config.audio_config
         with self._mark_tower_model(vllm_config, "audio"):
             if multimodal_config.get_limit_per_prompt("audio"):
                 self.audio_proj = MMAudioProjector(
@@ -851,7 +879,7 @@ class MiniMindOmniThinkerForConditionalGeneration(
             return inputs_embeds
     
     def compute_logits(self, hidden_states: torch.Tensor, **kwargs):
-        return self.language_model.lm_head(hidden_states)
+        return self.language_model.compute_logits(hidden_states)
         
     
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
