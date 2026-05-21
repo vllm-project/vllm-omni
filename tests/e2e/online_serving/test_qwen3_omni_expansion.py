@@ -5,6 +5,8 @@ E2E Online tests for Qwen3-Omni model.
 """
 
 import os
+import base64
+from pathlib import Path
 
 import pytest
 
@@ -509,3 +511,28 @@ def test_qwen3_omni_seed_tts_reads_questions_verbatim(omni_server, online_client
     )
     assert response.choices[0].finish_reason == "stop"
     assert response.choices[0].message.content == target
+    
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_audio_to_audio(omni_server, openai_client) -> None:
+    """
+    Input Modal: audio
+    Output Modal: audio
+    Input Setting: stream=False
+    Datasets: single request
+    """
+
+    audio_path = Path(__file__).parent.parent.parent / "assets" / "audio-prompt.wav"
+    audio_data_url = f"data:audio/wav;base64,{base64.b64encode(audio_path.read_bytes()).decode('utf-8')}"
+    messages = dummy_messages_from_mix_data(
+        audio_data_url=audio_data_url,
+        system_prompt=get_system_prompt(),
+    )
+
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "modalities": ["audio"],
+    }
+
+    openai_client.send_omni_request(request_config)
