@@ -20,7 +20,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import generate_synthetic_video
+from tests.helpers.media import generate_synthetic_video, generate_synthetic_audio, generate_synthetic_image
 from tests.helpers.runtime import QWEN3_OMNI_COLD_STAGE_INIT_TIMEOUT_S
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.platforms import current_omni_platform
@@ -67,12 +67,75 @@ thinker_test_params = [
 ]
 
 
-def get_question(prompt_type="video"):
+def get_question(prompt_type="text"):
     prompts = {
         "video": "Describe the video briefly.",
+        "image": "Describe the image.",
+        "audio": "Describe the audio.",
+        "text": "What is the capital of the United Kingdom?"
     }
-    return prompts.get(prompt_type, prompts["video"])
+    return prompts.get(prompt_type, prompts["text"])
 
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+def test_text_to_text(omni_runner, omni_runner_handler) -> None:
+    """Test generating text from text input"""
+    request_config = {"prompts": get_question("text"), "modalities": ["text"]}
+
+    # Test single completion
+    omni_runner_handler.send_omni_request(request_config)
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+def test_text_to_audio(omni_runner, omni_runner_handler) -> None:
+    """Test processing audio from text input"""
+    request_config = {"prompts": get_question("text"), "modalities": ["audio"]}
+
+    # Test single completion
+    omni_runner_handler.send_omni_request(request_config)
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+def test_image_to_text(omni_runner, omni_runner_handler) -> None:
+    """Test processing image, generating text output."""
+    image = generate_synthetic_image(224, 224)["np_array"]
+
+    request_config = {"prompts": get_question("image"), "images": image, "modalities": ["text"]}
+
+    # Test single completion
+    omni_runner_handler.send_omni_request(request_config)
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+def test_image_to_audio(omni_runner, omni_runner_handler) -> None:
+    """Test processing image, generating audio output."""
+    image = generate_synthetic_image(224, 224)["np_array"]
+
+    request_config = {"prompts": get_question("image"), "images": image, "modalities": ["audio"]}
+
+    # Test single completion
+    omni_runner_handler.send_omni_request(request_config)
+
+@pytest.mark.advanced_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_runner", test_params, indirect=True)
+def test_video_to_text(omni_runner, omni_runner_handler) -> None:
+    """Test processing video, generating text output."""
+    video = generate_synthetic_video(224, 224, 300)["np_array"]
+
+    request_config = {"prompts": get_question("video"), "videos": video, "modalities": ["text"]}
+
+    # Test single completion
+    omni_runner_handler.send_omni_request(request_config)
 
 @pytest.mark.advanced_model
 @pytest.mark.omni
