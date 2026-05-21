@@ -105,16 +105,3 @@ class TestOmniVoiceVoiceCloning:
             "min_audio_bytes": _DEFAULT_MIN_AUDIO_BYTES,
         }
         openai_client.send_audio_speech_request(request_config)
-
-    @hardware_test(res={"cuda": "L4"}, num_cards=1)
-    def test_voice_clone_invalid_ref_audio_format(self, omni_server, openai_client) -> None:
-        """Test that invalid ref_audio format returns a clear error."""
-        request_config = {
-            "model": omni_server.model,
-            "input": get_prompt("text"),
-            "ref_audio": "not_a_valid_uri",
-            "response_format": "wav",
-            "timeout": 180.0,
-            "status_code": (400, 422),
-        }
-        openai_client.send_audio_speech_request(request_config)

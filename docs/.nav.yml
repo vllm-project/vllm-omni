@@ -6,10 +6,11 @@ nav:
     - getting_started/installation/*
   - Serving:
     - OpenAI-Compatible API:
-      - Diffusion Chat API: serving/diffusion_chat_api.md
+      - Chat Completions API: serving/chat_completions_api.md
       - Image Generation: serving/image_generation_api.md
       - Image Edit: serving/image_edit_api.md
       - Text to Speech: serving/speech_api.md
+      - Videos: serving/videos_api.md
       - Audio Generation: serving/audio_generate_api.md
       - Streaming Video Input: serving/video_stream_api.md
   - Examples:
@@ -79,6 +80,8 @@ nav:
       - Quantized KV Cache: user_guide/quantization/quantized_kvcache.md
       - FP8 W8A8: user_guide/quantization/fp8.md
       - Int8 W8A8: user_guide/quantization/int8.md
+      - MXFP8 W8A8: user_guide/quantization/mxfp8.md
+      - MXFP4 W4A4: user_guide/quantization/mxfp4.md
       - ModelOpt: user_guide/quantization/modelopt.md
       - GGUF: user_guide/quantization/gguf.md
       - AutoRound: user_guide/quantization/autoround.md

@@ -31,6 +31,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.multimodal.audio import AudioResampler
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -456,7 +457,6 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._scaffold_graphs: dict[int, _CapturedGraph] = {}
         self._residual_graphs: dict[int, _CapturedGraph] = {}
         self._max_cached_graphs = self._max_batch_size
-        self._cuda_graph_pool: tuple | None = None
         self._cuda_graph_warmup_steps = 0
         self._cuda_graph_warmup_threshold = 3
 
@@ -661,11 +661,6 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         tts = self.tts
         return tts.stop_head(tts.stop_actn(tts.stop_proj(lm_h)))
 
-    def _get_cuda_graph_pool(self) -> tuple:
-        if self._cuda_graph_pool is None:
-            self._cuda_graph_pool = torch.cuda.graph_pool_handle()
-        return self._cuda_graph_pool
-
     @staticmethod
     def _nullify_volatile_metadata(ctx: Any) -> Any:
         """Set ``scheduler_metadata`` to None on all attention layers.
@@ -698,7 +693,6 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         hidden_size = self.config.hidden_size
         dtype = self._side_dtype
         dev = torch.device(self._device)
-        pool = self._get_cuda_graph_pool()
 
         model.precompute_fused_qkv()
 
@@ -721,7 +715,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             for _ in range(3):
                 _ = model(**call_kwargs)
 
-            with torch.cuda.graph(g.graph, pool=pool):
+            with torch.cuda.graph(g.graph, pool=current_platform.get_global_graph_pool()):
                 g.output = model(**call_kwargs)
 
         logger.info("CUDA Graph captured for %s (batch_size=%d)", label, batch_size)

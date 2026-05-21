@@ -49,34 +49,17 @@ def get_batch_token_config(default_path):
     )
 
 
-def get_default_config(default_path):
-    """Flip async_chunk on and bump stage 0 thinker output to 2048 tokens.
-
-    Pipeline registry (qwen3_omni/pipeline.py) already wires
-    thinker2talker_async_chunk / talker2code2wav_async_chunk on stages 0/1,
-    so no per-stage processor override is needed. Using only flat-schema
-    writes so _parse_stage_deploy stays in its flat branch (nested
-    ``engine_args:`` would drop other overlay fields).
-    """
-    return modify_stage_config(
-        default_path,
-        updates={
-            "stages": {0: {"default_sampling_params.max_tokens": 2048}},
-        },
-    )
-
-
 # CI deploy YAML (single file; xpu deltas applied via ``platforms:`` section).
 # The overlay explicitly sets ``async_chunk: False``, so ``default`` tests the
 # sync path and ``async_chunk`` tests the streaming path with a longer thinker
 # output — two distinct scenarios, kept as separate parametrizations.
-default_path = get_deploy_config_path("ci/qwen3_omni_moe.yaml")
+default_path = get_deploy_config_path("qwen3_omni_moe.yaml")
 
 test_params = [
     pytest.param(
         OmniServerParams(
             model=model,
-            stage_config_path=get_default_config(default_path),
+            stage_config_path=default_path,
             use_stage_cli=True,
             server_args=["--no-async-chunk"],
         ),
@@ -85,7 +68,7 @@ test_params = [
     pytest.param(
         OmniServerParams(
             model=model,
-            stage_config_path=get_default_config(default_path),
+            stage_config_path=default_path,
             use_stage_cli=True,
             server_args=["--async-chunk"],
         ),
