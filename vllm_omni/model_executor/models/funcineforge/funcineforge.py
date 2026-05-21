@@ -254,6 +254,11 @@ class FunCineForgeMultiModalProcessor(BaseMultiModalProcessor[FunCineForgeMultiM
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
+        # code2wav stage has no SOS token in its input — skip prompt insertion.
+        model_stage = getattr(self.info.ctx.model_config, "model_stage", "")
+        if model_stage == "funcineforge_code2wav":
+            return []
+
         # Insert face placeholder tokens after SOS via PromptInsertion.
         # This matches CosyVoice3's pattern and lets vLLM's multimodal
         # framework correctly track placeholder positions + budget.
@@ -263,8 +268,6 @@ class FunCineForgeMultiModalProcessor(BaseMultiModalProcessor[FunCineForgeMultiM
             if face_embedding is not None:
                 face_data = getattr(face_embedding, "data", face_embedding)
                 if isinstance(face_data, torch.Tensor) and face_data.numel() > 0:
-                    # Official FunCineForge inserts one projected face frame
-                    # per target codec frame immediately after SOS.
                     face_len = face_data.shape[-2] if face_data.dim() >= 2 else face_data.shape[0]
                     return [_FACE_TOKEN] * int(face_len)
 
