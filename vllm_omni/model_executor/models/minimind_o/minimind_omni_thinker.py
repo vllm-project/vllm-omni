@@ -770,7 +770,7 @@ class MiniMindOmniThinkerForConditionalGeneration(
         except (ImportError, RuntimeError, FileNotFoundError) as exc:
             warnings.warn(f"[MiniMindOmni] {exc}")
             return None
-        return model.model.encoder
+        return model.model.encoder.to(device=self.device, dtype=torch.float32)
 
     def encode_audio_inputs(
         self,
@@ -781,17 +781,12 @@ class MiniMindOmniThinkerForConditionalGeneration(
             return ()
         if self.audio_encoder is None:
             raise RuntimeError("audio_inputs were provided but audio_encoder is not initialized.")
-        if not audio_inputs.any():
+        if audio_inputs.numel() == 0 or audio_inputs.size(0) == 0:
             return ()
 
-        batch_mask = audio_inputs.flatten(1).any(1)
-        if not batch_mask.any():
-            return ()
-
-        enc_dtype = next(self.audio_encoder.parameters()).dtype
-        valid_fbank = audio_inputs[batch_mask].to(device=self.device, dtype=enc_dtype)
+        valid_fbank = audio_inputs.to(device=self.device, dtype=torch.float32)
         if audio_lens is not None:
-            valid_lens = audio_lens.reshape(-1)[batch_mask].to(device=valid_fbank.device)
+            valid_lens = audio_lens.reshape(-1).to(device=valid_fbank.device)
         else:
             valid_lens = torch.full(
                 (valid_fbank.size(0),),
@@ -968,6 +963,15 @@ class MiniMindOmniThinkerForConditionalGeneration(
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_weights.add(name)
+
+        # Vision/audio encoders are initialized from their own external
+        # checkpoints during __init__, not from the MiniMind thinker checkpoint.
+        # Mark them as loaded so vLLM's post-load validation does not report
+        # already-initialized tower parameters as missing.
+        for external_prefix in ("vision_encoder.", "audio_encoder."):
+            loaded_weights.update(
+                name for name in params_dict if name.startswith(external_prefix)
+            )
 
         return loaded_weights
 

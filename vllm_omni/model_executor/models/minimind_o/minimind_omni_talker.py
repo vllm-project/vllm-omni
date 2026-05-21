@@ -15,9 +15,8 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsMultiModal
+from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.utils import WeightsMapper, maybe_prefix
-from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -30,9 +29,6 @@ from vllm_omni.model_executor.models.minimind_o.minimind_omni_config import (
 )
 from vllm_omni.model_executor.models.minimind_o.minimind_omni_thinker import (
     MiniMindBlock,
-    MiniMindOmniDummyInputsBuilder,
-    MiniMindOmniMultiModalProcessor,
-    MiniMindOmniProcessingInfo,
 )
 
 
@@ -141,12 +137,7 @@ class MiniMindOmniTalkerEmbedding(nn.Module):
         return torch.stack(adapted, dim=0).mean(dim=0)
 
 
-@MULTIMODAL_REGISTRY.register_processor(
-    MiniMindOmniMultiModalProcessor,
-    info=MiniMindOmniProcessingInfo,
-    dummy_inputs=MiniMindOmniDummyInputsBuilder,
-)
-class MiniMindOmniTalkerForConditionalGeneration(nn.Module, SupportsMultiModal):
+class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
     hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"talker.": ""})
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -251,7 +242,26 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module, SupportsMultiModal):
         return self
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
-        return []
+        num_items = 0
+        for value in kwargs.values():
+            if isinstance(value, torch.Tensor) and value.ndim > 0:
+                num_items = int(value.shape[0])
+                break
+            if isinstance(value, (list, tuple)):
+                num_items = len(value)
+                break
+        if num_items <= 0:
+            return []
+
+        ref_param = next(self.parameters())
+        return [
+            torch.zeros(
+                (1, self.talker_config.hidden_size),
+                device=ref_param.device,
+                dtype=ref_param.dtype,
+            )
+            for _ in range(num_items)
+        ]
 
     def embed_input_ids(
         self,
