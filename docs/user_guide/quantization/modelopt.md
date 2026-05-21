@@ -80,8 +80,9 @@ backend and quality validation.
 | Wan2.2 | Not available | Diffusion transformer | Not validated |
 
 For full serving commands and benchmark context, see
-[`recipes/Qwen/Qwen-Image.md`](../../../recipes/Qwen/Qwen-Image.md) and
-[`recipes/Tencent/HunyuanImage-3.0-Instruct.md`](../../../recipes/Tencent/HunyuanImage-3.0-Instruct.md).
+[`recipes/Qwen/Qwen-Image.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Qwen/Qwen-Image.md)
+and
+[`recipes/Tencent/HunyuanImage-3.0-Instruct.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tencent/HunyuanImage-3.0-Instruct.md).
 
 ### Multi-Stage Omni/TTS Model
 
