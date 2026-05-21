@@ -796,12 +796,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         voice_lower = request.voice.lower()
         if voice_lower not in self.uploaded_speakers:
-            if self._tts_model_type in ("cosyvoice3", "fish_tts", "omnivoice", "moss_tts_nano"):
+            if self._tts_model_type in ("cosyvoice3", "fish_tts", "omnivoice", "moss_tts_nano", "higgs_audio_v2"):
                 label = {
                     "cosyvoice3": "CosyVoice3",
                     "fish_tts": "Fish Speech",
                     "omnivoice": "OmniVoice",
                     "moss_tts_nano": "MOSS-TTS-Nano",
+                    "higgs_audio_v2": "Higgs-Audio V2",
                 }.get(self._tts_model_type, self._tts_model_type)
                 return (
                     f"Unknown voice '{request.voice}'. {label} has no "
@@ -1427,10 +1428,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "higgs_audio_v2 v1 does not support 'x_vector_only_mode' (voice-cloning helper field)"
         if request.speaker_embedding is not None:
             return "higgs_audio_v2 v1 does not support 'speaker_embedding' (voice-cloning helper field)"
-        if request.voice:
+        if request.voice and request.ref_audio is None:
+            # _apply_uploaded_speaker runs before this validator; if voice was
+            # an uploaded speaker, ref_audio is now populated and ref_text is
+            # backfilled from the speaker entry. A bare voice= with no
+            # ref_audio means the name didn't resolve to an uploaded speaker
+            # (and higgs has no built-in preset voices).
             return (
-                "higgs_audio_v2 v1 does not support 'voice'/'speaker' selection; "
-                f"the model produces plain text -> speech only and does not honor voice={request.voice!r}"
+                "higgs_audio_v2 v1 does not support 'voice'/'speaker' selection for built-in voices; "
+                f"upload a voice first via POST /v1/audio/voices, or use ref_audio + ref_text. "
+                f"Got voice={request.voice!r}"
             )
         if request.instructions:
             return (
@@ -2159,10 +2166,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # Qwen-style generic placeholder path; build prompt_token_ids
             # directly via the upstream processor + the project's plain-text
             # helper.
+            #
+            # Resolve uploaded voices first so a voice=<name> request (after
+            # POST /v1/audio/voices) populates ref_audio + ref_text from the
+            # cached speaker entry, mirroring the cosyvoice3 / voxcpm2 flow.
+            err = self._apply_uploaded_speaker(request)
+            if err:
+                raise ValueError(err)
             validation_error = self._validate_higgs_audio_v2_request(request)
             if validation_error:
                 raise ValueError(validation_error)
             prompt = await self._build_higgs_audio_v2_params(request)
+            if request.voice:
+                voice_lower = request.voice.lower()
+                if voice_lower in self.uploaded_speakers and not has_inline_ref_audio:
+                    additional = prompt.setdefault("additional_information", {})
+                    additional["voice_name"] = voice_lower
+                    additional["voice_created_at"] = self._voice_created_at(voice_lower)
             tts_params = {}
         elif self._tts_model_type == "voxcpm2":
             # voxcpm2 doesn't use `_apply_uploaded_speaker` because the prompt builder needs the
