@@ -237,6 +237,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _extract_peak_memory_mb(result: Any) -> float:
+    """Pull worker-reported peak VRAM (MiB) generation result.
+
+    Mirrors vllm_omni/entrypoints/openai/serving_video.py:_extract_peak_memory_mb.
+    """
+    if isinstance(result, list):
+        result = result[0] if result else None
+    if result is None:
+        return 0.0
+    val = getattr(result, "peak_memory_mb", 0.0)
+    if not val:
+        inner = getattr(result, "request_output", None)
+        if isinstance(inner, list):
+            inner = inner[0] if inner else None
+        val = getattr(inner, "peak_memory_mb", 0.0)
+    try:
+        return float(val or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def main():
     args = parse_args()
     model_class_name = args.model_class_name
@@ -347,6 +368,10 @@ def main():
 
     # Print profiling results
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
+
+    peak_mb = _extract_peak_memory_mb(frames)
+    if peak_mb:
+        print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB)")
 
     audio = None
     if isinstance(frames, list):
