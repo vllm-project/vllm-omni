@@ -58,13 +58,10 @@ def validate_plain_text_input(text: str) -> None:
     code paths.
     """
     if not isinstance(text, str):
-        raise UnsupportedInputError(
-            f"higgs_audio_v2 expects plain text input; got {type(text).__name__}"
-        )
+        raise UnsupportedInputError(f"higgs_audio_v2 expects plain text input; got {type(text).__name__}")
     if MULTI_SPEAKER_TAG_PATTERN.search(text):
         raise UnsupportedInputError(
-            "higgs_audio_v2 v1 does not support multi-speaker [SPEAKERn] tags; "
-            "received text contains a speaker tag"
+            "higgs_audio_v2 v1 does not support multi-speaker [SPEAKERn] tags; received text contains a speaker tag"
         )
 
 
@@ -115,10 +112,7 @@ def build_plain_text_prompt(
         return_tensors=return_tensors,
     )
     if "input_ids" not in inputs:
-        raise RuntimeError(
-            "HiggsAudioV2 processor returned no input_ids; got keys "
-            f"{list(inputs.keys())!r}"
-        )
+        raise RuntimeError(f"HiggsAudioV2 processor returned no input_ids; got keys {list(inputs.keys())!r}")
     return inputs
 
 
@@ -127,9 +121,7 @@ def input_ids_to_python_list(inputs: dict[str, Any]) -> list[int]:
     ids = inputs["input_ids"]
     if isinstance(ids, torch.Tensor):
         if ids.ndim == 2 and int(ids.shape[0]) != 1:
-            raise ValueError(
-                f"expected batch=1 prompt; got input_ids shape {tuple(ids.shape)}"
-            )
+            raise ValueError(f"expected batch=1 prompt; got input_ids shape {tuple(ids.shape)}")
         return ids.reshape(-1).tolist()
     return list(ids)
 
@@ -157,9 +149,7 @@ def _build_delay_pattern(codes: torch.Tensor) -> torch.Tensor:
     wrapped_len = wrapped.shape[1]
     new_seq_len = wrapped_len + num_codebooks - 1
 
-    output = torch.ones(
-        (1, num_codebooks, new_seq_len), dtype=codes.dtype, device=codes.device
-    )
+    output = torch.ones((1, num_codebooks, new_seq_len), dtype=codes.dtype, device=codes.device)
     bos_mask = torch.tril(output, -1) > 0
     eos_mask = torch.triu(output, wrapped_len) > 0
     data_mask = ~(bos_mask | eos_mask)
@@ -204,7 +194,7 @@ def _load_audio_tokenizer():
 
 
 def _encode_ref_audio_codes(
-    wav: "np.ndarray",
+    wav: np.ndarray,
     sr: int,
 ) -> torch.Tensor:
     """Encode a single ref clip to codec codes via HF ``HiggsAudioV2TokenizerModel``.
@@ -265,7 +255,7 @@ def build_voice_clone_conversation(
 def build_voice_clone_prompt(
     processor: Any,
     text: str,
-    ref_audio_wav: "np.ndarray | torch.Tensor",
+    ref_audio_wav: np.ndarray | torch.Tensor,
     ref_audio_sr: int,
     ref_text: str,
     *,
@@ -310,10 +300,7 @@ def build_voice_clone_prompt(
     n_delay = num_codebooks - 1
     n_audio = T_full - n_delay
     if n_audio < 0:
-        raise RuntimeError(
-            f"ref clip too short ({T_full} frames) for delay pattern with "
-            f"num_codebooks={num_codebooks}"
-        )
+        raise RuntimeError(f"ref clip too short ({T_full} frames) for delay pattern with num_codebooks={num_codebooks}")
     placeholders = _AUDIO_OUT_TOKEN * n_audio + _AUDIO_DELAY_TOKEN * n_delay
     expanded_assistant = f"{_AUDIO_OUT_BOS_TOKEN}{placeholders}{_AUDIO_EOS_TOKEN}"
     if _AUDIO_OUT_TOKEN not in rendered:
@@ -326,7 +313,9 @@ def build_voice_clone_prompt(
     # 4. Tokenize the rendered prompt. ``apply_chat_template`` already emits
     #    ``<|begin_of_text|>``, so disable add_special_tokens.
     encoded = processor.tokenizer(
-        rendered, add_special_tokens=False, return_tensors=return_tensors,
+        rendered,
+        add_special_tokens=False,
+        return_tensors=return_tensors,
     )
     prompt_token_ids = encoded["input_ids"]
     if isinstance(prompt_token_ids, torch.Tensor):

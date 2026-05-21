@@ -28,7 +28,6 @@ from vllm_omni.data_entry_keys import (
     MetaStruct,
     OmniPayload,
     OmniPayloadStruct,
-    to_dict,
 )
 
 __all__ = ["talker2code2wav", "talker2code2wav_async_chunk"]
@@ -60,9 +59,7 @@ def _filter_real_code_frames(audio_codes: torch.Tensor) -> torch.Tensor:
     if audio_codes.numel() == 0:
         return audio_codes
     if audio_codes.ndim != 2:
-        raise ValueError(
-            f"expected [num_frames, num_codebooks] audio_codes; got shape {tuple(audio_codes.shape)}"
-        )
+        raise ValueError(f"expected [num_frames, num_codebooks] audio_codes; got shape {tuple(audio_codes.shape)}")
     valid = (audio_codes >= 0).all(dim=1) & (audio_codes < _NUM_REAL_CODES).all(dim=1)
     return audio_codes[valid]
 
@@ -79,9 +76,7 @@ def _revert_delay_pattern(audio_codes_qt: torch.Tensor) -> torch.Tensor:
     trailing PAD entries.
     """
     if audio_codes_qt.ndim != 2:
-        raise ValueError(
-            f"_revert_delay_pattern expects [Q, T] input; got {tuple(audio_codes_qt.shape)}"
-        )
+        raise ValueError(f"_revert_delay_pattern expects [Q, T] input; got {tuple(audio_codes_qt.shape)}")
     q, t = audio_codes_qt.shape
     if t < q:
         # Not enough frames to revert delay pattern; return as-is.
@@ -133,9 +128,7 @@ def talker2code2wav(
             audio_codes = audio_codes.reshape(-1, _NUM_CODEBOOKS)
 
         if audio_codes.ndim != 2:
-            raise ValueError(
-                f"audio_codes must be 1D or 2D; got shape {tuple(audio_codes.shape)}"
-            )
+            raise ValueError(f"audio_codes must be 1D or 2D; got shape {tuple(audio_codes.shape)}")
 
         # Audio_codes from Stage-0 are emitted in DELAY-PATTERN layout.
         # Revert the shift to recover the canonical ``[Q, seq_len]`` form,
@@ -171,9 +164,7 @@ def _extract_last_frame(pooling_output: OmniPayload) -> torch.Tensor | None:
     elif audio_codes.ndim == 1:
         frame = audio_codes
     else:
-        raise ValueError(
-            f"unexpected audio_codes shape for higgs_audio_v2 async_chunk: {tuple(audio_codes.shape)}"
-        )
+        raise ValueError(f"unexpected audio_codes shape for higgs_audio_v2 async_chunk: {tuple(audio_codes.shape)}")
     if frame.numel() == 0:
         return None
     frame = frame.to(torch.long).reshape(-1)
@@ -209,9 +200,7 @@ def talker2code2wav_async_chunk(
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size = int(cfg.get("codec_chunk_frames", _DEFAULT_CODEC_CHUNK_FRAMES))
-    left_context_size_config = int(
-        cfg.get("codec_left_context_frames", _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES)
-    )
+    left_context_size_config = int(cfg.get("codec_left_context_frames", _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES))
 
     if chunk_size <= 0 or left_context_size_config < 0:
         raise ValueError(
@@ -247,9 +236,7 @@ def talker2code2wav_async_chunk(
 
     num_codebooks = len(window_frames[0])
     if num_codebooks != _NUM_CODEBOOKS:
-        raise ValueError(
-            f"expected {_NUM_CODEBOOKS} codebooks per frame; got {num_codebooks}"
-        )
+        raise ValueError(f"expected {_NUM_CODEBOOKS} codebooks per frame; got {num_codebooks}")
     num_frames = len(window_frames)
     flat = torch.tensor(
         [window_frames[f][q] for q in range(num_codebooks) for f in range(num_frames)],

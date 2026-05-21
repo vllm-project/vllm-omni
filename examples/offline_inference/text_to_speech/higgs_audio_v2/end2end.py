@@ -106,9 +106,7 @@ def _extract_pcm(multimodal_output: dict) -> torch.Tensor:
     if audio is None:
         audio = multimodal_output.get("audio")
     if audio is None:
-        raise ValueError(
-            f"no audio key in multimodal_output: {list(multimodal_output.keys())}"
-        )
+        raise ValueError(f"no audio key in multimodal_output: {list(multimodal_output.keys())}")
     if isinstance(audio, list):
         valid = [torch.as_tensor(a).float().cpu().reshape(-1) for a in audio if a is not None]
         if not valid:

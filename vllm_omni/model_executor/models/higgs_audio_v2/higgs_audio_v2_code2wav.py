@@ -117,9 +117,7 @@ class HiggsAudioV2Code2Wav(nn.Module):
             try:
                 self.load_codec_from_disk(self._model_path)
             except FileNotFoundError as exc:
-                logger.warning(
-                    "HiggsAudioV2Code2Wav: eager codec load deferred (%s)", exc
-                )
+                logger.warning("HiggsAudioV2Code2Wav: eager codec load deferred (%s)", exc)
 
     # ------------------------------------------------------------- engine hooks
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
@@ -177,9 +175,7 @@ class HiggsAudioV2Code2Wav(nn.Module):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         audio_tokenizer_path = self._resolve_audio_tokenizer_path(model_dir)
-        quantizer, fc2, acoustic_decoder, _tokenizer_config = load_higgs_audio_codec(
-            audio_tokenizer_path, device
-        )
+        quantizer, fc2, acoustic_decoder, _tokenizer_config = load_higgs_audio_codec(audio_tokenizer_path, device)
         if len(quantizer.quantizers) != self.num_codebooks:
             raise ValueError(
                 f"checkpoint has {len(quantizer.quantizers)} quantizers but config.num_codebooks={self.num_codebooks}"
@@ -385,8 +381,7 @@ class HiggsAudioV2Code2Wav(nn.Module):
             )
         if int(audio_codes.shape[1]) != self.num_codebooks:
             raise ValueError(
-                f"audio_codes second dim must equal num_codebooks={self.num_codebooks}; "
-                f"got {int(audio_codes.shape[1])}"
+                f"audio_codes second dim must equal num_codebooks={self.num_codebooks}; got {int(audio_codes.shape[1])}"
             )
         if audio_codes.numel() > 0:
             max_val = int(audio_codes.max().item())
@@ -403,9 +398,7 @@ class HiggsAudioV2Code2Wav(nn.Module):
         return audio_codes
 
     @staticmethod
-    def _split_request_ids(
-        ids: torch.Tensor, seq_token_counts: list[int] | None = None
-    ) -> list[torch.Tensor]:
+    def _split_request_ids(ids: torch.Tensor, seq_token_counts: list[int] | None = None) -> list[torch.Tensor]:
         """Split a concatenated flat-codes tensor into per-request segments."""
         if seq_token_counts is not None and len(seq_token_counts) > 1:
             boundaries = [0]

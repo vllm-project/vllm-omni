@@ -1424,15 +1424,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
 
         if request.x_vector_only_mode is not None:
-            return (
-                "higgs_audio_v2 v1 does not support 'x_vector_only_mode' "
-                "(voice-cloning helper field)"
-            )
+            return "higgs_audio_v2 v1 does not support 'x_vector_only_mode' (voice-cloning helper field)"
         if request.speaker_embedding is not None:
-            return (
-                "higgs_audio_v2 v1 does not support 'speaker_embedding' "
-                "(voice-cloning helper field)"
-            )
+            return "higgs_audio_v2 v1 does not support 'speaker_embedding' (voice-cloning helper field)"
         if request.voice:
             return (
                 "higgs_audio_v2 v1 does not support 'voice'/'speaker' selection; "
@@ -1444,26 +1438,18 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 "style/emotion control); supply plain text instead"
             )
         if request.task_type is not None:
-            return (
-                "higgs_audio_v2 v1 does not support 'task_type'; the model is "
-                "single-mode plain text -> speech"
-            )
+            return "higgs_audio_v2 v1 does not support 'task_type'; the model is single-mode plain text -> speech"
         if request.language is not None:
             return (
-                "higgs_audio_v2 v1 does not accept 'language' overrides; the "
-                "model infers language from the input text"
+                "higgs_audio_v2 v1 does not accept 'language' overrides; the model infers language from the input text"
             )
         if request.speed is not None and request.speed != 1.0:
             return (
-                "higgs_audio_v2 v1 does not support 'speed' adjustments; the "
-                "audio is rendered at native rate (24 kHz)"
+                "higgs_audio_v2 v1 does not support 'speed' adjustments; the audio is rendered at native rate (24 kHz)"
             )
 
         if MULTI_SPEAKER_TAG_PATTERN.search(request.input):
-            return (
-                "higgs_audio_v2 v1 does not support multi-speaker [SPEAKERn] tags; "
-                "remove the tag from the input"
-            )
+            return "higgs_audio_v2 v1 does not support multi-speaker [SPEAKERn] tags; remove the tag from the input"
 
         if request.max_new_tokens is not None:
             if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
@@ -1541,9 +1527,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # stage (the CLI-passed model id is the single source of truth).
             model_path = getattr(self.engine_client, "model", None)
         if model_path is None:
-            raise RuntimeError(
-                "higgs_audio_v2 serving could not resolve the model path from the engine stage configs"
-            )
+            raise RuntimeError("higgs_audio_v2 serving could not resolve the model path from the engine stage configs")
         processor = AutoProcessor.from_pretrained(model_path)
         self._higgs_audio_v2_processor = processor
         return processor

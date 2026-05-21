@@ -103,9 +103,7 @@ class OmniVoiceDecoder(nn.Module):
     def load_weights(self, model_dir: str, device: torch.device) -> None:
         """Load decoder components from audio_tokenizer/model.safetensors."""
         audio_tokenizer_path = os.path.join(model_dir, "audio_tokenizer")
-        quantizer, fc2, acoustic_decoder, _tokenizer_config = load_higgs_audio_codec(
-            audio_tokenizer_path, device
-        )
+        quantizer, fc2, acoustic_decoder, _tokenizer_config = load_higgs_audio_codec(audio_tokenizer_path, device)
         self.quantizer = quantizer
         self.fc2 = fc2
         self.acoustic_decoder = acoustic_decoder

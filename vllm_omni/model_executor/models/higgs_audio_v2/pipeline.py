@@ -22,9 +22,7 @@ HIGGS_AUDIO_V2_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            async_chunk_process_next_stage_input_func=(
-                f"{_PROC}.talker2code2wav_async_chunk"
-            ),
+            async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
             sampling_constraints={
                 "detokenize": False,
                 # Two stop signals for Stage-0:

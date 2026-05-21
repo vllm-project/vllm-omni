@@ -9,9 +9,6 @@ rejects voice cloning fields, multi-speaker tags, language overrides, and
 task_type/voice selection with explicit 4xx — this suite exercises both the
 happy path (plain text in, audio bytes out) and the validator rejections,
 so a regression that loosens the schema will fail loudly.
-
-Unit-level coverage of the validator + tokenizer + DualFFN internals lives
-at tests/model_executor/models/higgs_audio_v2/test_higgs_audio_v2_units.py.
 """
 
 from __future__ import annotations
@@ -62,10 +59,7 @@ _MIN_AUDIO_BYTES = 20_000
 # for the asset rationale — keeping a single shared reference clip across TTS
 # tests avoids duplicating WAVs in the repo.
 _REF_AUDIO_URL = load_test_audio_data_url("qwen3_tts/clone_2.wav")
-_REF_TEXT = (
-    "Okay. Yeah. I resent you. I love you. I respect you. But you know "
-    "what? You blew it! And thanks to you."
-)
+_REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 
 
 @pytest.mark.parametrize("omni_server", TEST_PARAMS, indirect=True)

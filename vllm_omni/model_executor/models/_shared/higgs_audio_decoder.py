@@ -181,9 +181,7 @@ class BosonDacDecoder(nn.Module):
         d_out: int = 1,
     ):
         super().__init__()
-        layers: list[nn.Module] = [
-            _wn_conv1d(input_channel, channels, kernel_size=7, padding=3)
-        ]
+        layers: list[nn.Module] = [_wn_conv1d(input_channel, channels, kernel_size=7, padding=3)]
         last_dim = channels
         for i, stride in enumerate(rates):
             input_dim = channels // 2**i
@@ -286,9 +284,7 @@ def _load_higgs_audio_state_dict(audio_tokenizer_dir: str, device: torch.device)
 
         sd = load_file(safetensors_path, device=str(device))
     else:
-        raise FileNotFoundError(
-            f"Audio tokenizer weights not found at {pth_path} or {safetensors_path}"
-        )
+        raise FileNotFoundError(f"Audio tokenizer weights not found at {pth_path} or {safetensors_path}")
     # Run the boson-layout remap if needed; for the OmniVoice-bundled layout
     # it is a no-op (no ``quantizer.vq.layers.*`` keys to rewrite).
     if any(k.startswith("quantizer.vq.layers.") for k in sd):
@@ -349,12 +345,12 @@ def _remap_boson_model_pth_state_dict(sd: dict[str, torch.Tensor]) -> dict[str, 
         # boson decoder + fc_post2 -> our vendored kernel names.
         if key.startswith("decoder_2."):
             # decoder_2.model.<i>.{...} -> acoustic_decoder.model.<i>.{...}
-            new_key = "acoustic_decoder." + key[len("decoder_2."):]
+            new_key = "acoustic_decoder." + key[len("decoder_2.") :]
             remapped[new_key] = tensor
             continue
         if key.startswith("fc_post2."):
             # fc_post2.{weight,bias} -> fc2.{weight,bias}
-            new_key = "fc2." + key[len("fc_post2."):]
+            new_key = "fc2." + key[len("fc_post2.") :]
             remapped[new_key] = tensor
             continue
         # Anything else (acoustic_decoder.*, fc2.*, fc.*, fc_post*.*, decoder_2.*,
@@ -445,9 +441,7 @@ def load_higgs_audio_codec(
     if is_boson_layout:
         acoustic_decoder = build_boson_dac_decoder(device)
         boson_sd = {
-            k[len("acoustic_decoder.") :]: v
-            for k, v in state_dict.items()
-            if k.startswith("acoustic_decoder.")
+            k[len("acoustic_decoder.") :]: v for k, v in state_dict.items() if k.startswith("acoustic_decoder.")
         }
         load_report = acoustic_decoder.load_state_dict(boson_sd, strict=False)
         if load_report.missing_keys:
@@ -476,9 +470,7 @@ def load_higgs_audio_codec(
         # uninitialised — PCM quality will be noise on this path.
         first_conv = getattr(acoustic_decoder, "conv1", None)
         if first_conv is None or not hasattr(first_conv, "in_channels"):
-            raise RuntimeError(
-                "acoustic_decoder has no conv1.in_channels; cannot size fc2 fallback"
-            )
+            raise RuntimeError("acoustic_decoder has no conv1.in_channels; cannot size fc2 fallback")
         fc2 = nn.Linear(hidden_size, int(first_conv.in_channels)).to(device)
 
     return quantizer, fc2, acoustic_decoder, tokenizer_config

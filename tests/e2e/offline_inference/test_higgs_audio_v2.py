@@ -44,10 +44,7 @@ TEST_TEXT = "Hello world."
 # Reuse the qwen3_tts ref clip + transcript for voice clone tests (see
 # tests/e2e/online_serving/test_qwen3_tts_base.py:27-28 for the source).
 _REF_AUDIO_ASSET = "qwen3_tts/clone_2.wav"
-_REF_TEXT = (
-    "Okay. Yeah. I resent you. I love you. I respect you. But you know "
-    "what? You blew it! And thanks to you."
-)
+_REF_TEXT = "Okay. Yeah. I resent you. I love you. I respect you. But you know what? You blew it! And thanks to you."
 
 # (model, stage_config_path, extra_omni_kwargs) — same shape as test_voxtral_tts.py.
 # Stage configs already pin enforce_eager=true per stage, so no Omni-level override.
@@ -229,8 +226,6 @@ def test_higgs_audio_v2_offline_voice_clone(omni_runner_function: OmniRunner) ->
 
     pcm = _extract_pcm(outputs)
     arr = pcm.numpy()
-    assert arr.size > MIN_AUDIO_SAMPLES, (
-        f"cloned audio too short: {arr.size} samples, expected > {MIN_AUDIO_SAMPLES}"
-    )
+    assert arr.size > MIN_AUDIO_SAMPLES, f"cloned audio too short: {arr.size} samples, expected > {MIN_AUDIO_SAMPLES}"
     assert np.max(np.abs(arr)) > 5e-4, "voice-clone output is silent"
     assert np.isfinite(arr).all(), "voice-clone audio contains non-finite samples"

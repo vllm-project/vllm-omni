@@ -129,9 +129,12 @@ class OpenAICreateSpeechRequest(BaseModel):
         model_id = data.get("model")
         if not isinstance(model_id, str):
             return data
-        # Match either the exact "higgs_audio_v2" model_type label or the
-        # HF architecture id used in pipeline_registry.hf_architectures.
-        if "higgs_audio_v2" not in model_id.lower():
+        # Match the "higgs_audio_v2" model_type label, the HF architecture id
+        # in pipeline_registry.hf_architectures, and the hyphenated HF repo id
+        # (e.g. "bosonai/higgs-audio-v2-generation-3B-base") by normalizing
+        # both underscores and hyphens out of the id before substring matching.
+        normalized = model_id.lower().replace("-", "").replace("_", "")
+        if "higgsaudiov2" not in normalized:
             return data
         offending = sorted(k for k in higgs_audio_v2_reserved_keys if k in data)
         if offending:
