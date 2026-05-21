@@ -579,7 +579,7 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
                 params = inspect.signature(fn).parameters
                 args = {k: v for k, v in mask_kwargs.items() if k in params}
                 if "inputs_embeds" not in params and "input_embeds" in params:
-                    args["input_embeds"] = args.pop("inputs_embeds")
+                    args["input_embeds"] = mask_kwargs["inputs_embeds"]
                 return args
 
             # Create the masks
