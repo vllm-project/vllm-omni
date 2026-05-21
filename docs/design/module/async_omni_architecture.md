@@ -79,10 +79,10 @@
 
 [6] AsyncOmni._final_output_loop (background coroutine)
     -> AsyncOmniEngine.try_get_output_async()
-    -> route by request_id to ClientRequestState.queue
+    -> route by request_id to AsyncClientRequestState.queue
 
 [7] AsyncOmni._process_orchestrator_results
-    -> read from ClientRequestState.queue
+    -> read from AsyncClientRequestState.queue
     -> _process_single_result(...)
     -> yield OmniRequestOutput
 
