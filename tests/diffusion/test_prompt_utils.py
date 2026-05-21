@@ -21,9 +21,20 @@ def test_none_negative_stripped():
     assert "negative_prompt" not in result
 
 
-def test_empty_negative_stripped():
-    result = normalize_prompt_entry({"prompt": "a cat", "negative_prompt": "  "})
-    assert result == {"prompt": "a cat"}
+def test_whitespace_negative_preserved():
+    """Whitespace-only negative_prompt must be preserved to enable CFG (e.g. Qwen-Image-Edit)."""
+    result = normalize_prompt_entry({"prompt": "a cat", "negative_prompt": " "})
+    assert result == {"prompt": "a cat", "negative_prompt": " "}
+    assert "negative_prompt" in result
+
+
+def test_whitespace_negative_enables_cfg():
+    req = OmniDiffusionRequest(
+        prompts=[{"prompt": "cat", "negative_prompt": " "}],
+        sampling_params=OmniDiffusionSamplingParams(guidance_scale=3.5),
+    )
+    assert req.prompts[0]["negative_prompt"] == " "
+    assert req.sampling_params.do_classifier_free_guidance is True
 
 
 def test_valid_negative_kept():
@@ -50,6 +61,33 @@ def test_preserves_multimodal_keys():
 def test_invalid_type_raises():
     with pytest.raises(TypeError, match="str or dict"):
         normalize_prompt_entry(123)
+
+
+def test_extract_batch_prompts_invalid_type_raises():
+    """extract_batch_prompts should raise TypeError for non-str/dict entries,
+    consistent with normalize_prompt_entry."""
+    with pytest.raises(TypeError, match="str or dict"):
+        extract_batch_prompts([{"prompt": "cat"}, 123])
+
+
+def test_extract_batch_prompts_empty():
+    prompt, negative = extract_batch_prompts([])
+    assert prompt == []
+    assert negative is None
+
+
+def test_normalize_omni_diffusion_prompts():
+    result = normalize_omni_diffusion_prompts(
+        [
+            {"prompt": "a cat", "negative_prompt": None},
+            {"prompt": "  hello  ", "negative_prompt": "blurry"},
+            "plain string",
+        ]
+    )
+    assert result[0] == {"prompt": "a cat"}
+    assert "negative_prompt" not in result[0]
+    assert result[1] == {"prompt": "hello", "negative_prompt": "blurry"}
+    assert result[2] == "plain string"
 
 
 def test_batch_extract_all_none():

@@ -9,14 +9,14 @@ from typing import Any
 
 
 def _effective_negative(negative: Any) -> str | None:
-    """Return a non-empty negative prompt string, or None if unset/blank."""
+    """Return the negative prompt as a string, or None if it is None.
+
+    Whitespace-only strings (e.g. ``" "``) are intentionally preserved;
+    some models (e.g. Qwen-Image-Edit) pass them to enable CFG.
+    """
     if negative is None:
         return None
-    if isinstance(negative, str):
-        stripped = negative.strip()
-        return stripped if stripped else None
-    text = str(negative).strip()
-    return text if text else None
+    return negative if isinstance(negative, str) else str(negative)
 
 
 def normalize_prompt_entry(raw: Any) -> str | dict[str, Any]:
@@ -73,7 +73,7 @@ def extract_batch_prompts(
         elif isinstance(entry, dict):
             prompt.append(str(entry.get("prompt") or ""))
         else:
-            prompt.append("")
+            raise TypeError(f"Diffusion prompt must be str or dict, got {type(entry)!r}")
 
     if not has_negative_prompt(prompts):
         return prompt, None
