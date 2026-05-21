@@ -69,6 +69,10 @@ class FunCineForgeMultiModalProcessingInfo(BaseProcessingInfo):
         return self.ctx.get_hf_config(FunCineForgeConfig)
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        # code2wav receives codec tokens from stage connector, not multimodal input.
+        model_stage = getattr(self.ctx.model_config, "model_stage", "")
+        if model_stage == "funcineforge_code2wav":
+            return {}
         return {"audio": None}
 
     def get_mm_max_tokens_per_item(
@@ -76,10 +80,9 @@ class FunCineForgeMultiModalProcessingInfo(BaseProcessingInfo):
         seq_len: int,
         mm_counts: Mapping[str, int],
     ) -> Mapping[str, int] | None:
-        # 30s max audio at 25 Hz token rate = 750 face placeholder tokens.
-        # Returning pre-computed value skips dummy-input profiling which
-        # crashes because _get_prompt_updates returns empty (FunCineForge
-        # audio data doesn't use the placeholder-replacement mechanism).
+        model_stage = getattr(self.ctx.model_config, "model_stage", "")
+        if model_stage == "funcineforge_code2wav":
+            return {}
         return {"audio": 750}
 
     def get_data_parser(self):
