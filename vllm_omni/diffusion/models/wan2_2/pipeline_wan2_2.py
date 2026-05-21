@@ -122,8 +122,7 @@ def load_transformer_config(model_path: str, subfolder: str = "transformer", loc
 
 
 def create_transformer_from_config(
-    config: dict,
-    quant_config: QuantizationConfig | None = None,
+    config: dict, quant_config: QuantizationConfig | None = None, prefix: str = ""
 ) -> WanTransformer3DModel:
     """Create WanTransformer3DModel from config dict."""
     kwargs: dict = {}
@@ -166,6 +165,8 @@ def create_transformer_from_config(
 
     if quant_config is not None:
         kwargs["quant_config"] = quant_config
+    if prefix:
+        kwargs["prefix"] = prefix
 
     return WanTransformer3DModel(**kwargs)
 
