@@ -156,12 +156,20 @@ def _build_omni_kwargs(args, quantization=None):
 
 
 def _generate_image(omni, args, prompt, seed):
-    """Generate a single image and return (PIL.Image, time_seconds, memory_gib)."""
+    """Generate a single image; returns (PIL.Image, elapsed_s, peak_gib, weights_gib, activations_gib).
+
+    `weights_gib` is `memory_allocated()` snapshotted right before the
+    generate() call (everything the engine currently holds: model
+    parameters + any persistent buffers). `peak_gib` is the high-water
+    mark observed during generate(). `activations_gib` = peak - weights
+    (transient memory the diffusion loop needed on top of the model).
+    """
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
     from vllm_omni.outputs import OmniRequestOutput
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
+    weights_mem = torch.accelerator.memory_allocated() / (1024**3)
     torch.accelerator.reset_peak_memory_stats()
     start = time.perf_counter()
     outputs = omni.generate(
@@ -175,21 +183,26 @@ def _generate_image(omni, args, prompt, seed):
     )
     elapsed = time.perf_counter() - start
     peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
+    activations_mem = max(peak_mem - weights_mem, 0.0)
 
     req_out = OmniRequestOutput.unwrap_result(outputs)
     if not req_out.images:
         raise ValueError("Could not extract image output from result.")
     img = req_out.images[0]
-    return img, elapsed, peak_mem
+    return img, elapsed, peak_mem, weights_mem, activations_mem
 
 
 def _generate_video(omni, args, prompt, seed):
-    """Generate a video and return (np.ndarray [F,H,W,C], time_seconds, memory_gib)."""
+    """Generate a video; returns (np.ndarray [F,H,W,C], elapsed_s, peak_gib, weights_gib, activations_gib).
+
+    See `_generate_image` for what each memory number means.
+    """
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
     from vllm_omni.outputs import OmniRequestOutput
     from vllm_omni.platforms import current_omni_platform
 
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(seed)
+    weights_mem = torch.accelerator.memory_allocated() / (1024**3)
     torch.accelerator.reset_peak_memory_stats()
     start = time.perf_counter()
     outputs = omni.generate(
@@ -205,6 +218,7 @@ def _generate_video(omni, args, prompt, seed):
     )
     elapsed = time.perf_counter() - start
     peak_mem = torch.accelerator.max_memory_allocated() / (1024**3)
+    activations_mem = max(peak_mem - weights_mem, 0.0)
 
     first = outputs[0]
     if hasattr(first, "request_output") and isinstance(first.request_output, list):
@@ -241,7 +255,7 @@ def _generate_video(omni, args, prompt, seed):
         if frames_array.ndim == 5:
             frames_array = frames_array[0]
 
-    return frames_array, elapsed, peak_mem
+    return frames_array, elapsed, peak_mem, weights_mem, activations_mem
 
 
 def _free_gpu_memory():
@@ -277,17 +291,20 @@ def run_benchmark(args):
     bl_kwargs = _build_omni_kwargs(args, quantization=None)
     omni_bl = Omni(**bl_kwargs)
 
-    baseline_outputs = {}  # prompt -> (output, time, mem)
+    baseline_outputs = {}  # prompt -> (output, time, peak_mem, weights_mem, activations_mem)
     for prompt in prompts:
         print(f"  Generating: {prompt[:60]}...")
         if is_video:
-            out, t, mem = _generate_video(omni_bl, args, prompt, seed)
+            out, t, mem, weights, acts = _generate_video(omni_bl, args, prompt, seed)
         else:
-            out, t, mem = _generate_image(omni_bl, args, prompt, seed)
-        baseline_outputs[prompt] = (out, t, mem)
+            out, t, mem, weights, acts = _generate_image(omni_bl, args, prompt, seed)
+        baseline_outputs[prompt] = (out, t, mem, weights, acts)
 
     bl_avg_time = np.mean([v[1] for v in baseline_outputs.values()])
-    bl_mem = baseline_outputs[prompts[0]][2]  # use first prompt's memory
+    # First prompt's memory snapshot is canonical (matches PR #1470 convention).
+    bl_mem = baseline_outputs[prompts[0]][2]
+    bl_weights = baseline_outputs[prompts[0]][3]
+    bl_acts = baseline_outputs[prompts[0]][4]
     omni_bl.shutdown()
     del omni_bl
     _free_gpu_memory()
@@ -323,13 +340,15 @@ def run_benchmark(args):
         for prompt in prompts:
             print(f"  Generating: {prompt[:60]}...")
             if is_video:
-                out, t, mem = _generate_video(omni_qt, args, prompt, seed)
+                out, t, mem, weights, acts = _generate_video(omni_qt, args, prompt, seed)
             else:
-                out, t, mem = _generate_image(omni_qt, args, prompt, seed)
-            qt_outputs[prompt] = (out, t, mem)
+                out, t, mem, weights, acts = _generate_image(omni_qt, args, prompt, seed)
+            qt_outputs[prompt] = (out, t, mem, weights, acts)
 
         qt_avg_time = np.mean([v[1] for v in qt_outputs.values()])
         qt_mem = qt_outputs[prompts[0]][2]
+        qt_weights = qt_outputs[prompts[0]][3]
+        qt_acts = qt_outputs[prompts[0]][4]
         omni_qt.shutdown()
         del omni_qt
         _free_gpu_memory()
@@ -367,6 +386,8 @@ def run_benchmark(args):
                 "avg_time": qt_avg_time,
                 "speedup": speedup,
                 "memory_gib": qt_mem,
+                "weights_gib": qt_weights,
+                "activations_gib": qt_acts,
                 "mem_reduction_pct": mem_reduction,
                 "mean_lpips": mean_lpips,
                 "per_prompt": per_prompt,
@@ -402,6 +423,33 @@ def run_benchmark(args):
         )
     lines.append("")
     lines.append("> LPIPS < 0.01 = imperceptible, > 0.1 = clearly noticeable.")
+    lines.append("")
+
+    # Memory profiling table (mirrors PR #1470 layout)
+    tp = args.tensor_parallel_size
+    lines.append("### Memory Profiling")
+    lines.append("")
+    lines.append(
+        f"First-prompt snapshot at {args.height}x{args.width}, "
+        f"{args.num_inference_steps} steps. "
+        "Weights = `memory_allocated()` before `generate()`; "
+        "Peak = `max_memory_allocated()` during `generate()`; "
+        "Activations = Peak − Weights."
+    )
+    lines.append("")
+    lines.append("| Config | Weights | Activations | Peak | Total Reduction |")
+    lines.append("|--------|---------|-------------|------|-----------------|")
+    lines.append(
+        f"| BF16, TP={tp} | {bl_weights:.2f} GiB | {bl_acts:.2f} GiB "
+        f"| {bl_mem:.2f} GiB | — |"
+    )
+    for r in all_results:
+        reduction_pct = (bl_mem - r["memory_gib"]) / bl_mem * 100 if bl_mem > 0 else 0.0
+        lines.append(
+            f"| {r['config']}, TP={tp} | {r['weights_gib']:.2f} GiB "
+            f"| {r['activations_gib']:.2f} GiB | {r['memory_gib']:.2f} GiB "
+            f"| **{reduction_pct:.0f}%** |"
+        )
     lines.append("")
 
     # Per-prompt table
