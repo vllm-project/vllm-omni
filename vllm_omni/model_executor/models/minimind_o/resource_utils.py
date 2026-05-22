@@ -22,14 +22,11 @@ def resolve_model_dir(path_or_repo: str, resource_name: str) -> str:
         from huggingface_hub import snapshot_download
     except ImportError as exc:
         raise RuntimeError(
-            f"huggingface_hub is required to download MiniMind-O {resource_name} "
-            f"from '{path_or_repo}'."
+            f"huggingface_hub is required to download MiniMind-O {resource_name} from '{path_or_repo}'."
         ) from exc
 
     logger.info("Downloading MiniMind-O %s from %s", resource_name, path_or_repo)
     try:
         return snapshot_download(repo_id=path_or_repo)
     except Exception as exc:
-        raise RuntimeError(
-            f"Failed to resolve MiniMind-O {resource_name} from '{path_or_repo}'."
-        ) from exc
+        raise RuntimeError(f"Failed to resolve MiniMind-O {resource_name} from '{path_or_repo}'.") from exc

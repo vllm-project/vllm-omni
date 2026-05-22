@@ -1,19 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 The vLLM-Omni team.
 
+import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
-import contextlib
-import io
-import logging
-import os
-import warnings
 
 import numpy as np
 import torch
 from torch import nn
 from transformers import BatchFeature, PreTrainedModel, SiglipImageProcessor, SiglipVisionModel
-
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheConfig
 from vllm.config.multimodal import BaseDummyOptions
@@ -22,13 +17,13 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -39,10 +34,8 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
-    SupportsPP,
 )
 from vllm.model_executor.models.utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     _merge_multimodal_embeddings,
     maybe_prefix,
@@ -74,27 +67,29 @@ from vllm_omni.model_executor.models.minimind_o.resource_utils import resolve_mo
 
 CapturedHiddenStates = dict[str, dict[str, dict[int, torch.Tensor]]]
 
+
 class MiniMindOmniAttention(nn.Module):
-    def __init__(self, 
-                 config: MiniMindConfig, 
-                 layer_idx: int,
-                 cache_config: CacheConfig|None=None,
-                 quant_config: QuantizationConfig|None=None,
-                 prefix: str = "",
-            ):
+    def __init__(
+        self,
+        config: MiniMindConfig,
+        layer_idx: int,
+        cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         super().__init__()
-        self.config=config
-        self.layer_idx=layer_idx
+        self.config = config
+        self.layer_idx = layer_idx
 
-        self.hidden_size=config.hidden_size
-        self.num_heads=config.num_attention_heads
-        self.num_key_value_heads=config.num_key_value_heads
-        self.head_dim=config.head_dim
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
 
-        self.q_size=self.num_heads * self.head_dim
+        self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
-        self.qkv_proj=QKVParallelLinear(
+        self.qkv_proj = QKVParallelLinear(
             hidden_size=self.hidden_size,
             head_size=self.head_dim,
             total_num_heads=self.num_heads,
@@ -103,40 +98,43 @@ class MiniMindOmniAttention(nn.Module):
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "qkv_proj"),
         )
-        self.attn=Attention(
+        self.attn = Attention(
             num_heads=self.num_heads,
             head_size=self.head_dim,
-            scale=self.head_dim ** -0.5,
+            scale=self.head_dim**-0.5,
             num_kv_heads=self.num_key_value_heads,
-            cache_config=cache_config, 
+            cache_config=cache_config,
             quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "attn")
+            prefix=maybe_prefix(prefix, "attn"),
         )
-        self.o_proj=RowParallelLinear(
+        self.o_proj = RowParallelLinear(
             input_size=self.num_heads * self.head_dim,
             output_size=self.hidden_size,
             bias=False,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "o_proj"),
         )
-        self.q_norm=RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm=RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         self.rotary_emb = get_rope(
-                head_size=self.head_dim,
-                max_position=config.max_position_embeddings,
-                is_neox_style=True,
-                rope_parameters = {
-                    "rope_theta": config.rope_theta,
-                    "rope_type": "default",
-                }
-            )
+            head_size=self.head_dim,
+            max_position=config.max_position_embeddings,
+            is_neox_style=True,
+            rope_parameters={
+                "rope_theta": config.rope_theta,
+                "rope_type": "default",
+            },
+        )
 
-    def forward(self, positions: torch.Tensor,
-        hidden_states: torch.Tensor,)->torch.Tensor:
-        qkv,_=self.qkv_proj(hidden_states)
-        q,k,v=qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
         num_tokens = q.shape[0]
         q = self.q_norm(q.view(num_tokens, self.num_heads, self.head_dim)).view(num_tokens, self.q_size)
         k = self.k_norm(k.view(num_tokens, self.num_key_value_heads, self.head_dim)).view(num_tokens, self.kv_size)
@@ -144,26 +142,23 @@ class MiniMindOmniAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
-        output,_=self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output)
         return output
 
+
 class FeedForward(nn.Module):
-    def __init__(self, 
-                 config: MiniMindConfig, 
-                 quant_config: QuantizationConfig|None=None,
-                 prefix: str = ""
-                ):
+    def __init__(self, config: MiniMindConfig, quant_config: QuantizationConfig | None = None, prefix: str = ""):
         super().__init__()
         intermediate_size = config.intermediate_size
 
-        self.gate_up_proj=MergedColumnParallelLinear(
+        self.gate_up_proj = MergedColumnParallelLinear(
             input_size=config.hidden_size,
             output_sizes=[intermediate_size, intermediate_size],
             bias=False,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "gate_up_proj"),
         )
-        self.down_proj=RowParallelLinear(
+        self.down_proj = RowParallelLinear(
             input_size=intermediate_size,
             output_size=config.hidden_size,
             bias=False,
@@ -172,28 +167,22 @@ class FeedForward(nn.Module):
         )
 
         if config.hidden_act != "silu":
-            raise NotImplementedError(
-                f"MiniMind vLLM MLP only supports silu, got {config.hidden_act}"
-            )
-        self.act_fn=SiluAndMul()
+            raise NotImplementedError(f"MiniMind vLLM MLP only supports silu, got {config.hidden_act}")
+        self.act_fn = SiluAndMul()
 
-    def forward(self, x:torch.Tensor)->torch.Tensor:
-        x,_=self.gate_up_proj(x)
-        x=self.act_fn(x)
-        x,_=self.down_proj(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, _ = self.gate_up_proj(x)
+        x = self.act_fn(x)
+        x, _ = self.down_proj(x)
         return x
 
+
 class MOEFeedForward(nn.Module):
-    def __init__(
-        self, 
-        config: MiniMindConfig,
-        quant_config: QuantizationConfig|None=None,
-        prefix: str = ""
-    ):
+    def __init__(self, config: MiniMindConfig, quant_config: QuantizationConfig | None = None, prefix: str = ""):
         super().__init__()
         self.config = config
 
-        self.gate=ReplicatedLinear(
+        self.gate = ReplicatedLinear(
             input_size=config.hidden_size,
             output_size=config.num_experts,
             bias=False,
@@ -201,7 +190,7 @@ class MOEFeedForward(nn.Module):
             prefix=maybe_prefix(prefix, "gate"),
         )
 
-        self.experts=FusedMoE(
+        self.experts = FusedMoE(
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
@@ -211,7 +200,7 @@ class MOEFeedForward(nn.Module):
             prefix=maybe_prefix(prefix, "experts"),
         )
 
-        self.experts.expert_mapping=FusedMoE.make_expert_params_mapping(
+        self.experts.expert_mapping = FusedMoE.make_expert_params_mapping(
             self.experts,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -219,23 +208,25 @@ class MOEFeedForward(nn.Module):
             num_experts=config.num_experts,
         )
 
-    def forward(self, x:torch.Tensor)->torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape
         hidden_dim = x.shape[-1]
         x_flat = x.view(-1, hidden_dim)
 
-        router_logits,_=self.gate(x_flat)
-        y=self.experts(x_flat,router_logits)
+        router_logits, _ = self.gate(x_flat)
+        y = self.experts(x_flat, router_logits)
         return y.view(*original_shape)
 
+
 class MiniMindBlock(nn.Module):
-    def __init__(self,  
-                 config: MiniMindConfig, 
-                 layer_idx: int, 
-                 cache_config: CacheConfig|None=None, 
-                 quant_config: QuantizationConfig|None=None,
-                 prefix: str = "",
-            ):
+    def __init__(
+        self,
+        config: MiniMindConfig,
+        layer_idx: int,
+        cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         super().__init__()
 
         self.self_attn = MiniMindOmniAttention(
@@ -247,13 +238,13 @@ class MiniMindBlock(nn.Module):
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = FeedForward(
-            config,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, f"layers.{layer_idx}.mlp")
-        ) if not config.use_moe else MOEFeedForward(config,
-                                                    quant_config=quant_config,
-                                                    prefix=maybe_prefix(prefix, f"layers.{layer_idx}.mlp"))
+        self.mlp = (
+            FeedForward(config, quant_config=quant_config, prefix=maybe_prefix(prefix, f"layers.{layer_idx}.mlp"))
+            if not config.use_moe
+            else MOEFeedForward(
+                config, quant_config=quant_config, prefix=maybe_prefix(prefix, f"layers.{layer_idx}.mlp")
+            )
+        )
 
     def forward(
         self,
@@ -265,6 +256,7 @@ class MiniMindBlock(nn.Module):
         hidden_states += residual
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states
+
 
 class MiniMindModel(nn.Module):
     def __init__(
@@ -337,9 +329,11 @@ class MiniMindModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states, captured_hidden_states
 
+
 class MiniMindForCausalLM(PreTrainedModel):
     config_class = MiniMindConfig
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
     def __init__(
         self,
         config: MiniMindConfig | None = None,
@@ -371,9 +365,81 @@ class MiniMindForCausalLM(PreTrainedModel):
         return self.logits_processor(self.lm_head, hidden_states)
 
 
-class MMAudioProjector(nn.Module):
-    def __init__(self, config: MiniMindOmniConfig, quant_config: QuantizationConfig|None=None, prefix: str=""):
+_PROJECTOR_ACTIVATION_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
+def _is_projector_activation_dtype(dtype: object) -> bool:
+    return isinstance(dtype, torch.dtype) and dtype in _PROJECTOR_ACTIVATION_DTYPES
+
+
+def _select_projector_activation_dtype(
+    supported_dtypes: Sequence[torch.dtype],
+    fallback: torch.dtype,
+) -> torch.dtype:
+    supported = [dtype for dtype in supported_dtypes if _is_projector_activation_dtype(dtype)]
+    if not supported:
+        return fallback
+    if fallback in supported:
+        return fallback
+    for dtype in _PROJECTOR_ACTIVATION_DTYPES:
+        if dtype in supported:
+            return dtype
+    return supported[0]
+
+
+def _linear_activation_dtype(linear: nn.Module, fallback: torch.dtype) -> torch.dtype:
+    quant_method = getattr(linear, "quant_method", None)
+    for attr in ("input_dtype", "act_dtype"):
+        dtype = getattr(quant_method, attr, None)
+        if _is_projector_activation_dtype(dtype):
+            return dtype
+
+    weight = getattr(linear, "weight", None)
+    if isinstance(weight, torch.Tensor) and _is_projector_activation_dtype(weight.dtype):
+        return weight.dtype
+
+    quant_config = getattr(linear, "quant_config", None)
+    if quant_config is not None:
+        try:
+            return _select_projector_activation_dtype(
+                quant_config.get_supported_act_dtypes(),
+                fallback,
+            )
+        except Exception:
+            pass
+
+    params_dtype = getattr(linear, "params_dtype", None)
+    if _is_projector_activation_dtype(params_dtype):
+        return params_dtype
+
+    return fallback
+
+
+class _MiniMindProjectorMixin:
+    _activation_dtype_fallback: torch.dtype
+
+    def set_activation_dtype_fallback(self, dtype: torch.dtype) -> None:
+        if _is_projector_activation_dtype(dtype):
+            self._activation_dtype_fallback = dtype
+
+    @property
+    def input_dtype(self) -> torch.dtype:
+        return _linear_activation_dtype(self.mlp[1], self._activation_dtype_fallback)
+
+    def _linear_dtype(self, linear_idx: int) -> torch.dtype:
+        return _linear_activation_dtype(self.mlp[linear_idx], self._activation_dtype_fallback)
+
+    def _cast_for_linear(self, x: torch.Tensor, linear_idx: int) -> torch.Tensor:
+        target_dtype = self._linear_dtype(linear_idx)
+        if x.dtype == target_dtype:
+            return x
+        return x.to(dtype=target_dtype)
+
+
+class MMAudioProjector(_MiniMindProjectorMixin, nn.Module):
+    def __init__(self, config: MiniMindOmniConfig, quant_config: QuantizationConfig | None = None, prefix: str = ""):
         super().__init__()
+        self._activation_dtype_fallback = torch.get_default_dtype()
         self.mlp = nn.ModuleList(
             [
                 LayerNorm(config.audio_hidden_size),
@@ -397,14 +463,16 @@ class MMAudioProjector(nn.Module):
 
     def forward(self, x):
         x = self.mlp[0](x)
-        x, _ = self.mlp[1](x)
+        x, _ = self.mlp[1](self._cast_for_linear(x, 1))
         x = self.mlp[2](x)
-        x, _ = self.mlp[3](x)
+        x, _ = self.mlp[3](self._cast_for_linear(x, 3))
         return x
-    
-class MMVisionProjector(nn.Module):
-    def __init__(self, config: MiniMindOmniConfig, quant_config: QuantizationConfig|None=None, prefix: str = ""):
+
+
+class MMVisionProjector(_MiniMindProjectorMixin, nn.Module):
+    def __init__(self, config: MiniMindOmniConfig, quant_config: QuantizationConfig | None = None, prefix: str = ""):
         super().__init__()
+        self._activation_dtype_fallback = torch.get_default_dtype()
         self.mlp = nn.ModuleList(
             [
                 LayerNorm(config.image_hidden_size),
@@ -425,20 +493,20 @@ class MMVisionProjector(nn.Module):
                 ),
             ]
         )
-                
+
     def forward(self, x):
         x = self.mlp[0](x)
-        x, _ = self.mlp[1](x)
+        x, _ = self.mlp[1](self._cast_for_linear(x, 1))
         x = self.mlp[2](x)
-        x, _ = self.mlp[3](x)
+        x, _ = self.mlp[3](self._cast_for_linear(x, 3))
         return x
 
-  
-def _load_sensevoice_model(path: str, *, device: torch.device | str = "cpu"):
+
+def _load_sensevoice_model(path: str, *, device: str = "cpu"):
     if not path:
         raise FileNotFoundError("SenseVoice path or repo id is empty.")
     path = resolve_model_dir(path, "SenseVoice encoder")
-    
+
     try:
         from funasr import AutoModel
 
@@ -450,6 +518,7 @@ def _load_sensevoice_model(path: str, *, device: torch.device | str = "cpu"):
         )
     except ImportError as exc:
         raise ImportError(f"funasr is required to load SenseVoice model: {exc}") from exc
+
 
 class MiniMindOmniProcessingInfo(BaseProcessingInfo):
     def get_hf_config(self) -> MiniMindOmniConfig:
@@ -505,8 +574,8 @@ class MiniMindOmniDummyInputsBuilder(BaseDummyInputsBuilder[MiniMindOmniProcessi
         if num_images:
             image_overrides = mm_options.get("image") if mm_options else None
             mm_data["image"] = self._get_dummy_images(
-                width=256, 
-                height=256, 
+                width=256,
+                height=256,
                 num_images=num_images,
                 overrides=image_overrides,
             )
@@ -519,6 +588,7 @@ class MiniMindOmniDummyInputsBuilder(BaseDummyInputsBuilder[MiniMindOmniProcessi
                 overrides=audio_overrides,
             )
         return mm_data
+
 
 class MiniMindOmniMultiModalProcessor(BaseMultiModalProcessor[MiniMindOmniProcessingInfo]):
     def _get_sensevoice_frontend(self):
@@ -672,6 +742,7 @@ class MiniMindOmniMultiModalProcessor(BaseMultiModalProcessor[MiniMindOmniProces
         data.update(tokenizer(prompt, return_tensors="pt", **tok_kwargs))
         return BatchFeature(data=data, tensor_type=None)
 
+
 @MULTIMODAL_REGISTRY.register_processor(
     MiniMindOmniMultiModalProcessor,
     info=MiniMindOmniProcessingInfo,
@@ -698,15 +769,15 @@ class MiniMindOmniThinkerForConditionalGeneration(
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        self.vllm_config=vllm_config
-        config: MiniMindOmniConfig =vllm_config.model_config.hf_config
+        self.vllm_config = vllm_config
+        config: MiniMindOmniConfig = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
-        quant_config=vllm_config.quant_config
-        multimodal_config=vllm_config.model_config.multimodal_config
+        quant_config = vllm_config.quant_config
+        multimodal_config = vllm_config.model_config.multimodal_config
 
-        self.config= config
-        self.quant_config=quant_config
-        self.multimodal_config=multimodal_config
+        self.config = config
+        self.quant_config = quant_config
+        self.multimodal_config = multimodal_config
         self.device = get_local_device()
 
         self.text_config = config.text_config
@@ -718,10 +789,16 @@ class MiniMindOmniThinkerForConditionalGeneration(
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "language_model"),
             )
+        self.language_model_dtype = self._module_dtype(self.language_model)
 
         self.vision_config = config.vision_config
         with self._mark_tower_model(vllm_config, "image"):
             if multimodal_config.get_limit_per_prompt("image"):
+                self.vision_proj = MMVisionProjector(
+                    self.vision_config,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "vision_proj"),
+                )
                 vision_dir = (
                     resolve_model_dir(self.vision_config.vision_model_path, "vision encoder")
                     if self.vision_config.vision_model_path
@@ -735,14 +812,14 @@ class MiniMindOmniThinkerForConditionalGeneration(
                     if vision_dir
                     else None
                 )
-                self.vision_proj = MMVisionProjector(
-                    self.vision_config,
-                    quant_config=quant_config,
-                    prefix=maybe_prefix(prefix, "vision_proj"),
-                )
+                self.vision_proj.set_activation_dtype_fallback(self.language_model_dtype)
+                self.vision_encoder_dtype = self._module_input_dtype(self.vision_encoder)
+                self.vision_proj_dtype = self.vision_proj.input_dtype
             else:
                 self.vision_encoder = None
                 self.vision_proj = None
+                self.vision_encoder_dtype = torch.float32
+                self.vision_proj_dtype = torch.float32
 
         self.audio_config = config.audio_config
         with self._mark_tower_model(vllm_config, "audio"):
@@ -757,9 +834,14 @@ class MiniMindOmniThinkerForConditionalGeneration(
                     if self.audio_config.audio_encoder_path
                     else None
                 )
+                self.audio_proj.set_activation_dtype_fallback(self.language_model_dtype)
+                self.audio_encoder_dtype = self._module_input_dtype(self.audio_encoder)
+                self.audio_proj_dtype = self.audio_proj.input_dtype
             else:
                 self.audio_proj = None
                 self.audio_encoder = None
+                self.audio_encoder_dtype = torch.float32
+                self.audio_proj_dtype = torch.float32
 
     def _init_audio_encoder(self, path: str | None) -> nn.Module | None:
         if not path:
@@ -770,7 +852,7 @@ class MiniMindOmniThinkerForConditionalGeneration(
         except (ImportError, RuntimeError, FileNotFoundError) as exc:
             warnings.warn(f"[MiniMindOmni] {exc}")
             return None
-        return model.model.encoder.to(device=self.device, dtype=torch.float32)
+        return model.model.encoder.to(device=self.device)
 
     def encode_audio_inputs(
         self,
@@ -784,7 +866,7 @@ class MiniMindOmniThinkerForConditionalGeneration(
         if audio_inputs.numel() == 0 or audio_inputs.size(0) == 0:
             return ()
 
-        valid_fbank = audio_inputs.to(device=self.device, dtype=torch.float32)
+        valid_fbank = audio_inputs.to(device=self.device, dtype=self.audio_encoder_dtype)
         if audio_lens is not None:
             valid_lens = audio_lens.reshape(-1).to(device=valid_fbank.device)
         else:
@@ -797,17 +879,13 @@ class MiniMindOmniThinkerForConditionalGeneration(
 
         audio_hidden, _ = self.audio_encoder(valid_fbank, valid_lens)
 
-        proj_dtype = next(self.audio_proj.parameters()).dtype
         audio_embeddings = []
         for idx in range(audio_hidden.size(0)):
             feature_len = max(1, min(int(valid_lens[idx].item()), audio_hidden.size(1)))
-            projected = self.audio_proj(
-                audio_hidden[idx, :feature_len].unsqueeze(0).to(proj_dtype)
-            ).squeeze(0)
+            projected = self.audio_proj(audio_hidden[idx, :feature_len].unsqueeze(0).to(device=self.device)).squeeze(0)
             audio_embeddings.append(projected)
         return tuple(audio_embeddings)
 
-    
     def get_language_model(self) -> nn.Module:
         return self.language_model
 
@@ -831,13 +909,15 @@ class MiniMindOmniThinkerForConditionalGeneration(
         elif pixel_values is not None:
             if self.vision_encoder is None:
                 raise RuntimeError("pixel_values were provided but vision_encoder is not initialized.")
-            image_hidden = self.vision_encoder(pixel_values=pixel_values).last_hidden_state  # type: ignore[arg-type]
-            multimodal_embeddings += self._as_embedding_tuple(self.vision_proj(image_hidden))
+            pixel_values = pixel_values.to(device=self.device, dtype=self.vision_encoder_dtype)  # type: ignore[union-attr]
+            image_hidden = self.vision_encoder(pixel_values=pixel_values).last_hidden_state
+            multimodal_embeddings += self._as_embedding_tuple(self.vision_proj(image_hidden.to(device=self.device)))
 
         if audio_embeds is not None:
             multimodal_embeddings += self._as_embedding_tuple(audio_embeds)  # type: ignore[arg-type]
         elif audio_features is not None:
-            multimodal_embeddings += self._as_embedding_tuple(self.audio_proj(audio_features))  # type: ignore[arg-type]
+            audio_features = audio_features.to(device=self.device)  # type: ignore[union-attr]
+            multimodal_embeddings += self._as_embedding_tuple(self.audio_proj(audio_features))
         elif audio_inputs is not None:
             multimodal_embeddings += self.encode_audio_inputs(
                 audio_inputs,  # type: ignore[arg-type]
@@ -845,47 +925,73 @@ class MiniMindOmniThinkerForConditionalGeneration(
             )
 
         return multimodal_embeddings
-    
+
     def embed_input_ids(
-            self,
-            input_ids: torch.Tensor,
-            multimodal_embeddings=None,
-            *,
-            is_multimodal: torch.Tensor | None = None,
-        ) -> torch.Tensor:
-            inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings=None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
-            if not multimodal_embeddings:
-                return inputs_embeds
-
-            if is_multimodal is not None:
-                return _merge_multimodal_embeddings(
-                    inputs_embeds=inputs_embeds,
-                    multimodal_embeddings=multimodal_embeddings,
-                    is_multimodal=is_multimodal,
-                )
-
-            image_embeds = multimodal_embeddings[0]
-            image_token_id = self.vision_config.image_ids[0]
-            image_mask = input_ids == image_token_id
-
-            flat_embeds = inputs_embeds.view(-1, inputs_embeds.shape[-1])
-            flat_mask = image_mask.view(-1)
-
-            flat_image_embeds = image_embeds.reshape(-1, image_embeds.shape[-1])
-            if flat_mask.sum().item() != flat_image_embeds.shape[0]:
-                raise ValueError(
-                    f"Image token count {flat_mask.sum().item()} != "
-                    f"image embedding count {flat_image_embeds.shape[0]}"
-                )
-
-            flat_embeds[flat_mask] = flat_image_embeds.to(flat_embeds.dtype)
+        if not multimodal_embeddings:
             return inputs_embeds
-    
+
+        multimodal_embeddings = tuple(
+            embedding.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype) for embedding in multimodal_embeddings
+        )
+
+        if is_multimodal is not None:
+            return _merge_multimodal_embeddings(
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=multimodal_embeddings,
+                is_multimodal=is_multimodal,
+            )
+
+        image_embeds = multimodal_embeddings[0]
+        image_token_id = self.vision_config.image_ids[0]
+        image_mask = input_ids == image_token_id
+
+        flat_embeds = inputs_embeds.view(-1, inputs_embeds.shape[-1])
+        flat_mask = image_mask.view(-1)
+
+        flat_image_embeds = image_embeds.reshape(-1, image_embeds.shape[-1])
+        if flat_mask.sum().item() != flat_image_embeds.shape[0]:
+            raise ValueError(
+                f"Image token count {flat_mask.sum().item()} != image embedding count {flat_image_embeds.shape[0]}"
+            )
+
+        flat_embeds[flat_mask] = flat_image_embeds.to(flat_embeds.dtype)
+        return inputs_embeds
+
     def compute_logits(self, hidden_states: torch.Tensor, **kwargs):
         return self.language_model.compute_logits(hidden_states)
-        
-    
+
+    @staticmethod
+    def _module_dtype(module: nn.Module | None, default: torch.dtype = torch.float32) -> torch.dtype:
+        if module is None:
+            return default
+        for p in module.parameters(recurse=True):
+            if p.is_floating_point():
+                return p.dtype
+        for b in module.buffers(recurse=True):
+            if b.is_floating_point():
+                return b.dtype
+        return default
+
+    @staticmethod
+    def _module_input_dtype(module: nn.Module | None, default: torch.dtype = torch.float32) -> torch.dtype:
+        if module is None:
+            return default
+        input_module_types = (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.Linear)
+        for child in module.modules():
+            if isinstance(child, input_module_types):
+                weight = getattr(child, "weight", None)
+                if isinstance(weight, torch.Tensor) and weight.is_floating_point():
+                    return weight.dtype
+        return MiniMindOmniThinkerForConditionalGeneration._module_dtype(module, default)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             ("qkv_proj", "q_proj", "q"),
@@ -896,7 +1002,7 @@ class MiniMindOmniThinkerForConditionalGeneration(
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_weights: set[str] = set()
-        use_moe=self.text_config.use_moe
+        use_moe = self.text_config.use_moe
 
         self.expert_params_mapping = []
         if use_moe:
@@ -908,7 +1014,6 @@ class MiniMindOmniThinkerForConditionalGeneration(
                     break
             if not self.expert_params_mapping:
                 raise RuntimeError("MiniMind MoE is enabled but no FusedMoE expert_mapping was found.")
-
 
         for name, loaded_weight in self.hf_to_vllm_mapper.apply(weights):
             if name.startswith("talker."):
@@ -969,32 +1074,30 @@ class MiniMindOmniThinkerForConditionalGeneration(
         # Mark them as loaded so vLLM's post-load validation does not report
         # already-initialized tower parameters as missing.
         for external_prefix in ("vision_encoder.", "audio_encoder."):
-            loaded_weights.update(
-                name for name in params_dict if name.startswith(external_prefix)
-            )
+            loaded_weights.update(name for name in params_dict if name.startswith(external_prefix))
 
         return loaded_weights
 
     def forward(
-            self,
-            input_ids: torch.Tensor,
-            positions: torch.Tensor,
-            intermediate_tensors: IntermediateTensors | None = None,
-            inputs_embeds: torch.Tensor | None = None,
-            capture_layer_indices: Sequence[int] | None = None,
-            return_hidden_states: bool = False,
-            **kwargs, 
-        ) -> torch.Tensor|IntermediateTensors:
-            if intermediate_tensors is not None:
-                inputs_embeds = None
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        capture_layer_indices: Sequence[int] | None = None,
+        return_hidden_states: bool = False,
+        **kwargs,
+    ) -> torch.Tensor | IntermediateTensors:
+        if intermediate_tensors is not None:
+            inputs_embeds = None
 
-            hidden_states, captured_hidden_states =self.language_model.model(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                capture_layer_indices=capture_layer_indices,
-                return_hidden_states=return_hidden_states,
-                **kwargs,
-            )
-            return hidden_states,captured_hidden_states
+        hidden_states, captured_hidden_states = self.language_model.model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            capture_layer_indices=capture_layer_indices,
+            return_hidden_states=return_hidden_states,
+            **kwargs,
+        )
+        return hidden_states, captured_hidden_states

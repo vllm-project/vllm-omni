@@ -322,11 +322,7 @@ _OMNI_MODELS = {
         "MingFlashOmniTalkerForConditionalGeneration",
     ),
     ## MiniMind-Omni
-    "MiniMindOmni": (
-        "minimind_o",
-        "minimind_omni",
-        "MiniMindOmniForConditionalGeneration"
-    ),
+    "MiniMindOmni": ("minimind_o", "minimind_omni", "MiniMindOmniForConditionalGeneration"),
     "MiniMindOmniForConditionalGeneration": (
         "minimind_o",
         "minimind_omni",

@@ -8,7 +8,6 @@ from typing import Any
 
 import torch
 from torch import nn
-
 from vllm.config import VllmConfig
 from vllm.model_executor.models.interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsPP
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
@@ -17,7 +16,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
-from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.minimind_o.minimind_omni_code2wav import (
     MiniMindOmniCode2Wav,
 )
@@ -26,6 +24,7 @@ from vllm_omni.model_executor.models.minimind_o.minimind_omni_thinker import (
     MiniMindOmniMultiModalProcessor,
     MiniMindOmniProcessingInfo,
 )
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 
 @MULTIMODAL_REGISTRY.register_processor(
@@ -83,9 +82,7 @@ class MiniMindOmniForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
                 "Expected one of: 'thinker', 'talker', 'code2wav'."
             )
 
-        self.make_empty_intermediate_tensors = getattr(
-            self.model, "make_empty_intermediate_tensors", lambda: None
-        )
+        self.make_empty_intermediate_tensors = getattr(self.model, "make_empty_intermediate_tensors", lambda: None)
 
     def get_language_model(self) -> nn.Module:
         return self.model.get_language_model()
@@ -124,7 +121,6 @@ class MiniMindOmniForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
-
 
     def preprocess(
         self,

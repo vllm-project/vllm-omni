@@ -4,8 +4,8 @@
 from __future__ import annotations
 
 import math
-from typing import Any
 from dataclasses import dataclass
+from typing import Any
 
 from transformers import AutoConfig, PretrainedConfig
 
@@ -13,6 +13,7 @@ from transformers import AutoConfig, PretrainedConfig
 @dataclass
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
+
     def __init__(
         self,
         hidden_size: int = 768,
@@ -83,7 +84,7 @@ class MiniMindConfig(PretrainedConfig):
         self.norm_topk_prob = norm_topk_prob
         self.router_aux_loss_coef = router_aux_loss_coef
 
-    def get_text_config(self, **kwargs: Any) -> "MiniMindConfig":
+    def get_text_config(self, **kwargs: Any) -> MiniMindConfig:
         return self
 
 
@@ -308,7 +309,7 @@ class MiniMindOmniConfig(PretrainedConfig):
             vision_config = MiniMindOmniVisionConfig(**vision_defaults)
         self.vision_config = vision_config
 
-        # init audio config 
+        # init audio config
         audio_defaults = {
             "hidden_size": hidden_size,
             "audio_ids": audio_ids,
@@ -330,8 +331,7 @@ class MiniMindOmniConfig(PretrainedConfig):
             audio_config = MiniMindOmniAudioConfig(**audio_defaults)
         self.audio_config = audio_config
 
-
-        # init code2wav config        
+        # init code2wav config
         if isinstance(code2wav_config, dict):
             code2wav_config = MiniMindOmniCode2WavConfig(**code2wav_config)
         elif code2wav_config is None:
@@ -412,6 +412,7 @@ class MiniMindOmniConfig(PretrainedConfig):
 
     def get_text_config(self, **kwargs: Any) -> PretrainedConfig:
         return self.text_config
+
 
 try:
     AutoConfig.register(MiniMindConfig.model_type, MiniMindConfig)

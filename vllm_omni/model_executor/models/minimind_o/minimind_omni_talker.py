@@ -4,11 +4,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any, cast
+from typing import Any
 
 import torch
 from torch import nn
-
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
@@ -22,14 +21,14 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
-from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.minimind_o.minimind_omni_config import (
-    MiniMindOmniTalkerConfig,
     MiniMindOmniConfig,
+    MiniMindOmniTalkerConfig,
 )
 from vllm_omni.model_executor.models.minimind_o.minimind_omni_thinker import (
     MiniMindBlock,
 )
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 
 class MiniMindOmniTalkerHead(nn.Module):
@@ -125,15 +124,10 @@ class MiniMindOmniTalkerEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 3 or x.shape[1] != self.num_layers:
-            raise ValueError(
-                f"audio code ids must have shape [batch, {self.num_layers}, seq], got {tuple(x.shape)}"
-            )
+            raise ValueError(f"audio code ids must have shape [batch, {self.num_layers}, seq], got {tuple(x.shape)}")
 
         base_out = self.base(x)
-        adapted = [
-            base_out[:, i, :, :] + adapter(x[:, i, :])
-            for i, adapter in enumerate(self.adapters)
-        ]
+        adapted = [base_out[:, i, :, :] + adapter(x[:, i, :]) for i, adapter in enumerate(self.adapters)]
         return torch.stack(adapted, dim=0).mean(dim=0)
 
 
@@ -143,7 +137,7 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config: MiniMindOmniConfig = vllm_config.model_config.hf_config
-        talker_config: MiniMindOmniTalkerConfig= config.talker_config
+        talker_config: MiniMindOmniTalkerConfig = config.talker_config
         self.config = config
         self.talker_config = talker_config
         self.vllm_config = vllm_config
@@ -303,9 +297,7 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
         if bridge.ndim == 3:
             bridge = bridge.reshape(-1, bridge.shape[-1])
         if bridge.shape[0] < span_len:
-            raise ValueError(
-                f"bridge hidden states length {bridge.shape[0]} is shorter than scheduled span {span_len}"
-            )
+            raise ValueError(f"bridge hidden states length {bridge.shape[0]} is shorter than scheduled span {span_len}")
         return bridge[-span_len:]
 
     def _make_inputs_embeds(
@@ -455,10 +447,14 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
             )
         audio_codes = torch.stack(codes, dim=-1).to(dtype=torch.long)
         code_embeds = self.codec_proj(self.embed_tokens(audio_codes.unsqueeze(-1)).reshape(batch, -1))
-        next_embeds = code_embeds * self.audio_scale + text_step.reshape(batch, -1).to(
-            device=code_embeds.device,
-            dtype=code_embeds.dtype,
-        ) * self.text_scale
+        next_embeds = (
+            code_embeds * self.audio_scale
+            + text_step.reshape(batch, -1).to(
+                device=code_embeds.device,
+                dtype=code_embeds.dtype,
+            )
+            * self.text_scale
+        )
         return next_embeds, audio_codes
 
     def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
@@ -542,10 +538,7 @@ class MiniMindOmniTalkerForConditionalGeneration(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name_parts:
                     continue
-                mapped_parts = [
-                    param_name if part == weight_name else part
-                    for part in name_parts
-                ]
+                mapped_parts = [param_name if part == weight_name else part for part in name_parts]
                 mapped_name = ".".join(mapped_parts)
                 if mapped_name not in params_dict:
                     break
