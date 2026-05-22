@@ -280,12 +280,12 @@ class MiniMindModel(nn.Module):
             [
                 MiniMindBlock(
                     config,
-                    layer_idx=l,
+                    layer_idx=l_idx,
                     cache_config=cache_config,
                     quant_config=quant_config,
                     prefix=prefix,
                 )
-                for l in range(self.num_hidden_layers)
+                for l_idx in range(self.num_hidden_layers)
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
